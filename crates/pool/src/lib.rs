@@ -254,6 +254,7 @@ impl Drop for IsolatePool {
 }
 
 /// Decrements a worker's load counter when dropped.
+#[derive(Debug)]
 pub struct ContextLoadGuard {
     load: Arc<AtomicUsize>,
 }

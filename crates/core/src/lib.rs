@@ -808,15 +808,23 @@ struct FrameState {
     viewport: (f64, f64),
 }
 
-/// A live worker: its own V8 context on the page's worker thread, and the URL its
-/// own requests resolve against. A worker built from a blob has no document to
+/// A live worker: its own V8 context on an isolate thread of its own, and the URL
+/// its own requests resolve against. A worker built from a blob has no document to
 /// resolve against, so it keeps the page's base — which is what a browser does
 /// with the blob's origin.
 #[derive(Debug, Clone)]
 struct WorkerState {
+    /// Поток пула, на изоляте которого живёт контекст воркера. Он не обязан
+    /// совпадать с потоком страницы — в браузере воркер и есть отдельный поток,
+    /// — а номер контекста нумеруется внутри изолята, так что адресом воркера
+    /// работает только пара «поток + номер».
+    worker: nokk_pool::WorkerId,
     index: usize,
     url: String,
     fetch_base: String,
+    /// Пока контекст жив, поток пула считает его своим: без этого выбор
+    /// наименее нагруженного потока перестал бы видеть воркеров вовсе.
+    _load: std::sync::Arc<nokk_pool::ContextLoadGuard>,
 }
 
 /// One page's open sockets, plus the single queue everything they produce lands
@@ -999,11 +1007,24 @@ impl BrowserContext {
     /// page's own context is [`Self::index`], so `eval_in(self.index, …)` is
     /// exactly [`Self::evaluate`].
     async fn eval_in(&self, index: usize, source: &str) -> Result<Value, EngineError> {
+        self.eval_at(self.worker, index, source).await
+    }
+
+    /// То же, но в контексте на другом потоке пула. Номера контекстов свои у
+    /// каждого изолята, поэтому воркер, живущий не с нами, адресуется только
+    /// парой «поток + номер»; [`Self::eval_in`] — этот же вызов для потока
+    /// страницы.
+    async fn eval_at(
+        &self,
+        worker: nokk_pool::WorkerId,
+        index: usize,
+        source: &str,
+    ) -> Result<Value, EngineError> {
         let source = source.to_string();
         let out = self
             .engine
             .pool
-            .dispatch(self.worker, move |iso| iso.eval(index, &source))
+            .dispatch(worker, move |iso| iso.eval(index, &source))
             .await?
             .map_err(EngineError::Js)?;
         Ok(Value::String(out))
@@ -1232,16 +1253,19 @@ impl BrowserContext {
             //    is a *total* budget across rounds so a runaway `setInterval` is
             //    bounded overall, not merely per round.
             let remaining = TIMER_CAP.saturating_sub(total_timers);
-            let ran = self
-                .engine
-                .pool
-                .dispatch(self.worker, move |iso| {
-                    // Short per-round grab so the worker is released back to other
-                    // contexts frequently (fairness), rather than held for seconds.
-                    iso.run_event_loop(index, remaining, std::time::Duration::from_millis(250))
-                })
-                .await?
-                .map_err(EngineError::Js)?;
+            // Воркеры крутятся здесь же, а не своей очередью после страницы:
+            // они живут на других потоках пула, и ждать друг друга им больше
+            // незачем. В браузере это так и есть — страница считает, воркер
+            // считает, и время ответа складывается из дороги сообщения, а не из
+            // того, кто кого дождался.
+            let page_slice = self.engine.pool.dispatch(self.worker, move |iso| {
+                // Short per-round grab so the worker is released back to other
+                // contexts frequently (fairness), rather than held for seconds.
+                iso.run_event_loop(index, remaining, std::time::Duration::from_millis(250))
+            });
+            let (page, workers) = tokio::join!(page_slice, self.pump_workers());
+            let ran = page?.map_err(EngineError::Js)?;
+            let pumped_workers = workers?;
             total_timers += ran;
 
             // 2. Pull the I/O the JS queued — fetches and socket operations in one
@@ -1304,8 +1328,6 @@ impl BrowserContext {
             if index == self.index {
                 self.flush_resource_timings(index).await;
             }
-
-            let pumped_workers = self.pump_workers().await?;
 
             let busy = ran > 0
                 || pumped_workers > 0
@@ -1742,10 +1764,17 @@ impl BrowserContext {
                         continue;
                     }
                     let boot = self.bootstrap.clone();
+                    // Воркеру — свой поток. В браузере он и есть отдельный
+                    // поток: страница считает свою работу, пока воркер считает
+                    // свою, и ответ приходит через время сообщения, а не через
+                    // время «страница освободилась». У нас всё жило на одном
+                    // изоляте, и каждый ход воркера отнимался у страницы.
+                    let place = self.engine.pool.pick_worker();
+                    let load = std::sync::Arc::new(self.engine.pool.register_context(place));
                     let Ok(Ok(child)) = self
                         .engine
                         .pool
-                        .dispatch(self.worker, move |iso| iso.create_context(&boot))
+                        .dispatch(place, move |iso| iso.create_context(&boot))
                         .await
                     else {
                         continue;
@@ -1761,25 +1790,27 @@ impl BrowserContext {
                         resolve_url(base, raw).unwrap_or_else(|| raw.to_string())
                     };
                     let _ = self
-                        .eval_in(child, &nokk_stealth::worker_scope_script(name, &url))
+                        .eval_at(place, child, &nokk_stealth::worker_scope_script(name, &url))
                         .await;
                     if let Ok(mut w) = self.workers.lock() {
                         w.insert(
                             key,
                             WorkerState {
+                                worker: place,
                                 index: child,
                                 url: url.clone(),
                                 // A worker resolves its relative requests against
                                 // its own script — unless it came from a blob,
                                 // which has no path of its own to resolve against.
                                 fetch_base: if local { base.to_string() } else { url.clone() },
+                                _load: load,
                             },
                         );
                     }
-                    tracing::debug!(url = %url, bytes = source.len(),
+                    tracing::debug!(url = %url, bytes = source.len(), thread = place.0,
                                     head = %&source[..source.len().min(400)], "worker started");
                     let code = format!("{source}\n//# sourceURL={url}");
-                    if let Err(e) = self.eval_in(child, &code).await {
+                    if let Err(e) = self.eval_at(place, child, &code).await {
                         tracing::debug!(error = %e, "worker script threw");
                         let _ = self
                             .eval_in(
@@ -1794,20 +1825,20 @@ impl BrowserContext {
                         .workers
                         .lock()
                         .ok()
-                        .and_then(|w| w.get(&key).map(|s| s.index));
+                        .and_then(|w| w.get(&key).map(|s| (s.worker, s.index)));
                     match child {
-                        Some(child) => {
+                        Some((place, child)) => {
                             let data = op["data"].as_str().unwrap_or("null");
                             tracing::debug!(owner = index, worker = id, bytes = data.len(), "worker post");
                             let _ = self
-                                .eval_in(child, &format!("__pt_workerDeliver({})", js_str(data)))
+                                .eval_at(place, child, &format!("__pt_workerDeliver({})", js_str(data)))
                                 .await;
                             // И сразу отдаём воркеру ход. Задание обычно ставит
                             // короткий таймер и ждёт его: челлендж просит
                             // «отзовись через 55 мс» и меряет, сколько вышло.
                             // Дожидаться общего круга значило приписать к его
                             // 55 мс наши тридцать.
-                            self.serve_worker_soon(index, id, child).await;
+                            self.serve_worker_soon(index, id, place, child).await;
                         }
                         None => tracing::debug!(owner = index, worker = id, "worker post: no such worker"),
                     }
@@ -1826,50 +1857,44 @@ impl BrowserContext {
     /// Дать воркеру доработать то, что вот-вот наступит: свежедоставленное
     /// сообщение почти всегда ставит короткий таймер, и время до него — это
     /// время, которое кто-то замеряет.
-    async fn serve_worker_soon(&self, owner: usize, id: u32, child: usize) {
+    async fn serve_worker_soon(
+        &self,
+        owner: usize,
+        id: u32,
+        place: nokk_pool::WorkerId,
+        child: usize,
+    ) {
         // Ждём только то, что вот-вот: короткий таймер задания. Длинные — не
         // наше дело, их обслужит общий круг, иначе один воркер задержит всех.
-        const NEAR: i64 = 80;
-        let started = std::time::Instant::now();
-        while started.elapsed() < std::time::Duration::from_millis(150) {
-            let slice = self
-                .engine
-                .pool
-                .dispatch(self.worker, move |iso| {
-                    iso.run_event_loop(child, 200, std::time::Duration::from_millis(40))
-                })
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .unwrap_or(0);
-            if slice > 0 {
-                // Ответ уходит домой сразу же, а не следующим общим кругом:
-                // это последние миллисекунды, которые челлендж приписывает к
-                // нашему времени отклика.
-                self.flush_worker_out(owner, id, child).await;
-                continue;
-            }
-            let next = self
-                .eval_in(child, "typeof __pt_nextTimerDelay === 'function' ? __pt_nextTimerDelay() : -1")
-                .await
-                .ok()
-                .and_then(|v| v.as_f64())
-                .map(|v| v as i64)
-                .unwrap_or(-1);
-            if !(0..=NEAR).contains(&next) {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(next.max(1) as u64)).await;
-        }
-        self.flush_worker_out(owner, id, child).await;
+        // Ожидание живёт на потоке воркера: возвращать ход сюда ради каждого
+        // пятимиллисекундного шага дороже самого шага.
+        const NEAR: std::time::Duration = std::time::Duration::from_millis(80);
+        const TURN: std::time::Duration = std::time::Duration::from_millis(150);
+        let _ = self
+            .engine
+            .pool
+            .dispatch(place, move |iso| {
+                iso.run_worker_loop(child, 400, TURN, NEAR)
+            })
+            .await;
+        // Ответ уходит домой сразу же, а не следующим общим кругом: это
+        // последние миллисекунды, которые челлендж приписывает к нашему времени
+        // отклика.
+        self.flush_worker_out(owner, id, place, child).await;
     }
 
     /// Отдать домой всё, что воркер уже отправил. Отдельно от общего круга,
     /// потому что время между «колбэк положил сообщение» и «страница его
     /// получила» тоже засекают.
-    async fn flush_worker_out(&self, owner: usize, id: u32, child: usize) {
+    async fn flush_worker_out(
+        &self,
+        owner: usize,
+        id: u32,
+        place: nokk_pool::WorkerId,
+        child: usize,
+    ) {
         let Ok(out) = self
-            .eval_in(child, "__ptJSON.stringify(__pt_drainWorkerOut())")
+            .eval_at(place, child, "__ptJSON.stringify(__pt_drainWorkerOut())")
             .await
         else {
             return;
@@ -1904,67 +1929,41 @@ impl BrowserContext {
         let mut work = 0usize;
         for (key, state) in workers {
             let (owner, id) = key;
-            let child = state.index;
+            let (place, child) = (state.worker, state.index);
             // Пока воркеру есть что делать, даём ещё срез — до четырёх подряд.
             // Один срез в 50 мс на виток родительского цикла означал, что
             // секунда работы воркера растягивалась на несколько секунд стены:
             // сборщик отпечатка отвечал рывками с провалами по три-четыре
             // секунды, и челлендж успевал объявить себя просроченным.
-            let mut ran = 0u32;
             let turn_started = std::time::Instant::now();
             // Пока воркеру есть что делать — или вот-вот будет, — не отдаём его
             // ход обратно. Бюджет ограничивает жадность: страница и другие
-            // контексты ждать вечно не должны.
+            // контексты ждать вечно не должны. Ждёт воркер сам, на своём потоке:
+            // их сборщик разложен на цепочку таймеров по 55 мс, и поездка сюда
+            // за каждым шагом стоила дороже самого шага.
             const WORKER_TURN: std::time::Duration = std::time::Duration::from_millis(500);
-            while turn_started.elapsed() < WORKER_TURN {
-                let slice = self
-                    .engine
-                    .pool
-                    .dispatch(self.worker, move |iso| {
-                        iso.run_event_loop(child, 400, std::time::Duration::from_millis(60))
-                    })
-                    .await?
-                    .unwrap_or(0);
-                ran += slice;
-                if slice > 0 {
-                    continue;
-                }
-                // Ничего не сработало — но, может быть, вот-вот сработает. Сборщик
-                // отпечатка гоняет свою работу цепочкой таймеров по 55 мс, и один
-                // шаг за виток родительского цикла растягивал секунду работы на
-                // десять секунд стены. Ждём ближайший таймер, если он близко, и
-                // даём ещё срез.
-                let next = self
-                    .eval_in(child, "typeof __pt_nextTimerDelay === 'function' ? __pt_nextTimerDelay() : -1")
-                    .await
-                    .ok()
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(-1);
-                // Их сборщик разложен на цепочку таймеров: шаг — колбэк — пауза.
-                // Один шаг за виток родительского цикла превращал секунду работы
-                // в десяток секунд, и челлендж успевал объявить себя просроченным.
-                if next < 0 {
-                    break;
-                }
-                let wait = next.max(1) as u64;
-                if turn_started.elapsed() + std::time::Duration::from_millis(wait) > WORKER_TURN {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
-            }
+            const NEAR: std::time::Duration = std::time::Duration::from_millis(80);
+            let ran = self
+                .engine
+                .pool
+                .dispatch(place, move |iso| {
+                    iso.run_worker_loop(child, 2_000, WORKER_TURN, NEAR)
+                })
+                .await?
+                .unwrap_or(0);
             let slices_ms = turn_started.elapsed().as_millis();
             work += ran as usize;
             // Что воркер ждёт, когда молчит: свой таймер (и через сколько) или
             // ничего вовсе — тогда он висит на обещании.
             let pending = self
-                .eval_in(child, "typeof __pt_nextTimerDelay === 'function' ? __pt_nextTimerDelay() : -1")
+                .eval_at(place, child, "typeof __pt_nextTimerDelay === 'function' ? __pt_nextTimerDelay() : -1")
                 .await
                 .ok()
                 .and_then(|v| v.as_i64())
                 .unwrap_or(-1);
             tracing::debug!(worker = id, ran, slices_ms, pending, "worker turn");
 
-            let qjson = self.eval_in(child, DRAIN_IO).await?;
+            let qjson = self.eval_at(place, child, DRAIN_IO).await?;
             let queues: Value = match qjson {
                 Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
                 _ => Value::Null,
@@ -1974,7 +1973,7 @@ impl BrowserContext {
                 for r in reqs.iter().take(32) {
                     work += 1;
                     let settle = self.perform_fetch(&state.fetch_base, r).await;
-                    let _ = self.eval_in(child, &settle).await;
+                    let _ = self.eval_at(place, child, &settle).await;
                 }
             }
 
@@ -1982,7 +1981,8 @@ impl BrowserContext {
             // worker ends it, and a context nobody will ever pump again should
             // not stay on the isolate.
             let out = self
-                .eval_in(
+                .eval_at(
+                    place,
                     child,
                     "__ptJSON.stringify({out: __pt_drainWorkerOut(), closed: !!globalThis.__ptClosed})",
                 )
@@ -2029,7 +2029,7 @@ impl BrowserContext {
             .unwrap_or_default();
         let mut out = Vec::new();
         for state in workers {
-            if let Ok(v) = self.eval_in(state.index, js).await {
+            if let Ok(v) = self.eval_at(state.worker, state.index, js).await {
                 out.push((state.url, v));
             }
         }
@@ -2062,7 +2062,8 @@ impl BrowserContext {
     async fn dispose_worker(&self, owner: usize, state: &WorkerState) {
         if std::env::var("NOKK_TRACE_PROBES").is_ok() {
             let log = self
-                .eval_in(
+                .eval_at(
+                    state.worker,
                     state.index,
                     "typeof __pt_probeLog === 'function' ? __pt_probeLog() : ''",
                 )
@@ -2087,7 +2088,7 @@ impl BrowserContext {
         let _ = self
             .engine
             .pool
-            .dispatch(self.worker, move |iso| iso.dispose_context(child))
+            .dispatch(state.worker, move |iso| iso.dispose_context(child))
             .await;
     }
 
@@ -5886,6 +5887,126 @@ mod tests {
         assert!(
             (22..=23).contains(&out["navProto"].as_u64().unwrap_or(0)),
             "WorkerNavigator's own members: {out}"
+        );
+    }
+
+    /// Сколько миллисекунд проходит между «страница отправила» и «страница
+    /// получила ответ». Число само по себе ничего не доказывает — но челлендж
+    /// его меряет: сборщик отпечатка просит воркер отозваться через 55 мс и
+    /// смотрит, сколько вышло на самом деле. Живой браузер укладывается в
+    /// шестьдесят с небольшим, потому что воркер — отдельный поток; здесь тот же
+    /// круг, десять раз подряд, и порог оставлен заведомо мягким, чтобы тест
+    /// ловил обвал на порядок, а не дрожание машины.
+    #[tokio::test]
+    async fn a_message_to_a_worker_and_back_takes_about_a_frame() {
+        let _serial = serial().await;
+        let engine = engine(4, 6);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/app/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        ctx.evaluate(
+            r#"(() => {
+            const src = `self.onmessage = (e) => { postMessage(e.data + 1); };`;
+            const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+            // Страница при этом занята — как всякая живая страница. Пока всё
+            // жило на одном изоляте, ответ воркера ждал, когда она освободится,
+            // и круг вырастал ровно на её работу.
+            const burn = () => {
+              const until = performance.now() + 15;
+              while (performance.now() < until) {}
+              if (globalThis.__rt.length < 10) setTimeout(burn, 1);
+            };
+            globalThis.__rt = [];
+            globalThis.__mark = performance.now();
+            w.onmessage = (e) => {
+              const now = performance.now();
+              globalThis.__rt.push(now - globalThis.__mark);
+              globalThis.__mark = now;
+              if (globalThis.__rt.length < 10) w.postMessage(e.data);
+            };
+            w.postMessage(0);
+            setTimeout(burn, 1);
+            return 1;
+        })()"#,
+        )
+        .await
+        .unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        let rt = probe(&ctx, "__ptJSON.stringify(globalThis.__rt || [])").await;
+        let mut trips: Vec<f64> = rt
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
+            .unwrap_or_default();
+        assert_eq!(trips.len(), 10, "ten round trips completed: {rt}");
+        trips.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = trips[trips.len() / 2];
+        println!(
+            "worker round trip: median {median:.0} ms, min {:.0}, max {:.0}",
+            trips[0],
+            trips[trips.len() - 1]
+        );
+        assert!(
+            median < 250.0,
+            "a round trip through a worker should cost tens of milliseconds, not hundreds: {rt}"
+        );
+    }
+
+    /// Воркер держит своё время сам. Сборщик отпечатка Cloudflare разложен в
+    /// цепочку коротких таймеров внутри воркера, и пока всё жило на одном
+    /// изоляте, каждый его шаг ждал, когда освободится страница: секунда работы
+    /// растягивалась на секунды стены, а челлендж успевал объявить сборщик
+    /// повисшим. Здесь цепочка из двадцати шагов по 5 мс идёт на фоне занятой
+    /// страницы — и должна укладываться в своё собственное время.
+    #[tokio::test]
+    async fn a_worker_keeps_its_own_clock_while_the_page_is_busy() {
+        let _serial = serial().await;
+        let engine = engine(4, 6);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/app/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        ctx.evaluate(
+            r#"(() => {
+            const src = `const t0 = performance.now();
+              let n = 0;
+              const step = () => {
+                if (++n < 20) { setTimeout(step, 5); return; }
+                postMessage(performance.now() - t0);
+              };
+              self.onmessage = () => setTimeout(step, 5);`;
+            const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+            globalThis.__done = null;
+            globalThis.__wall = performance.now();
+            w.onmessage = (e) => {
+              globalThis.__done = { inWorker: e.data, wall: performance.now() - globalThis.__wall };
+            };
+            w.postMessage(0);
+            const burn = () => {
+              const until = performance.now() + 15;
+              while (performance.now() < until) {}
+              if (!globalThis.__done) setTimeout(burn, 1);
+            };
+            setTimeout(burn, 1);
+            return 1;
+        })()"#,
+        )
+        .await
+        .unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        let done = probe(&ctx, "__ptJSON.stringify(globalThis.__done)").await;
+        let wall = done["wall"].as_f64().unwrap_or(f64::MAX);
+        let inside = done["inWorker"].as_f64().unwrap_or(f64::MAX);
+        println!("worker chain: {inside:.0} ms inside the worker, {wall:.0} ms of wall clock");
+        // Двадцать шагов по 5 мс — это сто миллисекунд работы. Порог мягкий:
+        // ловим не дрожание, а возврат к прежнему порядку величины.
+        assert!(
+            wall < 600.0,
+            "a worker's own timer chain must not wait for the page: {done}"
         );
     }
 

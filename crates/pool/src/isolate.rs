@@ -435,6 +435,53 @@ impl Isolate {
         result
     }
 
+    /// То же, но контекст держит своё время сам: когда ничего не наступило, а
+    /// ближайший таймер ближе `near`, поток ждёт его здесь и продолжает круг,
+    /// вместо того чтобы возвращать ход наверх и ехать обратно.
+    ///
+    /// Так работает воркер в браузере: у него свой поток, и цепочка коротких
+    /// таймеров — а сборщик отпечатка Cloudflare разложен именно в неё — идёт
+    /// подряд, а не по шагу за виток чужого цикла. Ждать здесь можно только
+    /// потому, что контекст воркера живёт на изоляте, который больше никому не
+    /// нужен; для страницы это было бы остановкой всего.
+    pub fn run_worker_loop(
+        &mut self,
+        index: usize,
+        max_callbacks: u32,
+        budget: std::time::Duration,
+        near: std::time::Duration,
+    ) -> Result<u32, String> {
+        let deadline = std::time::Instant::now() + budget;
+        let mut total = 0u32;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() || total >= max_callbacks {
+                return Ok(total);
+            }
+            total += self.run_event_loop(index, max_callbacks - total, left)?;
+            let next = self.next_timer_delay(index);
+            let Some(wait) = next.filter(|d| *d <= near.min(left)) else {
+                return Ok(total);
+            };
+            std::thread::sleep(wait);
+        }
+    }
+
+    /// Через сколько сработает ближайший таймер контекста; `None` — не ждёт
+    /// ничего вовсе.
+    fn next_timer_delay(&mut self, index: usize) -> Option<std::time::Duration> {
+        let ms = self
+            .eval(
+                index,
+                "typeof __pt_nextTimerDelay === 'function' ? __pt_nextTimerDelay() : -1",
+            )
+            .ok()?
+            .trim()
+            .parse::<f64>()
+            .ok()?;
+        (ms >= 0.0).then(|| std::time::Duration::from_millis(ms.max(0.0) as u64))
+    }
+
     /// Inner timer pump for [`Self::run_event_loop`], factored out so the
     /// watchdog can wrap it. Runs the earliest pending timer repeatedly until the
     /// queue drains, `max_callbacks` is hit, or `deadline` passes.
