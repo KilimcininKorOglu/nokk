@@ -2086,6 +2086,127 @@ const WEB_BODIES_TEMPLATE: &str = r##"(() => {
     meth(CS.prototype, 'match', function () { return Promise.resolve(undefined); });
   }
 
+  // Заготовки из таблицы имён — это пустые объекты, и каждая отвечала
+  // `[object Object]` там, где браузер называет себя: `visualViewport`,
+  // шесть `BarProp`, `customElements`, `indexedDB`, `cookieStore`… Тридцать
+  // одна штука, снятая сравнением с Chrome 148 (`scripts` в блокноте:
+  // `tags_expr.js`). Сборщику отпечатка это первое, что видно: он зовёт
+  // `Object.prototype.toString` по всему окну подряд.
+  //
+  // Конструкторы для них таблица уже создала, так что достаточно пересадить
+  // объект на нужный прототип — заодно чинятся `instanceof` и `constructor`.
+  const BRANDED = {
+    locationbar: 'BarProp', menubar: 'BarProp', personalbar: 'BarProp',
+    scrollbars: 'BarProp', statusbar: 'BarProp', toolbar: 'BarProp',
+    visualViewport: 'VisualViewport', navigation: 'Navigation', external: 'External',
+    scheduler: 'Scheduler', customElements: 'CustomElementRegistry',
+    indexedDB: 'IDBFactory', cookieStore: 'CookieStore', sharedStorage: 'SharedStorage',
+    crashReport: 'CrashReportContext', documentPictureInPicture: 'DocumentPictureInPicture',
+    viewport: 'Viewport', launchQueue: 'LaunchQueue',
+  };
+  // Интерфейс на имя — один: шесть панелей окна в Chrome делят один и тот же
+  // прототип, и сравнение `Object.getPrototypeOf(locationbar) ===
+  // Object.getPrototypeOf(toolbar)` это показывает.
+  const made = new Map();
+  for (const [prop, name] of Object.entries(BRANDED)) {
+    try {
+      const v = globalThis[prop];
+      if (!v || typeof v !== 'object') continue;
+      // Пустышку из таблицы имён пересаживаем на настоящий интерфейс. А вот у
+      // объекта с собственным прототипом там живут его методы — такому имя
+      // ставим на месте, иначе `customElements` останется без `define` и
+      // `get`, и любая страница с веб-компонентами упадёт.
+      const proto = Object.getPrototypeOf(v);
+      if (proto && proto !== Object.prototype) {
+        try { Object.defineProperty(proto, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {}
+        const C = proto.constructor;
+        if (typeof C === 'function') {
+          try { Object.defineProperty(C, 'name', { value: name, configurable: true }); } catch (e) {}
+        }
+        continue;
+      }
+      const done = made.get(name);
+      // Интерфейс объявляем открыто: таблица имён положила туда пустую
+      // функцию без метки, а `instanceof` и `constructor` должны сойтись с
+      // тем прототипом, на который объект сейчас переедет.
+      if (done) Object.setPrototypeOf(v, done.prototype);
+      else made.set(name, rebrand(v, name, name === 'VisualViewport' ? ET : undefined));
+    } catch (e) {}
+  }
+  // Порядок имён на прототипе тоже читают: у Chrome сначала члены, `constructor`
+  // последним, а у свежесозданного интерфейса он оказывается первым.
+  const constructorLast = (proto) => {
+    try {
+      const d = Object.getOwnPropertyDescriptor(proto, 'constructor');
+      if (!d) return;
+      delete proto.constructor;
+      Object.defineProperty(proto, 'constructor', d);
+    } catch (e) {}
+  };
+  // Панель окна отвечает, видно ли её, — и в обычном окне видно всё.
+  try {
+    const BP = made.get('BarProp').prototype;
+    defg(BP, 'visible', function () { return true; });
+    constructorLast(BP);
+  } catch (e) {}
+  // Видимая часть окна: та же, что `innerWidth`/`innerHeight`, без сдвига и без
+  // масштаба. Пустой `visualViewport` отвечал `undefined` на каждый вопрос —
+  // а спрашивают его первым делом, когда меряют окно.
+  try {
+    const VV = made.get('VisualViewport').prototype;
+    defg(VV, 'offsetLeft', function () { return 0; });
+    defg(VV, 'offsetTop', function () { return 0; });
+    defg(VV, 'pageLeft', function () { return globalThis.scrollX || 0; });
+    defg(VV, 'pageTop', function () { return globalThis.scrollY || 0; });
+    defg(VV, 'width', function () { return globalThis.innerWidth; });
+    defg(VV, 'height', function () { return globalThis.innerHeight; });
+    defg(VV, 'scale', function () { return 1; });
+    for (const on of ['onresize', 'onscroll', 'onscrollend']) {
+      Object.defineProperty(VV, on, { value: null, writable: true, enumerable: true, configurable: true });
+    }
+    constructorLast(VV);
+  } catch (e) {}
+  // Пространства имён устроены иначе: конструктора у них нет вовсе, имя носит
+  // сам объект. `StyleMedia` из той же породы — Chrome его конструктор не
+  // публикует, а объект зовётся `[object StyleMedia]`.
+  const TAGGED = {
+    Intl: 'Intl', CSS: 'CSS', Temporal: 'Temporal', styleMedia: 'StyleMedia',
+    GPUBufferUsage: 'GPUBufferUsage', GPUColorWrite: 'GPUColorWrite', GPUMapMode: 'GPUMapMode',
+    GPUShaderStage: 'GPUShaderStage', GPUTextureUsage: 'GPUTextureUsage',
+  };
+  for (const [prop, tag] of Object.entries(TAGGED)) {
+    try {
+      const v = globalThis[prop];
+      if (v && typeof v === 'object') {
+        Object.defineProperty(v, Symbol.toStringTag, { value: tag, configurable: true });
+      }
+    } catch (e) {}
+  }
+  // `clientInformation` — не копия навигатора, а он сам: одно и то же
+  // значение под двумя именами, и сравнение на равенство это показывает.
+  try {
+    if (globalThis.navigator) {
+      Object.defineProperty(globalThis, 'clientInformation', {
+        get: native(function clientInformation() { return navigator; }),
+        enumerable: true, configurable: true,
+      });
+    }
+  } catch (e) {}
+  const brandInPlace = (v, name, base) => {
+    if (!v || typeof v !== 'object') return;
+    const proto = Object.getPrototypeOf(v);
+    if (proto && proto !== Object.prototype) {
+      try { Object.defineProperty(proto, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {}
+      return;
+    }
+    rebrand(v, name, base);
+  };
+  try { brandInPlace(document && document.timeline, 'DocumentTimeline'); } catch (e) {}
+  try { brandInPlace(globalThis.navigator && navigator.serviceWorker, 'ServiceWorkerContainer', ET); } catch (e) {}
+  // Канал WebRTC создаётся уже во время работы страницы — ему нужен готовый
+  // прототип с меткой, а не пустышка из таблицы.
+  try { iface('RTCDataChannel', ET); } catch (e) {}
+
   // `speechSynthesis` голосов не отдаёт (их и в headless-Chrome нет), но
   // интерфейсом быть обязан: сборщик идёт по прототипу.
   const SS = rebrand(globalThis.speechSynthesis, 'SpeechSynthesis', ET);
@@ -4605,6 +4726,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         readyState: 'connecting', bufferedAmount: 0, id: null, protocol: (opts && opts.protocol) || '',
         send() {}, close() { this.readyState = 'closed'; },
       });
+      // Канал обязан называть себя каналом: `Object.prototype.toString` по
+      // нему — обычная проверка, и `[object Object]` выдаёт нас с головой.
+      // Прототип интерфейса таблица имён уже создала.
+      try {
+        const C = globalThis.RTCDataChannel;
+        if (C && C.prototype) Object.setPrototypeOf(channel, C.prototype);
+      } catch (e) {}
       return channel;
     }
     async createOffer() {

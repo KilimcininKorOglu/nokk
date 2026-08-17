@@ -3370,6 +3370,58 @@ mod tests {
         assert!(engine.injection_script().contains("'webdriver', false"));
     }
 
+    /// Платформенный объект называет себя сам. Заготовки из таблицы имён были
+    /// пустыми объектами и отвечали `[object Object]` там, где Chrome говорит
+    /// `[object VisualViewport]` или `[object BarProp]`, — а
+    /// `Object.prototype.toString` по всему окну подряд сборщик отпечатка зовёт
+    /// первым делом. Значения сняты с Chrome 148.
+    #[tokio::test]
+    async fn a_platform_object_says_what_it_is() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let tags = probe(
+            &ctx,
+            r#"__ptJSON.stringify({
+                bar: Object.prototype.toString.call(locationbar),
+                viewport: Object.prototype.toString.call(visualViewport),
+                elements: Object.prototype.toString.call(customElements),
+                idb: Object.prototype.toString.call(indexedDB),
+                intl: Object.prototype.toString.call(Intl),
+                css: Object.prototype.toString.call(CSS),
+                channel: Object.prototype.toString.call(new RTCPeerConnection().createDataChannel('x')),
+                sameBar: Object.getPrototypeOf(locationbar) === Object.getPrototypeOf(toolbar),
+                isBar: locationbar instanceof BarProp,
+                visible: locationbar.visible,
+                order: Object.getOwnPropertyNames(BarProp.prototype).join(','),
+                width: visualViewport.width === innerWidth,
+                sameNavigator: clientInformation === navigator,
+            })"#,
+        )
+        .await;
+
+        assert_eq!(tags["bar"], "[object BarProp]", "{tags}");
+        assert_eq!(tags["viewport"], "[object VisualViewport]", "{tags}");
+        assert_eq!(tags["elements"], "[object CustomElementRegistry]", "{tags}");
+        assert_eq!(tags["idb"], "[object IDBFactory]", "{tags}");
+        assert_eq!(tags["intl"], "[object Intl]", "{tags}");
+        assert_eq!(tags["css"], "[object CSS]", "{tags}");
+        assert_eq!(tags["channel"], "[object RTCDataChannel]", "{tags}");
+        // Шесть панелей окна — один интерфейс на всех, и он тот же, что в
+        // `instanceof`: разные прототипы под одним именем видно сразу.
+        assert_eq!(tags["sameBar"], true, "{tags}");
+        assert_eq!(tags["isBar"], true, "{tags}");
+        assert_eq!(tags["visible"], true, "{tags}");
+        // Порядок имён на прототипе тоже читают: члены, потом `constructor`.
+        assert_eq!(tags["order"], "visible,constructor", "{tags}");
+        assert_eq!(tags["width"], true, "видимая часть окна — это окно: {tags}");
+        assert_eq!(tags["sameNavigator"], true, "одно значение под двумя именами: {tags}");
+    }
+
     /// Каждая сборка Vite приезжает вдвойне: модульная половина и запасная под
     /// `nomodule`. Браузер с модулями берёт первую и пропускает вторую — а мы
     /// исполняли обе, то есть запускали приложение дважды. На 2captcha это
