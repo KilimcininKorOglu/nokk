@@ -818,6 +818,11 @@
     set async(v) { v ? this.setAttribute('async', '') : this.removeAttribute('async'); }
     get defer() { return this.hasAttribute('defer'); }
     set defer(v) { v ? this.setAttribute('defer', '') : this.removeAttribute('defer'); }
+    // `'noModule' in script` — как страница спрашивает, умеет ли браузер модули.
+    // Без этого свойства мы для любой сборки Vite — браузер из позапрошлой эпохи,
+    // и нам присылают legacy-половину.
+    get noModule() { return this.hasAttribute('nomodule'); }
+    set noModule(v) { v ? this.setAttribute('nomodule', '') : this.removeAttribute('nomodule'); }
 
     get children() { return __collection(this.__ptKids.filter(n => n.nodeType === ELEMENT_NODE)); }
     get childElementCount() { return this.children.length; }
@@ -909,6 +914,8 @@
       // Anything that is not classic JS — a JSON island, a template, an importmap
       // — is data the page reads itself, not code to run.
       if (type && !/^(text|application)\/(java|ecma)script$|^module$/.test(type)) return;
+      // `nomodule` — «это для браузера без модулей». Мы с модулями, значит мимо.
+      if (type !== 'module' && this.hasAttribute('nomodule')) return;
       const src = this.getAttribute('src');
       // Nothing to run *yet*: an element appended empty starts when its `src`
       // arrives, so the flag must not be set until there is something to do.

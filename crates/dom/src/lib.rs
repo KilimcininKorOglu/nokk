@@ -28,6 +28,13 @@ pub enum Script {
     /// `<script type="module" src=…>`: the whole of a modern site is usually
     /// this one line.
     ExternalModule(String),
+    /// A `<script nomodule>`: the fallback bundle for a browser from before
+    /// modules. One that has them skips it, and must — a Vite site ships both
+    /// halves, and running both loads the app twice.
+    ///
+    /// The element is still counted so the numbering stays the document's own:
+    /// `__pt_beginScript(i)` indexes every `<script>` the parser saw.
+    Skipped,
 }
 
 /// The result of parsing an HTML document.
@@ -122,19 +129,24 @@ fn serialize(node: &Handle, scripts: &mut Vec<Script>) -> Value {
                 let module = attr("type")
                     .map(|t| t.trim().eq_ignore_ascii_case("module"))
                     .unwrap_or(false);
-                match attr("src") {
+                let nomodule = attrs.borrow().iter().any(|a| &*a.name.local == "nomodule");
+                if nomodule && !module {
+                    scripts.push(Script::Skipped);
+                } else {
+                    match attr("src") {
                     Some(src) if !src.is_empty() => scripts.push(if module {
                         Script::ExternalModule(src)
                     } else {
                         Script::External(src)
                     }),
-                    _ => {
-                        let code = text_content(node);
-                        scripts.push(if module {
-                            Script::InlineModule(code)
-                        } else {
-                            Script::Inline(code)
-                        })
+                        _ => {
+                            let code = text_content(node);
+                            scripts.push(if module {
+                                Script::InlineModule(code)
+                            } else {
+                                Script::Inline(code)
+                            })
+                        }
                     }
                 }
             }
@@ -224,6 +236,31 @@ mod tests {
                 Script::Inline("var a = 1;".into()),
                 Script::External("/app.js".into()),
                 Script::Inline("var b = 2;".into()),
+            ]
+        );
+    }
+
+    /// A Vite build ships both halves: the module bundle and a `nomodule`
+    /// fallback for browsers without modules. A browser takes exactly one — and
+    /// the element still counts, because `document.currentScript` is addressed
+    /// by position among all the `<script>`s the parser saw.
+    #[test]
+    fn a_nomodule_fallback_is_counted_but_not_run() {
+        let page = parse(
+            r#"<html><body>
+                <script type="module" src="/app.js"></script>
+                <script nomodule src="/legacy.js"></script>
+                <script nomodule>System.import('/legacy-entry.js')</script>
+                <script>var tail = 1;</script>
+            </body></html>"#,
+        );
+        assert_eq!(
+            page.scripts,
+            vec![
+                Script::ExternalModule("/app.js".into()),
+                Script::Skipped,
+                Script::Skipped,
+                Script::Inline("var tail = 1;".into()),
             ]
         );
     }

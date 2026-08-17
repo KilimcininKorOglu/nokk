@@ -638,7 +638,12 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
     if (!url) return;
     let abs = url;
     try { abs = new URL(url, locState.href).href; } catch (e) {}
-    navQueue.push({ url: abs, replace: !!replace });
+    // Кто именно уводит страницу — вопрос, который задаёшь каждый раз, когда
+    // сайт вдруг перезагружает сам себя. Верхние кадры стека отвечают на него
+    // сразу, поэтому едут вместе с запросом.
+    let via = '';
+    try { via = String(new Error().stack || '').split('\n').slice(1, 4).join(' | ').slice(0, 300); } catch (e) {}
+    navQueue.push({ url: abs, replace: !!replace, via });
   };
   globalThis.__pt_drainNavQueue = () => navQueue.splice(0);
 

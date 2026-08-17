@@ -1065,6 +1065,13 @@ impl BrowserContext {
         // can point `document.currentScript` at the running node (document.write
         // positioning); `__pt_endScript` clears it afterward.
         for (idx, script) in page.scripts.iter().enumerate() {
+            // `<script nomodule>` is addressed to a browser without modules. We
+            // have them, so we are not the audience — and a site that ships both
+            // halves (every Vite build does) runs its whole app twice if we take
+            // the fallback as well.
+            if matches!(script, nokk_dom::Script::Skipped) {
+                continue;
+            }
             // A module is not a script with different syntax: it is parsed, linked
             // and evaluated as a graph, so it goes down its own path.
             if let nokk_dom::Script::InlineModule(code) | nokk_dom::Script::ExternalModule(code) =
@@ -1119,7 +1126,9 @@ impl BrowserContext {
                     }
                 },
                 // Handled above, before this match.
-                nokk_dom::Script::InlineModule(_) | nokk_dom::Script::ExternalModule(_) => continue,
+                nokk_dom::Script::InlineModule(_)
+                | nokk_dom::Script::ExternalModule(_)
+                | nokk_dom::Script::Skipped => continue,
             };
             let _ = self
                 .eval_in(index, &format!("__pt_beginScript({idx})"))
@@ -1278,7 +1287,8 @@ impl BrowserContext {
                 if let Some(url) = op["url"].as_str() {
                     if index == self.index {
                         let to = url.to_string();
-                        tracing::debug!(url = %to, "page navigated itself");
+                        let via = op["via"].as_str().unwrap_or("");
+                        tracing::debug!(url = %to, via, "page navigated itself");
                         // Boxed: the loop is reached *from* `navigate`, so this
                         // is a recursive async call and needs an indirection.
                         let from = base.clone();
@@ -3349,6 +3359,43 @@ mod tests {
         let _serial = serial().await;
         let engine = engine(1, 1);
         assert!(engine.injection_script().contains("'webdriver', false"));
+    }
+
+    /// Каждая сборка Vite приезжает вдвойне: модульная половина и запасная под
+    /// `nomodule`. Браузер с модулями берёт первую и пропускает вторую — а мы
+    /// исполняли обе, то есть запускали приложение дважды. На 2captcha это
+    /// кончалось бесконечной перезагрузкой страницы.
+    #[tokio::test]
+    async fn a_nomodule_script_does_not_run_and_the_page_says_it_has_modules() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        let html = r#"<!DOCTYPE html><html><body>
+              <script>globalThis.ran = [];</script>
+              <script nomodule>globalThis.ran.push('parsed-fallback');</script>
+              <script>
+                globalThis.ran.push('classic');
+                var s = document.createElement('script');
+                s.noModule = true;
+                s.text = "globalThis.ran.push('inserted-fallback')";
+                document.body.appendChild(s);
+                globalThis.detect = ('noModule' in document.createElement('script'))
+                  + '/' + s.hasAttribute('nomodule');
+              </script>
+            </body></html>"#;
+
+        ctx.load_html("https://example.com/", html).await.unwrap();
+
+        assert_eq!(
+            ctx.evaluate("globalThis.ran.join(',')").await.unwrap(),
+            Value::String("classic".into())
+        );
+        // `'noModule' in script` — тем же вопросом Vite решает, какую половину
+        // сборки нам отдать.
+        assert_eq!(
+            ctx.evaluate("globalThis.detect").await.unwrap(),
+            Value::String("true/true".into())
+        );
     }
 
     #[tokio::test]
