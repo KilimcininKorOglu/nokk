@@ -331,6 +331,22 @@ async fn main() -> Result<()> {
                 let hook = r#"(() => {
                   try { console.error('[hook] installed'); } catch (e) {}
                   globalThis.__pt_streamHooks = __STREAM__;
+                  // Опыт: недостижимый хост в браузере не отвечает вовсе —
+                  // запрос висит. У нас соединение падает сразу, и челлендж
+                  // получает отказ там, где Chrome не получает ничего.
+                  if (__HANG__) {
+                    try {
+                      const F = globalThis.fetch;
+                      globalThis.fetch = function (r, o) {
+                        const u = String((r && r.url) || r || '');
+                        if (/brunhild\./.test(u)) {
+                          try { console.error('[hang] ' + u.slice(0, 90)); } catch (e) {}
+                          return new Promise(() => {});
+                        }
+                        return F.apply(this, arguments);
+                      };
+                    } catch (e) {}
+                  }
                   // Собранный отпечаток уходит через JSON.stringify до того, как
                   // его сожмут и зашифруют — это единственная точка, где видно,
                   // что именно мы про себя рассказали.
@@ -406,6 +422,133 @@ async fn main() -> Result<()> {
                       };
                     }
                   } catch (e) {}
+                  // Их отправка сообщения кадру читает `contentWindow` раньше,
+                  // чем проверяет целевой origin, — и молча уходит ни с чем,
+                  // если origin пуст. Значит по чтению видно, дошёл ли тик до
+                  // отправки вообще, даже когда сообщение потерялось.
+                  try {
+                    const d = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
+                    if (d && d.get) {
+                      let n = 0;
+                      Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+                        configurable: true,
+                        get() {
+                          if (n++ < 40) {
+                            try {
+                              const at = String(new Error().stack || '').split('\n').slice(2, 4)
+                                .map(x => x.trim().replace(/^at /, '')).join(' | ').slice(0, 150);
+                              console.error('[cw] read #' + n + ' on #' + (this.id || '?') + ' @ ' + at);
+                            } catch (e) {}
+                          }
+                          const win = d.get.call(this);
+                          // И сам вызов: их `Cr` роняет сообщение молча, если
+                          // целевой origin пуст, — значит надо видеть, дошло ли
+                          // дело до postMessage и с чем.
+                          try {
+                            if (win && !win.__ptLogged) {
+                              const P = win.postMessage;
+                              win.postMessage = function (data, origin) {
+                                try {
+                                  const ev = data && data.event;
+                                  console.error('[pm] → frame event=' + ev + ' origin=' + JSON.stringify(origin));
+                                } catch (e) {}
+                                return P.apply(this, arguments);
+                              };
+                              win.__ptLogged = true;
+                            }
+                          } catch (e) {}
+                          return win;
+                        },
+                      });
+                    }
+                  } catch (e) {}
+                  // Что кот видит на каждом тике: его проверки идут по теневому
+                  // корню виджета и по его обёртке, и любая из них молча
+                  // пропускает ход. Снимаем их сами — раз в две секунды.
+                  try {
+                    const shadows = [];
+                    const AS = Element.prototype.attachShadow;
+                    Element.prototype.attachShadow = function (init) {
+                      const sh = AS.apply(this, arguments);
+                      try {
+                        shadows.push([this, sh]);
+                        console.error('[shadow] host=' + this.localName + '#' + (this.id || '') +
+                                      ' mode=' + (init && init.mode));
+                      } catch (e) {}
+                      return sh;
+                    };
+                    globalThis.setTimeout(function report() {
+                      try {
+                        for (const [host, sh] of shadows) {
+                          const kids = [];
+                          try { for (const k of sh.children) kids.push(k.localName + '#' + (k.id || '')); } catch (e) {}
+                          console.error('[watchcat] host=' + host.localName + '#' + (host.id || '') +
+                                        ' connected=' + host.isConnected +
+                                        ' isShadowRoot=' + (sh instanceof ShadowRoot) +
+                                        ' kids=' + kids.join(',') +
+                                        ' qsWidget=' + kids.map(k => k.split('#')[1])
+                                            .filter(Boolean)
+                                            .map(id => id + ':' + !!sh.querySelector('#' + id)).join(' '));
+                          // Сам ход кота: он берёт найденный элемент и шлёт в
+                          // него сообщение с целевым origin. Если это бросает,
+                          // их цикл гасит исключение и молчит.
+                          for (const k of sh.children) {
+                            if (k.localName !== 'iframe') continue;
+                            let win = 'n/a', posted = 'n/a';
+                            try { win = String(!!k.contentWindow); } catch (e) { win = 'threw ' + e; }
+                            try {
+                              const origin = new URL(k.src || 'https://challenges.cloudflare.com').origin;
+                              k.contentWindow.postMessage({ event: 'probe' }, origin);
+                              posted = 'ok';
+                            } catch (e) { posted = 'threw ' + String(e).slice(0, 90); }
+                            console.error('[watchcat] send to ' + k.id + ': contentWindow=' + win + ' post=' + posted);
+                          }
+                        }
+                      } catch (e) { try { console.error('[watchcat] threw ' + e); } catch (x) {} }
+                      globalThis.setTimeout(report, 2000);
+                    }, 2000);
+                  } catch (e) {}
+                  // Повторяющиеся таймеры: сторожевой кот Turnstile — это
+                  // setInterval на 900 мс в контексте страницы, и молчание кота
+                  // видно только так — заведён он или заведён, но не тикает.
+                  try {
+                    const SI = globalThis.setInterval;
+                    let ivId = 0;
+                    globalThis.setInterval = function (fn, ms) {
+                      const id = ++ivId;
+                      let fired = 0;
+                      try { console.error('[interval] set #' + id + ' every ' + ms + 'ms'); } catch (e) {}
+                      const wrapped = typeof fn !== 'function' ? fn : function () {
+                        fired++;
+                        if (fired <= 3 || fired % 10 === 0) {
+                          try { console.error('[interval] #' + id + ' tick ' + fired + ' (' + ms + 'ms)'); } catch (e) {}
+                        }
+                        return fn.apply(this, arguments);
+                      };
+                      return SI.call(this, wrapped, ms);
+                    };
+                  } catch (e) {}
+                  // Ошибку челлендж ловит сам и уносит в свой маяк зашифрованной
+                  // — но создаёт он её здесь, обычным конструктором. Один
+                  // перехват даёт то, ради чего иначе расшифровывают маяк.
+                  try {
+                    for (const nm of ['Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError']) {
+                      const E = globalThis[nm];
+                      if (typeof E !== 'function') continue;
+                      const Wrapped = function (...a) {
+                        const e = new E(...a);
+                        try {
+                          const at = String(e.stack || '').split('\n').slice(1, 3).join(' | ').slice(0, 220);
+                          console.error('[throw] ' + nm + ': ' + String(a[0]).slice(0, 160) + ' @ ' + at);
+                        } catch (x) {}
+                        return e;
+                      };
+                      Wrapped.prototype = E.prototype;
+                      Object.setPrototypeOf(Wrapped, E);
+                      Object.defineProperty(Wrapped, 'name', { value: nm, configurable: true });
+                      globalThis[nm] = Wrapped;
+                    }
+                  } catch (e) {}
                   // Их собственные хлебные крошки: код усыпан вызовами
                   // UpvLO0(<метка>) и eVARP2(<метка>) на каждом шаге. Метки
                   // уникальны, поэтому последовательность вызовов — это трасса
@@ -418,7 +561,16 @@ async fn main() -> Result<()> {
                         get() { return held; },
                         set(v) {
                           held = typeof v !== 'function' ? v : function (tag) {
-                            try { console.error('[crumb] ' + name + ' ' + String(tag).slice(0, 24)); } catch (e) {}
+                            // Метка зашифрована на каждую выдачу, а место вызова
+                            // — нет: строка в их бандле одна и та же и у нас, и
+                            // в Chrome, поэтому сравнивать трассы можно по ней.
+                            let at = '';
+                            try {
+                              const f = String(new Error().stack || '').split('\n').slice(2);
+                              at = (f.find(s => s.indexOf('cloudflare.com') >= 0) || f[0] || '')
+                                     .replace(/^\s*at\s*/, '').replace(/^.*\/(?=[^/]*:)/, '');
+                            } catch (e) {}
+                            try { console.error('[crumb] ' + name + ' ' + String(tag).slice(0, 24) + ' @ ' + at); } catch (e) {}
                             return v.apply(this, arguments);
                           };
                         },
@@ -691,6 +843,10 @@ async fn main() -> Result<()> {
                 // кольцо печатается только при броске.
                 let stream = std::env::var("NOKK_TRACE_STREAM").is_ok();
                 let hook = hook.replace("__STREAM__", if stream { "true" } else { "false" });
+                let hook = hook.replace(
+                    "__HANG__",
+                    if std::env::var("NOKK_HANG_UNREACHABLE").is_ok() { "true" } else { "false" },
+                );
                 c.add_frame_init_script(hook.clone());
                 c.add_init_script(hook);
             }

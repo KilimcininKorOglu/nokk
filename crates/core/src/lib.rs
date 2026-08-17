@@ -2265,7 +2265,15 @@ impl BrowserContext {
                     let data = op["data"].as_str().unwrap_or("null").to_string();
                     // Виден весь обмен со фреймом — без патчей в JS, которые ломают
                     // проверку `event.source === iframe.contentWindow`.
-                    if !data.contains("\"meow\"") && !data.contains("\"food\"") {
+                    // Перекличка сторожевого кота идёт каждые 900 мс и в полном
+                    // виде топит остальной обмен. Её считаем отдельной строкой:
+                    // важно не содержимое, а что она вообще идёт — и в обе ли
+                    // стороны.
+                    let beat = data.contains("\"meow\"") || data.contains("\"food\"");
+                    if beat {
+                        tracing::debug!(to_parent = op["toParent"].as_bool().unwrap_or(false),
+                                        payload = %&data[..data.len().min(120)], "watchcat");
+                    } else {
                         tracing::debug!(to_parent = op["toParent"].as_bool().unwrap_or(false),
                                         payload = %&data[..data.len().min(9000)], "frame message");
                     }
