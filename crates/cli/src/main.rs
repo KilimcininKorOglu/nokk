@@ -462,6 +462,150 @@ async fn main() -> Result<()> {
                       });
                     }
                   } catch (e) {}
+                  // Всё, что VM собирает на лету: стек внутри такого кода
+                  // указывает смещением, а исходник иначе взять негде.
+                  try {
+                    globalThis.__ptBuilt = [];
+                    const F0 = globalThis.Function;
+                    const FN = function Function() {
+                      const src = Array.prototype.join.call(arguments, ',');
+                      try { if (src.length > 200) __ptBuilt.push(src); } catch (e) {}
+                      return F0.apply(this, arguments);
+                    };
+                    FN.prototype = F0.prototype;
+                    globalThis.Function = FN;
+                    const E0 = globalThis.eval;
+                    globalThis.eval = function (src) {
+                      try { if (typeof src === 'string' && src.length > 200) __ptBuilt.push(src); } catch (e) {}
+                      return E0.apply(this, arguments);
+                    };
+                  } catch (e) {}
+                  // Чего кадр ждёт, когда стоит: раз в две секунды печатаем
+                  // всё, что могло бы его разбудить, — незавершённые запросы,
+                  // ближайший таймер и обещания, которые висят дольше пяти
+                  // секунд (с местом, где их создали). Виджет замирает молча,
+                  // и другого способа спросить «чего ты ждёшь» у нас нет.
+                  try {
+                    const inflight = new Map();
+                    let reqId = 0;
+                    const F = globalThis.fetch;
+                    if (typeof F === 'function') {
+                      globalThis.fetch = function (r, o) {
+                        const id = ++reqId;
+                        const u = String((r && r.url) || r || '').slice(-60);
+                        inflight.set(id, { kind: 'fetch', url: u, at: Date.now() });
+                        const done = () => inflight.delete(id);
+                        let p;
+                        try { p = F.apply(this, arguments); } catch (e) { done(); throw e; }
+                        return p && p.then ? p.then((v) => { done(); return v; }, (e) => { done(); throw e; }) : p;
+                      };
+                    }
+                    const XS = XMLHttpRequest.prototype.send, XO = XMLHttpRequest.prototype.open;
+                    XMLHttpRequest.prototype.open = function (m, u) { this.__ptURL = String(u); return XO.apply(this, arguments); };
+                    XMLHttpRequest.prototype.send = function () {
+                      const id = ++reqId;
+                      inflight.set(id, { kind: 'xhr', url: String(this.__ptURL || '').slice(-60), at: Date.now() });
+                      this.addEventListener('loadend', () => inflight.delete(id));
+                      return XS.apply(this, arguments);
+                    };
+                    // Обещания: считаем только те, что создала не наша обвязка.
+                    const pending = new Map();
+                    let pid = 0;
+                    const P0 = globalThis.Promise;
+                    const Wrapped = function Promise(executor) {
+                      const id = ++pid;
+                      let at = '';
+                      try { at = String(new Error().stack || '').split('\n').slice(2, 9).map((x) => x.trim()).join(' | ').slice(0, 400); } catch (e) {}
+                      let did = '';
+                      const p = new P0(function (res, rej) {
+                        // Что исполнитель успел спросить у хоста, пока
+                        // выполнялся: обещание висит именно из-за этого — оно
+                        // ждёт того, о чём здесь договорилось.
+                        let before = 0;
+                        try { before = (globalThis.__pt_probeTail ? JSON.parse(__pt_probeTail(400)).length : 0); } catch (e) {}
+                        try {
+                          return executor(function (v) { pending.delete(id); return res(v); },
+                                          function (e) { pending.delete(id); return rej(e); });
+                        } finally {
+                          try {
+                            const tail = globalThis.__pt_probeTail ? JSON.parse(__pt_probeTail(400)) : [];
+                            did = tail.slice(Math.max(0, before)).map((r) => r[1] + '→' + String(r[2]).slice(0, 24)).join(' ; ').slice(0, 400);
+                          } catch (e) {}
+                        }
+                      });
+                      // Исходник самого исполнителя: место рождения указывает
+                      // внутрь сгенерированного кода, которого у нас нет, а вот
+                      // тело функции читается всегда.
+                      let body = '';
+                      try {
+                        body = String(executor).replace(/\s+/g, ' ').slice(0, 300)
+                             + ' | name=' + (executor && executor.name) + ' arity=' + (executor && executor.length);
+                      } catch (e) {}
+                      pending.set(id, { at, born: Date.now(), body, did });
+                      return p;
+                    };
+                    Wrapped.prototype = P0.prototype;
+                    Object.setPrototypeOf(Wrapped, P0);
+                    for (const k of ['resolve', 'reject', 'all', 'allSettled', 'race', 'any', 'try', 'withResolvers']) {
+                      if (typeof P0[k] === 'function') Wrapped[k] = P0[k].bind(P0);
+                    }
+                    globalThis.Promise = Wrapped;
+                    // Какие задачи вообще будят кадр: кадры и микрозадачи,
+                    // порт канала сообщений, простой таймер. Если программа
+                    // ждёт одну из них, а она не приходит, — это и есть стоп.
+                    let raf = 0, micro = 0, port = 0, idleCb = 0;
+                    try { (function tick() { raf++; requestAnimationFrame(tick); })(); } catch (e) {}
+                    // Не по кругу: цепочка микрозадач сама себя кормит и
+                    // задушит всё остальное — считаем по несколько штук за раз,
+                    // ставя новую партию на таймер.
+                    let chan = null;
+                    try {
+                      chan = new MessageChannel();
+                      chan.port1.onmessage = () => { port++; };
+                      chan.port1.start && chan.port1.start();
+                    } catch (e) {}
+                    globalThis.setInterval(function () {
+                      try { queueMicrotask(() => { micro++; }); } catch (e) {}
+                      try { if (chan) chan.port2.postMessage(1); } catch (e) {}
+                      try { requestIdleCallback(() => { idleCb++; }); } catch (e) {}
+                    }, 500);
+                    globalThis.setTimeout(function idle() {
+                      try {
+                        const now = Date.now();
+                        const reqs = [...inflight.values()].map((r) => r.kind + ':' + r.url + ' (' + (now - r.at) + 'ms)');
+                        const old = [...pending.values()].filter((p) => now - p.born > 5000);
+                        console.error('[idle] запросов в полёте=' + reqs.length +
+                                      ' таймер через=' + (globalThis.__pt_nextTimerDelay ? __pt_nextTimerDelay() : '?') +
+                                      ' таймеров=' + (globalThis.__pt_pendingTimers ? __pt_pendingTimers() : '?') +
+                                      ' обещаний висит>5с=' + old.length +
+                                      ' | кадров=' + raf + ' микрозадач=' + micro + ' порт=' + port + ' idle=' + idleCb +
+                                      (reqs.length ? ' :: ' + reqs.join(' ; ') : ''));
+                        for (const p of old.slice(-3)) {
+                          console.error('[idle] обещание с ' + Math.round((now - p.born) / 1000) + 'с @ ' + p.at);
+                          console.error('[idle] его тело: ' + p.body);
+                          console.error('[idle] исполнитель спросил: ' + (p.did || '(ничего)'));
+                          // Ищем место рождения по имени функции из стека: у
+                          // сгенерированного кода нет адреса, но есть текст.
+                          try {
+                            const m = /at ([\w$.]+) \(<anonymous>:\d+:(\d+)\)/.exec(p.at);
+                            const fname = m ? m[1].split('.').pop() : '';
+                            if (fname) {
+                              for (const src of (globalThis.__ptBuilt || [])) {
+                                const k = src.indexOf(fname + ':function');
+                                const k2 = k >= 0 ? k : src.indexOf(fname + '=function');
+                                if (k2 >= 0) {
+                                  console.error('[idle] ' + fname + ' найдена в сборке ' + src.length + ' байт: ' +
+                                                src.slice(k2, k2 + 320).replace(/\s+/g, ' '));
+                                  break;
+                                }
+                              }
+                            }
+                          } catch (e) {}
+                        }
+                      } catch (e) { try { console.error('[idle] threw ' + e); } catch (x) {} }
+                      globalThis.setTimeout(idle, 2000);
+                    }, 2000);
+                  } catch (e) {}
                   // Что кот видит на каждом тике: его проверки идут по теневому
                   // корню виджета и по его обёртке, и любая из них молча
                   // пропускает ход. Снимаем их сами — раз в две секунды.
@@ -780,6 +924,9 @@ async fn main() -> Result<()> {
                           catch (e) { console.error('[vm] build threw after ' + (Date.now() - t0) + 'ms: ' + e); throw e; }
                           console.error('[vm] built in ' + (Date.now() - t0) + 'ms from ' +
                                         ((src && src.length) || 0) + ' bytes → ' + typeof fn);
+                          // Текст программы держим под рукой: стек внутри неё
+                          // указывает смещением, и без исходника оно немое.
+                          try { globalThis.__pt_vmSrc = String(src || ''); } catch (e) {}
                           if (typeof fn !== 'function') return fn;
                           return function () {
                             const t1 = Date.now();
@@ -1019,6 +1166,30 @@ async fn main() -> Result<()> {
                 }
             }
             // Хвост: чем страница и каждый фрейм занимались последними, по порядку.
+            // Исходник программы челленджа — по требованию: 600+ КБ в лог не
+            // кладут, а для чтения стека он нужен целиком.
+            if let Ok(path) = std::env::var("NOKK_DUMP_VM") {
+                let mut where_: Vec<Option<u32>> = vec![None];
+                where_.extend(ctx.frame_list().iter().map(|f| Some(f.id)));
+                for slot in where_ {
+                    let js = "typeof __pt_vmSrc === 'string' ? __pt_vmSrc : ''";
+                    let out = match slot {
+                        None => ctx.evaluate(js).await,
+                        Some(id) => ctx.evaluate_in_frame(id, js).await,
+                    };
+                    if let Ok(serde_json::Value::String(src)) = out {
+                        if src.len() > 1000 {
+                            let name = match slot {
+                                None => format!("{path}.page.js"),
+                                Some(id) => format!("{path}.frame{id}.js"),
+                            };
+                            if std::fs::write(&name, &src).is_ok() {
+                                eprintln!("# программа сохранена: {name} ({} байт)", src.len());
+                            }
+                        }
+                    }
+                }
+            }
             let tail = match std::env::var("NOKK_TRACE_HEAD") {
                 Ok(_) => "typeof __pt_probeHead === 'function' ? __pt_probeHead(400000) : ''",
                 Err(_) => "typeof __pt_probeTail === 'function' ? __pt_probeTail(40) : ''",
