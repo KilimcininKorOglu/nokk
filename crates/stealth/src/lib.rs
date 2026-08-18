@@ -4833,21 +4833,45 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // всё остальное на прототипе, как в браузере.
     const api = Object.create(Storage.prototype);
     StorageData.set(api, m);
-    return new Proxy(api, {
+    const proxy = new Proxy(api, {
       get: (t, p) => (p in t ? t[p] : (m.has(String(p)) ? m.get(String(p)) : undefined)),
       set: (t, p, v) => { if (p in t) return true; m.set(String(p), String(v)); return true; },
       has: (t, p) => p in t || m.has(String(p)),
       deleteProperty: (t, p) => { m.delete(String(p)); return true; },
+      // Ключи хранилища — собственные свойства объекта: `Object.keys(localStorage)`
+      // в браузере перечисляет то, что записано.
+      ownKeys: (t) => [...new Set([...m.keys(), ...Reflect.ownKeys(t)])],
+      getOwnPropertyDescriptor: (t, p) => (m.has(String(p))
+        ? { value: m.get(String(p)), writable: true, enumerable: true, configurable: true }
+        : Reflect.getOwnPropertyDescriptor(t, p)),
     });
+    // Методы вызывают с `this` — самим хранилищем, а страница держит в руках
+    // Proxy, не его цель. Без этой строки `data(this)` не находил ничего и
+    // отдавал каждый раз новую пустую карту: страница писала и читала обратно
+    // `null`, а `length` навсегда оставался нулём.
+    StorageData.set(proxy, m);
+    return proxy;
   };
   if (!globalThis.localStorage) globalThis.localStorage = makeStorage();
   if (!globalThis.sessionStorage) globalThis.sessionStorage = makeStorage();
 
-  globalThis.IntersectionObserver = globalThis.IntersectionObserver || class IntersectionObserver {
+  // Не `||`: таблица имён уже положила сюда пустую функцию, и настоящая
+  // реализация до глобали не доезжала — `observe()` молча не звал колбэк
+  // никогда, а браузер доставляет первое наблюдение сразу. Код, который ждёт
+  // его, ждал вечно.
+  globalThis.IntersectionObserver = class IntersectionObserver {
     constructor(cb) { this._cb = cb; }
     observe(el) { const cb = this._cb, self = this; setTimeout(() => { try { cb([{ target: el, isIntersecting: true, intersectionRatio: 1, boundingClientRect: {}, intersectionRect: {}, rootBounds: null, time: 0 }], self); } catch (e) {} }, 0); }
     unobserve() {} disconnect() {} takeRecords() { return []; }
   };
+  try {
+    const P = globalThis.IntersectionObserver.prototype;
+    Object.defineProperty(P, Symbol.toStringTag, { value: 'IntersectionObserver', configurable: true });
+    mask(globalThis.IntersectionObserver, 'IntersectionObserver');
+    for (const m of ['observe', 'unobserve', 'disconnect', 'takeRecords']) {
+      if (typeof P[m] === 'function') mask(P[m], m);
+    }
+  } catch (e) {}
   globalThis.MutationObserver = globalThis.MutationObserver || class MutationObserver { constructor(cb) { this._cb = cb; } observe() {} disconnect() {} takeRecords() { return []; } };
   globalThis.ResizeObserver = globalThis.ResizeObserver || class ResizeObserver { constructor(cb) { this._cb = cb; } observe() {} unobserve() {} disconnect() {} };
   globalThis.PerformanceObserver = globalThis.PerformanceObserver || class PerformanceObserver { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } };

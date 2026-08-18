@@ -3479,6 +3479,96 @@ mod tests {
         assert!(engine.injection_script().contains("'webdriver', false"));
     }
 
+    /// Хранилище должно хранить. Наше отдавало `null` на только что записанное
+    /// и держало `length` в нуле: методы живут на прототипе и берут данные по
+    /// `this`, а страница держит в руках Proxy, тогда как карта была заведена
+    /// на его цель — и каждый вызов получал свежую пустую. Виджет Turnstile
+    /// пишет туда `cf.turnstile.u` и читает обратно.
+    #[tokio::test]
+    async fn what_the_page_stores_it_can_read_back() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let out = probe(
+            &ctx,
+            r#"(() => {
+                localStorage.setItem('cf.turnstile.u', 'abc123');
+                localStorage.direct = 'via property';
+                sessionStorage.setItem('other', 'x');
+                return __ptJSON.stringify({
+                  back: localStorage.getItem('cf.turnstile.u'),
+                  viaProp: localStorage['cf.turnstile.u'],
+                  fromProperty: localStorage.getItem('direct'),
+                  len: localStorage.length,
+                  key0: localStorage.key(0),
+                  keys: Object.keys(localStorage),
+                  separate: sessionStorage.getItem('cf.turnstile.u'),
+                  gone: (localStorage.removeItem('direct'), localStorage.getItem('direct')),
+                })
+              })()"#,
+        )
+        .await;
+
+        assert_eq!(out["back"], "abc123", "{out}");
+        assert_eq!(out["viaProp"], "abc123", "ключ читается и как свойство: {out}");
+        assert_eq!(out["fromProperty"], "via property", "и пишется как свойство: {out}");
+        assert_eq!(out["len"], 2, "{out}");
+        assert_eq!(out["key0"], "cf.turnstile.u", "{out}");
+        assert_eq!(
+            out["keys"],
+            serde_json::json!(["cf.turnstile.u", "direct"]),
+            "ключи — собственные свойства объекта: {out}"
+        );
+        // Два хранилища — две разные корзины.
+        assert_eq!(out["separate"], Value::Null, "{out}");
+        assert_eq!(out["gone"], Value::Null, "{out}");
+    }
+
+    /// `IntersectionObserver` доставляет первое наблюдение сам, как только за
+    /// элементом начали следить. У нас настоящая реализация проигрывала пустой
+    /// заготовке из таблицы имён (`X = X || …`, а имя уже занято), и код,
+    /// ждущий этого колбэка, ждал вечно.
+    #[tokio::test]
+    async fn watching_an_element_reports_it_straight_away() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body><div id=t>x</div></body></html>")
+            .await
+            .unwrap();
+
+        ctx.evaluate(
+            r#"(() => {
+                globalThis.__seen = [];
+                const io = new IntersectionObserver((entries) => {
+                  for (const e of entries) globalThis.__seen.push([e.target.id, e.isIntersecting]);
+                });
+                io.observe(document.getElementById('t'));
+                return 1;
+              })()"#,
+        )
+        .await
+        .unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        let out = probe(
+            &ctx,
+            "__ptJSON.stringify({seen: globalThis.__seen, \
+               tag: Object.prototype.toString.call(new IntersectionObserver(() => {}))})",
+        )
+        .await;
+        assert_eq!(
+            out["seen"],
+            serde_json::json!([["t", true]]),
+            "наблюдение приходит само: {out}"
+        );
+        assert_eq!(out["tag"], "[object IntersectionObserver]", "{out}");
+    }
+
     /// Платформенный объект называет себя сам. Заготовки из таблицы имён были
     /// пустыми объектами и отвечали `[object Object]` там, где Chrome говорит
     /// `[object VisualViewport]` или `[object BarProp]`, — а
