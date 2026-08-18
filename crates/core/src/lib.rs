@@ -3479,6 +3479,71 @@ mod tests {
         assert!(engine.injection_script().contains("'webdriver', false"));
     }
 
+    /// Контекст рисования — это интерфейс, а не мешок свойств. В Chrome у
+    /// самого контекста нет ни одного собственного свойства: все 73 имени 2D и
+    /// все 442 имени WebGL живут на прототипе, и сборщик отпечатка идёт именно
+    /// по нему. У нас было наоборот — пустой прототип и семь десятков имён на
+    /// объекте, что видно с первого шага обхода.
+    #[tokio::test]
+    async fn a_drawing_context_is_an_interface_not_a_bag_of_properties() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let out = probe(
+            &ctx,
+            r#"(() => {
+                const a = document.createElement('canvas');
+                a.width = 60; a.height = 30;
+                const x = a.getContext('2d');
+                x.fillStyle = '#f60'; x.fillRect(0, 0, 40, 20);
+                // Второй контекст: аксессоры прототипа уже стоят, и сборка
+                // второй реализации не должна попасть в них саму на себя.
+                const b = document.createElement('canvas');
+                const y = b.getContext('2d');
+                y.fillStyle = '#0af'; y.fillRect(0, 0, 5, 5);
+                const gl = document.createElement('canvas').getContext('webgl');
+                const px = x.getImageData(1, 1, 1, 1).data;
+                return __ptJSON.stringify({
+                  own2d: Object.getOwnPropertyNames(x).length,
+                  ownSecond: Object.getOwnPropertyNames(y).length,
+                  proto2d: Object.getOwnPropertyNames(CanvasRenderingContext2D.prototype).length,
+                  fillRect: typeof CanvasRenderingContext2D.prototype.fillRect,
+                  isCtx: x instanceof CanvasRenderingContext2D,
+                  canvasBack: x.canvas === a,
+                  style: x.fillStyle, otherStyle: y.fillStyle,
+                  painted: [px[0], px[1], px[2], px[3]],
+                  differ: a.toDataURL() !== b.toDataURL(),
+                  ownGl: Object.getOwnPropertyNames(gl).length,
+                  protoGl: Object.getOwnPropertyNames(WebGLRenderingContext.prototype).length,
+                  constOnProto: WebGLRenderingContext.prototype.DEPTH_BUFFER_BIT,
+                  vendor: gl.getParameter(gl.VENDOR),
+                })
+              })()"#,
+        )
+        .await;
+
+        // Снято с Chrome 148: 73 имени плюс `constructor`, 436+6 плюс он же.
+        assert_eq!(out["own2d"], 0, "{out}");
+        assert_eq!(out["ownSecond"], 0, "{out}");
+        assert_eq!(out["proto2d"], 74, "{out}");
+        assert_eq!(out["fillRect"], "function", "{out}");
+        assert_eq!(out["isCtx"], true, "{out}");
+        assert_eq!(out["canvasBack"], true, "{out}");
+        // Рисование при этом целое, и два холста по-прежнему различимы.
+        assert_eq!(out["style"], "#f60", "{out}");
+        assert_eq!(out["otherStyle"], "#0af", "{out}");
+        assert_eq!(out["painted"], serde_json::json!([255, 102, 0, 255]), "{out}");
+        assert_eq!(out["differ"], true, "{out}");
+        assert_eq!(out["ownGl"], 0, "{out}");
+        assert_eq!(out["protoGl"], 443, "{out}");
+        assert_eq!(out["constOnProto"], 256, "константы тоже на прототипе: {out}");
+        assert_eq!(out["vendor"], "WebKit", "{out}");
+    }
+
     /// Объект, который страница построила сама, называет себя своим именем.
     /// Тридцать один из тридцати шести проверенных отвечал `[object Object]`, а
     /// `Object.prototype.toString.call(new Blob([]))` — строчка из любого
