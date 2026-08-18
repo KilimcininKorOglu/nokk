@@ -1891,7 +1891,8 @@ impl BrowserContext {
                     match child {
                         Some((place, child)) => {
                             let data = op["data"].as_str().unwrap_or("null");
-                            tracing::debug!(owner = index, worker = id, bytes = data.len(), "worker post");
+                            tracing::debug!(owner = index, worker = id, bytes = data.len(),
+                                            head = %&data[..data.len().min(120)], "worker post");
                             let _ = self
                                 .eval_at(place, child, &format!("__pt_workerDeliver({})", js_str(data)))
                                 .await;
@@ -1973,6 +1974,11 @@ impl BrowserContext {
             })
             .unwrap_or_default();
         for m in messages {
+            // Та же запись, что и на общем круге: ответ, ушедший быстрым путём,
+            // раньше не оставлял в логе следа — и разговор выглядел так, будто
+            // воркер промолчал.
+            tracing::debug!(worker = id, bytes = m.len(),
+                            head = %&m[..m.len().min(70)], "worker reply delivered");
             let _ = self
                 .eval_in(owner, &format!("__pt_workerMessage({id}, {})", js_str(&m)))
                 .await;
@@ -2066,7 +2072,8 @@ impl BrowserContext {
                 let _ = self
                     .eval_in(owner, &format!("__pt_workerMessage({id}, {})", js_str(&m)))
                     .await;
-                tracing::debug!(worker = id, bytes = m.len(), "worker reply delivered");
+                tracing::debug!(worker = id, bytes = m.len(),
+                                head = %&m[..m.len().min(70)], "worker reply delivered");
             }
             if drained["closed"].as_bool().unwrap_or(false) {
                 work += 1;
@@ -2880,6 +2887,17 @@ impl BrowserContext {
                 if !matches!(e, NetError::Unimplemented) {
                     self.record_in(context, &method, &url, &kind, 0, &[]);
                 }
+                // До хоста, к которому нет маршрута, браузер стучится дальше:
+                // запрос висит, пока не выйдет его собственный таймаут, и
+                // страница за это время не узнаёт ничего. Мы же отвечали
+                // отказом через тридцать миллисекунд — и код, который на живом
+                // браузере просто ждёт, у нас уходил в обработку ошибки.
+                // Челлендж Cloudflare зовёт так свой IPv6-only хост, и в Chrome
+                // этот запрос за пятьдесят секунд не завершается ни разу.
+                if matches!(e, NetError::Unreachable(_)) {
+                    tracing::debug!(url = %url, "no route to host: leaving the request pending, as a browser does");
+                    return String::new();
+                }
                 format!(
                     "__pt_fetchReject({}, {})",
                     id,
@@ -3477,6 +3495,63 @@ mod tests {
         let _serial = serial().await;
         let engine = engine(1, 1);
         assert!(engine.injection_script().contains("'webdriver', false"));
+    }
+
+    /// Первое, что челлендж спрашивает у своего воркера, — поля навигатора,
+    /// одним сообщением с объектом в ответ. В Chrome ответ приходит сразу; у
+    /// нас он терялся, хотя следом стоящий таймер из того же скрипта доезжал
+    /// исправно. Проверяем ровно тот скрипт, который приходит с чужой стороны.
+    #[tokio::test]
+    async fn a_worker_answers_the_first_question_about_itself() {
+        let _serial = serial().await;
+        let engine = engine(4, 6);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/app/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        ctx.evaluate(
+            r#"(() => {
+            const src = "onmessage=function(e){ e.isTrusted && '' === e.origin && null === e.source && eval(e.data) }";
+            const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+            globalThis.__got = [];
+            w.onmessage = (e) => { globalThis.__got.push(e.data); };
+            w.postMessage("var n=self.navigator;postMessage({ KzOg4:n.platform,TzEx3:n.languages,Bwko4:n.hardwareConcurrency,ycmYm0:n.deviceMemory,EhUAu5:n.userAgent});setTimeout(function(){postMessage({ dnjTe7:1})},200)");
+            return 1;
+        })()"#,
+        )
+        .await
+        .unwrap();
+        // Таймер в воркере длиннее ближнего порога, так что круг надо крутить,
+        // пока он не наступит, — как это делает живая страница.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            ctx.run_event_loop().await.unwrap();
+            let n = probe(&ctx, "__ptJSON.stringify((globalThis.__got || []).length)").await;
+            if n.as_u64().unwrap_or(0) >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let got = probe(&ctx, "__ptJSON.stringify(globalThis.__got || [])").await;
+        let list = got.as_array().cloned().unwrap_or_default();
+        assert!(
+            list.len() >= 2,
+            "оба сообщения воркера должны дойти — и ответ, и таймер: {got}"
+        );
+        let first = &list[0];
+        assert!(
+            first["KzOg4"].as_str().unwrap_or("").starts_with("Linux"),
+            "платформа в ответе: {got}"
+        );
+        assert!(first["TzEx3"].is_array(), "языки массивом: {got}");
+        assert!(first["Bwko4"].as_u64().unwrap_or(0) > 0, "ядра: {got}");
+        assert!(
+            first["EhUAu5"].as_str().unwrap_or("").contains("Chrome/"),
+            "user-agent: {got}"
+        );
+        assert_eq!(list[1]["dnjTe7"], 1, "и таймер следом: {got}");
     }
 
     /// Контекст рисования — это интерфейс, а не мешок свойств. В Chrome у

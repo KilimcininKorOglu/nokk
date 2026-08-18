@@ -34,6 +34,12 @@ pub enum NetError {
     Timeout,
     #[error("connection error: {0}")]
     Connect(String),
+    /// Хоста не достать вовсе: нет маршрута до его адреса (у нас так с
+    /// IPv6-only именами). Браузер в этом случае не отвечает отказом сразу —
+    /// запрос висит, пока не выйдет его собственный таймаут соединения, — и
+    /// страница, которая ждёт этот ответ, ждёт молча, а не получает ошибку.
+    #[error("host unreachable: {0}")]
+    Unreachable(String),
     #[error("all connection slots for host `{0}` are in use")]
     HostSaturated(String),
 }
@@ -544,7 +550,24 @@ impl HttpClient for FingerprintClient {
             if e.is_timeout() {
                 NetError::Timeout
             } else {
-                NetError::Connect(e.to_string())
+                // Причину видно только в глубине цепочки источников: наверху у
+                // всех отказов один и тот же текст.
+                let mut chain = Vec::new();
+                let mut src: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+                while let Some(err) = src {
+                    chain.push(err.to_string());
+                    src = err.source();
+                }
+                let cause = chain.join(" <- ");
+                tracing::debug!(url = %req.url, chain = %cause, "request failed");
+                // «Нет маршрута» — не то же, что «отказано» или «имя не
+                // разрешилось»: первые два браузер сообщает сразу, а до
+                // недостижимого адреса он продолжает стучаться.
+                if cause.contains("Network is unreachable") || cause.contains("No route to host") {
+                    NetError::Unreachable(e.to_string())
+                } else {
+                    NetError::Connect(e.to_string())
+                }
             }
         })?;
         let status = resp.status().as_u16();
