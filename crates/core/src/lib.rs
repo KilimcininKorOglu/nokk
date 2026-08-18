@@ -3497,6 +3497,53 @@ mod tests {
         assert!(engine.injection_script().contains("'webdriver', false"));
     }
 
+    /// Файловая система источника. Челлендж просит её у воркера, создаёт файл,
+    /// берёт синхронную ручку, пишет байт и засекает `flush()` — а наш
+    /// `getDirectory()` отвечал отказом «доступ запрещён», которого в
+    /// защищённом контексте Chrome не бывает. Проверяем ровно ту пробу, что
+    /// приходит с чужой стороны.
+    #[tokio::test]
+    async fn the_origin_private_file_system_answers_from_a_worker() {
+        let _serial = serial().await;
+        let engine = engine(4, 6);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/app/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        ctx.evaluate(
+            r#"(() => {
+            const src = "onmessage=function(e){ e.isTrusted && '' === e.origin && null === e.source && eval(e.data) }";
+            const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+            globalThis.__got = [];
+            w.onmessage = (e) => { globalThis.__got.push(e.data); };
+            w.postMessage("~function(){navigator.storage.getDirectory().then(function(L){var i=`UQnV8`,j={};j[`create`]=!![],L.getFileHandle(i,j).then(function(y){return y.createSyncAccessHandle()}).then(function(y){var F=new Uint8Array(1),a={};a[`at`]=0,y.write(F,a);var t=performance.now();y.flush();var Z=performance.now()-t;y.close();var B={};B[`hnMoX4`]=Z,self.postMessage(B)}).catch(function(y){self.postMessage({\"CEnF0\":(y.message||String(y)).substring(0,100)})})}).catch(function(O){self.postMessage({\"CEnF0\":(O.message||String(O)).substring(0,100)})})}();");
+            return 1;
+        })()"#,
+        )
+        .await
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            ctx.run_event_loop().await.unwrap();
+            let n = probe(&ctx, "__ptJSON.stringify((globalThis.__got || []).length)").await;
+            if n.as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let got = probe(&ctx, "__ptJSON.stringify(globalThis.__got || [])").await;
+        let list = got.as_array().cloned().unwrap_or_default();
+        assert_eq!(list.len(), 1, "воркер обязан ответить: {got}");
+        // `hnMoX4` — сколько занял `flush()`. Ответ должен быть числом, а не
+        // жалобой в `CEnF0`: последнее значит, что файловой системы нет.
+        assert!(
+            list[0]["hnMoX4"].is_number(),
+            "проба прошла до конца, а не упала: {got}"
+        );
+    }
+
     /// Первое, что челлендж спрашивает у своего воркера, — поля навигатора,
     /// одним сообщением с объектом в ответ. В Chrome ответ приходит сразу; у
     /// нас он терялся, хотя следом стоящий таймер из того же скрипта доезжал

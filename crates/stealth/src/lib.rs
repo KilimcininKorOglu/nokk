@@ -1477,6 +1477,23 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
     }}
     try {{ if (typeof globalThis.onmessage === 'function') globalThis.onmessage(ev); }} catch (e) {{}}
   }};
+
+  // OPFS в воркере — не тот же, что в окне: только здесь есть синхронная ручка
+  // (`FileSystemSyncAccessHandle`), и именно её берёт проба челленджа. Блок тот
+  // же, что и на странице, но собирается заново — в окне синхронного имени нет
+  // вовсе, и там оно не могло быть установлено.
+__OPFS__
+  try {{
+    const st = globalThis.navigator && globalThis.navigator.storage;
+    if (st && typeof __ptOPFS === 'function') {{
+      const proto = Object.getPrototypeOf(st) || st;
+      const g = function getDirectory() {{ return __ptOPFS(); }};
+      Object.defineProperty(proto, 'getDirectory', {{
+        value: globalThis.__pt_native ? __pt_native(g) : g,
+        writable: true, enumerable: true, configurable: true,
+      }});
+    }}
+  }} catch (e) {{}}
 }})();"##,
         name = quoted(name),
         url = quoted(url),
@@ -1486,6 +1503,7 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
     .replace("__WORKER_SCOPE_ENUM__", WORKER_SCOPE_ENUMERABLE)
     .replace("__WORKER_SCOPE__", WORKER_SCOPE)
     .replace("__WORKER_NAV__", WORKER_NAVIGATOR)
+    .replace("__OPFS__", OPFS_TEMPLATE)
 }
 
 /// Имена, перечислимые на `window` у Chrome 148 — все 237, снятые с живого
@@ -1498,7 +1516,8 @@ const WINDOW_ENUMERABLE: &str = r#"["alert", "atob", "blur", "btoa", "caches", "
 
 pub fn web_surface_script() -> String {
     format!(
-        "{WEB_SURFACE_TEMPLATE}\n{WEB_BODIES_TEMPLATE}\n{}",
+        "{WEB_SURFACE_TEMPLATE}\n{}\n{}",
+        WEB_BODIES_TEMPLATE.replace("__OPFS__", OPFS_TEMPLATE),
         WINDOW_SHAPE_TEMPLATE.replace("__WINDOW_ENUMERABLE__", WINDOW_ENUMERABLE)
     )
 }
@@ -1655,7 +1674,222 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
 /// Идёт после [`WEB_SURFACE_TEMPLATE`]: имена вроде `navigator.gpu` создаёт
 /// именно он, и пересаживать заглушку на интерфейс можно только когда она уже
 /// есть.
+const OPFS_TEMPLATE: &str = r##"  // ── Origin Private File System ───────────────────────────────────────────
+  // Челлендж просит у воркера файл в OPFS, берёт синхронную ручку, пишет байт
+  // и засекает `flush()` — а у нас `getDirectory()` отвечал отказом «доступ
+  // запрещён», которого в защищённом контексте Chrome не бывает никогда.
+  // Хранилище — в памяти реалма: проба пишет один байт и уходит.
+  const __ptOPFS = (() => {
+    const bytesOf = (chunk) => {
+      if (chunk == null) return new Uint8Array(0);
+      if (typeof chunk === 'string') return new TextEncoder().encode(chunk);
+      if (chunk instanceof Uint8Array) return chunk;
+      if (chunk.buffer instanceof ArrayBuffer) return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+      if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+      return new TextEncoder().encode(String(chunk));
+    };
+    const putAt = (file, data, at) => {
+      const start = Math.max(0, at | 0), end = start + data.length;
+      if (end > file.data.length) {
+        const grown = new Uint8Array(end);
+        grown.set(file.data);
+        file.data = grown;
+      }
+      file.data.set(data, start);
+      return data.length;
+    };
+    const iface = (name, base) => {
+      const C = globalThis[name];
+      if (!C || !C.prototype) return null;
+      if (base && Object.getPrototypeOf(C.prototype) !== base.prototype) {
+        try { Object.setPrototypeOf(C.prototype, base.prototype); } catch (e) {}
+      }
+      try {
+        if (!Object.getOwnPropertyDescriptor(C.prototype, Symbol.toStringTag)) {
+          Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true });
+        }
+      } catch (e) {}
+      return C;
+    };
+    const put = (C, name, fn) => {
+      if (!C) return;
+      try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (e) {}
+      try {
+        Object.defineProperty(C.prototype, name, {
+          value: globalThis.__pt_native ? __pt_native(fn) : fn,
+          writable: true, enumerable: true, configurable: true,
+        });
+      } catch (e) {}
+    };
+    const accessor = (C, name, get) => {
+      if (!C) return;
+      try {
+        Object.defineProperty(C.prototype, name, {
+          get: globalThis.__pt_native ? __pt_native(get) : get,
+          enumerable: true, configurable: true,
+        });
+      } catch (e) {}
+    };
+
+    const STATE = new WeakMap();          // ручка → её узел
+    const Handle = iface('FileSystemHandle');
+    const Dir = iface('FileSystemDirectoryHandle', Handle);
+    const FileH = iface('FileSystemFileHandle', Handle);
+    const Writable = iface('FileSystemWritableFileStream');
+    const Sync = iface('FileSystemSyncAccessHandle');
+    if (!Handle || !Dir || !FileH) return null;
+
+    const makeHandle = (C, node) => { const h = Object.create(C.prototype); STATE.set(h, node); return h; };
+    const node = (h) => STATE.get(h);
+
+    accessor(Handle, 'kind', function kind() { const n = node(this); return n ? n.kind : undefined; });
+    accessor(Handle, 'name', function name() { const n = node(this); return n ? n.name : undefined; });
+    put(Handle, 'isSameEntry', function isSameEntry(other) { return Promise.resolve(node(this) === node(other)); });
+    put(Handle, 'queryPermission', function queryPermission() { return Promise.resolve('granted'); });
+    put(Handle, 'requestPermission', function requestPermission() { return Promise.resolve('granted'); });
+    put(Handle, 'remove', function remove() {
+      const n = node(this);
+      if (n && n.parent) n.parent.children.delete(n.name);
+      return Promise.resolve(undefined);
+    });
+
+    const notFound = (name) => {
+      const e = new (globalThis.DOMException || Error)(
+        'A requested file or directory could not be found at the time an operation was processed.', 'NotFoundError');
+      e.name = 'NotFoundError';
+      return e;
+    };
+
+    put(Dir, 'getFileHandle', function getFileHandle(name, opts) {
+      const n = node(this);
+      const key = String(name);
+      let child = n.children.get(key);
+      if (!child) {
+        if (!(opts && opts.create)) return Promise.reject(notFound(key));
+        child = { kind: 'file', name: key, data: new Uint8Array(0), parent: n };
+        n.children.set(key, child);
+      }
+      return Promise.resolve(makeHandle(FileH, child));
+    });
+    put(Dir, 'getDirectoryHandle', function getDirectoryHandle(name, opts) {
+      const n = node(this);
+      const key = String(name);
+      let child = n.children.get(key);
+      if (!child) {
+        if (!(opts && opts.create)) return Promise.reject(notFound(key));
+        child = { kind: 'directory', name: key, children: new Map(), parent: n };
+        n.children.set(key, child);
+      }
+      return Promise.resolve(makeHandle(Dir, child));
+    });
+    put(Dir, 'removeEntry', function removeEntry(name) {
+      const n = node(this);
+      return n.children.delete(String(name)) ? Promise.resolve(undefined) : Promise.reject(notFound(String(name)));
+    });
+    put(Dir, 'resolve', function resolve(child) {
+      const path = [];
+      let cur = node(child);
+      const root = node(this);
+      while (cur && cur !== root) { path.unshift(cur.name); cur = cur.parent; }
+      return Promise.resolve(cur === root ? path : null);
+    });
+    const entriesOf = (dir, pick) => {
+      const items = [...node(dir).children.values()].map(pick);
+      let i = 0;
+      const it = { next: () => Promise.resolve(i < items.length ? { value: items[i++], done: false } : { value: undefined, done: true }) };
+      it[Symbol.asyncIterator] = function () { return this; };
+      return it;
+    };
+    put(Dir, 'keys', function keys() { return entriesOf(this, (c) => c.name); });
+    put(Dir, 'values', function values() {
+      return entriesOf(this, (c) => makeHandle(c.kind === 'file' ? FileH : Dir, c));
+    });
+    put(Dir, 'entries', function entries() {
+      return entriesOf(this, (c) => [c.name, makeHandle(c.kind === 'file' ? FileH : Dir, c)]);
+    });
+    if (Dir) {
+      try { Object.defineProperty(Dir.prototype, Symbol.asyncIterator, { value: Dir.prototype.entries, writable: true, configurable: true }); } catch (e) {}
+    }
+
+    put(FileH, 'getFile', function getFile() {
+      const n = node(this);
+      const blob = new Blob([n.data]);
+      try {
+        Object.defineProperty(blob, 'name', { value: n.name, configurable: true });
+        Object.defineProperty(blob, 'lastModified', { value: Date.now(), configurable: true });
+      } catch (e) {}
+      return Promise.resolve(blob);
+    });
+    put(FileH, 'move', function move(dest, name) {
+      const n = node(this);
+      if (n.parent) n.parent.children.delete(n.name);
+      const target = typeof dest === 'string' ? n.parent : node(dest);
+      n.name = String(typeof dest === 'string' ? dest : (name === undefined ? n.name : name));
+      n.parent = target;
+      if (target) target.children.set(n.name, n);
+      return Promise.resolve(undefined);
+    });
+    put(FileH, 'createWritable', function createWritable(opts) {
+      const n = node(this);
+      if (!(opts && opts.keepExistingData)) n.data = new Uint8Array(0);
+      const stream = Object.create(Writable ? Writable.prototype : Object.prototype);
+      STATE.set(stream, { file: n, at: 0 });
+      return Promise.resolve(stream);
+    });
+
+    if (Writable) {
+      accessor(Writable, 'mode', function mode() { return 'siloed'; });
+      put(Writable, 'write', function write(chunk) {
+        const st = node(this);
+        if (chunk && typeof chunk === 'object' && chunk.type) {
+          if (chunk.type === 'seek') { st.at = chunk.position | 0; return Promise.resolve(undefined); }
+          if (chunk.type === 'truncate') { st.file.data = st.file.data.slice(0, chunk.size | 0); return Promise.resolve(undefined); }
+          chunk = chunk.data;
+        }
+        st.at += putAt(st.file, bytesOf(chunk), st.at);
+        return Promise.resolve(undefined);
+      });
+      put(Writable, 'seek', function seek(pos) { node(this).at = pos | 0; return Promise.resolve(undefined); });
+      put(Writable, 'truncate', function truncate(size) {
+        const st = node(this);
+        st.file.data = st.file.data.slice(0, size | 0);
+        return Promise.resolve(undefined);
+      });
+      put(Writable, 'close', function close() { return Promise.resolve(undefined); });
+      put(Writable, 'abort', function abort() { return Promise.resolve(undefined); });
+    }
+
+    // Синхронная ручка есть только у воркера — в окне Chrome такого имени нет.
+    if (Sync) {
+      put(FileH, 'createSyncAccessHandle', function createSyncAccessHandle() {
+        const h = Object.create(Sync.prototype);
+        STATE.set(h, { file: node(this), closed: false });
+        return Promise.resolve(h);
+      });
+      put(Sync, 'write', function write(buf, opts) {
+        const st = node(this);
+        return putAt(st.file, bytesOf(buf), opts && opts.at !== undefined ? opts.at : 0);
+      });
+      put(Sync, 'read', function read(buf, opts) {
+        const st = node(this), at = Math.max(0, (opts && opts.at) | 0);
+        const out = bytesOf(buf);
+        const n = Math.max(0, Math.min(out.length, st.file.data.length - at));
+        out.set(st.file.data.subarray(at, at + n));
+        return n;
+      });
+      put(Sync, 'getSize', function getSize() { return node(this).file.data.length; });
+      put(Sync, 'truncate', function truncate(size) { const st = node(this); st.file.data = st.file.data.slice(0, size | 0); });
+      put(Sync, 'flush', function flush() {});
+      put(Sync, 'close', function close() { node(this).closed = true; });
+    }
+
+    const root = { kind: 'directory', name: '', children: new Map(), parent: null };
+    return () => Promise.resolve(makeHandle(Dir, root));
+  })();
+"##;
+
 const WEB_BODIES_TEMPLATE: &str = r##"(() => {
+__OPFS__
   const native = globalThis.__pt_native || ((f) => f);
   const defv = (o, k, v) => {
     try { Object.defineProperty(o, k, { value: v, writable: true, enumerable: true, configurable: true }); } catch (e) {}
@@ -1851,9 +2085,11 @@ const WEB_BODIES_TEMPLATE: &str = r##"(() => {
       }
       meth(Storage_.prototype, 'persisted', function () { return Promise.resolve(false); });
       meth(Storage_.prototype, 'persist', function () { return Promise.resolve(false); });
-      meth(Storage_.prototype, 'getDirectory', function () {
-        return Promise.reject(new TypeError('Failed to execute \'getDirectory\' on \'StorageManager\': Storage directory access is denied.'));
-      });
+      // OPFS у Chrome в защищённом контексте есть всегда: отказ здесь — сам по
+      // себе примета. Реализация общая с воркером, см. `OPFS_TEMPLATE`.
+      if (typeof __ptOPFS === 'function') {
+        meth(Storage_.prototype, 'getDirectory', function getDirectory() { return __ptOPFS(); });
+      }
     }
 
     rebrand(nav.permissions, 'Permissions');
