@@ -3120,6 +3120,63 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // document present there is a real tree to watch.
   globalThis.CustomElementRegistry = CustomElementRegistry;
   globalThis.customElements = new CustomElementRegistry();
+  // `document.createRange()` был именем без тела и отдавал undefined. Полный
+  // Range нам не нужен, но объект должен быть объектом своего интерфейса:
+  // страницы меряют текст через `range.getBoundingClientRect()`, а сборщики
+  // отпечатка спрашивают у него имя.
+  const __range = () => {
+    const R = globalThis.Range;
+    const r = Object.create(R && R.prototype ? R.prototype : Object.prototype);
+    let start = document, startOff = 0, end = document, endOff = 0;
+    Object.defineProperties(r, {
+      startContainer: { get: () => start, enumerable: true, configurable: true },
+      endContainer: { get: () => end, enumerable: true, configurable: true },
+      startOffset: { get: () => startOff, enumerable: true, configurable: true },
+      endOffset: { get: () => endOff, enumerable: true, configurable: true },
+      collapsed: { get: () => start === end && startOff === endOff, enumerable: true, configurable: true },
+      commonAncestorContainer: { get: () => start, enumerable: true, configurable: true },
+    });
+    Object.assign(r, {
+      setStart(n, o) { start = n; startOff = o | 0; },
+      setEnd(n, o) { end = n; endOff = o | 0; },
+      setStartBefore(n) { start = n.parentNode || n; startOff = 0; },
+      setStartAfter(n) { start = n.parentNode || n; startOff = 0; },
+      setEndBefore(n) { end = n.parentNode || n; endOff = 0; },
+      setEndAfter(n) { end = n.parentNode || n; endOff = 0; },
+      selectNode(n) { start = end = n.parentNode || n; startOff = 0; endOff = 0; },
+      selectNodeContents(n) { start = end = n; startOff = 0; endOff = (n.childNodes || []).length; },
+      collapse(toStart) { if (toStart) { end = start; endOff = startOff; } else { start = end; startOff = endOff; } },
+      cloneRange() { const c = __range(); c.setStart(start, startOff); c.setEnd(end, endOff); return c; },
+      detach() {},
+      toString() { return ''; },
+      getBoundingClientRect() { return { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0 }; },
+      getClientRects() { return []; },
+      deleteContents() {}, extractContents() { return document.createDocumentFragment(); },
+      cloneContents() { return document.createDocumentFragment(); },
+      insertNode(n) { if (start && start.appendChild) start.appendChild(n); },
+      surroundContents() {},
+      isPointInRange() { return false; },
+      comparePoint() { return 0; },
+      intersectsNode() { return false; },
+    });
+    return r;
+  };
+  Document.prototype.createRange = function createRange() { return __range(); };
+
+  // `new Audio()` — это не свой интерфейс, а фабрика: браузер отдаёт
+  // HTMLAudioElement, и `Object.prototype.toString` по нему говорит именно это.
+  globalThis.Audio = function Audio(src) {
+    const el = document.createElement('audio');
+    if (src !== undefined) el.src = String(src);
+    return el;
+  };
+  try {
+    Object.defineProperty(globalThis.Audio, 'prototype', {
+      value: globalThis.HTMLAudioElement ? globalThis.HTMLAudioElement.prototype : Object.prototype,
+      writable: false, enumerable: false, configurable: false,
+    });
+  } catch (e) {}
+
   globalThis.MutationObserver = MutationObserver;
   globalThis.ResizeObserver = ResizeObserver;
 

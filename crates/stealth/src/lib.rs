@@ -2207,6 +2207,41 @@ const WEB_BODIES_TEMPLATE: &str = r##"(() => {
   // прототип с меткой, а не пустышка из таблицы.
   try { iface('RTCDataChannel', ET); } catch (e) {}
 
+  // Объект, который страница построила сама, тоже обязан называть себя:
+  // `Object.prototype.toString.call(new Blob([]))` — строчка из любого набора
+  // проверок, и у нас на неё отвечали `[object Object]` тридцать один объект
+  // из тридцати шести проверенных (снято с Chrome 148). Метку носит прототип,
+  // поэтому чиним разом: у кого её нет — тому ставим имя интерфейса.
+  //
+  // Встроенное в язык не трогаем: там метки либо уже есть (Map, Promise), либо
+  // тип узнаётся иначе (массивы, функции), и лишняя метка — это уже отличие в
+  // другую сторону.
+  {
+    const LANGUAGE = new Set([
+      'Object', 'Function', 'Array', 'Number', 'String', 'Boolean', 'Symbol', 'BigInt',
+      'Date', 'RegExp', 'Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError',
+      'TypeError', 'URIError', 'AggregateError', 'SuppressedError', 'Proxy', 'Reflect',
+      'ArrayBuffer', 'SharedArrayBuffer', 'DataView', 'Int8Array', 'Uint8Array',
+      'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array',
+      'Float16Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array',
+      'Map', 'Set', 'WeakMap', 'WeakSet', 'WeakRef', 'FinalizationRegistry', 'Promise',
+      'Iterator', 'DisposableStack', 'AsyncDisposableStack',
+      // Эти трое — не интерфейсы, а фабрики: `new Audio()` возвращает
+      // HTMLAudioElement, и метка с именем фабрики сделала бы только хуже.
+      'Image', 'Audio', 'Option',
+    ]);
+    for (const name of Object.getOwnPropertyNames(globalThis)) {
+      if (LANGUAGE.has(name) || name.lastIndexOf('__pt', 0) === 0) continue;
+      let C;
+      try { C = globalThis[name]; } catch (e) { continue; }
+      if (typeof C !== 'function' || !C.prototype || typeof C.prototype !== 'object') continue;
+      try {
+        if (Object.getOwnPropertyDescriptor(C.prototype, Symbol.toStringTag)) continue;
+        Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true });
+      } catch (e) {}
+    }
+  }
+
   // `speechSynthesis` голосов не отдаёт (их и в headless-Chrome нет), но
   // интерфейсом быть обязан: сборщик идёт по прототипу.
   const SS = rebrand(globalThis.speechSynthesis, 'SpeechSynthesis', ET);
@@ -4908,14 +4943,19 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       }
     }
     const listeners = [];
-    return {
+    // Возвращаем не литерал, а объект интерфейса: страница читает
+    // `Object.prototype.toString.call(matchMedia(...))` наравне со всем
+    // остальным, и `[object Object]` там — готовая примета.
+    const MQL = globalThis.MediaQueryList;
+    const proto = MQL && MQL.prototype ? MQL.prototype : Object.prototype;
+    return Object.assign(Object.create(proto), {
       matches, media: query, onchange: null,
       addListener: (f) => { if (f) listeners.push(f); },
       removeListener: (f) => { const i = listeners.indexOf(f); if (i >= 0) listeners.splice(i, 1); },
       addEventListener: (t, f) => { if (t === 'change' && f) listeners.push(f); },
       removeEventListener: (t, f) => { const i = listeners.indexOf(f); if (i >= 0) listeners.splice(i, 1); },
       dispatchEvent: () => false,
-    };
+    });
   };
   globalThis.getComputedStyle = globalThis.getComputedStyle || (() => ({ getPropertyValue: () => '', getPropertyPriority: () => '', length: 0, cssText: '', item: () => '', display: '', visibility: 'visible' }));
   globalThis.requestIdleCallback = globalThis.requestIdleCallback || ((cb) => setTimeout(() => cb({ didTimeout: false, timeRemaining: () => 50 }), 1));
@@ -4950,7 +4990,27 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       } catch (e) {}
       return String(x);
     };
-    globalThis.Blob = class Blob { constructor(parts, opts) { this._p = (parts || []).map(blobPart); this.type = (opts && opts.type) || ''; this.size = this._p.reduce((n, x) => n + x.length, 0); } text() { return Promise.resolve(this._p.join('')); } arrayBuffer() { return Promise.resolve(new TextEncoder().encode(this._p.join('')).buffer); } slice() { return new Blob([]); } toString() { return this._p.join(''); } };
+    // Части, тип и размер живут не собственными свойствами объекта: у
+    // настоящего Blob их нет вовсе (`Object.getOwnPropertyNames(blob)` пуст),
+    // всё читается с прототипа. Ключ — символ, потому что символов в этом
+    // перечислении не видно.
+    const BLOB = Symbol('blob');
+    globalThis.Blob = class Blob {
+      constructor(parts, opts) {
+        const p = (parts || []).map(blobPart);
+        Object.defineProperty(this, BLOB, {
+          value: { parts: p, type: (opts && opts.type) || '', size: p.reduce((n, x) => n + x.length, 0) },
+        });
+      }
+      get size() { return this[BLOB].size; }
+      get type() { return this[BLOB].type; }
+      text() { return Promise.resolve(this[BLOB].parts.join('')); }
+      arrayBuffer() { return Promise.resolve(new TextEncoder().encode(this[BLOB].parts.join('')).buffer); }
+      bytes() { return Promise.resolve(new TextEncoder().encode(this[BLOB].parts.join(''))); }
+      slice() { return new Blob([]); }
+      toString() { return this[BLOB].parts.join(''); }
+    };
+    globalThis.__pt_blobParts = (b) => (b && b[BLOB] ? b[BLOB].parts : null);
   }
   // Here rather than with the other web globals: `File` extends `Blob`, which is
   // defined just above, and a class body is evaluated where it is written.

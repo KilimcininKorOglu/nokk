@@ -3479,6 +3479,63 @@ mod tests {
         assert!(engine.injection_script().contains("'webdriver', false"));
     }
 
+    /// Объект, который страница построила сама, называет себя своим именем.
+    /// Тридцать один из тридцати шести проверенных отвечал `[object Object]`, а
+    /// `Object.prototype.toString.call(new Blob([]))` — строчка из любого
+    /// набора проверок. Значения сняты с Chrome 148.
+    #[tokio::test]
+    async fn an_object_the_page_builds_names_itself() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let out = probe(
+            &ctx,
+            r#"(() => {
+                const tag = (v) => Object.prototype.toString.call(v);
+                const blob = new Blob(['x'], { type: 'text/plain' });
+                return __ptJSON.stringify({
+                  blob: tag(blob),
+                  blobOwn: Object.getOwnPropertyNames(blob).length,
+                  blobSize: blob.size,
+                  blobType: blob.type,
+                  headers: tag(new Headers()),
+                  form: tag(new FormData()),
+                  params: tag(new URLSearchParams('a=1')),
+                  url: tag(new URL('https://example.com/')),
+                  response: tag(new Response('x')),
+                  channel: tag(new MessageChannel()),
+                  mql: tag(matchMedia('(min-width: 1px)')),
+                  range: tag(document.createRange()),
+                  audio: tag(new Audio()),
+                  decoder: tag(new TextDecoder()),
+                })
+              })()"#,
+        )
+        .await;
+
+        assert_eq!(out["blob"], "[object Blob]", "{out}");
+        // У настоящего Blob собственных свойств нет: размер и тип — с прототипа,
+        // а части лежат под символом, которого в перечислении не видно.
+        assert_eq!(out["blobOwn"], 0, "{out}");
+        assert_eq!(out["blobSize"], 1, "{out}");
+        assert_eq!(out["blobType"], "text/plain", "{out}");
+        assert_eq!(out["headers"], "[object Headers]", "{out}");
+        assert_eq!(out["form"], "[object FormData]", "{out}");
+        assert_eq!(out["params"], "[object URLSearchParams]", "{out}");
+        assert_eq!(out["url"], "[object URL]", "{out}");
+        assert_eq!(out["response"], "[object Response]", "{out}");
+        assert_eq!(out["channel"], "[object MessageChannel]", "{out}");
+        assert_eq!(out["mql"], "[object MediaQueryList]", "{out}");
+        assert_eq!(out["range"], "[object Range]", "{out}");
+        // `Audio` — фабрика, а не интерфейс: она отдаёт элемент.
+        assert_eq!(out["audio"], "[object HTMLAudioElement]", "{out}");
+        assert_eq!(out["decoder"], "[object TextDecoder]", "{out}");
+    }
+
     /// Хранилище должно хранить. Наше отдавало `null` на только что записанное
     /// и держало `length` в нуле: методы живут на прототипе и берут данные по
     /// `this`, а страница держит в руках Proxy, тогда как карта была заведена
