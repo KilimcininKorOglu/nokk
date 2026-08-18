@@ -625,7 +625,8 @@ impl Engine {
             base_url: std::sync::Mutex::new("about:blank".to_string()),
             requests: std::sync::Mutex::new(Vec::new()),
             started: std::time::Instant::now(),
-            timings_sent: std::sync::Mutex::new(0),
+            timings_sent: std::sync::Mutex::new(HashMap::new()),
+            nav_sent: std::sync::Mutex::new(std::collections::HashSet::new()),
             sockets: tokio::sync::Mutex::new(PageSockets::new()),
             network_tx: std::sync::Mutex::new(None),
             frames: std::sync::Mutex::new(HashMap::new()),
@@ -744,7 +745,12 @@ pub struct BrowserContext {
     /// When this context started, and how many of its requests have been handed
     /// to the page as Resource Timing entries.
     started: std::time::Instant,
-    timings_sent: std::sync::Mutex<usize>,
+    /// Сколько записей уже отдано каждому контексту: у страницы и у каждого
+    /// кадра лента своя.
+    timings_sent: std::sync::Mutex<HashMap<usize, usize>>,
+    /// Кадры, которым уже отдана их навигация. Своих записей у кадра может не
+    /// быть вовсе, так что считать по ним нечего — нужна отдельная пометка.
+    nav_sent: std::sync::Mutex<std::collections::HashSet<usize>>,
     /// Name of the persistent session this context belongs to, if any. On drop
     /// its cookie jar is flushed to the session store.
     session: Option<String>,
@@ -906,6 +912,10 @@ pub struct NetworkRecord {
     /// page that reports no timings is a page that never loaded anything.
     pub started_ms: f64,
     pub duration_ms: f64,
+    /// Контекст, который запросил: страница или один из её кадров. Времена
+    /// ресурсов раздаются по нему — у кадра в браузере своя лента, и пустая
+    /// лента там заметна не меньше, чем пустая у страницы.
+    pub context: usize,
 }
 
 impl BrowserContext {
@@ -1344,7 +1354,7 @@ impl BrowserContext {
                     break;
                 }
                 fetches_done += 1;
-                let settle = self.perform_fetch(&base, &r).await;
+                let settle = self.perform_fetch(index, &base, &r).await;
                 self.engine
                     .pool
                     .dispatch(self.worker, move |iso| iso.eval(index, &settle))
@@ -1564,10 +1574,62 @@ impl BrowserContext {
     /// page load is not a browser at all — anti-bot code asks exactly that.
     async fn flush_resource_timings(&self, index: usize) {
         let (from, records) = {
-            let sent = self.timings_sent.lock().map(|c| *c).unwrap_or(0);
-            let all = self.requests.lock().map(|r| r.clone()).unwrap_or_default();
+            let sent = self
+                .timings_sent
+                .lock()
+                .map(|c| c.get(&index).copied().unwrap_or(0))
+                .unwrap_or(0);
+            // Каждому контексту — только его собственные запросы: у кадра в
+            // браузере своя лента, и чужих ресурсов в ней нет.
+            let all: Vec<NetworkRecord> = self
+                .requests
+                .lock()
+                .map(|r| r.iter().filter(|x| x.context == index).cloned().collect())
+                .unwrap_or_default();
             (sent, all)
         };
+        // Документ кадра браузер показывает дважды: у родителя это ресурс с
+        // `initiatorType: "iframe"`, а внутри самого кадра — его навигация.
+        // Запись о нём одна, поэтому кадру она отдаётся отдельно, первой.
+        let nav_due = index != self.index
+            && self
+                .nav_sent
+                .lock()
+                .map(|mut s| s.insert(index))
+                .unwrap_or(false);
+        if nav_due {
+            let url = self
+                .frames
+                .lock()
+                .ok()
+                .and_then(|f| f.values().find(|s| s.index == index).map(|s| s.url.clone()));
+            if let Some(url) = url {
+                let doc = self
+                    .requests
+                    .lock()
+                    .ok()
+                    .and_then(|log| log.iter().find(|r| r.url == url).cloned());
+                if let Some(r) = doc {
+                    let entry = serde_json::json!({
+                        "name": r.url,
+                        "entryType": "navigation",
+                        "initiatorType": "navigation",
+                        "start": 0.0,
+                        "duration": r.duration_ms,
+                        "size": r.body.len() + 300,
+                        "decoded": r.body.len(),
+                        "status": r.status,
+                        "protocol": "h2",
+                        "contentType": r.headers.get("content-type").cloned().unwrap_or_default(),
+                    });
+                    let js = format!(
+                        "globalThis.__pt_noteResources && __pt_noteResources({})",
+                        js_str(&Value::Array(vec![entry]).to_string())
+                    );
+                    let _ = self.eval_in(index, &js).await;
+                }
+            }
+        }
         if records.len() <= from {
             return;
         }
@@ -1575,9 +1637,9 @@ impl BrowserContext {
             .iter()
             .enumerate()
             .map(|(i, r)| {
-                // Only the page's own document is a navigation. A frame's is a
-                // resource of the page that embedded it, which is where a browser
-                // lists it too.
+                // Навигация у каждого документа своя: у страницы это её адрес, у
+                // кадра — его собственный. Всё остальное, что он запросил, — его
+                // ресурсы.
                 let top_document = from + i == 0 && r.resource_type == "document";
                 let kind = if top_document { "navigation" } else { "resource" };
                 let initiator = match r.resource_type.as_str() {
@@ -1603,7 +1665,7 @@ impl BrowserContext {
             })
             .collect();
         if let Ok(mut c) = self.timings_sent.lock() {
-            *c = records.len();
+            c.insert(index, records.len());
         }
         let js = format!(
             "globalThis.__pt_noteResources && __pt_noteResources({})",
@@ -1972,7 +2034,7 @@ impl BrowserContext {
             if let Some(reqs) = queues["fetch"].as_array() {
                 for r in reqs.iter().take(32) {
                     work += 1;
-                    let settle = self.perform_fetch(&state.fetch_base, r).await;
+                    let settle = self.perform_fetch(owner, &state.fetch_base, r).await;
                     let _ = self.eval_at(place, child, &settle).await;
                 }
             }
@@ -2349,7 +2411,7 @@ impl BrowserContext {
                     continue;
                 }
                 seen.insert(target.clone());
-                match self.fetch_text(&target, "script").await {
+                match self.fetch_text_in(index, &target, "script", None).await {
                     Ok((_, code)) => pending.push((target, code)),
                     Err(e) => tracing::debug!(url = %target, error = %e, "import failed to load"),
                 }
@@ -2418,7 +2480,7 @@ impl BrowserContext {
                 let _ = self.eval_in(index, &done(true)).await;
                 continue;
             }
-            match self.fetch_text(&url, "script").await {
+            match self.fetch_text_in(index, &url, "script", None).await {
                 Ok((_, code)) => {
                     // Скрипт читает тайминг собственного <script> первой же
                     // строкой — запись должна быть на месте до того, как он
@@ -2482,6 +2544,11 @@ impl BrowserContext {
             .unwrap_or_default();
         let mut work = 0;
         for (id, index) in frames {
+            // Кадру — его собственная лента времён, и до того, как он начнёт
+            // считать: у виджета Turnstile первое же, что делает программа, —
+            // читает `performance`, а пустая лента там значит «я ничего не
+            // грузил», чего про живой документ не бывает.
+            self.flush_resource_timings(index).await;
             let ran = self
                 .engine
                 .pool
@@ -2537,7 +2604,7 @@ impl BrowserContext {
             if let Some(reqs) = queues["fetch"].as_array() {
                 for r in reqs.iter().take(64) {
                     work += 1;
-                    let settle = self.perform_fetch(&base, r).await;
+                    let settle = self.perform_fetch(index, &base, r).await;
                     let _ = self.eval_in(index, &settle).await;
                 }
             }
@@ -2734,7 +2801,7 @@ impl BrowserContext {
     }
 
     /// Run one queued `fetch` request and build the JS call that settles it.
-    async fn perform_fetch(&self, base: &str, r: &Value) -> String {
+    async fn perform_fetch(&self, context: usize, base: &str, r: &Value) -> String {
         let id = r["id"].as_i64().unwrap_or(0);
         let raw_url = r["url"].as_str().unwrap_or("").to_string();
         let url = resolve_url(base, &raw_url).unwrap_or(raw_url);
@@ -2760,7 +2827,7 @@ impl BrowserContext {
         // Blocked tracker: never hit the wire; reject like a real ad-blocker
         // (ERR_BLOCKED_BY_CLIENT), and log it so the interception audit is complete.
         if self.engine.block_trackers && nokk_net::is_blocked_url(&url) {
-            self.record(&method, &url, &kind, 0, &[]);
+            self.record_in(context, &method, &url, &kind, 0, &[]);
             return format!(
                 "__pt_fetchReject({}, {})",
                 id,
@@ -2782,6 +2849,7 @@ impl BrowserContext {
         match self.client.send(req).await {
             Ok(resp) => {
                 self.record_full(
+                    context,
                     &method,
                     &url,
                     &kind,
@@ -2810,7 +2878,7 @@ impl BrowserContext {
                 // status 0 so the interception log stays complete. (Skip the
                 // "no real network" stub error, which never reached the wire.)
                 if !matches!(e, NetError::Unimplemented) {
-                    self.record(&method, &url, &kind, 0, &[]);
+                    self.record_in(context, &method, &url, &kind, 0, &[]);
                 }
                 format!(
                     "__pt_fetchReject({}, {})",
@@ -2833,11 +2901,34 @@ impl BrowserContext {
         self.fetch_text_from(url, resource_type, None).await
     }
 
+    /// То же, но запрос числится за кадром: его документ и его скрипты — его
+    /// собственная лента времён, как в браузере.
+    async fn fetch_text_in(
+        &self,
+        context: usize,
+        url: &str,
+        resource_type: &str,
+        referrer: Option<&str>,
+    ) -> Result<(String, String), EngineError> {
+        self.fetch_text_at(context, url, resource_type, referrer).await
+    }
+
     /// The same, for a navigation the page made itself: `referrer` is the
     /// document that asked, and it changes what goes on the wire — a referrer,
     /// `sec-fetch-site: same-origin`, and no claim of a human gesture.
     async fn fetch_text_from(
         &self,
+        url: &str,
+        resource_type: &str,
+        referrer: Option<&str>,
+    ) -> Result<(String, String), EngineError> {
+        self.fetch_text_at(self.index, url, resource_type, referrer).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_text_at(
+        &self,
+        context: usize,
         url: &str,
         resource_type: &str,
         referrer: Option<&str>,
@@ -2882,6 +2973,7 @@ impl BrowserContext {
         match self.client.send(req).await {
             Ok(resp) => {
                 self.record_full(
+                    context,
                     "GET",
                     url,
                     resource_type,
@@ -2900,7 +2992,7 @@ impl BrowserContext {
             Err(NetError::Unimplemented) => Err(EngineError::NavNotImplemented),
             Err(e) => {
                 // Log the failed attempt (status 0) before surfacing the error.
-                self.record("GET", url, resource_type, 0, &[]);
+                self.record_in(context, "GET", url, resource_type, 0, &[]);
                 Err(EngineError::Net(e))
             }
         }
@@ -2908,7 +3000,21 @@ impl BrowserContext {
 
     /// Append a request to this context's interception log.
     fn record(&self, method: &str, url: &str, resource_type: &str, status: u16, body: &[u8]) {
+        self.record_in(self.index, method, url, resource_type, status, body)
+    }
+
+    /// То же, но от имени кадра или воркера, который этот запрос заказал.
+    fn record_in(
+        &self,
+        context: usize,
+        method: &str,
+        url: &str,
+        resource_type: &str,
+        status: u16,
+        body: &[u8],
+    ) {
         self.record_full(
+            context,
             method,
             url,
             resource_type,
@@ -2919,6 +3025,7 @@ impl BrowserContext {
         )
     }
 
+
     /// Log one request and tell any subscriber (the CDP layer) about it. Called
     /// once the outcome is known, which is why a subscriber receives the whole
     /// lifecycle at once rather than a `willBeSent` ahead of time — the timings
@@ -2926,6 +3033,7 @@ impl BrowserContext {
     #[allow(clippy::too_many_arguments)]
     fn record_full(
         &self,
+        context: usize,
         method: &str,
         url: &str,
         resource_type: &str,
@@ -2953,6 +3061,7 @@ impl BrowserContext {
             request_body: request_body.to_vec(),
             started_ms: started_ms.max(0.0),
             duration_ms: duration_ms.max(0.0),
+            context,
         };
         if let Ok(mut log) = self.requests.lock() {
             log.push(rec.clone());
@@ -6868,6 +6977,52 @@ mod tests {
 
         let out = probe(&ctx, "__ptJSON.stringify(globalThis.__ran || {})").await;
         assert_eq!(out["ran"], true, "the worker ran from a revoked URL: {out}");
+    }
+
+    /// У кадра своя лента времён. Мы наливали её только странице, и документ
+    /// внутри кадра отвечал `performance.getEntries()` пустым массивом — то
+    /// есть «я ничего не грузил», чего про живой документ не бывает. Сборщик
+    /// отпечатка Turnstile читает её в кадре виджета первым делом.
+    #[tokio::test]
+    async fn a_frame_has_a_resource_timeline_of_its_own() {
+        let _serial = serial().await;
+        let url = frame_ping_server().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 5,
+                max_heap_mb: None,
+            },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&url).await.unwrap();
+        for _ in 0..3 {
+            ctx.run_event_loop().await.unwrap();
+        }
+        let frame = ctx.frame_list().first().map(|f| f.id).expect("a frame");
+
+        let seen = ctx
+            .evaluate_in_frame(
+                frame,
+                "__ptJSON.stringify({\
+                   nav: performance.getEntriesByType('navigation').length,\
+                   name: (performance.getEntriesByType('navigation')[0] || {}).name || '',\
+                   kind: (performance.getEntriesByType('navigation')[0] || {}).entryType || '',\
+                 })",
+            )
+            .await
+            .expect("frame answered");
+        let seen: Value = serde_json::from_str(seen.as_str().unwrap_or("{}")).unwrap_or_default();
+        assert_eq!(seen["nav"], 1, "кадр знает свою навигацию: {seen}");
+        // И это его собственный адрес, а не адрес страницы.
+        assert!(
+            seen["name"].as_str().unwrap_or("").ends_with("/frame"),
+            "навигация кадра — его документ: {seen}"
+        );
+        assert_eq!(seen["kind"], "navigation", "{seen}");
     }
 
     /// A widget collects from inside its own frame: the frame builds the blob,
