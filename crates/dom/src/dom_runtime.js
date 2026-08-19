@@ -41,6 +41,10 @@
   const __connectSubtree = (node) => __walkTree(node, (n) => {
     if (n.__ptLocal === 'iframe') n.__ptConnectFrame();
     else if (n.__ptLocal === 'script') n.__ptRunScript();
+    // Стиль и предзагрузка тоже начинают грузиться с попадания в документ, а
+    // не с присваивания `href`: порядок бывает любой.
+    else if (n.__ptLocal === 'link' && n.__ptLoadLink) n.__ptLoadLink();
+    else if (n.__ptLocal === 'img' && n.__ptLoadImage) n.__ptLoadImage();
     if (n.nodeType === ELEMENT_NODE && __customs.has(n.__ptLocal)) {
       if (!n.__ptUpgraded) __customUpgrade(n, __customs.get(n.__ptLocal));
       else __customCallback(n, 'connectedCallback');
@@ -793,7 +797,32 @@
     get allow() { return this.getAttribute('allow') || ''; }
     set allow(v) { this.setAttribute('allow', v); }
     get href() { return this.__ptUrlAttr('href'); }
-    set href(v) { this.setAttribute('href', v); }
+    set href(v) {
+      this.setAttribute('href', v);
+      // `<link>` — тоже запрос: предзагрузка, стиль, значок. Браузер идёт за
+      // ними сам, а мы не ходили ни за одним, и `rel=preload` не отправлял
+      // ничего вовсе.
+      if (this.__ptLocal === 'link' && this.__ptLoadLink) this.__ptLoadLink();
+    }
+
+    __ptLoadLink() {
+      const rel = String(this.getAttribute('rel') || '').toLowerCase();
+      // Загружаемые виды: остальные (`alternate`, `canonical`, `dns-prefetch`)
+      // в браузере запроса не делают.
+      if (!/^(stylesheet|preload|prefetch|modulepreload|icon|shortcut icon|apple-touch-icon|manifest|prerender)$/.test(rel)) return;
+      const raw = this.getAttribute('href');
+      if (!raw) return;
+      let url = raw;
+      try { url = new URL(raw, document.baseURI || location.href).href; } catch (e) {}
+      if (this.__ptLinkAt === url) return;
+      Object.defineProperty(this, '__ptLinkAt', { value: url, configurable: true, enumerable: false });
+      if (url.slice(0, 5) === 'data:' || url.slice(0, 5) === 'blob:' || typeof globalThis.__pt_subresource !== 'function') return;
+      const kind = rel === 'stylesheet' ? 'stylesheet' : 'other';
+      __pt_subresource(url, kind).then(
+        () => { if (this.__ptFireLoad) this.__ptFireLoad(true); },
+        () => { if (this.__ptFireLoad) this.__ptFireLoad(false); },
+      );
+    }
 
     // A link reflects the parts of its URL, and parsing a URL by assigning it to a
     // throwaway `<a>` and reading the pieces back is one of the oldest idioms on
