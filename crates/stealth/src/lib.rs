@@ -622,6 +622,17 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   win.innerWidth = 1920; win.innerHeight = 969;
   win.outerWidth = 1920; win.outerHeight = 1080;
   win.devicePixelRatio = 1;
+  // Где окно стоит на экране. Значение приехало снимком чужого окна — десять
+  // пикселей отступа, — но окно шириной во весь экран с таким отступом не
+  // сходится: развёрнутое окно начинается в нуле. Считаем, а не помним.
+  {
+    const w = win.screen.width || win.outerWidth, h = win.screen.height || win.outerHeight;
+    const left = win.outerWidth >= w ? 0 : Math.max(0, Math.round((w - win.outerWidth) / 2));
+    const top = win.outerHeight >= h ? 0 : Math.max(0, Math.round((h - win.outerHeight) / 2));
+    for (const [k, v] of [['screenX', left], ['screenLeft', left], ['screenY', top], ['screenTop', top]]) {
+      try { Object.defineProperty(win, k, { get: () => v, enumerable: true, configurable: true }); } catch (e) {}
+    }
+  }
 
   // --- location (getters read a backing store the Rust driver updates) --
   const LocationProto = defClass("Location");

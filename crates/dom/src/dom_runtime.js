@@ -343,6 +343,11 @@
     }
     __ptDispatch(event) {
       event.target = this;
+      // `window.event` — событие, которое обрабатывается прямо сейчас. Старое,
+      // но живое свойство: у нас оно было `undefined` всегда, а в Chrome внутри
+      // обработчика там лежит само событие.
+      const outerEvent = globalThis.event;
+      try { globalThis.event = event; } catch (e) {}
       // Build the ancestor path for capture/bubble.
       const path = []; for (let n = this; n; n = n.parentNode) path.push(n);
       // Capture phase (root -> target), then bubble (target -> root).
@@ -364,6 +369,8 @@
         if (typeof on === 'function') { event.currentTarget = this; try { on.call(this, event); } catch (e) { __pt_reportError(e, 'on' + event.type); } }
       }
       if (event.bubbles) for (let i = 1; i < path.length; i++) { if (event.__ptStop) break; event.eventPhase = 3; fire(path[i]); }
+      // Возвращаем `window.event` как было: вне обработки его нет.
+      try { globalThis.event = outerEvent; } catch (e) {}
       return !event.defaultPrevented;
     }
   }
