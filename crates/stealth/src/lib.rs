@@ -927,6 +927,33 @@ pub fn fingerprint_script(profile: &StealthProfile) -> String {
     FINGERPRINT_TEMPLATE
         .replace("__WEBGL_VENDOR__", &quoted(&profile.webgl_vendor))
         .replace("__WEBGL_RENDERER__", &quoted(&profile.webgl_renderer))
+        .replace("__FP_SEED__", &identity_seed(profile).to_string())
+}
+
+/// The canvas/audio seed for a profile: FNV-1a over the fields that make up the
+/// machine's identity. Deterministic across runs and processes on purpose — a
+/// device's canvas hash does not change between visits, and one that does is a
+/// tell. Distinct profiles (`--rotate-fingerprint`) still get distinct seeds.
+fn identity_seed(profile: &StealthProfile) -> u32 {
+    let mut h: u32 = 2166136261;
+    let mut eat = |s: &str| {
+        for b in s.as_bytes() {
+            h ^= u32::from(*b);
+            h = h.wrapping_mul(16777619);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(16777619);
+    };
+    eat(&profile.user_agent);
+    eat(&profile.platform);
+    eat(&profile.webgl_vendor);
+    eat(&profile.webgl_renderer);
+    eat(&profile.timezone);
+    eat(&profile.screen_width.to_string());
+    eat(&profile.screen_height.to_string());
+    eat(&profile.hardware_concurrency.to_string());
+    eat(&profile.device_memory_gb.to_string());
+    h & 0x7fff_ffff
 }
 
 /// Timer / event-loop APIs. A bare V8 isolate has no `setTimeout` — this defines
@@ -4187,10 +4214,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
   const noop = () => {};
 
-  // Per-session seed: gives canvas/audio a stable-within-session but
-  // varies-across-sessions fingerprint, like a real device (not a fixed value
-  // that could be blacklisted once and flag every instance at once).
-  const SEED = (Math.floor(Math.random() * 0x7fffffff)) >>> 0;
+  // The seed canvas and audio derive their device-specific character from.
+  // It is a hash of *this profile* — the same identity therefore draws the same
+  // pixels and plays the same waveform in every run, the way one machine does,
+  // and two identities differ. It used to be `Math.random()` per session, which
+  // is the opposite of a device: a fingerprint that changes on every visit is
+  // itself the signal anti-bot scoring hunts for.
+  const SEED = __FP_SEED__;
   const seededByte = (i) => ((i * 1103515245 + 12345 + SEED) >>> 0) & 0xff;
 
   // Context constructor globals so `x instanceof WebGLRenderingContext` etc.
@@ -6337,6 +6367,25 @@ mod tests {
         assert!(script.contains("webdriver: false"));
         assert!(script.contains("hardwareConcurrency: 8"));
         assert!(script.contains(r#"languages: Object.freeze(["en-US","en"])"#));
+    }
+
+    #[test]
+    fn the_fingerprint_seed_belongs_to_the_identity_not_the_run() {
+        let a = StealthProfile::default();
+        // The same machine draws the same pixels every time it is asked.
+        assert_eq!(identity_seed(&a), identity_seed(&StealthProfile::default()));
+        let script = fingerprint_script(&a);
+        assert!(!script.contains("__FP_SEED__"), "seed left unsubstituted");
+        assert!(
+            script.contains(&format!("const SEED = {};", identity_seed(&a))),
+            "the seed is not the profile's"
+        );
+        // A different machine draws differently.
+        let b = StealthProfile {
+            webgl_renderer: "ANGLE (NVIDIA, GeForce RTX 3060, OpenGL 4.6)".into(),
+            ..StealthProfile::default()
+        };
+        assert_ne!(identity_seed(&a), identity_seed(&b));
     }
 
     #[test]

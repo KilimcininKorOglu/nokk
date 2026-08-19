@@ -1,19 +1,17 @@
-# Design: optional real rendering (`render` feature)
+# Design: real rendering (`render` / `webgl` features)
 
 Status: **Phase 1 landed (canvas 2D); Phase 2 landed (WebGL: shaders, draws,
 textures, framebuffers).** Giving nokk *real*
-off-screen canvas-2D and WebGL rasterization behind an opt-in Cargo feature, so
-the default build stays lightweight (synthesis) and a `--features render` build
-produces genuine pixels for harder anti-bot.
+off-screen canvas-2D and WebGL rasterization, **on by default in the binary**;
+`--no-default-features` gives the light synthesis build back.
 
-Implemented today under `--features render`: 2D fills, **real glyph text**
+Implemented today under `render`: 2D fills, **real glyph text**
 (`fillText`/`strokeText`/`measureText` via a bundled Liberation Sans),
 **vector paths** (`fill`/`stroke`/`fillRect`/`strokeRect` + `arc`/`ellipse`/
 `bezierCurveTo`/`quadraticCurveTo` tessellated to a verb stream), **linear/radial
 gradients**, and image data `put`/`get`/`toDataURL` — all backed by `tiny-skia` +
 `ab_glyph`, in [crates/pool/src/canvas.rs](../crates/pool/src/canvas.rs). Only
-`drawImage` still falls back to the JS deterministic stamp. Under the separate
-`--features webgl`: a real headless GL context (surfaceless EGL + Mesa) behind
+`drawImage` still falls back to the JS deterministic stamp. Under `webgl`: a real headless GL context (surfaceless EGL + Mesa) behind
 `getContext('webgl'|'webgl2')` — see Phase 2 below.
 
 ## Goal & non-goals
@@ -30,23 +28,30 @@ more. It is **necessary but not sufficient** for interactive Turnstile (which al
 needs Web Workers, cross-origin iframe execution, and full environment coherence
 — see [examples/cf-harvester](../examples/cf-harvester) for the real-browser path).
 
-## The opt-in principle
+## Why they are on by default
 
-Default nokk must stay light and dependency-thin. Real rendering pulls in a 2D
-rasterizer, font stack, and a GL backend — weight and build cost that most users
-(scraping JS apps, passive fingerprinting) don't need.
+They started opt-in, to keep the default build thin. Measurement against Chrome
+148 on the same machine settled it the other way:
 
-So they are **Cargo features**, off by default — `render` (canvas 2D, pure Rust)
-and `webgl` (a real GL stack), split because only the second one needs anything
-installed at runtime:
+|                        | synthesis | `render`/`webgl` | Chrome |
+|------------------------|-----------|------------------|--------|
+| canvas PNG, 220×60     | 12688 B   | 3949 B           | 3946 B |
+| distinct colours       | 2292      | 292              | 348    |
+| same hash next run     | **no**    | yes              | yes    |
+| WebGL shader-draw hash | synthetic | `8071c7d5`       | `8071c7d5` |
 
-- `cargo build --release --bin nokk` → light (synthesis, the default behavior)
-- `cargo build --release -p nokk-cli --features render,webgl --bin nokk` → real
-  canvas/WebGL rasterization
+The synthesized surface is a fingerprint of its own — it draws what no font
+engine draws, and it used to carry per-session noise, which is precisely the
+signal anti-bot scoring hunts for. The real backend's WebGL draw is
+*bit-identical* to Chrome's on the same GPU. So the binary carries both:
 
-Both ship from a tag: a second release binary `nokk-render-<tag>-linux-x86_64.tar.gz`
-and a second image tag (`ghcr.io/…:render` / `:<version>-render`, which carries the
-Mesa runtime `webgl` dlopen's). The JS/DOM surface is identical either way; only
+- `cargo build --release --bin nokk` → real canvas/WebGL rasterization
+- `cargo build --release --bin nokk --no-default-features` → light (synthesis)
+
+`webgl` is still safe to compile in everywhere: it `dlopen`s `libEGL.so.1` at
+run time and, where Mesa is absent, falls back to the drawn surface.
+
+The image tag `ghcr.io/…:render` carries the Mesa runtime `webgl` dlopen's. The JS/DOM surface is identical either way; only
 the pixel backend differs — and where Mesa is absent, the WebGL half falls back to
 the synthesis on its own. Still open: teaching the npm/pip launchers to select the
 render binary.

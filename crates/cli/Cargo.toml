@@ -10,11 +10,15 @@ keywords = ["headless-browser", "stealth", "scraping", "cli", "puppeteer"]
 categories = ["command-line-utilities", "web-programming"]
 
 [features]
-default = []
-# `cargo build --release --bin nokk --features render` → real off-screen canvas
-# rasterization (docs/rendering.md). Off by default; the standard binary stays light.
+# Real pixels are on by default: a synthesized canvas is a fingerprint of its
+# own — it draws nothing a font engine would draw, and it carries per-session
+# noise, which is itself what anti-bot scoring looks for. `cargo build
+# --no-default-features` gives the light build back (docs/rendering.md).
+default = ["render", "webgl"]
+# Real off-screen canvas rasterization: tiny-skia + ab_glyph, pure Rust.
 render = ["nokk/render"]
-# `--features webgl` → real headless WebGL (Mesa). Runs only where Mesa/EGL exists.
+# Real headless WebGL. Loads libEGL at run time and falls back to the drawn
+# surface where Mesa/EGL is absent, so it is safe to build in everywhere.
 webgl = ["nokk/webgl"]
 
 [[bin]]
