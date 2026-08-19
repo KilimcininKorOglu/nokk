@@ -186,7 +186,10 @@ impl FingerprintProfile {
                  Chrome/148.0.0.0 Safari/537.36",
                 8,
                 "Google Inc. (Intel)",
-                "ANGLE (Intel, Mesa Intel(R) UHD Graphics, OpenGL 4.6)",
+                // Снято с Chrome 148 на живой машине с Mesa: у ANGLE своя форма —
+                // модель чипа в скобках и «OpenGL ES 3.2», а не «OpenGL 4.6».
+                // Прежняя строка была правдоподобной выдумкой не той формы.
+                "ANGLE (Intel, Mesa Intel(R) Xe Graphics (TGL GT2), OpenGL ES 3.2)",
             ),
             Self::ChromeWindows => common(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
@@ -5148,15 +5151,87 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     setTargetAtTime() { return this; }, setValueCurveAtTime() { return this; },
     cancelScheduledValues() { return this; }, cancelAndHoldAtTime() { return this; },
   });
+  // Узел графа — это интерфейс: у браузера общие члены лежат на `AudioNode`,
+  // свои — на прототипе своего вида (`AnalyserNode`, `GainNode`…), а у самого
+  // объекта собственных свойств нет. У нас всё лежало на объекте, и
+  // `AnalyserNode.prototype` был пуст — при том что аудио читают наравне с
+  // канвасом.
+  const NODE_IFACE = {
+    analyser: 'AnalyserNode', gain: 'GainNode', oscillator: 'OscillatorNode',
+    compressor: 'DynamicsCompressorNode', biquad: 'BiquadFilterNode',
+    scriptprocessor: 'ScriptProcessorNode', buffersource: 'AudioBufferSourceNode',
+    convolver: 'ConvolverNode', stereopanner: 'StereoPannerNode', delay: 'DelayNode',
+    waveshaper: 'WaveShaperNode', panner: 'PannerNode', destination: 'AudioDestinationNode',
+  };
+  const NODE_STATE = new WeakMap();
+  const shapeNodeProto = (name, base, members) => {
+    const C = globalThis[name];
+    if (!C || !C.prototype) return null;
+    const P = C.prototype;
+    if (base && globalThis[base] && globalThis[base].prototype
+        && Object.getPrototypeOf(P) !== globalThis[base].prototype) {
+      try { Object.setPrototypeOf(P, globalThis[base].prototype); } catch (e) {}
+    }
+    for (const key of members) {
+      if (Object.getOwnPropertyDescriptor(P, key)) continue;
+      const acc = {
+        get [key]() { const st = NODE_STATE.get(this); return st ? st[key] : undefined; },
+        set [key](v) { const st = NODE_STATE.get(this); if (st) st[key] = v; },
+      };
+      const d = Object.getOwnPropertyDescriptor(acc, key);
+      try {
+        Object.defineProperty(P, key, { get: mask(d.get, 'get ' + key), set: mask(d.set, 'set ' + key), enumerable: true, configurable: true });
+      } catch (e) {}
+    }
+    try {
+      if (!Object.getOwnPropertyDescriptor(P, Symbol.toStringTag)) {
+        Object.defineProperty(P, Symbol.toStringTag, { value: name, configurable: true });
+      }
+    } catch (e) {}
+    return P;
+  };
+
   const makeNode = (ctx, kind, extra) => {
-    const node = Object.assign({
+    const state = Object.assign({
       context: ctx, numberOfInputs: 1, numberOfOutputs: 1, channelCount: 2,
       channelCountMode: 'max', channelInterpretation: 'speakers', __ptKind: kind,
       connect(dst) { ctx.__ptEdges.push(kind + '>' + (dst && dst.__ptKind || 'destination')); return dst && dst.connect ? dst : undefined; },
       disconnect() {}, start() {}, stop() {},
       addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
     }, extra || {});
-    ctx.__ptNodes.push(node);
+    const iface = NODE_IFACE[kind];
+    // Общие члены — на `AudioNode`, свои — на прототипе своего вида: у Chrome
+    // на `AnalyserNode` ровно девять имён плюс `constructor`, а `connect` и
+    // `channelCount` лежат уровнем выше.
+    shapeNodeProto('AudioNode', 'EventTarget',
+      ['context', 'numberOfInputs', 'numberOfOutputs', 'channelCount', 'channelCountMode',
+       'channelInterpretation', 'connect', 'disconnect']);
+    const SHARED = new Set(['context', 'numberOfInputs', 'numberOfOutputs', 'channelCount',
+      'channelCountMode', 'channelInterpretation', 'connect', 'disconnect',
+      'addEventListener', 'removeEventListener', 'dispatchEvent',
+      // `start`/`stop`/`onended` — не у каждого узла, а только у источников, и
+      // в браузере они на своём уровне: AudioScheduledSourceNode.
+      'start', 'stop']);
+    const scheduled = kind === 'oscillator' || kind === 'buffersource';
+    if (scheduled) {
+      const S = shapeNodeProto('AudioScheduledSourceNode', 'AudioNode', ['start', 'stop', 'onended']);
+      if (S && globalThis[NODE_IFACE[kind]]) {
+        try { Object.setPrototypeOf(globalThis[NODE_IFACE[kind]].prototype, S); } catch (e) {}
+      } else {
+        // Имени нет в таблице — кладём на сам вид, лишь бы не на объект.
+        shapeNodeProto(NODE_IFACE[kind], 'AudioNode', ['start', 'stop', 'onended']);
+      }
+    }
+    const ownMembers = Object.keys(state).filter(
+      (k) => k.lastIndexOf('__pt', 0) !== 0 && !SHARED.has(k));
+    // База у источника своя: OscillatorNode наследует AudioScheduledSourceNode,
+    // а не AudioNode напрямую — иначе `start` теряется вместе со ступенью.
+    const P = iface ? shapeNodeProto(iface, scheduled ? 'AudioScheduledSourceNode' : 'AudioNode', ownMembers) : null;
+    if (!P) { ctx.__ptNodes.push(state); return state; }
+    const node = Object.create(P);
+    NODE_STATE.set(node, state);
+    Object.defineProperty(node, '__ptKind', { value: kind, enumerable: false, configurable: true });
+    ctx.__ptNodes.push(state);
     return node;
   };
   // FNV-1a over every node parameter + the edge list: the graph's identity.

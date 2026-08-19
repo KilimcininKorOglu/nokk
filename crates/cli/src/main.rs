@@ -742,6 +742,51 @@ async fn main() -> Result<()> {
                   // у нас не отработала.
                   let baseGlobals = [];
                   try { baseGlobals = Object.getOwnPropertyNames(globalThis); } catch (e) {}
+                  // Счётчик шагов их машины. Имена в бандле меняются с каждой
+                  // выдачей, поэтому ловим не имя, а поведение: после сборки
+                  // программы берём все функции, которых на окне не было, и
+                  // считаем вызовы. Диспетчер опкодов выдаст себя частотой —
+                  // сравнивать с браузером можно именно её.
+                  try {
+                    globalThis.__ptSteps = new Map();
+                    globalThis.__ptLastArgs = new Map();
+                    globalThis.__ptCountVM = () => {
+                      let wrapped = 0;
+                      for (const name of Object.getOwnPropertyNames(globalThis)) {
+                        if (name.lastIndexOf('__pt', 0) === 0) continue;
+                        if (baseGlobals.indexOf(name) >= 0) continue;
+                        let v;
+                        try { v = globalThis[name]; } catch (e) { continue; }
+                        if (typeof v !== 'function' || v.__ptCounted) continue;
+                        const counter = { n: 0 };
+                        __ptSteps.set(name, counter);
+                        const wrap = function (...args) {
+                          counter.n++;
+                          if (counter.n % 5000 === 0 || counter.n < 3) {
+                            try { __ptLastArgs.set(name, args.map((a) => String(a).slice(0, 18)).join(',').slice(0, 60)); } catch (e) {}
+                          }
+                          return v.apply(this, args);
+                        };
+                        wrap.__ptCounted = true;
+                        try { Object.defineProperty(globalThis, name, { value: wrap, writable: true, configurable: true }); wrapped++; } catch (e) {}
+                      }
+                      return wrapped;
+                    };
+                    // Считать начинаем, когда программа собрана, и печатаем итог
+                    // раз в две секунды.
+                    globalThis.setTimeout(function counter() {
+                      try {
+                        const added = __ptCountVM();
+                        const top = [...__ptSteps.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 4);
+                        if (top.length && top[0][1].n > 0) {
+                          console.error('[vmsteps] ' + top.map(([k, c]) => k + '=' + c.n).join(' ') +
+                                        (added ? ' (+' + added + ' новых)' : ''));
+                        }
+                      } catch (e) { try { console.error('[vmsteps] threw ' + e); } catch (x) {} }
+                      globalThis.setTimeout(counter, 2000);
+                    }, 1500);
+                  } catch (e) {}
+
                   const addedGlobals = () => {
                     try {
                       const b = new Set(baseGlobals);
