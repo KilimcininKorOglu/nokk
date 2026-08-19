@@ -591,7 +591,18 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
     for (const k of Object.keys(obj)) { const v = obj[k]; accessor(proto, k, () => v); }
   };
   const protoMethod = (proto, name, fn) => {
-    try { Object.defineProperty(proto, name, { value: fn, enumerable: true, configurable: true, writable: true }); } catch (e) {}
+    // То же правило: метод браузера — не конструктор, `prototype` у него нет.
+    let m = fn;
+    try {
+      const methodish = /^[a-z_$]/.test(String(name))
+        && Object.getOwnPropertyNames((fn && fn.prototype) || {}).length <= 1;
+      if (typeof fn === 'function' && methodish && Object.getOwnPropertyDescriptor(fn, 'prototype')) {
+        const holder = { [name](...args) { return fn.apply(this, args); } };
+        m = holder[name];
+        Object.defineProperty(m, 'length', { value: fn.length, configurable: true });
+      }
+    } catch (e) {}
+    try { Object.defineProperty(proto, name, { value: m, enumerable: true, configurable: true, writable: true }); } catch (e) {}
   };
 
   // --- navigator --------------------------------------------------------
@@ -2063,9 +2074,18 @@ __OPFS__
     try { Object.defineProperty(g, 'name', { value: 'get ' + k, configurable: true }); } catch (e) {}
     try { Object.defineProperty(o, k, { get: native(g), enumerable: true, configurable: true }); } catch (e) {}
   };
+  // Метод, а не функция: `prototype` у метода браузера нет (см. `asMethod`).
   const fn = (name, f) => {
-    try { Object.defineProperty(f, 'name', { value: name, configurable: true }); } catch (e) {}
-    return native(f);
+    let m = f;
+    const methodish = /^[a-z_$]/.test(String(name))
+      && Object.getOwnPropertyNames((f && f.prototype) || {}).length <= 1;
+    if (typeof f === 'function' && methodish && Object.getOwnPropertyDescriptor(f, 'prototype')) {
+      const holder = { [name](...args) { return f.apply(this, args); } };
+      m = holder[name];
+      try { Object.defineProperty(m, 'length', { value: f.length, configurable: true }); } catch (e) {}
+    }
+    try { Object.defineProperty(m, 'name', { value: name, configurable: true }); } catch (e) {}
+    return native(m);
   };
   const meth = (proto, name, f) => defv(proto, name, fn(name, f));
 
@@ -4077,12 +4097,32 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // из WEB_SURFACE_TEMPLATE помечает свои функции нативными через него.
   globalThis.__pt_native = (fn) => { if (typeof fn === 'function') __ptNative.add(fn); return fn; };
 
+  // Метод браузера — не конструктор: у него нет `prototype`, и `new` по нему
+  // бросает. Обычная функция несёт и то и другое, а `prototype` у неё удалить
+  // нельзя — значит функцию надо не чинить, а пересоздать методом. Проверка
+  // `'prototype' in el.getAttribute` стоит ровно ничего и отличает нас сразу.
+  const asMethod = (fn, name) => {
+    if (typeof fn !== 'function') return fn;
+    if (!Object.getOwnPropertyDescriptor(fn, 'prototype')) return fn;   // уже метод
+    const key = name || fn.name || 'anonymous';
+    // Интерфейс методом не делаем: у класса имя с большой буквы, а на его
+    // прототипе есть члены — по этим двум приметам он и отличается.
+    const looksLikeMethod = /^[a-z_$]/.test(key)
+      && Object.getOwnPropertyNames(fn.prototype || {}).length <= 1;
+    if (!looksLikeMethod) return fn;
+    const holder = { [key](...args) { return fn.apply(this, args); } };
+    const m = holder[key];
+    try { Object.defineProperty(m, 'length', { value: fn.length, configurable: true }); } catch (e) {}
+    return m;
+  };
+
   const mask = (fn, name) => {
+    const m = asMethod(fn, name);
     try {
-      if (name) Object.defineProperty(fn, 'name', { value: name, configurable: true });
+      if (name) Object.defineProperty(m, 'name', { value: name, configurable: true });
     } catch (e) {}
-    if (typeof fn === 'function') __ptNative.add(fn);
-    return fn;
+    if (typeof m === 'function') __ptNative.add(m);
+    return m;
   };
 
   // Mark every own function/accessor on a prototype as native — real DOM and
@@ -4093,6 +4133,17 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       try {
         const d = Object.getOwnPropertyDescriptor(proto, k);
         if (!d) continue;
+        // Функция на прототипе — это метод: пересоздаём её методом, если она
+        // ещё несёт `prototype`, и только потом помечаем нативной.
+        if (typeof d.value === 'function' && k !== 'constructor' && d.configurable
+            && /^[a-z_$]/.test(k)
+            && Object.getOwnPropertyNames(d.value.prototype || {}).length <= 1
+            && Object.getOwnPropertyDescriptor(d.value, 'prototype')) {
+          const m = asMethod(d.value, k);
+          Object.defineProperty(proto, k, Object.assign({}, d, { value: m }));
+          __ptNative.add(m);
+          continue;
+        }
         if (typeof d.value === 'function') __ptNative.add(d.value);
         if (typeof d.get === 'function') __ptNative.add(d.get);
         if (typeof d.set === 'function') __ptNative.add(d.set);

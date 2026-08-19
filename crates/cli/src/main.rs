@@ -354,7 +354,14 @@ async fn main() -> Result<()> {
                     const S_ = XMLHttpRequest.prototype.send, O_ = XMLHttpRequest.prototype.open;
                     XMLHttpRequest.prototype.open = function (m, u) { this.__ptU = String(u); return O_.apply(this, arguments); };
                     XMLHttpRequest.prototype.send = function (b) {
-                      try { console.error('[send] bytes=' + ((b && b.length) || 0) + ' url=' + String(this.__ptU || '').slice(-40)); } catch (e) {}
+                      try {
+                        const size = b == null ? 0
+                          : (typeof b === 'string' ? b.length
+                          : (b.byteLength !== undefined ? b.byteLength
+                          : (b.size !== undefined ? b.size : (b.length || 0))));
+                        console.error('[send] bytes=' + size + ' kind=' + Object.prototype.toString.call(b) +
+                                      ' url=' + String(this.__ptU || '').slice(-40));
+                      } catch (e) {}
                       // Маяк `/eb/` — единственное место, где челлендж сам
                       // рассказывает, что у него не так. Тело собирается мимо
                       // JSON.stringify и btoa, поэтому берём его прямо здесь.
@@ -1271,8 +1278,15 @@ async fn main() -> Result<()> {
             let reqs = ctx.requests();
             println!("{} requests for {url}", reqs.len());
             for r in &reqs {
+                // Размер тела запроса виден только здесь, а он — половина
+                // ответа на «что мы про себя рассказали».
+                let sent = if r.request_body.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [отправлено {} байт]", r.request_body.len())
+                };
                 println!(
-                    "[{:<8}] {:<4} {} → {} ({} bytes)",
+                    "[{:<8}] {:<4} {} → {} ({} bytes){sent}",
                     r.resource_type,
                     r.method,
                     r.url,
