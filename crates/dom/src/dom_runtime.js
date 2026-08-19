@@ -1519,8 +1519,15 @@
     try { data = __pt_cloneDecode(json); } catch (e) {}
     const ev = __ptTrust(new MessageEvent('message', { data, origin: '', source: null }));
     try { ev.target = W.worker; ev.currentTarget = W.worker; } catch (e) {}
-    try { if (typeof W.onmessage === 'function') W.onmessage.call(W.worker, ev); } catch (e) {}
-    for (const h of (W.listeners.message || [])) { try { h.call(W.worker, ev); } catch (e) {} }
+    // Внутри обработчика `window.event` — это событие, снаружи ничего.
+    const outer = globalThis.event;
+    try { globalThis.event = ev; } catch (e) {}
+    try {
+      try { if (typeof W.onmessage === 'function') W.onmessage.call(W.worker, ev); } catch (e) {}
+      for (const h of (W.listeners.message || [])) { try { h.call(W.worker, ev); } catch (e) {} }
+    } finally {
+      try { globalThis.event = outer; } catch (e) {}
+    }
   };
   globalThis.__pt_workerFailed = (id, message) => {
     const W = __workers.get(id);

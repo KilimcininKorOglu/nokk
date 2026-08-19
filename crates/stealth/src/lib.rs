@@ -3273,12 +3273,20 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         const t = __ptSelf(this);
         const type = ev && ev.type;
         const l = (t.__ptLis && t.__ptLis[type]) || [];
-        for (const e of l.slice()) {
-          if (e.once) t.removeEventListener(type, e.fn);
-          try { typeof e.fn === 'function' ? e.fn.call(t, ev) : (e.fn.handleEvent && e.fn.handleEvent(ev)); } catch (x) {}
+        // `window.event` — событие, которое обрабатывается прямо сейчас: в
+        // браузере внутри обработчика там лежит оно, а снаружи ничего.
+        const outer = globalThis.event;
+        try { globalThis.event = ev; } catch (x) {}
+        try {
+          for (const e of l.slice()) {
+            if (e.once) t.removeEventListener(type, e.fn);
+            try { typeof e.fn === 'function' ? e.fn.call(t, ev) : (e.fn.handleEvent && e.fn.handleEvent(ev)); } catch (x) {}
+          }
+          const on = t['on' + type];
+          if (typeof on === 'function') { try { on.call(t, ev); } catch (x) {} }
+        } finally {
+          try { globalThis.event = outer; } catch (x) {}
         }
-        const on = t['on' + type];
-        if (typeof on === 'function') { try { on.call(t, ev); } catch (x) {} }
         return !ev || !ev.defaultPrevented;
       }
     };
@@ -5106,6 +5114,45 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // returns null for a conflicting request rather than a second context.
       const t = type === 'experimental-webgl' ? 'webgl' : String(type);
       if (this.__ptCtxType && this.__ptCtxType !== t) return null;
+      // WebGPU: у Chrome холст отдаёт контекст, а не null, — и на нём висит
+      // `canvas`, `configure`, `getCurrentTexture` и прочее. Мы отвечали null,
+      // а `navigator.gpu` при этом был на месте: сочетание само по себе примета.
+      if (t === 'webgpu') {
+        if (this.__ptGpuCtx) return this.__ptGpuCtx;
+        const C = globalThis.GPUCanvasContext;
+        if (!C || !C.prototype) return null;
+        const P = C.prototype;
+        if (!P.__ptShaped) {
+          try { Object.defineProperty(P, '__ptShaped', { value: true }); } catch (e) {}
+          const owner = new WeakMap();
+          globalThis.__pt_gpuCtxOwner = owner;
+          const put = (name, value) => {
+            try { Object.defineProperty(P, name, { value: mask(value, name), writable: true, enumerable: true, configurable: true }); } catch (e) {}
+          };
+          try {
+            Object.defineProperty(P, 'canvas', {
+              get: mask(function canvas() { return owner.get(this); }, 'get canvas'),
+              enumerable: true, configurable: true,
+            });
+          } catch (e) {}
+          put('configure', function configure() {});
+          put('unconfigure', function unconfigure() {});
+          put('getConfiguration', function getConfiguration() { return null; });
+          put('getCurrentTexture', function getCurrentTexture() {
+            const T = globalThis.GPUTexture;
+            return T && T.prototype ? Object.create(T.prototype) : {};
+          });
+          try {
+            if (!Object.getOwnPropertyDescriptor(P, Symbol.toStringTag)) {
+              Object.defineProperty(P, Symbol.toStringTag, { value: 'GPUCanvasContext', configurable: true });
+            }
+          } catch (e) {}
+        }
+        const ctx = Object.create(P);
+        globalThis.__pt_gpuCtxOwner.set(ctx, this);
+        try { Object.defineProperty(this, '__ptGpuCtx', { value: ctx, configurable: true, enumerable: false }); } catch (e) {}
+        return ctx;
+      }
       if (t !== '2d' && t !== 'webgl' && t !== 'webgl2') return null;
       this.__ptCtxType = t;
       if (t === '2d') return this.__ptC2d || (this.__ptC2d = make2DContext(this));
