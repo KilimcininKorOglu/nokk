@@ -1447,7 +1447,7 @@
     const W = __workers.get(id);
     if (!W || W.closed) return;
     let data = null;
-    try { data = __ptJSON.parse(json); } catch (e) {}
+    try { data = __pt_cloneDecode(json); } catch (e) {}
     const ev = __ptTrust(new MessageEvent('message', { data, origin: '', source: null }));
     try { ev.target = W.worker; ev.currentTarget = W.worker; } catch (e) {}
     try { if (typeof W.onmessage === 'function') W.onmessage.call(W.worker, ev); } catch (e) {}
@@ -1484,7 +1484,9 @@
       const W = this.__ptW;
       if (W.closed) return;
       let json = 'null';
-      try { json = __ptJSON.stringify(data === undefined ? null : data); } catch (e) {}
+      // Как в браузере: структурный клон, а не JSON, — иначе воркер получит
+      // вместо байтов объект, а вместо даты строку.
+      json = __pt_cloneEncode(data);
       __workerOps.push({ op: 'post', id: W.id, data: json });
     }
     terminate() {
@@ -2909,7 +2911,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // and flushed on ready, as a browser queues them against `about:blank`.
   const __frameWindow = (id, st) => ({
     postMessage: (data, targetOrigin) => {
-      const op = { op: 'post', id, data: __ptJSON.stringify(data === undefined ? null : data), toParent: false, targetOrigin: String(targetOrigin || '*') };
+      const op = { op: 'post', id, data: __pt_cloneEncode(data), toParent: false, targetOrigin: String(targetOrigin || '*') };
       __pushFrameOp(op, st.ready ? __frameOps : st.pending);
     },
     get closed() { return false; },
@@ -2943,7 +2945,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   };
 
   // A `message` event arriving from the other side of a frame boundary.
-  globalThis.__pt_deliverMessage = (data, origin, fromFrameId) => {
+  globalThis.__pt_deliverMessage = (raw, origin, fromFrameId) => {
+    // Значение приезжает разобранным литералом — оживляем из него те же типы.
+    let data = raw;
+    try { data = globalThis.__pt_cloneRevive ? __pt_cloneRevive(raw) : raw; } catch (e) {}
     const source = fromFrameId ? (__frames.get(fromFrameId) || {}).win || null : (globalThis.parent === globalThis ? null : globalThis.parent);
     const ev = {
       type: 'message', data, origin: String(origin || ''), lastEventId: '',
@@ -2960,7 +2965,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     globalThis.__pt_frameId = id;
     const up = {
       postMessage: (data) => {
-        __pushFrameOp({ op: 'post', data: __ptJSON.stringify(data === undefined ? null : data), toParent: true });
+        __pushFrameOp({ op: 'post', data: __pt_cloneEncode(data), toParent: true });
       },
       get closed() { return false; },
       get frames() { return up; },

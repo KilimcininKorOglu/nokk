@@ -1451,12 +1451,13 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
   const outbox = [];
   globalThis.__pt_drainWorkerOut = () => outbox.splice(0);
   globalThis.postMessage = native(function postMessage(data) {{
-    try {{ outbox.push(__ptJSON.stringify(data === undefined ? null : data)); }} catch (e) {{ outbox.push('null'); }}
+    // Клонируем, а не сериализуем: на той стороне ждут тех же типов.
+    try {{ outbox.push(__pt_cloneEncode(data)); }} catch (e) {{ outbox.push('null'); }}
   }});
   globalThis.close = native(function close() {{ globalThis.__ptClosed = true; }});
   globalThis.__pt_workerDeliver = (json) => {{
     let data = null;
-    try {{ data = __ptJSON.parse(json); }} catch (e) {{}}
+    try {{ data = __pt_cloneDecode(json); }} catch (e) {{}}
     // У выделенного воркера `origin` пустой, а `source` — null: сообщение
     // пришло по порту, а не от окна.
     let ev;
@@ -1517,7 +1518,9 @@ const WINDOW_ENUMERABLE: &str = r#"["alert", "atob", "blur", "btoa", "caches", "
 pub fn web_surface_script() -> String {
     format!(
         "{WEB_SURFACE_TEMPLATE}\n{}\n{}",
-        WEB_BODIES_TEMPLATE.replace("__OPFS__", OPFS_TEMPLATE),
+        WEB_BODIES_TEMPLATE
+            .replace("__CLONE__", CLONE_TEMPLATE)
+            .replace("__OPFS__", OPFS_TEMPLATE),
         WINDOW_SHAPE_TEMPLATE.replace("__WINDOW_ENUMERABLE__", WINDOW_ENUMERABLE)
     )
 }
@@ -1674,6 +1677,156 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
 /// Идёт после [`WEB_SURFACE_TEMPLATE`]: имена вроде `navigator.gpu` создаёт
 /// именно он, и пересаживать заглушку на интерфейс можно только когда она уже
 /// есть.
+const CLONE_TEMPLATE: &str = r##"  // ── Структурное клонирование ─────────────────────────────────────────────
+  // Сообщение между окном, кадром и воркером браузер передаёт структурным
+  // клоном: `Uint8Array` приходит массивом байт, `Map` — картой, дата — датой.
+  // Мы возили всё через JSON, и на той стороне вместо байтов оказывался
+  // обычный объект `{0:1,1:2}`, вместо даты — строка. Код, который ждёт своего
+  // типа, такого сообщения просто не понимает.
+  (() => {
+    const TA = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array',
+                'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array',
+                'BigInt64Array', 'BigUint64Array', 'DataView'];
+    const b64 = (bytes) => {
+      let s = '';
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      }
+      return globalThis.btoa ? btoa(s) : s;
+    };
+    const unb64 = (text) => {
+      const s = globalThis.atob ? atob(text) : text;
+      const out = new Uint8Array(s.length);
+      for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 255;
+      return out;
+    };
+    const bytesOf = (v) => (v instanceof ArrayBuffer
+      ? new Uint8Array(v)
+      : new Uint8Array(v.buffer, v.byteOffset, v.byteLength));
+
+    const encodeValue = (v, seen) => {
+      if (v === undefined) return { $: 'u' };
+      if (v === null) return null;
+      const t = typeof v;
+      if (t === 'string' || t === 'boolean') return v;
+      if (t === 'number') return Number.isFinite(v) ? v : { $: 'nf', v: String(v) };
+      if (t === 'bigint') return { $: 'big', v: String(v) };
+      if (t === 'function' || t === 'symbol') {
+        const e = new (globalThis.DOMException || Error)(
+          'Failed to execute \'postMessage\': ' + String(v) + ' could not be cloned.', 'DataCloneError');
+        e.name = 'DataCloneError';
+        throw e;
+      }
+      const known = seen.get(v);
+      if (known !== undefined) return { $: 'ref', i: known };
+      const id = seen.size;
+      seen.set(v, id);
+      const tag = Object.prototype.toString.call(v);
+      if (tag === '[object Date]') return { $: 'date', t: v.getTime() };
+      if (tag === '[object RegExp]') return { $: 're', s: v.source, f: v.flags };
+      if (tag === '[object Error]' || v instanceof Error) {
+        return { $: 'err', n: String(v.name || 'Error'), m: String(v.message || ''), k: String(v.stack || '') };
+      }
+      if (tag === '[object ArrayBuffer]') return { $: 'ab', b: b64(new Uint8Array(v)) };
+      const kind = tag.slice(8, -1);
+      if (TA.indexOf(kind) >= 0) {
+        return { $: 'ta', k: kind, b: b64(bytesOf(v)), o: 0, n: kind === 'DataView' ? v.byteLength : v.length };
+      }
+      if (tag === '[object Map]') {
+        const e = [];
+        v.forEach((val, key) => e.push([encodeValue(key, seen), encodeValue(val, seen)]));
+        return { $: 'map', e };
+      }
+      if (tag === '[object Set]') {
+        const e = [];
+        v.forEach((val) => e.push(encodeValue(val, seen)));
+        return { $: 'set', e };
+      }
+      if (tag === '[object Blob]' || tag === '[object File]') {
+        // Блоб браузер клонирует целиком — вместе с содержимым и типом.
+        let data = '';
+        try { data = globalThis.__pt_blobParts ? (__pt_blobParts(v) || []).join('') : ''; } catch (e) {}
+        return { $: 'blob', d: data, t: String(v.type || ''), n: v.name === undefined ? null : String(v.name) };
+      }
+      if (Array.isArray(v)) return { $: 'arr', v: v.map((x) => encodeValue(x, seen)) };
+      const p = {};
+      for (const k of Object.keys(v)) {
+        let val;
+        try { val = v[k]; } catch (e) { continue; }
+        p[k] = encodeValue(val, seen);
+      }
+      return { $: 'obj', p };
+    };
+
+    const reviveValue = (v, made) => {
+      if (v === null || typeof v !== 'object') return v;
+      if (Array.isArray(v)) return v.map((x) => reviveValue(x, made));
+      const kind = v.$;
+      if (kind === undefined) {                     // чужой формат — как есть
+        const out = {};
+        for (const k of Object.keys(v)) out[k] = reviveValue(v[k], made);
+        return out;
+      }
+      if (kind === 'u') return undefined;
+      if (kind === 'nf') return Number(v.v);
+      if (kind === 'big') return globalThis.BigInt ? BigInt(v.v) : Number(v.v);
+      if (kind === 'ref') return made[v.i];
+      if (kind === 'date') { const d = new Date(v.t); made.push(d); return d; }
+      if (kind === 're') { const r = new RegExp(v.s, v.f); made.push(r); return r; }
+      if (kind === 'err') {
+        const C = globalThis[v.n] && /Error$/.test(v.n) ? globalThis[v.n] : Error;
+        const e = new C(v.m);
+        try { e.stack = v.k; } catch (x) {}
+        made.push(e);
+        return e;
+      }
+      if (kind === 'ab') { const b = unb64(v.b); made.push(b.buffer); return b.buffer; }
+      if (kind === 'ta') {
+        const bytes = unb64(v.b);
+        const C = globalThis[v.k] || Uint8Array;
+        const out = v.k === 'DataView' ? new DataView(bytes.buffer) : new C(bytes.buffer);
+        made.push(out);
+        return out;
+      }
+      if (kind === 'map') {
+        const m = new Map(); made.push(m);
+        for (const [k, val] of v.e) m.set(reviveValue(k, made), reviveValue(val, made));
+        return m;
+      }
+      if (kind === 'set') {
+        const s = new Set(); made.push(s);
+        for (const val of v.e) s.add(reviveValue(val, made));
+        return s;
+      }
+      if (kind === 'blob') {
+        const b = new Blob([v.d], { type: v.t });
+        if (v.n !== null) { try { Object.defineProperty(b, 'name', { value: v.n, configurable: true }); } catch (x) {} }
+        made.push(b);
+        return b;
+      }
+      if (kind === 'arr') {
+        const out = []; made.push(out);
+        for (const x of v.v) out.push(reviveValue(x, made));
+        return out;
+      }
+      if (kind === 'obj') {
+        const out = {}; made.push(out);
+        for (const k of Object.keys(v.p)) out[k] = reviveValue(v.p[k], made);
+        return out;
+      }
+      return v;
+    };
+
+    globalThis.__pt_cloneEncode = (v) => __ptJSON.stringify(encodeValue(v, new Map()));
+    globalThis.__pt_cloneRevive = (v) => reviveValue(v, []);
+    globalThis.__pt_cloneDecode = (text) => {
+      let parsed = null;
+      try { parsed = __ptJSON.parse(text); } catch (e) { return null; }
+      return reviveValue(parsed, []);
+    };
+  })();
+"##;
+
 const OPFS_TEMPLATE: &str = r##"  // ── Origin Private File System ───────────────────────────────────────────
   // Челлендж просит у воркера файл в OPFS, берёт синхронную ручку, пишет байт
   // и засекает `flush()` — а у нас `getDirectory()` отвечал отказом «доступ
@@ -1889,6 +2042,7 @@ const OPFS_TEMPLATE: &str = r##"  // ── Origin Private File System ───
 "##;
 
 const WEB_BODIES_TEMPLATE: &str = r##"(() => {
+__CLONE__
 __OPFS__
   const native = globalThis.__pt_native || ((f) => f);
   const defv = (o, k, v) => {

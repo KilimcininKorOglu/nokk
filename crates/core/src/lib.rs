@@ -1892,7 +1892,7 @@ impl BrowserContext {
                         Some((place, child)) => {
                             let data = op["data"].as_str().unwrap_or("null");
                             tracing::debug!(owner = index, worker = id, bytes = data.len(),
-                                            head = %&data[..data.len().min(120)], "worker post");
+                                            head = %&data[..data.len().min(420)], "worker post");
                             let _ = self
                                 .eval_at(place, child, &format!("__pt_workerDeliver({})", js_str(data)))
                                 .await;
@@ -1978,7 +1978,7 @@ impl BrowserContext {
             // раньше не оставлял в логе следа — и разговор выглядел так, будто
             // воркер промолчал.
             tracing::debug!(worker = id, bytes = m.len(),
-                            head = %&m[..m.len().min(70)], "worker reply delivered");
+                            head = %&m[..m.len().min(420)], "worker reply delivered");
             let _ = self
                 .eval_in(owner, &format!("__pt_workerMessage({id}, {})", js_str(&m)))
                 .await;
@@ -2073,7 +2073,7 @@ impl BrowserContext {
                     .eval_in(owner, &format!("__pt_workerMessage({id}, {})", js_str(&m)))
                     .await;
                 tracing::debug!(worker = id, bytes = m.len(),
-                                head = %&m[..m.len().min(70)], "worker reply delivered");
+                                head = %&m[..m.len().min(420)], "worker reply delivered");
             }
             if drained["closed"].as_bool().unwrap_or(false) {
                 work += 1;
@@ -3495,6 +3495,64 @@ mod tests {
         let _serial = serial().await;
         let engine = engine(1, 1);
         assert!(engine.injection_script().contains("'webdriver', false"));
+    }
+
+    /// Что переживает дорогу до воркера и обратно. Браузер отправляет
+    /// сообщения структурным клонированием: двоичные данные приходят
+    /// двоичными, `Map` остаётся `Map`, дата — датой. Мы возим их через JSON,
+    /// и всё это по дороге превращается в что-то другое — а код на той стороне
+    /// ждёт своего типа.
+    #[tokio::test]
+    async fn a_message_to_a_worker_keeps_its_shape() {
+        let _serial = serial().await;
+        let engine = engine(4, 6);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/app/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        ctx.evaluate(
+            r#"(() => {
+            const src = "onmessage=function(e){ const d = e.data; postMessage({ \
+                 kind: Object.prototype.toString.call(d.bytes), \
+                 first: d.bytes && d.bytes[0], \
+                 len: d.bytes && d.bytes.length, \
+                 mapKind: Object.prototype.toString.call(d.map), \
+                 dateKind: Object.prototype.toString.call(d.when), \
+                 back: new Uint8Array([7, 8, 9]) }) }";
+            const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+            globalThis.__got = null;
+            w.onmessage = (e) => {
+              globalThis.__got = {
+                said: e.data,
+                backKind: Object.prototype.toString.call(e.data && e.data.back),
+                backFirst: e.data && e.data.back && e.data.back[0],
+              };
+            };
+            w.postMessage({ bytes: new Uint8Array([1, 2, 3]), map: new Map([['a', 1]]), when: new Date(0) });
+            return 1;
+        })()"#,
+        )
+        .await
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            ctx.run_event_loop().await.unwrap();
+            let n = probe(&ctx, "__ptJSON.stringify(globalThis.__got ? 1 : 0)").await;
+            if n.as_u64().unwrap_or(0) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let got = probe(&ctx, "__ptJSON.stringify(globalThis.__got)").await;
+        assert_eq!(got["said"]["kind"], "[object Uint8Array]", "байты приезжают байтами: {got}");
+        assert_eq!(got["said"]["first"], 1, "{got}");
+        assert_eq!(got["said"]["len"], 3, "{got}");
+        assert_eq!(got["said"]["mapKind"], "[object Map]", "Map остаётся Map: {got}");
+        assert_eq!(got["said"]["dateKind"], "[object Date]", "дата остаётся датой: {got}");
+        assert_eq!(got["backKind"], "[object Uint8Array]", "и обратно тоже: {got}");
+        assert_eq!(got["backFirst"], 7, "{got}");
     }
 
     /// Файловая система источника. Челлендж просит её у воркера, создаёт файл,
