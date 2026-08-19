@@ -3555,6 +3555,146 @@ mod tests {
         assert_eq!(got["backFirst"], 7, "{got}");
     }
 
+    /// Весь путь Turnstile целиком, на тестовых ключах самого Cloudflare:
+    /// виджет строится, разговаривает со страницей, у интерактивного варианта
+    /// движок нажимает флажок — и страница получает токен. Это проверка
+    /// машинерии, а не отпечатка: ключи `1x…AA` и `3x…FF` выдают токен любому,
+    /// кто дошёл до конца, и потому показывают, цела ли дорога.
+    #[tokio::test]
+    async fn a_turnstile_widget_runs_to_a_token() {
+        let _serial = serial().await;
+        const PAGE: &str = r#"<html><body><div id="box"></div><script>
+            window.__state = { token: null, events: [] };
+            addEventListener('message', (e) => {
+              try { if (e.data && e.data.source === 'cloudflare-challenge') __state.events.push(e.data.event); } catch (x) {}
+            });
+            window.onTurnstileLoad = function () {
+              window.turnstile.render('#box', {
+                sitekey: '__KEY__',
+                callback: (t) => { __state.token = String(t).slice(0, 30); },
+              });
+            };
+            const s = document.createElement('script');
+            s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onTurnstileLoad&render=explicit';
+            document.head.appendChild(s);
+          </script></body></html>"#;
+
+        for (key, interactive) in [
+            ("1x00000000000000000000AA", false),
+            ("3x00000000000000000000FF", true),
+        ] {
+            let html = PAGE.replace("__KEY__", key);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let body = html.clone();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let body = body.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 1024];
+                        let _ = stream.read(&mut buf).await;
+                        let out = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(out.as_bytes()).await;
+                    });
+                }
+            });
+
+            let engine = Engine::new(EngineConfig {
+                pool: PoolConfig { workers: 2, max_live_contexts: 6, max_heap_mb: None },
+                use_real_network: true,
+                ..Default::default()
+            })
+            .expect("engine");
+            let ctx = engine.new_context().await.unwrap();
+            ctx.navigate(&format!("http://{addr}/")).await.unwrap();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+            let mut token = Value::Null;
+            while std::time::Instant::now() < deadline {
+                ctx.run_event_loop().await.unwrap();
+                let _ = ctx.press_widget_control().await;
+                token = ctx
+                    .evaluate("(globalThis.__state && __state.token) || ''")
+                    .await
+                    .unwrap_or(Value::Null);
+                if token.as_str().map_or(false, |t| !t.is_empty()) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+
+            let events = ctx
+                .evaluate("((globalThis.__state && __state.events) || []).join(',')")
+                .await
+                .unwrap_or(Value::Null);
+            let events = events.as_str().unwrap_or("").to_string();
+            assert!(
+                token.as_str().map_or(false, |t| t.contains("TOKEN")),
+                "ключ {key} должен выдать токен: события [{events}]"
+            );
+            assert!(events.contains("complete"), "и сказать `complete`: [{events}]");
+            if interactive {
+                assert!(
+                    events.contains("interactiveBegin") && events.contains("interactiveEnd"),
+                    "интерактивный вариант проходит через нажатие: [{events}]"
+                );
+            }
+        }
+    }
+
+    /// Обещания, которых ждёт сборщик: адаптер WebGPU, декодирование медиа,
+    /// раскладка клавиатуры, оценка хранилища, разрешения. Любое неразрешённое
+    /// — это остановка их программы, и снаружи она выглядит тишиной.
+    #[tokio::test]
+    async fn the_promises_a_collector_waits_for_all_settle() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        ctx.evaluate(
+            r#"(() => {
+              globalThis.__r = {};
+              const note = (k, v) => { globalThis.__r[k] = v; };
+              try {
+                navigator.gpu.requestAdapter().then(
+                  (a) => note('adapter', a ? Object.prototype.toString.call(a) : String(a)),
+                  (e) => note('adapter', 'отказ'));
+              } catch (e) { note('adapter', 'бросил'); }
+              try {
+                navigator.mediaCapabilities.decodingInfo({ type: 'file',
+                  video: { contentType: 'video/mp4; codecs="avc1.42E01E"', width: 640, height: 480, bitrate: 1000, framerate: 30 } })
+                  .then((r) => note('mediaCaps', !!r), () => note('mediaCaps', 'отказ'));
+              } catch (e) { note('mediaCaps', 'бросил'); }
+              try { navigator.keyboard.getLayoutMap().then((m) => note('layout', !!m), () => note('layout', 'отказ')); }
+              catch (e) { note('layout', 'бросил'); }
+              try { navigator.storage.estimate().then((r) => note('estimate', !!r), () => note('estimate', 'отказ')); }
+              catch (e) { note('estimate', 'бросил'); }
+              try { navigator.permissions.query({ name: 'notifications' }).then((s) => note('perm', s && s.state), () => note('perm', 'отказ')); }
+              catch (e) { note('perm', 'бросил'); }
+              try { navigator.storage.getDirectory().then((d) => note('opfs', !!d), () => note('opfs', 'отказ')); }
+              catch (e) { note('opfs', 'бросил'); }
+              return 1;
+            })()"#,
+        )
+        .await
+        .unwrap();
+        for _ in 0..4 {
+            ctx.run_event_loop().await.unwrap();
+        }
+
+        let out = probe(&ctx, "__ptJSON.stringify(globalThis.__r)").await;
+        for key in ["adapter", "mediaCaps", "layout", "estimate", "perm", "opfs"] {
+            assert!(out.get(key).is_some(), "обещание `{key}` не разрешилось: {out}");
+        }
+    }
+
     /// SHA-256 через `crypto.subtle.digest` — то, чем страница подписывает
     /// собранное. Проверяем на известном векторе: у "abc" хеш начинается с
     /// ba 78 16 bf.

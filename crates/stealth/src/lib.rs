@@ -1294,9 +1294,31 @@ const TRACER_TEMPLATE: &str = r##"(() => {
     ['CSSStyleDeclaration', 'style.'], ['MediaQueryList', 'mql.'],
     ['Storage', 'storage.'], ['Crypto', 'crypto.'], ['Date', 'date.'],
     ['Intl', 'intl.'], ['RTCPeerConnection', 'rtc.'], ['SpeechSynthesis', 'speech.'],
+    // Поверхности, которых прибор до сих пор не касался: они не на виду, но
+    // отпечаток собирают и по ним.
+    ['FontFaceSet', 'fonts.'], ['NavigatorUAData', 'uaData.'], ['MediaDevices', 'mediaDevices.'],
+    ['Permissions', 'permissions.'], ['StorageManager', 'storageMgr.'],
+    ['MediaCapabilities', 'mediaCaps.'], ['Keyboard', 'keyboard.'],
+    ['GPU', 'gpu.'], ['GPUAdapter', 'gpuAdapter.'], ['PerformanceObserver', 'perfObs.'],
+    ['TextEncoder', 'textEnc.'], ['TextDecoder', 'textDec.'], ['URL', 'url.'],
+    ['SubtleCrypto', 'subtle.'], ['NetworkInformation', 'connection.'],
   ]) {
     trace(proto(name), tag);
   }
+  // Объекты, у которых интерфейс не назван на окне, — трогаем сами объекты.
+  try {
+    const pairs = [
+      [globalThis.WebAssembly, 'wasm.'],
+      [globalThis.document && document.fonts, 'fonts.own.'],
+      [globalThis.navigator && navigator.userAgentData, 'uaData.own.'],
+      [globalThis.navigator && navigator.mediaDevices, 'mediaDevices.own.'],
+      [globalThis.navigator && navigator.permissions, 'permissions.own.'],
+      [globalThis.navigator && navigator.connection, 'connection.own.'],
+      [globalThis.navigator && navigator.gpu, 'gpu.own.'],
+      [globalThis.crypto && crypto.subtle, 'subtle.own.'],
+    ];
+    for (const [obj, tag] of pairs) if (obj) trace(obj, tag);
+  } catch (e) {}
   for (const [name, tag] of [['navigator', 'n.'], ['screen', 's.'], ['performance', 'perf.']]) {
     if (globalThis[name]) { trace(globalThis[name], tag + 'own.'); traceData(globalThis[name], tag); }
   }
