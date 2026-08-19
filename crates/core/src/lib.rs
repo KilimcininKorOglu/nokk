@@ -3555,6 +3555,60 @@ mod tests {
         assert_eq!(got["backFirst"], 7, "{got}");
     }
 
+    /// Картинка — это запрос. `new Image().src = …` — обычный способ послать
+    /// GET, и раньше он уходил в сеть только по абсолютному `http(s)` адресу:
+    /// относительный, каким его пишут почти всегда, не отправлял ничего.
+    #[tokio::test]
+    async fn setting_an_image_source_makes_a_request() {
+        let _serial = serial().await;
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if let Some(path) = req.split_whitespace().nth(1) {
+                        if let Ok(mut v) = seen.lock() {
+                            v.push(path.to_string());
+                        }
+                    }
+                    let body = if req.contains("GET /page") {
+                        "<html><body><script>const i = new Image(); i.src = '/pixel.png?x=1';</script></body></html>"
+                    } else {
+                        "ok"
+                    };
+                    let out = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(out.as_bytes()).await;
+                });
+            }
+        });
+
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 4, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&format!("http://{addr}/page")).await.unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        let asked = hits.lock().map(|v| v.clone()).unwrap_or_default();
+        assert!(
+            asked.iter().any(|p| p.starts_with("/pixel.png")),
+            "запрос за картинкой должен уйти: {asked:?}"
+        );
+    }
+
     /// Файловая система источника. Челлендж просит её у воркера, создаёт файл,
     /// берёт синхронную ручку, пишет байт и засекает `flush()` — а наш
     /// `getDirectory()` отвечал отказом «доступ запрещён», которого в

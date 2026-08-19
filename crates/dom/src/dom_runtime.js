@@ -18,6 +18,7 @@
   const ELEMENT_NODE = 1, TEXT_NODE = 3, COMMENT_NODE = 8,
         DOCUMENT_NODE = 9, DOCUMENT_FRAGMENT_NODE = 11;
 
+  const __pt_soon = (f) => { try { queueMicrotask(f); } catch (e) { setTimeout(f, 0); } };
   const VOID = new Set(['area','base','br','col','embed','hr','img','input',
     'link','meta','param','source','track','wbr']);
 
@@ -723,11 +724,43 @@
     get src() { return this.__ptUrlAttr('src'); }
     set src(v) {
       this.setAttribute('src', v);
+      // Картинка идёт в сеть от одного присваивания, без всякого документа:
+      // `new Image().src = …` — обычный способ послать GET, и у нас он не
+      // посылал ничего. Запрос делает браузер сам, поэтому мимо страничного
+      // `fetch`, а по готовности бросаем `load` или `error`, как он.
+      if (this.__ptLocal === 'img') { this.__ptLoadImage(); return; }
       if (!this.isConnected) return;
       // The src can arrive after the element is in the document, in either order:
       // `el.src = …; head.appendChild(el)` or `head.appendChild(el); el.src = …`.
       if (this.__ptConnectFrame) this.__ptConnectFrame();
       if (this.__ptRunScript) this.__ptRunScript();
+    }
+
+    __ptLoadImage() {
+      const raw = this.getAttribute('src');
+      if (!raw) return;
+      let url = raw;
+      try { url = new URL(raw, document.baseURI || location.href).href; } catch (e) {}
+      if (this.__ptImgAt === url) return;                 // тот же адрес — не грузим дважды
+      Object.defineProperty(this, '__ptImgAt', { value: url, configurable: true, enumerable: false });
+      Object.defineProperty(this, '__ptImgDone', { value: false, writable: true, configurable: true, enumerable: false });
+      if (url.slice(0, 5) === 'data:' || url.slice(0, 5) === 'blob:') {
+        this.__ptImgDone = true;
+        __pt_soon(() => this.__ptFireLoad(true));
+        return;
+      }
+      if (typeof globalThis.__pt_subresource !== 'function') return;
+      __pt_subresource(url, 'img').then(
+        () => { this.__ptImgDone = true; this.__ptFireLoad(true); },
+        () => { this.__ptImgDone = true; this.__ptFireLoad(false); },
+      );
+    }
+
+    __ptFireLoad(ok) {
+      const type = ok ? 'load' : 'error';
+      const ev = { type, target: this, currentTarget: this, isTrusted: true };
+      try { const h = this['on' + type]; if (typeof h === 'function') h.call(this, ev); } catch (e) {}
+      try { this.dispatchEvent && this.dispatchEvent(new Event(type)); } catch (e) {}
     }
     // `script.text` — тот же текст, что и textContent, и присвоение ему
     // запускает скрипт. Мы его молча проглатывали: у нас это было обычное
@@ -3174,6 +3207,41 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return r;
   };
   Document.prototype.createRange = function createRange() { return __range(); };
+
+  // Таблица формы интерфейсов кладёт на `HTMLImageElement.prototype` свой
+  // отражатель `src`, и он перебивает наш — тот, что отправляет запрос. Ставим
+  // настоящий обратно, поверх заглушки.
+  try {
+    const IP = globalThis.HTMLImageElement && globalThis.HTMLImageElement.prototype;
+    if (IP) {
+      Object.defineProperty(IP, 'src', {
+        get() { return this.__ptUrlAttr ? this.__ptUrlAttr('src') : (this.getAttribute('src') || ''); },
+        set(v) {
+          this.setAttribute('src', v);
+          if (this.__ptLoadImage) this.__ptLoadImage();
+        },
+        enumerable: true, configurable: true,
+      });
+    }
+  } catch (e) {}
+
+  // `new Image()` — фабрика, как и `Audio`: браузер отдаёт настоящий элемент
+  // `<img>`. У нас под этим именем лежала заготовка из таблицы имён — с
+  // правильной меткой, но без нашего класса, — поэтому `img.src = …` был
+  // обычным присваиванием и в сеть не шёл ничего.
+  const __ptImageCtor = function Image(w, h) {
+    const el = document.createElement('img');
+    if (w !== undefined) el.width = w | 0;
+    if (h !== undefined) el.height = h | 0;
+    return el;
+  };
+  try {
+    Object.defineProperty(globalThis, 'Image', { value: __ptImageCtor, writable: true, enumerable: false, configurable: true });
+    Object.defineProperty(globalThis.Image, 'prototype', {
+      value: globalThis.HTMLImageElement ? globalThis.HTMLImageElement.prototype : Object.prototype,
+      writable: false, enumerable: false, configurable: false,
+    });
+  } catch (e) {}
 
   // `new Audio()` — это не свой интерфейс, а фабрика: браузер отдаёт
   // HTMLAudioElement, и `Object.prototype.toString` по нему говорит именно это.

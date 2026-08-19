@@ -3180,6 +3180,15 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     });
   };
 
+  // Подресурс страницы — картинка, стиль, предзагрузка. Идёт той же дорогой,
+  // что и `fetch`, но мимо страничного `fetch`: браузер такие запросы делает
+  // сам, и код, который подменил `window.fetch`, их не видит.
+  globalThis.__pt_subresource = (url, kind) => {
+    const id = fid++;
+    queue.push({ id, url: String(url), method: 'GET', headers: { 'x-pt-kind': kind || 'img' }, body: null });
+    return new Promise((resolve, reject) => { pending.set(id, { resolve, reject, url: String(url) }); });
+  };
+
   // Rust hooks -------------------------------------------------------------
   globalThis.__pt_drainFetchQueue = () => { const q = queue.splice(0); return __ptJSON.stringify(q); };
   globalThis.__pt_pendingFetches = () => pending.size;
@@ -5065,31 +5074,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
   // --- Image (new Image(); img.src = ... fires onload) ------------------
   if (globalThis.document) {
-    const ImageCtor = mask(function Image(w, h) {
-      const img = document.createElement('img');
-      if (w != null) img.width = w;
-      if (h != null) img.height = h;
-      img.complete = false; img.naturalWidth = 0; img.naturalHeight = 0;
-      let src = '';
-      Object.defineProperty(img, 'src', {
-        get() { return src; },
-        set(v) {
-          src = String(v);
-          img.complete = true;
-          img.naturalWidth = img.width || 1; img.naturalHeight = img.height || 1;
-          // Actually fetch http(s) images (tracking pixels / beacons) through the
-          // engine so they're captured; skip data:/blob: (canvas fingerprints).
-          if (/^https?:/i.test(src)) {
-            try { globalThis.fetch(src, { headers: { 'x-pt-kind': 'image' } }).catch(() => {}); } catch (e) {}
-          }
-          // Fire onload asynchronously via the event loop, like a real load.
-          setTimeout(() => { if (typeof img.onload === 'function') img.onload({ target: img }); }, 0);
-        },
-        configurable: true,
-      });
-      return img;
-    }, 'Image');
-    globalThis.Image = ImageCtor;
+    // Конструктор `Image` живёт в слое DOM: там он делает настоящий элемент, и
+    // запрос уходит по любому адресу, а не только по абсолютному `http(s)` —
+    // относительный `/pixel.png` прежняя реализация молча не отправляла вовсе.
     if (!globalThis.HTMLImageElement) globalThis.HTMLImageElement = globalThis.Element;
   }
 
