@@ -2818,9 +2818,23 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // Called after all page scripts have run: fire DOMContentLoaded then load.
   globalThis.__pt_finishLoad = () => {
     document.readyState = 'interactive';
-    document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
+    const dcl = new Event('DOMContentLoaded', { bubbles: true });
+    document.dispatchEvent(dcl);
+    // Событие всплывает с документа на окно, и слушают его чаще именно там:
+    // `window.addEventListener('DOMContentLoaded', …)` — так api.js Turnstile
+    // ставит свой авторендер. Наш всплыть не мог: окно и документ у нас разные
+    // цели, — и виджет на странице с `.cf-turnstile` не появлялся вовсе.
+    try {
+      if (globalThis.dispatchEvent) {
+        try { dcl.target = document; dcl.currentTarget = globalThis; } catch (e) {}
+        globalThis.dispatchEvent(dcl);
+      }
+    } catch (e) {}
     document.readyState = 'complete';
-    globalThis.dispatchEvent && globalThis.dispatchEvent(new Event('load'));
+    const load = new Event('load');
+    globalThis.dispatchEvent && globalThis.dispatchEvent(load);
+    // `load` в браузере доходит и до документа, и до тела.
+    try { document.dispatchEvent(new Event('load')); } catch (e) {}
   };
 
   // window is an EventTarget too.

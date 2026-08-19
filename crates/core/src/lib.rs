@@ -3555,6 +3555,34 @@ mod tests {
         assert_eq!(got["backFirst"], 7, "{got}");
     }
 
+    /// `DOMContentLoaded` всплывает с документа на окно, и слушают его чаще
+    /// именно там. Наше не всплывало — и код, который ждёт его на окне (так
+    /// api.js Turnstile ставит свой авторендер), не получал ничего.
+    #[tokio::test]
+    async fn dom_content_loaded_reaches_the_window() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><head><script>
+                 window.__log = { onWindow: false, onDocument: false, state: null, load: false };
+                 addEventListener('DOMContentLoaded', () => { __log.onWindow = true; __log.state = document.readyState; });
+                 document.addEventListener('DOMContentLoaded', () => { __log.onDocument = true; });
+                 addEventListener('load', () => { __log.load = true; });
+               </script></head><body></body></html>"#,
+        )
+        .await
+        .unwrap();
+
+        let out = probe(&ctx, "__ptJSON.stringify(window.__log)").await;
+        assert_eq!(out["onWindow"], true, "окно слышит событие: {out}");
+        assert_eq!(out["onDocument"], true, "и документ тоже: {out}");
+        // В браузере во время DOMContentLoaded документ уже `interactive`.
+        assert_eq!(out["state"], "interactive", "{out}");
+        assert_eq!(out["load"], true, "{out}");
+    }
+
     /// Весь путь Turnstile целиком, на тестовых ключах самого Cloudflare:
     /// виджет строится, разговаривает со страницей, у интерактивного варианта
     /// движок нажимает флажок — и страница получает токен. Это проверка
