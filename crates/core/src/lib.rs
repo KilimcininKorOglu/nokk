@@ -3555,6 +3555,42 @@ mod tests {
         assert_eq!(got["backFirst"], 7, "{got}");
     }
 
+    /// SHA-256 через `crypto.subtle.digest` — то, чем страница подписывает
+    /// собранное. Проверяем на известном векторе: у "abc" хеш начинается с
+    /// ba 78 16 bf.
+    #[tokio::test]
+    async fn subtle_crypto_computes_a_real_digest() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        ctx.evaluate(
+            r#"(() => {
+                globalThis.__h = null;
+                crypto.subtle.digest('SHA-256', new TextEncoder().encode('abc')).then(
+                  (b) => { globalThis.__h = Array.from(new Uint8Array(b)); },
+                  (e) => { globalThis.__h = 'отказ: ' + e; });
+                return 1;
+              })()"#,
+        )
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            ctx.run_event_loop().await.unwrap();
+        }
+
+        let out = probe(&ctx, "__ptJSON.stringify(globalThis.__h)").await;
+        let bytes = out.as_array().cloned().unwrap_or_default();
+        assert_eq!(bytes.len(), 32, "должно быть тридцать два байта: {out}");
+        assert_eq!(bytes[0], 0xba, "{out}");
+        assert_eq!(bytes[1], 0x78, "{out}");
+        assert_eq!(bytes[2], 0x16, "{out}");
+        assert_eq!(bytes[3], 0xbf, "{out}");
+    }
+
     /// Список свойств CSS — это подпись движка и его версии, и сборщик
     /// отпечатка его сериализует целиком. У браузера имена лежат собственными
     /// свойствами объявления (семьсот три, в своём порядке), а методы — на
