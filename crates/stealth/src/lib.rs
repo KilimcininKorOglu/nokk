@@ -3255,10 +3255,23 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   // Подресурс страницы — картинка, стиль, предзагрузка. Идёт той же дорогой,
   // что и `fetch`, но мимо страничного `fetch`: браузер такие запросы делает
   // сам, и код, который подменил `window.fetch`, их не видит.
+  // The document's memory of what it has already fetched. A page routinely asks
+  // for one address twice — a `<link rel=preload as=image>` and then the `<img>`
+  // that uses it — and a browser answers the second from memory, so one address
+  // is one request. Without this the challenge's beacon went out twice, which is
+  // one time more than it is ever meant to be sent.
+  const subresources = new Map();
   globalThis.__pt_subresource = (url, kind) => {
+    url = String(url);
+    const seen = subresources.get(url);
+    if (seen) return seen;
     const id = fid++;
-    queue.push({ id, url: String(url), method: 'GET', headers: { 'x-pt-kind': kind || 'img' }, body: null });
-    return new Promise((resolve, reject) => { pending.set(id, { resolve, reject, url: String(url) }); });
+    queue.push({ id, url, method: 'GET', headers: { 'x-pt-kind': kind || 'img' }, body: null });
+    const p = new Promise((resolve, reject) => { pending.set(id, { resolve, reject, url }); });
+    subresources.set(url, p);
+    // A failure is not worth remembering: a browser retries a broken image.
+    p.catch(() => { subresources.delete(url); });
+    return p;
   };
 
   // What an image turned out to be, by address. Rust reads the two numbers out
