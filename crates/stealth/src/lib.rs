@@ -4272,23 +4272,31 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     if (!P.__ptPublished) {
       try { Object.defineProperty(P, '__ptPublished', { value: true }); } catch (e) {}
       for (const name of methods) {
-        // Только собственный метод реализации: иначе имя, которого у неё нет,
-        // находит на прототипе этот же переходник и зовёт сам себя.
-        const f = function () {
-          const t = CTX_IMPL.get(this) || this;
-          const m = Object.prototype.hasOwnProperty.call(t, name) ? t[name] : null;
-          return typeof m === 'function' ? m.apply(t, arguments) : undefined;
-        };
-        try { Object.defineProperty(f, 'name', { value: name, configurable: true }); } catch (e) {}
+        // Метод, а не функция: у метода браузера нет `prototype` и его нельзя
+        // позвать через `new`, а обычная функция и то и другое умеет — разница
+        // видна первой же проверкой. Заодно только собственный метод
+        // реализации: иначе имя, которого у неё нет, найдёт на прототипе этот
+        // же переходник и позовёт сам себя.
+        const f = ({
+          [name](...args) {
+            const t = CTX_IMPL.get(this) || this;
+            const m = Object.prototype.hasOwnProperty.call(t, name) ? t[name] : null;
+            return typeof m === 'function' ? m.apply(t, args) : undefined;
+          },
+        })[name];
         try { Object.defineProperty(f, 'length', { value: 0, configurable: true }); } catch (e) {}
         try { Object.defineProperty(P, name, { value: mask(f, name), writable: true, enumerable: true, configurable: true }); } catch (e) {}
       }
       for (const name of attrs) {
-        const get = function () {
-          const t = CTX_IMPL.get(this) || this;
-          return Object.prototype.hasOwnProperty.call(t, name) ? t[name] : undefined;
+        const acc = {
+          get [name]() {
+            const t = CTX_IMPL.get(this) || this;
+            return Object.prototype.hasOwnProperty.call(t, name) ? t[name] : undefined;
+          },
+          set [name](v) { const t = CTX_IMPL.get(this) || this; t[name] = v; },
         };
-        const set = function (v) { const t = CTX_IMPL.get(this) || this; t[name] = v; };
+        const d0 = Object.getOwnPropertyDescriptor(acc, name);
+        const get = d0.get, set = d0.set;
         try {
           Object.defineProperty(P, name, {
             get: mask(get, 'get ' + name), set: mask(set, 'set ' + name),
@@ -4297,9 +4305,44 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         } catch (e) {}
       }
     }
+    if (!impl) return null;                    // только объявить интерфейс
     const pub = Object.create(P);
     CTX_IMPL.set(pub, impl);
     return pub;
+  };
+
+  // Пиксели возвращают не литералом: в браузере это ImageData, и по нему
+  // спрашивают `Object.prototype.toString`. `data` у него — собственное
+  // свойство, остальное с прототипа.
+  const IMAGE_DATA = new WeakMap();
+  const makeImageData = (data, w, h) => {
+    const C = globalThis.ImageData;
+    if (typeof C !== 'function' || !C.prototype) return { data, width: w, height: h, colorSpace: 'srgb' };
+    const P = C.prototype;
+    if (!P.__ptShaped) {
+      try { Object.defineProperty(P, '__ptShaped', { value: true }); } catch (e) {}
+      const acc = (name, pick) => {
+        try {
+          Object.defineProperty(P, name, {
+            get: mask(({ [name]() { const st = IMAGE_DATA.get(this); return st ? pick(st) : undefined; } })[name], 'get ' + name),
+            enumerable: true, configurable: true,
+          });
+        } catch (e) {}
+      };
+      acc('width', (st) => st.w);
+      acc('height', (st) => st.h);
+      acc('colorSpace', () => 'srgb');
+      try {
+        if (!Object.getOwnPropertyDescriptor(P, Symbol.toStringTag)) {
+          Object.defineProperty(P, Symbol.toStringTag, { value: 'ImageData', configurable: true });
+        }
+      } catch (e) {}
+    }
+    const o = Object.create(P);
+    IMAGE_DATA.set(o, { w, h });
+    // `data` — единственное собственное свойство: так и в браузере.
+    try { Object.defineProperty(o, 'data', { value: data, enumerable: true }); } catch (e) {}
+    return o;
   };
 
   const make2DContext = (canvas) => {
@@ -4500,9 +4543,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       getImageData(x, y, w, h) {
         w = w | 0; h = h | 0;
         const out = S.read(x, y, w, h, new Uint8ClampedArray(Math.max(0, w * h * 4)));
-        return { data: out, width: w, height: h, colorSpace: 'srgb' };
+        return makeImageData(out, w, h);
       },
-      createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(0, (w | 0) * (h | 0) * 4)), width: w | 0, height: h | 0, colorSpace: 'srgb' }; },
+      createImageData(w, h) {
+        return makeImageData(new Uint8ClampedArray(Math.max(0, (w | 0) * (h | 0) * 4)), w | 0, h | 0);
+      },
       createLinearGradient(x0, y0, x1, y1) { note('linearGradient|' + [x0, y0, x1, y1]); return makeGradient(0, [+x0 || 0, +y0 || 0, +x1 || 0, +y1 || 0, 0, 0]); },
       createRadialGradient(x0, y0, r0, x1, y1, r1) { note('radialGradient|' + [x0, y0, r0, x1, y1, r1]); return makeGradient(1, [+x0 || 0, +y0 || 0, +x1 || 0, +y1 || 0, +r0 || 0, +r1 || 0]); },
       createPattern() { note('pattern'); return {}; },
@@ -4532,6 +4577,46 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   const GL2_CONSTS = 'DEPTH_BUFFER_BIT=256,STENCIL_BUFFER_BIT=1024,COLOR_BUFFER_BIT=16384,POINTS=0,LINES=1,LINE_LOOP=2,LINE_STRIP=3,TRIANGLES=4,TRIANGLE_STRIP=5,TRIANGLE_FAN=6,ZERO=0,ONE=1,SRC_COLOR=768,ONE_MINUS_SRC_COLOR=769,SRC_ALPHA=770,ONE_MINUS_SRC_ALPHA=771,DST_ALPHA=772,ONE_MINUS_DST_ALPHA=773,DST_COLOR=774,ONE_MINUS_DST_COLOR=775,SRC_ALPHA_SATURATE=776,FUNC_ADD=32774,BLEND_EQUATION=32777,BLEND_EQUATION_RGB=32777,BLEND_EQUATION_ALPHA=34877,FUNC_SUBTRACT=32778,FUNC_REVERSE_SUBTRACT=32779,BLEND_DST_RGB=32968,BLEND_SRC_RGB=32969,BLEND_DST_ALPHA=32970,BLEND_SRC_ALPHA=32971,CONSTANT_COLOR=32769,ONE_MINUS_CONSTANT_COLOR=32770,CONSTANT_ALPHA=32771,ONE_MINUS_CONSTANT_ALPHA=32772,BLEND_COLOR=32773,ARRAY_BUFFER=34962,ELEMENT_ARRAY_BUFFER=34963,ARRAY_BUFFER_BINDING=34964,ELEMENT_ARRAY_BUFFER_BINDING=34965,STREAM_DRAW=35040,STATIC_DRAW=35044,DYNAMIC_DRAW=35048,BUFFER_SIZE=34660,BUFFER_USAGE=34661,CURRENT_VERTEX_ATTRIB=34342,FRONT=1028,BACK=1029,FRONT_AND_BACK=1032,TEXTURE_2D=3553,CULL_FACE=2884,BLEND=3042,DITHER=3024,STENCIL_TEST=2960,DEPTH_TEST=2929,SCISSOR_TEST=3089,POLYGON_OFFSET_FILL=32823,SAMPLE_ALPHA_TO_COVERAGE=32926,SAMPLE_COVERAGE=32928,NO_ERROR=0,INVALID_ENUM=1280,INVALID_VALUE=1281,INVALID_OPERATION=1282,OUT_OF_MEMORY=1285,CW=2304,CCW=2305,LINE_WIDTH=2849,ALIASED_POINT_SIZE_RANGE=33901,ALIASED_LINE_WIDTH_RANGE=33902,CULL_FACE_MODE=2885,FRONT_FACE=2886,DEPTH_RANGE=2928,DEPTH_WRITEMASK=2930,DEPTH_CLEAR_VALUE=2931,DEPTH_FUNC=2932,STENCIL_CLEAR_VALUE=2961,STENCIL_FUNC=2962,STENCIL_FAIL=2964,STENCIL_PASS_DEPTH_FAIL=2965,STENCIL_PASS_DEPTH_PASS=2966,STENCIL_REF=2967,STENCIL_VALUE_MASK=2963,STENCIL_WRITEMASK=2968,STENCIL_BACK_FUNC=34816,STENCIL_BACK_FAIL=34817,STENCIL_BACK_PASS_DEPTH_FAIL=34818,STENCIL_BACK_PASS_DEPTH_PASS=34819,STENCIL_BACK_REF=36003,STENCIL_BACK_VALUE_MASK=36004,STENCIL_BACK_WRITEMASK=36005,VIEWPORT=2978,SCISSOR_BOX=3088,COLOR_CLEAR_VALUE=3106,COLOR_WRITEMASK=3107,UNPACK_ALIGNMENT=3317,PACK_ALIGNMENT=3333,MAX_TEXTURE_SIZE=3379,MAX_VIEWPORT_DIMS=3386,SUBPIXEL_BITS=3408,RED_BITS=3410,GREEN_BITS=3411,BLUE_BITS=3412,ALPHA_BITS=3413,DEPTH_BITS=3414,STENCIL_BITS=3415,POLYGON_OFFSET_UNITS=10752,POLYGON_OFFSET_FACTOR=32824,TEXTURE_BINDING_2D=32873,SAMPLE_BUFFERS=32936,SAMPLES=32937,SAMPLE_COVERAGE_VALUE=32938,SAMPLE_COVERAGE_INVERT=32939,COMPRESSED_TEXTURE_FORMATS=34467,DONT_CARE=4352,FASTEST=4353,NICEST=4354,GENERATE_MIPMAP_HINT=33170,BYTE=5120,UNSIGNED_BYTE=5121,SHORT=5122,UNSIGNED_SHORT=5123,INT=5124,UNSIGNED_INT=5125,FLOAT=5126,DEPTH_COMPONENT=6402,ALPHA=6406,RGB=6407,RGBA=6408,LUMINANCE=6409,LUMINANCE_ALPHA=6410,UNSIGNED_SHORT_4_4_4_4=32819,UNSIGNED_SHORT_5_5_5_1=32820,UNSIGNED_SHORT_5_6_5=33635,FRAGMENT_SHADER=35632,VERTEX_SHADER=35633,MAX_VERTEX_ATTRIBS=34921,MAX_VERTEX_UNIFORM_VECTORS=36347,MAX_VARYING_VECTORS=36348,MAX_COMBINED_TEXTURE_IMAGE_UNITS=35661,MAX_VERTEX_TEXTURE_IMAGE_UNITS=35660,MAX_TEXTURE_IMAGE_UNITS=34930,MAX_FRAGMENT_UNIFORM_VECTORS=36349,SHADER_TYPE=35663,DELETE_STATUS=35712,LINK_STATUS=35714,VALIDATE_STATUS=35715,ATTACHED_SHADERS=35717,ACTIVE_UNIFORMS=35718,ACTIVE_ATTRIBUTES=35721,SHADING_LANGUAGE_VERSION=35724,CURRENT_PROGRAM=35725,NEVER=512,LESS=513,EQUAL=514,LEQUAL=515,GREATER=516,NOTEQUAL=517,GEQUAL=518,ALWAYS=519,KEEP=7680,REPLACE=7681,INCR=7682,DECR=7683,INVERT=5386,INCR_WRAP=34055,DECR_WRAP=34056,VENDOR=7936,RENDERER=7937,VERSION=7938,NEAREST=9728,LINEAR=9729,NEAREST_MIPMAP_NEAREST=9984,LINEAR_MIPMAP_NEAREST=9985,NEAREST_MIPMAP_LINEAR=9986,LINEAR_MIPMAP_LINEAR=9987,TEXTURE_MAG_FILTER=10240,TEXTURE_MIN_FILTER=10241,TEXTURE_WRAP_S=10242,TEXTURE_WRAP_T=10243,TEXTURE=5890,TEXTURE_CUBE_MAP=34067,TEXTURE_BINDING_CUBE_MAP=34068,TEXTURE_CUBE_MAP_POSITIVE_X=34069,TEXTURE_CUBE_MAP_NEGATIVE_X=34070,TEXTURE_CUBE_MAP_POSITIVE_Y=34071,TEXTURE_CUBE_MAP_NEGATIVE_Y=34072,TEXTURE_CUBE_MAP_POSITIVE_Z=34073,TEXTURE_CUBE_MAP_NEGATIVE_Z=34074,MAX_CUBE_MAP_TEXTURE_SIZE=34076,TEXTURE0=33984,TEXTURE1=33985,TEXTURE2=33986,TEXTURE3=33987,TEXTURE4=33988,TEXTURE5=33989,TEXTURE6=33990,TEXTURE7=33991,TEXTURE8=33992,TEXTURE9=33993,TEXTURE10=33994,TEXTURE11=33995,TEXTURE12=33996,TEXTURE13=33997,TEXTURE14=33998,TEXTURE15=33999,TEXTURE16=34000,TEXTURE17=34001,TEXTURE18=34002,TEXTURE19=34003,TEXTURE20=34004,TEXTURE21=34005,TEXTURE22=34006,TEXTURE23=34007,TEXTURE24=34008,TEXTURE25=34009,TEXTURE26=34010,TEXTURE27=34011,TEXTURE28=34012,TEXTURE29=34013,TEXTURE30=34014,TEXTURE31=34015,ACTIVE_TEXTURE=34016,REPEAT=10497,CLAMP_TO_EDGE=33071,MIRRORED_REPEAT=33648,FLOAT_VEC2=35664,FLOAT_VEC3=35665,FLOAT_VEC4=35666,INT_VEC2=35667,INT_VEC3=35668,INT_VEC4=35669,BOOL=35670,BOOL_VEC2=35671,BOOL_VEC3=35672,BOOL_VEC4=35673,FLOAT_MAT2=35674,FLOAT_MAT3=35675,FLOAT_MAT4=35676,SAMPLER_2D=35678,SAMPLER_CUBE=35680,VERTEX_ATTRIB_ARRAY_ENABLED=34338,VERTEX_ATTRIB_ARRAY_SIZE=34339,VERTEX_ATTRIB_ARRAY_STRIDE=34340,VERTEX_ATTRIB_ARRAY_TYPE=34341,VERTEX_ATTRIB_ARRAY_NORMALIZED=34922,VERTEX_ATTRIB_ARRAY_POINTER=34373,VERTEX_ATTRIB_ARRAY_BUFFER_BINDING=34975,IMPLEMENTATION_COLOR_READ_TYPE=35738,IMPLEMENTATION_COLOR_READ_FORMAT=35739,COMPILE_STATUS=35713,LOW_FLOAT=36336,MEDIUM_FLOAT=36337,HIGH_FLOAT=36338,LOW_INT=36339,MEDIUM_INT=36340,HIGH_INT=36341,FRAMEBUFFER=36160,RENDERBUFFER=36161,RGBA4=32854,RGB5_A1=32855,RGB565=36194,DEPTH_COMPONENT16=33189,STENCIL_INDEX8=36168,DEPTH_STENCIL=34041,RENDERBUFFER_WIDTH=36162,RENDERBUFFER_HEIGHT=36163,RENDERBUFFER_INTERNAL_FORMAT=36164,RENDERBUFFER_RED_SIZE=36176,RENDERBUFFER_GREEN_SIZE=36177,RENDERBUFFER_BLUE_SIZE=36178,RENDERBUFFER_ALPHA_SIZE=36179,RENDERBUFFER_DEPTH_SIZE=36180,RENDERBUFFER_STENCIL_SIZE=36181,FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE=36048,FRAMEBUFFER_ATTACHMENT_OBJECT_NAME=36049,FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL=36050,FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE=36051,COLOR_ATTACHMENT0=36064,DEPTH_ATTACHMENT=36096,STENCIL_ATTACHMENT=36128,DEPTH_STENCIL_ATTACHMENT=33306,NONE=0,FRAMEBUFFER_COMPLETE=36053,FRAMEBUFFER_INCOMPLETE_ATTACHMENT=36054,FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT=36055,FRAMEBUFFER_INCOMPLETE_DIMENSIONS=36057,FRAMEBUFFER_UNSUPPORTED=36061,FRAMEBUFFER_BINDING=36006,RENDERBUFFER_BINDING=36007,MAX_RENDERBUFFER_SIZE=34024,INVALID_FRAMEBUFFER_OPERATION=1286,UNPACK_FLIP_Y_WEBGL=37440,UNPACK_PREMULTIPLY_ALPHA_WEBGL=37441,CONTEXT_LOST_WEBGL=37442,UNPACK_COLORSPACE_CONVERSION_WEBGL=37443,BROWSER_DEFAULT_WEBGL=37444,READ_BUFFER=3074,UNPACK_ROW_LENGTH=3314,UNPACK_SKIP_ROWS=3315,UNPACK_SKIP_PIXELS=3316,PACK_ROW_LENGTH=3330,PACK_SKIP_ROWS=3331,PACK_SKIP_PIXELS=3332,COLOR=6144,DEPTH=6145,STENCIL=6146,RED=6403,RGB8=32849,RGBA8=32856,RGB10_A2=32857,TEXTURE_BINDING_3D=32874,UNPACK_SKIP_IMAGES=32877,UNPACK_IMAGE_HEIGHT=32878,TEXTURE_3D=32879,TEXTURE_WRAP_R=32882,MAX_3D_TEXTURE_SIZE=32883,UNSIGNED_INT_2_10_10_10_REV=33640,MAX_ELEMENTS_VERTICES=33000,MAX_ELEMENTS_INDICES=33001,TEXTURE_MIN_LOD=33082,TEXTURE_MAX_LOD=33083,TEXTURE_BASE_LEVEL=33084,TEXTURE_MAX_LEVEL=33085,MIN=32775,MAX=32776,DEPTH_COMPONENT24=33190,MAX_TEXTURE_LOD_BIAS=34045,TEXTURE_COMPARE_MODE=34892,TEXTURE_COMPARE_FUNC=34893,CURRENT_QUERY=34917,QUERY_RESULT=34918,QUERY_RESULT_AVAILABLE=34919,STREAM_READ=35041,STREAM_COPY=35042,STATIC_READ=35045,STATIC_COPY=35046,DYNAMIC_READ=35049,DYNAMIC_COPY=35050,MAX_DRAW_BUFFERS=34852,DRAW_BUFFER0=34853,DRAW_BUFFER1=34854,DRAW_BUFFER2=34855,DRAW_BUFFER3=34856,DRAW_BUFFER4=34857,DRAW_BUFFER5=34858,DRAW_BUFFER6=34859,DRAW_BUFFER7=34860,DRAW_BUFFER8=34861,DRAW_BUFFER9=34862,DRAW_BUFFER10=34863,DRAW_BUFFER11=34864,DRAW_BUFFER12=34865,DRAW_BUFFER13=34866,DRAW_BUFFER14=34867,DRAW_BUFFER15=34868,MAX_FRAGMENT_UNIFORM_COMPONENTS=35657,MAX_VERTEX_UNIFORM_COMPONENTS=35658,SAMPLER_3D=35679,SAMPLER_2D_SHADOW=35682,FRAGMENT_SHADER_DERIVATIVE_HINT=35723,PIXEL_PACK_BUFFER=35051,PIXEL_UNPACK_BUFFER=35052,PIXEL_PACK_BUFFER_BINDING=35053,PIXEL_UNPACK_BUFFER_BINDING=35055,FLOAT_MAT2x3=35685,FLOAT_MAT2x4=35686,FLOAT_MAT3x2=35687,FLOAT_MAT3x4=35688,FLOAT_MAT4x2=35689,FLOAT_MAT4x3=35690,SRGB=35904,SRGB8=35905,SRGB8_ALPHA8=35907,COMPARE_REF_TO_TEXTURE=34894,RGBA32F=34836,RGB32F=34837,RGBA16F=34842,RGB16F=34843,VERTEX_ATTRIB_ARRAY_INTEGER=35069,MAX_ARRAY_TEXTURE_LAYERS=35071,MIN_PROGRAM_TEXEL_OFFSET=35076,MAX_PROGRAM_TEXEL_OFFSET=35077,MAX_VARYING_COMPONENTS=35659,TEXTURE_2D_ARRAY=35866,TEXTURE_BINDING_2D_ARRAY=35869,R11F_G11F_B10F=35898,UNSIGNED_INT_10F_11F_11F_REV=35899,RGB9_E5=35901,UNSIGNED_INT_5_9_9_9_REV=35902,TRANSFORM_FEEDBACK_BUFFER_MODE=35967,MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS=35968,TRANSFORM_FEEDBACK_VARYINGS=35971,TRANSFORM_FEEDBACK_BUFFER_START=35972,TRANSFORM_FEEDBACK_BUFFER_SIZE=35973,TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN=35976,RASTERIZER_DISCARD=35977,MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS=35978,MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS=35979,INTERLEAVED_ATTRIBS=35980,SEPARATE_ATTRIBS=35981,TRANSFORM_FEEDBACK_BUFFER=35982,TRANSFORM_FEEDBACK_BUFFER_BINDING=35983,RGBA32UI=36208,RGB32UI=36209,RGBA16UI=36214,RGB16UI=36215,RGBA8UI=36220,RGB8UI=36221,RGBA32I=36226,RGB32I=36227,RGBA16I=36232,RGB16I=36233,RGBA8I=36238,RGB8I=36239,RED_INTEGER=36244,RGB_INTEGER=36248,RGBA_INTEGER=36249,SAMPLER_2D_ARRAY=36289,SAMPLER_2D_ARRAY_SHADOW=36292,SAMPLER_CUBE_SHADOW=36293,UNSIGNED_INT_VEC2=36294,UNSIGNED_INT_VEC3=36295,UNSIGNED_INT_VEC4=36296,INT_SAMPLER_2D=36298,INT_SAMPLER_3D=36299,INT_SAMPLER_CUBE=36300,INT_SAMPLER_2D_ARRAY=36303,UNSIGNED_INT_SAMPLER_2D=36306,UNSIGNED_INT_SAMPLER_3D=36307,UNSIGNED_INT_SAMPLER_CUBE=36308,UNSIGNED_INT_SAMPLER_2D_ARRAY=36311,DEPTH_COMPONENT32F=36012,DEPTH32F_STENCIL8=36013,FLOAT_32_UNSIGNED_INT_24_8_REV=36269,FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING=33296,FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE=33297,FRAMEBUFFER_ATTACHMENT_RED_SIZE=33298,FRAMEBUFFER_ATTACHMENT_GREEN_SIZE=33299,FRAMEBUFFER_ATTACHMENT_BLUE_SIZE=33300,FRAMEBUFFER_ATTACHMENT_ALPHA_SIZE=33301,FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE=33302,FRAMEBUFFER_ATTACHMENT_STENCIL_SIZE=33303,FRAMEBUFFER_DEFAULT=33304,UNSIGNED_INT_24_8=34042,DEPTH24_STENCIL8=35056,UNSIGNED_NORMALIZED=35863,DRAW_FRAMEBUFFER_BINDING=36006,READ_FRAMEBUFFER=36008,DRAW_FRAMEBUFFER=36009,READ_FRAMEBUFFER_BINDING=36010,RENDERBUFFER_SAMPLES=36011,FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER=36052,MAX_COLOR_ATTACHMENTS=36063,COLOR_ATTACHMENT1=36065,COLOR_ATTACHMENT2=36066,COLOR_ATTACHMENT3=36067,COLOR_ATTACHMENT4=36068,COLOR_ATTACHMENT5=36069,COLOR_ATTACHMENT6=36070,COLOR_ATTACHMENT7=36071,COLOR_ATTACHMENT8=36072,COLOR_ATTACHMENT9=36073,COLOR_ATTACHMENT10=36074,COLOR_ATTACHMENT11=36075,COLOR_ATTACHMENT12=36076,COLOR_ATTACHMENT13=36077,COLOR_ATTACHMENT14=36078,COLOR_ATTACHMENT15=36079,FRAMEBUFFER_INCOMPLETE_MULTISAMPLE=36182,MAX_SAMPLES=36183,HALF_FLOAT=5131,RG=33319,RG_INTEGER=33320,R8=33321,RG8=33323,R16F=33325,R32F=33326,RG16F=33327,RG32F=33328,R8I=33329,R8UI=33330,R16I=33331,R16UI=33332,R32I=33333,R32UI=33334,RG8I=33335,RG8UI=33336,RG16I=33337,RG16UI=33338,RG32I=33339,RG32UI=33340,VERTEX_ARRAY_BINDING=34229,R8_SNORM=36756,RG8_SNORM=36757,RGB8_SNORM=36758,RGBA8_SNORM=36759,SIGNED_NORMALIZED=36764,COPY_READ_BUFFER=36662,COPY_WRITE_BUFFER=36663,COPY_READ_BUFFER_BINDING=36662,COPY_WRITE_BUFFER_BINDING=36663,UNIFORM_BUFFER=35345,UNIFORM_BUFFER_BINDING=35368,UNIFORM_BUFFER_START=35369,UNIFORM_BUFFER_SIZE=35370,MAX_VERTEX_UNIFORM_BLOCKS=35371,MAX_FRAGMENT_UNIFORM_BLOCKS=35373,MAX_COMBINED_UNIFORM_BLOCKS=35374,MAX_UNIFORM_BUFFER_BINDINGS=35375,MAX_UNIFORM_BLOCK_SIZE=35376,MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS=35377,MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS=35379,UNIFORM_BUFFER_OFFSET_ALIGNMENT=35380,ACTIVE_UNIFORM_BLOCKS=35382,UNIFORM_TYPE=35383,UNIFORM_SIZE=35384,UNIFORM_BLOCK_INDEX=35386,UNIFORM_OFFSET=35387,UNIFORM_ARRAY_STRIDE=35388,UNIFORM_MATRIX_STRIDE=35389,UNIFORM_IS_ROW_MAJOR=35390,UNIFORM_BLOCK_BINDING=35391,UNIFORM_BLOCK_DATA_SIZE=35392,UNIFORM_BLOCK_ACTIVE_UNIFORMS=35394,UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES=35395,UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER=35396,UNIFORM_BLOCK_REFERENCED_BY_FRAGMENT_SHADER=35398,INVALID_INDEX=4294967295,MAX_VERTEX_OUTPUT_COMPONENTS=37154,MAX_FRAGMENT_INPUT_COMPONENTS=37157,MAX_SERVER_WAIT_TIMEOUT=37137,OBJECT_TYPE=37138,SYNC_CONDITION=37139,SYNC_STATUS=37140,SYNC_FLAGS=37141,SYNC_FENCE=37142,SYNC_GPU_COMMANDS_COMPLETE=37143,UNSIGNALED=37144,SIGNALED=37145,ALREADY_SIGNALED=37146,TIMEOUT_EXPIRED=37147,CONDITION_SATISFIED=37148,WAIT_FAILED=37149,SYNC_FLUSH_COMMANDS_BIT=1,VERTEX_ATTRIB_ARRAY_DIVISOR=35070,ANY_SAMPLES_PASSED=35887,ANY_SAMPLES_PASSED_CONSERVATIVE=36202,SAMPLER_BINDING=35097,RGB10_A2UI=36975,INT_2_10_10_10_REV=36255,TRANSFORM_FEEDBACK=36386,TRANSFORM_FEEDBACK_PAUSED=36387,TRANSFORM_FEEDBACK_ACTIVE=36388,TRANSFORM_FEEDBACK_BINDING=36389,TEXTURE_IMMUTABLE_FORMAT=37167,MAX_ELEMENT_INDEX=36203,TEXTURE_IMMUTABLE_LEVELS=33503,TIMEOUT_IGNORED=-1,MAX_CLIENT_WAIT_TIMEOUT_WEBGL=37447';
   const GL2_METHODS = 'activeTexture,attachShader,beginQuery,beginTransformFeedback,bindAttribLocation,bindBufferBase,bindBufferRange,bindRenderbuffer,bindSampler,bindTransformFeedback,bindVertexArray,blendColor,blendEquation,blendEquationSeparate,blendFunc,blendFuncSeparate,blitFramebuffer,bufferData,bufferSubData,checkFramebufferStatus,clientWaitSync,compileShader,compressedTexImage2D,compressedTexImage3D,compressedTexSubImage2D,compressedTexSubImage3D,copyBufferSubData,copyTexImage2D,copyTexSubImage2D,copyTexSubImage3D,createBuffer,createFramebuffer,createProgram,createQuery,createRenderbuffer,createSampler,createShader,createTexture,createTransformFeedback,createVertexArray,cullFace,deleteBuffer,deleteFramebuffer,deleteProgram,deleteQuery,deleteRenderbuffer,deleteSampler,deleteShader,deleteSync,deleteTexture,deleteTransformFeedback,deleteVertexArray,depthFunc,depthMask,depthRange,detachShader,disable,drawArraysInstanced,drawElementsInstanced,drawRangeElements,enable,endQuery,endTransformFeedback,fenceSync,finish,flush,framebufferRenderbuffer,framebufferTexture2D,framebufferTextureLayer,frontFace,generateMipmap,getActiveAttrib,getActiveUniform,getActiveUniformBlockName,getActiveUniformBlockParameter,getActiveUniforms,getAttachedShaders,getAttribLocation,getBufferParameter,getBufferSubData,getContextAttributes,getError,getExtension,getFragDataLocation,getFramebufferAttachmentParameter,getIndexedParameter,getInternalformatParameter,getParameter,getProgramInfoLog,getProgramParameter,getQuery,getQueryParameter,getRenderbufferParameter,getSamplerParameter,getShaderInfoLog,getShaderParameter,getShaderPrecisionFormat,getShaderSource,getSupportedExtensions,getSyncParameter,getTexParameter,getTransformFeedbackVarying,getUniform,getUniformBlockIndex,getUniformIndices,getUniformLocation,getVertexAttrib,getVertexAttribOffset,hint,invalidateFramebuffer,invalidateSubFramebuffer,isBuffer,isContextLost,isEnabled,isFramebuffer,isProgram,isQuery,isRenderbuffer,isSampler,isShader,isSync,isTexture,isTransformFeedback,isVertexArray,lineWidth,linkProgram,pauseTransformFeedback,pixelStorei,polygonOffset,readBuffer,readPixels,renderbufferStorage,renderbufferStorageMultisample,resumeTransformFeedback,sampleCoverage,samplerParameterf,samplerParameteri,shaderSource,stencilFunc,stencilFuncSeparate,stencilMask,stencilMaskSeparate,stencilOp,stencilOpSeparate,texImage2D,texImage3D,texParameterf,texParameteri,texStorage2D,texStorage3D,texSubImage2D,texSubImage3D,transformFeedbackVaryings,uniform1ui,uniform2ui,uniform3ui,uniform4ui,uniformBlockBinding,useProgram,validateProgram,vertexAttribDivisor,vertexAttribI4i,vertexAttribI4ui,vertexAttribIPointer,waitSync,bindBuffer,bindFramebuffer,bindTexture,clear,clearBufferfi,clearBufferfv,clearBufferiv,clearBufferuiv,clearColor,clearDepth,clearStencil,colorMask,disableVertexAttribArray,drawArrays,drawBuffers,drawElements,enableVertexAttribArray,scissor,uniform1f,uniform1fv,uniform1i,uniform1iv,uniform1uiv,uniform2f,uniform2fv,uniform2i,uniform2iv,uniform2uiv,uniform3f,uniform3fv,uniform3i,uniform3iv,uniform3uiv,uniform4f,uniform4fv,uniform4i,uniform4iv,uniform4uiv,uniformMatrix2fv,uniformMatrix2x3fv,uniformMatrix2x4fv,uniformMatrix3fv,uniformMatrix3x2fv,uniformMatrix3x4fv,uniformMatrix4fv,uniformMatrix4x2fv,uniformMatrix4x3fv,vertexAttrib1f,vertexAttrib1fv,vertexAttrib2f,vertexAttrib2fv,vertexAttrib3f,vertexAttrib3fv,vertexAttrib4f,vertexAttrib4fv,vertexAttribI4iv,vertexAttribI4uiv,vertexAttribPointer,viewport,drawingBufferStorage,makeXRCompatible';
   const GL_ATTRS = 'canvas,drawingBufferWidth,drawingBufferHeight,drawingBufferColorSpace,unpackColorSpace,drawingBufferFormat'.split(',');
+  // Пределы и форматы WebGL, снятые с Chrome 148 на этой же машине: на
+  // половину вопросов мы отвечали нулём, а у живой видеокарты нулей там не
+  // бывает. Наши собственные строки (вендор, рендерер, версии) остаются
+  // нашими — таблица заполняет только то, чего не было.
+  const GL1_PARAMS = {2849:1,2884:false,2885:1029,2886:2305,2928:[0,1],2929:false,2930:true,2931:1,2932:513,2960:false,2961:0,2962:519,2963:4294967295,2964:7680,2965:7680,2966:7680,2967:0,2968:4294967295,2978:[0,0,300,150],3024:true,3042:false,3088:[0,0,300,150],3089:false,3106:[0,0,0,0],3107:[true,true,true,true],3317:4,3333:4,3379:16384,3386:[16384,16384],3408:4,3410:8,3411:8,3412:8,3413:8,3414:24,3415:0,7936:"WebKit",7937:"WebKit WebGL",7938:"WebGL 1.0 (OpenGL ES 2.0 Chromium)",10752:0,32773:[0,0,0,0],32777:32774,32823:false,32824:0,32926:false,32928:false,32936:1,32937:4,32938:1,32939:false,32968:0,32969:1,32970:0,32971:1,33170:4352,33901:[1,255],33902:[1,7.375],34016:33984,34024:16384,34076:16384,34467:[],34816:519,34817:7680,34818:7680,34819:7680,34877:32774,34921:16,34930:32,35660:32,35661:64,35724:"WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)",35738:5121,35739:6408,36003:0,36004:4294967295,36005:4294967295,36347:1024,36348:32,36349:1024,37440:false,37441:false,37443:37444};
+  const GL2_PARAMS = {2849:1,2884:false,2885:1029,2886:2305,2928:[0,1],2929:false,2930:true,2931:1,2932:513,2960:false,2961:0,2962:519,2963:4294967295,2964:7680,2965:7680,2966:7680,2967:0,2968:4294967295,2978:[0,0,300,150],3024:true,3042:false,3074:1029,3088:[0,0,300,150],3089:false,3106:[0,0,0,0],3107:[true,true,true,true],3314:0,3315:0,3316:0,3317:4,3330:0,3331:0,3332:0,3333:4,3379:16384,3386:[16384,16384],3408:4,3410:8,3411:8,3412:8,3413:8,3414:24,3415:0,7936:"WebKit",7937:"WebKit WebGL",7938:"WebGL 2.0 (OpenGL ES 3.0 Chromium)",10752:0,32773:[0,0,0,0],32777:32774,32823:false,32824:0,32877:0,32878:0,32883:2048,32926:false,32928:false,32936:1,32937:4,32938:1,32939:false,32968:0,32969:1,32970:0,32971:1,33000:3000,33001:3000,33170:4352,33901:[1,255],33902:[1,7.375],34016:33984,34024:16384,34045:15,34076:16384,34467:[],34816:519,34817:7680,34818:7680,34819:7680,34852:8,34853:1029,34854:1029,34855:1029,34856:1029,34857:1029,34858:1029,34859:1029,34860:1029,34877:32774,34921:16,34930:32,35071:2048,35076:-8,35077:7,35371:15,35373:15,35374:45,35375:72,35376:65536,35377:262144,35379:262144,35380:32,35657:4096,35658:4096,35659:128,35660:32,35661:64,35723:4352,35724:"WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)",35738:5121,35739:6408,35968:4,35977:false,35978:64,35979:4,36003:0,36004:4294967295,36005:4294967295,36063:8,36183:16,36203:4294967295,36347:1024,36348:32,36349:1024,36387:false,36388:false,37137:9223372034707292000,37154:128,37157:128,37440:false,37441:false,37443:37444,37447:0};
+  // Точность шейдерных типов: диапазон и число значащих бит.
+  const GL_PRECISION = {"35633:36336":[127,127,23],"35633:36337":[127,127,23],"35633:36338":[127,127,23],"35633:36339":[31,30,0],"35633:36340":[31,30,0],"35633:36341":[31,30,0],"35632:36336":[127,127,23],"35632:36337":[127,127,23],"35632:36338":[127,127,23],"35632:36339":[31,30,0],"35632:36340":[31,30,0],"35632:36341":[31,30,0]};
+  // Сколько сглаживаний поддерживает каждый внутренний формат буфера.
+  const GL_FORMAT_SAMPLES = {32849:[16,8,4,2],32854:[16,8,4,2],32855:[16,8,4,2],32856:[16,8,4,2],32857:[16,8,4,2],33189:[16,8,4,2],33190:[16,8,4,2],33321:[16,8,4,2],33323:[16,8,4,2],33329:[],33330:[],33331:[],33332:[],33333:[],33334:[],33335:[],33336:[],33337:[],33338:[],33339:[],33340:[],35056:[16,8,4,2],35907:[16,8,4,2],36012:[16,8,4,2],36013:[16,8,4,2],36168:[16,8,4,2],36194:[16,8,4,2],36208:[],36214:[],36220:[],36226:[],36232:[],36238:[],36975:[]};
+  const GL1_EXTS = ["ANGLE_instanced_arrays", "EXT_blend_minmax", "EXT_clip_control", "EXT_color_buffer_half_float", "EXT_depth_clamp", "EXT_disjoint_timer_query", "EXT_float_blend", "EXT_frag_depth", "EXT_polygon_offset_clamp", "EXT_texture_compression_bptc", "EXT_texture_compression_rgtc", "EXT_texture_filter_anisotropic", "EXT_sRGB", "KHR_parallel_shader_compile", "OES_element_index_uint", "OES_fbo_render_mipmap", "OES_standard_derivatives", "OES_texture_float", "OES_texture_float_linear", "OES_texture_half_float", "OES_texture_half_float_linear", "OES_vertex_array_object", "WEBGL_blend_func_extended", "WEBGL_color_buffer_float", "WEBGL_compressed_texture_astc", "WEBGL_compressed_texture_etc", "WEBGL_compressed_texture_etc1", "WEBGL_compressed_texture_s3tc", "WEBGL_compressed_texture_s3tc_srgb", "WEBGL_debug_renderer_info", "WEBGL_debug_shaders", "WEBGL_depth_texture", "WEBGL_draw_buffers", "WEBGL_lose_context", "WEBGL_multi_draw"];
+  const GL2_EXTS = ["EXT_clip_control", "EXT_color_buffer_float", "EXT_color_buffer_half_float", "EXT_depth_clamp", "EXT_disjoint_timer_query_webgl2", "EXT_float_blend", "EXT_polygon_offset_clamp", "EXT_texture_compression_bptc", "EXT_texture_compression_rgtc", "EXT_texture_filter_anisotropic", "EXT_texture_norm16", "KHR_parallel_shader_compile", "NV_shader_noperspective_interpolation", "OES_draw_buffers_indexed", "OES_sample_variables", "OES_shader_multisample_interpolation", "OES_texture_float_linear", "WEBGL_blend_func_extended", "WEBGL_compressed_texture_astc", "WEBGL_compressed_texture_etc", "WEBGL_compressed_texture_etc1", "WEBGL_compressed_texture_s3tc", "WEBGL_compressed_texture_s3tc_srgb", "WEBGL_debug_renderer_info", "WEBGL_debug_shaders", "WEBGL_lose_context", "WEBGL_multi_draw", "WEBGL_stencil_texturing"];
+
+  // Расширения WebGL, как их отдаёт Chrome 148: у каждого свой интерфейс и свой
+  // набор членов. Мы отдавали пустой объект `{}` на любое имя — то есть
+  // `Object.prototype.toString` по нему говорил `[object Object]` там, где
+  // браузер называет `[object EXTTextureFilterAnisotropic]`, а члены
+  // отсутствовали вовсе.
+  const GL1_EXT_SHAPE = {"ANGLE_instanced_arrays":["ANGLEInstancedArrays","VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE,drawArraysInstancedANGLE,drawElementsInstancedANGLE,vertexAttribDivisorANGLE"],"EXT_blend_minmax":["EXTBlendMinMax","MIN_EXT,MAX_EXT"],"EXT_clip_control":["EXTClipControl","LOWER_LEFT_EXT,UPPER_LEFT_EXT,NEGATIVE_ONE_TO_ONE_EXT,ZERO_TO_ONE_EXT,CLIP_ORIGIN_EXT,CLIP_DEPTH_MODE_EXT,clipControlEXT"],"EXT_color_buffer_half_float":["EXTColorBufferHalfFloat","RGBA16F_EXT,RGB16F_EXT,FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE_EXT,UNSIGNED_NORMALIZED_EXT"],"EXT_depth_clamp":["EXTDepthClamp","DEPTH_CLAMP_EXT"],"EXT_disjoint_timer_query":["EXTDisjointTimerQuery","QUERY_COUNTER_BITS_EXT,CURRENT_QUERY_EXT,QUERY_RESULT_EXT,QUERY_RESULT_AVAILABLE_EXT,TIME_ELAPSED_EXT,TIMESTAMP_EXT,GPU_DISJOINT_EXT,beginQueryEXT,createQueryEXT,deleteQueryEXT,endQueryEXT,getQueryEXT,getQueryObjectEXT,isQueryEXT,queryCounterEXT"],"EXT_float_blend":["EXTFloatBlend",""],"EXT_frag_depth":["EXTFragDepth",""],"EXT_polygon_offset_clamp":["EXTPolygonOffsetClamp","POLYGON_OFFSET_CLAMP_EXT,polygonOffsetClampEXT"],"EXT_texture_compression_bptc":["EXTTextureCompressionBPTC","COMPRESSED_RGBA_BPTC_UNORM_EXT,COMPRESSED_SRGB_ALPHA_BPTC_UNORM_EXT,COMPRESSED_RGB_BPTC_SIGNED_FLOAT_EXT,COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT_EXT"],"EXT_texture_compression_rgtc":["EXTTextureCompressionRGTC","COMPRESSED_RED_RGTC1_EXT,COMPRESSED_SIGNED_RED_RGTC1_EXT,COMPRESSED_RED_GREEN_RGTC2_EXT,COMPRESSED_SIGNED_RED_GREEN_RGTC2_EXT"],"EXT_texture_filter_anisotropic":["EXTTextureFilterAnisotropic","TEXTURE_MAX_ANISOTROPY_EXT,MAX_TEXTURE_MAX_ANISOTROPY_EXT"],"EXT_sRGB":["EXTsRGB","SRGB_EXT,SRGB_ALPHA_EXT,SRGB8_ALPHA8_EXT,FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING_EXT"],"KHR_parallel_shader_compile":["KHRParallelShaderCompile","COMPLETION_STATUS_KHR"],"OES_element_index_uint":["OESElementIndexUint",""],"OES_fbo_render_mipmap":["OESFboRenderMipmap",""],"OES_standard_derivatives":["OESStandardDerivatives","FRAGMENT_SHADER_DERIVATIVE_HINT_OES"],"OES_texture_float":["OESTextureFloat",""],"OES_texture_float_linear":["OESTextureFloatLinear",""],"OES_texture_half_float":["OESTextureHalfFloat","HALF_FLOAT_OES"],"OES_texture_half_float_linear":["OESTextureHalfFloatLinear",""],"OES_vertex_array_object":["OESVertexArrayObject","VERTEX_ARRAY_BINDING_OES,bindVertexArrayOES,createVertexArrayOES,deleteVertexArrayOES,isVertexArrayOES"],"WEBGL_blend_func_extended":["WebGLBlendFuncExtended","SRC1_COLOR_WEBGL,SRC1_ALPHA_WEBGL,ONE_MINUS_SRC1_COLOR_WEBGL,ONE_MINUS_SRC1_ALPHA_WEBGL,MAX_DUAL_SOURCE_DRAW_BUFFERS_WEBGL"],"WEBGL_color_buffer_float":["WebGLColorBufferFloat","RGBA32F_EXT,FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE_EXT,UNSIGNED_NORMALIZED_EXT"],"WEBGL_compressed_texture_astc":["WebGLCompressedTextureASTC","COMPRESSED_RGBA_ASTC_4x4_KHR,COMPRESSED_RGBA_ASTC_5x4_KHR,COMPRESSED_RGBA_ASTC_5x5_KHR,COMPRESSED_RGBA_ASTC_6x5_KHR,COMPRESSED_RGBA_ASTC_6x6_KHR,COMPRESSED_RGBA_ASTC_8x5_KHR,COMPRESSED_RGBA_ASTC_8x6_KHR,COMPRESSED_RGBA_ASTC_8x8_KHR,COMPRESSED_RGBA_ASTC_10x5_KHR,COMPRESSED_RGBA_ASTC_10x6_KHR,COMPRESSED_RGBA_ASTC_10x8_KHR,COMPRESSED_RGBA_ASTC_10x10_KHR,COMPRESSED_RGBA_ASTC_12x10_KHR,COMPRESSED_RGBA_ASTC_12x12_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_6x5_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_8x5_KHR"],"WEBGL_compressed_texture_etc":["WebGLCompressedTextureETC","COMPRESSED_R11_EAC,COMPRESSED_SIGNED_R11_EAC,COMPRESSED_RG11_EAC,COMPRESSED_SIGNED_RG11_EAC,COMPRESSED_RGB8_ETC2,COMPRESSED_SRGB8_ETC2,COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2,COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2,COMPRESSED_RGBA8_ETC2_EAC,COMPRESSED_SRGB8_ALPHA8_ETC2_EAC"],"WEBGL_compressed_texture_etc1":["WebGLCompressedTextureETC1","COMPRESSED_RGB_ETC1_WEBGL"],"WEBGL_compressed_texture_s3tc":["WebGLCompressedTextureS3TC","COMPRESSED_RGB_S3TC_DXT1_EXT,COMPRESSED_RGBA_S3TC_DXT1_EXT,COMPRESSED_RGBA_S3TC_DXT3_EXT,COMPRESSED_RGBA_S3TC_DXT5_EXT"],"WEBGL_compressed_texture_s3tc_srgb":["WebGLCompressedTextureS3TCsRGB","COMPRESSED_SRGB_S3TC_DXT1_EXT,COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT,COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT,COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT"],"WEBGL_debug_renderer_info":["WebGLDebugRendererInfo","UNMASKED_VENDOR_WEBGL,UNMASKED_RENDERER_WEBGL"],"WEBGL_debug_shaders":["WebGLDebugShaders","getTranslatedShaderSource"],"WEBGL_depth_texture":["WebGLDepthTexture","UNSIGNED_INT_24_8_WEBGL"],"WEBGL_draw_buffers":["WebGLDrawBuffers","COLOR_ATTACHMENT0_WEBGL,COLOR_ATTACHMENT1_WEBGL,COLOR_ATTACHMENT2_WEBGL,COLOR_ATTACHMENT3_WEBGL,COLOR_ATTACHMENT4_WEBGL,COLOR_ATTACHMENT5_WEBGL,COLOR_ATTACHMENT6_WEBGL,COLOR_ATTACHMENT7_WEBGL,COLOR_ATTACHMENT8_WEBGL,COLOR_ATTACHMENT9_WEBGL,COLOR_ATTACHMENT10_WEBGL,COLOR_ATTACHMENT11_WEBGL,COLOR_ATTACHMENT12_WEBGL,COLOR_ATTACHMENT13_WEBGL,COLOR_ATTACHMENT14_WEBGL,COLOR_ATTACHMENT15_WEBGL,DRAW_BUFFER0_WEBGL,DRAW_BUFFER1_WEBGL,DRAW_BUFFER2_WEBGL,DRAW_BUFFER3_WEBGL"],"WEBGL_lose_context":["WebGLLoseContext","loseContext,restoreContext"],"WEBGL_multi_draw":["WebGLMultiDraw","multiDrawArraysInstancedWEBGL,multiDrawArraysWEBGL,multiDrawElementsInstancedWEBGL,multiDrawElementsWEBGL"]};
+  const GL2_EXT_SHAPE = {"EXT_clip_control":["EXTClipControl","LOWER_LEFT_EXT,UPPER_LEFT_EXT,NEGATIVE_ONE_TO_ONE_EXT,ZERO_TO_ONE_EXT,CLIP_ORIGIN_EXT,CLIP_DEPTH_MODE_EXT,clipControlEXT"],"EXT_color_buffer_float":["EXTColorBufferFloat",""],"EXT_color_buffer_half_float":["EXTColorBufferHalfFloat","RGBA16F_EXT,RGB16F_EXT,FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE_EXT,UNSIGNED_NORMALIZED_EXT"],"EXT_depth_clamp":["EXTDepthClamp","DEPTH_CLAMP_EXT"],"EXT_disjoint_timer_query_webgl2":["EXTDisjointTimerQueryWebGL2","QUERY_COUNTER_BITS_EXT,TIME_ELAPSED_EXT,TIMESTAMP_EXT,GPU_DISJOINT_EXT,queryCounterEXT"],"EXT_float_blend":["EXTFloatBlend",""],"EXT_polygon_offset_clamp":["EXTPolygonOffsetClamp","POLYGON_OFFSET_CLAMP_EXT,polygonOffsetClampEXT"],"EXT_texture_compression_bptc":["EXTTextureCompressionBPTC","COMPRESSED_RGBA_BPTC_UNORM_EXT,COMPRESSED_SRGB_ALPHA_BPTC_UNORM_EXT,COMPRESSED_RGB_BPTC_SIGNED_FLOAT_EXT,COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT_EXT"],"EXT_texture_compression_rgtc":["EXTTextureCompressionRGTC","COMPRESSED_RED_RGTC1_EXT,COMPRESSED_SIGNED_RED_RGTC1_EXT,COMPRESSED_RED_GREEN_RGTC2_EXT,COMPRESSED_SIGNED_RED_GREEN_RGTC2_EXT"],"EXT_texture_filter_anisotropic":["EXTTextureFilterAnisotropic","TEXTURE_MAX_ANISOTROPY_EXT,MAX_TEXTURE_MAX_ANISOTROPY_EXT"],"EXT_texture_norm16":["EXTTextureNorm16","R16_EXT,RG16_EXT,RGB16_EXT,RGBA16_EXT,R16_SNORM_EXT,RG16_SNORM_EXT,RGB16_SNORM_EXT,RGBA16_SNORM_EXT"],"KHR_parallel_shader_compile":["KHRParallelShaderCompile","COMPLETION_STATUS_KHR"],"NV_shader_noperspective_interpolation":["NVShaderNoperspectiveInterpolation",""],"OES_draw_buffers_indexed":["OESDrawBuffersIndexed","blendEquationSeparateiOES,blendEquationiOES,blendFuncSeparateiOES,blendFunciOES,colorMaskiOES,disableiOES,enableiOES"],"OES_sample_variables":["OESSampleVariables",""],"OES_shader_multisample_interpolation":["OESShaderMultisampleInterpolation","MIN_FRAGMENT_INTERPOLATION_OFFSET_OES,MAX_FRAGMENT_INTERPOLATION_OFFSET_OES,FRAGMENT_INTERPOLATION_OFFSET_BITS_OES"],"OES_texture_float_linear":["OESTextureFloatLinear",""],"WEBGL_blend_func_extended":["WebGLBlendFuncExtended","SRC1_COLOR_WEBGL,SRC1_ALPHA_WEBGL,ONE_MINUS_SRC1_COLOR_WEBGL,ONE_MINUS_SRC1_ALPHA_WEBGL,MAX_DUAL_SOURCE_DRAW_BUFFERS_WEBGL"],"WEBGL_compressed_texture_astc":["WebGLCompressedTextureASTC","COMPRESSED_RGBA_ASTC_4x4_KHR,COMPRESSED_RGBA_ASTC_5x4_KHR,COMPRESSED_RGBA_ASTC_5x5_KHR,COMPRESSED_RGBA_ASTC_6x5_KHR,COMPRESSED_RGBA_ASTC_6x6_KHR,COMPRESSED_RGBA_ASTC_8x5_KHR,COMPRESSED_RGBA_ASTC_8x6_KHR,COMPRESSED_RGBA_ASTC_8x8_KHR,COMPRESSED_RGBA_ASTC_10x5_KHR,COMPRESSED_RGBA_ASTC_10x6_KHR,COMPRESSED_RGBA_ASTC_10x8_KHR,COMPRESSED_RGBA_ASTC_10x10_KHR,COMPRESSED_RGBA_ASTC_12x10_KHR,COMPRESSED_RGBA_ASTC_12x12_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_6x5_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_8x5_KHR"],"WEBGL_compressed_texture_etc":["WebGLCompressedTextureETC","COMPRESSED_R11_EAC,COMPRESSED_SIGNED_R11_EAC,COMPRESSED_RG11_EAC,COMPRESSED_SIGNED_RG11_EAC,COMPRESSED_RGB8_ETC2,COMPRESSED_SRGB8_ETC2,COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2,COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2,COMPRESSED_RGBA8_ETC2_EAC,COMPRESSED_SRGB8_ALPHA8_ETC2_EAC"],"WEBGL_compressed_texture_etc1":["WebGLCompressedTextureETC1","COMPRESSED_RGB_ETC1_WEBGL"],"WEBGL_compressed_texture_s3tc":["WebGLCompressedTextureS3TC","COMPRESSED_RGB_S3TC_DXT1_EXT,COMPRESSED_RGBA_S3TC_DXT1_EXT,COMPRESSED_RGBA_S3TC_DXT3_EXT,COMPRESSED_RGBA_S3TC_DXT5_EXT"],"WEBGL_compressed_texture_s3tc_srgb":["WebGLCompressedTextureS3TCsRGB","COMPRESSED_SRGB_S3TC_DXT1_EXT,COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT,COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT,COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT"],"WEBGL_debug_renderer_info":["WebGLDebugRendererInfo","UNMASKED_VENDOR_WEBGL,UNMASKED_RENDERER_WEBGL"],"WEBGL_debug_shaders":["WebGLDebugShaders","getTranslatedShaderSource"],"WEBGL_lose_context":["WebGLLoseContext","loseContext,restoreContext"],"WEBGL_multi_draw":["WebGLMultiDraw","multiDrawArraysInstancedWEBGL,multiDrawArraysWEBGL,multiDrawElementsInstancedWEBGL,multiDrawElementsWEBGL"],"WEBGL_stencil_texturing":["WebGLStencilTexturing","DEPTH_STENCIL_TEXTURE_MODE_WEBGL,STENCIL_INDEX_WEBGL"]};
+  const GL1_SUPPORTED = ["ANGLE_instanced_arrays", "EXT_blend_minmax", "EXT_clip_control", "EXT_color_buffer_half_float", "EXT_depth_clamp", "EXT_disjoint_timer_query", "EXT_float_blend", "EXT_frag_depth", "EXT_polygon_offset_clamp", "EXT_texture_compression_bptc", "EXT_texture_compression_rgtc", "EXT_texture_filter_anisotropic", "EXT_sRGB", "KHR_parallel_shader_compile", "OES_element_index_uint", "OES_fbo_render_mipmap", "OES_standard_derivatives", "OES_texture_float", "OES_texture_float_linear", "OES_texture_half_float", "OES_texture_half_float_linear", "OES_vertex_array_object", "WEBGL_blend_func_extended", "WEBGL_color_buffer_float", "WEBGL_compressed_texture_astc", "WEBGL_compressed_texture_etc", "WEBGL_compressed_texture_etc1", "WEBGL_compressed_texture_s3tc", "WEBGL_compressed_texture_s3tc_srgb", "WEBGL_debug_renderer_info", "WEBGL_debug_shaders", "WEBGL_depth_texture", "WEBGL_draw_buffers", "WEBGL_lose_context", "WEBGL_multi_draw"];
+  const GL2_SUPPORTED = ["EXT_clip_control", "EXT_color_buffer_float", "EXT_color_buffer_half_float", "EXT_depth_clamp", "EXT_disjoint_timer_query_webgl2", "EXT_float_blend", "EXT_polygon_offset_clamp", "EXT_texture_compression_bptc", "EXT_texture_compression_rgtc", "EXT_texture_filter_anisotropic", "EXT_texture_norm16", "KHR_parallel_shader_compile", "NV_shader_noperspective_interpolation", "OES_draw_buffers_indexed", "OES_sample_variables", "OES_shader_multisample_interpolation", "OES_texture_float_linear", "WEBGL_blend_func_extended", "WEBGL_compressed_texture_astc", "WEBGL_compressed_texture_etc", "WEBGL_compressed_texture_etc1", "WEBGL_compressed_texture_s3tc", "WEBGL_compressed_texture_s3tc_srgb", "WEBGL_debug_renderer_info", "WEBGL_debug_shaders", "WEBGL_lose_context", "WEBGL_multi_draw", "WEBGL_stencil_texturing"];
+
+  // Константы расширений, значения которых важны: остальным хватает наличия.
+  // Диапазоны и точки — дробные, список сжатых форматов — беззнаковый.
+  const GL_F32 = [2928, 3106, 32824, 33901, 33902, 2849, 32777];
+  const GL_U32 = [34467];
+  // Параметры, которые появляются только вместе с расширением: их нет среди
+  // констант интерфейса, но спрашивают их наравне со всеми.
+  const EXT_PARAMS = { 34047: 16, 35723: 4352, 36795: false };
+
+  const EXT_VALUES = {
+    UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246,
+    MAX_TEXTURE_MAX_ANISOTROPY_EXT: 0x84FF, TEXTURE_MAX_ANISOTROPY_EXT: 0x84FE,
+    VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE: 0x88FE, MIN_EXT: 0x8007, MAX_EXT: 0x8008,
+    UNSIGNED_NORMALIZED_EXT: 0x8C17, RGBA16F_EXT: 0x881A, RGB16F_EXT: 0x881B,
+    FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE_EXT: 0x8211,
+    COMPLETION_STATUS_KHR: 0x91B1, MAX_DRAW_BUFFERS_WEBGL: 0x8824,
+  };
+
   const publishGL = (impl, C, constsStr, methodsStr) => {
     if (!C || !C.prototype) return impl;
     const P = C.prototype;
@@ -4549,27 +4634,46 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         } catch (e) {}
       }
       for (const name of methodsStr.split(',')) {
-        const f = function () {
-          const t = CTX_IMPL.get(this) || this;
-          const m = Object.prototype.hasOwnProperty.call(t, name) ? t[name] : null;
-          return typeof m === 'function' ? m.apply(t, arguments) : undefined;
-        };
-        try { Object.defineProperty(f, 'name', { value: name, configurable: true }); } catch (e) {}
+        const f = ({
+          [name](...args) {
+            const t = CTX_IMPL.get(this) || this;
+            const m = Object.prototype.hasOwnProperty.call(t, name) ? t[name] : null;
+            return typeof m === 'function' ? m.apply(t, args) : undefined;
+          },
+        })[name];
         try { Object.defineProperty(P, name, { value: mask(f, name), writable: true, enumerable: true, configurable: true }); } catch (e) {}
       }
       for (const name of GL_ATTRS) {
-        const get = function () {
-          const t = CTX_IMPL.get(this) || this;
-          return Object.prototype.hasOwnProperty.call(t, name) ? t[name] : undefined;
+        const acc = {
+          get [name]() {
+            const t = CTX_IMPL.get(this) || this;
+            return Object.prototype.hasOwnProperty.call(t, name) ? t[name] : undefined;
+          },
+          set [name](v) { const t = CTX_IMPL.get(this) || this; t[name] = v; },
         };
-        const set = function (v) { const t = CTX_IMPL.get(this) || this; t[name] = v; };
+        const d0 = Object.getOwnPropertyDescriptor(acc, name);
+        const get = d0.get, set = d0.set;
         try { Object.defineProperty(P, name, { get: mask(get, 'get ' + name), set: mask(set, 'set ' + name), enumerable: true, configurable: true }); } catch (e) {}
       }
     }
+    if (!impl) return null;                    // только объявить интерфейс
+    if (!impl) return null;                    // только объявить интерфейс
     const pub = Object.create(P);
     CTX_IMPL.set(pub, impl);
     return pub;
   };
+
+  // Интерфейсы объявляем сразу, а не при первом `getContext`: в браузере члены
+  // лежат на прототипе с самого начала, и сборщик, который перечисляет
+  // `CanvasRenderingContext2D.prototype` до всякого холста, у нас видел пустоту
+  // (а заодно её видел и наш собственный трассировщик, отчего целая фаза
+  // сбора — вся работа с WebGL — не попадала в ленту).
+  try {
+    publishContext(null, globalThis.CanvasRenderingContext2D, CTX2D_METHODS, CTX2D_ATTRS);
+    publishContext(null, globalThis.OffscreenCanvasRenderingContext2D, CTX2D_METHODS, CTX2D_ATTRS);
+    publishGL(null, globalThis.WebGLRenderingContext, GL1_CONSTS, GL1_METHODS);
+    publishGL(null, globalThis.WebGL2RenderingContext, GL2_CONSTS, GL2_METHODS);
+  } catch (e) {}
 
   const makeGL = (canvas, ver) => {
     const P = {
@@ -4579,10 +4683,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       0x8B8C: ver === 2 ? 'WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)' : 'WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)',
       0x9245: WEBGL_VENDOR,                               // UNMASKED_VENDOR_WEBGL
       0x9246: WEBGL_RENDERER,                             // UNMASKED_RENDERER_WEBGL
-      0x0D33: 16384, 0x851C: 16384, 0x84E8: 16, 0x8B4C: 16, 0x8B4D: 32, 0x8869: 16,
-      0x8DFB: 30, 0x8DFC: 32, 0x8DFD: 30, 0x8B4B: 1024, 0x0D3A: 32, 0x84E2: 32,
-      0x846E: [1, 1], 0x0B21: 8192, 0x8073: 16, 0x8B9A: 35724,
     };
+    // Числовые пределы раньше стояли здесь горстью догадок — и половина из них
+    // расходилась с тем, что на этой же машине отдаёт Chrome. Теперь их берут
+    // из измеренной таблицы (`GL1_PARAMS`/`GL2_PARAMS`), а здесь остаётся
+    // только то, чем мы представляемся: вендор, рендерер и версии.
     // WebGL enum constants — fingerprinters read `gl.VENDOR` etc., not literals.
     const C = {
       VENDOR: 0x1F00, RENDERER: 0x1F01, VERSION: 0x1F02, SHADING_LANGUAGE_VERSION: 0x8B8C,
@@ -4603,29 +4708,74 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       MAX_3D_TEXTURE_SIZE: 0x8073, MAX_ARRAY_TEXTURE_LAYERS: 0x88FF,
       MAX_DRAW_BUFFERS: 0x8824, MAX_COLOR_ATTACHMENTS: 0x8CDF,
     };
-    // Give MAX_* params sensible Chrome-ish values so `getParameter` answers.
-    Object.assign(P, {
-      [C.MAX_TEXTURE_SIZE]: 16384, [C.MAX_CUBE_MAP_TEXTURE_SIZE]: 16384, [C.MAX_RENDERBUFFER_SIZE]: 16384,
-      [C.MAX_VIEWPORT_DIMS]: [32767, 32767], [C.MAX_VERTEX_ATTRIBS]: 16,
-      [C.MAX_VERTEX_UNIFORM_VECTORS]: 4096, [C.MAX_VARYING_VECTORS]: 30, [C.MAX_FRAGMENT_UNIFORM_VECTORS]: 1024,
-      [C.MAX_VERTEX_TEXTURE_IMAGE_UNITS]: 16, [C.MAX_COMBINED_TEXTURE_IMAGE_UNITS]: 32,
-      [C.MAX_TEXTURE_IMAGE_UNITS]: 16, [C.MAX_TEXTURE_MAX_ANISOTROPY_EXT]: 16,
-      [C.ALIASED_LINE_WIDTH_RANGE]: [1, 1], [C.ALIASED_POINT_SIZE_RANGE]: [1, 1024],
-      [C.RED_BITS]: 8, [C.GREEN_BITS]: 8, [C.BLUE_BITS]: 8, [C.ALPHA_BITS]: 8,
-      [C.DEPTH_BITS]: 24, [C.STENCIL_BITS]: 0, [C.SAMPLES]: 0, [C.MAX_SAMPLES]: 8,
-      [C.MAX_3D_TEXTURE_SIZE]: 2048, [C.MAX_ARRAY_TEXTURE_LAYERS]: 2048,
-      [C.MAX_DRAW_BUFFERS]: 8, [C.MAX_COLOR_ATTACHMENTS]: 8,
-    });
+    // Пределы больше не выдумываем: они сняты с Chrome на этой же машине и
+    // лежат в `GL1_PARAMS`/`GL2_PARAMS`. Прежние «правдоподобные» значения
+    // расходились с настоящими в половине случаев — 8 сглаживаний против 16,
+    // 2048 слоёв против 2048 у одних и нули у полутора десятков других.
     const glProto = (ver === 2 ? globalThis.WebGL2RenderingContext : globalThis.WebGLRenderingContext).prototype;
     // То же и здесь: реализация живёт отдельно от интерфейса (см. publishGL).
     const gl = Object.assign({}, C, {
       canvas, drawingBufferWidth: canvas.width || 300, drawingBufferHeight: canvas.height || 150,
-      drawingBufferColorSpace: 'srgb',
-      getParameter(p){ return Object.prototype.hasOwnProperty.call(P, p) ? P[p] : (typeof p === 'number' ? 0 : null); },
-      getExtension(name){ if (name === 'WEBGL_debug_renderer_info') return { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 }; return GL_EXTS.indexOf(name) >= 0 ? {} : null; },
-      getSupportedExtensions(){ return GL_EXTS.slice(); },
+      drawingBufferColorSpace: 'srgb', unpackColorSpace: 'srgb',
+      getParameter(p){
+        if (Object.prototype.hasOwnProperty.call(P, p)) return P[p];
+        if (Object.prototype.hasOwnProperty.call(EXT_PARAMS, p)) return EXT_PARAMS[p];
+        const T = ver === 2 ? GL2_PARAMS : GL1_PARAMS;
+        if (Object.prototype.hasOwnProperty.call(T, p)) {
+          const v = T[p];
+          // Вид массива у каждого параметра свой, и он читается: диапазоны —
+          // Float32Array, список сжатых форматов — Uint32Array, размеры —
+          // Int32Array, маска цвета — обычный массив булевых.
+          if (!Array.isArray(v)) return v;
+          if (typeof v[0] === 'boolean') return v.slice();
+          if (GL_F32.indexOf(p) >= 0) return new Float32Array(v);
+          if (GL_U32.indexOf(p) >= 0) return new Uint32Array(v);
+          return new Int32Array(v);
+        }
+        return typeof p === 'number' ? 0 : null;
+      },
+      getShaderPrecisionFormat(st, pt){
+        const v = GL_PRECISION[st + ':' + pt] || [127, 127, 23];
+        const C = globalThis.WebGLShaderPrecisionFormat;
+        const o = C && C.prototype ? Object.create(C.prototype) : {};
+        Object.defineProperties(o, {
+          rangeMin: { value: v[0], enumerable: true },
+          rangeMax: { value: v[1], enumerable: true },
+          precision: { value: v[2], enumerable: true },
+        });
+        return o;
+      },
+      getInternalformatParameter(target, format, pname){
+        const v = GL_FORMAT_SAMPLES[format];
+        return new Int32Array(v || []);
+      },
+      getExtension(name){
+        const shape = (ver === 2 ? GL2_EXT_SHAPE : GL1_EXT_SHAPE)[name];
+        if (!shape) return null;
+        const [iface, keys] = shape;
+        const C_ = globalThis[iface];
+        const o = C_ && C_.prototype ? Object.create(C_.prototype) : {};
+        try {
+          if (C_ && C_.prototype && !Object.getOwnPropertyDescriptor(C_.prototype, Symbol.toStringTag)) {
+            Object.defineProperty(C_.prototype, Symbol.toStringTag, { value: iface, configurable: true });
+          } else if (!C_) {
+            Object.defineProperty(o, Symbol.toStringTag, { value: iface, configurable: true });
+          }
+        } catch (e) {}
+        // Члены расширения: константы — числами, функции — функциями.
+        for (const k of (keys ? keys.split(',') : [])) {
+          if (!k) continue;
+          const known = EXT_VALUES[k];
+          if (typeof known === 'number') { try { Object.defineProperty(o, k, { value: known, enumerable: true }); } catch (e) {} }
+          else if (/^[a-z]/.test(k)) { const f = ({ [k](){ } })[k]; try { Object.defineProperty(o, k, { value: mask(f, k), enumerable: true, writable: true, configurable: true }); } catch (e) {} }
+          else { try { Object.defineProperty(o, k, { value: 0, enumerable: true }); } catch (e) {} }
+        }
+        return o;
+      },
+      getSupportedExtensions(){ return (ver === 2 ? GL2_SUPPORTED : GL1_SUPPORTED).slice(); },
+      getAttribLocation(){ return 0; },
       getContextAttributes(){ return { alpha: true, antialias: true, depth: true, desynchronized: false, failIfMajorPerformanceCaveat: false, powerPreference: 'default', premultipliedAlpha: true, preserveDrawingBuffer: false, stencil: false, xrCompatible: false }; },
-      getShaderPrecisionFormat(){ return { rangeMin: 127, rangeMax: 127, precision: 23 }; },
+
       getContextAttributes_: null,
     });
     const iface = (n) => (globalThis[n] ? globalThis[n].prototype : Object.prototype);
@@ -4764,7 +4914,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           const px = __pt_glReadPixels(gid, x | 0, y | 0, w | 0, h | 0, 0);
           const n = Math.min(dst.length === undefined ? px.length : dst.length, px.length);
           for (let i = 0; i < n; i++) dst[i] = px[i];
-          return dst;
+          // Ничего не возвращает: пиксели кладут в переданный массив, а сам
+          // вызов в браузере отдаёт undefined.
         },
         // toDataURL is the *canvas*, so read the drawing buffer even mid-pass
         // with an offscreen framebuffer bound, then put the binding back.
@@ -4822,7 +4973,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           S.note('readPixels|' + [x, y, w, h, format, type]);
           w = w | 0; h = h | 0;
           if (dst && dst.length >= w * h * 4) S.read(x, y, w, h, dst);
-          return dst;
+          // Пиксели уходят в переданный массив; сам вызов — undefined.
         },
         __ptPixels() { return S.pixels(); },
       });
