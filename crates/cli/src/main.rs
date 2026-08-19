@@ -1312,6 +1312,14 @@ async fn main() -> Result<()> {
                         r.status,
                         r.body.len()
                     );
+                    // Половина разговора — то, что ушло наверх. Маячок ошибки
+                    // челленджа отвечает пустотой, а всё, что он рассказывает о
+                    // нас, лежит в теле запроса; без него дамп молчит о главном.
+                    if !r.request_body.is_empty() {
+                        eprintln!("# отправлено ({} байт):", r.request_body.len());
+                        println!("{}", String::from_utf8_lossy(&r.request_body));
+                        eprintln!("# получено ({} байт):", r.body.len());
+                    }
                     println!("{}", String::from_utf8_lossy(&r.body));
                 }
                 None => eprintln!("no captured request matching '{needle}'"),

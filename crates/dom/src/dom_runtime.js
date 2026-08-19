@@ -1137,10 +1137,30 @@
     // Reflected dimension attributes. Without these, `canvas.width = 200` would
     // create an *own* property on the element (real ones are prototype
     // accessors), which is exactly the tell we hide everywhere else.
-    get width() { const v = parseInt(this.getAttribute('width'), 10); return Number.isFinite(v) ? v : (this.tagName === 'CANVAS' ? 300 : 0); }
+    get width() {
+      const v = parseInt(this.getAttribute('width'), 10);
+      if (Number.isFinite(v)) return v;
+      if (this.tagName === 'CANVAS') return 300;
+      // Без атрибута ширина картинки — её собственная, та, что в файле.
+      return this.tagName === 'IMG' ? this.naturalWidth : 0;
+    }
     set width(v) { this.setAttribute('width', String(Math.max(0, v | 0))); }
-    get height() { const v = parseInt(this.getAttribute('height'), 10); return Number.isFinite(v) ? v : (this.tagName === 'CANVAS' ? 150 : 0); }
+    get height() {
+      const v = parseInt(this.getAttribute('height'), 10);
+      if (Number.isFinite(v)) return v;
+      if (this.tagName === 'CANVAS') return 150;
+      return this.tagName === 'IMG' ? this.naturalHeight : 0;
+    }
     set height(v) { this.setAttribute('height', String(Math.max(0, v | 0))); }
+    // Собственный размер картинки: ноль, пока она не загружена, и настоящий —
+    // после. У нас его не было вовсе, и всё, что меряет нарисованное, видело
+    // картинку нулевого размера.
+    get naturalWidth() { const s = this.__ptImgSize(); return s ? s[0] : 0; }
+    get naturalHeight() { const s = this.__ptImgSize(); return s ? s[1] : 0; }
+    __ptImgSize() {
+      if (this.tagName !== 'IMG' || !this.__ptImgDone || !this.__ptImgAt) return null;
+      try { return globalThis.__pt_imageSizeOf ? __pt_imageSizeOf(this.__ptImgAt) : null; } catch (e) { return null; }
+    }
     get checked() { return this.__ptChecked !== undefined ? this.__ptChecked : this.hasAttribute('checked'); }
     set checked(v) { this.__ptChecked = !!v; }
     get selectionStart() { return String(this.value || '').length; }

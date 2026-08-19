@@ -3261,6 +3261,21 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     return new Promise((resolve, reject) => { pending.set(id, { resolve, reject, url: String(url) }); });
   };
 
+  // What an image turned out to be, by address. Rust reads the two numbers out
+  // of the image header — the body reaches us as lossy text, where they are
+  // gone — and states them just before settling the request, so an element that
+  // has loaded can answer `naturalWidth` the moment its `load` fires.
+  const imageSizes = new Map();
+  const imageCors = new Set();
+  globalThis.__pt_imageMeta = (url, w, h, cors) => {
+    imageSizes.set(String(url), [w | 0, h | 0]);
+    if (cors) imageCors.add(String(url));
+  };
+  globalThis.__pt_imageSizeOf = (url) => imageSizes.get(String(url)) || null;
+  // Позволил ли сервер читать эту картинку кому-то ещё: от этого зависит,
+  // испортит ли она холст, на который её нарисуют.
+  globalThis.__pt_imageCorsOk = (url) => imageCors.has(String(url));
+
   // Rust hooks -------------------------------------------------------------
   globalThis.__pt_drainFetchQueue = () => { const q = queue.splice(0); return __ptJSON.stringify(q); };
   globalThis.__pt_pendingFetches = () => pending.size;
@@ -3287,7 +3302,14 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   };
   globalThis.__pt_fetchReject = (id, msg) => {
     const p = pending.get(id); if (!p) return; pending.delete(id);
-    p.reject(new TypeError('Failed to fetch: ' + msg));
+    // Chrome says exactly `Failed to fetch` and nothing else, whatever went
+    // wrong underneath. Ours used to append the transport's own words — and a
+    // page that stringifies the error sends them onward: Cloudflare's worker
+    // reports the message it caught verbatim, so "error sending request for
+    // uri" would have travelled to them as our signature. The detail stays
+    // here, for a debugger to read.
+    globalThis.__pt_lastFetchError = msg;
+    p.reject(new TypeError('Failed to fetch'));
   };
 
   // XMLHttpRequest layered on the same queue -------------------------------
@@ -4479,10 +4501,38 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     return o;
   };
 
+  // A canvas that has been shown something from another origin stops being
+  // readable: the browser refuses `getImageData` and `toDataURL` on it. We
+  // handed the pixels over regardless — a one-line probe (draw a foreign image,
+  // ask for the data, expect a throw) that we failed in the loudest direction,
+  // by answering where a browser refuses.
+  const securityError = (method, iface, why) => {
+    const e = new (globalThis.DOMException || Error)(
+      "Failed to execute '" + method + "' on '" + iface + "': " + why, 'SecurityError');
+    return e;
+  };
+  // Does drawing this taint the canvas? Same-origin content and anything the
+  // server opened up with CORS does not; a foreign image without that
+  // permission does. Another canvas passes on whatever state it carries.
+  const taints = (src) => {
+    if (!src) return false;
+    try {
+      const g = __pt_ctxImpl(src.__ptC2d || src.__ptGl1 || src.__ptGl2);
+      if (g && typeof g.__ptTainted === 'function') return g.__ptTainted();
+      const raw = String(src.currentSrc || src.src || '');
+      if (!raw || raw.slice(0, 5) === 'data:' || raw.slice(0, 5) === 'blob:') return false;
+      const u = new URL(raw, location.href);
+      if (u.origin === location.origin) return false;
+      const ok = globalThis.__pt_imageCorsOk && __pt_imageCorsOk(u.href);
+      return !(src.crossOrigin && ok);
+    } catch (e) { return false; }
+  };
+
   const make2DContext = (canvas) => {
     const S = makeSurface(canvas);
     const note = S.note, solid = S.solid, stamp = S.stamp;
     let bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;     // current path bounding box
+    let tainted = false;                        // shown something from elsewhere
 
     const pathPoint = (x, y) => {
       x = +x || 0; y = +y || 0;
@@ -4652,6 +4702,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
       drawImage(img, x, y, w, h) {
         note('drawImage|' + [x, y, w, h, img && (img.src || img.localName)]);
+        if (taints(img)) tainted = true;
         stamp(x || 0, y || 0, w || (img && img.width) || 32, h || (img && img.height) || 32);
       },
       putImageData(data, x, y) {
@@ -4675,6 +4726,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         return { width: w, actualBoundingBoxLeft: 0, actualBoundingBoxRight: w, actualBoundingBoxAscent: size * 0.7, actualBoundingBoxDescent: size * 0.2, fontBoundingBoxAscent: size * 0.9, fontBoundingBoxDescent: size * 0.2 };
       },
       getImageData(x, y, w, h) {
+        if (tainted) throw securityError('getImageData', 'CanvasRenderingContext2D',
+          'The canvas has been tainted by cross-origin data.');
         w = w | 0; h = h | 0;
         const out = S.read(x, y, w, h, new Uint8ClampedArray(Math.max(0, w * h * 4)));
         return makeImageData(out, w, h);
@@ -4688,6 +4741,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       getContextAttributes() { return { alpha: true, colorSpace: 'srgb', desynchronized: false, willReadFrequently: false }; },
       // Hidden (filtered) accessor the canvas element uses to encode itself.
       __ptPixels() { return S.pixels(); },
+      __ptTainted() { return tainted; },
     }));
     return publishContext(impl, C2D, CTX2D_METHODS, CTX2D_ATTRS);
   };
@@ -5214,6 +5268,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     proto.toDataURL = mask(function toDataURL() {
       if (this.localName !== 'canvas') return 'data:,';
       const g = __pt_ctxImpl(this.__ptC2d || this.__ptGl1 || this.__ptGl2 || this.getContext('2d'));
+      if (g && typeof g.__ptTainted === 'function' && g.__ptTainted()) {
+        throw securityError('toDataURL', 'HTMLCanvasElement', 'Tainted canvases may not be exported.');
+      }
       const p = g && g.__ptPixels ? g.__ptPixels() : null;
       if (!p || !p.w || !p.h) return 'data:,';
       return __pt_pngDataUrl(p.w, p.h, p.data) || 'data:,';

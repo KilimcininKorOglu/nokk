@@ -2867,11 +2867,35 @@ impl BrowserContext {
                 );
                 let headers_js =
                     serde_json::to_string(&resp.headers).unwrap_or_else(|_| "{}".into());
+                // An image's intrinsic size is knowable only here, where the raw
+                // bytes are: the body reaches JS as lossy text. A loaded image
+                // used to report no size at all — `naturalWidth` undefined,
+                // `width` zero — and anything that measures what it drew, as the
+                // challenge does with its beacon PNG, read a picture 0 by 0.
+                let meta = if kind == "img" {
+                    // Whether the server opened the image up to other origins
+                    // decides whether drawing it costs the canvas its readability.
+                    let cors = resp
+                        .headers
+                        .iter()
+                        .any(|(k, _)| k.eq_ignore_ascii_case("access-control-allow-origin"));
+                    image_size(&resp.body)
+                        .map(|(w, h)| {
+                            format!(
+                                "__pt_imageMeta({}, {w}, {h}, {cors});",
+                                serde_json::to_string(&url).unwrap()
+                            )
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 let body = String::from_utf8_lossy(&resp.body);
                 // `response.url` is the final URL after redirects (fetch spec).
                 let final_url = if resp.url.is_empty() { &url } else { &resp.url };
                 format!(
-                    "__pt_fetchResolve({}, {}, {}, {}, {}, {})",
+                    "{}__pt_fetchResolve({}, {}, {}, {}, {}, {})",
+                    meta,
                     id,
                     resp.status,
                     serde_json::to_string(reason_phrase(resp.status)).unwrap(),
@@ -2887,16 +2911,15 @@ impl BrowserContext {
                 if !matches!(e, NetError::Unimplemented) {
                     self.record_in(context, &method, &url, &kind, 0, &[]);
                 }
-                // До хоста, к которому нет маршрута, браузер стучится дальше:
-                // запрос висит, пока не выйдет его собственный таймаут, и
-                // страница за это время не узнаёт ничего. Мы же отвечали
-                // отказом через тридцать миллисекунд — и код, который на живом
-                // браузере просто ждёт, у нас уходил в обработку ошибки.
-                // Челлендж Cloudflare зовёт так свой IPv6-only хост, и в Chrome
-                // этот запрос за пятьдесят секунд не завершается ни разу.
-                if matches!(e, NetError::Unreachable(_)) {
-                    tracing::debug!(url = %url, "no route to host: leaving the request pending, as a browser does");
-                    return String::new();
+                // Хост без маршрута мы одно время оставляли висеть, решив, что
+                // так поступает браузер. Лента Chrome с этой же машины говорит
+                // обратное: его fetch к тому же IPv6-only хосту челленджа
+                // отклоняется, и воркер челленджа докладывает об этом
+                // (`TypeError: Failed to fetch`) — а следующую фазу он начинает
+                // только получив такой ответ. Ожидание навсегда оставляло его
+                // ждать вместе с нами. Отказ — это тоже ответ.
+                if let NetError::Unreachable(why) = &e {
+                    tracing::debug!(url = %url, %why, "no route to host: rejecting, as the browser does");
                 }
                 format!(
                     "__pt_fetchReject({}, {})",
@@ -3197,6 +3220,83 @@ fn location_setter(u: &str) -> Option<String> {
 /// `Response.statusText`. Unlisted codes get an empty string (browsers do too on
 /// HTTP/2, which carries no reason phrase). Also used by the CDP layer for
 /// `Network.responseReceived`.
+/// The intrinsic size of an encoded image, read from its header alone.
+///
+/// Enough of each container to find the two numbers a browser reports as
+/// `naturalWidth`/`naturalHeight`; no pixels are decoded. Unknown or truncated
+/// data gives `None`, and the image then keeps the zero size it has before a
+/// browser has finished decoding.
+fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let be32 = |i: usize| -> Option<u32> {
+        Some(u32::from_be_bytes(bytes.get(i..i + 4)?.try_into().ok()?))
+    };
+    let le32 = |i: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(bytes.get(i..i + 4)?.try_into().ok()?))
+    };
+    let be16 = |i: usize| -> Option<u32> {
+        Some(u32::from(u16::from_be_bytes(
+            bytes.get(i..i + 2)?.try_into().ok()?,
+        )))
+    };
+    let le16 = |i: usize| -> Option<u32> {
+        Some(u32::from(u16::from_le_bytes(
+            bytes.get(i..i + 2)?.try_into().ok()?,
+        )))
+    };
+
+    // PNG: the IHDR chunk is always first, at a fixed offset.
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.get(12..16) == Some(b"IHDR") {
+        return Some((be32(16)?, be32(20)?));
+    }
+    // GIF87a/89a: little-endian logical screen size.
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some((le16(6)?, le16(8)?));
+    }
+    // BMP: the DIB header carries a signed width/height.
+    if bytes.starts_with(b"BM") {
+        return Some((le32(18)?, le32(22)?.cast_signed().unsigned_abs()));
+    }
+    // WebP: three flavours, each keeping the size somewhere else.
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        return match bytes.get(12..16)? {
+            b"VP8 " => Some((be16(26)?.swap_bytes() & 0x3fff, be16(28)?.swap_bytes() & 0x3fff)),
+            b"VP8L" => {
+                let b = u32::from_le_bytes(bytes.get(21..25)?.try_into().ok()?);
+                Some(((b & 0x3fff) + 1, ((b >> 14) & 0x3fff) + 1))
+            }
+            b"VP8X" => {
+                let w = u32::from(bytes[24]) | u32::from(bytes[25]) << 8 | u32::from(bytes[26]) << 16;
+                let h = u32::from(bytes[27]) | u32::from(bytes[28]) << 8 | u32::from(bytes[29]) << 16;
+                Some((w + 1, h + 1))
+            }
+            _ => None,
+        };
+    }
+    // JPEG: walk the marker chain to the frame header that states the size.
+    if bytes.starts_with(b"\xff\xd8") {
+        let mut i = 2;
+        while i + 9 < bytes.len() {
+            if bytes[i] != 0xff {
+                i += 1;
+                continue;
+            }
+            let marker = bytes[i + 1];
+            // Standalone markers carry no length.
+            if (0xd0..=0xd9).contains(&marker) || marker == 0x01 || marker == 0xff {
+                i += 2;
+                continue;
+            }
+            let len = be16(i + 2)? as usize;
+            // SOF0..SOF15, minus the two that are not frame headers.
+            if (0xc0..=0xcf).contains(&marker) && marker != 0xc4 && marker != 0xcc {
+                return Some((be16(i + 7)?, be16(i + 5)?));
+            }
+            i += 2 + len.max(2);
+        }
+    }
+    None
+}
+
 pub fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -3924,6 +4024,92 @@ mod tests {
     /// одним сообщением с объектом в ответ. В Chrome ответ приходит сразу; у
     /// нас он терялся, хотя следом стоящий таймер из того же скрипта доезжал
     /// исправно. Проверяем ровно тот скрипт, который приходит с чужой стороны.
+    #[test]
+    fn an_image_states_its_size_in_its_own_header() {
+        // A one-pixel PNG, GIF and JPEG: the three a page is most likely to meet.
+        let png = [
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, b'I', b'H', b'D', b'R',
+            0, 0, 1, 0x10, 0, 0, 0, 0x5c,
+        ];
+        assert_eq!(image_size(&png), Some((272, 92)));
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&[0x40, 0x01, 0x20, 0x00]);
+        assert_eq!(image_size(&gif), Some((320, 32)));
+        let jpeg = [
+            0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x00, 0x00, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x00,
+            0x5c, 0x01, 0x10, 0x03,
+        ];
+        assert_eq!(image_size(&jpeg), Some((272, 92)));
+        // Not an image, and a truncated one: no answer rather than a wrong one.
+        assert_eq!(image_size(b"<html>"), None);
+        assert_eq!(image_size(&png[..12]), None);
+    }
+
+    #[tokio::test]
+    async fn a_canvas_shown_a_foreign_image_stops_being_readable() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/app/", "<html><body></body></html>")
+            .await
+            .unwrap();
+        // Nothing foreign has been drawn: the pixels are ours to read.
+        let clean = probe(
+            &ctx,
+            r#"__ptJSON.stringify((() => {
+                const c = document.createElement('canvas');
+                const x = c.getContext('2d');
+                x.fillStyle = '#f00'; x.fillRect(0, 0, 4, 4);
+                try { x.getImageData(0, 0, 1, 1); return 'читается'; }
+                catch (e) { return 'бросок: ' + e.message; }
+            })())"#,
+        )
+        .await;
+        assert_eq!(clean.as_str(), Some("читается"));
+
+        // An image from another origin, drawn without permission, costs the
+        // canvas its readability — both ways out of it.
+        let tainted = probe(
+            &ctx,
+            r#"__ptJSON.stringify((() => {
+                const c = document.createElement('canvas');
+                const x = c.getContext('2d');
+                const im = document.createElement('img');
+                im.src = 'https://cdn.example.org/logo.png';
+                x.drawImage(im, 0, 0);
+                const out = [];
+                try { x.getImageData(0, 0, 1, 1); out.push('данные отданы'); }
+                catch (e) { out.push(e.name + ': ' + e.message); }
+                try { c.toDataURL(); out.push('картинка отдана'); }
+                catch (e) { out.push(e.name); }
+                return out;
+            })())"#,
+        )
+        .await;
+        let out = tainted.as_array().expect("array");
+        assert_eq!(
+            out[0].as_str(),
+            Some("SecurityError: Failed to execute 'getImageData' on 'CanvasRenderingContext2D': The canvas has been tainted by cross-origin data.")
+        );
+        assert_eq!(out[1].as_str(), Some("SecurityError"));
+
+        // A same-origin image is no threat to it.
+        let same = probe(
+            &ctx,
+            r#"__ptJSON.stringify((() => {
+                const c = document.createElement('canvas');
+                const x = c.getContext('2d');
+                const im = document.createElement('img');
+                im.src = 'https://example.com/app/logo.png';
+                x.drawImage(im, 0, 0);
+                try { x.getImageData(0, 0, 1, 1); return 'читается'; }
+                catch (e) { return 'бросок: ' + e.message; }
+            })())"#,
+        )
+        .await;
+        assert_eq!(same.as_str(), Some("читается"));
+    }
+
     #[tokio::test]
     async fn a_worker_answers_the_first_question_about_itself() {
         let _serial = serial().await;
