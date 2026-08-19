@@ -1738,19 +1738,64 @@
 
   // Блок объявлений правила: тот же интерфейс, что у `el.style`, но за ним
   // стоит карта правила, а не атрибут элемента.
+  // Имена свойств CSS, как их держит Chrome 148 у каждого объявления стиля:
+  // собственными свойствами объекта и в этом порядке. Их перечисляет любой
+  // сборщик отпечатка — по ним видно и движок, и его версию.
+  const CSS_PROPS = ["accentColor", "additiveSymbols", "alignContent", "alignItems", "alignSelf", "alignmentBaseline", "all", "anchorName", "anchorScope", "animation", "animationComposition", "animationDelay", "animationDirection", "animationDuration", "animationFillMode", "animationIterationCount", "animationName", "animationPlayState", "animationRange", "animationRangeEnd", "animationRangeStart", "animationTimeline", "animationTimingFunction", "animationTrigger", "appRegion", "appearance", "ascentOverride", "aspectRatio", "backdropFilter", "backfaceVisibility", "background", "backgroundAttachment", "backgroundBlendMode", "backgroundClip", "backgroundColor", "backgroundImage", "backgroundOrigin", "backgroundPosition", "backgroundPositionX", "backgroundPositionY", "backgroundRepeat", "backgroundSize", "basePalette", "baselineShift", "baselineSource", "blockSize", "border", "borderBlock", "borderBlockColor", "borderBlockEnd", "borderBlockEndColor", "borderBlockEndStyle", "borderBlockEndWidth", "borderBlockStart", "borderBlockStartColor", "borderBlockStartStyle", "borderBlockStartWidth", "borderBlockStyle", "borderBlockWidth", "borderBottom", "borderBottomColor", "borderBottomLeftRadius", "borderBottomRightRadius", "borderBottomStyle", "borderBottomWidth", "borderCollapse", "borderColor", "borderEndEndRadius", "borderEndStartRadius", "borderImage", "borderImageOutset", "borderImageRepeat", "borderImageSlice", "borderImageSource", "borderImageWidth", "borderInline", "borderInlineColor", "borderInlineEnd", "borderInlineEndColor", "borderInlineEndStyle", "borderInlineEndWidth", "borderInlineStart", "borderInlineStartColor", "borderInlineStartStyle", "borderInlineStartWidth", "borderInlineStyle", "borderInlineWidth", "borderLeft", "borderLeftColor", "borderLeftStyle", "borderLeftWidth", "borderRadius", "borderRight", "borderRightColor", "borderRightStyle", "borderRightWidth", "borderShape", "borderSpacing", "borderStartEndRadius", "borderStartStartRadius", "borderStyle", "borderTop", "borderTopColor", "borderTopLeftRadius", "borderTopRightRadius", "borderTopStyle", "borderTopWidth", "borderWidth", "bottom", "boxDecorationBreak", "boxShadow", "boxSizing", "breakAfter", "breakBefore", "breakInside", "bufferedRendering", "captionSide", "caretAnimation", "caretColor", "caretShape", "clear", "clip", "clipPath", "clipRule", "color", "colorInterpolation", "colorInterpolationFilters", "colorRendering", "colorScheme", "columnCount", "columnFill", "columnGap", "columnHeight", "columnRule", "columnRuleColor", "columnRuleStyle", "columnRuleWidth", "columnSpan", "columnWidth", "columnWrap", "columns", "contain", "containIntrinsicBlockSize", "containIntrinsicHeight", "containIntrinsicInlineSize", "containIntrinsicSize", "containIntrinsicWidth", "container", "containerName", "containerType", "content", "contentVisibility", "cornerBlockEndShape", "cornerBlockStartShape", "cornerBottomLeftShape", "cornerBottomRightShape", "cornerBottomShape", "cornerEndEndShape", "cornerEndStartShape", "cornerInlineEndShape", "cornerInlineStartShape", "cornerLeftShape", "cornerRightShape", "cornerShape", "cornerStartEndShape", "cornerStartStartShape", "cornerTopLeftShape", "cornerTopRightShape", "cornerTopShape", "counterIncrement", "counterReset", "counterSet", "cursor", "cx", "cy", "d", "descentOverride", "direction", "display", "dominantBaseline", "dynamicRangeLimit", "emptyCells", "epubCaptionSide", "epubTextCombine", "epubTextEmphasis", "epubTextEmphasisColor", "epubTextEmphasisStyle", "epubTextOrientation", "epubTextTransform", "epubWordBreak", "epubWritingMode", "fallback", "fieldSizing", "fill", "fillOpacity", "fillRule", "filter", "flex", "flexBasis", "flexDirection", "flexFlow", "flexGrow", "flexShrink", "flexWrap", "float", "floodColor", "floodOpacity", "font", "fontDisplay", "fontFamily", "fontFeatureSettings", "fontKerning", "fontLanguageOverride", "fontOpticalSizing", "fontPalette", "fontSize", "fontSizeAdjust", "fontStretch", "fontStyle", "fontSynthesis", "fontSynthesisSmallCaps", "fontSynthesisStyle", "fontSynthesisWeight", "fontVariant", "fontVariantAlternates", "fontVariantCaps", "fontVariantEastAsian", "fontVariantEmoji", "fontVariantLigatures", "fontVariantNumeric", "fontVariantPosition", "fontVariationSettings", "fontWeight", "forcedColorAdjust", "gap", "grid", "gridArea", "gridAutoColumns", "gridAutoFlow", "gridAutoRows", "gridColumn", "gridColumnEnd", "gridColumnGap", "gridColumnStart", "gridGap", "gridRow", "gridRowEnd", "gridRowGap", "gridRowStart", "gridTemplate", "gridTemplateAreas", "gridTemplateColumns", "gridTemplateRows", "height", "hyphenateCharacter", "hyphenateLimitChars", "hyphens", "imageOrientation", "imageRendering", "inherits", "initialLetter", "initialValue", "inlineSize", "inset", "insetBlock", "insetBlockEnd", "insetBlockStart", "insetInline", "insetInlineEnd", "insetInlineStart", "interactivity", "interestDelay", "interestDelayEnd", "interestDelayStart", "interpolateSize", "isolation", "justifyContent", "justifyItems", "justifySelf", "left", "letterSpacing", "lightingColor", "lineBreak", "lineGapOverride", "lineHeight", "listStyle", "listStyleImage", "listStylePosition", "listStyleType", "margin", "marginBlock", "marginBlockEnd", "marginBlockStart", "marginBottom", "marginInline", "marginInlineEnd", "marginInlineStart", "marginLeft", "marginRight", "marginTop", "marker", "markerEnd", "markerMid", "markerStart", "mask", "maskClip", "maskComposite", "maskImage", "maskMode", "maskOrigin", "maskPosition", "maskRepeat", "maskSize", "maskType", "mathDepth", "mathShift", "mathStyle", "maxBlockSize", "maxHeight", "maxInlineSize", "maxWidth", "minBlockSize", "minHeight", "minInlineSize", "minWidth", "mixBlendMode", "navigation", "negative", "objectFit", "objectPosition", "objectViewBox", "offset", "offsetAnchor", "offsetDistance", "offsetPath", "offsetPosition", "offsetRotate", "opacity", "order", "orphans", "outline", "outlineColor", "outlineOffset", "outlineStyle", "outlineWidth", "overflow", "overflowAnchor", "overflowBlock", "overflowClipMargin", "overflowInline", "overflowWrap", "overflowX", "overflowY", "overlay", "overrideColors", "overscrollBehavior", "overscrollBehaviorBlock", "overscrollBehaviorInline", "overscrollBehaviorX", "overscrollBehaviorY", "pad", "padding", "paddingBlock", "paddingBlockEnd", "paddingBlockStart", "paddingBottom", "paddingInline", "paddingInlineEnd", "paddingInlineStart", "paddingLeft", "paddingRight", "paddingTop", "page", "pageBreakAfter", "pageBreakBefore", "pageBreakInside", "pageOrientation", "paintOrder", "perspective", "perspectiveOrigin", "placeContent", "placeItems", "placeSelf", "pointerEvents", "position", "positionAnchor", "positionArea", "positionTry", "positionTryFallbacks", "positionTryOrder", "positionVisibility", "prefix", "printColorAdjust", "quotes", "r", "range", "readingFlow", "readingOrder", "resize", "result", "right", "rotate", "rowGap", "rubyAlign", "rubyPosition", "rx", "ry", "scale", "scrollBehavior", "scrollInitialTarget", "scrollMargin", "scrollMarginBlock", "scrollMarginBlockEnd", "scrollMarginBlockStart", "scrollMarginBottom", "scrollMarginInline", "scrollMarginInlineEnd", "scrollMarginInlineStart", "scrollMarginLeft", "scrollMarginRight", "scrollMarginTop", "scrollMarkerGroup", "scrollPadding", "scrollPaddingBlock", "scrollPaddingBlockEnd", "scrollPaddingBlockStart", "scrollPaddingBottom", "scrollPaddingInline", "scrollPaddingInlineEnd", "scrollPaddingInlineStart", "scrollPaddingLeft", "scrollPaddingRight", "scrollPaddingTop", "scrollSnapAlign", "scrollSnapStop", "scrollSnapType", "scrollTargetGroup", "scrollTimeline", "scrollTimelineAxis", "scrollTimelineName", "scrollbarColor", "scrollbarGutter", "scrollbarWidth", "shapeImageThreshold", "shapeMargin", "shapeOutside", "shapeRendering", "size", "sizeAdjust", "speak", "speakAs", "src", "stopColor", "stopOpacity", "stroke", "strokeDasharray", "strokeDashoffset", "strokeLinecap", "strokeLinejoin", "strokeMiterlimit", "strokeOpacity", "strokeWidth", "suffix", "symbols", "syntax", "system", "tabSize", "tableLayout", "textAlign", "textAlignLast", "textAnchor", "textAutospace", "textBox", "textBoxEdge", "textBoxTrim", "textCombineUpright", "textDecoration", "textDecorationColor", "textDecorationLine", "textDecorationSkipInk", "textDecorationStyle", "textDecorationThickness", "textEmphasis", "textEmphasisColor", "textEmphasisPosition", "textEmphasisStyle", "textIndent", "textJustify", "textOrientation", "textOverflow", "textRendering", "textShadow", "textSizeAdjust", "textSpacingTrim", "textTransform", "textUnderlineOffset", "textUnderlinePosition", "textWrap", "textWrapMode", "textWrapStyle", "timelineScope", "timelineTrigger", "timelineTriggerActivationRange", "timelineTriggerActivationRangeEnd", "timelineTriggerActivationRangeStart", "timelineTriggerActiveRange", "timelineTriggerActiveRangeEnd", "timelineTriggerActiveRangeStart", "timelineTriggerName", "timelineTriggerSource", "top", "touchAction", "transform", "transformBox", "transformOrigin", "transformStyle", "transition", "transitionBehavior", "transitionDelay", "transitionDuration", "transitionProperty", "transitionTimingFunction", "translate", "triggerScope", "types", "unicodeBidi", "unicodeRange", "userSelect", "vectorEffect", "verticalAlign", "viewTimeline", "viewTimelineAxis", "viewTimelineInset", "viewTimelineName", "viewTransitionClass", "viewTransitionGroup", "viewTransitionName", "viewTransitionScope", "visibility", "webkitAlignContent", "webkitAlignItems", "webkitAlignSelf", "webkitAnimation", "webkitAnimationDelay", "webkitAnimationDirection", "webkitAnimationDuration", "webkitAnimationFillMode", "webkitAnimationIterationCount", "webkitAnimationName", "webkitAnimationPlayState", "webkitAnimationTimingFunction", "webkitAppRegion", "webkitAppearance", "webkitBackfaceVisibility", "webkitBackgroundClip", "webkitBackgroundOrigin", "webkitBackgroundSize", "webkitBorderAfter", "webkitBorderAfterColor", "webkitBorderAfterStyle", "webkitBorderAfterWidth", "webkitBorderBefore", "webkitBorderBeforeColor", "webkitBorderBeforeStyle", "webkitBorderBeforeWidth", "webkitBorderBottomLeftRadius", "webkitBorderBottomRightRadius", "webkitBorderEnd", "webkitBorderEndColor", "webkitBorderEndStyle", "webkitBorderEndWidth", "webkitBorderHorizontalSpacing", "webkitBorderImage", "webkitBorderRadius", "webkitBorderStart", "webkitBorderStartColor", "webkitBorderStartStyle", "webkitBorderStartWidth", "webkitBorderTopLeftRadius", "webkitBorderTopRightRadius", "webkitBorderVerticalSpacing", "webkitBoxAlign", "webkitBoxDecorationBreak", "webkitBoxDirection", "webkitBoxFlex", "webkitBoxOrdinalGroup", "webkitBoxOrient", "webkitBoxPack", "webkitBoxReflect", "webkitBoxShadow", "webkitBoxSizing", "webkitClipPath", "webkitColumnBreakAfter", "webkitColumnBreakBefore", "webkitColumnBreakInside", "webkitColumnCount", "webkitColumnGap", "webkitColumnRule", "webkitColumnRuleColor", "webkitColumnRuleStyle", "webkitColumnRuleWidth", "webkitColumnSpan", "webkitColumnWidth", "webkitColumns", "webkitFilter", "webkitFlex", "webkitFlexBasis", "webkitFlexDirection", "webkitFlexFlow", "webkitFlexGrow", "webkitFlexShrink", "webkitFlexWrap", "webkitFontFeatureSettings", "webkitFontSmoothing", "webkitHyphenateCharacter", "webkitJustifyContent", "webkitLineBreak", "webkitLineClamp", "webkitLocale", "webkitLogicalHeight", "webkitLogicalWidth", "webkitMarginAfter", "webkitMarginBefore", "webkitMarginEnd", "webkitMarginStart", "webkitMask", "webkitMaskBoxImage", "webkitMaskBoxImageOutset", "webkitMaskBoxImageRepeat", "webkitMaskBoxImageSlice", "webkitMaskBoxImageSource", "webkitMaskBoxImageWidth", "webkitMaskClip", "webkitMaskComposite", "webkitMaskImage", "webkitMaskOrigin", "webkitMaskPosition", "webkitMaskPositionX", "webkitMaskPositionY", "webkitMaskRepeat", "webkitMaskSize", "webkitMaxLogicalHeight", "webkitMaxLogicalWidth", "webkitMinLogicalHeight", "webkitMinLogicalWidth", "webkitOpacity", "webkitOrder", "webkitPaddingAfter", "webkitPaddingBefore", "webkitPaddingEnd", "webkitPaddingStart", "webkitPerspective", "webkitPerspectiveOrigin", "webkitPerspectiveOriginX", "webkitPerspectiveOriginY", "webkitPrintColorAdjust", "webkitRtlOrdering", "webkitRubyPosition", "webkitShapeImageThreshold", "webkitShapeMargin", "webkitShapeOutside", "webkitTapHighlightColor", "webkitTextCombine", "webkitTextDecorationsInEffect", "webkitTextEmphasis", "webkitTextEmphasisColor", "webkitTextEmphasisPosition", "webkitTextEmphasisStyle", "webkitTextFillColor", "webkitTextOrientation", "webkitTextSecurity", "webkitTextSizeAdjust", "webkitTextStroke", "webkitTextStrokeColor", "webkitTextStrokeWidth", "webkitTransform", "webkitTransformOrigin", "webkitTransformOriginX", "webkitTransformOriginY", "webkitTransformOriginZ", "webkitTransformStyle", "webkitTransition", "webkitTransitionDelay", "webkitTransitionDuration", "webkitTransitionProperty", "webkitTransitionTimingFunction", "webkitUserDrag", "webkitUserModify", "webkitUserSelect", "webkitWritingMode", "whiteSpace", "whiteSpaceCollapse", "widows", "width", "willChange", "wordBreak", "wordSpacing", "wordWrap", "writingMode", "x", "y", "zIndex", "zoom"];
+
+  const __cssMaps = new WeakMap();
+  // Методы и `length` живут на прототипе, а собственными свойствами объявления
+  // идут имена свойств CSS — все семьсот три, в порядке браузера. У нас было
+  // наоборот: методы собственными, имён не было вовсе, и перечисление стиля
+  // выглядело как что угодно, только не как браузер.
+  const __shapeStyleProto = (proto) => {
+    if (proto.__ptStyleShaped) return proto;
+    try { Object.defineProperty(proto, '__ptStyleShaped', { value: true }); } catch (e) {}
+    const dash = (p) => String(p).replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
+    const mapOf = (o) => __cssMaps.get(o) || new Map();
+    const def = (name, value) => {
+      try { Object.defineProperty(proto, name, { value, writable: true, enumerable: true, configurable: true }); } catch (e) {}
+    };
+    def('getPropertyValue', function getPropertyValue(p) { return mapOf(this).get(String(p).toLowerCase()) || ''; });
+    def('getPropertyPriority', function getPropertyPriority() { return ''; });
+    def('setProperty', function setProperty(p, v) {
+      const k = dash(String(p)).toLowerCase();
+      mapOf(this).set(k, __cssValue(k, v));
+    });
+    def('removeProperty', function removeProperty(p) {
+      const k = dash(String(p)).toLowerCase(), m = mapOf(this), had = m.get(k) || '';
+      m.delete(k); return had;
+    });
+    def('item', function item(i) { return [...mapOf(this).keys()][i] || ''; });
+    const acc = (name, get) => {
+      try { Object.defineProperty(proto, name, { get, enumerable: true, configurable: true }); } catch (e) {}
+    };
+    acc('length', function length() { return mapOf(this).size; });
+    acc('cssText', function cssText() { return [...mapOf(this)].map(([k, v]) => k + ': ' + v + ';').join(' '); });
+    acc('parentRule', function parentRule() { return null; });
+    acc('cssFloat', function cssFloat() { return mapOf(this).get('float') || ''; });
+    try {
+      Object.defineProperty(proto, Symbol.iterator, {
+        value: function* () { for (const k of mapOf(this).keys()) yield k; },
+        writable: true, configurable: true,
+      });
+    } catch (e) {}
+    return proto;
+  };
+
   function __cssDeclaration(map) {
     const dash = (p) => String(p).replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
-    const target = Object.assign(Object.create(__styleProto()), {
-      getPropertyValue: (p) => map.get(String(p).toLowerCase()) || '',
-      getPropertyPriority: () => '',
-      setProperty: (p, v) => { map.set(dash(String(p)).toLowerCase(), __cssValue(dash(String(p)).toLowerCase(), v)); },
-      removeProperty: (p) => { const k = dash(String(p)).toLowerCase(); const had = map.get(k) || ''; map.delete(k); return had; },
-      item: (i) => [...map.keys()][i] || '',
-      get length() { return map.size; },
-      get cssText() { return [...map].map(([k, v]) => k + ': ' + v + ';').join(' '); },
-      get parentRule() { return null; },
-      [Symbol.iterator]: function* () { for (const k of map.keys()) yield k; },
-    });
+    const target = Object.create(__shapeStyleProto(__styleProto()));
+    __cssMaps.set(target, map);
+    // Имена свойств — собственные, как в браузере, и в его порядке.
+    for (const name of CSS_PROPS) {
+      const key = dash(name).toLowerCase();
+      Object.defineProperty(target, name, {
+        get() { return map.get(key) || ''; },
+        set(v) { if (v === '' || v == null) map.delete(key); else map.set(key, __cssValue(key, v)); },
+        enumerable: true, configurable: true,
+      });
+    }
     return new Proxy(target, {
       get: (t, p) => {
         if (typeof p === 'string' && !(p in t)) return map.get(dash(p).toLowerCase()) || '';
@@ -1968,6 +2013,63 @@
     } catch (e) {}
     return proto;
   };
+  const __cssReaders = new WeakMap();
+  // Прототип инлайнового объявления: те же десять членов, что у браузера.
+  const __inlineStyleProto = () => {
+    const proto = __styleProto();
+    if (proto.__ptInlineShaped) return proto;
+    try { Object.defineProperty(proto, '__ptInlineShaped', { value: true }); } catch (e) {}
+    const st = (o) => __cssReaders.get(o);
+    const def = (name, value) => {
+      try { Object.defineProperty(proto, name, { value, writable: true, enumerable: true, configurable: true }); } catch (e) {}
+    };
+    const acc = (name, get, set) => {
+      try { Object.defineProperty(proto, name, { get, set, enumerable: true, configurable: true }); } catch (e) {}
+    };
+    def('getPropertyValue', function getPropertyValue(p) {
+      const s = st(this); if (!s) return '';
+      const k = String(p).toLowerCase();
+      return s.computed ? (s.map.get(k) || '') : (s.read().get(k) || '');
+    });
+    def('getPropertyPriority', function getPropertyPriority() { return ''; });
+    def('setProperty', function setProperty(p, v) {
+      const s = st(this); if (!s) return;
+      if (s.computed) throw new TypeError('Cannot modify computed style');
+      const m = s.read(); m.set(String(p).toLowerCase(), String(v)); s.write(m);
+    });
+    def('removeProperty', function removeProperty(p) {
+      const s = st(this); if (!s) return '';
+      if (s.computed) throw new TypeError('Cannot modify computed style');
+      const m = s.read(), k = String(p).toLowerCase(), had = m.get(k) || '';
+      m.delete(k); s.write(m); return had;
+    });
+    def('item', function item(i) {
+      const s = st(this); if (!s) return '';
+      return s.computed ? (s.names[i] || '') : ([...s.read().keys()][i] || '');
+    });
+    acc('length', function length() {
+      const s = st(this); if (!s) return 0;
+      return s.computed ? s.names.length : s.read().size;
+    });
+    acc('parentRule', function parentRule() { return null; });
+    acc('cssFloat',
+      function cssFloat() { const s = st(this); return s ? (s.read().get('float') || '') : ''; },
+      function cssFloat(v) { const s = st(this); if (!s) return; const m = s.read(); m.set('float', String(v)); s.write(m); });
+    acc('cssText',
+      function cssText() {
+        const s = st(this); if (!s) return '';
+        // У вычисленного стиля он пуст, как в браузере.
+        if (s.computed) return '';
+        return [...s.read()].map(([k, v]) => k + ': ' + v).join('; ');
+      },
+      function cssText(v) {
+        const s = st(this); if (!s) return;
+        if (s.el && s.el.setAttribute) s.el.setAttribute('style', String(v));
+        __markDirty();
+      });
+    return proto;
+  };
+
   function makeStyle(el) {
     let cachedText = null, cachedMap = new Map();
     const read = () => {
@@ -1990,19 +2092,25 @@
       if (el && el.setAttribute) el.setAttribute('style', text);
       __markDirty();
     };
-    return new Proxy(Object.assign(Object.create(__styleProto()), {
-      getPropertyValue: (p) => read().get(String(p).toLowerCase()) || '',
-      getPropertyPriority: () => '',
-      get parentRule() { return null; },
-      get cssFloat() { return read().get('float') || ''; },
-      set cssFloat(v) { const m = read(); m.set('float', String(v)); write(m); },
-      setProperty: (p, v) => { const m = read(); m.set(String(p).toLowerCase(), String(v)); write(m); },
-      removeProperty: (p) => { const m = read(); const had = m.get(String(p).toLowerCase()) || ''; m.delete(String(p).toLowerCase()); write(m); return had; },
-      get cssText() { return [...read()].map(([k, v]) => `${k}: ${v}`).join('; '); },
-      set cssText(v) { if (el && el.setAttribute) el.setAttribute('style', String(v)); cachedText = null; __markDirty(); },
-      get length() { return read().size; },
-      item: (i) => [...read().keys()][i] || '',
-    }), {
+    // Форма как у браузера: методы и `length` — на прототипе, а собственными
+    // свойствами объявления идут имена свойств CSS, все семьсот три и в том же
+    // порядке. У нас собственными были методы, а имён не было вовсе — и всякий,
+    // кто перечисляет стиль (а его перечисляют), видел это сразу.
+    const target = Object.create(__inlineStyleProto());
+    __cssReaders.set(target, { read, write, el });
+    for (const name of CSS_PROPS) {
+      const key = dash(name);
+      Object.defineProperty(target, name, {
+        get() { return read().get(key) || ''; },
+        set(v) {
+          const m = read();
+          if (v === '' || v == null) m.delete(key); else m.set(key, String(v));
+          write(m);
+        },
+        enumerable: true, configurable: true,
+      });
+    }
+    return new Proxy(target, {
       get: (t, p) => {
         if (typeof p === 'string' && !(p in t)) return read().get(dash(p)) || '';
         const v = t[p];
@@ -3548,23 +3656,25 @@ const CS_REPLACED = {"block-size":"65px","border-block-end-style":"inset","borde
         Object.defineProperty(proto, Symbol.toStringTag, { value: 'CSSStyleDeclaration', configurable: true });
       }
     } catch (e) {}
-    const decl = Object.assign(Object.create(proto), {
-      getPropertyValue: (n) => map.get(String(n).toLowerCase()) || '',
-      getPropertyPriority: () => '',
-      item: (i) => names[i] || '',
-      get length() { return names.length; },
-      get cssText() { return ''; },   // как в браузере: у вычисленного стиля он пуст
-      setProperty() { throw new TypeError("Cannot modify computed style"); },
-      removeProperty() { throw new TypeError("Cannot modify computed style"); },
-      [Symbol.iterator]: function* () { for (const n of names) yield n; },
-    });
-    for (const n of names) {
-      const camel = CS_CAMEL(n);
-      const value = map.get(n);
-      Object.defineProperty(decl, n, { get: () => value, enumerable: false, configurable: true });
-      if (camel !== n) Object.defineProperty(decl, camel, { get: () => value, enumerable: false, configurable: true });
+    // Форма как у браузера: собственные свойства объявления — это индексы и
+    // имена в camelCase, и больше ничего; методы и `length` — на прототипе.
+    // Дефисные имена читаются, но собственными свойствами не числятся, поэтому
+    // за них отвечает Proxy.
+    const decl = Object.create(__inlineStyleProto());
+    __cssReaders.set(decl, { computed: true, names, map });
+    const own = (name, d) => { try { Object.defineProperty(decl, name, d); } catch (e) {} };
+    for (let i = 0; i < names.length; i++) own(String(i), { value: names[i], enumerable: true, configurable: true });
+    for (const name of CSS_PROPS) {
+      const dashed = name.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase()).toLowerCase();
+      own(name, { get: () => map.get(dashed) || '', enumerable: true, configurable: true });
     }
-    return decl;
+    return new Proxy(decl, {
+      get: (t, p) => {
+        if (typeof p === 'string' && !(p in t)) return map.get(p.toLowerCase()) || '';
+        const v = t[p];
+        return typeof v === 'function' ? v.bind(t) : v;
+      },
+    });
   };
 
   function __boxOf(el) {

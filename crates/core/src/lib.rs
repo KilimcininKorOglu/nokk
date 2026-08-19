@@ -3555,6 +3555,66 @@ mod tests {
         assert_eq!(got["backFirst"], 7, "{got}");
     }
 
+    /// Список свойств CSS — это подпись движка и его версии, и сборщик
+    /// отпечатка его сериализует целиком. У браузера имена лежат собственными
+    /// свойствами объявления (семьсот три, в своём порядке), а методы — на
+    /// прототипе; у нас было наоборот: собственными были методы, имён не было
+    /// вовсе. Значения сняты с Chrome 148.
+    #[tokio::test]
+    async fn a_style_declaration_is_shaped_like_a_browsers() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let out = probe(
+            &ctx,
+            r#"(() => {
+                const st = document.body.style;
+                st.color = 'red';
+                st.setProperty('background-color', 'blue');
+                const cs = getComputedStyle(document.body);
+                const names = Object.getOwnPropertyNames(st);
+                return __ptJSON.stringify({
+                  inlineOwn: names.length,
+                  firstThree: names.slice(0, 3),
+                  protoOwn: Object.getOwnPropertyNames(Object.getPrototypeOf(st)).length,
+                  color: st.color,
+                  background: st.getPropertyValue('background-color'),
+                  cssText: st.cssText,
+                  inlineLength: st.length,
+                  computedLength: cs.length,
+                  computedOwn: Object.getOwnPropertyNames(cs).length,
+                  computedFirst: cs[0],
+                  computedDashed: cs['background-color'],
+                  sameProto: Object.getPrototypeOf(cs) === Object.getPrototypeOf(st),
+                })
+              })()"#,
+        )
+        .await;
+
+        assert_eq!(out["inlineOwn"], 703, "{out}");
+        assert_eq!(
+            out["firstThree"],
+            serde_json::json!(["accentColor", "additiveSymbols", "alignContent"]),
+            "и в порядке браузера: {out}"
+        );
+        assert_eq!(out["protoOwn"], 10, "{out}");
+        // Форма формой, а работать оно обязано по-прежнему.
+        assert_eq!(out["color"], "red", "{out}");
+        assert_eq!(out["background"], "blue", "{out}");
+        assert_eq!(out["inlineLength"], 2, "{out}");
+        assert_eq!(out["cssText"], "color: red; background-color: blue", "{out}");
+        // Вычисленный стиль: 456 свойств по индексам плюс те же имена.
+        assert_eq!(out["computedLength"], 456, "{out}");
+        assert_eq!(out["computedOwn"], 1159, "{out}");
+        assert_eq!(out["computedFirst"], "accent-color", "{out}");
+        assert!(out["computedDashed"].is_string(), "дефисное имя читается: {out}");
+        assert_eq!(out["sameProto"], true, "оба объявления одного интерфейса: {out}");
+    }
+
     /// Картинка — это запрос. `new Image().src = …` — обычный способ послать
     /// GET, и раньше он уходил в сеть только по абсолютному `http(s)` адресу:
     /// относительный, каким его пишут почти всегда, не отправлял ничего.
