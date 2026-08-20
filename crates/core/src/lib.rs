@@ -4080,6 +4080,33 @@ mod tests {
         assert_eq!(v[4].as_i64(), Some(-1), "NodeFilter must have no prototype");
     }
 
+    /// A browser's window is one rectangle: `innerWidth` and
+    /// `documentElement.clientWidth` describe the same viewport. Ours answered
+    /// 1280x720 to one and the profile's size to the other — a page that asks
+    /// both saw two windows at once.
+    #[tokio::test]
+    async fn the_document_and_the_window_are_the_same_size() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body>hi</body></html>")
+            .await
+            .unwrap();
+        let got = probe(
+            &ctx,
+            r#"__ptJSON.stringify({
+                inner: [innerWidth, innerHeight],
+                doc: [document.documentElement.clientWidth, document.documentElement.clientHeight],
+                filter: document.createElement('canvas').getContext('2d').filter,
+            })"#,
+        )
+        .await;
+        assert_eq!(got["inner"], got["doc"], "окно и документ разошлись: {got}");
+        assert!(got["inner"][0].as_u64().unwrap_or(0) > 0, "{got}");
+        // И заодно единственный вопрос кадра, на который мы отвечали пустотой.
+        assert_eq!(got["filter"], "none", "{got}");
+    }
+
     #[test]
     fn an_image_states_its_size_in_its_own_header() {
         // A one-pixel PNG, GIF and JPEG: the three a page is most likely to meet.

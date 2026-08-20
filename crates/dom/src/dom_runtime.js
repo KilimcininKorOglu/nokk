@@ -2929,7 +2929,15 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // things drivers need: (a) a non-empty box + coordinates for visibility and
   // click-point computation, and (b) a reversible point→element mapping so an
   // Input mouse event at a computed coordinate hits the intended element.
-  const LAYOUT = { W: 1280, H: 720, ROW: 20 };
+  // Окно документа — то же окно, что и `innerWidth`/`innerHeight`: у браузера
+  // `documentElement.clientWidth` и `innerWidth` описывают один прямоугольник.
+  // Мы держали здесь 1280×720 независимо от них, и страница видела два разных
+  // окна сразу — несостыковка, которую ищут первым делом.
+  const LAYOUT = {
+    W: (globalThis.innerWidth | 0) || 1280,
+    H: (globalThis.innerHeight | 0) || 720,
+    ROW: 20,
+  };
   // Окно кадра — это его собственный `<iframe>`, а не страница: у виджета
   // Turnstile внутри 300×65, и он этот размер читает. Движок сообщает его сюда
   // сразу после создания контекста.

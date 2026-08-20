@@ -4854,6 +4854,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       fillStyle: '#000000', strokeStyle: '#000000', font: '10px sans-serif',
       globalAlpha: 1.0, lineWidth: 1.0, textBaseline: 'alphabetic', textAlign: 'start',
       shadowColor: 'rgba(0, 0, 0, 0)', shadowBlur: 0, globalCompositeOperation: 'source-over',
+      // Из 3051 вопроса, что задаёт кадр челленджа, только на один мы отвечали
+      // пустотой: у браузера фильтр холста — строка `none`, а не `undefined`.
+      filter: 'none',
 
       fillRect(x, y, w, h) {
         note('fillRect|' + [x, y, w, h, this.fillStyle]);
