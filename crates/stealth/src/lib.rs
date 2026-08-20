@@ -1626,6 +1626,7 @@ pub fn web_surface_script() -> String {
             .replace("__IFACE_STATICS__", IFACE_STATICS)
             .replace("__IFACE_PROTO_MOVES__", IFACE_PROTO_MOVES)
             .replace("__IFACE_CHAIN__", IFACE_CHAIN)
+            .replace("__IFACE_LIFT__", IFACE_LIFT)
     )
 }
 
@@ -2758,6 +2759,13 @@ __OPFS__
   }
 })();"##;
 
+/// Eight interfaces whose members we kept on the object while the browser keeps
+/// them on the prototype — `url.protocol`, `pc.iceGatheringState`,
+/// `mql.matches`. The challenge counts the names on each prototype, and ours
+/// came up 12 short on `URL`, 31 on `RTCPeerConnection`. Measured from Chrome
+/// 148: `a` are properties, `m` are methods with their arity.
+const IFACE_LIFT: &str = r#"{"URL":{"a":["hash","host","hostname","origin","password","pathname","port","protocol","search","searchParams","username"],"m":{"toJSON":0}},"RTCPeerConnection":{"a":["canTrickleIceCandidates","connectionState","currentLocalDescription","currentRemoteDescription","iceConnectionState","iceGatheringState","localDescription","onaddstream","onconnectionstatechange","ondatachannel","onicecandidate","onicecandidateerror","oniceconnectionstatechange","onicegatheringstatechange","onnegotiationneeded","onremovestream","onsignalingstatechange","ontrack","pendingLocalDescription","pendingRemoteDescription","remoteDescription","sctp","signalingState"],"m":{"addStream":1,"addTrack":1,"addTransceiver":1,"createDTMFSender":1,"getLocalStreams":0,"getRemoteStreams":0,"removeStream":1,"removeTrack":1}},"AnalyserNode":{"a":["fftSize","frequencyBinCount","maxDecibels","minDecibels","smoothingTimeConstant"],"m":{"getByteFrequencyData":1,"getByteTimeDomainData":1,"getFloatFrequencyData":1,"getFloatTimeDomainData":1}},"MediaDevices":{"a":["ondevicechange"],"m":{"enumerateDevices":0,"getDisplayMedia":0,"getSupportedConstraints":0,"getUserMedia":0,"setCaptureHandleConfig":0}},"MediaQueryList":{"a":["matches","media","onchange"],"m":{"addListener":1,"removeListener":1}},"TextDecoder":{"a":["encoding","fatal","ignoreBOM"]},"TextEncoder":{"a":["encoding"],"m":{"encodeInto":2}},"SubtleCrypto":{"m":{"unwrapKey":7,"wrapKey":4}}}"#;
+
 /// Who inherits from whom, measured from Chrome 148. Our interfaces were mostly
 /// flat — `AbortSignal` did not descend from `EventTarget`, `Text` did not
 /// descend from `CharacterData` — and a graph walk reads the chain, not just the
@@ -2877,6 +2885,56 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
   // оформляется лениво. Так что здесь верность имени уступает верности
   // поведения, и это осознанный размен, а не недоделка.
   try { if (globalThis.__pt_sinkAudioMethods) __pt_sinkAudioMethods(); } catch (e) {}
+
+  // Члены, которые браузер объявляет на прототипе, а мы держали на самом
+  // объекте. Свойство становится аксессором над скрытым состоянием экземпляра:
+  // `this.protocol = 'https:'` в нашем же конструкторе идёт через сеттер и
+  // ложится туда же, так что поведение прежнее, а `Object.keys` у экземпляра
+  // пустеет — как в браузере. Метод, которого у нас нет вовсе, объявляется
+  // пустым: имя есть, обещания работы нет, но и раньше его не было.
+  // Слои, оформляющие свои прототипы позже нас (аудиоузлы — при создании
+  // первого узла), проверяют «не занято ли имя» и уступали бы нашему. Метим
+  // объявленное здесь, чтобы такая проверка считала место свободным.
+  const stubs = globalThis.__pt_stubMembers || (globalThis.__pt_stubMembers = new WeakSet());
+  const named = (f, n) => {
+    try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {}
+    try { stubs.add(f); } catch (e) {}
+    return native(f);
+  };
+  const LIFT = __IFACE_LIFT__;
+  for (const iface of Object.keys(LIFT)) {
+    const C = globalThis[iface];
+    let P;
+    try { P = C && C.prototype; } catch (e) { continue; }
+    if (!P) continue;
+    const spec = LIFT[iface];
+    const slots = new WeakMap();
+    for (const k of spec.a || []) {
+      if (Object.prototype.hasOwnProperty.call(P, k)) continue;
+      try {
+        Object.defineProperty(P, k, {
+          get: named(function () { const st = slots.get(this); return st ? st[k] : undefined; }, 'get ' + k),
+          set: named(function (v) {
+            let st = slots.get(this);
+            if (!st) { st = {}; try { slots.set(this, st); } catch (e2) { return; } }
+            st[k] = v;
+          }, 'set ' + k),
+          enumerable: true, configurable: true,
+        });
+      } catch (e) {}
+    }
+    for (const k of Object.keys(spec.m || {})) {
+      if (Object.prototype.hasOwnProperty.call(P, k)) continue;
+      try {
+        const f = strictFn();
+        Object.defineProperty(f, 'length', { value: spec.m[k], configurable: true });
+        try { delete f.prototype; } catch (e2) {}
+        Object.defineProperty(P, k, {
+          value: named(f, k), writable: true, enumerable: true, configurable: true,
+        });
+      } catch (e) {}
+    }
+  }
 
   const MOVES = __IFACE_PROTO_MOVES__;
   for (const iface of Object.keys(MOVES)) {

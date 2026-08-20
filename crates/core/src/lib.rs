@@ -4107,6 +4107,40 @@ mod tests {
         assert_eq!(got["filter"], "none", "{got}");
     }
 
+    /// The challenge counts the names on each interface prototype. Ours kept
+    /// them on the object instead — `url.protocol`, `pc.iceGatheringState`,
+    /// `mql.matches` — so `URL.prototype` had 3 names against Chrome's 15 and
+    /// `RTCPeerConnection.prototype` had 15 against 46.
+    #[tokio::test]
+    async fn an_interface_keeps_its_members_on_the_prototype() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+        let got = probe(
+            &ctx,
+            r#"__ptJSON.stringify({
+                counts: [URL, RTCPeerConnection, AnalyserNode, MediaDevices,
+                         MediaQueryList, TextDecoder, TextEncoder, SubtleCrypto]
+                    .map((C) => Object.getOwnPropertyNames(C.prototype).length),
+                url: (() => { const u = new URL('https://a.b:8443/p?q=1#h');
+                    return [u.protocol, u.host, u.hash, u.search, u.origin, Object.keys(u).length]; })(),
+            })"#,
+        )
+        .await;
+        // Snapshot of Chrome 148, interface by interface.
+        assert_eq!(got["counts"], serde_json::json!([15, 46, 10, 7, 6, 5, 4, 13]), "{got}");
+        // And the members still answer — they read the object's own state, they
+        // just live where the browser keeps them.
+        assert_eq!(
+            got["url"],
+            serde_json::json!(["https:", "a.b:8443", "#h", "?q=1", "https://a.b:8443", 0]),
+            "{got}"
+        );
+    }
+
     #[test]
     fn an_image_states_its_size_in_its_own_header() {
         // A one-pixel PNG, GIF and JPEG: the three a page is most likely to meet.
