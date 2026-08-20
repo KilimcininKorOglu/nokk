@@ -4033,6 +4033,53 @@ mod tests {
     /// одним сообщением с объектом в ответ. В Chrome ответ приходит сразу; у
     /// нас он терялся, хотя следом стоящий таймер из того же скрипта доезжал
     /// исправно. Проверяем ровно тот скрипт, который приходит с чужой стороны.
+    /// The challenge fingerprints by walking the global graph. Closing that graph
+    /// by name was not enough: every interface object we made was an ordinary
+    /// function, and an ordinary function owns `arguments` and `caller`, which no
+    /// browser interface does. 834 of 947 carried them.
+    #[tokio::test]
+    async fn an_interface_object_has_a_browser_shape() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let bad = probe(
+            &ctx,
+            r#"__ptJSON.stringify((() => {
+                const out = [];
+                for (const n of Object.getOwnPropertyNames(globalThis)) {
+                    if (!/^[A-Z]/.test(n)) continue;
+                    let v; try { v = globalThis[n]; } catch (e) { continue; }
+                    if (typeof v !== 'function') continue;
+                    const own = Object.getOwnPropertyNames(v);
+                    if (own.indexOf('arguments') >= 0 || own.indexOf('caller') >= 0) out.push(n);
+                }
+                return out;
+            })())"#,
+        )
+        .await;
+        assert_eq!(bad.as_array().map(Vec::len), Some(0), "not browser-shaped: {bad}");
+
+        // And the statics that live on the interface itself, which a graph walk
+        // reads on its first step.
+        let statics = probe(
+            &ctx,
+            r#"__ptJSON.stringify([Event.AT_TARGET, DOMException.ABORT_ERR,
+                KeyboardEvent.DOM_KEY_LOCATION_NUMPAD, typeof URL.canParse,
+                Object.getOwnPropertyNames(NodeFilter).indexOf('prototype')])"#,
+        )
+        .await;
+        let v = statics.as_array().expect("array");
+        assert_eq!(v[0].as_i64(), Some(2));
+        assert_eq!(v[1].as_i64(), Some(20));
+        assert_eq!(v[2].as_i64(), Some(3));
+        assert_eq!(v[3].as_str(), Some("function"));
+        assert_eq!(v[4].as_i64(), Some(-1), "NodeFilter must have no prototype");
+    }
+
     #[test]
     fn an_image_states_its_size_in_its_own_header() {
         // A one-pixel PNG, GIF and JPEG: the three a page is most likely to meet.
