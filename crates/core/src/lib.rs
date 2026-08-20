@@ -4705,18 +4705,18 @@ mod tests {
         assert!(out["navGraph"].as_u64().unwrap() > 75, "navigator graph: {}", out["navGraph"]);
         // Measured against Chrome 148 in the same shape of page: 243 enumerable
         // names up the window's chain — 237 own, two on `Window.prototype`, four
-        // on `EventTarget.prototype`. Ours is 236: the same own set bar `status`,
-        // and the chain's own levels are still missing (see the constructor
-        // check below). It used to be over 1100, because every interface object
-        // was enumerable here and none of them is in a browser.
+        // on `EventTarget.prototype`. The own set is now Chrome's exactly;
+        // `status` was the last name missing from it. It used to be over 1100,
+        // because every interface object was enumerable here and none of them is
+        // in a browser.
         assert!(
             (230..=250).contains(&out["winGraph"].as_u64().unwrap()),
             "window graph: {} (Chrome: 243)",
             out["winGraph"]
         );
         assert_eq!(
-            out["winKeys"], 236,
-            "own enumerable names on the window, Chrome's set exactly bar `status`"
+            out["winKeys"], 237,
+            "own enumerable names on the window — Chrome's set, exactly"
         );
         assert_eq!(out["docRemove"], false, "Document has no ChildNode.remove");
         assert_eq!(out["elRemove"], "function", "elements keep theirs");

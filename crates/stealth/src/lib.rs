@@ -1023,9 +1023,25 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   globalThis.clearTimeout = (id) => { const t = q.get(id); if (t) t.cancelled = true; q.delete(id); };
   globalThis.clearInterval = globalThis.clearTimeout;
   globalThis.queueMicrotask = (fn) => { Promise.resolve().then(fn); };
-  globalThis.requestAnimationFrame = (fn) =>
-    add(() => fn(globalThis.performance ? globalThis.performance.now() : clock()), 16, false, []);
-  globalThis.cancelAnimationFrame = globalThis.clearTimeout;
+  // У кадров анимации свой счётчик, отдельный от таймеров: в браузере первый
+  // `requestAnimationFrame` на странице возвращает 1, даже если до него уже
+  // завели два таймера. Мы отдавали общий номер — разница видна одной строкой.
+  let rafSeq = 0;
+  const rafIds = new Map();
+  globalThis.requestAnimationFrame = (fn) => {
+    const rid = ++rafSeq;
+    rafIds.set(rid, add(() => {
+      rafIds.delete(rid);
+      fn(globalThis.performance ? globalThis.performance.now() : clock());
+    }, 16, false, []));
+    return rid;
+  };
+  globalThis.cancelAnimationFrame = (rid) => {
+    const tid = rafIds.get(rid);
+    if (tid === undefined) return;
+    rafIds.delete(rid);
+    globalThis.clearTimeout(tid);
+  };
   // No browser has `setImmediate`/`clearImmediate` — they are Node's, and we were
   // the ones putting them on the page. An extra global is as much a tell as a
   // missing one, and this pair is a well-known signature.
@@ -1756,9 +1772,20 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
     }
   } catch (e) {}
 
+  // `window.status` — наследство девяностых, но у Chrome оно есть: пустая
+  // строка, которую можно писать. Единственное имя, которого нам не хватало на
+  // окне против браузера.
+  if (!('status' in globalThis)) {
+    try {
+      Object.defineProperty(globalThis, 'status', {
+        value: '', writable: true, enumerable: true, configurable: true,
+      });
+    } catch (e) {}
+  }
+
   const ENUM = new Set(__WINDOW_ENUMERABLE__);
   for (const name of Object.getOwnPropertyNames(globalThis)) {
-    if (name.lastIndexOf('__pt', 0) === 0 || name === '__out') continue;
+    if (name.lastIndexOf('__pt', 0) === 0 || name.lastIndexOf('__out', 0) === 0) continue;
     let d;
     try { d = Object.getOwnPropertyDescriptor(globalThis, name); } catch (e) { continue; }
     if (!d || !d.configurable) continue;
@@ -2834,6 +2861,28 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
   }
   if (!changed) break;
   }
+
+  // Потоковые входы WebAssembly даёт не движок, а браузер: они принимают
+  // `Response` и читают из него байты. У V8 их нет вовсе, и в перечислении
+  // пространства имён нам не хватало ровно этих двух имён против Chrome.
+  // Реализуем честно — через тот же ответ, что отдаёт наш `fetch`.
+  try {
+    const W = globalThis.WebAssembly;
+    if (W && typeof W.compile === 'function' && typeof W.compileStreaming !== 'function') {
+      const bytesOf = (src) => Promise.resolve(src).then((r) => {
+        if (r && typeof r.arrayBuffer === 'function') return r.arrayBuffer();
+        return r;
+      });
+      const cs = function compileStreaming(source) { return bytesOf(source).then((b) => W.compile(b)); };
+      const is = function instantiateStreaming(source, imports) {
+        return bytesOf(source).then((b) => W.instantiate(b, imports));
+      };
+      Object.defineProperty(W, 'compileStreaming', {
+        value: native(cs), writable: true, enumerable: false, configurable: true });
+      Object.defineProperty(W, 'instantiateStreaming', {
+        value: native(is), writable: true, enumerable: false, configurable: true });
+    }
+  } catch (e) {}
 
   const STATICS = __IFACE_STATICS__;
   for (const iface of Object.keys(STATICS)) {
@@ -6481,7 +6530,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // non-enumerable AND filter them out at every introspection choke point. They
   // stay callable by bare name (the Rust driver's only need), which lookups by
   // name still resolve. The filters themselves are marked native (#1).
-  const __ptHidden = (k) => typeof k === 'string' && (k.lastIndexOf('__pt', 0) === 0 || k === '__out');
+  // `__out*` — имена одноразовой пробы движка (`--eval` кладёт туда ответ);
+  // прятать надо всё семейство, иначе `__outDone` торчит на окне лишним именем.
+  const __ptHidden = (k) => typeof k === 'string' && (k.lastIndexOf('__pt', 0) === 0 || k.lastIndexOf('__out', 0) === 0);
   for (const k of Object.getOwnPropertyNames(globalThis)) {
     if (__ptHidden(k)) {
       try { Object.defineProperty(globalThis, k, { enumerable: false }); } catch (e) {}
