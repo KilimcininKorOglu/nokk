@@ -2764,7 +2764,7 @@ __OPFS__
 /// `mql.matches`. The challenge counts the names on each prototype, and ours
 /// came up 12 short on `URL`, 31 on `RTCPeerConnection`. Measured from Chrome
 /// 148: `a` are properties, `m` are methods with their arity.
-const IFACE_LIFT: &str = r#"{"URL":{"a":["hash","host","hostname","origin","password","pathname","port","protocol","search","searchParams","username"],"m":{"toJSON":0}},"RTCPeerConnection":{"a":["canTrickleIceCandidates","connectionState","currentLocalDescription","currentRemoteDescription","iceConnectionState","iceGatheringState","localDescription","onaddstream","onconnectionstatechange","ondatachannel","onicecandidate","onicecandidateerror","oniceconnectionstatechange","onicegatheringstatechange","onnegotiationneeded","onremovestream","onsignalingstatechange","ontrack","pendingLocalDescription","pendingRemoteDescription","remoteDescription","sctp","signalingState"],"m":{"addStream":1,"addTrack":1,"addTransceiver":1,"createDTMFSender":1,"getLocalStreams":0,"getRemoteStreams":0,"removeStream":1,"removeTrack":1}},"AnalyserNode":{"a":["fftSize","frequencyBinCount","maxDecibels","minDecibels","smoothingTimeConstant"],"m":{"getByteFrequencyData":1,"getByteTimeDomainData":1,"getFloatFrequencyData":1,"getFloatTimeDomainData":1}},"MediaDevices":{"a":["ondevicechange"],"m":{"enumerateDevices":0,"getDisplayMedia":0,"getSupportedConstraints":0,"getUserMedia":0,"setCaptureHandleConfig":0}},"MediaQueryList":{"a":["matches","media","onchange"],"m":{"addListener":1,"removeListener":1}},"TextDecoder":{"a":["encoding","fatal","ignoreBOM"]},"TextEncoder":{"a":["encoding"],"m":{"encodeInto":2}},"SubtleCrypto":{"m":{"unwrapKey":7,"wrapKey":4}}}"#;
+const IFACE_LIFT: &str = r#"{"URL":{"a":["hash","host","hostname","origin","password","pathname","port","protocol","search","searchParams","username"],"m":{"toJSON":0}},"RTCPeerConnection":{"a":["canTrickleIceCandidates","connectionState","currentLocalDescription","currentRemoteDescription","iceConnectionState","iceGatheringState","localDescription","onaddstream","onconnectionstatechange","ondatachannel","onicecandidate","onicecandidateerror","oniceconnectionstatechange","onicegatheringstatechange","onnegotiationneeded","onremovestream","onsignalingstatechange","ontrack","pendingLocalDescription","pendingRemoteDescription","remoteDescription","sctp","signalingState"],"m":{"addStream":1,"addTrack":1,"addTransceiver":1,"createDTMFSender":1,"getLocalStreams":0,"getRemoteStreams":0,"removeStream":1,"removeTrack":1}},"AnalyserNode":{"a":["fftSize","frequencyBinCount","maxDecibels","minDecibels","smoothingTimeConstant"],"m":{"getByteFrequencyData":1,"getByteTimeDomainData":1,"getFloatFrequencyData":1,"getFloatTimeDomainData":1}},"MediaDevices":{"a":["ondevicechange"],"m":{"enumerateDevices":0,"getDisplayMedia":0,"getSupportedConstraints":0,"getUserMedia":0,"setCaptureHandleConfig":0}},"MediaQueryList":{"a":["matches","media","onchange"],"m":{"addListener":1,"removeListener":1}},"TextDecoder":{"a":["encoding","fatal","ignoreBOM"]},"TextEncoder":{"a":["encoding"],"m":{"encodeInto":2}},"SubtleCrypto":{"m":{"unwrapKey":7,"wrapKey":4}},"Date":{"m":{"toTemporalInstant":0}}}"#;
 
 /// Who inherits from whom, measured from Chrome 148. Our interfaces were mostly
 /// flat — `AbortSignal` did not descend from `EventTarget`, `Text` did not
@@ -3264,9 +3264,8 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
     clearMeasures() {}
     clearResourceTimings() { entries.length = 0; }
     setResourceTimingBufferSize() {}
-    addEventListener() {}
-    removeEventListener() {}
-    dispatchEvent() { return true; }
+    // Слушателей объявляет `EventTarget`, от которого `Performance` наследует, —
+    // одна пустышка здесь давала три лишних имени на прототипе против браузера.
     toJSON() {
       return { timeOrigin: ORIGIN, timing: timing.toJSON(), navigation: navigation.toJSON() };
     }
@@ -5901,7 +5900,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   });
   // Desktop Chrome's NetworkInformation omits `type` (it's mobile-only) — its
   // presence is a tell, so we leave it off.
-  navExtra('connection', { effectiveType: '4g', rtt: 50, downlink: 10, saveData: false, onchange: null, addEventListener: noop, removeEventListener: noop });
+  navExtra('connection', { effectiveType: '4g', rtt: 50, downlink: 10, saveData: false, onchange: null });
   const batteryLevel = 0.7 + (SEED % 300) / 1000; // per-session, plausible
   navExtra('getBattery', mask(function getBattery() { return Promise.resolve({ charging: true, chargingTime: 0, dischargingTime: Infinity, level: Math.round(batteryLevel * 100) / 100, onchargingchange: null, onchargingtimechange: null, ondischargingtimechange: null, onlevelchange: null, addEventListener: noop, removeEventListener: noop }); }, 'getBattery'));
   navExtra('storage', { estimate: () => Promise.resolve({ quota: 299977155072, usage: 0, usageDetails: {} }), persist: () => Promise.resolve(false), persisted: () => Promise.resolve(false) });
