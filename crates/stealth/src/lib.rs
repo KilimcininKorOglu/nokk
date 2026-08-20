@@ -1622,7 +1622,10 @@ pub fn web_surface_script() -> String {
             .replace("__CLONE__", CLONE_TEMPLATE)
             .replace("__OPFS__", OPFS_TEMPLATE),
         WINDOW_SHAPE_TEMPLATE.replace("__WINDOW_ENUMERABLE__", WINDOW_ENUMERABLE),
-        IFACE_STATICS_TEMPLATE.replace("__IFACE_STATICS__", IFACE_STATICS)
+        IFACE_STATICS_TEMPLATE
+            .replace("__IFACE_STATICS__", IFACE_STATICS)
+            .replace("__IFACE_PROTO_MOVES__", IFACE_PROTO_MOVES)
+            .replace("__IFACE_CHAIN__", IFACE_CHAIN)
     )
 }
 
@@ -2755,6 +2758,19 @@ __OPFS__
   }
 })();"##;
 
+/// Who inherits from whom, measured from Chrome 148. Our interfaces were mostly
+/// flat — `AbortSignal` did not descend from `EventTarget`, `Text` did not
+/// descend from `CharacterData` — and a graph walk reads the chain, not just the
+/// names on each level.
+const IFACE_CHAIN: &str = r#"{"AggregateError":"Error","EvalError":"Error","RangeError":"Error","ReferenceError":"Error","SyntaxError":"Error","TypeError":"Error","URIError":"Error","Uint8Array":"TypedArray","Int8Array":"TypedArray","Uint16Array":"TypedArray","Int16Array":"TypedArray","Uint32Array":"TypedArray","Int32Array":"TypedArray","BigUint64Array":"TypedArray","BigInt64Array":"TypedArray","Uint8ClampedArray":"TypedArray","Float32Array":"TypedArray","Float64Array":"TypedArray","Option":"HTMLElement","Image":"HTMLElement","Audio":"HTMLMediaElement","WebKitCSSMatrix":"DOMMatrixReadOnly","XMLHttpRequestUpload":"XMLHttpRequestEventTarget","XMLHttpRequestEventTarget":"EventTarget","XMLHttpRequest":"XMLHttpRequestEventTarget","XMLDocument":"Document","Worker":"EventTarget","Window":"EventTarget","WheelEvent":"MouseEvent","WebSocket":"EventTarget","WebGLVertexArrayObject":"WebGLObject","WebGLTransformFeedback":"WebGLObject","WebGLTexture":"WebGLObject","WebGLSync":"WebGLObject","WebGLShader":"WebGLObject","WebGLSampler":"WebGLObject","WebGLRenderbuffer":"WebGLObject","WebGLQuery":"WebGLObject","WebGLProgram":"WebGLObject","WebGLFramebuffer":"WebGLObject","WebGLContextEvent":"Event","WebGLBuffer":"WebGLObject","WaveShaperNode":"AudioNode","VisualViewport":"EventTarget","VisibilityStateEntry":"PerformanceEntry","VirtualKeyboardGeometryChangeEvent":"Event","ViewTimeline":"ScrollTimeline","VTTCue":"TextTrackCue","UIEvent":"Event","TransitionEvent":"Event","TrackEvent":"Event","TouchEvent":"UIEvent","ToggleEvent":"Event","TextUpdateEvent":"Event","TextTrackList":"EventTarget","TextTrackCue":"EventTarget","TextTrack":"EventTarget","TextFormatUpdateEvent":"Event","TextEvent":"UIEvent","Text":"CharacterData","TaskSignal":"AbortSignal","TaskPriorityChangeEvent":"Event","TaskController":"AbortController","TaskAttributionTiming":"PerformanceEntry","SubmitEvent":"Event","StylePropertyMap":"StylePropertyMapReadOnly","StorageEvent":"Event","StereoPannerNode":"AudioNode","StaticRange":"AbstractRange","SourceBufferList":"EventTarget","SourceBuffer":"EventTarget","ShadowRoot":"DocumentFragment","SecurityPolicyViolationEvent":"Event","ScrollTimeline":"AnimationTimeline","ScriptProcessorNode":"AudioNode","ScreenOrientation":"EventTarget","Screen":"EventTarget","SVGViewElement":"SVGElement","SVGUseElement":"SVGGraphicsElement","SVGTitleElement":"SVGElement","SVGTextPositioningElement":"SVGTextContentElement","SVGTextPathElement":"SVGTextContentElement","SVGTextElement":"SVGTextPositioningElement","SVGTextContentElement":"SVGGraphicsElement","SVGTSpanElement":"SVGTextPositioningElement","SVGSymbolElement":"SVGGraphicsElement","SVGSwitchElement":"SVGGraphicsElement","SVGStyleElement":"SVGElement","SVGStopElement":"SVGElement","SVGSetElement":"SVGAnimationElement","SVGScriptElement":"SVGElement","SVGSVGElement":"SVGGraphicsElement","SVGRectElement":"SVGGeometryElement","SVGRadialGradientElement":"SVGGradientElement","SVGPolylineElement":"SVGGeometryElement","SVGPolygonElement":"SVGGeometryElement","SVGPatternElement":"SVGElement","SVGPathElement":"SVGGeometryElement","SVGMetadataElement":"SVGElement","SVGMaskElement":"SVGElement","SVGMarkerElement":"SVGElement","SVGMPathElement":"SVGElement","SVGLinearGradientElement":"SVGGradientElement","SVGLineElement":"SVGGeometryElement","SVGImageElement":"SVGGraphicsElement","SVGGraphicsElement":"SVGElement","SVGGradientElement":"SVGElement","SVGGeometryElement":"SVGGraphicsElement","SVGGElement":"SVGGraphicsElement","SVGForeignObjectElement":"SVGGraphicsElement","SVGFilterElement":"SVGElement","SVGFETurbulenceElement":"SVGElement","SVGFETileElement":"SVGElement","SVGFESpotLightElement":"SVGElement","SVGFESpecularLightingElement":"SVGElement","SVGFEPointLightElement":"SVGElement","SVGFEOffsetElement":"SVGElement","SVGFEMorphologyElement":"SVGElement","SVGFEMergeNodeElement":"SVGElement","SVGFEMergeElement":"SVGElement","SVGFEImageElement":"SVGElement","SVGFEGaussianBlurElement":"SVGElement","SVGFEFuncRElement":"SVGComponentTransferFunctionElement","SVGFEFuncGElement":"SVGComponentTransferFunctionElement","SVGFEFuncBElement":"SVGComponentTransferFunctionElement","SVGFEFuncAElement":"SVGComponentTransferFunctionElement","SVGFEFloodElement":"SVGElement","SVGFEDropShadowElement":"SVGElement","SVGFEDistantLightElement":"SVGElement","SVGFEDisplacementMapElement":"SVGElement","SVGFEDiffuseLightingElement":"SVGElement","SVGFEConvolveMatrixElement":"SVGElement","SVGFECompositeElement":"SVGElement","SVGFEComponentTransferElement":"SVGElement","SVGFEColorMatrixElement":"SVGElement","SVGFEBlendElement":"SVGElement","SVGEllipseElement":"SVGGeometryElement","SVGElement":"Element","SVGDescElement":"SVGElement","SVGDefsElement":"SVGGraphicsElement","SVGComponentTransferFunctionElement":"SVGElement","SVGClipPathElement":"SVGElement","SVGCircleElement":"SVGGeometryElement","SVGAnimationElement":"SVGElement","SVGAnimateTransformElement":"SVGAnimationElement","SVGAnimateMotionElement":"SVGAnimationElement","SVGAnimateElement":"SVGAnimationElement","SVGAElement":"SVGGraphicsElement","Range":"AbstractRange","RadioNodeList":"NodeList","RTCTrackEvent":"Event","RTCSctpTransport":"EventTarget","RTCPeerConnectionIceEvent":"Event","RTCPeerConnectionIceErrorEvent":"Event","RTCPeerConnection":"EventTarget","RTCIceTransport":"EventTarget","RTCErrorEvent":"Event","RTCError":"DOMException","RTCDtlsTransport":"EventTarget","RTCDataChannelEvent":"Event","RTCDTMFToneChangeEvent":"Event","RTCDTMFSender":"EventTarget","PromiseRejectionEvent":"Event","ProgressEvent":"Event","ProcessingInstruction":"CharacterData","PopStateEvent":"Event","PointerEvent":"MouseEvent","PictureInPictureWindow":"EventTarget","PictureInPictureEvent":"Event","PermissionStatus":"EventTarget","PerformanceScriptTiming":"PerformanceEntry","PerformanceResourceTiming":"PerformanceEntry","PerformancePaintTiming":"PerformanceEntry","PerformanceNavigationTiming":"PerformanceResourceTiming","PerformanceMeasure":"PerformanceEntry","PerformanceMark":"PerformanceEntry","PerformanceLongTaskTiming":"PerformanceEntry","PerformanceLongAnimationFrameTiming":"PerformanceEntry","PerformanceEventTiming":"PerformanceEntry","PerformanceElementTiming":"PerformanceEntry","Performance":"EventTarget","PannerNode":"AudioNode","PageTransitionEvent":"Event","OverconstrainedError":"DOMException","OscillatorNode":"AudioScheduledSourceNode","OffscreenCanvas":"EventTarget","OfflineAudioContext":"BaseAudioContext","OfflineAudioCompletionEvent":"Event","Node":"EventTarget","NetworkInformation":"EventTarget","NavigationHistoryEntry":"EventTarget","NavigationCurrentEntryChangeEvent":"Event","Navigation":"EventTarget","NavigateEvent":"Event","MouseEvent":"UIEvent","MessagePort":"EventTarget","MessageEvent":"Event","MediaStreamTrackGenerator":"MediaStreamTrack","MediaStreamTrackEvent":"Event","MediaStreamTrack":"EventTarget","MediaStreamEvent":"Event","MediaStreamAudioSourceNode":"AudioNode","MediaStreamAudioDestinationNode":"AudioNode","MediaStream":"EventTarget","MediaSource":"EventTarget","MediaRecorder":"EventTarget","MediaQueryListEvent":"Event","MediaQueryList":"EventTarget","MediaEncryptedEvent":"Event","MediaElementAudioSourceNode":"AudioNode","MathMLElement":"Element","LayoutShift":"PerformanceEntry","LargestContentfulPaint":"PerformanceEntry","KeyframeEffect":"AnimationEffect","KeyboardEvent":"UIEvent","InputEvent":"UIEvent","InputDeviceInfo":"MediaDeviceInfo","IIRFilterNode":"AudioNode","IDBVersionChangeEvent":"Event","IDBTransaction":"EventTarget","IDBRequest":"EventTarget","IDBOpenDBRequest":"IDBRequest","IDBDatabase":"EventTarget","IDBCursorWithValue":"IDBCursor","HashChangeEvent":"Event","HTMLVideoElement":"HTMLMediaElement","HTMLUnknownElement":"HTMLElement","HTMLUListElement":"HTMLElement","HTMLTrackElement":"HTMLElement","HTMLTitleElement":"HTMLElement","HTMLTimeElement":"HTMLElement","HTMLTextAreaElement":"HTMLElement","HTMLTemplateElement":"HTMLElement","HTMLTableSectionElement":"HTMLElement","HTMLTableRowElement":"HTMLElement","HTMLTableElement":"HTMLElement","HTMLTableColElement":"HTMLElement","HTMLTableCellElement":"HTMLElement","HTMLTableCaptionElement":"HTMLElement","HTMLStyleElement":"HTMLElement","HTMLSpanElement":"HTMLElement","HTMLSourceElement":"HTMLElement","HTMLSlotElement":"HTMLElement","HTMLSelectedContentElement":"HTMLElement","HTMLSelectElement":"HTMLElement","HTMLScriptElement":"HTMLElement","HTMLQuoteElement":"HTMLElement","HTMLProgressElement":"HTMLElement","HTMLPreElement":"HTMLElement","HTMLPictureElement":"HTMLElement","HTMLParamElement":"HTMLElement","HTMLParagraphElement":"HTMLElement","HTMLOutputElement":"HTMLElement","HTMLOptionsCollection":"HTMLCollection","HTMLOptionElement":"HTMLElement","HTMLOptGroupElement":"HTMLElement","HTMLObjectElement":"HTMLElement","HTMLOListElement":"HTMLElement","HTMLModElement":"HTMLElement","HTMLMeterElement":"HTMLElement","HTMLMetaElement":"HTMLElement","HTMLMenuElement":"HTMLElement","HTMLMediaElement":"HTMLElement","HTMLMarqueeElement":"HTMLElement","HTMLMapElement":"HTMLElement","HTMLLinkElement":"HTMLElement","HTMLLegendElement":"HTMLElement","HTMLLabelElement":"HTMLElement","HTMLLIElement":"HTMLElement","HTMLInputElement":"HTMLElement","HTMLImageElement":"HTMLElement","HTMLIFrameElement":"HTMLElement","HTMLHtmlElement":"HTMLElement","HTMLHeadingElement":"HTMLElement","HTMLHeadElement":"HTMLElement","HTMLHRElement":"HTMLElement","HTMLFrameSetElement":"HTMLElement","HTMLFrameElement":"HTMLElement","HTMLFormElement":"HTMLElement","HTMLFormControlsCollection":"HTMLCollection","HTMLFontElement":"HTMLElement","HTMLFieldSetElement":"HTMLElement","HTMLEmbedElement":"HTMLElement","HTMLElement":"Element","HTMLDocument":"Document","HTMLDivElement":"HTMLElement","HTMLDirectoryElement":"HTMLElement","HTMLDialogElement":"HTMLElement","HTMLDetailsElement":"HTMLElement","HTMLDataListElement":"HTMLElement","HTMLDataElement":"HTMLElement","HTMLDListElement":"HTMLElement","HTMLCanvasElement":"HTMLElement","HTMLButtonElement":"HTMLElement","HTMLBodyElement":"HTMLElement","HTMLBaseElement":"HTMLElement","HTMLBRElement":"HTMLElement","HTMLAudioElement":"HTMLMediaElement","HTMLAreaElement":"HTMLElement","HTMLAnchorElement":"HTMLElement","GamepadEvent":"Event","GainNode":"AudioNode","FormDataEvent":"Event","FontFaceSetLoadEvent":"Event","FocusEvent":"UIEvent","FileReader":"EventTarget","File":"Blob","EventSource":"EventTarget","ErrorEvent":"Event","Element":"Node","EditContext":"EventTarget","DynamicsCompressorNode":"AudioNode","DragEvent":"MouseEvent","DocumentType":"Node","DocumentTimeline":"AnimationTimeline","DocumentFragment":"Node","Document":"Node","DelayNode":"AudioNode","DOMRect":"DOMRectReadOnly","DOMPoint":"DOMPointReadOnly","DOMMatrix":"DOMMatrixReadOnly","DOMException":"Error","CustomEvent":"Event","ConvolverNode":"AudioNode","ContentVisibilityAutoStateChangeEvent":"Event","ConstantSourceNode":"AudioScheduledSourceNode","CompositionEvent":"UIEvent","Comment":"CharacterData","CommandEvent":"Event","CloseWatcher":"EventTarget","CloseEvent":"Event","ClipboardEvent":"Event","CharacterData":"Node","CharacterBoundsUpdateEvent":"Event","ChannelSplitterNode":"AudioNode","ChannelMergerNode":"AudioNode","CanvasCaptureMediaStreamTrack":"MediaStreamTrack","CSSViewTransitionRule":"CSSRule","CSSUnparsedValue":"CSSStyleValue","CSSUnitValue":"CSSNumericValue","CSSTranslate":"CSSTransformComponent","CSSTransition":"Animation","CSSTransformValue":"CSSStyleValue","CSSSupportsRule":"CSSConditionRule","CSSStyleSheet":"StyleSheet","CSSStyleRule":"CSSRule","CSSStartingStyleRule":"CSSGroupingRule","CSSSkewY":"CSSTransformComponent","CSSSkewX":"CSSTransformComponent","CSSSkew":"CSSTransformComponent","CSSScopeRule":"CSSGroupingRule","CSSScale":"CSSTransformComponent","CSSRotate":"CSSTransformComponent","CSSPropertyRule":"CSSRule","CSSPositionValue":"CSSStyleValue","CSSPositionTryRule":"CSSRule","CSSPositionTryDescriptors":"CSSStyleDeclaration","CSSPerspective":"CSSTransformComponent","CSSPageRule":"CSSGroupingRule","CSSNumericValue":"CSSStyleValue","CSSNestedDeclarations":"CSSRule","CSSNamespaceRule":"CSSRule","CSSMediaRule":"CSSConditionRule","CSSMatrixComponent":"CSSTransformComponent","CSSMathValue":"CSSNumericValue","CSSMathSum":"CSSMathValue","CSSMathProduct":"CSSMathValue","CSSMathNegate":"CSSMathValue","CSSMathMin":"CSSMathValue","CSSMathMax":"CSSMathValue","CSSMathInvert":"CSSMathValue","CSSMathClamp":"CSSMathValue","CSSMarginRule":"CSSRule","CSSLayerStatementRule":"CSSRule","CSSLayerBlockRule":"CSSGroupingRule","CSSKeywordValue":"CSSStyleValue","CSSKeyframesRule":"CSSRule","CSSKeyframeRule":"CSSRule","CSSImportRule":"CSSRule","CSSImageValue":"CSSStyleValue","CSSGroupingRule":"CSSRule","CSSFontPaletteValuesRule":"CSSRule","CSSFontFaceRule":"CSSRule","CSSCounterStyleRule":"CSSRule","CSSContainerRule":"CSSConditionRule","CSSConditionRule":"CSSGroupingRule","CSSAnimation":"Animation","CSPViolationReportBody":"ReportBody","CDATASection":"Text","BrowserCaptureMediaStreamTrack":"MediaStreamTrack","BroadcastChannel":"EventTarget","BlobEvent":"Event","BiquadFilterNode":"AudioNode","BeforeUnloadEvent":"Event","BeforeInstallPromptEvent":"Event","BaseAudioContext":"EventTarget","AudioWorkletNode":"AudioNode","AudioScheduledSourceNode":"AudioNode","AudioProcessingEvent":"Event","AudioNode":"EventTarget","AudioDestinationNode":"AudioNode","AudioContext":"BaseAudioContext","AudioBufferSourceNode":"AudioScheduledSourceNode","Attr":"Node","AnimationPlaybackEvent":"Event","AnimationEvent":"Event","Animation":"EventTarget","AnalyserNode":"AudioNode","AbortSignal":"EventTarget","SuppressedError":"Error","Float16Array":"TypedArray","AbsoluteOrientationSensor":"OrientationSensor","Accelerometer":"Sensor","AudioDecoder":"EventTarget","AudioEncoder":"EventTarget","AudioWorklet":"Worklet","BatteryManager":"EventTarget","Clipboard":"EventTarget","CookieChangeEvent":"Event","CookieStore":"EventTarget","CreateMonitor":"EventTarget","DeviceMotionEvent":"Event","DeviceOrientationEvent":"Event","FederatedCredential":"Credential","GPUDevice":"EventTarget","GPUInternalError":"GPUError","GPUOutOfMemoryError":"GPUError","GPUPipelineError":"DOMException","GPUUncapturedErrorEvent":"Event","GPUValidationError":"GPUError","GravitySensor":"Accelerometer","Gyroscope":"Sensor","IdleDetector":"EventTarget","LinearAccelerationSensor":"Accelerometer","MIDIAccess":"EventTarget","MIDIConnectionEvent":"Event","MIDIInput":"MIDIPort","MIDIMessageEvent":"Event","MIDIOutput":"MIDIPort","MIDIPort":"EventTarget","MediaDevices":"EventTarget","MediaKeyMessageEvent":"Event","MediaKeySession":"EventTarget","NavigatorManagedData":"EventTarget","OrientationSensor":"Sensor","PasswordCredential":"Credential","RelativeOrientationSensor":"OrientationSensor","ScreenDetailed":"Screen","ScreenDetails":"EventTarget","Sensor":"EventTarget","SensorErrorEvent":"Event","ServiceWorkerRegistration":"EventTarget","VideoDecoder":"EventTarget","VideoEncoder":"EventTarget","VirtualKeyboard":"EventTarget","WebTransportError":"DOMException","XRLayer":"EventTarget","AuthenticatorAssertionResponse":"AuthenticatorResponse","AuthenticatorAttestationResponse":"AuthenticatorResponse","PublicKeyCredential":"Credential","CaptureController":"EventTarget","ClipboardChangeEvent":"Event","DevicePosture":"EventTarget","DigitalCredential":"Credential","DocumentPictureInPicture":"EventTarget","FileSystemDirectoryHandle":"FileSystemHandle","FileSystemFileHandle":"FileSystemHandle","FileSystemWritableFileStream":"WritableStream","HID":"EventTarget","HIDConnectionEvent":"Event","HIDDevice":"EventTarget","HIDInputReportEvent":"Event","IdentityCredential":"Credential","IdentityCredentialError":"DOMException","LanguageModel":"EventTarget","ServiceWorker":"EventTarget","ServiceWorkerContainer":"EventTarget","OTPCredential":"Credential","PaymentRequest":"EventTarget","PaymentRequestUpdateEvent":"Event","PaymentResponse":"EventTarget","PaymentMethodChangeEvent":"PaymentRequestUpdateEvent","PresentationAvailability":"EventTarget","PresentationConnection":"EventTarget","PresentationConnectionAvailableEvent":"Event","PresentationConnectionCloseEvent":"Event","PresentationConnectionList":"EventTarget","PresentationRequest":"EventTarget","Serial":"EventTarget","SerialPort":"EventTarget","USB":"EventTarget","USBConnectionEvent":"Event","WakeLockSentinel":"EventTarget","XRBoundedReferenceSpace":"XRReferenceSpace","XRCPUDepthInformation":"XRDepthInformation","XRInputSourceEvent":"Event","XRInputSourcesChangeEvent":"Event","XRJointPose":"XRPose","XRJointSpace":"XRSpace","XRLightProbe":"EventTarget","XRReferenceSpace":"XRSpace","XRReferenceSpaceEvent":"Event","XRSession":"EventTarget","XRSessionEvent":"Event","XRSpace":"EventTarget","XRSystem":"EventTarget","XRViewerPose":"XRPose","XRWebGLDepthInformation":"XRDepthInformation","XRWebGLLayer":"XRLayer","XRCompositionLayer":"XRLayer","XRProjectionLayer":"XRCompositionLayer","XRCubeLayer":"XRCompositionLayer","XRCylinderLayer":"XRCompositionLayer","XREquirectLayer":"XRCompositionLayer","XRLayerEvent":"Event","XRQuadLayer":"XRCompositionLayer","XRWebGLSubImage":"XRSubImage","XRVisibilityMaskChangeEvent":"Event","BackgroundFetchRegistration":"EventTarget","CSSFontFeatureValuesRule":"CSSRule","CSSFunctionDeclarations":"CSSRule","CSSFunctionDescriptors":"CSSStyleDeclaration","CSSFunctionRule":"CSSGroupingRule","DocumentPictureInPictureEvent":"Event","HTMLFencedFrameElement":"HTMLElement","HTMLGeolocationElement":"HTMLElement","IntegrityViolationReportBody":"ReportBody","InterestEvent":"Event","Notification":"EventTarget","PageRevealEvent":"Event","PageSwapEvent":"Event","Profiler":"EventTarget","QuotaExceededError":"DOMException","RTCDataChannel":"EventTarget","RemotePlayback":"EventTarget","SharedStorageAppendMethod":"SharedStorageModifierMethod","SharedStorageClearMethod":"SharedStorageModifierMethod","SharedStorageDeleteMethod":"SharedStorageModifierMethod","SharedStorageSetMethod":"SharedStorageModifierMethod","SharedWorker":"EventTarget","SnapEvent":"Event","SpeechRecognition":"EventTarget","SpeechRecognitionErrorEvent":"Event","SpeechRecognitionEvent":"Event","SpeechSynthesis":"EventTarget","SpeechSynthesisErrorEvent":"SpeechSynthesisEvent","SpeechSynthesisEvent":"Event","SpeechSynthesisUtterance":"EventTarget","TimelineTrigger":"AnimationTrigger","WebSocketError":"DOMException","WindowControlsOverlay":"EventTarget","WindowControlsOverlayGeometryChangeEvent":"Event"}"#;
+
+/// Members we put on a lower level than the browser does — `addEventListener` on
+/// every event target instead of once on `EventTarget`, `data` on `Text` instead
+/// of `CharacterData`. Each maps to the interfaces Chrome 148 says own it; the
+/// installer walks our own chain to find which of them is the ancestor.
+const IFACE_PROTO_MOVES: &str = r#"{"AbortSignal":{"addEventListener":["EventTarget"],"dispatchEvent":["EventTarget"],"removeEventListener":["EventTarget"]},"BroadcastChannel":{"addEventListener":["EventTarget"],"dispatchEvent":["EventTarget"],"removeEventListener":["EventTarget"]},"FileReader":{"addEventListener":["EventTarget"],"dispatchEvent":["EventTarget"],"removeEventListener":["EventTarget"]},"KeyboardEvent":{"which":["UIEvent"]},"MessagePort":{"addEventListener":["EventTarget"],"dispatchEvent":["EventTarget"],"removeEventListener":["EventTarget"]},"NetworkInformation":{"addEventListener":["EventTarget"],"removeEventListener":["EventTarget"]},"Performance":{"addEventListener":["EventTarget"],"dispatchEvent":["EventTarget"],"removeEventListener":["EventTarget"]},"ServiceWorkerContainer":{"addEventListener":["EventTarget"],"removeEventListener":["EventTarget"]},"Worker":{"addEventListener":["EventTarget"],"dispatchEvent":["EventTarget"],"removeEventListener":["EventTarget"]},"BaseAudioContext":{"addEventListener":["EventTarget"],"removeEventListener":["EventTarget"],"dispatchEvent":["EventTarget"]}}"#;
+
+
 /// The interface objects' static members, installed last of all: constants like
 /// `Event.AT_TARGET` and `DOMException.ABORT_ERR` sit on the interface itself,
 /// and a graph walk reads them on its first step. Runs after every layer has
@@ -2766,6 +2782,45 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     'use strict';
     return function () { return function () {}; };
   })();
+  // Сначала цепочка: пока `Text` не наследует `CharacterData`, класть члены по
+  // уровням бессмысленно — они лягут не туда. Ставим только там, где наша
+  // цепочка оборвана, и только если это не создаёт петли.
+  const CHAIN = __IFACE_CHAIN__;
+  const protoOf = (n) => {
+    // %TypedArray% не имеет имени на окне — до него добираются только через
+    // любой конкретный типизированный массив.
+    if (n === 'TypedArray') {
+      try { return Object.getPrototypeOf(Int8Array.prototype); } catch (e) { return null; }
+    }
+    try { const C = globalThis[n]; return (typeof C === 'function' && C.prototype) || null; }
+    catch (e) { return null; }
+  };
+  // Порядок обхода таблицы произволен, а звенья зависят друг от друга: пока
+  // `CharacterData` сам не встроен в `Node`, вставлять `Text` под него нельзя —
+  // мы потеряли бы уровень. Повторяем, пока цепочка ещё удлиняется.
+  for (let pass = 0; pass < 6; pass++) {
+  let changed = false;
+  for (const child of Object.keys(CHAIN)) {
+    const P = protoOf(child), Q = protoOf(CHAIN[child]);
+    if (!P || !Q || P === Q) continue;
+    const now = Object.getPrototypeOf(P);
+    if (now !== Object.prototype) {
+      // Уже во что-то встроен. Вставить недостающее звено (`Text` наследует
+      // `CharacterData`, а тот — `Node`) можно, только если нынешний предок
+      // остаётся в цепочке ниже нового: иначе мы теряем уровень.
+      if (now === Q) continue;
+      let keeps = false;
+      for (let q = Q; q; q = Object.getPrototypeOf(q)) { if (q === now) { keeps = true; break; } }
+      if (!keeps) continue;
+    }
+    let cycle = false;
+    for (let q = Q; q; q = Object.getPrototypeOf(q)) { if (q === P) { cycle = true; break; } }
+    if (cycle) continue;
+    try { Object.setPrototypeOf(P, Q); changed = true; } catch (e) {}
+  }
+  if (!changed) break;
+  }
+
   const STATICS = __IFACE_STATICS__;
   for (const iface of Object.keys(STATICS)) {
     const I = globalThis[iface];
@@ -2803,6 +2858,45 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         Object.defineProperty(g, 'name', { value: 'get ' + k, configurable: true });
         Object.defineProperty(I, k, { get: native(g), enumerable: true, configurable: true });
       } catch (e) {}
+    }
+  }
+
+  // Уровнем ниже — по прототипам — таблица снята, но не поставлена. Объявить
+  // все 5007 членов, которых нам не хватает против Chrome, оказалось нельзя:
+  // имя на прототипе — обещание работы, и страница, найдя член, зовёт его. На
+  // семействе `Performance*` этим ломался виджет челленджа: наши записи
+  // тайминга живут на этих же прототипах, и заглушка перекрывала настоящее
+  // значение. Отличить «интерфейс, который движок реализует» от «имени из
+  // таблицы графа» надёжно нельзя — пустой прототип бывает и у первого, если он
+  // оформляется лениво. Так что здесь верность имени уступает верности
+  // поведения, и это осознанный размен, а не недоделка.
+  try { if (globalThis.__pt_sinkAudioMethods) __pt_sinkAudioMethods(); } catch (e) {}
+
+  const MOVES = __IFACE_PROTO_MOVES__;
+  for (const iface of Object.keys(MOVES)) {
+    const I = globalThis[iface];
+    let P;
+    try { P = I && I.prototype; } catch (e) { continue; }
+    if (!P) continue;
+    for (const name of Object.keys(MOVES[iface])) {
+      let d;
+      try { d = Object.getOwnPropertyDescriptor(P, name); } catch (e) { continue; }
+      if (!d || !d.configurable) continue;
+      const owners = MOVES[iface][name];
+      let target = null, answered = false;
+      for (let q = Object.getPrototypeOf(P); q; q = Object.getPrototypeOf(q)) {
+        if (Object.prototype.hasOwnProperty.call(q, name)) { answered = true; break; }
+        if (q === Object.prototype) break;
+        let who = '';
+        try { who = (q.constructor && q.constructor.name) || ''; } catch (e) {}
+        if (owners.indexOf(who) >= 0) { target = q; break; }
+      }
+      // Предок уже отвечает за это имя — своя копия лишняя. Ни предка, ни
+      // ответа: имя, которого у браузера нет нигде (`Blob.prototype.toString`),
+      // — убираем, только если оно ничего не несёт.
+      if (!target && !answered && owners.length) continue;
+      try { delete P[name]; } catch (e) { continue; }
+      if (target) { try { Object.defineProperty(target, name, d); } catch (e) {} }
     }
   }
 })();"#;
@@ -3211,9 +3305,9 @@ const CRYPTO_TEMPLATE: &str = r#"(() => {
         return diff === 0;
       });
     }
-    encrypt(alg, key, data) { return this.__op(true, alg, key, data); }
-    decrypt(alg, key, data) { return this.__op(false, alg, key, data); }
-    __op(enc, alg, key, data) {
+    encrypt(alg, key, data) { return this.__ptOp(true, alg, key, data); }
+    decrypt(alg, key, data) { return this.__ptOp(false, alg, key, data); }
+    __ptOp(enc, alg, key, data) {
       const k = raw(key);
       if (!k) return fail('InvalidAccessError', 'Not a CryptoKey');
       const n = nameOf(alg);
@@ -3297,7 +3391,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     if (s.slice(0, 5) === 'blob:') {
       const b = globalThis.__pt_blobs && globalThis.__pt_blobs.get(s);
       if (!b) return null;
-      const body = typeof b.text === 'function' ? String(b) : String(b);
+      const body = typeof b.__ptText === 'function' ? b.__ptText() : String(b);
       return { body, type: b.type || '' };
     }
     if (s.slice(0, 5) === 'data:') {
@@ -4357,6 +4451,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   };
 
   const noop = () => {};
+  // Свои значения по именам, которые браузер объявляет только на чтение:
+  // присваивание такому имени бросает, а объявление — нет.
+  const own = (o, k, v) => {
+    try { Object.defineProperty(o, k, { value: v, writable: true, enumerable: true, configurable: true }); }
+    catch (e) {}
+  };
+
 
   // The seed canvas and audio derive their device-specific character from.
   // It is a hash of *this profile* — the same identity therefore draws the same
@@ -5451,7 +5552,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       try { Object.setPrototypeOf(P, globalThis[base].prototype); } catch (e) {}
     }
     for (const key of members) {
-      if (Object.getOwnPropertyDescriptor(P, key)) continue;
+      const cur = Object.getOwnPropertyDescriptor(P, key);
+      const stubbed = cur && globalThis.__pt_stubMembers
+        && ((cur.get && __pt_stubMembers.has(cur.get)) || (cur.value && __pt_stubMembers.has(cur.value)));
+      if (cur && !stubbed) continue;
       const acc = {
         get [key]() { const st = NODE_STATE.get(this); return st ? st[key] : undefined; },
         set [key](v) { const st = NODE_STATE.get(this); if (st) st[key] = v; },
@@ -5606,7 +5710,28 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     }
   }
   const audioTag = (Ctor, name) => { try { Object.defineProperty(Ctor.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {} return Ctor; };
+  // Базу надо объявить на окне самой: иначе имя `BaseAudioContext` достаётся
+  // заглушке из таблицы графа, и в цепочке оказывается другой объект с тем же
+  // именем — `Object.getPrototypeOf(AudioContext.prototype) !== BaseAudioContext.prototype`.
+  globalThis.BaseAudioContext = audioTag(mask(BaseAudioContext, 'BaseAudioContext'), 'BaseAudioContext');
   globalThis.AudioContext = audioTag(mask(class AudioContext extends BaseAudioContext {}, 'AudioContext'), 'AudioContext');
+  // `close`/`resume`/`suspend` браузер объявляет на самих контекстах, а не на
+  // общей базе: наследование то же, уровень другой — и обход графа это читает.
+  globalThis.__pt_sinkAudioMethods = () => {
+    const B = globalThis.BaseAudioContext && globalThis.BaseAudioContext.prototype;
+    if (!B) return;
+    for (const k of ['close', 'resume', 'suspend']) {
+      const d = Object.getOwnPropertyDescriptor(B, k);
+      if (!d) continue;
+      for (const n of ['AudioContext', 'OfflineAudioContext']) {
+        const C = globalThis[n];
+        if (!C || !C.prototype || Object.prototype.hasOwnProperty.call(C.prototype, k)) continue;
+        if (n === 'OfflineAudioContext' && k === 'close') continue;   // у офлайнового его нет
+        try { Object.defineProperty(C.prototype, k, d); } catch (e) {}
+      }
+      try { delete B[k]; } catch (e) {}
+    }
+  };
   globalThis.OfflineAudioContext = audioTag(mask(class OfflineAudioContext extends BaseAudioContext {
     constructor(ch, len, rate) {
       super();
@@ -6056,7 +6181,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       arrayBuffer() { return Promise.resolve(new TextEncoder().encode(this[BLOB].parts.join('')).buffer); }
       bytes() { return Promise.resolve(new TextEncoder().encode(this[BLOB].parts.join(''))); }
       slice() { return new Blob([]); }
-      toString() { return this[BLOB].parts.join(''); }
+      __ptText() { return this[BLOB].parts.join(''); }
     };
     globalThis.__pt_blobParts = (b) => (b && b[BLOB] ? b[BLOB].parts : null);
   }
@@ -6083,44 +6208,44 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       removeEventListener(t, fn) { const l = this.__ls[t]; if (!l) return; const i = l.indexOf(fn); if (i >= 0) l.splice(i, 1); }
       dispatchEvent() { return true; }
       abort() { this.readyState = 2; }
-      __fire(type) {
+      __ptFire(type) {
         const ev = { type, target: this, currentTarget: this, isTrusted: true };
         try { if (typeof this['on' + type] === 'function') this['on' + type](ev); } catch (e) {}
         for (const fn of (this.__ls[type] || []).slice()) { try { fn.call(this, ev); } catch (e) {} }
       }
-      __read(blob, make) {
+      __ptRead(blob, make) {
         this.readyState = 1;
         Promise.resolve(blob && blob.text ? blob.text() : String(blob)).then((t) => {
           this.result = make(t); this.readyState = 2;
-          this.__fire('load'); this.__fire('loadend');
-        }, (e) => { this.error = e; this.readyState = 2; this.__fire('error'); this.__fire('loadend'); });
+          this.__ptFire('load'); this.__ptFire('loadend');
+        }, (e) => { this.error = e; this.readyState = 2; this.__ptFire('error'); this.__ptFire('loadend'); });
       }
-      readAsText(b) { this.__read(b, (t) => t); }
-      readAsDataURL(b) { this.__read(b, (t) => 'data:' + ((b && b.type) || 'application/octet-stream') + ';base64,' + btoa(t)); }
-      readAsArrayBuffer(b) { this.__read(b, (t) => new TextEncoder().encode(t).buffer); }
-      readAsBinaryString(b) { this.__read(b, (t) => t); }
+      readAsText(b) { this.__ptRead(b, (t) => t); }
+      readAsDataURL(b) { this.__ptRead(b, (t) => 'data:' + ((b && b.type) || 'application/octet-stream') + ';base64,' + btoa(t)); }
+      readAsArrayBuffer(b) { this.__ptRead(b, (t) => new TextEncoder().encode(t).buffer); }
+      readAsBinaryString(b) { this.__ptRead(b, (t) => t); }
     };
   }
   if (!globalThis.FormData) {
-    globalThis.FormData = class FormData { constructor() { this._d = []; } append(k, v) { this._d.push([String(k), v]); } set(k, v) { this.delete(k); this.append(k, v); } get(k) { const e = this._d.find((x) => x[0] === k); return e ? e[1] : null; } getAll(k) { return this._d.filter((x) => x[0] === k).map((x) => x[1]); } has(k) { return this._d.some((x) => x[0] === k); } delete(k) { this._d = this._d.filter((x) => x[0] !== k); } forEach(f) { for (const [k, v] of this._d) f(v, k, this); } entries() { return this._d[Symbol.iterator](); } toString() { return this._d.map(([k, v]) => k + '=' + v).join('&'); } };
+    globalThis.FormData = class FormData { constructor() { this.__ptD = []; } append(k, v) { this.__ptD.push([String(k), v]); } set(k, v) { this.delete(k); this.append(k, v); } get(k) { const e = this.__ptD.find((x) => x[0] === k); return e ? e[1] : null; } getAll(k) { return this.__ptD.filter((x) => x[0] === k).map((x) => x[1]); } has(k) { return this.__ptD.some((x) => x[0] === k); } delete(k) { this.__ptD = this.__ptD.filter((x) => x[0] !== k); } forEach(f) { for (const [k, v] of this.__ptD) f(v, k, this); } entries() { return this.__ptD[Symbol.iterator](); } toString() { return this.__ptD.map(([k, v]) => k + '=' + v).join('&'); } };
   }
 
   if (!globalThis.URLSearchParams) {
     globalThis.URLSearchParams = class URLSearchParams {
-      constructor(init) { this._d = [];
-        if (typeof init === 'string') { init.replace(/^[?]/, '').split('&').forEach((p) => { if (!p) return; const i = p.indexOf('='); const k = decodeURIComponent(i < 0 ? p : p.slice(0, i)); const v = i < 0 ? '' : decodeURIComponent(p.slice(i + 1).replace(/[+]/g, ' ')); this._d.push([k, v]); }); }
-        else if (init && typeof init === 'object') { for (const k in init) this._d.push([k, String(init[k])]); } }
-      get(k) { const e = this._d.find((x) => x[0] === k); return e ? e[1] : null; }
-      getAll(k) { return this._d.filter((x) => x[0] === k).map((x) => x[1]); }
-      has(k) { return this._d.some((x) => x[0] === k); }
-      set(k, v) { const e = this._d.find((x) => x[0] === k); if (e) e[1] = String(v); else this._d.push([k, String(v)]); }
-      append(k, v) { this._d.push([k, String(v)]); }
-      delete(k) { this._d = this._d.filter((x) => x[0] !== k); }
-      forEach(f) { for (const [k, v] of this._d) f(v, k, this); }
-      keys() { return this._d.map((x) => x[0])[Symbol.iterator](); }
-      values() { return this._d.map((x) => x[1])[Symbol.iterator](); }
-      entries() { return this._d.map((x) => [x[0], x[1]])[Symbol.iterator](); }
-      toString() { return this._d.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&'); }
+      constructor(init) { this.__ptD = [];
+        if (typeof init === 'string') { init.replace(/^[?]/, '').split('&').forEach((p) => { if (!p) return; const i = p.indexOf('='); const k = decodeURIComponent(i < 0 ? p : p.slice(0, i)); const v = i < 0 ? '' : decodeURIComponent(p.slice(i + 1).replace(/[+]/g, ' ')); this.__ptD.push([k, v]); }); }
+        else if (init && typeof init === 'object') { for (const k in init) this.__ptD.push([k, String(init[k])]); } }
+      get(k) { const e = this.__ptD.find((x) => x[0] === k); return e ? e[1] : null; }
+      getAll(k) { return this.__ptD.filter((x) => x[0] === k).map((x) => x[1]); }
+      has(k) { return this.__ptD.some((x) => x[0] === k); }
+      set(k, v) { const e = this.__ptD.find((x) => x[0] === k); if (e) e[1] = String(v); else this.__ptD.push([k, String(v)]); }
+      append(k, v) { this.__ptD.push([k, String(v)]); }
+      delete(k) { this.__ptD = this.__ptD.filter((x) => x[0] !== k); }
+      forEach(f) { for (const [k, v] of this.__ptD) f(v, k, this); }
+      keys() { return this.__ptD.map((x) => x[0])[Symbol.iterator](); }
+      values() { return this.__ptD.map((x) => x[1])[Symbol.iterator](); }
+      entries() { return this.__ptD.map((x) => [x[0], x[1]])[Symbol.iterator](); }
+      toString() { return this.__ptD.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&'); }
     };
   }
   if (!globalThis.URL || !globalThis.URL.prototype || !('searchParams' in (globalThis.URL.prototype || {}))) {
