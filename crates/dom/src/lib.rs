@@ -130,7 +130,24 @@ fn serialize(node: &Handle, scripts: &mut Vec<Script>) -> Value {
                     .map(|t| t.trim().eq_ignore_ascii_case("module"))
                     .unwrap_or(false);
                 let nomodule = attrs.borrow().iter().any(|a| &*a.name.local == "nomodule");
-                if nomodule && !module {
+                // A `<script>` whose type is not JavaScript is a data block, not
+                // code: an import map, structured data, a template, a pile of
+                // JSON the page reads back out of `textContent`. A browser never
+                // runs one. We ran them all, and every real page carries at least
+                // one — chess.com's `application/ld+json` threw a SyntaxError on
+                // its first colon, which is what a page's own error handler then
+                // reports as ours.
+                let executable = match attr("type") {
+                    None => true,
+                    Some(t) => {
+                        let t = t.trim().to_ascii_lowercase();
+                        let t = t.split(';').next().unwrap_or("").trim().to_string();
+                        t.is_empty() || t == "module" || is_javascript_type(&t)
+                    }
+                };
+                if !executable {
+                    scripts.push(Script::Skipped);
+                } else if nomodule && !module {
                     scripts.push(Script::Skipped);
                 } else {
                     match attr("src") {
@@ -179,6 +196,32 @@ fn serialize(node: &Handle, scripts: &mut Vec<Script>) -> Value {
 }
 
 /// Concatenate the direct text children of a node (used for inline scripts).
+/// Is this `type` one a browser will execute? The HTML spec fixes the list of
+/// JavaScript MIME types; everything else — `application/json`, `importmap`,
+/// `speculationrules`, `text/template`, `application/ld+json` — makes the
+/// element a data block that only `textContent` ever reads.
+fn is_javascript_type(t: &str) -> bool {
+    matches!(
+        t,
+        "application/ecmascript"
+            | "application/javascript"
+            | "application/x-ecmascript"
+            | "application/x-javascript"
+            | "text/ecmascript"
+            | "text/javascript"
+            | "text/javascript1.0"
+            | "text/javascript1.1"
+            | "text/javascript1.2"
+            | "text/javascript1.3"
+            | "text/javascript1.4"
+            | "text/javascript1.5"
+            | "text/jscript"
+            | "text/livescript"
+            | "text/x-ecmascript"
+            | "text/x-javascript"
+    )
+}
+
 fn text_content(node: &Handle) -> String {
     let mut out = String::new();
     for child in node.children.borrow().iter() {
@@ -244,6 +287,39 @@ mod tests {
     /// fallback for browsers without modules. A browser takes exactly one — and
     /// the element still counts, because `document.currentScript` is addressed
     /// by position among all the `<script>`s the parser saw.
+    /// Every real page carries at least one `<script>` that is not code:
+    /// structured data, an import map, a template. A browser reads them and runs
+    /// none of them; we ran them all, and chess.com's `application/ld+json` threw
+    /// a SyntaxError on its first colon.
+    #[test]
+    fn a_script_that_is_not_javascript_is_data_and_is_not_run() {
+        let page = parse(
+            r#"<html><head>
+                <script type="application/ld+json">{"@context": "https://schema.org"}</script>
+                <script type="importmap">{"imports": {}}</script>
+                <script type="speculationrules">{"prerender": []}</script>
+                <script type="text/template"><div>{{x}}</div></script>
+                <script type="text/javascript; charset=utf-8">var a = 1</script>
+                <script type="TEXT/JavaScript">var b = 2</script>
+                <script>var c = 3</script>
+                <script type="module">var d = 4</script>
+            </head></html>"#,
+        );
+        assert_eq!(
+            page.scripts,
+            vec![
+                Script::Skipped,
+                Script::Skipped,
+                Script::Skipped,
+                Script::Skipped,
+                Script::Inline("var a = 1".into()),
+                Script::Inline("var b = 2".into()),
+                Script::Inline("var c = 3".into()),
+                Script::InlineModule("var d = 4".into()),
+            ]
+        );
+    }
+
     #[test]
     fn a_nomodule_fallback_is_counted_but_not_run() {
         let page = parse(

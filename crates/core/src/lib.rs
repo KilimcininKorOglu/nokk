@@ -1129,6 +1129,9 @@ impl BrowserContext {
                 let _ = self.eval_in(index, "__pt_endScript()").await;
                 continue;
             }
+            // Which script it was, for the log below: an anonymous "a script
+            // threw" says nothing on a page that runs forty of them.
+            let mut whose = String::from("inline");
             let code = match script {
                 nokk_dom::Script::Inline(code) => code.clone(),
                 nokk_dom::Script::External(src) => match resolve_url(base_url, src) {
@@ -1144,7 +1147,10 @@ impl BrowserContext {
                             // кадр стека выглядит как `<anonymous>`, тогда как в
                             // браузере там адрес скрипта. `new Error().stack`
                             // читают, и форма стека — часть отпечатка.
-                            Ok((_, code)) => format!("{code}\n//# sourceURL={abs}"),
+                            Ok((_, code)) => {
+                                whose = abs.clone();
+                                format!("{code}\n//# sourceURL={abs}")
+                            }
                             Err(e) => {
                                 tracing::warn!(url = %abs, error = %e, "external script fetch failed");
                                 continue;
@@ -1165,7 +1171,10 @@ impl BrowserContext {
                 .eval_in(index, &format!("__pt_beginScript({idx})"))
                 .await;
             if let Err(e) = self.eval_in(index, &code).await {
-                tracing::debug!(error = %e, "page script threw");
+                // For an inline script the address is the page's, so name it by
+                // its opening instead — enough to find it in the document.
+                let head: String = code.chars().filter(|c| !c.is_control()).take(70).collect();
+                tracing::debug!(error = %e, script = %whose, %head, "page script threw");
             }
             let _ = self.eval_in(index, "__pt_endScript()").await;
         }
