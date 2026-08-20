@@ -206,17 +206,29 @@ fn render(v: &serde_json::Value) -> String {
 async fn eval_and_print(ctx: &BrowserContext, js: &str) -> Result<()> {
     // Route both sync values and Promise resolutions through `__out`.
     let wrapped = format!(
-        "(() => {{ const v = ({js}); \
+        "(() => {{ globalThis.__outDone = false; const v = ({js}); \
            if (v && typeof v.then === 'function') {{ \
-             v.then(x => {{ globalThis.__out = x; }}, e => {{ globalThis.__out = 'ERR: ' + e; }}); \
-           }} else {{ globalThis.__out = v; }} \
+             v.then(x => {{ globalThis.__out = x; globalThis.__outDone = true; }}, \
+                    e => {{ globalThis.__out = 'ERR: ' + e; globalThis.__outDone = true; }}); \
+           }} else {{ globalThis.__out = v; globalThis.__outDone = true; }} \
            return undefined; }})()"
     );
     if let Err(e) = ctx.evaluate(&wrapped).await {
         eprintln!("eval error: {e}");
         std::process::exit(1);
     }
-    ctx.run_event_loop().await.ok();
+    // Один оборот круга доводит микрозадачи — но не таймер и не воркера, а
+    // всякая интересная проба ждёт именно их: `undefined` вместо ответа было
+    // свойством измерителя, а не измеряемого. Крутим, пока обещание не решится.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        ctx.run_event_loop().await.ok();
+        let done = ctx.evaluate("globalThis.__outDone === true").await;
+        if matches!(done, Ok(serde_json::Value::Bool(true))) || Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let out = ctx
         .evaluate(
             "globalThis.__out === undefined ? 'undefined' \

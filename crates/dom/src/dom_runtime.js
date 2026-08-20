@@ -2494,7 +2494,12 @@
   // лестницу; сами члены пока живут на Element, их развес — следующим шагом.
   const __ifaceProto = new Map();
   let __pendingTag = 'div';
-  const __mkIface = (name, parentProto) => {
+  // Строгий контекст здесь не украшение: у обычной функции есть собственные
+  // `arguments` и `caller`, а у интерфейса браузера их нет — и обход графа
+  // видел два лишних свойства у каждого из сотни имён `HTML*Element`.
+  const __mkIface = (function () {
+    'use strict';
+    return (name, parentProto) => {
     const C = function () {
       // `new HTMLElement()` в браузере бросает, но `super()` из класса
       // кастомного элемента обязан работать — это его штатный путь.
@@ -2507,7 +2512,8 @@
     try { Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {}
     globalThis[name] = globalThis.__pt_native ? __pt_native(C) : C;
     return C.prototype;
-  };
+    };
+  })();
   const __htmlProto = __mkIface('HTMLElement', Element.prototype);
   // Тег → интерфейс, снято с Chrome 148.
   const TAG_IFACE = {
@@ -3407,12 +3413,16 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // `<img>`. У нас под этим именем лежала заготовка из таблицы имён — с
   // правильной меткой, но без нашего класса, — поэтому `img.src = …` был
   // обычным присваиванием и в сеть не шёл ничего.
-  const __ptImageCtor = function Image(w, h) {
-    const el = document.createElement('img');
-    if (w !== undefined) el.width = w | 0;
-    if (h !== undefined) el.height = h | 0;
-    return el;
-  };
+  // Строгие: у фабрики браузера нет собственных `arguments`/`caller`.
+  const __ptImageCtor = (function () {
+    'use strict';
+    return function Image(w, h) {
+      const el = document.createElement('img');
+      if (w !== undefined) el.width = w | 0;
+      if (h !== undefined) el.height = h | 0;
+      return el;
+    };
+  })();
   try {
     Object.defineProperty(globalThis, 'Image', { value: __ptImageCtor, writable: true, enumerable: false, configurable: true });
     Object.defineProperty(globalThis.Image, 'prototype', {
@@ -3423,11 +3433,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   // `new Audio()` — это не свой интерфейс, а фабрика: браузер отдаёт
   // HTMLAudioElement, и `Object.prototype.toString` по нему говорит именно это.
-  globalThis.Audio = function Audio(src) {
-    const el = document.createElement('audio');
-    if (src !== undefined) el.src = String(src);
-    return el;
-  };
+  globalThis.Audio = (function () {
+    'use strict';
+    return function Audio(src) {
+      const el = document.createElement('audio');
+      if (src !== undefined) el.src = String(src);
+      return el;
+    };
+  })();
   try {
     Object.defineProperty(globalThis.Audio, 'prototype', {
       value: globalThis.HTMLAudioElement ? globalThis.HTMLAudioElement.prototype : Object.prototype,
