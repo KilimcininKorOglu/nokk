@@ -339,6 +339,16 @@
     addEventListener(type, fn, opts) {
       if (!fn) return;
       const cap = !!(opts && (opts === true || opts.capture));
+      // Обработчик-свойство встаёт в очередь там, где его присвоили: если
+      // `onload` был задан раньше первого слушателя, браузер зовёт его первым.
+      // Присваивание нам не перехватить — `on…` у элемента обычное свойство, —
+      // но здесь видно, было ли оно уже занято.
+      if (!this.__ptOnFirst) {
+        Object.defineProperty(this, '__ptOnFirst', { value: {}, enumerable: false, configurable: true });
+      }
+      if (this.__ptOnFirst[type] === undefined) {
+        this.__ptOnFirst[type] = typeof this['on' + type] === 'function';
+      }
       (this.__ptLis[type] || (this.__ptLis[type] = [])).push({ fn, cap });
     }
     removeEventListener(type, fn, opts) {
@@ -366,13 +376,21 @@
       };
       for (let i = path.length - 1; i >= 1; i--) { if (event.__ptStop) break; if (path[i].__ptLis && path[i].__ptLis[event.type]) { event.eventPhase = 1; fireCapture(path[i], event); } }
       event.eventPhase = 2;
-      if (!event.__ptStop) fire(this);
       // Обработчик-свойство (`onclick`, `onload`, `onmessage`) — такой же
       // слушатель цели, и вызывает его тот же dispatch, а не вызывающий код.
-      if (!event.__ptStopImm) {
+      // Порядок — тот, в котором его завели: раньше слушателей или позже.
+      const onFirst = !!(this.__ptOnFirst && this.__ptOnFirst[event.type]);
+      const callOn = () => {
+        if (event.__ptStopImm) return;
         const on = this['on' + event.type];
-        if (typeof on === 'function') { event.currentTarget = this; try { on.call(this, event); } catch (e) { __pt_reportError(e, 'on' + event.type); } }
-      }
+        if (typeof on === 'function') {
+          event.currentTarget = this;
+          try { on.call(this, event); } catch (e) { __pt_reportError(e, 'listener ' + event.type); }
+        }
+      };
+      if (!event.__ptStop && onFirst) callOn();
+      if (!event.__ptStop) fire(this);
+      if (!onFirst) callOn();
       if (event.bubbles) for (let i = 1; i < path.length; i++) { if (event.__ptStop) break; event.eventPhase = 3; fire(path[i]); }
       // Возвращаем `window.event` как было: вне обработки его нет.
       try { globalThis.event = outerEvent; } catch (e) {}
@@ -429,6 +447,16 @@
         ['addEventListener', function addEventListener(type, fn, opts) {
           const t = self_(this); if (!fn) return;
           const cap = !!(opts && (opts === true || opts.capture));
+          // Тот же учёт порядка, что и у узла: был ли `on…` занят раньше
+          // первого слушателя. Присваивание не перехватить — здесь видно.
+          try {
+            if (!t.__ptOnFirst) {
+              Object.defineProperty(t, '__ptOnFirst', { value: {}, enumerable: false, configurable: true });
+            }
+            if (t.__ptOnFirst[type] === undefined) {
+              t.__ptOnFirst[type] = typeof t['on' + type] === 'function';
+            }
+          } catch (e) {}
           const l = store(t); (l[type] = l[type] || []).push({ fn, cap, once: !!(opts && opts.once) });
         }],
         ['removeEventListener', function removeEventListener(type, fn, opts) {
@@ -762,8 +790,9 @@
 
     __ptFireLoad(ok) {
       const type = ok ? 'load' : 'error';
-      const ev = { type, target: this, currentTarget: this, isTrusted: true };
-      try { const h = this['on' + type]; if (typeof h === 'function') h.call(this, ev); } catch (e) {}
+      // Рассылки достаточно: она сама зовёт и `onload`, и слушателей. Мы звали
+      // обработчик ещё и напрямую, и он срабатывал дважды на каждой картинке и
+      // каждом кадре — счётчик загрузок у страницы получался вдвое больше.
       try { this.dispatchEvent && this.dispatchEvent(new Event(type)); } catch (e) {}
     }
     // `script.text` — тот же текст, что и textContent, и присвоение ему
@@ -1025,6 +1054,13 @@
         // Кадр с `srcdoc` грузится сам, как только попал в документ, — ждать,
         // пока кто-нибудь прочитает `contentWindow`, браузер не заставляет.
         if (src || this.getAttribute('srcdoc') !== null) { try { this.__ptRealmWindow(); } catch (e) {} }
+        // Пустой документ тоже загружается: браузер сообщает `load` следующим
+        // же оборотом. Мы молчали, и страница, ждущая `iframe.onload`, ждала
+        // вечно — а это обычный способ дождаться готового кадра.
+        if (!this.__ptBlankLoaded) {
+          Object.defineProperty(this, '__ptBlankLoaded', { value: true, configurable: true, enumerable: false });
+          __pt_soon(() => { try { this.__ptFireLoad(true); } catch (e) {} });
+        }
         return;
       }
       const id = __nextFrameId++;
@@ -3121,8 +3157,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (!el) return;
     __scriptEls.delete(id);
     const ev = { type: ok ? 'load' : 'error', target: el, currentTarget: el, isTrusted: true };
-    const handler = ok ? el.onload : el.onerror;
-    try { if (typeof handler === 'function') handler.call(el, ev); } catch (e) {}
+    // Рассылка сама зовёт `on…`; вызывать его ещё и отдельно — значит сработать
+    // дважды на каждом скрипте.
     try { el.dispatchEvent && el.dispatchEvent(ev); } catch (e) {}
   };
 
@@ -3163,7 +3199,6 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     st.sameOrigin = !!(globalThis.location && origin === location.origin);
     for (const op of st.pending.splice(0)) __pushFrameOp(op);
     const ev = { type: 'load', target: st.el, currentTarget: st.el, isTrusted: true };
-    try { if (typeof st.el.onload === 'function') st.el.onload(ev); } catch (e) {}
     try { st.el.dispatchEvent && st.el.dispatchEvent(ev); } catch (e) {}
   };
 
@@ -3172,7 +3207,6 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (!st) return;
     __frames.delete(id);
     const ev = { type: 'error', target: st.el, currentTarget: st.el, isTrusted: true };
-    try { if (typeof st.el.onerror === 'function') st.el.onerror(ev); } catch (e) {}
     try { st.el.dispatchEvent && st.el.dispatchEvent(ev); } catch (e) {}
   };
 

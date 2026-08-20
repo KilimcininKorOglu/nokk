@@ -4141,6 +4141,45 @@ mod tests {
         );
     }
 
+    /// A load fires once, and the property handler takes its turn where it was
+    /// set. Ours called `onload` itself *and* dispatched, so every image and
+    /// every frame reported twice; and the handler always went last, where a
+    /// browser runs it in registration order.
+    #[tokio::test]
+    async fn a_load_arrives_once_and_in_order() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+        let got = probe(
+            &ctx,
+            r#"__ptJSON.stringify((() => {
+                const order = (setup) => {
+                    const seen = [];
+                    const el = document.createElement('div');
+                    setup(el, seen);
+                    el.dispatchEvent(new Event('load'));
+                    return seen;
+                };
+                return {
+                    onFirst: order((el, seen) => {
+                        el.onload = () => seen.push('on');
+                        el.addEventListener('load', () => seen.push('lis'));
+                    }),
+                    listenerFirst: order((el, seen) => {
+                        el.addEventListener('load', () => seen.push('lis'));
+                        el.onload = () => seen.push('on');
+                    }),
+                };
+            })())"#,
+        )
+        .await;
+        assert_eq!(got["onFirst"], serde_json::json!(["on", "lis"]), "{got}");
+        assert_eq!(got["listenerFirst"], serde_json::json!(["lis", "on"]), "{got}");
+    }
+
     #[test]
     fn an_image_states_its_size_in_its_own_header() {
         // A one-pixel PNG, GIF and JPEG: the three a page is most likely to meet.
