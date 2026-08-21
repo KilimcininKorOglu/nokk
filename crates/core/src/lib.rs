@@ -4522,6 +4522,36 @@ mod tests {
         assert_eq!(got["toBlobNoArgs"], "TypeError: Failed to execute 'toBlob' on 'HTMLCanvasElement': 1 argument required, but only 0 present.", "{got}");
     }
 
+    /// An element that is not rendered answers `innerText` with its whole
+    /// `textContent` — styles, scripts and all. Ours answered with nothing,
+    /// which is a different thing entirely.
+    #[tokio::test]
+    async fn a_hidden_element_reads_back_everything_it_holds() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+        let got = probe(
+            &ctx,
+            r#"__ptJSON.stringify((() => {
+                const hidden = document.createElement('div');
+                hidden.innerHTML = '<style>.z{color:red}</style><b>текст</b>';
+                hidden.style.display = 'none';
+                document.body.appendChild(hidden);
+                const shown = document.createElement('div');
+                shown.innerHTML = '<style>.z{color:red}</style><b>текст</b>';
+                document.body.appendChild(shown);
+                return { hidden: hidden.innerText, shown: shown.innerText };
+            })())"#,
+        )
+        .await;
+        // Chrome 148, exactly.
+        assert_eq!(got["hidden"], ".z{color:red}текст", "{got}");
+        assert_eq!(got["shown"], "текст", "стиль не отрисован: {got}");
+    }
+
     #[test]
     fn an_image_states_its_size_in_its_own_header() {
         // A one-pixel PNG, GIF and JPEG: the three a page is most likely to meet.

@@ -3834,7 +3834,11 @@ const CS_REPLACED = {"block-size":"65px","border-block-end-style":"inset","borde
   // for reading rendered text.
   const __INNERTEXT_SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'HEAD', 'TITLE']);
   function __innerText(el) {
-    if (!el || el.nodeType !== ELEMENT_NODE || __isHiddenEl(el)) return '';
+    if (!el || el.nodeType !== ELEMENT_NODE) return '';
+    // Неотрисованный элемент отвечает своим `textContent` — со стилями,
+    // скриптами и всем, что внутри. Мы отвечали пустотой, а это разные вещи:
+    // у Chrome `d.style.display='none'; d.innerText` даёт «.z{color:red}текст».
+    if (__isHiddenEl(el)) return el.textContent || '';
     // `innerText` renders only visible content — the text inside <script>/<style>
     // etc. is not rendered, so it must not leak into it (`textContent` includes it).
     if (__INNERTEXT_SKIP.has(el.tagName)) return '';
