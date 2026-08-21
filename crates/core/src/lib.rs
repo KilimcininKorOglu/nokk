@@ -4441,6 +4441,47 @@ mod tests {
         (format!("http://{addr}"), hits)
     }
 
+    /// The challenge measures the clock's resolution: five thousand readings in
+    /// a row, keeping the smallest positive difference. Chrome answers
+    /// 0.09999996423721313, not a clean tenth, because it keeps the timestamp to
+    /// 2^-24 ms. Ours answered 0.09999999999999432 — the same measurement, a
+    /// different machine.
+    #[tokio::test]
+    async fn the_clock_sits_on_the_lattice_a_browser_uses() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+        let got = probe(
+            &ctx,
+            r#"__ptJSON.stringify((() => {
+                let a = 1, b = 1, c;
+                for (let d = 0; d < 5000; d++) {
+                    const e = performance.now(), f = performance.now();
+                    if (e < f) { c = f - e; if (c > a && c < b) b = c; else if (c < a) { b = a; a = c; } }
+                }
+                const t = performance.now();
+                return { min: a, onLattice: Math.floor(t * 16777216) / 16777216 === t };
+            })())"#,
+        )
+        .await;
+        // Chrome 148, measured on the same machine.
+        // Chrome 148 на этой машине отвечает 1677721/2^24. Последний бит зависит
+        // от того, на какой отметке мерить — вычитание двух точек решётки
+        // округляется по-разному, — поэтому сверяем с точностью до пары ulp и
+        // отдельно проверяем, что это не ровная десятая, как было у нас.
+        let min = got["min"].as_f64().expect("число");
+        let want = 1_677_721.0 / 16_777_216.0;
+        assert!((min - want).abs() < 1e-15, "разрешение часов: {min} против {want}");
+        assert!(
+            (min - 0.1_f64).abs() > 1e-9,
+            "ровная десятая — признак часов, считающих от нуля: {min}"
+        );
+        assert_eq!(got["onLattice"], true, "{got}");
+    }
+
     #[test]
     fn an_image_states_its_size_in_its_own_header() {
         // A one-pixel PNG, GIF and JPEG: the three a page is most likely to meet.

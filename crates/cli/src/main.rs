@@ -1286,6 +1286,27 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            // Спросить одно и то же у страницы и у каждого её кадра. Кадр
+            // челленджа чужого происхождения, со страницы в него не заглянуть, а
+            // движок ходит туда сам — и без этого половина сравнений с браузером
+            // невозможна.
+            if let Ok(js) = std::env::var("NOKK_EVAL_FRAMES") {
+                let mut where_: Vec<Option<u32>> = vec![None];
+                where_.extend(ctx.frame_list().iter().map(|f| Some(f.id)));
+                for slot in where_ {
+                    let out = match slot {
+                        None => ctx.evaluate(&js).await,
+                        Some(id) => ctx.evaluate_in_frame(id, &js).await,
+                    };
+                    let label = slot
+                        .map(|i| format!("frame {i}"))
+                        .unwrap_or_else(|| "page".to_string());
+                    match out {
+                        Ok(v) => eprintln!("# {label}: {}", render(&v)),
+                        Err(e) => eprintln!("# {label}: ошибка: {e}"),
+                    }
+                }
+            }
             // Ошибки, которые чужая программа построила у себя в кадре: их не
             // прочитать со страницы — кадр чужого происхождения, — но движок
             // ходит в него сам.

@@ -3112,7 +3112,14 @@ const WEB_SURFACE_TEMPLATE: &str = r##"(() => {
 /// coarsened monotonic `now()`, and carries the legacy `timing`/`navigation`
 /// blocks plus Chrome's `memory`.
 const PERFORMANCE_TEMPLATE: &str = r#"(() => {
-  const ORIGIN = Date.now();
+  // У браузера начало отсчёта тоже не целое: оно снято с тех же часов, что и
+  // `now()`, и несёт доли миллисекунды.
+  const ORIGIN = (() => {
+    const ms = Date.now();
+    const hr0 = typeof globalThis.__pt_hrtime === 'function' ? globalThis.__pt_hrtime() : 0;
+    const frac = Math.floor((hr0 - Math.floor(hr0)) * 10) / 10;
+    return Math.floor((ms + frac) * 16777216) / 16777216;
+  })();
 
   // DOMHighResTimeStamp: 0.1 ms granularity (Chrome coarsens it against timing
   // attacks) and never decreasing. Derived from the same clock as `Date.now()`,
@@ -3131,7 +3138,13 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
     // Тот же квант, что у Chrome, и та же арифметика с плавающей точкой:
     // деление на 10 даёт 98.59999996423721, а не 98.6 — это видно в замерах.
     const coarse = Math.floor(raw * 10) / 10;
-    if (coarse > last) last = coarse;
+    // И та же решётка, что у браузера. Chrome держит отметку с точностью
+    // 2^-24 мс, поэтому его десятые доли — не ровные: 2294.1 у него равно
+    // 2294.099999964237, а .5 и .0 точны. Измеряется это в одну строку —
+    // пять тысяч замеров подряд и минимальная разница, — и у нас выходило
+    // ровное 0.09999999999999432 против браузерного 0.09999996423721313.
+    const v = Math.floor(coarse * 16777216) / 16777216;
+    if (v > last) last = v;
     return last;
   };
 
