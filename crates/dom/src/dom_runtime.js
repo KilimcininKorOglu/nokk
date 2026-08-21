@@ -846,7 +846,9 @@
       if (this.__ptLinkAt === url) return;
       Object.defineProperty(this, '__ptLinkAt', { value: url, configurable: true, enumerable: false });
       if (url.slice(0, 5) === 'data:' || url.slice(0, 5) === 'blob:' || typeof globalThis.__pt_subresource !== 'function') return;
-      const kind = rel === 'stylesheet' ? 'stylesheet' : 'other';
+      // Всё, что пришло через `<link>`, браузер называет `link` в перечне
+      // ресурсов — и предзагрузку, и значок, и таблицу стилей.
+      const kind = rel === 'stylesheet' ? 'stylesheet' : 'link';
       __pt_subresource(url, kind).then(
         () => { if (this.__ptFireLoad) this.__ptFireLoad(true); },
         () => { if (this.__ptFireLoad) this.__ptFireLoad(false); },

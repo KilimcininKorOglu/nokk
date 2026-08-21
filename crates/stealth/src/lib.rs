@@ -3809,7 +3809,10 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     meth('send', function (body) {
       const self = this, b = this.__ptX;
       fire(this, 'loadstart');
-      fetch(b.url, { method: b.method, headers: b.headers, body })
+      // Помечаем запрос как XHR: в перечне ресурсов браузер называет его
+      // `xmlhttprequest`, а не `fetch`, и это видно снаружи.
+      const headers = Object.assign({}, b.headers, { 'x-pt-kind': 'xhr' });
+      fetch(b.url, { method: b.method, headers, body })
         .then(async (r) => {
           if (b.aborted) return;
           b.status = r.status; b.statusText = r.statusText; b.responseURL = r.url || b.url;

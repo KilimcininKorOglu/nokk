@@ -1653,13 +1653,22 @@ impl BrowserContext {
                 // ресурсы.
                 let top_document = from + i == 0 && r.resource_type == "document";
                 let kind = if top_document { "navigation" } else { "resource" };
+                // Имена те же, что называет браузер: у стиля, взятого через
+                // `<link>`, это `link`, у XHR — `xmlhttprequest`, а `img` носит
+                // только то, что и правда картинка. Мы звали картинкой всё
+                // подряд, и перечень ресурсов — а его читают — был не тот.
                 let initiator = match r.resource_type.as_str() {
                     "script" => "script",
-                    "xhr" | "fetch" => "fetch",
+                    "xhr" => "xmlhttprequest",
+                    "fetch" => "fetch",
                     "document" if top_document => "navigation",
                     "document" => "iframe",
-                    "websocket" => "other",
-                    _ => "img",
+                    "stylesheet" => "link",
+                    "css" => "css",
+                    "img" | "image" => "img",
+                    "font" => "css",
+                    "websocket" | "beacon" => "other",
+                    _ => "link",
                 };
                 serde_json::json!({
                     "name": r.url,
