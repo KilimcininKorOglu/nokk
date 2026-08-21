@@ -343,7 +343,40 @@ async fn main() -> Result<()> {
             // измеряемое. Этот же виден только через `toString`, а он замаскирован.
             if std::env::var("NOKK_TRACE_THROWS").is_ok() {
                 let probe = r#"(() => {
-                  try { globalThis.__pt_probeRan = (globalThis.__pt_probeRan || 0) + 1; } catch (e) {}
+                  // Заодно — кто и с чем зовёт раскодировщик: пустой буфер там,
+                  // где у браузера данные, виден только так.
+                  // И кто просит пиксели: пустой ответ у нас против данных у
+                  // браузера означает холст нулевого размера.
+                  try {
+                    const C = globalThis.CanvasRenderingContext2D;
+                    if (C && C.prototype && C.prototype.getImageData) {
+                      const G = C.prototype.getImageData;
+                      C.prototype.getImageData = function (x, y, w, h) {
+                        try {
+                          const c = this.canvas || {};
+                          console.error('[pixels] просят ' + w + 'x' + h + ' у холста ' +
+                                        c.width + 'x' + c.height + ' (' + (c.id || c.className || '') + ')');
+                        } catch (e) {}
+                        return G.apply(this, arguments);
+                      };
+                    }
+                  } catch (e) {}
+                  globalThis.__pt_decodeSpy = (buf) => {
+                    try {
+                      if (Object.prototype.toString.call(buf) !== '[object ArrayBuffer]') return;
+                      // Челлендж занижает `stackTraceLimit` и подменяет
+                      // `prepareStackTrace`, чтобы спрятать свои кадры;
+                      // снимаем поверх этого.
+                      const lim = Error.stackTraceLimit;
+                      const prep = Error.prepareStackTrace;
+                      try { Error.stackTraceLimit = 30; Error.prepareStackTrace = undefined; } catch (e) {}
+                      const snap = String(new Error().stack || '');
+                      try { Error.stackTraceLimit = lim; Error.prepareStackTrace = prep; } catch (e) {}
+                      const st = snap.split('\n').slice(2, 8)
+                        .map((l) => l.trim()).join(' | ');
+                      console.error('[decode] ArrayBuffer ' + buf.byteLength + ' байт @ ' + st.slice(0, 330));
+                    } catch (e) {}
+                  };
                   const E = globalThis.Error;
                   const seen = [];
                   globalThis.__pt_throwTail = (n) => seen.slice(-(n || 12)).join('\n');

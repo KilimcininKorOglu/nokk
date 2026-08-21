@@ -4482,6 +4482,46 @@ mod tests {
         assert_eq!(got["onLattice"], true, "{got}");
     }
 
+    /// A wrong call is an answer too, and the browser's is exact. The challenge
+    /// calls `getImageData()` with no arguments at all and reads what happens;
+    /// ours handed back an empty set of pixels where Chrome throws.
+    #[tokio::test]
+    async fn a_wrong_call_to_the_canvas_is_refused_as_a_browser_refuses_it() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+        let got = probe(
+            &ctx,
+            r#"__ptJSON.stringify((() => {
+                const say = (f) => { try { f(); return 'ответил'; }
+                                     catch (e) { return e.name + ': ' + e.message; } };
+                const c = document.createElement('canvas'); c.width = 4; c.height = 4;
+                const x = c.getContext('2d');
+                return {
+                    noArgs: say(() => x.getImageData()),
+                    zeroWidth: say(() => x.getImageData(0, 0, 0, 4)),
+                    drawNoArgs: say(() => x.drawImage()),
+                    drawBad: say(() => x.drawImage({}, 0, 0)),
+                    putNoArgs: say(() => x.putImageData()),
+                    createZero: say(() => x.createImageData(0, 0)),
+                    toBlobNoArgs: say(() => c.toBlob()),
+                };
+            })())"#,
+        )
+        .await;
+        // Chrome 148, word for word.
+        assert_eq!(got["noArgs"], "TypeError: Failed to execute 'getImageData' on 'CanvasRenderingContext2D': 4 arguments required, but only 0 present.", "{got}");
+        assert_eq!(got["zeroWidth"], "IndexSizeError: Failed to execute 'getImageData' on 'CanvasRenderingContext2D': The source width is 0.", "{got}");
+        assert_eq!(got["drawNoArgs"], "TypeError: Failed to execute 'drawImage' on 'CanvasRenderingContext2D': 3 arguments required, but only 0 present.", "{got}");
+        assert!(got["drawBad"].as_str().unwrap_or("").starts_with("TypeError: Failed to execute 'drawImage'"), "{got}");
+        assert_eq!(got["putNoArgs"], "TypeError: Failed to execute 'putImageData' on 'CanvasRenderingContext2D': 3 arguments required, but only 0 present.", "{got}");
+        assert_eq!(got["createZero"], "IndexSizeError: Failed to execute 'createImageData' on 'CanvasRenderingContext2D': The source width is zero or not a number.", "{got}");
+        assert_eq!(got["toBlobNoArgs"], "TypeError: Failed to execute 'toBlob' on 'HTMLCanvasElement': 1 argument required, but only 0 present.", "{got}");
+    }
+
     #[test]
     fn an_image_states_its_size_in_its_own_header() {
         // A one-pixel PNG, GIF and JPEG: the three a page is most likely to meet.

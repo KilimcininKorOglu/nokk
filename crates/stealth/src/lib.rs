@@ -4943,6 +4943,19 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     } catch (e) { return false; }
   };
 
+  // Неверный вызов — тоже ответ, и он у браузера очень определённый. Челлендж
+  // зовёт `getImageData()` без единого аргумента и смотрит, что будет: у Chrome
+  // это TypeError с точным текстом, у нас выходил пустой набор пикселей.
+  const needArgs = (got, want, method, iface) => {
+    if (got >= want) return;
+    throw new TypeError("Failed to execute '" + method + "' on '" + iface + "': " +
+      want + " argument" + (want === 1 ? '' : 's') + " required, but only " + got + " present.");
+  };
+  const sizeError = (method, why) => {
+    const msg = "Failed to execute '" + method + "' on 'CanvasRenderingContext2D': " + why;
+    return new (globalThis.DOMException || Error)(msg, 'IndexSizeError');
+  };
+
   const make2DContext = (canvas) => {
     const S = makeSurface(canvas);
     const note = S.note, solid = S.solid, stamp = S.stamp;
@@ -5119,6 +5132,18 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       setLineDash(d) { note('setLineDash|' + d); }, getLineDash() { return []; },
 
       drawImage(img, x, y, w, h) {
+        needArgs(arguments.length, 3, 'drawImage', 'CanvasRenderingContext2D');
+        // Рисовать можно только тем, чем умеет браузер; всё прочее — отказ, и
+        // текст у него длинный и дословный.
+        const drawable = img && (img.localName === 'img' || img.localName === 'canvas' ||
+          img.localName === 'video' || img.__ptC2d || img.__ptGl1 || img.__ptGl2 ||
+          typeof img.src === 'string' || img.__ptImageBitmap);
+        if (!drawable) {
+          throw new TypeError("Failed to execute 'drawImage' on 'CanvasRenderingContext2D': " +
+            "The provided value is not of type '(CSSImageValue or HTMLCanvasElement or " +
+            "HTMLImageElement or HTMLVideoElement or ImageBitmap or OffscreenCanvas or " +
+            "SVGImageElement or VideoFrame)'.");
+        }
         note('drawImage|' + [x, y, w, h, img && (img.src || img.localName)]);
         if (taints(img)) tainted = true;
         // Сперва настоящие пиксели: страница, которая рисует картинку и читает
@@ -5130,6 +5155,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         stamp(x || 0, y || 0, w || (img && img.width) || 32, h || (img && img.height) || 32);
       },
       putImageData(data, x, y) {
+        needArgs(arguments.length, 3, 'putImageData', 'CanvasRenderingContext2D');
         note('putImageData|' + [x, y, data && data.width, data && data.height]);
         if (!data || !data.data) return;
         if (S.native) { S.put(data.data, x | 0, y | 0, data.width | 0, data.height | 0); return; }
@@ -5150,13 +5176,21 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         return { width: w, actualBoundingBoxLeft: 0, actualBoundingBoxRight: w, actualBoundingBoxAscent: size * 0.7, actualBoundingBoxDescent: size * 0.2, fontBoundingBoxAscent: size * 0.9, fontBoundingBoxDescent: size * 0.2 };
       },
       getImageData(x, y, w, h) {
+        needArgs(arguments.length, 4, 'getImageData', 'CanvasRenderingContext2D');
         if (tainted) throw securityError('getImageData', 'CanvasRenderingContext2D',
           'The canvas has been tainted by cross-origin data.');
         w = w | 0; h = h | 0;
+        if (w === 0) throw sizeError('getImageData', 'The source width is 0.');
+        if (h === 0) throw sizeError('getImageData', 'The source height is 0.');
         const out = S.read(x, y, w, h, new Uint8ClampedArray(Math.max(0, w * h * 4)));
         return makeImageData(out, w, h);
       },
       createImageData(w, h) {
+        needArgs(arguments.length, 1, 'createImageData', 'CanvasRenderingContext2D');
+        if ((w | 0) === 0) throw sizeError('createImageData', 'The source width is zero or not a number.');
+        if (arguments.length > 1 && (h | 0) === 0) {
+          throw sizeError('createImageData', 'The source height is zero or not a number.');
+        }
         return makeImageData(new Uint8ClampedArray(Math.max(0, (w | 0) * (h | 0) * 4)), w | 0, h | 0);
       },
       createLinearGradient(x0, y0, x1, y1) { note('linearGradient|' + [x0, y0, x1, y1]); return makeGradient(0, [+x0 || 0, +y0 || 0, +x1 || 0, +y1 || 0, 0, 0]); },
@@ -5700,6 +5734,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       return __pt_pngDataUrl(p.w, p.h, p.data) || 'data:,';
     }, 'toDataURL');
     proto.toBlob = mask(function toBlob(cb) {
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to execute 'toBlob' on 'HTMLCanvasElement': " +
+          '1 argument required, but only 0 present.');
+      }
       if (typeof cb !== 'function') return;
       const url = this.toDataURL();
       cb({ size: Math.max(0, url.length - 22), type: 'image/png' });
@@ -6381,6 +6419,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       get fatal() { return this.__ptFatal; }
       get ignoreBOM() { return this.__ptBOM; }
       decode(buf) {
+        if (globalThis.__pt_decodeSpy) { try { __pt_decodeSpy(buf); } catch (e) {} }
         if (buf === undefined || buf === null) return '';
         const a = buf instanceof Uint8Array ? buf
           : ArrayBuffer.isView(buf) ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
