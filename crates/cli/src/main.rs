@@ -336,6 +336,38 @@ async fn main() -> Result<()> {
                 }
                 None => engine.new_context().await?,
             };
+            // Узкий инструмент: только конструктор `Error`, и только чтобы
+            // прочитать, на чём споткнулась чужая программа. Всё, что шире —
+            // подмена `JSON.stringify`, `Array.join`, `String.fromCharCode` —
+            // меняет ход челленджа и рассказывает про измеритель, а не про
+            // измеряемое. Этот же виден только через `toString`, а он замаскирован.
+            if std::env::var("NOKK_TRACE_THROWS").is_ok() {
+                let probe = r#"(() => {
+                  try { globalThis.__pt_probeRan = (globalThis.__pt_probeRan || 0) + 1; } catch (e) {}
+                  const E = globalThis.Error;
+                  const seen = [];
+                  globalThis.__pt_throwTail = (n) => seen.slice(-(n || 12)).join('\n');
+                  const Wrapped = function Error(...a) {
+                    const e = new E(...a);
+                    try {
+                      const where = String(e.stack || '').split('\n').slice(1, 3)
+                        .map((l) => l.trim()).join(' | ');
+                      seen.push(String(a[0] === undefined ? '' : a[0]).slice(0, 160) + ' @ ' + where.slice(0, 200));
+                      if (seen.length > 400) seen.shift();
+                    } catch (e2) {}
+                    return e;
+                  };
+                  Wrapped.prototype = E.prototype;
+                  for (const k of Object.getOwnPropertyNames(E)) {
+                    if (k === 'prototype' || k === 'name' || k === 'length') continue;
+                    try { Wrapped[k] = E[k]; } catch (e2) {}
+                  }
+                  try { Object.defineProperty(E.prototype, 'constructor', { value: Wrapped, writable: true, configurable: true }); } catch (e2) {}
+                  globalThis.Error = globalThis.__pt_native ? __pt_native(Wrapped) : Wrapped;
+                })();"#;
+                c.add_frame_init_script(probe.to_string());
+                c.add_init_script(probe.to_string());
+            }
             // Наблюдение за крючками челленджа: программа, пришедшая с сервера,
             // зовёт виджет через его же таблицу колбэков, и увидеть, какие из
             // них она позвала, — единственный способ прочитать её решение.
@@ -1250,6 +1282,32 @@ async fn main() -> Result<()> {
                             if std::fs::write(&name, &src).is_ok() {
                                 eprintln!("# программа сохранена: {name} ({} байт)", src.len());
                             }
+                        }
+                    }
+                }
+            }
+            // Ошибки, которые чужая программа построила у себя в кадре: их не
+            // прочитать со страницы — кадр чужого происхождения, — но движок
+            // ходит в него сам.
+            if std::env::var("NOKK_TRACE_THROWS").is_ok() {
+                let js = "typeof __pt_throwTail === 'function' ? __pt_throwTail(20) : ''";
+                let mut where_: Vec<Option<u32>> = vec![None];
+                where_.extend(ctx.frame_list().iter().map(|f| Some(f.id)));
+                for slot in where_ {
+                    let out = match slot {
+                        None => ctx.evaluate(js).await,
+                        Some(id) => ctx.evaluate_in_frame(id, js).await,
+                    };
+                    if let Ok(serde_json::Value::String(text)) = out {
+                        if text.is_empty() {
+                            continue;
+                        }
+                        let label = slot
+                            .map(|i| format!("frame {i}"))
+                            .unwrap_or_else(|| "page".to_string());
+                        eprintln!("# броски {label}:");
+                        for line in text.lines() {
+                            eprintln!("#   {line}");
                         }
                     }
                 }

@@ -1692,6 +1692,16 @@ impl BrowserContext {
     /// between that and a widget-specific script is that this cannot go stale.
     /// A driver cannot do it itself — the control is usually inside a closed
     /// shadow root in a cross-origin frame, where page script has no reach.
+    /// Wait, keeping the page running. A pause with the event loop stopped is
+    /// not a pause a page can feel — its timers would all fire at the far end.
+    async fn settle(&self, how_long: std::time::Duration) {
+        let until = std::time::Instant::now() + how_long;
+        while std::time::Instant::now() < until {
+            let _ = self.run_event_loop().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     pub async fn press_widget_control(&self) -> Result<Option<String>, EngineError> {
         // Frames first: a challenge widget is one, and its control is the one
         // worth pressing.
@@ -1723,13 +1733,44 @@ impl BrowserContext {
             );
             // Inside the frame that owns it, so no coordinate has to survive a
             // trip through a parent that lays its frames out differently.
-            for kind in ["mouseMoved", "mousePressed", "mouseReleased"] {
-                let js = format!("__pt_mouse({}, {x}, {y}, \"left\", 1)", js_str(kind));
+            //
+            // Три события подряд в один такт — не нажатие человека, а его
+            // отсутствие: указатель возникает в точном центре, давит и
+            // отпускает за нулевое время. Челлендж этот промежуток измеряет.
+            // Поэтому: подвод по дуге, пауза перед нажатием, удержание, и
+            // конечная точка чуть в стороне от центра — руки в центр не
+            // попадают.
+            let send = async |js: String| {
                 let _ = match frame {
                     None => self.evaluate(&js).await,
                     Some(id) => self.evaluate_in_frame(id, &js).await,
                 };
+            };
+            // Разброс берём из самих координат: он постоянен для одной цели и
+            // разный у разных, без обращения к случайности.
+            let spread = ((x + y * 7.0) as i64).unsigned_abs() % 5;
+            let (tx, ty) = (x + 1.0 + spread as f64 * 0.5, y - 1.0 + (spread % 3) as f64 * 0.5);
+            let steps = 5 + spread as usize % 3;
+            for i in 1..=steps {
+                let t = i as f64 / steps as f64;
+                // Замедление к концу, как у руки: быстро подвели, медленно
+                // навели.
+                let e = 1.0 - (1.0 - t) * (1.0 - t);
+                let px = tx - 24.0 * (1.0 - e);
+                let py = ty - 14.0 * (1.0 - e) + (t * std::f64::consts::PI).sin() * 3.0;
+                send(format!(
+                    "__pt_mouse(\"mouseMoved\", {px:.1}, {py:.1}, \"left\", 0)"
+                ))
+                .await;
+                self.settle(std::time::Duration::from_millis(12 + (i as u64 * 7) % 18))
+                    .await;
             }
+            self.settle(std::time::Duration::from_millis(60 + spread as u64 * 11))
+                .await;
+            send(format!("__pt_mouse(\"mousePressed\", {tx:.1}, {ty:.1}, \"left\", 1)")).await;
+            self.settle(std::time::Duration::from_millis(58 + spread as u64 * 9))
+                .await;
+            send(format!("__pt_mouse(\"mouseReleased\", {tx:.1}, {ty:.1}, \"left\", 1)")).await;
             let what = format!(
                 "{}[{}]@{}{}",
                 c["tag"].as_str().unwrap_or("?"),
@@ -2881,7 +2922,10 @@ impl BrowserContext {
                 // used to report no size at all — `naturalWidth` undefined,
                 // `width` zero — and anything that measures what it drew, as the
                 // challenge does with its beacon PNG, read a picture 0 by 0.
-                let meta = if kind == "img" {
+                // Картинку узнаём по самим байтам, а не по тому, кто её просил:
+                // маячок челленджа приезжает как `<link>`, а рисуют его как
+                // картинку, и по объявленному виду мы бы его пропустили.
+                let meta = if image_size(&resp.body).is_some() {
                     // Whether the server opened the image up to other origins
                     // decides whether drawing it costs the canvas its readability.
                     let cors = resp

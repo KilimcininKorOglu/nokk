@@ -1490,19 +1490,36 @@
     getModifierState(k) { return modifierState.call(this, k); }
   }
   evtAccessors(MouseEvent, ['clientX', 'clientY', 'screenX', 'screenY', 'pageX', 'pageY',
-    'offsetX', 'offsetY', 'button', 'buttons', 'relatedTarget'].concat(MODS));
+    'offsetX', 'offsetY', 'button', 'buttons', 'relatedTarget', 'movementX', 'movementY',
+    'x', 'y', 'layerX', 'layerY'].concat(MODS));
 
   class PointerEvent extends MouseEvent {
     constructor(type, init) {
       super(type, init); init = init || {};
+      // Умолчания — по спецификации, а не «как удобнее»: событие, собранное
+      // страницей вручную, у Chrome отвечает `pointerId` 0, `pointerType` пустой
+      // строкой и нулевым нажимом. Настоящие значения ставит тот, кто вводит.
       Object.assign(this.__ptE, {
-        pointerId: init.pointerId || 1,
-        pointerType: init.pointerType || 'mouse',
-        isPrimary: init.isPrimary !== false,
+        pointerId: init.pointerId === undefined ? 0 : init.pointerId,
+        pointerType: init.pointerType === undefined ? '' : init.pointerType,
+        isPrimary: !!init.isPrimary,
+        width: init.width === undefined ? 1 : init.width,
+        height: init.height === undefined ? 1 : init.height,
+        pressure: init.pressure === undefined ? 0 : init.pressure,
+        tangentialPressure: init.tangentialPressure || 0,
+        tiltX: init.tiltX || 0,
+        tiltY: init.tiltY || 0,
+        twist: init.twist || 0,
+        altitudeAngle: init.altitudeAngle === undefined ? Math.PI / 2 : init.altitudeAngle,
+        azimuthAngle: init.azimuthAngle || 0,
       });
     }
+    // Список слитых событий у ненастоящего события пуст — это его и выдаёт.
+    getCoalescedEvents() { return this.isTrusted ? [this] : []; }
+    getPredictedEvents() { return []; }
   }
-  evtAccessors(PointerEvent, ['pointerId', 'pointerType', 'isPrimary']);
+  evtAccessors(PointerEvent, ['pointerId', 'pointerType', 'isPrimary', 'width', 'height',
+    'pressure', 'tangentialPressure', 'tiltX', 'tiltY', 'twist', 'altitudeAngle', 'azimuthAngle']);
 
   class KeyboardEvent extends UIEvent {
     constructor(type, init) {
@@ -3899,22 +3916,27 @@ const CS_REPLACED = {"block-size":"65px","border-block-end-style":"inset","borde
     const base = { bubbles: true, cancelable: true, composed: true,
                    clientX: x, clientY: y, screenX: x, screenY: y,
                    button: b, detail: clickCount || 1 };
+    // Настоящий указатель мыши: первый, шириной в пиксель. Нажим у браузера
+    // ненулевой только пока кнопка внизу.
+    const ptr = (extra) => Object.assign({}, base, {
+      pointerId: 1, pointerType: 'mouse', isPrimary: true, width: 1, height: 1,
+    }, extra || {});
     // Ввод от движка — доверенный: настоящий клик несёт isTrusted=true, и
     // виджеты, которые ждут нажатия человека, только такой и принимают.
     const send = (ev) => el.dispatchEvent(__ptTrust(ev));
     if (type === 'mousePressed') {
       if (__hoverEl !== el) {
         __hoverEl = el;
-        send(new PointerEvent('pointerover', base));
+        send(new PointerEvent('pointerover', ptr()));
         send(new MouseEvent('mouseover', base));
       }
-      send(new PointerEvent('pointerdown', { ...base, buttons: 1 }));
+      send(new PointerEvent('pointerdown', ptr({ buttons: 1, pressure: 0.5 })));
       send(new MouseEvent('mousedown', { ...base, buttons: 1 }));
       const f = __focusableAncestor(el);
       if (f) f.focus(); else if (globalThis.document) { const a = globalThis.document.activeElement; if (a && a.blur) a.blur(); }
       __mouseDownEl = el;
     } else if (type === 'mouseReleased') {
-      send(new PointerEvent('pointerup', base));
+      send(new PointerEvent('pointerup', ptr()));
       send(new MouseEvent('mouseup', base));
       if (__mouseDownEl === el) {
         // Нажатие на чекбокс/радио переключает его до того, как всплывёт click,
@@ -3930,10 +3952,10 @@ const CS_REPLACED = {"block-size":"65px","border-block-end-style":"inset","borde
     } else if (type === 'mouseMoved') {
       if (__hoverEl !== el) {
         __hoverEl = el;
-        send(new PointerEvent('pointerover', base));
+        send(new PointerEvent('pointerover', ptr()));
         send(new MouseEvent('mouseover', base));
       }
-      send(new PointerEvent('pointermove', base));
+      send(new PointerEvent('pointermove', ptr()));
       send(new MouseEvent('mousemove', base));
     }
     return true;
