@@ -19,6 +19,7 @@ render = ["nokk-pool/render"]
 webgl = ["nokk-pool/webgl"]
 
 [dependencies]
+base64 = { workspace = true }
 nokk-pool = { workspace = true }
 nokk-net = { workspace = true }
 nokk-stealth = { workspace = true }

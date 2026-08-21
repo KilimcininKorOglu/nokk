@@ -28,6 +28,10 @@ const FONT_BYTES: &[u8] = include_bytes!("../fonts/LiberationSans-Regular.ttf");
 
 thread_local! {
     static CANVASES: RefCell<HashMap<u32, Pixmap>> = RefCell::new(HashMap::new());
+    /// Decoded images, by address. A page draws the same picture many times —
+    /// the challenge's beacon PNG lands on a canvas on every round — so the
+    /// decode happens once and the pixels stay.
+    static IMAGES: RefCell<HashMap<String, (u32, u32, Vec<u8>)>> = RefCell::new(HashMap::new());
     static FONT: FontRef<'static> =
         FontRef::try_from_slice(FONT_BYTES).expect("bundled font parses");
 }
@@ -43,6 +47,118 @@ pub fn create(id: u32, w: u32, h: u32) {
             c.borrow_mut().insert(id, pm);
         });
     }
+}
+
+/// Remember an image's bytes under its address, decoded to RGBA.
+///
+/// Without this `drawImage` had nothing to draw: an image reaches JS as lossy
+/// text, so its pixels never left Rust. A page that draws a picture and reads
+/// the canvas back — which is what a challenge does with the beacon it sends —
+/// saw a synthesized pattern where the browser shows the picture.
+pub fn remember_image(url: &str, bytes: &[u8]) -> Option<(u32, u32)> {
+    let decoded = decode_rgba(bytes)?;
+    let (w, h) = (decoded.0, decoded.1);
+    IMAGES.with(|m| {
+        let mut m = m.borrow_mut();
+        // A page can load a great many pictures; keep the map from growing
+        // without bound by dropping the oldest arrival when it gets large.
+        if m.len() >= 256 {
+            if let Some(k) = m.keys().next().cloned() {
+                m.remove(&k);
+            }
+        }
+        m.insert(url.to_string(), decoded);
+    });
+    Some((w, h))
+}
+
+/// PNG to RGBA. Everything else is left to the caller's fallback: the formats a
+/// challenge uses for a data-bearing picture are lossless, and a lossy one
+/// would not carry data anyway.
+fn decode_rgba(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let decoder = png::Decoder::new(bytes);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let (w, h) = (info.width, info.height);
+    if w == 0 || h == 0 || w > MAX_DIM || h > MAX_DIM {
+        return None;
+    }
+    let px = &buf[..info.buffer_size()];
+    let rgba = match (info.color_type, info.bit_depth) {
+        (png::ColorType::Rgba, png::BitDepth::Eight) => px.to_vec(),
+        (png::ColorType::Rgb, png::BitDepth::Eight) => px
+            .chunks_exact(3)
+            .flat_map(|c| [c[0], c[1], c[2], 255])
+            .collect(),
+        (png::ColorType::Grayscale, png::BitDepth::Eight) => {
+            px.iter().flat_map(|&g| [g, g, g, 255]).collect()
+        }
+        (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => px
+            .chunks_exact(2)
+            .flat_map(|c| [c[0], c[0], c[0], c[1]])
+            .collect(),
+        _ => return None,
+    };
+    Some((w, h, rgba))
+}
+
+/// Draw a remembered image onto a canvas, scaled to `dw`x`dh` at `dx`,`dy`.
+///
+/// Nearest-neighbour and source-over, which is what a picture drawn at its own
+/// size needs; a challenge reading the pixels back gets the picture it sent.
+pub fn draw_image(id: u32, url: &str, dx: f32, dy: f32, dw: f32, dh: f32) -> bool {
+    IMAGES.with(|m| {
+        let m = m.borrow();
+        let Some((sw, sh, src)) = m.get(url) else {
+            return false;
+        };
+        let (sw, sh) = (*sw as i64, *sh as i64);
+        let dw = if dw > 0.0 { dw.round() as i64 } else { sw };
+        let dh = if dh > 0.0 { dh.round() as i64 } else { sh };
+        if dw <= 0 || dh <= 0 {
+            return false;
+        }
+        CANVASES.with(|c| {
+            let mut c = c.borrow_mut();
+            let Some(pm) = c.get_mut(&id) else {
+                return false;
+            };
+            let (cw, ch) = (pm.width() as i64, pm.height() as i64);
+            let dst = pm.pixels_mut();
+            let (ox, oy) = (dx.round() as i64, dy.round() as i64);
+            for ty in 0..dh {
+                let py = oy + ty;
+                if py < 0 || py >= ch {
+                    continue;
+                }
+                let sy = (ty * sh / dh).clamp(0, sh - 1);
+                for tx in 0..dw {
+                    let px = ox + tx;
+                    if px < 0 || px >= cw {
+                        continue;
+                    }
+                    let sx = (tx * sw / dw).clamp(0, sw - 1);
+                    let si = ((sy * sw + sx) * 4) as usize;
+                    let (r, g, b, a) = (src[si], src[si + 1], src[si + 2], src[si + 3]);
+                    let di = (py * cw + px) as usize;
+                    dst[di] = tiny_skia::PremultipliedColorU8::from_rgba(
+                        mul(r, a),
+                        mul(g, a),
+                        mul(b, a),
+                        a,
+                    )
+                    .unwrap_or_else(|| tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap());
+                }
+            }
+            true
+        })
+    })
+}
+
+/// Straight alpha to premultiplied, the form tiny-skia stores.
+fn mul(c: u8, a: u8) -> u8 {
+    ((u16::from(c) * u16::from(a) + 127) / 255) as u8
 }
 
 /// Drop a canvas surface (the JS wrapper was garbage-collected).

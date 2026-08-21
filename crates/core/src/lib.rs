@@ -2890,10 +2890,22 @@ impl BrowserContext {
                         .any(|(k, _)| k.eq_ignore_ascii_case("access-control-allow-origin"));
                     image_size(&resp.body)
                         .map(|(w, h)| {
-                            format!(
-                                "__pt_imageMeta({}, {w}, {h}, {cors});",
-                                serde_json::to_string(&url).unwrap()
-                            )
+                            let quoted = serde_json::to_string(&url).unwrap();
+                            // The pixels travel separately: the body reaches JS
+                            // as lossy text, so a picture drawn on a canvas
+                            // would be a guess. Base64 is the only road, and it
+                            // is worth taking only up to a sane size.
+                            let bytes = if resp.body.len() <= 4 * 1024 * 1024 {
+                                use base64::Engine as _;
+                                let b64 = base64::engine::general_purpose::STANDARD
+                                    .encode(&resp.body);
+                                format!(
+                                    "typeof __pt_imageBytes === 'function' && __pt_imageBytes({quoted}, \"{b64}\");"
+                                )
+                            } else {
+                                String::new()
+                            };
+                            format!("__pt_imageMeta({quoted}, {w}, {h}, {cors});{bytes}")
                         })
                         .unwrap_or_default()
                 } else {
@@ -4178,6 +4190,49 @@ mod tests {
         .await;
         assert_eq!(got["onFirst"], serde_json::json!(["on", "lis"]), "{got}");
         assert_eq!(got["listenerFirst"], serde_json::json!(["lis", "on"]), "{got}");
+    }
+
+    /// A picture drawn on a canvas has to be the picture. The bytes reach JS as
+    /// lossy text, so they never left Rust and `drawImage` stamped a synthesized
+    /// pattern instead — a page that draws and reads back, as a challenge does
+    /// with the beacon it sends, saw noise where a browser shows the image.
+    #[tokio::test]
+    async fn a_drawn_picture_reads_back_as_itself() {
+        let _serial = serial().await;
+        // A 2x1 PNG: one red pixel, one blue.
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAADklEQVR4nGP4z8AAQv8BD/kD/YURmXYAAAAASUVORK5CYII=";
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+        // Hand the pixels over the way a fetched image does.
+        let got = probe(
+            &ctx,
+            &format!(
+                r#"__ptJSON.stringify((() => {{
+                    if (typeof __pt_imageBytes !== 'function') return 'нет растеризатора';
+                    const size = __pt_imageBytes('https://example.com/p.png', "{PNG_B64}");
+                    const c = document.createElement('canvas'); c.width = 2; c.height = 1;
+                    const x = c.getContext('2d');
+                    const im = document.createElement('img');
+                    im.src = 'https://example.com/p.png';
+                    x.drawImage(im, 0, 0);
+                    return {{ size: size, row: Array.from(x.getImageData(0, 0, 2, 1).data) }};
+                }})())"#
+            ),
+        )
+        .await;
+        // Without the `render` feature there is no rasterizer and nothing to test.
+        if got.as_str() == Some("нет растеризатора") {
+            return;
+        }
+        assert_eq!(got["size"], 2 << 16 | 1, "размер картинки: {got}");
+        assert_eq!(
+            got["row"],
+            serde_json::json!([255, 0, 0, 255, 0, 0, 255, 255]),
+            "пиксели читаются обратно как есть: {got}"
+        );
     }
 
     #[test]

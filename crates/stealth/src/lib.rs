@@ -4653,6 +4653,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         s = String(s);
         for (let i = 0; i < s.length; i++) { ops ^= s.charCodeAt(i); ops = Math.imul(ops, 16777619) >>> 0; }
       },
+      // Настоящая картинка на холсте. Байты остались в Rust — сюда едет только
+      // адрес; если по нему ничего не декодировано, зовущий ставит свой штамп.
+      image(url, dx, dy, dw, dh) {
+        sync();
+        if (typeof __pt_canvasDrawImage !== 'function') return false;
+        try { return !!__pt_canvasDrawImage(id, String(url), dx, dy, dw, dh); }
+        catch (e) { return false; }
+      },
       solid(x, y, w, h, rgba) {
         sync();
         if ((rgba[3] | 0) === 0) __pt_canvasClearRect(id, x, y, w, h);
@@ -5041,6 +5049,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       drawImage(img, x, y, w, h) {
         note('drawImage|' + [x, y, w, h, img && (img.src || img.localName)]);
         if (taints(img)) tainted = true;
+        // Сперва настоящие пиксели: страница, которая рисует картинку и читает
+        // холст обратно, должна увидеть картинку. Челлендж именно так читает
+        // присланный им маячок. Штамп остаётся на случай, когда декодировать
+        // нечего — чужой формат, `blob:`, другой холст.
+        const src = img && (img.currentSrc || img.src);
+        if (src && S.image && S.image(src, x || 0, y || 0, w || 0, h || 0)) return;
         stamp(x || 0, y || 0, w || (img && img.width) || 32, h || (img && img.height) || 32);
       },
       putImageData(data, x, y) {

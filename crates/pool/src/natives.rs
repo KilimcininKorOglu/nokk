@@ -63,6 +63,8 @@ pub fn install(scope: &mut v8::HandleScope) {
         bind(scope, "__pt_canvasStrokePath", canvas_stroke_path);
         bind(scope, "__pt_canvasPutImageData", canvas_put_image_data);
         bind(scope, "__pt_canvasGetImageData", canvas_get_image_data);
+        bind(scope, "__pt_imageBytes", image_bytes);
+        bind(scope, "__pt_canvasDrawImage", canvas_draw_image);
     }
 
     // Optional real WebGL (the `webgl` feature) — a headless Mesa GL context. Their
@@ -323,6 +325,55 @@ fn canvas_put_image_data(
     let h = arg_usize(scope, args.get(4)) as u32;
     let data = arg_bytes(args.get(5));
     crate::canvas::put_image_data(id, x, y, w, h, &data);
+}
+
+/// `__pt_imageBytes(url, base64)` — hand an image's encoded bytes to the
+/// rasterizer, which decodes and keeps them under that address.
+///
+/// The body of a fetched image reaches JS as lossy text, so the pixels can only
+/// travel this way: base64 in, decoded RGBA kept in Rust. Answers the image's
+/// size, or 0 when the format is one we do not decode.
+#[cfg(feature = "render")]
+fn image_bytes(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let url = arg_string(scope, args.get(0));
+    let b64 = arg_string(scope, args.get(1));
+    let Ok(bytes) = base64_decode(&b64) else {
+        rv.set_uint32(0);
+        return;
+    };
+    match crate::canvas::remember_image(&url, &bytes) {
+        Some((w, h)) => rv.set_uint32(w << 16 | (h & 0xffff)),
+        None => rv.set_uint32(0),
+    }
+}
+
+/// `__pt_canvasDrawImage(id, url, dx, dy, dw, dh)` → true when it was drawn.
+#[cfg(feature = "render")]
+fn canvas_draw_image(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let url = arg_string(scope, args.get(1));
+    let dx = arg_f32(scope, args.get(2));
+    let dy = arg_f32(scope, args.get(3));
+    let dw = arg_f32(scope, args.get(4));
+    let dh = arg_f32(scope, args.get(5));
+    rv.set_bool(crate::canvas::draw_image(id, &url, dx, dy, dw, dh));
+}
+
+/// Standard base64, decoded here so no crate feature has to reach the isolate.
+#[cfg(feature = "render")]
+fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(s.as_bytes())
+        .map_err(|_| ())
 }
 
 /// `__pt_canvasGetImageData(id, x, y, w, h)` → straight-alpha RGBA `Uint8Array`.

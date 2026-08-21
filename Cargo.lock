@@ -1243,6 +1243,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 name = "nokk"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "futures-util",
  "nokk-dom",
  "nokk-net",
