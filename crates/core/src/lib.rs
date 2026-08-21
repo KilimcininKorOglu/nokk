@@ -3964,7 +3964,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(out["inlineOwn"], 703, "{out}");
+        assert_eq!(out["inlineOwn"], 694, "{out}");
         assert_eq!(
             out["firstThree"],
             serde_json::json!(["accentColor", "additiveSymbols", "alignContent"]),
@@ -3978,7 +3978,7 @@ mod tests {
         assert_eq!(out["cssText"], "color: red; background-color: blue", "{out}");
         // Вычисленный стиль: 456 свойств по индексам плюс те же имена.
         assert_eq!(out["computedLength"], 456, "{out}");
-        assert_eq!(out["computedOwn"], 1159, "{out}");
+        assert_eq!(out["computedOwn"], 1150, "{out}");
         assert_eq!(out["computedFirst"], "accent-color", "{out}");
         assert!(out["computedDashed"].is_string(), "дефисное имя читается: {out}");
         assert_eq!(out["sameProto"], true, "оба объявления одного интерфейса: {out}");

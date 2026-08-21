@@ -2530,6 +2530,23 @@ __OPFS__
   // Второй проход по форме интерфейсов: Storage, SpeechSynthesis и звук
   // объявляются позже DOM-слоя, и в первый раз их ещё нет.
   try { if (globalThis.__pt_fillShapes) __pt_fillShapes(); } catch (e) {}
+  // `for…in` по стилю отдаёт девять имён прототипа в порядке объявления, и у
+  // Chrome он свой. Заполнитель форм раскладывает члены по видам — сперва
+  // длина, потом методы, — поэтому здесь пересобираем в браузерном порядке.
+  try {
+    const P = globalThis.CSSStyleDeclaration && globalThis.CSSStyleDeclaration.prototype;
+    if (P) {
+      const order = ['cssText', 'length', 'parentRule', 'cssFloat', 'getPropertyPriority',
+        'getPropertyValue', 'item', 'removeProperty', 'setProperty'];
+      const saved = [];
+      for (const k of order) {
+        const d = Object.getOwnPropertyDescriptor(P, k);
+        if (d && d.configurable) saved.push([k, d]);
+      }
+      for (const [k] of saved) delete P[k];
+      for (const [k, d] of saved) Object.defineProperty(P, k, d);
+    }
+  } catch (e) {}
 
   // `document.fonts` — FontFaceSet. Проверка доступности шрифта через
   // `fonts.check('12px "Some Font"')` — обычный способ снять отпечаток по
