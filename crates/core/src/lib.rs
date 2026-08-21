@@ -4552,6 +4552,56 @@ mod tests {
         assert_eq!(got["shown"], "текст", "стиль не отрисован: {got}");
     }
 
+    /// A call made wrongly is answered exactly, and the answer names the method
+    /// and the interface. Ours either did the wrong thing quietly — `<<<` found
+    /// an element, `matches('###')` said yes — or reported its own internals
+    /// ("Cannot read properties of undefined"), which says the method is a plain
+    /// function and not the browser's.
+    #[tokio::test]
+    async fn a_wrong_call_is_refused_the_way_a_browser_refuses_it() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+        let got = probe(
+            &ctx,
+            r#"__ptJSON.stringify((() => {
+                const say = (f) => { try { f(); return 'ответил'; }
+                                     catch (e) { return e.name + ': ' + e.message; } };
+                const el = document.createElement('div');
+                return {
+                    badSelector: say(() => document.querySelector('<<<')),
+                    badMatches: say(() => el.matches('###')),
+                    noSelector: say(() => document.querySelector()),
+                    noAttr: say(() => el.setAttribute()),
+                    selfChild: say(() => el.appendChild(el)),
+                    notMine: say(() => document.body.removeChild(el)),
+                    badPosition: say(() => el.insertAdjacentHTML('нетакое', 'x')),
+                    noListener: say(() => el.addEventListener()),
+                    badUrl: say(() => new URL('не адрес')),
+                    noItem: say(() => localStorage.setItem()),
+                    goodSelector: say(() => document.querySelector('body')),
+                };
+            })())"#,
+        )
+        .await;
+        // Chrome 148, word for word.
+        assert_eq!(got["badSelector"], "SyntaxError: Failed to execute 'querySelector' on 'Document': '<<<' is not a valid selector.", "{got}");
+        assert_eq!(got["badMatches"], "SyntaxError: Failed to execute 'matches' on 'Element': '###' is not a valid selector.", "{got}");
+        assert_eq!(got["noSelector"], "TypeError: Failed to execute 'querySelector' on 'Document': 1 argument required, but only 0 present.", "{got}");
+        assert_eq!(got["noAttr"], "TypeError: Failed to execute 'setAttribute' on 'Element': 2 arguments required, but only 0 present.", "{got}");
+        assert_eq!(got["selfChild"], "HierarchyRequestError: Failed to execute 'appendChild' on 'Node': The new child element contains the parent.", "{got}");
+        assert_eq!(got["notMine"], "NotFoundError: Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node.", "{got}");
+        assert_eq!(got["noListener"], "TypeError: Failed to execute 'addEventListener' on 'EventTarget': 2 arguments required, but only 0 present.", "{got}");
+        assert_eq!(got["badUrl"], "TypeError: Failed to construct 'URL': Invalid URL", "{got}");
+        assert_eq!(got["noItem"], "TypeError: Failed to execute 'setItem' on 'Storage': 2 arguments required, but only 0 present.", "{got}");
+        assert!(got["badPosition"].as_str().unwrap_or("").starts_with("SyntaxError: Failed to execute 'insertAdjacentHTML'"), "{got}");
+        // And a call made properly is untouched.
+        assert_eq!(got["goodSelector"], "ответил", "{got}");
+    }
+
     #[test]
     fn an_image_states_its_size_in_its_own_header() {
         // A one-pixel PNG, GIF and JPEG: the three a page is most likely to meet.

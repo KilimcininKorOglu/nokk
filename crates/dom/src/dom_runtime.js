@@ -275,7 +275,18 @@
       return n;
     }
 
-    appendChild(child) { return this.insertBefore(child, null); }
+    appendChild(child) {
+      __needArgs(arguments.length, 1, 'appendChild', 'Node');
+      // Узел не может содержать сам себя — и своего предка тоже.
+      for (let p = this; p; p = p.parentNode) {
+        if (p === child) {
+          throw new (globalThis.DOMException || Error)(
+            "Failed to execute 'appendChild' on 'Node': The new child element contains the parent.",
+            'HierarchyRequestError');
+        }
+      }
+      return this.insertBefore(child, null);
+    }
     insertBefore(child, ref) {
       if (child.nodeType === DOCUMENT_FRAGMENT_NODE) {
         for (const c of child.__ptKids.slice()) this.insertBefore(c, ref);
@@ -297,8 +308,13 @@
       return child;
     }
     removeChild(child) {
+      __needArgs(arguments.length, 1, 'removeChild', 'Node');
       const i = this.__ptKids.indexOf(child);
-      if (i < 0) throw new Error('NotFoundError: removeChild');
+      if (i < 0) {
+        throw new (globalThis.DOMException || Error)(
+          "Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node.",
+          'NotFoundError');
+      }
       const prev = this.__ptKids[i - 1] || null, next = this.__ptKids[i + 1] || null;
       this.__ptKids.splice(i, 1); child.parentNode = null; __markDirty();
       __mutation(__childListRecord(this, [], [child], prev, next));
@@ -337,6 +353,7 @@
 
     // EventTarget
     addEventListener(type, fn, opts) {
+      __needArgs(arguments.length, 2, 'addEventListener', 'EventTarget');
       if (!fn) return;
       const cap = !!(opts && (opts === true || opts.capture));
       // Обработчик-свойство встаёт в очередь там, где его присвоили: если
@@ -445,6 +462,7 @@
       const proto = ET.prototype;
       for (const [name, fn] of [
         ['addEventListener', function addEventListener(type, fn, opts) {
+          __needArgs(arguments.length, 2, 'addEventListener', 'EventTarget');
           const t = self_(this); if (!fn) return;
           const cap = !!(opts && (opts === true || opts.capture));
           // Тот же учёт порядка, что и у узла: был ли `on…` занят раньше
@@ -460,6 +478,7 @@
           const l = store(t); (l[type] = l[type] || []).push({ fn, cap, once: !!(opts && opts.once) });
         }],
         ['removeEventListener', function removeEventListener(type, fn, opts) {
+          __needArgs(arguments.length, 2, 'removeEventListener', 'EventTarget');
           const t = self_(this);
           const cap = !!(opts && (opts === true || opts.capture));
           const l = t.__ptLis && t.__ptLis[type]; if (!l) return;
@@ -558,8 +577,15 @@
       return k.length ? k[k.length - 1] : null;
     }
     getElementById(id) { return firstMatch(this, (e) => e.getAttribute('id') === String(id)); }
-    querySelector(sel) { return query(this, sel)[0] || null; }
-    querySelectorAll(sel) { return __staticNodeList(query(this, sel)); }
+    querySelector(sel) {
+      __needArgs(arguments.length, 1, 'querySelector', this.constructor && this.constructor.name || 'Element');
+      return query(this, __checkSelector(sel, 'querySelector', this.constructor && this.constructor.name || 'Element'))[0] || null;
+    }
+    querySelectorAll(sel) {
+      const who = this.constructor && this.constructor.name || 'Element';
+      __needArgs(arguments.length, 1, 'querySelectorAll', who);
+      return __staticNodeList(query(this, __checkSelector(sel, 'querySelectorAll', who)));
+    }
     append(...nodes) { for (const n of nodes) this.appendChild(typeof n === 'string' ? new Text(n) : n); }
     prepend(...nodes) {
       const first = this.__ptKids[0] || null;
@@ -617,8 +643,15 @@
         return cs.every((x) => own.indexOf(x) >= 0);
       }));
     }
-    querySelector(sel) { return query(this, sel)[0] || null; }
-    querySelectorAll(sel) { return __staticNodeList(query(this, sel)); }
+    querySelector(sel) {
+      __needArgs(arguments.length, 1, 'querySelector', this.constructor && this.constructor.name || 'Element');
+      return query(this, __checkSelector(sel, 'querySelector', this.constructor && this.constructor.name || 'Element'))[0] || null;
+    }
+    querySelectorAll(sel) {
+      const who = this.constructor && this.constructor.name || 'Element';
+      __needArgs(arguments.length, 1, 'querySelectorAll', who);
+      return __staticNodeList(query(this, __checkSelector(sel, 'querySelectorAll', who)));
+    }
     append(...ns) { for (const n of ns) this.appendChild(typeof n === 'string' ? new Text(n) : n); }
     prepend(...ns) { for (const n of ns.reverse()) this.insertBefore(typeof n === 'string' ? new Text(n) : n, this.firstChild); }
     elementFromPoint() { return null; }
@@ -716,6 +749,7 @@
     // Attributes
     getAttribute(n) { const v = this.__ptAttrs.get(n.toLowerCase()); return v === undefined ? null : v; }
     setAttribute(n, v) {
+      __needArgs(arguments.length, 2, 'setAttribute', 'Element');
       const name = n.toLowerCase(), old = this.__ptAttrs.get(name);
       this.__ptAttrs.set(name, String(v));
       if (this.__ptUpgraded) {
@@ -944,10 +978,25 @@
         return cs.every((x) => own.indexOf(x) >= 0);
       }));
     }
-    querySelector(sel) { return query(this, sel)[0] || null; }
-    querySelectorAll(sel) { return __staticNodeList(query(this, sel)); }
-    closest(sel) { for (let e = this; e; e = e.parentNode) if (e.nodeType === ELEMENT_NODE && matchesSelector(e, sel)) return e; return null; }
-    matches(sel) { return matchesSelector(this, sel); }
+    querySelector(sel) {
+      __needArgs(arguments.length, 1, 'querySelector', this.constructor && this.constructor.name || 'Element');
+      return query(this, __checkSelector(sel, 'querySelector', this.constructor && this.constructor.name || 'Element'))[0] || null;
+    }
+    querySelectorAll(sel) {
+      const who = this.constructor && this.constructor.name || 'Element';
+      __needArgs(arguments.length, 1, 'querySelectorAll', who);
+      return __staticNodeList(query(this, __checkSelector(sel, 'querySelectorAll', who)));
+    }
+    closest(sel) {
+      __needArgs(arguments.length, 1, 'closest', 'Element');
+      __checkSelector(sel, 'closest', 'Element');
+      for (let e = this; e; e = e.parentNode) if (e.nodeType === ELEMENT_NODE && matchesSelector(e, sel)) return e;
+      return null;
+    }
+    matches(sel) {
+      __needArgs(arguments.length, 1, 'matches', 'Element');
+      return matchesSelector(this, __checkSelector(sel, 'matches', 'Element'));
+    }
 
     // Serialization
     // --- iframes ----------------------------------------------------------
@@ -1112,6 +1161,13 @@
     set innerText(v) { this.textContent = String(v); }
     get outerText() { return __innerText(this); }
     insertAdjacentHTML(pos, html) {
+      __needArgs(arguments.length, 2, 'insertAdjacentHTML', 'Element');
+      if (!/^(beforebegin|afterbegin|beforeend|afterend)$/i.test(String(pos))) {
+        throw new (globalThis.DOMException || Error)(
+          "Failed to execute 'insertAdjacentHTML' on 'Element': The value provided ('" + pos +
+          "') is not one of 'beforeBegin', 'afterBegin', 'beforeEnd', or 'afterEnd'.",
+          'SyntaxError');
+      }
       const nodes = parseFragment(String(html));
       if (pos === 'beforeend') for (const n of nodes) this.appendChild(n);
       else if (pos === 'afterbegin') for (const n of nodes.reverse()) this.insertBefore(n, this.firstChild);
@@ -1386,8 +1442,16 @@
     getElementById(id) { return this.documentElement ? this.documentElement.getElementById(id) : null; }
     getElementsByTagName(t) { return __collection(this.documentElement ? __tags(this.documentElement, t) : []); }
     getElementsByClassName(c) { return this.documentElement ? this.documentElement.getElementsByClassName(c) : []; }
-    querySelector(s) { return this.documentElement ? this.documentElement.querySelector(s) : null; }
-    querySelectorAll(s) { return __staticNodeList(this.documentElement ? query(this.documentElement, s) : []); }
+    querySelector(s) {
+      __needArgs(arguments.length, 1, 'querySelector', 'Document');
+      __checkSelector(s, 'querySelector', 'Document');
+      return this.documentElement ? query(this.documentElement, s)[0] || null : null;
+    }
+    querySelectorAll(s) {
+      __needArgs(arguments.length, 1, 'querySelectorAll', 'Document');
+      __checkSelector(s, 'querySelectorAll', 'Document');
+      return __staticNodeList(this.documentElement ? query(this.documentElement, s) : []);
+    }
 
     // document.write inserts parsed markup at the position of the script that
     // called it (tracked as `currentScript`), matching in-parse behaviour for the
@@ -2298,6 +2362,47 @@
     }
     return false;
   }
+  // Селектор, который браузер разобрать не может, — это отказ, а не пустой
+  // ответ: `document.querySelector('<<<')` бросает SyntaxError с точным текстом.
+  // У нас же он что-то находил — движок молча пропускал непонятное, и `<<<`
+  // отвечал первым элементом, а `matches('###')` отвечал «да».
+  const __selectorOk = (sel) => {
+    const s = String(sel);
+    if (!s.trim()) return false;
+    // Части через запятую проверяются по отдельности, как в браузере.
+    for (const part of s.split(',')) {
+      const t = part.trim();
+      if (!t) return false;
+      if (/[<>~+]$/.test(t) || /^[>~+]/.test(t)) return false;
+      // Скобки должны сходиться.
+      let depth = 0, square = 0;
+      for (const ch of t) {
+        if (ch === '(') depth++;
+        else if (ch === ')') { if (--depth < 0) return false; }
+        else if (ch === '[') square++;
+        else if (ch === ']') { if (--square < 0) return false; }
+        else if (ch === '<') return false;              // в селекторе не бывает
+      }
+      if (depth || square) return false;
+      // `#`, `.` и `:` обязаны вести к имени.
+      if (/[#.](?![-\w\\])/.test(t)) return false;
+      if (/:(?![-\w:(])/.test(t)) return false;
+    }
+    return true;
+  };
+  const __checkSelector = (sel, method, iface) => {
+    if (__selectorOk(sel)) return String(sel);
+    const msg = "Failed to execute '" + method + "' on '" + iface + "': '" +
+      String(sel) + "' is not a valid selector.";
+    throw new (globalThis.DOMException || Error)(msg, 'SyntaxError');
+  };
+  // Столько же доводов, сколько требует браузер, и тот же текст отказа.
+  const __needArgs = (got, want, method, iface) => {
+    if (got >= want) return;
+    throw new TypeError("Failed to execute '" + method + "' on '" + iface + "': " +
+      want + " argument" + (want === 1 ? '' : 's') + " required, but only " + got + " present.");
+  };
+
   function matchesSelector(el, selector) {
     if (!el || el.nodeType !== ELEMENT_NODE) return false;
     return selector.split(',').some(sel => {
