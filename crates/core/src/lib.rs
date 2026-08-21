@@ -1320,6 +1320,8 @@ impl BrowserContext {
             self.apply_frame_ops(&base, &frame_ops).await;
             self.apply_worker_ops(index, &base, &worker_ops).await;
             self.apply_script_ops(index, &base, &script_ops).await;
+            // `import()` спрашивают у движка напрямую, минуя очереди страницы.
+            self.serve_dynamic_imports().await;
 
             // 5. The page asked to go somewhere. Only the last request counts —
             //    a script that assigns `location.href` twice in a turn ends up at
@@ -2468,6 +2470,19 @@ impl BrowserContext {
                     continue;
                 }
                 seen.insert(target.clone());
+                // Уже собранный модуль второй раз не тянем: у браузера на реалм
+                // одна карта модулей, и адрес в ней один, сколько бы кусков его
+                // ни импортировало.
+                let (i, u) = (index, target.clone());
+                if self
+                    .engine
+                    .pool
+                    .dispatch(self.worker, move |iso| iso.has_module(i, &u))
+                    .await
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 match self.fetch_text_in(index, &target, "script", None).await {
                     Ok((_, code)) => pending.push((target, code)),
                     Err(e) => tracing::debug!(url = %target, error = %e, "import failed to load"),
@@ -2481,6 +2496,57 @@ impl BrowserContext {
             .dispatch(self.worker, move |iso| iso.eval_module(i, &u))
             .await?
             .map_err(EngineError::Js)
+    }
+
+    /// Serve the `import()` calls the isolate is waiting on.
+    ///
+    /// V8 has no loader of its own: it asks the embedder and waits on a promise.
+    /// We never answered, so every dynamic import was rejected — and with it any
+    /// page built in chunks, which is nearly all of them. Vite's `__vitePreload`
+    /// catches the rejection, fires `vite:preloadError`, and a page listening for
+    /// it reloads itself forever.
+    async fn serve_dynamic_imports(&self) -> usize {
+        let asked = match self
+            .engine
+            .pool
+            .dispatch(self.worker, move |iso| iso.drain_dynamic_imports())
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        let mut served = 0;
+        for (id, index, referrer, specifier) in asked {
+            // The referrer is the address the module was compiled under, so a
+            // relative specifier resolves against it exactly as in a browser.
+            let outcome = match resolve_url(&referrer, &specifier) {
+                None => Err(format!(
+                    "Failed to resolve module specifier '{specifier}'"
+                )),
+                Some(target) => match self.fetch_text_in(index, &target, "script", None).await {
+                    Err(e) => Err(format!("Failed to fetch dynamically imported module: {e}")),
+                    Ok((final_url, code)) => match self.run_module(index, &final_url, code).await {
+                        Err(e) => Err(e.to_string()),
+                        Ok(()) => Ok(final_url),
+                    },
+                },
+            };
+            let settle = outcome.as_ref().map(|u| u.as_str()).map_err(Clone::clone);
+            let owned: Result<String, String> = settle.map(str::to_string);
+            let _ = self
+                .engine
+                .pool
+                .dispatch(self.worker, move |iso| {
+                    iso.settle_dynamic_import(
+                        id,
+                        index,
+                        owned.as_ref().map(String::as_str).map_err(Clone::clone),
+                    )
+                })
+                .await;
+            served += 1;
+        }
+        served
     }
 
     async fn apply_script_ops(&self, index: usize, base: &str, ops: &[Value]) {
@@ -2673,6 +2739,10 @@ impl BrowserContext {
                     self.apply_script_ops(index, &base, ops).await;
                 }
             }
+
+            // И `import()`, которого движок ждёт: он спрашивает не через очередь
+            // страницы, а через свой крючок, и обещание висит, пока не ответим.
+            work += self.serve_dynamic_imports().await;
 
             // A widget's collection runs in workers *it* started, not the page's:
             // the frame builds the blob, the frame spawns the worker, and the
@@ -4277,6 +4347,89 @@ mod tests {
             serde_json::json!([255, 0, 0, 255, 0, 0, 255, 255]),
             "пиксели читаются обратно как есть: {got}"
         );
+    }
+
+    /// `import()` had no answer at all: V8 asks the embedder and waits, and we
+    /// never replied, so every dynamic import was rejected. A page built in
+    /// chunks — nearly every page now — loaded a fraction of its own code.
+    #[tokio::test]
+    async fn a_page_can_import_a_chunk_of_itself() {
+        let _serial = serial().await;
+        let (url, hits) = chunked_module_server().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 4, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&format!("{}/index.html", url.trim_end_matches('/')))
+            .await
+            .unwrap();
+        // The import settles a turn later, like any promise.
+        for _ in 0..40 {
+            ctx.run_event_loop().await.unwrap();
+            if probe(&ctx, "__ptJSON.stringify(globalThis.__r || '')").await != "" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let got = probe(&ctx, "__ptJSON.stringify(globalThis.__r || '(тишина)')").await;
+        assert_eq!(got.as_str(), Some("загрузилось: привет"), "{got}");
+        // And a module both chunks import is fetched once, as in a browser:
+        // one module map per realm, one address in it.
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "общая зависимость должна быть загружена один раз"
+        );
+    }
+
+    /// A page whose entry imports two chunks, both of which import one shared
+    /// module — the shape that shows whether the module map works.
+    async fn chunked_module_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counted = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let counted = counted.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 2048];
+                    let Ok(n) = sock.read(&mut buf).await else { return };
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let (kind, body) = match path.as_str() {
+                        "/index.html" => ("text/html", concat!(
+                            "<html><body><script type=\"module\">",
+                            "import('./a.js').then(m => import('./b.js').then(n => {",
+                            "  globalThis.__r = 'загрузилось: ' + m.hi() + n.tail();",
+                            "}), e => { globalThis.__r = 'отказ: ' + e.message; });",
+                            "</script></body></html>").to_string()),
+                        "/a.js" => ("text/javascript",
+                            "import { word } from './shared.js';\nexport function hi() { return word; }".to_string()),
+                        "/b.js" => ("text/javascript",
+                            "import { word } from './shared.js';\nexport function tail() { return word ? '' : '?'; }".to_string()),
+                        "/shared.js" => {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            ("text/javascript", "export const word = 'привет';".to_string())
+                        }
+                        _ => ("text/plain", String::new()),
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {kind}; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
     }
 
     #[test]

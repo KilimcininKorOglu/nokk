@@ -31,6 +31,20 @@ struct ModuleRegistry {
     edges: HashMap<(String, String), String>,
 }
 
+/// Дожидающиеся `import()`. У V8 нет своего загрузчика: он зовёт крючок и ждёт
+/// обещание, которое встроитель обязан сам исполнить. Без этого крючка каждый
+/// динамический импорт отклоняется — а на нём держится любая сборка «по кускам»,
+/// то есть почти всякий современный сайт.
+#[derive(Default)]
+#[allow(clippy::type_complexity)]
+struct DynamicImports {
+    next_id: u32,
+    /// id → обещание, которое нужно исполнить, когда модуль готов.
+    pending: HashMap<u32, v8::Global<v8::PromiseResolver>>,
+    /// Что спросили и откуда: (id, индекс контекста, адрес просящего, спецификатор).
+    queue: Vec<(u32, usize, String, String)>,
+}
+
 static V8_INIT: Once = Once::new();
 /// Serialises `v8::Isolate::new`. Concurrent isolate construction from multiple
 /// threads segfaults with the prebuilt V8; construction is a one-time,
@@ -186,7 +200,9 @@ impl Isolate {
         // Modules live for the isolate's whole life: their registry, and the hook
         // that gives each one its `import.meta.url`.
         isolate.set_slot(ModuleRegistry::default());
+        isolate.set_slot(DynamicImports::default());
         isolate.set_host_initialize_import_meta_object_callback(import_meta);
+        isolate.set_host_import_module_dynamically_callback(import_dynamically);
 
         // Install the graceful-OOM callback once, if a cap is in effect.
         let heap_state = max_heap_mb.map(|mb| {
@@ -241,6 +257,7 @@ impl Isolate {
     /// `navigator`/`window`/`screen`…), and return its index. If the bootstrap
     /// script throws, the context is discarded and the error is returned.
     pub fn create_context(&mut self, bootstrap: &str) -> Result<usize, String> {
+        let index = self.contexts.len();
         // Keep the bootstrap on the isolate so a *realm* can be built from it
         // later without the page ever seeing the source. A same-origin `<iframe>`
         // with no `src` is a real window in a browser, and anti-bot code reaches
@@ -260,6 +277,10 @@ impl Isolate {
             // WebCrypto layer is built on top of them.
             crate::natives::install(scope);
             run_script(scope, bootstrap)?;
+            // Крючок динамического импорта видит только область; чтобы он знал,
+            // в каком контексте спросили, контекст носит свой номер под
+            // `__pt`-именем — такие имена перечисление не показывает.
+            let _ = run_script(scope, &format!("globalThis.__pt_ctxIndex = {index};"));
             global
         };
         self.contexts.push(Some(global));
@@ -339,6 +360,19 @@ impl Isolate {
         Ok(out)
     }
 
+    /// Has this context already compiled the module at `url`?
+    ///
+    /// A browser keeps one module map per realm: an address is fetched once,
+    /// however many chunks import it. Ours refetched the shared dependencies of
+    /// every dynamic import, so a code-split page loaded twice the modules a
+    /// browser does.
+    pub fn has_module(&self, index: usize, url: &str) -> bool {
+        self.isolate
+            .get_slot::<ModuleRegistry>()
+            .map(|r| r.modules.contains_key(&format!("{index}:{url}")))
+            .unwrap_or(false)
+    }
+
     /// Record where one module's import specifier leads, so the synchronous
     /// resolve callback can answer without touching the network.
     pub fn link_module(&mut self, index: usize, url: &str, specifier: &str, target: &str) {
@@ -348,6 +382,63 @@ impl Isolate {
                 format!("{index}:{target}"),
             );
         }
+    }
+
+    /// What `import()` calls are waiting to be loaded, taken off the queue.
+    pub fn drain_dynamic_imports(&mut self) -> Vec<(u32, usize, String, String)> {
+        self.isolate
+            .get_slot_mut::<DynamicImports>()
+            .map(|d| std::mem::take(&mut d.queue))
+            .unwrap_or_default()
+    }
+
+    /// Settle a waiting `import()` with the namespace of the module now compiled
+    /// and evaluated under `url`, or with an error if it could not be loaded.
+    pub fn settle_dynamic_import(
+        &mut self,
+        id: u32,
+        index: usize,
+        outcome: Result<&str, String>,
+    ) -> Result<(), String> {
+        let global = self.context(index)?;
+        let scope = &mut v8::HandleScope::new(&mut self.isolate);
+        let context = v8::Local::new(scope, &global);
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        let Some(handle) = scope
+            .get_slot_mut::<DynamicImports>()
+            .and_then(|d| d.pending.remove(&id))
+        else {
+            return Err(format!("no import waiting under {id}"));
+        };
+        let resolver = v8::Local::new(scope, &handle);
+        match outcome {
+            Ok(url) => {
+                let key = format!("{index}:{url}");
+                let module = scope
+                    .get_slot::<ModuleRegistry>()
+                    .and_then(|r| r.modules.get(&key).cloned());
+                match module {
+                    Some(m) => {
+                        let m = v8::Local::new(scope, &m);
+                        let namespace = m.get_module_namespace();
+                        resolver.resolve(scope, namespace);
+                    }
+                    None => {
+                        let msg = v8::String::new(scope, &format!("module {url} was never compiled"))
+                            .ok_or("string")?;
+                        let err = v8::Exception::type_error(scope, msg);
+                        resolver.reject(scope, err);
+                    }
+                }
+            }
+            Err(why) => {
+                let msg = v8::String::new(scope, &why).ok_or("string")?;
+                let err = v8::Exception::type_error(scope, msg);
+                resolver.reject(scope, err);
+            }
+        }
+        Ok(())
     }
 
     /// Instantiate and evaluate an already-compiled module graph. Top-level
@@ -618,6 +709,40 @@ fn compile_module<'s>(
     );
     let mut src = v8::script_compiler::Source::new(code, Some(&origin));
     v8::script_compiler::compile_module(scope, &mut src)
+}
+
+/// V8 asks the embedder to load an `import()`, and waits on the promise we
+/// hand back. Everything here is bookkeeping: make the promise, remember the
+/// resolver by id, and queue what was asked for the driver to fetch.
+fn import_dynamically<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    _host_defined_options: v8::Local<'s, v8::Data>,
+    resource_name: v8::Local<'s, v8::Value>,
+    specifier: v8::Local<'s, v8::String>,
+    _import_attributes: v8::Local<'s, v8::FixedArray>,
+) -> Option<v8::Local<'s, v8::Promise>> {
+    let resolver = v8::PromiseResolver::new(scope)?;
+    let promise = resolver.get_promise(scope);
+    let referrer = resource_name.to_rust_string_lossy(scope);
+    let what = specifier.to_rust_string_lossy(scope);
+
+    // Which context asked. The number is on the global under a `__pt` name.
+    let context = scope.get_current_context();
+    let index = {
+        let global = context.global(scope);
+        v8::String::new(scope, "__pt_ctxIndex")
+            .and_then(|k| global.get(scope, k.into()))
+            .and_then(|v| v.uint32_value(scope))
+            .unwrap_or(0) as usize
+    };
+
+    let handle = v8::Global::new(scope, resolver);
+    let dynamic = scope.get_slot_mut::<DynamicImports>()?;
+    dynamic.next_id += 1;
+    let id = dynamic.next_id;
+    dynamic.pending.insert(id, handle);
+    dynamic.queue.push((id, index, referrer, what));
+    Some(promise)
 }
 
 /// `import.meta.url` — the module's own address, which bundles use to build
