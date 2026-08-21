@@ -3816,7 +3816,46 @@ const FETCH_TEMPLATE: &str = r#"(() => {
 
   // Minimal Headers/TextEncoder if missing.
   if (!globalThis.TextEncoder) {
-    globalThis.TextEncoder = class { encode(s) { s = String(s); const a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i) & 0xff; return a; } };
+    // Кодировщик отдавал младший байт каждого кода вместо UTF-8: «€» выходил
+    // одним байтом 0xAC там, где браузер даёт три, а эмодзи — мусором. Всё, что
+    // считает хеш от закодированного текста, считало его не от того.
+    globalThis.TextEncoder = class TextEncoder {
+      get encoding() { return 'utf-8'; }
+      encode(input) {
+        const s = input === undefined ? '' : String(input);
+        const out = [];
+        for (let i = 0; i < s.length; i++) {
+          let cp = s.charCodeAt(i);
+          // Суррогатная пара — один символ; одинокий суррогат браузер заменяет.
+          if (cp >= 0xd800 && cp <= 0xdbff) {
+            const next = s.charCodeAt(i + 1);
+            if (next >= 0xdc00 && next <= 0xdfff) { cp = 0x10000 + ((cp - 0xd800) << 10) + (next - 0xdc00); i++; }
+            else cp = 0xfffd;
+          } else if (cp >= 0xdc00 && cp <= 0xdfff) cp = 0xfffd;
+          if (cp < 0x80) out.push(cp);
+          else if (cp < 0x800) out.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
+          else if (cp < 0x10000) out.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+          else out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+        }
+        return new Uint8Array(out);
+      }
+      encodeInto(input, target) {
+        const s = input === undefined ? '' : String(input);
+        const bytes = this.encode(s);
+        // Пишем только целые символы: браузер не оставляет в буфере половину.
+        let written = 0, read = 0, i = 0;
+        while (i < s.length) {
+          const cp = s.codePointAt(i);
+          const size = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+          if (written + size > target.length) break;
+          for (let k = 0; k < size; k++) target[written + k] = bytes[written + k];
+          written += size;
+          const step = cp > 0xffff ? 2 : 1;
+          read += step; i += step;
+        }
+        return { read, written };
+      }
+    };
   }
 
   // --- base64 and the other globals every browser has ---------------------
@@ -6280,7 +6319,85 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   } catch (e) {}
 
   if (!globalThis.TextDecoder) {
-    globalThis.TextDecoder = class TextDecoder { constructor() { this.encoding = 'utf-8'; } decode(buf) { if (!buf) return ''; const a = buf instanceof Uint8Array ? buf : new Uint8Array(buf.buffer || buf); let s = ''; for (let i = 0; i < a.length; i++) s += String.fromCharCode(a[i]); return s; } };
+    // Раскодировщик был один на все случаи и всегда читал байты как latin-1.
+    // Две ошибки сразу: `utf-8` не разбирался вовсе (там, где браузер ставит
+    // U+FFFD, у нас выходил другой символ), а `latin1` в браузере — это
+    // windows-1252, где байт 0x80 даёт «€», а не невидимый управляющий знак.
+    // Челлендж собирает из байтов строку именно так, и каждый байт верхней
+    // половины давал у нас другой символ — а значит другую строку и другой хеш.
+    const CP1252_HIGH = [0x20ac, 0x81, 0x201a, 0x192, 0x201e, 0x2026, 0x2020, 0x2021,
+      0x2c6, 0x2030, 0x160, 0x2039, 0x152, 0x8d, 0x17d, 0x8f, 0x90, 0x2018, 0x2019,
+      0x201c, 0x201d, 0x2022, 0x2013, 0x2014, 0x2dc, 0x2122, 0x161, 0x203a, 0x153,
+      0x9d, 0x17e, 0x178];
+    const LABELS = {
+      'utf-8': 'utf-8', 'utf8': 'utf-8', 'unicode-1-1-utf-8': 'utf-8',
+      'latin1': 'windows-1252', 'iso-8859-1': 'windows-1252', 'windows-1252': 'windows-1252',
+      'ascii': 'windows-1252', 'us-ascii': 'windows-1252', 'cp1252': 'windows-1252',
+      'utf-16le': 'utf-16le', 'utf-16': 'utf-16le',
+    };
+    globalThis.TextDecoder = class TextDecoder {
+      constructor(label, opts) {
+        const want = String(label === undefined ? 'utf-8' : label).trim().toLowerCase();
+        const enc = LABELS[want];
+        if (!enc) throw new RangeError("Failed to construct 'TextDecoder': The encoding label provided ('" + label + "') is invalid.");
+        Object.defineProperty(this, '__ptEnc', { value: enc, enumerable: false });
+        Object.defineProperty(this, '__ptFatal', { value: !!(opts && opts.fatal), enumerable: false });
+        Object.defineProperty(this, '__ptBOM', { value: !!(opts && opts.ignoreBOM), enumerable: false });
+      }
+      get encoding() { return this.__ptEnc; }
+      get fatal() { return this.__ptFatal; }
+      get ignoreBOM() { return this.__ptBOM; }
+      decode(buf) {
+        if (buf === undefined || buf === null) return '';
+        const a = buf instanceof Uint8Array ? buf
+          : ArrayBuffer.isView(buf) ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+          : new Uint8Array(buf);
+        const enc = this.__ptEnc;
+        let s = '';
+        if (enc === 'windows-1252') {
+          for (let i = 0; i < a.length; i++) {
+            const b = a[i];
+            s += String.fromCharCode(b >= 0x80 && b <= 0x9f ? CP1252_HIGH[b - 0x80] : b);
+          }
+          return s;
+        }
+        if (enc === 'utf-16le') {
+          for (let i = 0; i + 1 < a.length; i += 2) s += String.fromCharCode(a[i] | (a[i + 1] << 8));
+          return s;
+        }
+        // utf-8, с заменой на U+FFFD там же, где её ставит браузер.
+        let i = 0;
+        if (!this.__ptBOM && a.length >= 3 && a[0] === 0xef && a[1] === 0xbb && a[2] === 0xbf) i = 3;
+        const bad = () => { if (this.__ptFatal) throw new TypeError('Failed to execute \'decode\' on \'TextDecoder\': The encoded data was not valid.'); return '\ufffd'; };
+        while (i < a.length) {
+          const b = a[i];
+          if (b < 0x80) { s += String.fromCharCode(b); i += 1; continue; }
+          let need, cp, low, high;
+          if (b >= 0xc2 && b <= 0xdf) { need = 1; cp = b & 0x1f; low = 0x80; high = 0xbf; }
+          else if (b >= 0xe0 && b <= 0xef) {
+            need = 2; cp = b & 0x0f;
+            low = b === 0xe0 ? 0xa0 : 0x80; high = b === 0xed ? 0x9f : 0xbf;
+          } else if (b >= 0xf0 && b <= 0xf4) {
+            need = 3; cp = b & 0x07;
+            low = b === 0xf0 ? 0x90 : 0x80; high = b === 0xf4 ? 0x8f : 0xbf;
+          } else { s += bad(); i += 1; continue; }
+          let ok = true;
+          for (let k = 1; k <= need; k++) {
+            const c = a[i + k];
+            const lo = k === 1 ? low : 0x80, hi = k === 1 ? high : 0xbf;
+            if (c === undefined || c < lo || c > hi) { ok = false; i += k; break; }
+            cp = (cp << 6) | (c & 0x3f);
+          }
+          if (!ok) { s += bad(); continue; }
+          i += need + 1;
+          if (cp > 0xffff) {
+            cp -= 0x10000;
+            s += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+          } else s += String.fromCharCode(cp);
+        }
+        return s;
+      }
+    };
   }
   if (!globalThis.Blob) {
     // Части блоба — не только строки: браузер принимает буферы и их представления,
