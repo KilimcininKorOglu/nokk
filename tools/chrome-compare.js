@@ -6,6 +6,8 @@
 // otherwise costs an evening — where our run stops matching a browser's.
 //
 //   node tools/chrome-compare.js <url> [ms]
+//   PROXY=http://host:port node tools/chrome-compare.js <url>   — через тот же
+//   выход, что и `nokk --proxy`: иначе сравниваются разные адреса.
 //   NOKK_TRACE_HOOKS=1 nokk --load <url> --solve-challenge 40 --eval 1
 //
 // Needs google-chrome, and DISPLAY for a visible window (a headless Chrome is
@@ -19,6 +21,9 @@ const chrome = spawn('google-chrome', [
   '--no-default-browser-check', '--window-size=1280,900',
   ...(process.env.UA ? [`--user-agent=${process.env.UA}`] : []),
   ...(process.env.CHROME_ARGS ? process.env.CHROME_ARGS.split(' ') : []),
+  // Контроль должен выходить в сеть там же, где движок, иначе сравниваются
+  // два разных адреса и вывод ничего не стоит.
+  ...(process.env.PROXY ? [`--proxy-server=${process.env.PROXY}`] : []),
   'about:blank',
 ], { env: { ...process.env, DISPLAY: ':0' }, stdio: 'ignore' });
 
