@@ -3284,6 +3284,56 @@
     def(svgEl, 'createSVGLength', function createSVGLength() { return svgLength(0); });
   }
 
+  // Опрос кодеков — стандартный блок отпечатка, и у нас его не было вовсе:
+  // `video.canPlayType` не существовал, вызов бросал. Ответы сняты с Chrome 151
+  // на тридцати восьми типах; правило из них выводится однозначно — известный
+  // контейнер без кодеков это «maybe», с известными кодеками «probably», всё
+  // прочее пустая строка.
+  {
+    const CONTAINERS = new Set(['video/mp4', 'video/webm', 'video/ogg', 'video/3gpp',
+                                'audio/mp4', 'audio/ogg', 'audio/wav', 'audio/webm', 'audio/x-m4a']);
+    // Эти типа сами себе кодек: контейнер и содержимое одно и то же.
+    const SINGLE = new Set(['audio/mpeg', 'audio/aac', 'audio/flac']);
+    const CODEC_OK = /^(avc1\.|avc3\.|hev1\.|hvc1\.|av01\.|vp8$|vp9$|vp09\.|vorbis$|opus$|mp4a\.40\.|flac$|1$|mp3$|ec-3$|ac-3$)/;
+    const canPlay = function canPlayType(type) {
+      const t = String(type == null ? '' : type).trim();
+      const semi = t.indexOf(';');
+      const mime = (semi < 0 ? t : t.slice(0, semi)).trim().toLowerCase();
+      const rest = semi < 0 ? '' : t.slice(semi + 1);
+      const m = /codecs\s*=\s*"?([^"]*)"?/i.exec(rest);
+      const codecs = m ? m[1].split(',').map((c) => c.trim()).filter(Boolean) : [];
+      if (!CONTAINERS.has(mime) && !SINGLE.has(mime)) return '';
+      if (!codecs.length) return SINGLE.has(mime) ? 'probably' : 'maybe';
+      return codecs.every((c) => CODEC_OK.test(c)) ? 'probably' : '';
+    };
+    const M = globalThis.HTMLMediaElement && globalThis.HTMLMediaElement.prototype;
+    if (M) {
+      try { Object.defineProperty(M, 'canPlayType', { value: canPlay, writable: true, enumerable: true, configurable: true }); } catch (e) {}
+    }
+    // Джойстики: браузер отдаёт четыре пустых гнезда, а не пустоту. Заглушка
+    // возвращала `undefined`, и всякий, кто читал `.length`, получал исключение.
+    const N = globalThis.Navigator && globalThis.Navigator.prototype;
+    if (N) {
+      const fn = function getGamepads() { return [null, null, null, null]; };
+      try {
+        Object.defineProperty(N, 'getGamepads', {
+          value: globalThis.__pt_native ? __pt_native(fn) : fn,
+          writable: true, enumerable: true, configurable: true,
+        });
+      } catch (e) {}
+    }
+    // `MediaSource.isTypeSupported` отвечает тем же знанием, только логическим.
+    const MS = globalThis.MediaSource;
+    if (MS) {
+      try {
+        Object.defineProperty(MS, 'isTypeSupported', {
+          value: function isTypeSupported(type) { return canPlay(type) === 'probably'; },
+          writable: true, enumerable: true, configurable: true,
+        });
+      } catch (e) {}
+    }
+  }
+
   // `hidden` — отражаемый атрибут HTMLElement: мы его читали внутри себя, но
   // наружу не отдавали вовсе, хотя в браузере он есть у каждого элемента.
   Object.defineProperty(__htmlProto, 'hidden', {

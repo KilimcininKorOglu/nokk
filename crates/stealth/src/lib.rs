@@ -3035,6 +3035,20 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
   // оформляется лениво. Так что здесь верность имени уступает верности
   // поведения, и это осознанный размен, а не недоделка.
   try { if (globalThis.__pt_sinkAudioMethods) __pt_sinkAudioMethods(); } catch (e) {}
+  // Статические члены расставляются по таблице после того, как их определил
+  // слой DOM, — и заглушка затирает настоящую проверку кодеков. Возвращаем её
+  // здесь: ответ тот же, что у `canPlayType`, только логический.
+  try {
+    const V = globalThis.document && globalThis.document.createElement
+      ? globalThis.document.createElement('video') : null;
+    if (V && typeof V.canPlayType === 'function' && globalThis.MediaSource) {
+      const fn = function isTypeSupported(type) { return V.canPlayType(type) === 'probably'; };
+      Object.defineProperty(globalThis.MediaSource, 'isTypeSupported', {
+        value: globalThis.__pt_native ? __pt_native(fn) : fn,
+        writable: true, enumerable: false, configurable: true,
+      });
+    }
+  } catch (e) {}
 
   // Члены, которые браузер объявляет на прототипе, а мы держали на самом
   // объекте. Свойство становится аксессором над скрытым состоянием экземпляра:
