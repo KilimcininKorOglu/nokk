@@ -45,6 +45,32 @@ struct DynamicImports {
     queue: Vec<(u32, usize, String, String)>,
 }
 
+/// Есть ли у движка данные ICU. С ними родной `Intl` отвечает как браузерный —
+/// валюты, склонения, часовые пояса, разбор на слова; без них его приходится
+/// подменять заглушкой, а заглушка отвечает не то.
+static ICU_READY: AtomicBool = AtomicBool::new(false);
+
+/// Загружены ли данные ICU (см. [`ICU_READY`]).
+pub fn icu_ready() -> bool {
+    ICU_READY.load(Ordering::Relaxed)
+}
+
+/// Где искать `icudtl.dat`: сперва там, куда указали, потом рядом с самим
+/// двоичным файлом. Формат данных привязан к версии ICU, с которой собран V8,
+/// поэтому чужой файл может и не подойти — тогда пробуем следующий.
+fn icu_candidates() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(p) = std::env::var("NOKK_ICU_DATA") {
+        out.push(std::path::PathBuf::from(p));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            out.push(dir.join("icudtl.dat"));
+        }
+    }
+    out
+}
+
 static V8_INIT: Once = Once::new();
 /// Serialises `v8::Isolate::new`. Concurrent isolate construction from multiple
 /// threads segfaults with the prebuilt V8; construction is a one-time,
@@ -74,6 +100,22 @@ pub(crate) fn init_platform() {
         let flags = std::env::var("NOKK_V8_FLAGS").unwrap_or_else(|_| "--no-maglev".to_string());
         if !flags.is_empty() {
             v8::V8::set_flags_from_string(&flags);
+        }
+        // Данные ICU: без них у прибитой сборки V8 нет ни `Intl`, ни локальных
+        // форматов дат и чисел — их приходится подменять заглушкой, а заглушка
+        // отвечает не то, что браузер. Путь к файлу даётся снаружи, потому что
+        // формат данных привязан к версии ICU, с которой собран V8.
+        for path in icu_candidates() {
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+            match v8::icu::set_common_data_74(leaked) {
+                Ok(()) => {
+                    ICU_READY.store(true, Ordering::Relaxed);
+                    tracing::info!(path = %path.display(), "ICU data loaded");
+                    break;
+                }
+                Err(code) => tracing::warn!(path = %path.display(), code, "ICU data refused"),
+            }
         }
         let platform = v8::new_default_platform(0, false).make_shared();
         // Pin one ref for the whole process so the platform is never freed while

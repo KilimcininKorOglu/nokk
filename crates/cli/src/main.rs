@@ -1055,7 +1055,15 @@ async fn main() -> Result<()> {
                                         ((src && src.length) || 0) + ' bytes → ' + typeof fn);
                           // Текст программы держим под рукой: стек внутри неё
                           // указывает смещением, и без исходника оно немое.
-                          try { globalThis.__pt_vmSrc = String(src || ''); } catch (e) {}
+                          // Держим самую большую из собранных: главная программа
+                          // приходит первой, а следом идут мелкие куски, и
+                          // «последняя» затирала её.
+                          try {
+                            const t = String(src || '');
+                            if (!globalThis.__pt_vmSrc || t.length > globalThis.__pt_vmSrc.length) {
+                              globalThis.__pt_vmSrc = t;
+                            }
+                          } catch (e) {}
                           if (typeof fn !== 'function') return fn;
                           return function () {
                             const t1 = Date.now();

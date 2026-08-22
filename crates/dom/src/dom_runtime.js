@@ -1514,6 +1514,9 @@
       init = init || {};
       this.__ptE = {
         type, bubbles: !!init.bubbles, cancelable: !!init.cancelable,
+        // `composed` — обычное поле события, и у браузера оно false, а не
+        // пустота: читают его наравне с `bubbles`.
+        composed: !!init.composed,
         defaultPrevented: false, target: null, currentTarget: null,
         // Событие, созданное страницей, не доверенное — доверенные приходят
         // только от движка (ввод, load, message), и он метит их __ptTrust.
@@ -1536,7 +1539,7 @@
   // Воркерная область объявляется отдельным скриптом и метит свои доставки этим.
   try { Object.defineProperty(globalThis, '__pt_trustEvent', { value: __ptTrust, enumerable: false, configurable: true }); } catch (e) {}
 
-  evtAccessors(Event, ['type', 'bubbles', 'cancelable', 'defaultPrevented', 'target',
+  evtAccessors(Event, ['type', 'bubbles', 'cancelable', 'composed', 'defaultPrevented', 'target',
     'currentTarget', 'eventPhase', 'timeStamp', 'isTrusted']);
 
   class CustomEvent extends Event {

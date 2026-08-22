@@ -31,7 +31,7 @@ mod natives;
 #[allow(dead_code)]
 mod webgl;
 
-pub use isolate::Isolate;
+pub use isolate::{icu_ready, Isolate};
 
 /// Errors surfaced by the pool.
 #[derive(Debug, thiserror::Error)]

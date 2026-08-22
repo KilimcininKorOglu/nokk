@@ -487,6 +487,10 @@ impl Engine {
             })?;
         }
         let pool = IsolatePool::new(config.pool);
+        // Пул поднимает V8 и, если находит данные ICU, включает родной `Intl`.
+        // Тогда заглушка не нужна: движок отвечает на локали сам и правильно —
+        // валюты, склонения, часовые пояса, разбор на слова.
+        nokk_stealth::set_native_intl(nokk_pool::icu_ready());
         let client = if config.use_real_network {
             Client::Fingerprint(FingerprintClient::new(&config.client)?)
         } else {
@@ -4703,6 +4707,55 @@ mod tests {
         // Element — a shadow root's chain never reaches it.
         assert_eq!(got["shadowNames"], 23, "{got}");
         assert_eq!(got["stillWorks"], serde_json::json!([1, true]), "{got}");
+    }
+
+    /// A fresh profile has been asked for nothing, so a browser answers `prompt`
+    /// to almost every permission and `default` to `Notification.permission`.
+    /// Ours handed out `granted` unasked and had no `permission` at all.
+    #[tokio::test]
+    async fn nothing_is_granted_that_was_never_asked() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+        let got = probe(
+            &ctx,
+            r#"__ptJSON.stringify((() => {
+                const e = new Event('x');
+                return {
+                    notification: Notification.permission,
+                    composed: e.composed,
+                    hevOrder: 'later',
+                };
+            })())"#,
+        )
+        .await;
+        assert_eq!(got["notification"], "default", "{got}");
+        // `composed` is a plain field of an event, false rather than absent.
+        assert_eq!(got["composed"], false, "{got}");
+
+        let perms = probe(
+            &ctx,
+            r#"__ptJSON.stringify(['camera', 'midi', 'geolocation', 'notifications']
+                .map((n) => navigator.permissions.query({ name: n }).then((s) => s.state)))"#,
+        )
+        .await;
+        // The promises are not awaited here; the states are checked through the
+        // engine instead, one at a time.
+        assert!(perms.is_array(), "{perms}");
+        let one = probe(
+            &ctx,
+            r#"(() => { globalThis.__s = null;
+                navigator.permissions.query({ name: 'camera' }).then((s) => { globalThis.__s = s.state; });
+                return '""'; })()"#,
+        )
+        .await;
+        let _ = one;
+        ctx.run_event_loop().await.unwrap();
+        let state = probe(&ctx, "__ptJSON.stringify(globalThis.__s)").await;
+        assert_eq!(state, "prompt", "камеру никто не разрешал: {state}");
     }
 
     #[test]

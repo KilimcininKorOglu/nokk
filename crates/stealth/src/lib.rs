@@ -484,6 +484,23 @@ pub fn injection_script(profile: &StealthProfile) -> String {
 /// browserleaks.com/javascript) report Chrome values with `navigator.webdriver`
 /// hidden. A real DOM (`document`, elements, events) arrives with Phases 3–4;
 /// until then, page scripts that require the DOM will not run to completion.
+/// Отвечает ли `Intl` сам движок. Со своими данными ICU он отвечает как
+/// браузерный — валюты, склонения, часовые пояса; без них его подменяет
+/// заглушка, и её ответы браузерными не назовёшь. Ставит это ядро, когда пул
+/// доложит, что данные загружены.
+static NATIVE_INTL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Сказать слою, что родной `Intl` работоспособен (см. [`NATIVE_INTL`]).
+pub fn set_native_intl(on: bool) {
+    NATIVE_INTL.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Работоспособен ли родной `Intl`.
+pub fn native_intl() -> bool {
+    NATIVE_INTL.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("NOKK_NATIVE_INTL").is_ok()
+}
+
 pub fn bootstrap_script(profile: &StealthProfile) -> String {
     // `appVersion` is the userAgent without the leading "Mozilla/".
     let app_version = profile
@@ -519,16 +536,22 @@ pub fn bootstrap_script(profile: &StealthProfile) -> String {
     // The Intl shim shadows the prebuilt V8's native Intl/Date-locale APIs, which
     // ICU-abort the whole process (this build lacks working ICU data). It also
     // pins timezone/locale to the profile — both fingerprint vectors.
-    let intl = INTL_SHIM_TEMPLATE
-        .replace("__TZ__", &quoted(&profile.timezone))
-        .replace("__LANG0__", &lang0)
-        .replace(
-            "__TZ_OFFSET__",
-            &profile.timezone_offset_minutes.to_string(),
-        )
-        .replace("__TZ_DST__", &quoted(&profile.timezone_dst))
-        .replace("__TZ_NAME_STD__", &quoted(&profile.timezone_name_std))
-        .replace("__TZ_NAME_DST__", &quoted(&profile.timezone_name_dst));
+    // Ставится только там, где у V8 нет данных ICU: с ними родной `Intl`
+    // отвечает как браузерный, а заглушка — нет.
+    let intl = if native_intl() {
+        String::new()
+    } else {
+        INTL_SHIM_TEMPLATE
+            .replace("__TZ__", &quoted(&profile.timezone))
+            .replace("__LANG0__", &lang0)
+            .replace(
+                "__TZ_OFFSET__",
+                &profile.timezone_offset_minutes.to_string(),
+            )
+            .replace("__TZ_DST__", &quoted(&profile.timezone_dst))
+            .replace("__TZ_NAME_STD__", &quoted(&profile.timezone_name_std))
+            .replace("__TZ_NAME_DST__", &quoted(&profile.timezone_name_dst))
+    };
 
     let timers = TIMERS_TEMPLATE.replace(
         "__FAST_TIMERS__",
@@ -2463,8 +2486,12 @@ __OPFS__
       const UAD = rebrand(UA, 'NavigatorUAData');
       meth(UAD.prototype, 'toJSON', function () { return { brands: brands, mobile: mobile, platform: platform }; });
       meth(UAD.prototype, 'getHighEntropyValues', function (hints) {
-        const out = { brands: brands, mobile: mobile, platform: platform };
-        for (const h of (hints || [])) if (Object.prototype.hasOwnProperty.call(HIGH, h)) out[h] = HIGH[h];
+        // Порядок ключей у браузера алфавитный, и он виден через
+        // `JSON.stringify` — у нас же три обязательных шли первыми.
+        const all = { brands: brands, mobile: mobile, platform: platform };
+        for (const h of (hints || [])) if (Object.prototype.hasOwnProperty.call(HIGH, h)) all[h] = HIGH[h];
+        const out = {};
+        for (const k of Object.keys(all).sort()) out[k] = all[k];
         return Promise.resolve(out);
       });
     }
@@ -2991,6 +3018,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     try { stubs.add(f); } catch (e) {}
     return native(f);
   };
+
   const LIFT = __IFACE_LIFT__;
   for (const iface of Object.keys(LIFT)) {
     const C = globalThis[iface];
@@ -3025,6 +3053,26 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       } catch (e) {}
     }
   }
+
+  // У свежего профиля `Notification.permission` — «default»: ни разрешения, ни
+  // запрета человек ещё не давал. У нас его не было вовсе, и страница читала
+  // пустоту там, где браузер отвечает словом.
+  try {
+    const N = globalThis.Notification;
+    if (typeof N === 'function' && N.permission === undefined) {
+      const get = function () { return 'default'; };
+      const ask = function () { return Promise.resolve('default'); };
+      try { Object.defineProperty(get, 'name', { value: 'get permission', configurable: true }); } catch (e) {}
+      try { Object.defineProperty(ask, 'name', { value: 'requestPermission', configurable: true }); } catch (e) {}
+      Object.defineProperty(N, 'permission', {
+        get: native(get), enumerable: true, configurable: true,
+      });
+      Object.defineProperty(N, 'requestPermission', {
+        value: native(ask), writable: true, enumerable: true, configurable: true,
+      });
+    }
+  } catch (e) {}
+
 
   const MOVES = __IFACE_PROTO_MOVES__;
   for (const iface of Object.keys(MOVES)) {
@@ -6091,7 +6139,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // --- permissions ------------------------------------------------------
   const permissions = { query: mask(function query(desc){
     const name = desc && desc.name;
-    const state = name === 'notifications' ? 'prompt' : (name === 'geolocation' ? 'prompt' : 'granted');
+    // У свежего профиля браузер почти на всё отвечает `prompt`: разрешение
+    // даёт человек. `granted` без спроса — заметная неправда.
+    const GRANTED = new Set(['storage-access', 'top-level-storage-access']);
+    const state = GRANTED.has(name) ? 'granted' : 'prompt';
     return Promise.resolve({ state, name, onchange: null, addEventListener(){}, removeEventListener(){} });
   }, 'query') };
   try { Object.defineProperty(navProto, 'permissions', { get: () => permissions, enumerable: true, configurable: true }); } catch (e) {}
