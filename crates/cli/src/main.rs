@@ -432,6 +432,33 @@ async fn main() -> Result<()> {
                       } catch (e) {}
                       return S.apply(this, arguments);
                     };
+                    // Счётчик обращений к тому, чего наш обычный пробник не
+                    // видит: сборщик у браузера зовёт эти вещи, и надо знать,
+                    // доходит ли до них наш прогон.
+                    const N = Object.create(null);
+                    const bump = (k) => { N[k] = (N[k] || 0) + 1; };
+                    const count = (obj, label, names) => {
+                      if (!obj) return;
+                      for (const n of names) {
+                        const f = obj[n];
+                        if (typeof f !== 'function') continue;
+                        try {
+                          Object.defineProperty(obj, n, {
+                            value: function (...a) { bump(label + '.' + n); return f.apply(this, a); },
+                            writable: true, enumerable: false, configurable: true,
+                          });
+                        } catch (e) {}
+                      }
+                    };
+                    count(globalThis.OfflineAudioContext && OfflineAudioContext.prototype, 'audio',
+                          ['startRendering', 'createOscillator', 'createDynamicsCompressor']);
+                    count(globalThis.HTMLMediaElement && HTMLMediaElement.prototype, 'media', ['canPlayType']);
+                    count(globalThis.Navigator && Navigator.prototype, 'nav', ['getGamepads']);
+                    count(globalThis, 'win', ['atob', 'btoa', 'matchMedia', 'getComputedStyle']);
+                    count(globalThis.RTCPeerConnection && RTCPeerConnection.prototype, 'rtc', ['getStats']);
+                    setTimeout(() => {
+                      for (const k of Object.keys(N)) console.error('[count] ' + N[k] + ' ' + k);
+                    }, 24000);
                     // Заодно то, что челлендж сам считает ошибкой: он зовёт
                     // `console.error` перед маяком далеко не всегда, но своё
                     // отклонённое обещание отдаёт в общий обработчик.

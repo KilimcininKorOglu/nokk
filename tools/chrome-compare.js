@@ -90,6 +90,67 @@ const HOOK = `(() => {
       return out;
     };
   } catch (e) {}
+  // Перепись вызовов: сколько раз челлендж позвал каждый из ходовых методов.
+  // Наш собственный пробник считает то же самое, и разница в счётчиках
+  // показывает, где сбор у нас обрывается, — это точнее, чем искать любые
+  // расхождения подряд.
+  try {
+    const N = Object.create(null);
+    const bump = (k) => { N[k] = (N[k] || 0) + 1; };
+    const wrapProto = (obj, label, names) => {
+      if (!obj) return;
+      for (const n of names) {
+        let d;
+        try { d = Object.getOwnPropertyDescriptor(obj, n); } catch (e) { continue; }
+        if (!d) continue;
+        if (typeof d.value === 'function') {
+          const f = d.value;
+          try {
+            Object.defineProperty(obj, n, { ...d, value: function (...a) { bump(label + '.' + n); return f.apply(this, a); } });
+          } catch (e) {}
+        } else if (typeof d.get === 'function') {
+          const g = d.get;
+          try {
+            Object.defineProperty(obj, n, { ...d, get: function () { bump(label + '.' + n); return g.call(this); } });
+          } catch (e) {}
+        }
+      }
+    };
+    const C2 = globalThis.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype;
+    wrapProto(C2, 'ctx2d', ['fillText','strokeText','measureText','fillRect','getImageData','putImageData',
+      'drawImage','arc','ellipse','bezierCurveTo','beginPath','closePath','fill','stroke','createLinearGradient',
+      'createRadialGradient','createPattern','getContextAttributes','setTransform','getTransform','isPointInPath']);
+    for (const [gl, tag] of [[globalThis.WebGLRenderingContext, 'gl'], [globalThis.WebGL2RenderingContext, 'gl2']]) {
+      wrapProto(gl && gl.prototype, tag, ['getParameter','getExtension','getSupportedExtensions',
+        'getShaderPrecisionFormat','readPixels','getInternalformatParameter','createShader','shaderSource',
+        'compileShader','linkProgram','drawArrays','drawElements','texImage2D','renderbufferStorage']);
+    }
+    wrapProto(Element.prototype, 'el', ['getAttribute','setAttribute','getBoundingClientRect','getClientRects',
+      'querySelector','querySelectorAll','matches','closest','hasAttribute','removeAttribute','attachShadow']);
+    wrapProto(HTMLElement.prototype, 'html', ['focus','blur','click']);
+    wrapProto(Document.prototype, 'd', ['createElement','createElementNS','createTextNode','querySelector',
+      'querySelectorAll','getElementById','createRange','elementFromPoint','elementsFromPoint']);
+    wrapProto(Navigator.prototype, 'nav', ['getGamepads','javaEnabled','sendBeacon']);
+    wrapProto(globalThis.HTMLMediaElement && HTMLMediaElement.prototype, 'media', ['canPlayType']);
+    wrapProto(globalThis.SVGGraphicsElement && SVGGraphicsElement.prototype, 'svg', ['getBBox','getCTM','getScreenCTM']);
+    wrapProto(globalThis.SVGGeometryElement && SVGGeometryElement.prototype, 'svg', ['getTotalLength','getPointAtLength','isPointInFill']);
+    wrapProto(globalThis.RTCPeerConnection && RTCPeerConnection.prototype, 'rtc', ['createOffer','setLocalDescription','getStats','createDataChannel']);
+    wrapProto(globalThis.AudioContext && AudioContext.prototype, 'audio', ['createOscillator','createAnalyser','createDynamicsCompressor','createGain']);
+    wrapProto(globalThis.OfflineAudioContext && OfflineAudioContext.prototype, 'audio', ['startRendering']);
+    wrapProto(globalThis.TextEncoder && TextEncoder.prototype, 'textEnc', ['encode']);
+    for (const n of ['getComputedStyle', 'matchMedia', 'requestAnimationFrame', 'queueMicrotask', 'fetch', 'btoa', 'atob']) {
+      const f = globalThis[n];
+      if (typeof f !== 'function') continue;
+      try { globalThis[n] = function (...a) { bump('win.' + n); return f.apply(this, a); }; } catch (e) {}
+    }
+    globalThis.__ptCounts = () => N;
+    // Выгружаем на исходе прогона: печатаем по строке на имя.
+    setTimeout(() => {
+      const rows = Object.entries(N).sort((a, b) => b[1] - a[1]);
+      for (const [k, v] of rows) console.log('[count] ' + v + ' ' + k);
+    }, 26000);
+  } catch (e) {}
+
   for (const name of ['RItcy2', 'HuCI0']) {
     let store;
     try {
@@ -118,7 +179,7 @@ const HOOK = `(() => {
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker)\]|^\[[jPC]\d* /.test(String(t)))
+      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* /.test(String(t)))
         lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
     }
     if (m.method === 'Target.attachedToTarget') {
