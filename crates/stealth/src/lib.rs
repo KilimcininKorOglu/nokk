@@ -7103,30 +7103,226 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       const s = hex.join('');
       return s.slice(0, 8) + '-' + s.slice(8, 12) + '-' + s.slice(12, 16) + '-' + s.slice(16, 20) + '-' + s.slice(20);
     };
-    globalThis.URL = class URL {
+    // Разбор адреса был выражением на одну строку, и расходился с браузером в
+    // шестнадцати случаях из двадцати пяти: не приводил схему и хост к нижнему
+    // регистру, не убирал порт по умолчанию, не сворачивал `..` в пути, не
+    // кодировал пробел, не знал пуникода, а `mailto:` превращал в
+    // `mailto://`. Адрес читают отовсюду — из `<a>`, из `location`, из самого
+    // `URL`, — так что это переписано по правилам, а не подогнано.
+    const SPECIAL = { 'http:': '80', 'https:': '443', 'ws:': '80', 'wss:': '443', 'ftp:': '21', 'file:': '' };
+    // Пуникод: имя с не-ASCII браузер записывает как `xn--…`.
+    const punyEncode = (label) => {
+      if (!/[^\x00-\x7f]/.test(label)) return label;
+      const base = 36, tmin = 1, tmax = 26, skew = 38, damp = 700, initialBias = 72, initialN = 128;
+      const cps = Array.from(label).map((c) => c.codePointAt(0));
+      const basic = cps.filter((c) => c < 128);
+      let out = basic.map((c) => String.fromCharCode(c)).join('');
+      let h = basic.length;
+      const delim = h > 0 ? '-' : '';
+      let n = initialN, delta = 0, bias = initialBias;
+      const adapt = (d, num, first) => {
+        d = first ? Math.floor(d / damp) : d >> 1;
+        d += Math.floor(d / num);
+        let k = 0;
+        while (d > ((base - tmin) * tmax) >> 1) { d = Math.floor(d / (base - tmin)); k += base; }
+        return k + Math.floor(((base - tmin + 1) * d) / (d + skew));
+      };
+      while (h < cps.length) {
+        let m = Infinity;
+        for (const c of cps) if (c >= n && c < m) m = c;
+        delta += (m - n) * (h + 1);
+        n = m;
+        for (const c of cps) {
+          if (c < n) delta++;
+          if (c !== n) continue;
+          let q = delta;
+          for (let k = base; ; k += base) {
+            const t = k <= bias ? tmin : (k >= bias + tmax ? tmax : k - bias);
+            if (q < t) break;
+            out += String.fromCharCode(t + ((q - t) % (base - t)) < 26
+              ? t + ((q - t) % (base - t)) + 97
+              : t + ((q - t) % (base - t)) + 22);
+            q = Math.floor((q - t) / (base - t));
+          }
+          out += String.fromCharCode(q < 26 ? q + 97 : q + 22);
+          bias = adapt(delta, h + 1, h === basic.length);
+          delta = 0;
+          h++;
+        }
+        delta++; n++;
+      }
+      return 'xn--' + (delim ? out : out);
+    };
+    const encHost = (h) => h.split('.').map(punyEncode).join('.');
+    // Пробел и не-ASCII в пути браузер записывает процентами; уже записанное
+    // не трогает.
+    const encPath = (p) => p.replace(/[^\x21-\x7e]|[\\"<>^`{|}]/g, (c) =>
+      Array.from(new TextEncoder().encode(c)).map((b) => '%' + b.toString(16).toUpperCase().padStart(2, '0')).join(''));
+    const normPath = (p) => {
+      const abs = p.startsWith('/');
+      const out = [];
+      for (const seg of p.split('/')) {
+        if (seg === '.' || (seg === '' && out.length && abs)) continue;
+        if (seg === '..') { out.pop(); continue; }
+        out.push(seg);
+      }
+      let r = out.join('/');
+      if (abs && !r.startsWith('/')) r = '/' + r;
+      if (/\/(\.|\.\.)$/.test(p) && !r.endsWith('/')) r += '/';
+      return r || (abs ? '/' : '');
+    };
+    const URL_STATE = new WeakMap();
+    const parseInto = (st, raw, base) => {
+      let s = String(raw).trim();
+      const m = /^([a-zA-Z][a-zA-Z0-9+.\-]*):/.exec(s);
+      let scheme = m ? m[1].toLowerCase() + ':' : '';
+      if (scheme) s = s.slice(m[0].length);
+      if (!scheme) {
+        if (!base) return false;
+        const b = URL_STATE.get(base) || base;
+        scheme = b.scheme;
+        if (!s.startsWith('//')) {
+          // Относительный адрес: схема, доступ и хост берутся у основы как
+          // есть. Пересобирать их обратно в строку нельзя — порт при этом
+          // терялся, и страница, ушедшая на `/dest` с базы с портом, никуда
+          // не приходила.
+          st.scheme = scheme;
+          st.username = b.username; st.password = b.password;
+          st.host = b.host; st.port = b.port;
+          st.opaque = false;
+          let rest = s;
+          const hi = rest.indexOf('#'); st.fragment = hi >= 0 ? rest.slice(hi) : '';
+          if (hi >= 0) rest = rest.slice(0, hi);
+          const qi = rest.indexOf('?'); st.query = qi >= 0 ? rest.slice(qi) : '';
+          if (qi >= 0) rest = rest.slice(0, qi);
+          let path;
+          if (!rest) path = b.path;
+          else if (rest.startsWith('/')) path = rest;
+          else path = b.path.replace(/[^/]*$/, '') + rest;
+          if (!rest && !st.query) st.query = st.fragment ? b.query : b.query;
+          st.path = encPath(normPath(path || '/'));
+          return true;
+        }
+      }
+      st.scheme = scheme;
+      const special = Object.prototype.hasOwnProperty.call(SPECIAL, scheme);
+      st.opaque = !special && !s.startsWith('//');
+      if (st.opaque) {
+        // `mailto:`, `data:`, `about:`, `blob:` — путь целиком, без хоста.
+        const hi = s.indexOf('#'); const frag = hi >= 0 ? s.slice(hi) : '';
+        if (hi >= 0) s = s.slice(0, hi);
+        const qi = s.indexOf('?'); const q = qi >= 0 ? s.slice(qi) : '';
+        if (qi >= 0) s = s.slice(0, qi);
+        st.host = ''; st.port = ''; st.username = ''; st.password = '';
+        st.path = s; st.query = q; st.fragment = frag;
+        return true;
+      }
+      if (s.startsWith('//')) s = s.slice(2);
+      const cut = s.search(/[/?#]/);
+      let auth = cut < 0 ? s : s.slice(0, cut);
+      let rest = cut < 0 ? '' : s.slice(cut);
+      const at = auth.lastIndexOf('@');
+      if (at >= 0) {
+        const ui = auth.slice(0, at); auth = auth.slice(at + 1);
+        const ci = ui.indexOf(':');
+        st.username = ci < 0 ? ui : ui.slice(0, ci);
+        st.password = ci < 0 ? '' : ui.slice(ci + 1);
+      } else { st.username = st.username || ''; st.password = st.password || ''; }
+      // IPv6 — в скобках, и двоеточия внутри к порту не относятся.
+      let hostPart = auth, portPart = '';
+      if (auth.startsWith('[')) {
+        const close = auth.indexOf(']');
+        hostPart = auth.slice(0, close + 1);
+        const after = auth.slice(close + 1);
+        if (after.startsWith(':')) portPart = after.slice(1);
+      } else {
+        const ci = auth.lastIndexOf(':');
+        if (ci >= 0) { hostPart = auth.slice(0, ci); portPart = auth.slice(ci + 1); }
+      }
+      st.host = hostPart.startsWith('[') ? hostPart.toLowerCase() : encHost(hostPart.toLowerCase());
+      st.port = portPart === SPECIAL[scheme] ? '' : portPart;
+      const hi = rest.indexOf('#'); st.fragment = hi >= 0 ? rest.slice(hi) : '';
+      if (hi >= 0) rest = rest.slice(0, hi);
+      const qi = rest.indexOf('?'); st.query = qi >= 0 ? rest.slice(qi) : '';
+      if (qi >= 0) rest = rest.slice(0, qi);
+      st.path = encPath(normPath(rest || '/'));
+      return true;
+    };
+    class URL {
       constructor(url, base) {
-        // Адрес без схемы и без основы — не адрес: браузер отказывается его
-        // строить, а мы молча делали из «не адрес» строку «https://не адрес».
-        const raw = url === undefined ? '' : String(url);
         if (arguments.length < 1) {
           throw new TypeError("Failed to construct 'URL': 1 argument required, but only 0 present.");
         }
-        let p = parse(raw);
-        if (!p.protocol && base === undefined) {
+        const st = { scheme: '', username: '', password: '', host: '', port: '', path: '', query: '', fragment: '', opaque: false };
+        let baseState = null;
+        if (base !== undefined) {
+          const bs = { scheme: '', username: '', password: '', host: '', port: '', path: '', query: '', fragment: '', opaque: false };
+          if (!parseInto(bs, base, null)) {
+            throw new TypeError("Failed to construct 'URL': Invalid base URL");
+          }
+          baseState = bs;
+        }
+        if (!parseInto(st, url, baseState)) {
           throw new TypeError("Failed to construct 'URL': Invalid URL");
         }
-        if (!p.protocol && base) { const b = parse(base); p.protocol = b.protocol; if (!p.authority) p.authority = b.authority; if (String(url)[0] !== '/') { p.path = b.path.replace(/[^/]*$/, '') + p.path; } }
-        this.protocol = p.protocol || 'https:';
-        const at = p.authority; const k = at.indexOf('@'); const hp = k >= 0 ? at.slice(k + 1) : at; const ui = k >= 0 ? at.slice(0, k) : '';
-        const ci = hp.indexOf(':'); this.hostname = ci < 0 ? hp : hp.slice(0, ci); this.port = ci < 0 ? '' : hp.slice(ci + 1);
-        this.host = hp; this.username = ui.split(':')[0] || ''; this.password = ui.split(':')[1] || '';
-        this.pathname = p.path || '/'; this.search = p.search || ''; this.hash = p.hash || '';
-        this.origin = this.protocol + '//' + this.host;
-        this.searchParams = new globalThis.URLSearchParams(this.search);
+        URL_STATE.set(this, st);
+        st.params = new globalThis.URLSearchParams(st.query);
       }
-      get href() { const s = this.searchParams.toString(); return this.protocol + '//' + this.host + this.pathname + (s ? '?' + s : this.search) + this.hash; }
-      set href(v) {}
+      get protocol() { return URL_STATE.get(this).scheme; }
+      set protocol(v) { const st = URL_STATE.get(this); const t = String(v).replace(/:*$/, '') + ':'; if (/^[a-z][a-z0-9+.\-]*:$/i.test(t)) st.scheme = t.toLowerCase(); }
+      get username() { return URL_STATE.get(this).username; }
+      set username(v) { URL_STATE.get(this).username = String(v); }
+      get password() { return URL_STATE.get(this).password; }
+      set password(v) { URL_STATE.get(this).password = String(v); }
+      get hostname() { return URL_STATE.get(this).host; }
+      set hostname(v) { const st = URL_STATE.get(this); if (!st.opaque) st.host = encHost(String(v).toLowerCase()); }
+      get port() { return URL_STATE.get(this).port; }
+      set port(v) { const st = URL_STATE.get(this); const t = String(v).replace(/[^0-9]/g, ''); st.port = t === SPECIAL[st.scheme] ? '' : t; }
+      get host() { const st = URL_STATE.get(this); return st.host + (st.port ? ':' + st.port : ''); }
+      set host(v) {
+        const st = URL_STATE.get(this); const t = String(v);
+        const ci = t.startsWith('[') ? t.indexOf(']') + 1 : t.lastIndexOf(':');
+        if (ci > 0 && t[ci] === ':') { this.hostname = t.slice(0, ci); this.port = t.slice(ci + 1); }
+        else this.hostname = t;
+      }
+      get pathname() { return URL_STATE.get(this).path; }
+      set pathname(v) { const st = URL_STATE.get(this); if (!st.opaque) st.path = encPath(normPath(String(v) || '/')); }
+      get search() { const st = URL_STATE.get(this); const s = st.params ? st.params.toString() : ''; return s ? '?' + s : ''; }
+      set search(v) { const st = URL_STATE.get(this); const t = String(v); st.query = t && t[0] !== '?' ? '?' + t : t; st.params = new globalThis.URLSearchParams(st.query); }
+      get searchParams() { return URL_STATE.get(this).params; }
+      get hash() { const st = URL_STATE.get(this); return st.fragment; }
+      set hash(v) { const st = URL_STATE.get(this); const t = String(v); st.fragment = t ? (t[0] === '#' ? t : '#' + t) : ''; }
+      get origin() {
+        const st = URL_STATE.get(this);
+        if (st.scheme === 'blob:') {
+          try { return new URL(st.path).origin; } catch (e) { return 'null'; }
+        }
+        // У файлового адреса происхождение есть, но без хоста: `file://`.
+        if (st.scheme === 'file:') return 'file://';
+        if (st.opaque || !Object.prototype.hasOwnProperty.call(SPECIAL, st.scheme)) return 'null';
+        return st.scheme + '//' + this.host;
+      }
+      get href() {
+        const st = URL_STATE.get(this);
+        if (st.opaque) return st.scheme + st.path + this.search + st.fragment;
+        const cred = st.username ? st.username + (st.password ? ':' + st.password : '') + '@' : '';
+        return st.scheme + '//' + cred + this.host + st.path + this.search + st.fragment;
+      }
+      set href(v) {
+        const st = URL_STATE.get(this);
+        const fresh = { scheme: '', username: '', password: '', host: '', port: '', path: '', query: '', fragment: '', opaque: false };
+        if (!parseInto(fresh, v, null)) throw new TypeError("Failed to set the 'href' property on 'URL': Invalid URL");
+        Object.assign(st, fresh);
+        st.params = new globalThis.URLSearchParams(st.query);
+      }
       toString() { return this.href; }
+      toJSON() { return this.href; }
+      static canParse(url, base) {
+        try { new URL(url, base); return true; } catch (e) { return false; }
+      }
+      static parse(url, base) {
+        try { return new URL(url, base); } catch (e) { return null; }
+      }
       // The URL has to lead back to the object: a page that stores a Blob and
       // fetches its URL (or runs it as a Worker) expects its own bytes back, and
       // handing out a URL that resolves to nothing breaks that silently.
@@ -7139,7 +7335,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         return u;
       }
       static revokeObjectURL(u) { if (globalThis.__pt_blobs) globalThis.__pt_blobs.delete(String(u)); }
-    };
+    }
+    globalThis.URL = URL;
   }
 
   // Интерфейсы, определённые нами как классы, обязаны читаться нативными: в

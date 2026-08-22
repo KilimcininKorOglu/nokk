@@ -977,6 +977,34 @@
     // и нам присылают legacy-половину.
     get noModule() { return this.hasAttribute('nomodule'); }
     set noModule(v) { v ? this.setAttribute('nomodule', '') : this.removeAttribute('nomodule'); }
+    get hreflang() { return this.getAttribute('hreflang') || ''; }
+    set hreflang(v) { this.setAttribute('hreflang', v); }
+    get content() { return this.getAttribute('content') || ''; }
+    set content(v) { this.setAttribute('content', v); }
+    get httpEquiv() { return this.getAttribute('http-equiv') || ''; }
+    set httpEquiv(v) { this.setAttribute('http-equiv', v); }
+    get loading() { return this.getAttribute('loading') || 'auto'; }
+    set loading(v) { this.setAttribute('loading', v); }
+    get maxLength() { const v = parseInt(this.getAttribute('maxlength'), 10); return Number.isFinite(v) ? v : -1; }
+    set maxLength(v) { this.setAttribute('maxlength', String(v)); }
+    get minLength() { const v = parseInt(this.getAttribute('minlength'), 10); return Number.isFinite(v) ? v : -1; }
+    set minLength(v) { this.setAttribute('minlength', String(v)); }
+    get defaultValue() { return this.getAttribute('value') || ''; }
+    set defaultValue(v) { this.setAttribute('value', v); }
+    // Поля, которые участвуют в проверке формы: у неотключённой кнопки или
+    // поля это `true`, и страницы это читают.
+    get willValidate() {
+      const t = String(this.getAttribute('type') || '').toLowerCase();
+      if (this.__ptLocal !== 'input' && this.__ptLocal !== 'textarea' && this.__ptLocal !== 'select') return undefined;
+      return !this.hasAttribute('disabled') && !this.hasAttribute('readonly')
+             && t !== 'hidden' && t !== 'button' && t !== 'reset';
+    }
+    // Список маркеров, а не строка: `rel`, `sandbox`, `relList` в браузере
+    // это `DOMTokenList`, и страница читает у них `length` и перебирает.
+    get relList() { return makeClassList(this, 'rel'); }
+    get sandbox() { return makeClassList(this, 'sandbox'); }
+    get htmlFor() { return this.getAttribute('for') || ''; }
+    set htmlFor(v) { this.setAttribute('for', v); }
 
     get children() { return __collection(this.__ptKids.filter(n => n.nodeType === ELEMENT_NODE)); }
     get childElementCount() { return this.children.length; }
@@ -1244,7 +1272,16 @@
     // Common form-field surface, reflected from attributes — drivers gate `fill`
     // and `select` on these (an input with no `type`/`disabled`/`readOnly` fails
     // Playwright's fillability check).
-    get type() { const t = (this.getAttribute('type') || '').toLowerCase(); return this.tagName === 'INPUT' ? (t || 'text') : t; }
+    // Неизвестное значение `type` у поля браузер сводит к `text`: страница,
+    // которая ставит выдуманный тип и читает его назад, получает `text`.
+    get type() {
+      const t = (this.getAttribute('type') || '').toLowerCase();
+      if (this.tagName !== 'INPUT') return t;
+      const KNOWN = ['button','checkbox','color','date','datetime-local','email','file','hidden',
+                     'image','month','number','password','radio','range','reset','search','submit',
+                     'tel','text','time','url','week'];
+      return KNOWN.indexOf(t) >= 0 ? t : 'text';
+    }
     set type(v) { this.setAttribute('type', v); }
     get disabled() { return this.hasAttribute('disabled'); }
     set disabled(v) { if (v) this.setAttribute('disabled', ''); else this.removeAttribute('disabled'); }
@@ -1815,20 +1852,62 @@
   globalThis.OffscreenCanvas = OffscreenCanvas;
 
   // ---- helpers: classList, dataset, style -----------------------------------
-  function makeClassList(el) {
-    const get = () => (el.getAttribute('class') || '').split(/\s+/).filter(Boolean);
-    const set = (arr) => el.setAttribute('class', arr.join(' '));
-    return {
+  function makeClassList(el, attr) {
+    const name = attr || 'class';
+    const get = () => (el.getAttribute(name) || '').split(/\s+/).filter(Boolean);
+    const set = (arr) => el.setAttribute(name, arr.join(' '));
+    // Настоящий `DOMTokenList`, а не литерал: он перебирается, индексируется и
+    // называет себя. `[...el.classList]` у нас бросал — а это одна из самых
+    // ходовых строк на любой странице.
+    const proto = (globalThis.DOMTokenList && globalThis.DOMTokenList.prototype) || Object.prototype;
+    try {
+      if (proto !== Object.prototype && !Object.getOwnPropertyDescriptor(proto, Symbol.toStringTag)) {
+        Object.defineProperty(proto, Symbol.toStringTag, { value: 'DOMTokenList', configurable: true });
+      }
+    } catch (e) {}
+    const api = Object.create(proto);
+    Object.assign(api, {
       contains: (c) => get().includes(c),
       add: (...cs) => { const s = get(); for (const c of cs) if (!s.includes(c)) s.push(c); set(s); },
       remove: (...cs) => set(get().filter(c => !cs.includes(c))),
       toggle: (c, force) => { const s = get(); const has = s.includes(c);
         if (force === true || (force === undefined && !has)) { if (!has) s.push(c); set(s); return true; }
         set(s.filter(x => x !== c)); return false; },
-      get length() { return get().length; },
+      replace: (a, b) => { const s = get(); const i = s.indexOf(a); if (i < 0) return false; s[i] = b; set(s); return true; },
+      supports: () => true,
       item: (i) => get()[i] || null,
+      forEach(fn, self) { get().forEach((v, i) => fn.call(self, v, i, api)); },
+      entries() { return get().entries(); },
+      keys() { return get().keys(); },
+      values() { return get().values(); },
       toString: () => get().join(' '),
-    };
+      [Symbol.iterator]() { return get()[Symbol.iterator](); },
+    });
+    Object.defineProperty(api, 'length', { get: () => get().length, configurable: true });
+    Object.defineProperty(api, 'value', {
+      get: () => get().join(' '), set: (v) => el.setAttribute(name, String(v)), configurable: true,
+    });
+    // Числовые ключи живые: список читается из атрибута при каждом обращении.
+    return new Proxy(api, {
+      get(t, k, r) {
+        if (typeof k === 'string' && /^\d+$/.test(k)) return get()[+k];
+        return Reflect.get(t, k, r);
+      },
+      has(t, k) {
+        if (typeof k === 'string' && /^\d+$/.test(k)) return +k < get().length;
+        return Reflect.has(t, k);
+      },
+      ownKeys(t) {
+        return get().map((_, i) => String(i)).concat(Reflect.ownKeys(t).filter((k) => typeof k !== 'string' || !/^\d+$/.test(k)));
+      },
+      getOwnPropertyDescriptor(t, k) {
+        if (typeof k === 'string' && /^\d+$/.test(k)) {
+          const v = get()[+k];
+          return v === undefined ? undefined : { value: v, enumerable: true, configurable: true, writable: false };
+        }
+        return Reflect.getOwnPropertyDescriptor(t, k);
+      },
+    });
   }
   // ---- CSSOM ---------------------------------------------------------------
   // Настоящие таблицы стилей: `document.styleSheets` был списком литералов с
@@ -3007,14 +3086,20 @@
       enumerable: true, configurable: true,
     });
   }
-  // `complete` у изображения ложен только пока загрузка в полёте. Мы за
-  // картинками в сеть не ходим, значит попытка всегда уже завершена — как и у
-  // браузера для картинки без src или с неудачной загрузкой.
+  // `complete` истинно, когда грузить нечего или загрузка уже завершилась —
+  // и ложно, пока она в полёте. Мы отвечали «истина» всегда, в том числе сразу
+  // после присвоения `src`, чего браузер не делает: там сначала `false`, а
+  // `true` приходит вместе с событием.
   {
     const proto = globalThis.HTMLImageElement && HTMLImageElement.prototype;
     if (proto) {
       Object.defineProperty(proto, 'complete', {
-        get() { return true; }, enumerable: true, configurable: true,
+        get() {
+          const src = this.getAttribute('src');
+          if (!src) return true;
+          return !!this.__ptImgDone;
+        },
+        enumerable: true, configurable: true,
       });
     }
   }
