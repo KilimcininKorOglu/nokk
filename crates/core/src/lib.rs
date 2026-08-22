@@ -5555,6 +5555,66 @@ mod tests {
         }
     }
 
+    /// Звуковой отпечаток — тот самый, который снимают все: треугольник на
+    /// 10 кГц через компрессор со стандартными полями, сумма модулей отсчётов
+    /// с 4500 по 5000. У Chrome 151 это 124.0435; у нас было 11.87, потому что
+    /// осциллятор звучал вполовину громче нужного и не был ограничен по
+    /// спектру, а «компрессор» делил амплитуду на степень сжатия, не зная ни
+    /// колена, ни следящего детектора, ни — главное — компенсирующего усиления.
+    #[tokio::test]
+    async fn the_audio_fingerprint_is_the_number_a_browser_produces() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+
+        let p = probe(
+            &ctx,
+            r#"(() => {
+              const oc = new OfflineAudioContext(1, 44100, 44100);
+              const osc = oc.createOscillator();
+              osc.type = 'triangle'; osc.frequency.value = 10000;
+              const comp = oc.createDynamicsCompressor();
+              comp.threshold.value = -50; comp.knee.value = 40; comp.ratio.value = 12;
+              comp.attack.value = 0; comp.release.value = 0.25;
+              osc.connect(comp); comp.connect(oc.destination); osc.start(0);
+              let out = null;
+              oc.startRendering().then((b) => { out = b; });
+              // Рендер у нас синхронный, обещание уже разрешено к этому месту
+              // только после микрозадачи — поэтому берём буфер и напрямую.
+              const b = out || oc.__ptRender(1, 44100);
+              const d = b.getChannelData(0);
+              let sum = 0;
+              for (let i = 4500; i < 5000; i++) sum += Math.abs(d[i]);
+              const ac = new AudioContext();
+              return __ptJSON.stringify({
+                sum,
+                rate: ac.sampleRate,
+                baseLatency: ac.baseLatency,
+                state: ac.state,
+                nyquist: [osc.frequency.minValue, osc.frequency.maxValue],
+                outputs: ac.destination.numberOfOutputs,
+              });
+            })()"#,
+        )
+        .await;
+
+        let sum = p["sum"].as_f64().expect("the sum is a number");
+        assert!(
+            (sum - 124.0435).abs() < 0.05,
+            "the audio fingerprint is {sum}, Chrome 151 gives 124.0435"
+        );
+        // Живой контекст: частота карты, задержка буфера, остановлен до жеста.
+        assert_eq!(p["rate"], 48000);
+        assert!((p["baseLatency"].as_f64().unwrap_or(0.0) - 512.0 / 48000.0).abs() < 1e-9);
+        assert_eq!(p["state"], "suspended");
+        assert_eq!(p["outputs"], 0, "the destination has no output");
+        assert_eq!(
+            p["nyquist"],
+            serde_json::json!([-22050, 22050]),
+            "an oscillator cannot be asked for more than half its context's sample rate"
+        );
+    }
+
     /// `drawImage` рисует всем, чем рисует браузер. Он отвергал
     /// `OffscreenCanvas` и `ImageBitmap` — притом что собственный текст ошибки
     /// перечислял их среди допустимых, — а холст-источник подменял штампом

@@ -697,8 +697,13 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
     orientation: { type: "landscape-primary", angle: 0 },
   });
   win.screen = Object.create(ScreenProto);
-  win.innerWidth = 1920; win.innerHeight = 969;
-  win.outerWidth = 1920; win.outerHeight = 1080;
+  // Окно должно помещаться в доступную область экрана. Оно объявляло высоту
+  // 1080 при `screen.availHeight` 1053 — то есть заходило под панель рабочего
+  // стола, чего не бывает. Развёрнутое окно занимает доступную область
+  // целиком, а его содержимое — на 111 пикселей ниже: столько у Chrome
+  // занимают вкладки с адресной строкой.
+  win.outerWidth = __SCREEN_W__; win.outerHeight = __AVAIL_H__;
+  win.innerWidth = __SCREEN_W__; win.innerHeight = __AVAIL_H__ - 111;
   win.devicePixelRatio = 1;
   // Где окно стоит на экране. Значение приехало снимком чужого окна — десять
   // пикселей отступа, — но окно шириной во весь экран с таким отступом не
@@ -5934,8 +5939,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // connections are tracked, and the rendered buffer is synthesised from the
   // actual graph, so different graphs differ, an identical graph is stable, and
   // the per-session seed adds device-like jitter.
-  const audioParam = (v) => ({
-    value: v, defaultValue: v, minValue: -3.4028235e38, maxValue: 3.4028235e38, automationRate: 'a-rate',
+  const audioParam = (v, lo, hi) => ({
+    value: v, defaultValue: v,
+    minValue: lo == null ? -3.4028235e38 : lo,
+    maxValue: hi == null ? 3.4028235e38 : hi,
+    automationRate: 'a-rate',
     setValueAtTime(x) { this.value = +x; return this; },
     linearRampToValueAtTime(x) { this.value = +x; return this; },
     exponentialRampToValueAtTime(x) { this.value = +x; return this; },
@@ -6042,13 +6050,222 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     note(ctx.__ptEdges.join(','));
     return h >>> 0;
   };
-  const oscWave = (type, phase) => {
-    const p = phase - Math.floor(phase);
-    if (type === 'square') return p < 0.5 ? 1 : -1;
-    if (type === 'sawtooth') return 2 * p - 1;
-    if (type === 'triangle') return 4 * Math.abs(p - 0.5) - 1;
-    return Math.sin(2 * Math.PI * p);
+  // Осциллятор в браузере не считает ряд Фурье на каждом отсчёте: он строит
+  // набор таблиц по 4096 точек — по одной на треть октавы, с обрезанными
+  // гармониками, — и читает две соседние с линейной интерполяцией, смешивая их.
+  // Разница с точным рядом мала, но она есть: 258,047 против 258,098 у Chrome
+  // на канонической проверке. Перенос PeriodicWave/OscillatorNode из
+  // WebKit/Blink, с их же размерами: 3 полосы на октаву, 400 центов на полосу.
+  const OSC_BANDS = 3, OSC_CENTS = 1200 / OSC_BANDS;
+  const oscTableSize = (rate) => (rate <= 24000 ? 2048 : rate <= 88200 ? 4096 : 8192);
+  const OSC_CACHE = new Map();
+
+  // Коэффициенты ряда — те же, что в браузере: все формы нечётные, косинусов нет.
+  const oscPartial = (type, n) => {
+    const pi = Math.PI, piFactor = 2 / (n * pi);
+    if (type === 'square') return (n & 1) ? 2 * piFactor : 0;
+    if (type === 'sawtooth') return piFactor * ((n & 1) ? 1 : -1);
+    if (type === 'triangle') return (n & 1) ? 8 * Math.sin(n * pi / 2) / (pi * pi * n * n) : 0;
+    return n === 1 ? 1 : 0;
   };
+
+  const oscTables = (type, rate) => {
+    const key = type + '@' + rate;
+    const hit = OSC_CACHE.get(key);
+    if (hit) return hit;
+    const size = oscTableSize(rate);
+    const maxPartials = size / 2;
+    const ranges = Math.round(0.5 + OSC_BANDS * Math.log2(size));
+    // Гармоника набирается поворотом, а не вызовом синуса на каждый отсчёт:
+    // самая полная таблица — это две тысячи гармоник на четыре тысячи точек, и
+    // восемь миллионов синусов заняли бы секунды. Поворот даёт то же с точностью
+    // двойного числа за десятки миллисекунд.
+    const build = (partials) => {
+      const t = new Float64Array(size);
+      const step = 2 * Math.PI / size;
+      for (let n = 1; n <= partials; n++) {
+        const b = oscPartial(type, n);
+        if (!b) continue;
+        const c = Math.cos(step * n), sn = Math.sin(step * n);
+        let x = 1, y = 0;
+        for (let i = 0; i < size; i++) {
+          t[i] += b * y;
+          const nx = x * c - y * sn;
+          y = x * sn + y * c;
+          x = nx;
+        }
+      }
+      return t;
+    };
+    // Масштаб нормировки браузер берёт с самой полной таблицы — со всеми
+    // гармониками, и обрезать их здесь нельзя: ряд треугольника сходится как
+    // 1/n², и уже на пятистах гармониках масштаб уходит на шесть сотых процента,
+    // а это ровно то, на сколько наш отпечаток расходился с браузерным.
+    const full = build(maxPartials);
+    let peak = 0;
+    for (let i = 0; i < size; i++) peak = Math.max(peak, Math.abs(full[i]));
+    const scale = peak ? 1 / peak : 1;
+    const tables = new Array(ranges);
+    const partialsFor = (r) => Math.floor(Math.pow(2, -r * OSC_CENTS / 1200) * maxPartials);
+    const made = { size, ranges, scale, lowest: (rate / 2) / maxPartials,
+                   get(r) {
+                     if (!tables[r]) {
+                       const src = build(partialsFor(r));
+                       const t = new Float32Array(size);
+                       for (let i = 0; i < size; i++) t[i] = src[i] * scale;
+                       tables[r] = t;
+                     }
+                     return tables[r];
+                   } };
+    OSC_CACHE.set(key, made);
+    return made;
+  };
+
+  // Один отсчёт осциллятора: выбор пары таблиц по высоте тона и две
+  // интерполяции — внутри таблицы и между таблицами.
+  const oscWaveAt = (type, phase, freq, rate) => {
+    const T = oscTables(type, rate);
+    const f = Math.abs(freq);
+    const ratio = f > 0 ? f / T.lowest : 0.5;
+    let pitch = 1 + Math.log2(ratio) * 1200 / OSC_CENTS;
+    pitch = Math.min(Math.max(pitch, 0), T.ranges - 1);
+    const r1 = Math.floor(pitch);
+    const r2 = r1 < T.ranges - 1 ? r1 + 1 : r1;
+    const between = pitch - r1;
+    const higher = T.get(r1), lower = T.get(r2);
+    const virt = (phase - Math.floor(phase)) * T.size;
+    const i0 = Math.floor(virt) % T.size;
+    const i1 = (i0 + 1) % T.size;
+    const frac = virt - Math.floor(virt);
+    const sHigher = (1 - frac) * higher[i0] + frac * higher[i1];
+    const sLower = (1 - frac) * lower[i0] + frac * lower[i1];
+    return (1 - between) * sHigher + between * sLower;
+  };
+
+  // Компрессор. Здесь стояло «выше порога делим на степень сжатия», и это
+  // давало не тот звук: сумма отсчётов канонического отпечатка выходила 11,9
+  // против 124,0 у Chrome. Настоящий узел — это следящий детектор с коленом,
+  // предзадержкой и, главное, компенсирующим усилением, которого у нас не было
+  // вовсе; из-за него всё и было вдесятеро тише.
+  //
+  // Перенос алгоритма Google из WebKit/Blink (DynamicsCompressorKernel), с его
+  // же значениями по умолчанию: предзадержка 6 мс, зоны отпускания
+  // 0.09/0.16/0.42/0.98, добавочное усиление 0 дБ, смешивание 1.
+  const dbToLin = (db) => Math.pow(10, 0.05 * db);
+  const linToDb = (x) => (x ? 20 * Math.log10(x) : -1000);
+
+  function compressorKernel(input, rate, opts) {
+    const dbThreshold = opts.threshold, dbKnee = opts.knee, ratio = opts.ratio;
+    const linearThreshold = dbToLin(dbThreshold);
+    const slope = 1 / ratio;
+
+    const kneeCurve = (x, k) => x < linearThreshold
+      ? x
+      : linearThreshold + (1 - Math.exp(-k * (x - linearThreshold))) / k;
+    const slopeAt = (x, k) => {
+      if (x < linearThreshold) return 1;
+      const x2 = x * 1.001;
+      const xDb = linToDb(x), x2Db = linToDb(x2);
+      return (linToDb(kneeCurve(x2, k)) - linToDb(kneeCurve(x, k))) / (x2Db - xDb);
+    };
+    // Коэффициент колена ищется двоичным поиском по наклону — пятнадцать шагов,
+    // как в исходнике.
+    let minK = 0.1, maxK = 10000, k = 5;
+    {
+      const x = dbToLin(dbThreshold + dbKnee);
+      for (let i = 0; i < 15; i++) {
+        if (slopeAt(x, k) < slope) maxK = k; else minK = k;
+        k = Math.sqrt(minK * maxK);
+      }
+    }
+    const kneeThresholdDb = dbThreshold + dbKnee;
+    const kneeThreshold = dbToLin(kneeThresholdDb);
+    const ykneeThresholdDb = linToDb(kneeCurve(kneeThreshold, k));
+    const saturate = (x) => x < kneeThreshold
+      ? kneeCurve(x, k)
+      : dbToLin(ykneeThresholdDb + slope * (linToDb(x) - kneeThresholdDb));
+
+    // Компенсирующее усиление: без него компрессор с порогом −50 дБ душит сигнал
+    // на два порядка, а браузер его возвращает — в степени 0,6, «на слух».
+    const masterLinearGain = dbToLin(0) * Math.pow(1 / saturate(1), 0.6);
+
+    const attackFrames = Math.max(0.001, opts.attack) * rate;
+    const releaseFrames = rate * opts.release;
+    const satReleaseFrames = 0.0025 * rate;
+    const y1 = releaseFrames * 0.09, y2 = releaseFrames * 0.16;
+    const y3 = releaseFrames * 0.42, y4 = releaseFrames * 0.98;
+    const kA = 0.9999999999999998 * y1 + 1.8432219684323923e-16 * y2
+             - 1.9373394351676423e-16 * y3 + 8.824516011816245e-18 * y4;
+    const kB = -1.5788320352845888 * y1 + 2.3305837032074286 * y2
+             - 0.9141194204840429 * y3 + 0.1623677525612032 * y4;
+    const kC = 0.5334142869106424 * y1 - 1.272736789213631 * y2
+             + 0.9258856042207512 * y3 - 0.18656310191776226 * y4;
+    const kD = 0.08783463138207234 * y1 - 0.1694162967925622 * y2
+             + 0.08588057951595272 * y3 - 0.00429891410546283 * y4;
+    const kE = -0.042416883008123074 * y1 + 0.1115693827987602 * y2
+             - 0.09764676325265872 * y3 + 0.028494263462021576 * y4;
+
+    const MASK = 1023;
+    const delay = new Float32Array(1024);
+    let readIndex = 0;
+    let writeIndex = Math.min(Math.floor(0.006 * rate), 1023);
+    let detectorAverage = 0, compressorGain = 1, maxAttackCompressionDiffDb = -1;
+
+    const out = new Float32Array(input.length);
+    const nDivisionFrames = 32;
+    const nDivisions = Math.floor(input.length / nDivisionFrames);
+    let frame = 0;
+    for (let d = 0; d < nDivisions; d++) {
+      if (!Number.isFinite(detectorAverage)) detectorAverage = 1;
+      const desiredGain = detectorAverage;
+      const scaledDesiredGain = Math.asin(desiredGain) / (0.5 * Math.PI);
+
+      let envelopeRate;
+      const isReleasing = scaledDesiredGain > compressorGain;
+      let compressionDiffDb = linToDb(compressorGain / scaledDesiredGain);
+      if (isReleasing) {
+        maxAttackCompressionDiffDb = -1;
+        if (!Number.isFinite(compressionDiffDb)) compressionDiffDb = -1;
+        let x = Math.min(0, Math.max(-12, compressionDiffDb));
+        x = 0.25 * (x + 12);
+        const x2 = x * x, x3 = x2 * x, x4 = x2 * x2;
+        const rf = kA + kB * x + kC * x2 + kD * x3 + kE * x4;
+        envelopeRate = dbToLin(5 / rf);
+      } else {
+        if (!Number.isFinite(compressionDiffDb)) compressionDiffDb = 1;
+        if (maxAttackCompressionDiffDb === -1 || maxAttackCompressionDiffDb < compressionDiffDb) {
+          maxAttackCompressionDiffDb = compressionDiffDb;
+        }
+        const effAttenDiffDb = Math.max(0.5, maxAttackCompressionDiffDb);
+        envelopeRate = 1 - Math.pow(0.25 / effAttenDiffDb, 1 / attackFrames);
+      }
+
+      for (let n = 0; n < nDivisionFrames; n++) {
+        const undelayed = input[frame];
+        delay[writeIndex] = undelayed;
+        const absInput = Math.abs(undelayed);
+        const shaped = saturate(absInput);
+        const attenuation = absInput <= 0.0001 ? 1 : shaped / absInput;
+        const attenuationDb = Math.max(2, -linToDb(attenuation));
+        const satReleaseRate = dbToLin(attenuationDb / satReleaseFrames) - 1;
+        const rate2 = attenuation > detectorAverage ? satReleaseRate : 1;
+        detectorAverage = Math.min(1, detectorAverage + (attenuation - detectorAverage) * rate2);
+        if (!Number.isFinite(detectorAverage)) detectorAverage = 1;
+
+        if (envelopeRate < 1) compressorGain += (scaledDesiredGain - compressorGain) * envelopeRate;
+        else compressorGain = Math.min(1, compressorGain * envelopeRate);
+
+        const postWarp = Math.sin(0.5 * Math.PI * compressorGain);
+        out[frame] = delay[readIndex] * masterLinearGain * postWarp;
+
+        frame++;
+        readIndex = (readIndex + 1) & MASK;
+        writeIndex = (writeIndex + 1) & MASK;
+      }
+    }
+    return out;
+  }
+
   const bufferOf = (data, chans, len, rate) => {
     const b = {
       numberOfChannels: chans, length: len, sampleRate: rate, duration: len / rate,
@@ -6061,14 +6278,28 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
   class BaseAudioContext {
     constructor() {
-      this.sampleRate = 44100; this.currentTime = 0; this.state = 'running';
+      // Частота живого контекста у Chrome — та, что у звуковой карты, и это
+      // 48 кГц, а не 44,1. Задержка вывода — размер буфера, делённый на неё.
+      // И контекст без действия пользователя браузер держит остановленным.
+      this.sampleRate = 48000; this.currentTime = 0; this.state = 'suspended';
       this.__ptNodes = []; this.__ptEdges = [];
-      this.destination = makeNode(this, 'destination', { maxChannelCount: 2 });
+      // У приёмника нет выхода, и число каналов у него задано явно, а не
+      // «сколько придёт»: снято с Chrome 151.
+      this.destination = makeNode(this, 'destination',
+        { maxChannelCount: 2, numberOfOutputs: 0, channelCountMode: 'explicit' });
       this.listener = { positionX: audioParam(0), positionY: audioParam(0), positionZ: audioParam(0), setPosition() {}, setOrientation() {} };
       this.audioWorklet = { addModule() { return Promise.resolve(); } };
       this.onstatechange = null;
     }
-    createOscillator() { return makeNode(this, 'oscillator', { type: 'sine', frequency: audioParam(440), detune: audioParam(0), onended: null, setPeriodicWave() {} }); }
+    createOscillator() {
+      // Частоту выше половины частоты дискретизации воспроизвести нечем, и
+      // браузер объявляет этот предел в самом параметре.
+      const nyq = this.sampleRate / 2;
+      return makeNode(this, 'oscillator', {
+        type: 'sine', frequency: audioParam(440, -nyq, nyq), detune: audioParam(0),
+        onended: null, setPeriodicWave() {},
+      });
+    }
     createGain() { return makeNode(this, 'gain', { gain: audioParam(1) }); }
     createAnalyser() {
       const ctx = this;
@@ -6120,17 +6351,23 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       const freq = osc && osc.frequency ? osc.frequency.value : 440;
       const type = osc ? osc.type : 'sine';
       const amp = gain && gain.gain ? gain.gain.value : 1;
-      const h = (graphHash(this) ^ SEED) >>> 0;
-      const jitter = (h / 4294967295) * 1e-4;      // device-DSP-scale
-      const jFreq = 1 + (h & 0x3ff) / 4096;
+      // Дрожи здесь больше нет. Её подмешивали, чтобы отпечаток звука был у
+      // каждой личности свой, — но у настоящих машин он один и тот же для
+      // одной сборки браузера, и «свой» означало «ничей известный».
       const thr = comp ? Math.pow(10, (comp.threshold.value || -24) / 20) : 1;
       const ratio = comp ? (comp.ratio.value || 12) : 1;
-      const data = new Float32Array(len);
+      let data = new Float32Array(len);
       for (let i = 0; i < len; i++) {
         const t = i / this.sampleRate;
-        let v = oscWave(type, freq * t) * 0.5 * amp;
-        if (comp) { const s = v < 0 ? -1 : 1, m = Math.abs(v); v = s * (m > thr ? thr + (m - thr) / ratio : m); }
-        data[i] = v + jitter * Math.sin(i * jFreq);
+        // Осциллятор звучит в полную амплитуду: половина здесь была ошибкой,
+        // и синус из-за неё расходился с браузером ровно вдвое.
+        data[i] = oscWaveAt(type, freq * t, freq, this.sampleRate) * amp;
+      }
+      if (comp) {
+        data = compressorKernel(data, this.sampleRate, {
+          threshold: comp.threshold.value, knee: comp.knee.value, ratio: comp.ratio.value,
+          attack: comp.attack.value, release: comp.release.value,
+        });
       }
       return bufferOf(data, chans, len, this.sampleRate);
     }
@@ -6140,7 +6377,17 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // заглушке из таблицы графа, и в цепочке оказывается другой объект с тем же
   // именем — `Object.getPrototypeOf(AudioContext.prototype) !== BaseAudioContext.prototype`.
   globalThis.BaseAudioContext = audioTag(mask(BaseAudioContext, 'BaseAudioContext'), 'BaseAudioContext');
-  globalThis.AudioContext = audioTag(mask(class AudioContext extends BaseAudioContext {}, 'AudioContext'), 'AudioContext');
+  globalThis.AudioContext = audioTag(mask(class AudioContext extends BaseAudioContext {
+    constructor() {
+      super();
+      // Задержки живого вывода: у Chrome это буфер в 512 отсчётов на частоте
+      // карты, а выходную он на этой машине не знает и говорит ноль. Их
+      // отсутствие само по себе примета — у офлайнового контекста их нет, у
+      // живого есть.
+      this.baseLatency = 512 / this.sampleRate;
+      this.outputLatency = 0;
+    }
+  }, 'AudioContext'), 'AudioContext');
   // `close`/`resume`/`suspend` браузер объявляет на самих контекстах, а не на
   // общей базе: наследование то же, уровень другой — и обход графа это читает.
   globalThis.__pt_sinkAudioMethods = () => {
