@@ -1678,7 +1678,11 @@ impl BrowserContext {
                     "name": r.url,
                     "entryType": kind,
                     "initiatorType": initiator,
-                    "start": r.started_ms,
+                    // Навигация в браузере всегда начинается с нуля: её запись —
+                    // начало отсчёта для всех остальных. Мы ставили сюда время
+                    // самого запроса, и страница видела навигацию, начавшуюся
+                    // через сто миллисекунд после собственного начала времён.
+                    "start": if top_document { 0.0 } else { r.started_ms },
                     "duration": r.duration_ms,
                     "size": r.body.len() + 300,
                     "decoded": r.body.len(),
