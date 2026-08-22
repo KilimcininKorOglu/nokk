@@ -481,9 +481,22 @@ impl HttpClient for FingerprintClient {
         rb = rb
             .header("sec-fetch-site", site)
             .header("sec-fetch-mode", mode)
-            .header("sec-fetch-dest", dest)
-            .header("priority", req.kind.priority());
+            .header("sec-fetch-dest", dest);
+        // По HTTP/1.1 у Chrome первыми идут `Host` и `Connection: keep-alive`, а
+        // у нас `host` уходил последним и соединения не было вовсе. Протокол
+        // решает ALPN, но простой `http://` — это почти всегда версия первая.
+        // (`priority` там лишний, но его кладёт сама эмуляция уже после сборки
+        // запроса, и снять его отсюда нечем.)
+        let plain_http = req.url.starts_with("http://");
+        rb = rb.header("priority", req.kind.priority());
+        if plain_http {
+            rb = rb.header("connection", "keep-alive");
+        }
         let mut order = wreq::header::OrigHeaderMap::new();
+        if plain_http {
+            order.insert("host");
+            order.insert("connection");
+        }
         for name in ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"] {
             order.insert(name);
         }
