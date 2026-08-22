@@ -32,7 +32,7 @@ type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 pub struct RealmBootstrap(pub String);
 
 /// Install every native binding on the current context's global object.
-pub fn install(scope: &mut v8::HandleScope) {
+pub fn install(scope: &mut v8::PinScope) {
     bind(scope, "__pt_makeRealm", make_realm);
     bind(scope, "__pt_randomBytes", random_bytes);
     bind(scope, "__pt_digest", digest);
@@ -147,12 +147,12 @@ pub fn install(scope: &mut v8::HandleScope) {
 }
 
 #[cfg(feature = "render")]
-fn arg_f32(scope: &mut v8::HandleScope, value: v8::Local<v8::Value>) -> f32 {
+fn arg_f32(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> f32 {
     value.number_value(scope).unwrap_or(0.0) as f32
 }
 
 #[cfg(feature = "webgl")]
-fn arg_i32(scope: &mut v8::HandleScope, value: v8::Local<v8::Value>) -> i32 {
+fn arg_i32(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> i32 {
     value.integer_value(scope).unwrap_or(0) as i32
 }
 
@@ -168,7 +168,7 @@ fn arg_f32s(value: v8::Local<v8::Value>) -> Vec<f32> {
 /// `__pt_canvasCreate(id, w, h)`
 #[cfg(feature = "render")]
 fn canvas_create(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -182,7 +182,7 @@ fn canvas_create(
 /// `__pt_canvasDestroy(id)`
 #[cfg(feature = "render")]
 fn canvas_destroy(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -192,7 +192,7 @@ fn canvas_destroy(
 /// `__pt_canvasFillRect(id, x, y, w, h, r, g, b, a)`
 #[cfg(feature = "render")]
 fn canvas_fill_rect(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -215,7 +215,7 @@ fn canvas_fill_rect(
 /// `__pt_canvasClearRect(id, x, y, w, h)`
 #[cfg(feature = "render")]
 fn canvas_clear_rect(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -231,7 +231,7 @@ fn canvas_clear_rect(
 /// `__pt_canvasFillText(id, text, x, y, size, r, g, b, a)` — real glyph pixels.
 #[cfg(feature = "render")]
 fn canvas_fill_text(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -254,7 +254,7 @@ fn canvas_fill_text(
 /// `__pt_canvasMeasureText(text, size)` → advance width in CSS px (a number).
 #[cfg(feature = "render")]
 fn canvas_measure_text(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -266,7 +266,7 @@ fn canvas_measure_text(
 /// `__pt_canvasFillPath(id, verbsF32, evenOdd, r, g, b, a)` — fill a tessellated path.
 #[cfg(feature = "render")]
 fn canvas_fill_path(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -285,7 +285,7 @@ fn canvas_fill_path(
 /// `__pt_canvasFillPathGradient(id, verbsF32, evenOdd, gradF32)` — gradient fill.
 #[cfg(feature = "render")]
 fn canvas_fill_path_gradient(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -299,7 +299,7 @@ fn canvas_fill_path_gradient(
 /// `__pt_canvasStrokePath(id, verbsF32, lineWidth, r, g, b, a)` — stroke a path.
 #[cfg(feature = "render")]
 fn canvas_stroke_path(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -318,7 +318,7 @@ fn canvas_stroke_path(
 /// `__pt_canvasPutImageData(id, x, y, w, h, data)` — overwrite from straight-alpha RGBA.
 #[cfg(feature = "render")]
 fn canvas_put_image_data(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -339,7 +339,7 @@ fn canvas_put_image_data(
 /// size, or 0 when the format is one we do not decode.
 #[cfg(feature = "render")]
 fn image_bytes(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -358,7 +358,7 @@ fn image_bytes(
 /// `__pt_canvasDrawImage(id, url, dx, dy, dw, dh)` → true when it was drawn.
 #[cfg(feature = "render")]
 fn canvas_draw_image(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -478,7 +478,7 @@ mod opfs {
 /// `__pt_fsOpen(key)` → handle, or 0 when the file could not be opened.
 #[cfg(feature = "render")]
 fn fs_open(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -489,7 +489,7 @@ fn fs_open(
 /// `__pt_fsFlush(handle, bytes)` → true when the bytes reached the disk.
 #[cfg(feature = "render")]
 fn fs_flush(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -501,7 +501,7 @@ fn fs_flush(
 /// `__pt_fsRead(handle)` → everything the file holds.
 #[cfg(feature = "render")]
 fn fs_read(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -513,7 +513,7 @@ fn fs_read(
 /// `__pt_fsClose(handle)`
 #[cfg(feature = "render")]
 fn fs_close(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -523,7 +523,7 @@ fn fs_close(
 /// `__pt_canvasGetImageData(id, x, y, w, h)` → straight-alpha RGBA `Uint8Array`.
 #[cfg(feature = "render")]
 fn canvas_get_image_data(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -546,7 +546,7 @@ fn canvas_get_image_data(
 /// `__pt_glAvailable()` → whether a real headless GL context can be created here.
 #[cfg(feature = "webgl")]
 fn gl_available(
-    _scope: &mut v8::HandleScope,
+    _scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -556,7 +556,7 @@ fn gl_available(
 /// `__pt_glCreate(id, w, h)`
 #[cfg(feature = "webgl")]
 fn gl_create(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -570,7 +570,7 @@ fn gl_create(
 /// `__pt_glDestroy(id)`
 #[cfg(feature = "webgl")]
 fn gl_destroy(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -580,7 +580,7 @@ fn gl_destroy(
 /// `__pt_glClear(id, r, g, b, a, mask)`
 #[cfg(feature = "webgl")]
 fn gl_clear(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -599,7 +599,7 @@ fn gl_clear(
 /// `__pt_glViewport(id, x, y, w, h)`
 #[cfg(feature = "webgl")]
 fn gl_viewport(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -615,7 +615,7 @@ fn gl_viewport(
 /// `__pt_glEnable(id, cap, on)`
 #[cfg(feature = "webgl")]
 fn gl_enable(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -629,7 +629,7 @@ fn gl_enable(
 /// `__pt_glCreateShader(id, type)` → handle
 #[cfg(feature = "webgl")]
 fn gl_create_shader(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -643,7 +643,7 @@ fn gl_create_shader(
 /// `__pt_glCompileShader(id, shader, source)`
 #[cfg(feature = "webgl")]
 fn gl_compile_shader(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -656,7 +656,7 @@ fn gl_compile_shader(
 /// `__pt_glShaderCompiled(id, shader)` → bool
 #[cfg(feature = "webgl")]
 fn gl_shader_compiled(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -669,7 +669,7 @@ fn gl_shader_compiled(
 /// `__pt_glShaderInfoLog(id, shader)` → string
 #[cfg(feature = "webgl")]
 fn gl_shader_info_log(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -685,7 +685,7 @@ fn gl_shader_info_log(
 /// `__pt_glCreateProgram(id)` → handle
 #[cfg(feature = "webgl")]
 fn gl_create_program(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -697,7 +697,7 @@ fn gl_create_program(
 /// `__pt_glAttachShader(id, program, shader)`
 #[cfg(feature = "webgl")]
 fn gl_attach_shader(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -711,7 +711,7 @@ fn gl_attach_shader(
 /// `__pt_glLinkProgram(id, program)`
 #[cfg(feature = "webgl")]
 fn gl_link_program(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -724,7 +724,7 @@ fn gl_link_program(
 /// `__pt_glProgramLinked(id, program)` → bool
 #[cfg(feature = "webgl")]
 fn gl_program_linked(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -737,7 +737,7 @@ fn gl_program_linked(
 /// `__pt_glUseProgram(id, program)`
 #[cfg(feature = "webgl")]
 fn gl_use_program(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -750,7 +750,7 @@ fn gl_use_program(
 /// `__pt_glAttribLocation(id, program, name)` → i32
 #[cfg(feature = "webgl")]
 fn gl_attrib_location(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -763,7 +763,7 @@ fn gl_attrib_location(
 /// `__pt_glUniformLocation(id, program, name)` → i32 (-1 = null)
 #[cfg(feature = "webgl")]
 fn gl_uniform_location(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -776,7 +776,7 @@ fn gl_uniform_location(
 /// `__pt_glCreateBuffer(id)` → handle
 #[cfg(feature = "webgl")]
 fn gl_create_buffer(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -788,7 +788,7 @@ fn gl_create_buffer(
 /// `__pt_glBindBuffer(id, target, buffer)`
 #[cfg(feature = "webgl")]
 fn gl_bind_buffer(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -802,7 +802,7 @@ fn gl_bind_buffer(
 /// `__pt_glBufferData(id, target, data, usage)`
 #[cfg(feature = "webgl")]
 fn gl_buffer_data(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -816,7 +816,7 @@ fn gl_buffer_data(
 /// `__pt_glEnableVertexAttribArray(id, index)`
 #[cfg(feature = "webgl")]
 fn gl_enable_vertex_attrib_array(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -829,7 +829,7 @@ fn gl_enable_vertex_attrib_array(
 /// `__pt_glVertexAttribPointer(id, index, size, type, normalized, stride, offset)`
 #[cfg(feature = "webgl")]
 fn gl_vertex_attrib_pointer(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -847,7 +847,7 @@ fn gl_vertex_attrib_pointer(
 /// `__pt_glUniformF(id, location, valuesF32)` — uniform{1,2,3,4}f by array length.
 #[cfg(feature = "webgl")]
 fn gl_uniform_f(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -860,7 +860,7 @@ fn gl_uniform_f(
 /// `__pt_glUniform1i(id, location, v)`
 #[cfg(feature = "webgl")]
 fn gl_uniform_1i(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -874,7 +874,7 @@ fn gl_uniform_1i(
 /// `__pt_glUniformMatrix4(id, location, transpose, valuesF32)`
 #[cfg(feature = "webgl")]
 fn gl_uniform_matrix4(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -888,7 +888,7 @@ fn gl_uniform_matrix4(
 /// `__pt_glDrawArrays(id, mode, first, count)`
 #[cfg(feature = "webgl")]
 fn gl_draw_arrays(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -903,7 +903,7 @@ fn gl_draw_arrays(
 /// `__pt_glDrawElements(id, mode, count, type, offset)`
 #[cfg(feature = "webgl")]
 fn gl_draw_elements(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -921,7 +921,7 @@ fn gl_draw_elements(
 /// into the canvas' top-left origin (for `toDataURL`).
 #[cfg(feature = "webgl")]
 fn gl_read_pixels(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -939,7 +939,7 @@ fn gl_read_pixels(
 /// `__pt_glCreateTexture(id)` → handle
 #[cfg(feature = "webgl")]
 fn gl_create_texture(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -951,7 +951,7 @@ fn gl_create_texture(
 /// `__pt_glBindTexture(id, target, texture)`
 #[cfg(feature = "webgl")]
 fn gl_bind_texture(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -965,7 +965,7 @@ fn gl_bind_texture(
 /// `__pt_glActiveTexture(id, unit)`
 #[cfg(feature = "webgl")]
 fn gl_active_texture(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -978,7 +978,7 @@ fn gl_active_texture(
 /// `__pt_glTexParameteri(id, target, pname, param)`
 #[cfg(feature = "webgl")]
 fn gl_tex_parameteri(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -994,7 +994,7 @@ fn gl_tex_parameteri(
 /// type, pixels, flipY, premultiply)` — `pixels` empty means WebGL's `null`.
 #[cfg(feature = "webgl")]
 fn gl_tex_image_2d(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -1019,7 +1019,7 @@ fn gl_tex_image_2d(
 /// pixels, flipY, premultiply)`
 #[cfg(feature = "webgl")]
 fn gl_tex_sub_image_2d(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -1043,7 +1043,7 @@ fn gl_tex_sub_image_2d(
 /// `__pt_glGenerateMipmap(id, target)`
 #[cfg(feature = "webgl")]
 fn gl_generate_mipmap(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -1056,7 +1056,7 @@ fn gl_generate_mipmap(
 /// `__pt_glCreateFramebuffer(id)` → handle
 #[cfg(feature = "webgl")]
 fn gl_create_framebuffer(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -1068,7 +1068,7 @@ fn gl_create_framebuffer(
 /// `__pt_glBindFramebuffer(id, target, framebuffer)` (0 = the drawing buffer)
 #[cfg(feature = "webgl")]
 fn gl_bind_framebuffer(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -1082,7 +1082,7 @@ fn gl_bind_framebuffer(
 /// `__pt_glFramebufferTexture2D(id, target, attachment, texTarget, texture, level)`
 #[cfg(feature = "webgl")]
 fn gl_framebuffer_texture_2d(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -1099,7 +1099,7 @@ fn gl_framebuffer_texture_2d(
 /// `__pt_glCheckFramebufferStatus(id, target)` → enum
 #[cfg(feature = "webgl")]
 fn gl_check_framebuffer_status(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -1112,7 +1112,7 @@ fn gl_check_framebuffer_status(
 /// `__pt_glCreateRenderbuffer(id)` → handle
 #[cfg(feature = "webgl")]
 fn gl_create_renderbuffer(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -1124,7 +1124,7 @@ fn gl_create_renderbuffer(
 /// `__pt_glBindRenderbuffer(id, target, renderbuffer)`
 #[cfg(feature = "webgl")]
 fn gl_bind_renderbuffer(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -1138,7 +1138,7 @@ fn gl_bind_renderbuffer(
 /// `__pt_glRenderbufferStorage(id, target, internalFormat, w, h)`
 #[cfg(feature = "webgl")]
 fn gl_renderbuffer_storage(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -1154,7 +1154,7 @@ fn gl_renderbuffer_storage(
 /// `__pt_glFramebufferRenderbuffer(id, target, attachment, rbTarget, renderbuffer)`
 #[cfg(feature = "webgl")]
 fn gl_framebuffer_renderbuffer(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -1170,7 +1170,7 @@ fn gl_framebuffer_renderbuffer(
 /// `__pt_glCreateVertexArray(id)` → handle
 #[cfg(feature = "webgl")]
 fn gl_create_vertex_array(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -1182,7 +1182,7 @@ fn gl_create_vertex_array(
 /// `__pt_glBindVertexArray(id, vao)`
 #[cfg(feature = "webgl")]
 fn gl_bind_vertex_array(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -1196,7 +1196,7 @@ fn gl_bind_vertex_array(
 /// `OBJ_*` kinds in `crate::webgl`).
 #[cfg(feature = "webgl")]
 fn gl_delete(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -1210,7 +1210,7 @@ fn gl_delete(
 /// `__pt_glBlendFunc(id, src, dst)`
 #[cfg(feature = "webgl")]
 fn gl_blend_func(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -1224,7 +1224,7 @@ fn gl_blend_func(
 /// `__pt_glDepthFunc(id, func)`
 #[cfg(feature = "webgl")]
 fn gl_depth_func(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
@@ -1234,7 +1234,7 @@ fn gl_depth_func(
     );
 }
 
-fn bind(scope: &mut v8::HandleScope, name: &str, cb: impl v8::MapFnTo<v8::FunctionCallback>) {
+fn bind(scope: &mut v8::PinScope, name: &str, cb: impl v8::MapFnTo<v8::FunctionCallback>) {
     let global = scope.get_current_context().global(scope);
     let Some(key) = v8::String::new(scope, name) else {
         return;
@@ -1263,16 +1263,16 @@ fn arg_bytes(value: v8::Local<v8::Value>) -> Vec<u8> {
     Vec::new()
 }
 
-fn arg_string(scope: &mut v8::HandleScope, value: v8::Local<v8::Value>) -> String {
+fn arg_string(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> String {
     value.to_rust_string_lossy(scope)
 }
 
-fn arg_usize(scope: &mut v8::HandleScope, value: v8::Local<v8::Value>) -> usize {
+fn arg_usize(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> usize {
     value.integer_value(scope).unwrap_or(0).max(0) as usize
 }
 
 /// Return `bytes` to JS as a `Uint8Array`.
-fn set_bytes(scope: &mut v8::HandleScope, rv: &mut v8::ReturnValue, bytes: &[u8]) {
+fn set_bytes(scope: &mut v8::PinScope, rv: &mut v8::ReturnValue, bytes: &[u8]) {
     let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes.to_vec()).make_shared();
     let buf = v8::ArrayBuffer::with_backing_store(scope, &store);
     match v8::Uint8Array::new(scope, buf, 0, bytes.len()) {
@@ -1302,7 +1302,7 @@ fn set_bytes(scope: &mut v8::HandleScope, rv: &mut v8::ReturnValue, bytes: &[u8]
 /// and the same bootstrap as any other context, so it looks like the window it
 /// claims to be rather than a bare V8 global.
 fn make_realm(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -1323,7 +1323,7 @@ fn make_realm(
     {
         let inner = &mut v8::ContextScope::new(scope, context);
         install(inner);
-        let inner = &mut v8::TryCatch::new(inner);
+        v8::tc_scope!(inner, inner);
         if let Some(src) = v8::String::new(inner, &bootstrap) {
             if let Some(script) = v8::Script::compile(inner, src, None) {
                 // A realm whose bootstrap threw is still a realm; the page gets
@@ -1336,7 +1336,7 @@ fn make_realm(
 }
 
 fn random_bytes(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -1351,7 +1351,7 @@ fn random_bytes(
 
 /// `__pt_digest(alg, data)`
 fn digest(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -1372,7 +1372,7 @@ fn digest(
 
 /// `__pt_hmac(hash, key, data)`
 fn hmac_sign(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -1406,7 +1406,7 @@ fn hmac_sign(
 
 /// `__pt_pbkdf2(hash, password, salt, iterations, byteLength)`
 fn pbkdf2_derive(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -1445,7 +1445,7 @@ fn pbkdf2_derive(
 
 /// `__pt_hkdf(hash, ikm, salt, info, byteLength)`
 fn hkdf_derive(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -1482,7 +1482,7 @@ fn hkdf_derive(
 /// and the only length browsers use in practice). Decryption returns `null` when
 /// authentication fails, which the JS layer reports as an `OperationError`.
 fn aes_gcm_op(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -1525,7 +1525,7 @@ fn aes_gcm_op(
 
 /// `__pt_aescbc(encrypt, key, iv, data)` — PKCS#7 padded, as WebCrypto specifies.
 fn aes_cbc_op(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -1567,7 +1567,7 @@ fn aes_cbc_op(
 /// including an empty canvas — hash identically, which a differential probe
 /// spots immediately. Encoding here also keeps the expensive part out of JS.
 fn png_data_url(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -1622,7 +1622,7 @@ fn png_data_url(
 /// одного продвижения. Отсюда и берётся настоящий монотонный источник, а
 /// огрубление до браузерного шага делает уже JS.
 fn hrtime(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {

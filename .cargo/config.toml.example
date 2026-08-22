@@ -13,3 +13,9 @@
 [env]
 LIBCLANG_PATH = "/home/YOU/.local/lib/python3.X/site-packages/clang/native"
 BINDGEN_EXTRA_CLANG_ARGS = "-isystem /usr/lib/gcc/x86_64-linux-gnu/12/include -isystem /usr/include"
+
+# Prebuilt V8 for the pinned rusty_v8 git tag — see docs/BUILD.md, "The V8
+# archive". Both files come from the matching GitHub release; keep them
+# somewhere stable, /tmp is emptied on reboot.
+RUSTY_V8_ARCHIVE = "/home/YOU/.cache/nokk/rusty_v8-149.4.0/lib.a"
+RUSTY_V8_SRC_BINDING_PATH = "/home/YOU/.cache/nokk/rusty_v8-149.4.0/binding.rs"

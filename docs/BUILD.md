@@ -56,10 +56,35 @@ BINDGEN_EXTRA_CLANG_ARGS = "-isystem /usr/lib/gcc/x86_64-linux-gnu/12/include -i
 > they live in `.cargo/config.toml` rather than ad-hoc shell exports. The file is
 > `.gitignore`d because the paths are machine-specific.
 
+## The V8 archive
+
+The engine pins `rusty_v8` to a git tag rather than a crates.io release, because
+the version matching the Chrome we emulate is published on GitHub only. For a
+crates.io release the crate downloads its prebuilt V8 archive itself; for a git
+dependency it does not, so point it at a local copy of the two release files:
+
+```
+https://github.com/denoland/rusty_v8/releases/tag/v149.4.0
+  librusty_v8_release_x86_64-unknown-linux-gnu.a.gz  → lib.a      (185 MB unpacked)
+  src_binding_release_x86_64-unknown-linux-gnu.rs    → binding.rs
+```
+
+Put them somewhere stable — not `/tmp` — and name them in the same
+`.cargo/config.toml`:
+
+```toml
+[env]
+RUSTY_V8_ARCHIVE = "/home/you/.cache/nokk/rusty_v8-149.4.0/lib.a"
+RUSTY_V8_SRC_BINDING_PATH = "/home/you/.cache/nokk/rusty_v8-149.4.0/binding.rs"
+```
+
+Building V8 from source instead (`V8_FROM_SOURCE=1`) works but wants ~30 GB and
+`depot_tools`; the release archive is the same binary Deno ships.
+
 ## Verifying the build
 
 ```bash
-cargo test                      # 48 tests, offline (no network)
+cargo test                      # 192 tests, offline (no network)
 cargo run --bin nokk -- --fetch https://tls.browserleaks.com/json
 ```
 

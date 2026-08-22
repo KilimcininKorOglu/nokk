@@ -84,20 +84,18 @@ static CREATE_LOCK: Mutex<()> = Mutex::new(());
 /// in [`Isolate::new`] is then a no-op.
 pub(crate) fn init_platform() {
     V8_INIT.call_once(|| {
-        // Maglev — the mid-tier optimiser — miscompiles a loop this engine meets
-        // on its first real page: a fingerprint collector walking the global
-        // graph. After ~1300 iterations the function tiers up, and from then on a
-        // string comparison inside it answers wrongly, so one property silently
-        // vanishes from what the page computed. Same source run as a fresh
-        // function object is correct; `--no-maglev`, `--no-turbofan`, `--no-opt`
-        // and `--jitless` all make it correct. TurboFan keeps hot code fast, so
-        // this costs warm-up speed only — and a page that computes the wrong
-        // answer quickly is worth nothing. Overridable: `NOKK_V8_FLAGS` replaces
-        // this entirely (`--no-opt` to bisect, `""` to run stock V8).
+        // Долгое время здесь стоял `--no-maglev`: средний ярус оптимизатора в V8
+        // 13.7 неверно компилировал цикл, который встречается на первой же
+        // настоящей странице — обход графа глобалей сборщиком отпечатков. После
+        // тысячи с лишним витков функция поднималась на ярус, и сравнение строк
+        // внутри неё начинало отвечать неверно: одно свойство молча пропадало из
+        // того, что насчитала страница.
         //
-        // Fix rather than mitigation: v8 137 → a current release, then re-run
-        // `a_warmed_enumeration_still_sees_every_property`.
-        let flags = std::env::var("NOKK_V8_FLAGS").unwrap_or_else(|_| "--no-maglev".to_string());
+        // На V8 14.9 этого нет — проверено тестом
+        // `a_warmed_enumeration_still_sees_every_property` и обходом графа на
+        // живой странице, — поэтому движок работает без ограничений, как в
+        // браузере. `NOKK_V8_FLAGS` по-прежнему заменяет набор целиком.
+        let flags = std::env::var("NOKK_V8_FLAGS").unwrap_or_default();
         if !flags.is_empty() {
             v8::V8::set_flags_from_string(&flags);
         }
@@ -108,7 +106,7 @@ pub(crate) fn init_platform() {
         for path in icu_candidates() {
             let Ok(bytes) = std::fs::read(&path) else { continue };
             let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-            match v8::icu::set_common_data_74(leaked) {
+            match v8::icu::set_common_data_77(leaked) {
                 Ok(()) => {
                     ICU_READY.store(true, Ordering::Relaxed);
                     tracing::info!(path = %path.display(), "ICU data loaded");
@@ -311,7 +309,7 @@ impl Isolate {
                 .set_slot(crate::natives::RealmBootstrap(bootstrap.to_string()));
         }
         let global = {
-            let scope = &mut v8::HandleScope::new(&mut self.isolate);
+            v8::scope!(scope, &mut self.isolate);
             let context = v8::Context::new(scope, v8::ContextOptions::default());
             let global = v8::Global::new(scope, context);
             let scope = &mut v8::ContextScope::new(scope, context);
@@ -346,9 +344,7 @@ impl Isolate {
         let watchdog = TerminateWatchdog::arm(&mut self.isolate);
 
         let result = {
-            let scope = &mut v8::HandleScope::new(&mut self.isolate);
-            let context = v8::Local::new(scope, &global);
-            let scope = &mut v8::ContextScope::new(scope, context);
+            v8::scope_with_context!(scope, &mut self.isolate, &global);
             run_script(scope, source)
         };
 
@@ -376,10 +372,8 @@ impl Isolate {
     ) -> Result<Vec<String>, String> {
         let global = self.context(index)?;
         let key = format!("{index}:{url}");
-        let scope = &mut v8::HandleScope::new(&mut self.isolate);
-        let context = v8::Local::new(scope, &global);
-        let scope = &mut v8::ContextScope::new(scope, context);
-        let scope = &mut v8::TryCatch::new(scope);
+        v8::scope_with_context!(scope, &mut self.isolate, &global);
+        v8::tc_scope!(scope, scope);
 
         let module = match compile_module(scope, url, source) {
             Some(m) => m,
@@ -443,9 +437,7 @@ impl Isolate {
         outcome: Result<&str, String>,
     ) -> Result<(), String> {
         let global = self.context(index)?;
-        let scope = &mut v8::HandleScope::new(&mut self.isolate);
-        let context = v8::Local::new(scope, &global);
-        let scope = &mut v8::ContextScope::new(scope, context);
+        v8::scope_with_context!(scope, &mut self.isolate, &global);
 
         let Some(handle) = scope
             .get_slot_mut::<DynamicImports>()
@@ -491,10 +483,8 @@ impl Isolate {
         let watchdog = TerminateWatchdog::arm(&mut self.isolate);
 
         let result = (|| {
-            let scope = &mut v8::HandleScope::new(&mut self.isolate);
-            let context = v8::Local::new(scope, &global);
-            let scope = &mut v8::ContextScope::new(scope, context);
-            let scope = &mut v8::TryCatch::new(scope);
+            v8::scope_with_context!(scope, &mut self.isolate, &global);
+            v8::tc_scope!(scope, scope);
 
             let handle = scope
                 .get_slot::<ModuleRegistry>()
@@ -624,10 +614,8 @@ impl Isolate {
         max_callbacks: u32,
         deadline: std::time::Instant,
     ) -> Result<u32, String> {
-        let scope = &mut v8::HandleScope::new(&mut self.isolate);
-        let context = v8::Local::new(scope, global);
-        let scope = &mut v8::ContextScope::new(scope, context);
-        let scope = &mut v8::TryCatch::new(scope);
+        v8::scope_with_context!(scope, &mut self.isolate, global);
+        v8::tc_scope!(scope, scope);
 
         // Compile the driver once; each run executes one timer, and the default
         // (Auto) microtask policy drains promise continuations when it returns.
@@ -730,7 +718,7 @@ impl TerminateWatchdog {
 /// Compile `source` as a module, tagged with its URL so stacks and
 /// `import.meta.url` name the right file.
 fn compile_module<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     url: &str,
     source: &str,
 ) -> Option<v8::Local<'s, v8::Module>> {
@@ -757,7 +745,7 @@ fn compile_module<'s>(
 /// hand back. Everything here is bookkeeping: make the promise, remember the
 /// resolver by id, and queue what was asked for the driver to fetch.
 fn import_dynamically<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     _host_defined_options: v8::Local<'s, v8::Data>,
     resource_name: v8::Local<'s, v8::Value>,
     specifier: v8::Local<'s, v8::String>,
@@ -794,7 +782,7 @@ unsafe extern "C" fn import_meta(
     module: v8::Local<v8::Module>,
     meta: v8::Local<v8::Object>,
 ) {
-    let scope = &mut unsafe { v8::CallbackScope::new(context) };
+    v8::callback_scope!(unsafe scope, context);
     let hash = module.get_identity_hash().get();
     let Some(key) = scope.get_slot::<ModuleRegistry>().and_then(|r| r.by_hash.get(&hash).cloned())
     else {
@@ -818,7 +806,7 @@ fn resolve_module<'a>(
     _attributes: v8::Local<'a, v8::FixedArray>,
     referrer: v8::Local<'a, v8::Module>,
 ) -> Option<v8::Local<'a, v8::Module>> {
-    let scope = &mut unsafe { v8::CallbackScope::new(context) };
+    v8::callback_scope!(unsafe scope, context);
     let spec = specifier.to_rust_string_lossy(scope);
     let hash = referrer.get_identity_hash().get();
     let handle = {
@@ -832,8 +820,8 @@ fn resolve_module<'a>(
 
 /// Compile and run `source` in the current context, returning its result as a
 /// string, or the exception message on failure.
-fn run_script(scope: &mut v8::HandleScope, source: &str) -> Result<String, String> {
-    let scope = &mut v8::TryCatch::new(scope);
+fn run_script(scope: &mut v8::PinScope, source: &str) -> Result<String, String> {
+    v8::tc_scope!(scope, scope);
 
     let Some(code) = v8::String::new(scope, source) else {
         return Err("script source too large for V8".to_string());
@@ -851,7 +839,9 @@ fn run_script(scope: &mut v8::HandleScope, source: &str) -> Result<String, Strin
 }
 
 /// Extract a human-readable message from a caught JS exception.
-fn exception_message(tc: &mut v8::TryCatch<v8::HandleScope>) -> String {
+fn exception_message(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> String {
     match tc.exception() {
         Some(ex) => ex
             .to_string(tc)

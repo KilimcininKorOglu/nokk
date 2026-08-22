@@ -40,7 +40,7 @@ libloading = { version = "0.8", optional = true }
 
 # Embedded JavaScript engine (Phase 1). Uses a prebuilt V8 static library, so it
 # does not compile V8 from source. One `v8::OwnedIsolate` lives per worker thread.
-v8 = "137"
+v8 = { git = "https://github.com/denoland/rusty_v8", tag = "v149.4.0" }
 
 # Native WebCrypto primitives exposed to each context (see src/natives.rs).
 sha1 = { workspace = true }
