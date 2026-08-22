@@ -5439,7 +5439,19 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   const GL_U32 = [34467];
   // Параметры, которые появляются только вместе с расширением: их нет среди
   // констант интерфейса, но спрашивают их наравне со всеми.
-  const EXT_PARAMS = { 34047: 16, 35723: 4352, 36795: false };
+  // Значения, которые появляются только вместе с расширением. Браузер отдаёт
+  // по ним `null`, пока страница не попросила расширение через `getExtension`,
+  // и по этому легко отличить подделку: настоящий Chrome не назовёт видеокарту
+  // тому, кто не спросил `WEBGL_debug_renderer_info`. Мы называли всегда.
+  const EXT_PARAMS = {
+    34047: [16, 'EXT_texture_filter_anisotropic'],
+    // В WebGL2 подсказка о производных — обычный параметр; расширение
+    // нужно только первой версии.
+    35723: [4352, 'OES_standard_derivatives', 1],
+    36795: [false, 'EXT_disjoint_timer_query'],
+    37445: [null, 'WEBGL_debug_renderer_info'],
+    37446: [null, 'WEBGL_debug_renderer_info'],
+  };
 
   const EXT_VALUES = {
     UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246,
@@ -5558,12 +5570,19 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // 2048 слоёв против 2048 у одних и нули у полутора десятков других.
     const glProto = (ver === 2 ? globalThis.WebGL2RenderingContext : globalThis.WebGLRenderingContext).prototype;
     // То же и здесь: реализация живёт отдельно от интерфейса (см. publishGL).
+    // Какие расширения страница успела попросить: часть значений видна только
+    // после этого.
+    const asked = new Set();
     const gl = Object.assign({}, C, {
       canvas, drawingBufferWidth: canvas.width || 300, drawingBufferHeight: canvas.height || 150,
       drawingBufferColorSpace: 'srgb', unpackColorSpace: 'srgb',
       getParameter(p){
+        if (Object.prototype.hasOwnProperty.call(EXT_PARAMS, p)) {
+          const [v, need, onlyVer] = EXT_PARAMS[p];
+          if ((!onlyVer || onlyVer === ver) && !asked.has(need)) return null;
+          return v !== null ? v : (Object.prototype.hasOwnProperty.call(P, p) ? P[p] : null);
+        }
         if (Object.prototype.hasOwnProperty.call(P, p)) return P[p];
-        if (Object.prototype.hasOwnProperty.call(EXT_PARAMS, p)) return EXT_PARAMS[p];
         const T = ver === 2 ? GL2_PARAMS : GL1_PARAMS;
         if (Object.prototype.hasOwnProperty.call(T, p)) {
           const v = T[p];
@@ -5576,7 +5595,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           if (GL_U32.indexOf(p) >= 0) return new Uint32Array(v);
           return new Int32Array(v);
         }
-        return typeof p === 'number' ? 0 : null;
+        // Неизвестное перечисление — `null`, а не ноль: браузер так и делает,
+        // а ноль означал бы, что мы знаем ответ.
+        return null;
       },
       getShaderPrecisionFormat(st, pt){
         const v = GL_PRECISION[st + ':' + pt] || [127, 127, 23];
@@ -5596,6 +5617,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       getExtension(name){
         const shape = (ver === 2 ? GL2_EXT_SHAPE : GL1_EXT_SHAPE)[name];
         if (!shape) return null;
+        asked.add(name);
         const [iface, keys] = shape;
         const C_ = globalThis[iface];
         const o = C_ && C_.prototype ? Object.create(C_.prototype) : {};
