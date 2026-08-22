@@ -5165,10 +5165,19 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // Gradient fillStyle/strokeStyle: real objects carrying coords + stops, flattened
     // to the [type,x0,y0,x1,y1,r0,r1,n,(pos,r,g,b,a)…] descriptor the native decoder
     // reads. A gradient object is detected by its `__ptGrad` marker.
-    const makeGradient = (type, coords) => ({
-      __ptGrad: { type, coords, stops: [] },
-      addColorStop(pos, color) { note('stop|' + [pos, color]); this.__ptGrad.stops.push([+pos || 0, parseColor(color)]); },
-    });
+    // Состояние градиента — за WeakMap, а не собственным свойством объекта: у
+    // браузерного `CanvasGradient` собственных свойств ноль, а наша метка
+    // `__ptGrad` торчала наружу и называла себя сама.
+    const GRAD = new WeakMap();
+    const makeGradient = (type, coords) => {
+      const state = { type, coords, stops: [] };
+      const g = globalThis.__pt_makeGradient
+        ? __pt_makeGradient({ add: (pos, color) => { note('stop|' + [pos, color]); state.stops.push([+pos || 0, parseColor(color)]); } })
+        : { addColorStop(pos, color) { note('stop|' + [pos, color]); state.stops.push([+pos || 0, parseColor(color)]); } };
+      GRAD.set(g, state);
+      return g;
+    };
+    const gradOf = (v) => (v && GRAD.get(v)) || null;
     const encodeGrad = (g) => {
       const a = [g.type, g.coords[0], g.coords[1], g.coords[2], g.coords[3], g.coords[4], g.coords[5], g.stops.length];
       for (let k = 0; k < g.stops.length; k++) { const s = g.stops[k]; a.push(s[0], s[1][0], s[1][1], s[1][2], s[1][3]); }
@@ -5204,7 +5213,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       fillRect(x, y, w, h) {
         note('fillRect|' + [x, y, w, h, this.fillStyle]);
         const fs = this.fillStyle;
-        if (S.native && fs && fs.__ptGrad) S.fillPathGradient(rectVerbs(x, y, w, h), false, encodeGrad(fs.__ptGrad));
+        if (S.native && gradOf(fs)) S.fillPathGradient(rectVerbs(x, y, w, h), false, encodeGrad(gradOf(fs)));
         else solid(x, y, w, h, parseColor(fs));
       },
       clearRect(x, y, w, h) { note('clearRect|' + [x, y, w, h]); solid(x, y, w, h, [0, 0, 0, 0]); },
@@ -5257,7 +5266,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         note('fill|' + this.fillStyle);
         if (!S.native) return paintPath();
         const fs = this.fillStyle;
-        if (fs && fs.__ptGrad) S.fillPathGradient(verbs, String(rule) === 'evenodd', encodeGrad(fs.__ptGrad));
+        if (gradOf(fs)) S.fillPathGradient(verbs, String(rule) === 'evenodd', encodeGrad(gradOf(fs)));
         else S.fillPath(verbs, String(rule) === 'evenodd', parseColor(fs));
       },
       stroke() {
@@ -5330,15 +5339,16 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const m = S.native
           ? S.width(t, size, fontFamily(this.font), fontBold(this.font), fontItalic(this.font))
           : null;
+        // Не литерал, а `TextMetrics`: страница читает имя объекта, а у
+        // литерала его нет. Базовые линии считает сам конструктор.
+        const mk = globalThis.__pt_makeMetrics || ((v) => v);
         if (!m) {
           const w = String(t).length * 6.7;
-          return { width: w, actualBoundingBoxLeft: 0, actualBoundingBoxRight: w,
-                   actualBoundingBoxAscent: size * 0.7, actualBoundingBoxDescent: size * 0.2,
-                   fontBoundingBoxAscent: size * 0.9, fontBoundingBoxDescent: size * 0.2 };
+          return mk({ width: w, left: 0, right: w, ascent: size * 0.7, descent: size * 0.2,
+                      fontAscent: size * 0.9, fontDescent: size * 0.2 });
         }
-        return { width: m[0], actualBoundingBoxLeft: m[1], actualBoundingBoxRight: m[2],
-                 actualBoundingBoxAscent: m[3], actualBoundingBoxDescent: m[4],
-                 fontBoundingBoxAscent: m[5], fontBoundingBoxDescent: m[6] };
+        return mk({ width: m[0], left: m[1], right: m[2], ascent: m[3], descent: m[4],
+                    fontAscent: m[5], fontDescent: m[6] });
       },
       getImageData(x, y, w, h) {
         needArgs(arguments.length, 4, 'getImageData', 'CanvasRenderingContext2D');
@@ -5360,7 +5370,19 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       },
       createLinearGradient(x0, y0, x1, y1) { note('linearGradient|' + [x0, y0, x1, y1]); return makeGradient(0, [+x0 || 0, +y0 || 0, +x1 || 0, +y1 || 0, 0, 0]); },
       createRadialGradient(x0, y0, r0, x1, y1, r1) { note('radialGradient|' + [x0, y0, r0, x1, y1, r1]); return makeGradient(1, [+x0 || 0, +y0 || 0, +x1 || 0, +y1 || 0, +r0 || 0, +r1 || 0]); },
-      createPattern() { note('pattern'); return {}; },
+      createPattern(img, rep) {
+        note('pattern|' + rep);
+        return globalThis.__pt_makePattern ? __pt_makePattern({ img, repetition: rep }) : {};
+      },
+      // Конического градиента у нас не было вовсе — `undefined` там, где
+      // браузер отдаёт объект.
+      createConicGradient(angle, x, y) {
+        note('conicGradient|' + [angle, x, y]);
+        return makeGradient(2, [+x || 0, +y || 0, 0, 0, +angle || 0, 0]);
+      },
+      getTransform() {
+        return globalThis.DOMMatrix ? new DOMMatrix() : undefined;
+      },
       getContextAttributes() { return { alpha: true, colorSpace: 'srgb', desynchronized: false, willReadFrequently: false }; },
       // Hidden (filtered) accessor the canvas element uses to encode itself.
       __ptPixels() { return S.pixels(); },

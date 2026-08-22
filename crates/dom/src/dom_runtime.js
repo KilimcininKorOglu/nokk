@@ -1198,8 +1198,8 @@
     // Synthetic layout (no real rendering): rendered elements report a non-empty
     // box so coordinate + visibility tooling works, hidden/detached ones an empty
     // one. See __relayout / __boxOf below.
-    getBoundingClientRect() { const r = __rectFromBox(__boxOf(this)); r.toJSON = function () { return this; }; return r; }
-    getClientRects() { const b = __boxOf(this); if (!b) return __ptRectList([]); const r = __rectFromBox(b); r.toJSON = function () { return this; }; return __ptRectList([r]); }
+    getBoundingClientRect() { return __rectFromBox(__boxOf(this)); }
+    getClientRects() { const b = __boxOf(this); if (!b) return __ptRectList([]); return __ptRectList([__rectFromBox(b)]); }
     get parentElement() { const p = this.parentNode; return p && p.nodeType === ELEMENT_NODE ? p : null; }
     // Layout-metric accessors derived from the synthetic box. `documentElement`'s
     // client size is the viewport (drivers clamp click boxes to it).
@@ -3788,11 +3788,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         if (!b) return __ptRectList([]);
         const h = (b.asc || 0) + (b.desc || 0);
         const rows = (b.lines && b.lines.length ? b.lines : [{ width: b.cw }]);
-        return __ptRectList(rows.map((ln, i) => {
-          const y = b.cy + i * (b.line || h);
-          return { x: b.cx, y, left: b.cx, top: y, right: b.cx + ln.width,
-                   bottom: y + h, width: ln.width, height: h };
-        }));
+        return __ptRectList(rows.map((ln, i) =>
+          new DOMRect(b.cx, b.cy + i * (b.line || h), ln.width, h)));
       },
       getBoundingClientRect() {
         const list = this.getClientRects();
@@ -4560,9 +4557,139 @@ const CS_REPLACED = {"block-size":"65px","border-block-end-style":"inset","borde
     return list;
   }
 
+  // Прямоугольник и метрики текста — не литералы, а объекты с именем. Страница
+  // спрашивает `Object.prototype.toString.call(el.getBoundingClientRect())` и
+  // должна услышать `[object DOMRect]`, а не `[object Object]`; у нас это были
+  // безымянные объекты, и `measureText` тоже. Состав прототипов снят с Chrome
+  // 151 перечислением: у `DOMRectReadOnly` десять имён, у `DOMRect` пять своих
+  // поверх них, у `TextMetrics` одиннадцать.
+  const __rectVals = new WeakMap();
+  class DOMRectReadOnly {
+    constructor(x, y, w, h) {
+      __rectVals.set(this, { x: +x || 0, y: +y || 0, w: +w || 0, h: +h || 0 });
+    }
+    get x() { return __rectVals.get(this).x; }
+    get y() { return __rectVals.get(this).y; }
+    get width() { return __rectVals.get(this).w; }
+    get height() { return __rectVals.get(this).h; }
+    get top() { const v = __rectVals.get(this); return Math.min(v.y, v.y + v.h); }
+    get right() { const v = __rectVals.get(this); return Math.max(v.x, v.x + v.w); }
+    get bottom() { const v = __rectVals.get(this); return Math.max(v.y, v.y + v.h); }
+    get left() { const v = __rectVals.get(this); return Math.min(v.x, v.x + v.w); }
+    toJSON() {
+      return { x: this.x, y: this.y, width: this.width, height: this.height,
+               top: this.top, right: this.right, bottom: this.bottom, left: this.left };
+    }
+  }
+  class DOMRect extends DOMRectReadOnly {
+    get x() { return __rectVals.get(this).x; }
+    set x(v) { __rectVals.get(this).x = +v || 0; }
+    get y() { return __rectVals.get(this).y; }
+    set y(v) { __rectVals.get(this).y = +v || 0; }
+    get width() { return __rectVals.get(this).w; }
+    set width(v) { __rectVals.get(this).w = +v || 0; }
+    get height() { return __rectVals.get(this).h; }
+    set height(v) { __rectVals.get(this).h = +v || 0; }
+  }
+  for (const [C, n] of [[DOMRectReadOnly, 'DOMRectReadOnly'], [DOMRect, 'DOMRect']]) {
+    try { Object.defineProperty(C.prototype, Symbol.toStringTag, { value: n, configurable: true }); } catch (e) {}
+    globalThis[n] = globalThis.__pt_native ? __pt_native(C) : C;
+  }
+  globalThis.__pt_makeRect = (x, y, w, h) => new DOMRect(x, y, w, h);
+
+  // `TextMetrics`: значения на прототипе, у самого объекта своих свойств нет —
+  // как и у всего, что отдаёт браузер. Базовые линии считаются от метрик
+  // гарнитуры: висячая — четыре пятых подъёма, иероглифическая — минус спуск.
+  const __tmVals = new WeakMap();
+  const TM_KEYS = ['width', 'actualBoundingBoxLeft', 'actualBoundingBoxRight',
+                   'actualBoundingBoxAscent', 'actualBoundingBoxDescent',
+                   'fontBoundingBoxAscent', 'fontBoundingBoxDescent',
+                   'alphabeticBaseline', 'hangingBaseline', 'ideographicBaseline'];
+  class TextMetrics {}
+  for (const k of TM_KEYS) {
+    Object.defineProperty(TextMetrics.prototype, k, {
+      get() { return (__tmVals.get(this) || {})[k] || 0; },
+      enumerable: false, configurable: true,
+    });
+  }
+  try { Object.defineProperty(TextMetrics.prototype, Symbol.toStringTag, { value: 'TextMetrics', configurable: true }); } catch (e) {}
+  globalThis.TextMetrics = globalThis.__pt_native ? __pt_native(TextMetrics) : TextMetrics;
+  globalThis.__pt_makeMetrics = (v) => {
+    const m = Object.create(TextMetrics.prototype);
+    __tmVals.set(m, {
+      width: v.width || 0,
+      actualBoundingBoxLeft: v.left || 0, actualBoundingBoxRight: v.right || 0,
+      actualBoundingBoxAscent: v.ascent || 0, actualBoundingBoxDescent: v.descent || 0,
+      fontBoundingBoxAscent: v.fontAscent || 0, fontBoundingBoxDescent: v.fontDescent || 0,
+      alphabeticBaseline: 0,
+      hangingBaseline: Math.round((v.fontAscent || 0) * 0.8 * 1e4) / 1e4,
+      ideographicBaseline: -(v.fontDescent || 0),
+    });
+    return m;
+  };
+
+  // Градиент, узор и выделение — тоже объекты с именем, а не литералы. У
+  // градиента вдобавок наружу светила наша метка `__ptGrad`: собственное
+  // свойство, которого у браузерного объекта нет ни одного.
+  const __gradVals = new WeakMap();
+  class CanvasGradient {
+    addColorStop(pos, color) {
+      const g = __gradVals.get(this);
+      if (g) g.add(pos, color);
+    }
+  }
+  const __patVals = new WeakMap();
+  class CanvasPattern {
+    setTransform(m) { const p = __patVals.get(this); if (p) p.transform = m || null; }
+  }
+  class Selection {
+    getRangeAt() { throw new (globalThis.DOMException || Error)("Failed to execute 'getRangeAt' on 'Selection': 0 is not a valid index.", 'IndexSizeError'); }
+    removeAllRanges() {} addRange() {} removeRange() {} empty() {} collapse() {}
+    collapseToStart() {} collapseToEnd() {} extend() {} modify() {}
+    selectAllChildren() {} setBaseAndExtent() {} setPosition() {}
+    deleteFromDocument() {} containsNode() { return false; }
+    getComposedRanges() { return []; }
+    toString() { return ''; }
+  }
+  for (const [k, v] of Object.entries({
+    anchorNode: null, anchorOffset: 0, focusNode: null, focusOffset: 0,
+    baseNode: null, baseOffset: 0, extentNode: null, extentOffset: 0,
+    isCollapsed: true, rangeCount: 0, type: 'None', direction: 'none',
+  })) Object.defineProperty(Selection.prototype, k, { get: () => v, configurable: true });
+  for (const [C, n] of [[CanvasGradient, 'CanvasGradient'], [CanvasPattern, 'CanvasPattern'],
+                        [Selection, 'Selection']]) {
+    try { Object.defineProperty(C.prototype, Symbol.toStringTag, { value: n, configurable: true }); } catch (e) {}
+    globalThis[n] = globalThis.__pt_native ? __pt_native(C) : C;
+  }
+  globalThis.__pt_makeGradient = (state) => {
+    const g = Object.create(CanvasGradient.prototype);
+    __gradVals.set(g, state);
+    return g;
+  };
+  globalThis.__pt_makePattern = (state) => {
+    const p = Object.create(CanvasPattern.prototype);
+    __patVals.set(p, state || {});
+    return p;
+  };
+  {
+    const sel = Object.create(Selection.prototype);
+    globalThis.getSelection = globalThis.__pt_native
+      ? __pt_native(function getSelection() { return sel; })
+      : function getSelection() { return sel; };
+    // На прототипе, а не на самом документе: у документа собственное свойство
+    // ровно одно — `location`, и лишнее там видно первой же проверкой.
+    const D = globalThis.document && Object.getPrototypeOf(globalThis.document);
+    if (D) {
+      try {
+        Object.defineProperty(D, 'getSelection', {
+          value: globalThis.getSelection, writable: true, enumerable: true, configurable: true,
+        });
+      } catch (e) {}
+    }
+  }
+
   function __rectFromBox(b) {
-    if (!b) return { x: 0, y: 0, left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
-    return { x: b.x, y: b.y, left: b.x, top: b.y, right: b.x + b.w, bottom: b.y + b.h, width: b.w, height: b.h };
+    return b ? new DOMRect(b.x, b.y, b.w, b.h) : new DOMRect(0, 0, 0, 0);
   }
 
   function __elementFromPoint(x, y) {

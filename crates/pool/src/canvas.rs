@@ -708,7 +708,10 @@ pub fn measure_text(
     let flat = ink_t > ink_b;
     TextMetrics {
         width: caret,
-        left: if none { 0.0 } else { -ink_l },
+        // Левую границу браузер отсекает к нулю, а не округляет: чернила,
+        // начавшиеся на восемь десятых пикселя правее начала, дают 0, а на
+        // полтора — −1. Проверено на двух гарнитурах.
+        left: if none { 0.0 } else { (-ink_l).trunc() },
         right: if none { 0.0 } else { ink_r },
         ascent: if flat { 0.0 } else { -ink_t },
         descent: if flat { 0.0 } else { ink_b },
