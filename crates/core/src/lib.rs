@@ -5555,6 +5555,62 @@ mod tests {
         }
     }
 
+    /// `performance.memory` — показания, а не три постоянные величины. Три
+    /// константы стояли здесь и не двигались ни на байт: страница, которая
+    /// выделяет память и перечитывает `usedJSHeapSize`, в браузере видит
+    /// выросшее число, а у нас видела прежнее. Предел движок считает от
+    /// физической памяти той же функцией V8, которой его считает Chrome, —
+    /// на машине с 16 ГБ оба объявляют 4 395 630 592.
+    #[tokio::test]
+    async fn the_heap_readings_move_when_the_page_allocates() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+
+        let p = probe(
+            &ctx,
+            r#"(() => {
+              const m = performance.memory;
+              const before = m.usedJSHeapSize;
+              const junk = [];
+              for (let i = 0; i < 200000; i++) junk.push({ x: i, s: 'abc' + i });
+              const after = m.usedJSHeapSize;
+              return __ptJSON.stringify({
+                before, after, total: m.totalJSHeapSize, limit: m.jsHeapSizeLimit,
+                kept: junk.length,
+                own: Object.getOwnPropertyNames(m).length,
+                deviceMemory: navigator.deviceMemory,
+              });
+            })()"#,
+        )
+        .await;
+
+        let before = p["before"].as_f64().expect("usedJSHeapSize is a number");
+        let after = p["after"].as_f64().expect("usedJSHeapSize is a number");
+        assert!(
+            after > before,
+            "usedJSHeapSize did not move after allocating: {before} → {after}"
+        );
+        let limit = p["limit"].as_f64().expect("jsHeapSizeLimit is a number");
+        assert!(
+            limit > after && limit > 1.0e9,
+            "jsHeapSizeLimit is not a plausible Chrome limit: {limit}"
+        );
+        assert!(
+            p["total"].as_f64().unwrap_or(0.0) >= after,
+            "totalJSHeapSize is below what is in use"
+        );
+        // Как и у всякого объекта, который мы отдаём, состояние живёт на прототипе.
+        assert_eq!(p["own"], 0, "MemoryInfo exposes own properties");
+        // Chrome берёт её от физической памяти машины и округляет к степени
+        // двойки; восьмёрки как потолка там больше нет.
+        let dm = p["deviceMemory"].as_u64().expect("deviceMemory is a number");
+        assert!(
+            dm.is_power_of_two() && (1..=64).contains(&dm),
+            "deviceMemory is not a plausible Chrome value: {dm}"
+        );
+    }
+
     /// WebCrypto must be *real*: `crypto.subtle` was previously absent altogether
     /// (an instant tell — every browser on a secure origin has it) and
     /// `getRandomValues` was a seeded xorshift. It is now backed by native Rust

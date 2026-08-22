@@ -43,6 +43,7 @@ pub fn install(scope: &mut v8::PinScope) {
     bind(scope, "__pt_aescbc", aes_cbc_op);
     bind(scope, "__pt_pngDataUrl", png_data_url);
     bind(scope, "__pt_hrtime", hrtime);
+    bind(scope, "__pt_heapStats", heap_stats);
 
     // Optional real 2D rasterization (the `render` feature). Their presence is the
     // signal the JS canvas checks to use real pixels instead of synthesis.
@@ -1621,6 +1622,28 @@ fn png_data_url(
 /// положительная разница между ними; у браузера она 0.1 мс, у нас не было ни
 /// одного продвижения. Отсюда и берётся настоящий монотонный источник, а
 /// огрубление до браузерного шага делает уже JS.
+/// Что V8 знает о своей куче: занято, отведено, предел. `performance.memory`
+/// в браузере — не три постоянные величины, а показания, которые растут по мере
+/// того, как страница выделяет память; страница, которая выделит массив и
+/// перечитает `usedJSHeapSize`, у нас видела бы одно и то же число, а в Chrome —
+/// выросшее.
+fn heap_stats(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let st = scope.get_heap_statistics();
+    let out = v8::Array::new(scope, 3);
+    for (i, v) in [st.used_heap_size(), st.total_heap_size(), st.heap_size_limit()]
+        .into_iter()
+        .enumerate()
+    {
+        let n = v8::Number::new(scope, v as f64);
+        out.set_index(scope, i as u32, n.into());
+    }
+    rv.set(out.into());
+}
+
 fn hrtime(
     scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,

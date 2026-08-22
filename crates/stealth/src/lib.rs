@@ -159,6 +159,34 @@ impl FingerprintProfile {
             ProfileOs::Windows => ("Win32", "Windows", 1920, 1080, 1032, 24),
             ProfileOs::Mac => ("MacIntel", "macOS", 1512, 982, 944, 30),
         };
+        // `navigator.deviceMemory` — не постоянная восьмёрка: Chrome берёт
+        // физическую память машины и округляет к ближайшей степени двойки.
+        // Измерено на Chrome 151 с 16 ГБ: он объявляет 16, а не 8, — потолка,
+        // о котором говорит спецификация, там больше нет.
+        fn device_memory_gb() -> u32 {
+            // Тот же вопрос движок задаёт себе отдельно, когда отводит кучу
+            // (`nokk_pool::Isolate::physical_memory_bytes`); связывать ради
+            // одной строки два ящика не стоит.
+            #[cfg(target_os = "linux")]
+            let bytes = std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find_map(|l| l.strip_prefix("MemTotal:"))
+                        .and_then(|r| r.split_whitespace().next()?.parse::<u64>().ok())
+                        .map(|kb| kb * 1024)
+                })
+                .unwrap_or(8 * 1024 * 1024 * 1024);
+            #[cfg(not(target_os = "linux"))]
+            let bytes: u64 = 8 * 1024 * 1024 * 1024;
+            let gb = (bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+            let mut v = 1u32;
+            while (v as f64) * 1.5 < gb && v < 64 {
+                v *= 2;
+            }
+            v
+        }
+
         let common = |ua: &str, hw: u32, webgl_vendor: &str, webgl_renderer: &str| StealthProfile {
             user_agent: ua.to_string(),
             platform: platform.to_string(),
@@ -166,7 +194,7 @@ impl FingerprintProfile {
             chrome_major: CHROME_MAJOR.parse().unwrap_or(148),
             languages: vec!["en-US".into(), "en".into()],
             hardware_concurrency: hw,
-            device_memory_gb: 8, // Chrome caps navigator.deviceMemory at 8
+            device_memory_gb: device_memory_gb(),
             vendor: "Google Inc.".into(),
             webgl_vendor: webgl_vendor.to_string(),
             webgl_renderer: webgl_renderer.to_string(),
@@ -3233,9 +3261,19 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
     domComplete: T(190), loadEventStart: T(191), loadEventEnd: T(196),
   };
   const NAVIGATION = { type: 0, redirectCount: 0 };
-  // Chrome quantises these; absent `performance.memory` under a Chrome UA is
-  // itself a tell.
-  const MEMORY = { jsHeapSizeLimit: 2172649472, totalJSHeapSize: 12800000, usedJSHeapSize: 10600000 };
+  // Показания, а не постоянные величины: страница, которая выделит массив и
+  // перечитает `usedJSHeapSize`, в браузере видит выросшее число. Три
+  // константы здесь стояли годами и не двигались ни на байт. Предел движок
+  // считает от физической памяти той же функцией V8, что и Chrome, поэтому
+  // совпадает. Отсутствующий `performance.memory` под видом Chrome — тоже
+  // примета, так что запасные значения остаются на случай сборки без натива.
+  const MEMORY_FALLBACK = { jsHeapSizeLimit: 4395630592, totalJSHeapSize: 12800000, usedJSHeapSize: 10600000 };
+  const heapStats = typeof __pt_heapStats === 'function' ? __pt_heapStats : null;
+  const MEMORY = {
+    get usedJSHeapSize() { return heapStats ? heapStats()[0] : MEMORY_FALLBACK.usedJSHeapSize; },
+    get totalJSHeapSize() { return heapStats ? heapStats()[1] : MEMORY_FALLBACK.totalJSHeapSize; },
+    get jsHeapSizeLimit() { return heapStats ? heapStats()[2] : MEMORY_FALLBACK.jsHeapSizeLimit; },
+  };
 
   // Expose a value bag as enumerable prototype getters, so instances stay free
   // of own properties (matching every other DOM object we hand out).
@@ -6958,7 +6996,7 @@ mod tests {
                 }
             }
             // deviceMemory never exceeds Chrome's cap; vendor is always Google.
-            assert!(s.device_memory_gb <= 8);
+            assert!(s.device_memory_gb.is_power_of_two() && s.device_memory_gb <= 64);
             assert_eq!(s.vendor, "Google Inc.");
         }
     }

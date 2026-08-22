@@ -456,12 +456,45 @@ async fn main() -> Result<()> {
                   try {
                     // Их сериализация не идёт через JSON — но строка где-то
                     // собирается: из массива, конкатенацией или из кодов.
-                    let seen = 0;
+                    let seen = 0, dumped = 0;
                     const J = Array.prototype.join;
                     Array.prototype.join = function (sep) {
                       const out = J.apply(this, arguments);
                       if (typeof out === 'string' && out.length > 1500 && seen++ < 3) {
                         try { console.error('[join ' + out.length + '] ' + out.slice(0, 700)); } catch (e) {}
+                      }
+                      // Перепись склеек. Отчёт уходит склейкой массива, но
+                      // на этом стыке он уже зашифрован — длина совпадает с
+                      // длиной отправки. Значит открытый текст собирается
+                      // раньше, другой склейкой, и найти её можно только по
+                      // ряду: чем и в каком порядке страница склеивала.
+                      // Сами строки остаются в кадре, их забирает
+                      // NOKK_EVAL_FRAMES.
+                      if (__REPORT__ && typeof out === 'string' && out.length > __JMIN__) {
+                        try {
+                          if (!globalThis.__ptJoins) globalThis.__ptJoins = [];
+                          if (!globalThis.__ptJoinN) globalThis.__ptJoinN = 0;
+                          const n = globalThis.__ptJoinN++;
+                          // Держать сами строки дорого: часть из них — мегабайты,
+                          // и удержание меняет то, что мы измеряем (Chrome под
+                          // таким крючком начинает перезапускать челлендж). Храним
+                          // только те, что по размеру похожи на отчёт.
+                          if (out.length < 200000) {
+                            __ptJoins.push([n, out]);
+                            if (__ptJoins.length > 12) __ptJoins.shift();
+                          } else if (out.length > 500000) {
+                            // Программа челленджа. Её выдают в двух размерах —
+                            // короткую подозрительным, длинную доверенным, — и
+                            // разница между ними и есть то, чего нам не дают
+                            // сделать. Забирают через NOKK_EVAL_FRAMES.
+                            globalThis.__ptProg = out;
+                          }
+                          let host = '?';
+                          try { host = location.host.slice(0, 12); } catch (e) {}
+                          console.error('[j ' + n + ' ' + host + ' ' + out.length + ' ' +
+                                        JSON.stringify(String(sep)) + '] ' +
+                                        out.slice(0, 90).replace(/\n/g, ' '));
+                        } catch (e) {}
                       }
                       return out;
                     };
@@ -1128,6 +1161,14 @@ async fn main() -> Result<()> {
                 let stream = std::env::var("NOKK_TRACE_STREAM").is_ok();
                 let hook = hook.replace("__STREAM__", if stream { "true" } else { "false" });
                 let hook = hook.replace(
+                    "__JMIN__",
+                    &std::env::var("NOKK_JOIN_MIN").unwrap_or_else(|_| "2000".into()),
+                );
+                let hook = hook.replace(
+                    "__REPORT__",
+                    if std::env::var("NOKK_DUMP_REPORT").is_ok() { "true" } else { "false" },
+                );
+                let hook = hook.replace(
                     "__HANG__",
                     if std::env::var("NOKK_HANG_UNREACHABLE").is_ok() { "true" } else { "false" },
                 );
@@ -1308,8 +1349,15 @@ async fn main() -> Result<()> {
             if let Ok(path) = std::env::var("NOKK_DUMP_VM") {
                 let mut where_: Vec<Option<u32>> = vec![None];
                 where_.extend(ctx.frame_list().iter().map(|f| Some(f.id)));
-                for slot in where_ {
-                    let js = "typeof __pt_vmSrc === 'string' ? __pt_vmSrc : ''";
+                // Две большие строки, а не одна: источник, который отдают
+                // `Function`, и та, что склеивается из ответа `/fo/`. Они
+                // разные — начала не совпадают, — и сравнивать с браузером надо
+                // обе, иначе легко сличить не то с тем.
+                for (js, tag) in [
+                    ("typeof __pt_vmSrc === 'string' ? __pt_vmSrc : ''", "js"),
+                    ("typeof __ptProg === 'string' ? __ptProg : ''", "join"),
+                ] {
+                for slot in where_.clone() {
                     let out = match slot {
                         None => ctx.evaluate(js).await,
                         Some(id) => ctx.evaluate_in_frame(id, js).await,
@@ -1317,14 +1365,15 @@ async fn main() -> Result<()> {
                     if let Ok(serde_json::Value::String(src)) = out {
                         if src.len() > 1000 {
                             let name = match slot {
-                                None => format!("{path}.page.js"),
-                                Some(id) => format!("{path}.frame{id}.js"),
+                                None => format!("{path}.page.{tag}"),
+                                Some(id) => format!("{path}.frame{id}.{tag}"),
                             };
                             if std::fs::write(&name, &src).is_ok() {
                                 eprintln!("# программа сохранена: {name} ({} байт)", src.len());
                             }
                         }
                     }
+                }
                 }
             }
             // Спросить одно и то же у страницы и у каждого её кадра. Кадр

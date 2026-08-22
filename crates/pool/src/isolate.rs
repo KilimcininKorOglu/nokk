@@ -223,6 +223,24 @@ impl Isolate {
             .unwrap_or(Self::EVAL_TIMEOUT)
     }
 
+    /// Сколько на машине физической памяти. Chrome отводит кучу от неё, а не от
+    /// свободной, и от неё же берёт `navigator.deviceMemory`.
+    pub fn physical_memory_bytes() -> u64 {
+        #[cfg(target_os = "linux")]
+        if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+            for line in s.lines() {
+                if let Some(rest) = line.strip_prefix("MemTotal:") {
+                    if let Some(kb) = rest.split_whitespace().next().and_then(|n| n.parse::<u64>().ok())
+                    {
+                        return kb * 1024;
+                    }
+                }
+            }
+        }
+        // Ничего не узнали — говорим то же, что самая обычная машина.
+        8 * 1024 * 1024 * 1024
+    }
+
     /// Create an isolate. `max_heap_mb` caps this isolate's JS heap (shared across
     /// all its contexts); `None` leaves V8's default (effectively unbounded).
     pub(crate) fn new(id: WorkerId, max_heap_mb: Option<usize>) -> Self {
@@ -231,6 +249,14 @@ impl Isolate {
         if let Some(mb) = max_heap_mb {
             // initial = 0 lets V8 pick its default starting heap; max is the cap.
             params = params.heap_limits(0, mb * 1024 * 1024);
+        } else {
+            // Без явного потолка V8 считает предел по свободной памяти, и на
+            // занятой машине он выходит втрое ниже браузерного. Chrome считает
+            // его от физической — той же функцией V8, — и `performance.memory`
+            // это показывает: на машине с 16 ГБ браузер объявляет 4 395 630 592,
+            // а мы объявляли 1 568 669 696. Число видно со страницы, поэтому
+            // считаем так же.
+            params = params.heap_limits_from_system_memory(Self::physical_memory_bytes(), 0);
         }
         let mut isolate = {
             // Never construct two isolates concurrently (see CREATE_LOCK).
