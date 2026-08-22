@@ -1824,10 +1824,81 @@
     'padding-bottom', 'padding-left', 'border-width', 'border-top-width',
     'border-right-width', 'border-bottom-width', 'border-left-width',
     'border-radius', 'font-size', 'letter-spacing', 'word-spacing', 'text-indent',
-    'outline-width', 'column-gap', 'row-gap', 'gap', 'inset',
+    'outline-width', 'column-gap', 'row-gap', 'gap', 'inset', 'border-spacing',
   ]);
+  // Цвет в браузере не остаётся тем, чем его написали: `#f2f2f2` в cssText
+  // возвращается как `rgb(242, 242, 242)`. Сверено с Chrome на таблице стилей
+  // виджета Cloudflare — из 183 правил 73 расходились только этим.
+  const __cssHex = (v) => v.replace(/#([0-9a-fA-F]{3,8})\b/g, (m, h) => {
+    const wide = h.length > 4;
+    if (h.length !== 3 && h.length !== 4 && h.length !== 6 && h.length !== 8) return m;
+    const at = (i) => wide ? parseInt(h.slice(i * 2, i * 2 + 2), 16)
+                           : parseInt(h[i] + h[i], 16);
+    const [r, g, b] = [at(0), at(1), at(2)];
+    if (h.length === 4 || h.length === 8) {
+      const a = at(3) / 255;
+      return 'rgba(' + r + ', ' + g + ', ' + b + ', ' + (Math.round(a * 100) / 100) + ')';
+    }
+    return 'rgb(' + r + ', ' + g + ', ' + b + ')';
+  });
+  // `.9` браузер печатает как `0.9`, и внутри функций тоже:
+  // `cubic-bezier(.55, .085, …)` → `cubic-bezier(0.55, 0.085, …)`.
+  const __cssZero = (v) => v.replace(/(^|[\s(,])(-?)\.(\d)/g, '$1$20.$3');
+
+  // Сокращённая запись `animation` разбирается на восемь составляющих и
+  // печатается всегда полностью, в порядке спецификации, с подставленными
+  // начальными значениями: `spin 5s linear infinite` →
+  // `5s linear 0s infinite normal none running spin`.
+  const ANIM_TIMING = new Set(['ease', 'linear', 'ease-in', 'ease-out', 'ease-in-out',
+                               'step-start', 'step-end']);
+  const ANIM_DIR = new Set(['normal', 'reverse', 'alternate', 'alternate-reverse']);
+  const ANIM_FILL = new Set(['none', 'forwards', 'backwards', 'both']);
+  const ANIM_STATE = new Set(['running', 'paused']);
+  const __cssTokens = (v) => {
+    const out = [];
+    let depth = 0, cur = '';
+    for (const c of v) {
+      if (c === '(') depth++;
+      else if (c === ')') depth--;
+      if (/\s/.test(c) && depth === 0) { if (cur) out.push(cur); cur = ''; continue; }
+      cur += c;
+    }
+    if (cur) out.push(cur);
+    return out;
+  };
+  const __cssAnimation = (v) => v.split(',').map((part) => {
+    // Запятые внутри `cubic-bezier(…)` не делят список — склеиваем обратно.
+    return part;
+  }).reduce((acc, part) => {
+    const prev = acc[acc.length - 1];
+    if (prev !== undefined && (prev.split('(').length !== prev.split(')').length)) {
+      acc[acc.length - 1] = prev + ',' + part;
+    } else acc.push(part);
+    return acc;
+  }, []).map((one) => {
+    const t = __cssTokens(one.trim());
+    let dur = null, timing = null, delay = null, count = null;
+    let dir = null, fill = null, state = null, name = null;
+    for (const tok of t) {
+      const low = tok.toLowerCase();
+      if (/^-?[\d.]+m?s$/.test(low)) { if (dur === null) dur = low; else if (delay === null) delay = low; continue; }
+      if (timing === null && (ANIM_TIMING.has(low) || /^(cubic-bezier|steps|linear)\(/.test(low))) { timing = tok; continue; }
+      if (count === null && (low === 'infinite' || /^[\d.]+$/.test(low))) { count = low; continue; }
+      if (dir === null && ANIM_DIR.has(low)) { dir = low; continue; }
+      if (fill === null && ANIM_FILL.has(low)) { fill = low; continue; }
+      if (state === null && ANIM_STATE.has(low)) { state = low; continue; }
+      if (name === null) name = tok;
+    }
+    return [dur || '0s', timing || 'ease', delay || '0s', count || '1',
+            dir || 'normal', fill || 'none', state || 'running', name || 'none'].join(' ');
+  }).join(', ');
+
   const __cssValue = (prop, value) => {
-    const v = String(value).trim().replace(/\s+/g, ' ');
+    let v = __cssZero(__cssHex(String(value).trim().replace(/\s+/g, ' ')));
+    if (prop === 'animation') return __cssAnimation(v);
+    // Составляющие сокращённой записи, равные начальному значению, браузер не
+    // печатает: `flex-flow: column nowrap` возвращается как `column`.
+    if (prop === 'flex-flow') v = v.replace(/\s+nowrap$/, '');
     if (!CSS_LENGTH_PROPS.has(prop)) return v;
     return v.replace(/(^|[\s(])(-?\d+(?:\.\d+)?)(?=$|[\s)])/g, (m, pre, num) => pre + num + 'px');
   };
@@ -2033,6 +2104,13 @@
     __ruleProtos.set(name, p);
     return p;
   };
+  // Правило с потомками браузер печатает в несколько строк, по строке на
+  // потомка с отступом в два пробела. `@keyframes` при этом оставляет пробел
+  // после открывающей скобки, а `@media` — нет; так в Chrome, и так здесь.
+  const __cssGroup = (prelude, kids, pad) => prelude + ' {' + (pad ? ' ' : '') + '\n'
+    + kids.map((k) => '  ' + String(k.cssText).replace(/\n/g, '\n  ')).join('\n')
+    + '\n}';
+
   function __makeRule(parsed, sheet, parent) {
     const prelude = parsed.prelude || '';
     const at = prelude.charCodeAt(0) === 64 ? prelude.split(/[\s({]/)[0].toLowerCase() : '';
@@ -2055,7 +2133,7 @@
       const kids = __cssParse(parsed.body || '').map((p) => __makeRule(p, sheet, r));
       own(r, { cssRules: __cssRuleList(kids), conditionText: cond });
       if (at === '@media') own(r, { media: __mediaList(cond) });
-      return own(r, { cssText: at + ' ' + cond + ' { ' + kids.map((k) => k.cssText).join(' ') + ' }' });
+      return own(r, { cssText: __cssGroup(at + ' ' + cond, kids, false) });
     }
     if (at === '@keyframes' || at === '@-webkit-keyframes') {
       const r = common(Object.create(__ruleProto('CSSKeyframesRule')), RULE_TYPE.keyframes);
@@ -2068,7 +2146,7 @@
       const name = prelude.slice(at.length).trim();
       return own(r, { name, length: kids.length, cssRules: __cssRuleList(kids),
                       appendRule() {}, deleteRule() {}, findRule() { return null; },
-                      cssText: '@keyframes ' + name + ' { ' + kids.map((k) => k.cssText).join(' ') + ' }' });
+                      cssText: __cssGroup('@keyframes ' + name, kids, true) });
     }
     if (at === '@font-face') {
       const r = common(Object.create(__ruleProto('CSSFontFaceRule')), RULE_TYPE['font-face']);

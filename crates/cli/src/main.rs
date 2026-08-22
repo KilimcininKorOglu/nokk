@@ -491,6 +491,16 @@ async fn main() -> Result<()> {
                           }
                           let host = '?';
                           try { host = location.host.slice(0, 12); } catch (e) {}
+                          // Перечисление стилей — целиком: сравнивать его с
+                          // браузером надо построчно, а кадр к концу прогона
+                          // уже снесён, файлом не забрать.
+                          if (String(sep) === '|' && out.length > 5000 &&
+                              (globalThis.__ptCssN = (globalThis.__ptCssN || 0) + 1) <= 2) {
+                            for (let i = 0; i < out.length; i += 4000) {
+                              console.error('[C' + globalThis.__ptCssN + ' @' + i + '] ' + out.slice(i, i + 4000));
+                            }
+                            console.error('[C' + globalThis.__ptCssN + ' end ' + out.length + ']');
+                          }
                           console.error('[j ' + n + ' ' + host + ' ' + out.length + ' ' +
                                         JSON.stringify(String(sep)) + '] ' +
                                         out.slice(0, 90).replace(/\n/g, ' '));
@@ -1356,6 +1366,10 @@ async fn main() -> Result<()> {
                 for (js, tag) in [
                     ("typeof __pt_vmSrc === 'string' ? __pt_vmSrc : ''", "js"),
                     ("typeof __ptProg === 'string' ? __ptProg : ''", "join"),
+                    // Склейки помельче — отчёт, перечисление стилей — по одной
+                    // на файл: сравнивать их с браузером построчно можно только
+                    // целиком.
+                    ("(globalThis.__ptJoins||[]).map(j => j[0] + '\\u0000' + j[1]).join('\\u0001')", "joins"),
                 ] {
                 for slot in where_.clone() {
                     let out = match slot {
@@ -1368,7 +1382,17 @@ async fn main() -> Result<()> {
                                 None => format!("{path}.page.{tag}"),
                                 Some(id) => format!("{path}.frame{id}.{tag}"),
                             };
-                            if std::fs::write(&name, &src).is_ok() {
+                            if tag == "joins" {
+                                for part in src.split('\u{1}') {
+                                    let Some((n, body)) = part.split_once('\u{0}') else {
+                                        continue;
+                                    };
+                                    let name = format!("{name}.{n}");
+                                    if std::fs::write(&name, body).is_ok() {
+                                        eprintln!("# склейка сохранена: {name} ({} байт)", body.len());
+                                    }
+                                }
+                            } else if std::fs::write(&name, &src).is_ok() {
                                 eprintln!("# программа сохранена: {name} ({} байт)", src.len());
                             }
                         }

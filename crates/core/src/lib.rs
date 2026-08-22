@@ -8501,9 +8501,13 @@ mod tests {
     /// `document.styleSheets` was a list of literals with an empty `cssRules`.
     /// Cloudflare's collector reads it hundreds of times at the start of its
     /// second stage — rules, selectors, `cssText` — and an empty list is not a
-    /// page that has any style. Serialisation follows Chrome: a bare `0` in a
-    /// length property becomes `0px`, selector combinators get their spaces, and
-    /// an @media condition gets one after the colon.
+    /// page that has any style. Serialisation follows Chrome, measured against
+    /// its own widget stylesheet: a bare `0` in a length property becomes `0px`,
+    /// selector combinators get their spaces, an @media condition gets one after
+    /// the colon, a hex colour comes back as `rgb(…)`, `.9` as `0.9`, the
+    /// `animation` shorthand as all eight longhands in spec order, a shorthand
+    /// component equal to its initial value is dropped, and a rule with children
+    /// is printed one child per indented line.
     #[tokio::test]
     async fn a_style_element_is_a_stylesheet_with_rules() {
         let _serial = serial().await;
@@ -8511,7 +8515,10 @@ mod tests {
         let ctx = engine.new_context().await.unwrap();
         ctx.load_html(
             "https://example.com/",
-            "<html><head><style media=\"screen\">a{color:red;font-weight:bold}.b .c>d{margin:0 1px}             @media (min-width:1px){e{top:0}}</style></head><body></body></html>",
+            "<html><head><style media=\"screen\">a{color:red;font-weight:bold}.b .c>d{margin:0 1px}             @media (min-width:1px){e{top:0}}\
+             f{color:#f2f2f2;border:1px solid #b20f03;opacity:.9;flex-flow:column nowrap}\
+             g{animation:spin 5s linear infinite}\
+             @keyframes spin{100%{transform:rotate(360deg)}}</style></head><body></body></html>",
         )
         .await
         .unwrap();
@@ -8549,7 +8556,11 @@ mod tests {
             serde_json::json!([
                 "a { color: red; font-weight: bold; }",
                 ".b .c > d { margin: 0px 1px; }",
-                "@media (min-width: 1px) { e { top: 0px; } }"
+                "@media (min-width: 1px) {\n  e { top: 0px; }\n}",
+                "f { color: rgb(242, 242, 242); border: 1px solid rgb(178, 15, 3); \
+opacity: 0.9; flex-flow: column; }",
+                "g { animation: 5s linear 0s infinite normal none running spin; }",
+                "@keyframes spin { \n  100% { transform: rotate(360deg); }\n}"
             ]),
             "serialised the way Chrome serialises them"
         );

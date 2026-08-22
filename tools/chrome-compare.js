@@ -63,6 +63,12 @@ const HOOK = `(() => {
           const n = globalThis.__ptJoinN++;
           let host = '?';
           try { host = location.host.slice(0, 12); } catch (e) {}
+          if (String(sep) === '|' && out.length > 5000 && (globalThis.__ptCssN = (globalThis.__ptCssN || 0) + 1) <= 2) {
+            for (let i = 0; i < out.length; i += 4000) {
+              console.log('[C' + globalThis.__ptCssN + ' @' + i + '] ' + out.slice(i, i + 4000));
+            }
+            console.log('[C' + globalThis.__ptCssN + ' end ' + out.length + ']');
+          }
           if (out.length > 500000 && !globalThis.__ptProgDone) {
             globalThis.__ptProgDone = 1;
             for (let i = 0; i < out.length; i += 4000) {
@@ -106,7 +112,7 @@ const HOOK = `(() => {
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker)\]|^\[[jP] /.test(String(t)))
+      if (/^\[(send|hook|hookerr|blob|worker)\]|^\[[jPC]\d* /.test(String(t)))
         lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
     }
     if (m.method === 'Target.attachedToTarget') {
