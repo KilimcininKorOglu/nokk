@@ -4077,7 +4077,7 @@ mod tests {
         assert_eq!(out["color"], "red", "{out}");
         assert_eq!(out["background"], "blue", "{out}");
         assert_eq!(out["inlineLength"], 2, "{out}");
-        assert_eq!(out["cssText"], "color: red; background-color: blue", "{out}");
+        assert_eq!(out["cssText"], "color: red; background-color: blue;", "{out}");
         // Вычисленный стиль: 456 свойств по индексам плюс те же имена.
         assert_eq!(out["computedLength"], 456, "{out}");
         assert_eq!(out["computedOwn"], 1150, "{out}");

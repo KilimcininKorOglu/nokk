@@ -1847,6 +1847,7 @@
     'border-right-width', 'border-bottom-width', 'border-left-width',
     'border-radius', 'font-size', 'letter-spacing', 'word-spacing', 'text-indent',
     'outline-width', 'column-gap', 'row-gap', 'gap', 'inset', 'border-spacing',
+    'border', 'outline',
   ]);
   // Цвет в браузере не остаётся тем, чем его написали: `#f2f2f2` в cssText
   // возвращается как `rgb(242, 242, 242)`. Сверено с Chrome на таблице стилей
@@ -1922,7 +1923,22 @@
     // печатает: `flex-flow: column nowrap` возвращается как `column`.
     if (prop === 'flex-flow') v = v.replace(/\s+nowrap$/, '');
     if (!CSS_LENGTH_PROPS.has(prop)) return v;
-    return v.replace(/(^|[\s(])(-?\d+(?:\.\d+)?)(?=$|[\s)])/g, (m, pre, num) => pre + num + 'px');
+    // Только на верхнем уровне: голый ноль в `border: 0` — это длина, а тройка
+    // внутри `rgb(178, 15, 3)` — нет, и приписанный ей `px` ломает цвет.
+    let depth = 0, out = '', tok = '';
+    const flush = () => {
+      if (tok && depth === 0 && /^-?\d+(?:\.\d+)?$/.test(tok)) out += tok + 'px';
+      else out += tok;
+      tok = '';
+    };
+    for (const c of v) {
+      if (c === '(') { flush(); depth++; out += c; continue; }
+      if (c === ')') { tok += c; out += tok; tok = ''; depth--; continue; }
+      if (/\s/.test(c) && depth === 0) { flush(); out += c; continue; }
+      tok += c;
+    }
+    flush();
+    return out;
   };
   const __cssSelector = (sel) => String(sel).trim()
     .replace(/\s+/g, ' ')
@@ -2050,6 +2066,81 @@
     return proto;
   };
 
+  // Во что браузер разворачивает сокращённые записи. `style.length` считает
+  // длинные свойства, а не написанные: у `border: none` их семнадцать, у
+  // `font` — девятнадцать. Снято с Chrome 151 перечислением самого объявления.
+  const CSS_LONGHANDS = {
+    'margin': ['margin-top','margin-right','margin-bottom','margin-left'],
+    'padding': ['padding-top','padding-right','padding-bottom','padding-left'],
+    'border': ['border-top-width','border-right-width','border-bottom-width','border-left-width','border-top-style','border-right-style','border-bottom-style','border-left-style','border-top-color','border-right-color','border-bottom-color','border-left-color','border-image-source','border-image-slice','border-image-width','border-image-outset','border-image-repeat'],
+    'border-width': ['border-top-width','border-right-width','border-bottom-width','border-left-width'],
+    'border-style': ['border-top-style','border-right-style','border-bottom-style','border-left-style'],
+    'border-color': ['border-top-color','border-right-color','border-bottom-color','border-left-color'],
+    'border-image': ['border-image-source','border-image-slice','border-image-width','border-image-outset','border-image-repeat'],
+    'border-radius': ['border-top-left-radius','border-top-right-radius','border-bottom-right-radius','border-bottom-left-radius'],
+    'background': ['background-image','background-position-x','background-position-y','background-size','background-repeat','background-attachment','background-origin','background-clip','background-color'],
+    'background-position': ['background-position-x','background-position-y'],
+    'font': ['font-style','font-variant-caps','font-variant-ligatures','font-variant-numeric','font-variant-east-asian','font-variant-alternates','font-size-adjust','font-language-override','font-kerning','font-optical-sizing','font-feature-settings','font-variation-settings','font-variant-position','font-variant-emoji','font-weight','font-stretch','font-size','line-height','font-family'],
+    'flex': ['flex-grow','flex-shrink','flex-basis'],
+    'flex-flow': ['flex-direction','flex-wrap'],
+    'overflow': ['overflow-x','overflow-y'],
+    'inset': ['top','right','bottom','left'],
+    'gap': ['row-gap','column-gap'],
+    'outline': ['outline-color','outline-style','outline-width'],
+    'grid-area': ['grid-row-start','grid-column-start','grid-row-end','grid-column-end'],
+    'grid-template': ['grid-template-rows','grid-template-columns','grid-template-areas'],
+    'transition': ['transition-behavior','transition-duration','transition-timing-function','transition-delay','transition-property'],
+    'animation': ['animation-duration','animation-timing-function','animation-delay','animation-iteration-count','animation-direction','animation-fill-mode','animation-play-state','animation-name','animation-timeline','animation-range-start','animation-range-end'],
+    'place-content': ['align-content','justify-content'],
+    'place-items': ['align-items','justify-items'],
+    'text-decoration': ['text-decoration-line','text-decoration-thickness','text-decoration-style','text-decoration-color'],
+    'list-style': ['list-style-position','list-style-image','list-style-type'],
+    'mask': ['mask-image','-webkit-mask-position-x','-webkit-mask-position-y','mask-size','mask-repeat','mask-origin','mask-clip','mask-composite','mask-mode'],
+    'columns': ['column-width','column-count','column-height','column-wrap'],
+  };
+  // Сокращение браузер собирает обратно, когда может, — но `border`, у которого
+  // все составляющие остались начальными, он собрать не может: отличить
+  // «задано начальным» от «не задано» нечем, и он печатает длинные. Проверено
+  // на одиннадцати значениях: разворачиваются ровно `none` и
+  // `medium none currentcolor`, а `0`, `solid`, `red`, `1px solid red` — нет.
+  const BORDER_INITIAL = { width: 'medium', style: 'none', color: 'currentcolor' };
+  const __borderParts = (v) => {
+    const out = { width: null, style: null, color: null };
+    for (const tok of String(v).trim().split(/\s+/)) {
+      const t = tok.toLowerCase();
+      if (/^(none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset)$/.test(t)) out.style = t;
+      else if (/^(thin|medium|thick)$/.test(t) || /^-?[\d.]+(px|em|rem|pt|%)?$/.test(t)) out.width = t;
+      else out.color = t;
+    }
+    return out;
+  };
+  const __borderAllInitial = (v) => {
+    const p = __borderParts(v);
+    return (p.width || BORDER_INITIAL.width) === BORDER_INITIAL.width
+        && (p.style || BORDER_INITIAL.style) === BORDER_INITIAL.style
+        && (p.color || BORDER_INITIAL.color) === BORDER_INITIAL.color;
+  };
+  /// Пары «имя: значение» на печать: то же, что в объявлении, но с раскрытым
+  /// `border`, если раскрыть его пришлось.
+  const __styleEntries = (m) => {
+    const out = [];
+    for (const [k, v] of m) {
+      if (k === 'border' && __borderAllInitial(v)) {
+        out.push(['border-width', 'medium'], ['border-style', 'none'],
+                 ['border-color', 'currentcolor'], ['border-image', 'none']);
+      } else out.push([k, v]);
+    }
+    return out;
+  };
+
+  /// Имена, которые перечисляет объявление: сокращения раскрыты, порядок как у
+  /// браузера — в порядке появления, без повторов.
+  const __styleNames = (m) => {
+    const out = [];
+    for (const k of m.keys()) for (const n of (CSS_LONGHANDS[k] || [k])) if (!out.includes(n)) out.push(n);
+    return out;
+  };
+
   function __cssDeclaration(map) {
     const dash = (p) => String(p).replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
     const target = Object.create(__shapeStyleProto(__styleProto()));
@@ -2070,7 +2161,11 @@
         return typeof v === 'function' ? v.bind(t) : v;
       },
       set: (t, p, v) => {
-        if (typeof p === 'string' && !(p in t)) { const k = dash(p).toLowerCase(); map.set(k, __cssValue(k, v)); return true; }
+        if (typeof p === 'string' && !(p in t)) {
+          const k = dash(p).toLowerCase();
+          if (v === '' || v == null) map.delete(k); else map.set(k, __cssValue(k, v));
+          return true;
+        }
         t[p] = v; return true;
       },
     });
@@ -2306,7 +2401,12 @@
     def('setProperty', function setProperty(p, v) {
       const s = st(this); if (!s) return;
       if (s.computed) throw new TypeError('Cannot modify computed style');
-      const m = s.read(); m.set(String(p).toLowerCase(), String(v)); s.write(m);
+      const m = s.read(), k = String(p).toLowerCase();
+      // Пустое значение свойство удаляет, а не оставляет пустым. Мы писали
+      // `opacity: ` без значения — строки, которой браузер не производит; кадр
+      // виджета читает свой `style` десятками тысяч раз и видел именно её.
+      if (v === '' || v == null) m.delete(k); else m.set(k, __cssValue(k, v));
+      s.write(m);
     });
     def('removeProperty', function removeProperty(p) {
       const s = st(this); if (!s) return '';
@@ -2316,11 +2416,11 @@
     });
     def('item', function item(i) {
       const s = st(this); if (!s) return '';
-      return s.computed ? (s.names[i] || '') : ([...s.read().keys()][i] || '');
+      return s.computed ? (s.names[i] || '') : (__styleNames(s.read())[i] || '');
     });
     acc('length', function length() {
       const s = st(this); if (!s) return 0;
-      return s.computed ? s.names.length : s.read().size;
+      return s.computed ? s.names.length : __styleNames(s.read()).length;
     });
     acc('parentRule', function parentRule() { return null; });
     acc('cssFloat',
@@ -2331,7 +2431,7 @@
         const s = st(this); if (!s) return '';
         // У вычисленного стиля он пуст, как в браузере.
         if (s.computed) return '';
-        return [...s.read()].map(([k, v]) => k + ': ' + v).join('; ');
+        return __styleEntries(s.read()).map(([k, v]) => k + ': ' + v + ';').join(' ');
       },
       function cssText(v) {
         const s = st(this); if (!s) return;
@@ -2358,7 +2458,8 @@
       return m;
     };
     const write = (m) => {
-      const text = [...m].map(([k, v]) => `${k}: ${v}`).join('; ');
+      // Точка с запятой в конце обязательна: браузер её ставит.
+      const text = __styleEntries(m).map(([k, v]) => `${k}: ${v};`).join(' ');
       cachedText = text; cachedMap = m;
       if (el && el.setAttribute) el.setAttribute('style', text);
       __markDirty();
@@ -2375,7 +2476,7 @@
         get() { return read().get(key) || ''; },
         set(v) {
           const m = read();
-          if (v === '' || v == null) m.delete(key); else m.set(key, String(v));
+          if (v === '' || v == null) m.delete(key); else m.set(key, __cssValue(key, v));
           write(m);
         },
         enumerable: true, configurable: true,
@@ -2389,7 +2490,11 @@
       },
       set: (t, p, v) => {
         if (p === 'cssText') { t.cssText = v; return true; }
-        const m = read(); m.set(dash(String(p)), String(v)); write(m); return true;
+        // Через перехватчик — те же правила, что через установщик: пустое
+        // значение удаляет свойство. Раньше он писал мимо и оставлял `opacity: `.
+        const m = read(), k = dash(String(p));
+        if (v === '' || v == null) m.delete(k); else m.set(k, __cssValue(k, v));
+        write(m); return true;
       },
     });
   }
