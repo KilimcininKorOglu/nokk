@@ -18,6 +18,7 @@ const chrome = spawn('google-chrome', [
   `--remote-debugging-port=${PORT}`, '--user-data-dir=/tmp/cdp-profile', '--no-first-run',
   '--no-default-browser-check', '--window-size=1280,900',
   ...(process.env.UA ? [`--user-agent=${process.env.UA}`] : []),
+  ...(process.env.CHROME_ARGS ? process.env.CHROME_ARGS.split(' ') : []),
   'about:blank',
 ], { env: { ...process.env, DISPLAY: ':0' }, stdio: 'ignore' });
 

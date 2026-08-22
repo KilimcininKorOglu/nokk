@@ -16,24 +16,190 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use tiny_skia::{
     Color, FillRule, GradientStop, LinearGradient, Paint, PathBuilder, Pixmap, Point,
     RadialGradient, Rect, Shader, SpreadMode, Stroke, Transform,
 };
 
-/// Bundled Liberation Sans (OFL, Arial-metric) — a plausible default sans for a
-/// Linux Chrome profile, so `fillText` glyphs are real *and* deterministic.
+/// Bundled Liberation Sans (OFL, Arial-metric): последний запасной вариант,
+/// когда системных шрифтов нет вовсе — в голом контейнере, например. Обычная
+/// машина отвечает своими файлами, и тогда метрики совпадают с браузерными.
 const FONT_BYTES: &[u8] = include_bytes!("../fonts/LiberationSans-Regular.ttf");
+
+/// Куда смотрит система за шрифтами. Порядок как у fontconfig: сначала общие
+/// каталоги, потом домашний.
+const FONT_DIRS: &[&str] = &[
+    "/usr/share/fonts",
+    "/usr/local/share/fonts",
+    "/usr/X11R6/lib/X11/fonts",
+];
+
+/// Какой файл берёт браузер под каким именем. Снято с Chrome 151 на этой
+/// машине: `16px Arial` и `16px "Liberation Sans"` дают одну и ту же ширину до
+/// тысячной, потому что fontconfig подменяет метрически совместимый шрифт.
+/// Семейство, которого в списке нет, браузер не находит вовсе и переходит к
+/// следующему в объявлении — а если не нашлось ни одного, берёт свой основной,
+/// и здесь это Liberation Serif.
+const FAMILIES: &[(&str, &[&str])] = &[
+    ("sans-serif", &["LiberationSans-Regular.ttf", "Arimo-Regular.ttf", "DejaVuSans.ttf"]),
+    ("arial", &["LiberationSans-Regular.ttf", "Arimo-Regular.ttf"]),
+    ("helvetica", &["LiberationSans-Regular.ttf", "Arimo-Regular.ttf"]),
+    ("liberation sans", &["LiberationSans-Regular.ttf"]),
+    ("serif", &["DejaVuSerif.ttf", "LiberationSerif-Regular.ttf"]),
+    ("times new roman", &["LiberationSerif-Regular.ttf", "Tinos-Regular.ttf"]),
+    ("times", &["LiberationSerif-Regular.ttf", "Tinos-Regular.ttf"]),
+    ("liberation serif", &["LiberationSerif-Regular.ttf"]),
+    ("monospace", &["NotoSansMono-Regular.ttf", "LiberationMono-Regular.ttf", "DejaVuSansMono.ttf"]),
+    ("courier new", &["LiberationMono-Regular.ttf", "Cousine-Regular.ttf"]),
+    ("courier", &["LiberationMono-Regular.ttf", "Cousine-Regular.ttf"]),
+    ("liberation mono", &["LiberationMono-Regular.ttf"]),
+    ("dejavu sans", &["DejaVuSans.ttf"]),
+    ("dejavu serif", &["DejaVuSerif.ttf"]),
+    ("dejavu sans mono", &["DejaVuSansMono.ttf"]),
+    ("noto sans mono", &["NotoSansMono-Regular.ttf"]),
+    // `system-ui` — шрифт рабочего стола; Chrome спрашивает его у системы
+    // и получает здесь Cantarell.
+    ("system-ui", &["Cantarell-Regular.otf", "NotoSans-Regular.ttf", "DejaVuSans.ttf"]),
+    ("cantarell", &["Cantarell-Regular.otf"]),
+];
+
+/// Основной шрифт браузера: им меряется всё, для чего семейство не нашлось.
+const FALLBACK_FAMILY: &str = "times new roman";
 
 thread_local! {
     static CANVASES: RefCell<HashMap<u32, Pixmap>> = RefCell::new(HashMap::new());
+    /// Разобранные файлы шрифтов, по имени файла. Разбор недёшев, а страница,
+    /// перебирающая семейства ради отпечатка, спрашивает их сотнями.
+    static LOADED: RefCell<HashMap<String, Option<&'static FontVec>>> =
+        RefCell::new(HashMap::new());
     /// Decoded images, by address. A page draws the same picture many times —
     /// the challenge's beacon PNG lands on a canvas on every round — so the
     /// decode happens once and the pixels stay.
     static IMAGES: RefCell<HashMap<String, (u32, u32, Vec<u8>)>> = RefCell::new(HashMap::new());
-    static FONT: FontRef<'static> =
-        FontRef::try_from_slice(FONT_BYTES).expect("bundled font parses");
+}
+
+/// Найти файл шрифта по имени в системных каталогах.
+fn font_path(file: &str) -> Option<std::path::PathBuf> {
+    for dir in FONT_DIRS {
+        let mut stack = vec![std::path::PathBuf::from(dir)];
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.file_name().and_then(|n| n.to_str()) == Some(file) {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Загрузить шрифт по имени файла, один раз за поток. Утечка намеренная:
+/// шрифтов конечное число, живут они до конца процесса, а `FontVec` иначе
+/// пришлось бы возвращать за замыканием.
+fn load(file: &str) -> Option<&'static FontVec> {
+    LOADED.with(|m| {
+        if let Some(hit) = m.borrow().get(file) {
+            return *hit;
+        }
+        let got = font_path(file)
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|bytes| FontVec::try_from_vec(bytes).ok())
+            .map(|f| &*Box::leak(Box::new(f)));
+        m.borrow_mut().insert(file.to_string(), got);
+        got
+    })
+}
+
+/// Разрешить список семейств так, как его разрешает браузер: по очереди, до
+/// первого, который в системе есть. Не нашлось ни одного — основной шрифт.
+fn face(file: &str, bold: bool, italic: bool) -> Option<&'static FontVec> {
+    if !bold && !italic {
+        return load(file);
+    }
+    // Имена начертаний у гарнитур разные: Liberation зовёт их `-Bold`/`-Italic`
+    // через `-Regular`, DejaVu приписывает `-Bold`/`-Oblique` к голому имени.
+    let (stem, ext) = file.rsplit_once('.')?;
+    let suffixes: &[&str] = match (bold, italic) {
+        (true, true) => &["BoldItalic", "BoldOblique"],
+        (true, false) => &["Bold"],
+        _ => &["Italic", "Oblique"],
+    };
+    for suffix in suffixes {
+        let name = if let Some(base) = stem.strip_suffix("-Regular") {
+            format!("{base}-{suffix}.{ext}")
+        } else {
+            format!("{stem}-{suffix}.{ext}")
+        };
+        if let Some(f) = load(&name) {
+            return Some(f);
+        }
+    }
+    load(file)
+}
+
+fn resolve(families: &str, bold: bool, italic: bool) -> Option<&'static FontVec> {
+    for raw in families.split(',') {
+        let name = raw.trim().trim_matches(['"', '\'']).to_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        let Some((_, files)) = FAMILIES.iter().find(|(f, _)| *f == name) else {
+            continue;
+        };
+        for file in *files {
+            if let Some(f) = face(file, bold, italic) {
+                return Some(f);
+            }
+        }
+    }
+    FAMILIES
+        .iter()
+        .find(|(f, _)| *f == FALLBACK_FAMILY)
+        .and_then(|(_, files)| files.iter().find_map(|f| face(f, bold, italic)))
+        .or_else(bundled)
+}
+
+/// Встроенный шрифт: система без шрифтов всё равно должна что-то нарисовать.
+fn bundled() -> Option<&'static FontVec> {
+    LOADED.with(|m| {
+        if let Some(hit) = m.borrow().get("\u{0}bundled") {
+            return *hit;
+        }
+        let got = FontVec::try_from_vec(FONT_BYTES.to_vec())
+            .ok()
+            .map(|f| &*Box::leak(Box::new(f)));
+        m.borrow_mut().insert("\u{0}bundled".to_string(), got);
+        got
+    })
+}
+
+/// Масштаб, которым `ab_glyph` рисует шрифт кегля `size_px`. `PxScale` задаёт
+/// не размер em, а высоту строки, поэтому кегль надо пересчитать: без этого все
+/// ширины выходят ровно во столько раз меньше браузерных, во сколько высота
+/// шрифта больше его em. У Liberation Sans это 2288/2048, то есть 1,1172 — и
+/// именно во столько наши измерения расходились с Chrome.
+fn px_scale<F: Font>(font: &F, size_px: f32) -> PxScale {
+    let upem = font.units_per_em().unwrap_or(1000.0);
+    PxScale::from(size_px * font.height_unscaled() / upem)
+}
+
+/// Метрики строки, как их возвращает `measureText`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TextMetrics {
+    pub width: f32,
+    pub left: f32,
+    pub right: f32,
+    pub ascent: f32,
+    pub descent: f32,
+    pub font_ascent: f32,
+    pub font_descent: f32,
 }
 
 /// Cap per-side pixels so a hostile page can't request an absurd allocation.
@@ -372,10 +538,23 @@ fn blend_over(data: &mut [u8], i: usize, rgba: [u8; 4], coverage: f32) {
 /// `y` being the alphabetic baseline (as canvas specifies), composited into the
 /// surface. This is the fingerprint-critical op: real, deterministic text pixels
 /// instead of a synthesized pattern.
-pub fn fill_text(id: u32, text: &str, x: f32, y: f32, size_px: f32, rgba: [u8; 4]) {
+pub fn fill_text(
+    id: u32,
+    text: &str,
+    x: f32,
+    y: f32,
+    size_px: f32,
+    rgba: [u8; 4],
+    families: &str,
+    bold: bool,
+    italic: bool,
+) {
     if size_px <= 0.0 || text.is_empty() {
         return;
     }
+    let Some(font) = resolve(families, bold, italic) else {
+        return;
+    };
     CANVASES.with(|c| {
         let mut map = c.borrow_mut();
         let Some(pm) = map.get_mut(&id) else {
@@ -383,8 +562,8 @@ pub fn fill_text(id: u32, text: &str, x: f32, y: f32, size_px: f32, rgba: [u8; 4
         };
         let (pw, ph) = (pm.width() as i32, pm.height() as i32);
         let data = pm.data_mut();
-        FONT.with(|font| {
-            let scale = PxScale::from(size_px);
+        {
+            let scale = px_scale(font, size_px);
             let scaled = font.as_scaled(scale);
             let mut caret = x;
             for ch in text.chars() {
@@ -403,21 +582,61 @@ pub fn fill_text(id: u32, text: &str, x: f32, y: f32, size_px: f32, rgba: [u8; 4
                 }
                 caret += scaled.h_advance(gid);
             }
-        });
+        }
     });
 }
 
 /// `measureText(text).width` for the bundled font at `size_px`.
-pub fn measure_text(text: &str, size_px: f32) -> f32 {
+pub fn measure_text(
+    text: &str,
+    size_px: f32,
+    families: &str,
+    bold: bool,
+    italic: bool,
+) -> TextMetrics {
     if size_px <= 0.0 {
-        return 0.0;
+        return TextMetrics::default();
     }
-    FONT.with(|font| {
-        let scaled = font.as_scaled(PxScale::from(size_px));
-        text.chars()
-            .map(|ch| scaled.h_advance(font.glyph_id(ch)))
-            .sum()
-    })
+    let Some(font) = resolve(families, bold, italic) else {
+        return TextMetrics::default();
+    };
+    let scale = px_scale(font, size_px);
+    let scaled = font.as_scaled(scale);
+    let upem = font.units_per_em().unwrap_or(1000.0);
+    // Границы чернил: браузер отдаёт их целыми по вертикали и дробными по
+    // горизонтали — так же, как получаются из растеризованного контура.
+    // По горизонтали браузер отдаёт границы чернил дробными, по вертикали —
+    // целыми: первые берутся из контура, вторые из растра. Поэтому и здесь два
+    // источника, а не один.
+    let f = size_px / upem;
+    let (mut ink_l, mut ink_r) = (f32::MAX, f32::MIN);
+    let (mut ink_t, mut ink_b) = (f32::MAX, f32::MIN);
+    let mut caret = 0.0f32;
+    for ch in text.chars() {
+        let gid = font.glyph_id(ch);
+        if let Some(o) = font.outline(gid) {
+            ink_l = ink_l.min(caret + o.bounds.min.x * f);
+            ink_r = ink_r.max(caret + o.bounds.max.x * f);
+        }
+        let glyph = gid.with_scale_and_position(scale, ab_glyph::point(caret, 0.0));
+        if let Some(og) = font.outline_glyph(glyph) {
+            let bb = og.px_bounds();
+            ink_t = ink_t.min(bb.min.y);
+            ink_b = ink_b.max(bb.max.y);
+        }
+        caret += scaled.h_advance(gid);
+    }
+    let none = ink_l > ink_r;
+    let flat = ink_t > ink_b;
+    TextMetrics {
+        width: caret,
+        left: if none { 0.0 } else { -ink_l },
+        right: if none { 0.0 } else { ink_r },
+        ascent: if flat { 0.0 } else { -ink_t },
+        descent: if flat { 0.0 } else { ink_b },
+        font_ascent: (font.ascent_unscaled() / upem * size_px).round(),
+        font_descent: (-font.descent_unscaled() / upem * size_px).round(),
+    }
 }
 
 /// `putImageData(data, x, y)` — overwrite a `w`×`h` region with straight-alpha
@@ -514,7 +733,7 @@ mod tests {
     fn fill_text_draws_real_glyph_pixels() {
         create(2, 40, 40);
         // Baseline near the bottom so a 24px 'H' lands inside the surface.
-        fill_text(2, "H", 4.0, 30.0, 24.0, [0, 0, 0, 255]);
+        fill_text(2, "H", 4.0, 30.0, 24.0, [0, 0, 0, 255], "sans-serif", false, false);
         let px = get_image_data(2, 0, 0, 40, 40);
         let opaque = px.chunks_exact(4).filter(|p| p[3] > 0).count();
         assert!(
@@ -569,13 +788,36 @@ mod tests {
 
     #[test]
     fn measure_text_is_positive_and_scales() {
-        let w1 = measure_text("nokk", 16.0);
-        let w2 = measure_text("nokk", 32.0);
+        let w1 = measure_text("nokk", 16.0, "sans-serif", false, false).width;
+        let w2 = measure_text("nokk", 32.0, "sans-serif", false, false).width;
         assert!(w1 > 0.0, "non-empty text has width");
         assert!(
             w2 > w1 * 1.9,
             "2x font size ~doubles advance ({w1} vs {w2})"
         );
-        assert_eq!(measure_text("", 16.0), 0.0, "empty text has zero width");
+        assert_eq!(
+            measure_text("", 16.0, "sans-serif", false, false).width,
+            0.0,
+            "empty text has zero width"
+        );
+    }
+
+    /// Семейства меряются каждое своим файлом. Раньше шрифт был один на все
+    /// имена, и страница, перебирающая гарнитуры измерением — самый ходовой
+    /// способ снять отпечаток, — видела машину, где Arial, Times и Courier
+    /// одной ширины. Числа сверены с Chrome 151 на этой машине.
+    #[test]
+    fn each_family_is_measured_with_its_own_file() {
+        let w = |fam: &str| measure_text("mmmmmmmmmmlli", 16.0, fam, false, false).width;
+        let (sans, serif, mono) = (w("Arial"), w("Times New Roman"), w("Courier New"));
+        assert!(
+            sans != serif && serif != mono && sans != mono,
+            "three families measured the same: {sans} {serif} {mono}"
+        );
+        // Неизвестное имя браузер не находит и переходит к следующему.
+        assert_eq!(w("NoSuchFontXYZ, Arial"), sans, "fell through to the next family");
+        // Жирное начертание — другой файл, значит другая ширина.
+        let bold = measure_text("mmmmmmmmmmlli", 16.0, "Times New Roman", true, false).width;
+        assert!(bold > serif, "bold is not wider than regular: {bold} vs {serif}");
     }
 }

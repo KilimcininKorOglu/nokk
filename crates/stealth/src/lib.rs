@@ -4854,8 +4854,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         else __pt_canvasFillRect(id, x, y, w, h, rgba[0], rgba[1], rgba[2], rgba[3]);
       },
       // Real glyphs. `y` is the alphabetic baseline, matching canvas semantics.
-      text(t, x, y, size, rgba) { sync(); __pt_canvasFillText(id, String(t), x, y, size, rgba[0], rgba[1], rgba[2], rgba[3]); },
-      width(t, size) { return __pt_canvasMeasureText(String(t), size); },
+      text(t, x, y, size, rgba, fam, b, i) { sync(); __pt_canvasFillText(id, String(t), x, y, size, rgba[0], rgba[1], rgba[2], rgba[3], fam || '', !!b, !!i); },
+      width(t, size, fam, b, i) { return __pt_canvasMeasureText(String(t), size, fam || '', !!b, !!i); },
       // Real vector paths: JS tessellates curves/arcs to a move/line/close verb
       // stream, tiny-skia fills or strokes it.
       fillPath(verbs, evenOdd, rgba) { sync(); __pt_canvasFillPath(id, new Float32Array(verbs), evenOdd ? 1 : 0, rgba[0], rgba[1], rgba[2], rgba[3]); },
@@ -5119,6 +5119,19 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
 
     const fontSize = (f) => { const m = /(\d+(?:\.\d+)?)px/.exec(String(f)); return m ? parseFloat(m[1]) : 10; };
+    // Семейства из `ctx.font`: всё, что стоит после кегля. Меряет и рисует их
+    // движок настоящими файлами шрифтов, поэтому список надо донести целиком —
+    // браузер идёт по нему до первого, который в системе есть.
+    // Начертание: жирное и наклонное — отдельные файлы шрифта, и ширины у них
+    // свои. `bold 20px Times New Roman` без этого мерился обычным начертанием и
+    // расходился с браузером на четыре процента.
+    const fontBold = (f) => /(^|\s)(bold|bolder|[5-9]00)(\s|$)/i.test(String(f));
+    const fontItalic = (f) => /(^|\s)(italic|oblique)(\s|$)/i.test(String(f));
+    const fontFamily = (f) => {
+      const t = String(f);
+      const m = /(?:\d+(?:\.\d+)?)(?:px|pt|em|%)\s*(?:\/\s*\S+\s*)?(.*)$/.exec(t);
+      return (m ? m[1] : t).trim();
+    };
     const drawText = function (t, x, y, rgba) {
       const size = fontSize(this.font);
       const w = this.measureText(t).width;
@@ -5129,7 +5142,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       if (b === 'top' || b === 'hanging') oy += size * 0.8;
       else if (b === 'middle') oy += size * 0.3;
       else if (b === 'bottom' || b === 'ideographic') oy -= size * 0.2;
-      if (S.native) S.text(t, ox, oy, size, rgba);
+      if (S.native) S.text(t, ox, oy, size, rgba, fontFamily(this.font), fontBold(this.font), fontItalic(this.font));
       else stamp(ox, oy - size, w, size * 1.3);
     };
 
@@ -5287,8 +5300,23 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       isPointInPath() { return false; },
       measureText(t) {
         const size = fontSize(this.font);
-        const w = S.native ? S.width(t, size) : String(t).length * 6.7;
-        return { width: w, actualBoundingBoxLeft: 0, actualBoundingBoxRight: w, actualBoundingBoxAscent: size * 0.7, actualBoundingBoxDescent: size * 0.2, fontBoundingBoxAscent: size * 0.9, fontBoundingBoxDescent: size * 0.2 };
+        // Метрики были долями кегля: 0.7 на подъём, 0.2 на спуск, а ширина
+        // одна и та же для любого семейства. Страница, перебирающая шрифты
+        // измерением — самый ходовой способ снять отпечаток, — видела машину,
+        // на которой все шрифты одинаковы. Теперь их меряет движок по
+        // настоящему файлу.
+        const m = S.native
+          ? S.width(t, size, fontFamily(this.font), fontBold(this.font), fontItalic(this.font))
+          : null;
+        if (!m) {
+          const w = String(t).length * 6.7;
+          return { width: w, actualBoundingBoxLeft: 0, actualBoundingBoxRight: w,
+                   actualBoundingBoxAscent: size * 0.7, actualBoundingBoxDescent: size * 0.2,
+                   fontBoundingBoxAscent: size * 0.9, fontBoundingBoxDescent: size * 0.2 };
+        }
+        return { width: m[0], actualBoundingBoxLeft: m[1], actualBoundingBoxRight: m[2],
+                 actualBoundingBoxAscent: m[3], actualBoundingBoxDescent: m[4],
+                 fontBoundingBoxAscent: m[5], fontBoundingBoxDescent: m[6] };
       },
       getImageData(x, y, w, h) {
         needArgs(arguments.length, 4, 'getImageData', 'CanvasRenderingContext2D');

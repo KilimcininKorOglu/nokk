@@ -249,7 +249,10 @@ fn canvas_fill_text(
         arg_usize(scope, args.get(7)) as u8,
         arg_usize(scope, args.get(8)) as u8,
     ];
-    crate::canvas::fill_text(id, &text, x, y, size, rgba);
+    let families = arg_string(scope, args.get(9));
+    let bold = args.get(10).boolean_value(scope);
+    let italic = args.get(11).boolean_value(scope);
+    crate::canvas::fill_text(id, &text, x, y, size, rgba, &families, bold, italic);
 }
 
 /// `__pt_canvasMeasureText(text, size)` → advance width in CSS px (a number).
@@ -261,7 +264,19 @@ fn canvas_measure_text(
 ) {
     let text = arg_string(scope, args.get(0));
     let size = arg_f32(scope, args.get(1));
-    rv.set_double(crate::canvas::measure_text(&text, size) as f64);
+    let families = arg_string(scope, args.get(2));
+    let bold = args.get(3).boolean_value(scope);
+    let italic = args.get(4).boolean_value(scope);
+    let m = crate::canvas::measure_text(&text, size, &families, bold, italic);
+    let out = v8::Array::new(scope, 7);
+    for (i, v) in [m.width, m.left, m.right, m.ascent, m.descent, m.font_ascent, m.font_descent]
+        .into_iter()
+        .enumerate()
+    {
+        let n = v8::Number::new(scope, v as f64);
+        out.set_index(scope, i as u32, n.into());
+    }
+    rv.set(out.into());
 }
 
 /// `__pt_canvasFillPath(id, verbsF32, evenOdd, r, g, b, a)` — fill a tessellated path.
