@@ -1954,6 +1954,18 @@ impl BrowserContext {
                             let data = op["data"].as_str().unwrap_or("null");
                             tracing::debug!(owner = index, worker = id, bytes = data.len(),
                                             head = %&data[..data.len().min(420)], "worker post");
+                            // Задача целиком — в файл, когда её надо прочитать.
+                            // Челлендж посылает воркеру модуль WebAssembly на
+                            // несколько килобайт, и в строку лога он не влезает,
+                            // а сравнивать его с браузером нужно дословно.
+                            if let Ok(dir) = std::env::var("NOKK_DUMP_WORKER_TASKS") {
+                                let n = WORKER_TASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let _ = std::fs::create_dir_all(&dir);
+                                let _ = std::fs::write(
+                                    std::path::Path::new(&dir).join(format!("task-{n:03}.js")),
+                                    data.as_bytes(),
+                                );
+                            }
                             let _ = self
                                 .eval_at(place, child, &format!("__pt_workerDeliver({})", js_str(data)))
                                 .await;
@@ -3440,6 +3452,9 @@ fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
     }
     None
 }
+
+/// Порядковый номер выгружаемой задачи воркера (см. `NOKK_DUMP_WORKER_TASKS`).
+static WORKER_TASK_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub fn reason_phrase(status: u16) -> &'static str {
     match status {
