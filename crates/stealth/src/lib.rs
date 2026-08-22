@@ -2850,7 +2850,7 @@ const IFACE_CHAIN: &str = r#"{"AggregateError":"Error","EvalError":"Error","Rang
 /// each class's own machinery, and a socket, a port or a signal without its own
 /// copy stops delivering events. The challenge stopped dead after its first
 /// question to the worker.
-const IFACE_PROTO_MOVES: &str = r#"{"Blob":{"toString":[]},"FormData":{"toString":[]},"KeyboardEvent":{"which":["UIEvent"]}}"#;
+const IFACE_PROTO_MOVES: &str = r#"{"Blob":{"toString":[]},"FormData":{"toString":[]},"KeyboardEvent":{"which":["UIEvent"]},"ShadowRoot":{"append":["DocumentFragment"],"prepend":["DocumentFragment"],"children":["DocumentFragment"],"childElementCount":["DocumentFragment"],"firstElementChild":["DocumentFragment"],"lastElementChild":["DocumentFragment"],"querySelector":["DocumentFragment"],"querySelectorAll":["DocumentFragment"],"getElementById":["DocumentFragment"],"replaceChildren":["DocumentFragment"],"moveBefore":["DocumentFragment"],"nodeName":["Node"],"nodeValue":["Node"],"textContent":["Node"],"getElementsByClassName":[],"getElementsByTagName":[]}}"#;
 
 
 /// The interface objects' static members, installed last of all: constants like

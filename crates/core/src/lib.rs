@@ -4661,6 +4661,50 @@ mod tests {
         assert!(took < 500.0, "и не бывает вечной: {got}");
     }
 
+    /// A list sits directly on its own interface, with nothing in between.
+    /// Ours kept an empty object of its own in the chain — the leftover of
+    /// moving the members onto the interface — so every collection in the engine
+    /// was one level deeper than a browser's, which a walk up the prototypes
+    /// reads at once. And a shadow root's `styleSheets` was a plain Array.
+    #[tokio::test]
+    async fn a_collection_sits_on_its_own_interface() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body><div class='a b'></div></body></html>")
+            .await
+            .unwrap();
+        let got = probe(
+            &ctx,
+            r#"__ptJSON.stringify((() => {
+                const el = document.querySelector('div');
+                const sr = el.attachShadow({ mode: 'open' });
+                const on = (o, name) => Object.getPrototypeOf(o) === globalThis[name].prototype;
+                return {
+                    nodeList: on(document.querySelectorAll('div'), 'NodeList'),
+                    live: on(document.body.childNodes, 'NodeList'),
+                    collection: on(document.getElementsByTagName('div'), 'HTMLCollection'),
+                    tokens: on(el.classList, 'DOMTokenList'),
+                    attrs: on(el.attributes, 'NamedNodeMap'),
+                    sheets: on(document.styleSheets, 'StyleSheetList'),
+                    shadowSheets: on(sr.styleSheets, 'StyleSheetList'),
+                    shadowNames: Object.getOwnPropertyNames(ShadowRoot.prototype).length,
+                    stillWorks: [document.querySelectorAll('div').length, el.classList.contains('b')],
+                };
+            })())"#,
+        )
+        .await;
+        for k in [
+            "nodeList", "live", "collection", "tokens", "attrs", "sheets", "shadowSheets",
+        ] {
+            assert_eq!(got[k], true, "{k} должен лежать на своём интерфейсе: {got}");
+        }
+        // Chrome 148 and 151 alike: 23 names, and none of them borrowed from
+        // Element — a shadow root's chain never reaches it.
+        assert_eq!(got["shadowNames"], 23, "{got}");
+        assert_eq!(got["stillWorks"], serde_json::json!([1, true]), "{got}");
+    }
+
     #[test]
     fn an_image_states_its_size_in_its_own_header() {
         // A one-pixel PNG, GIF and JPEG: the three a page is most likely to meet.

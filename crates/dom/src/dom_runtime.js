@@ -55,8 +55,7 @@
   // Страницы читают `.length` и перебирают — этого достаточно, а `Array.isArray`
   // на настоящей коллекции ложен, как и должно быть.
   function __collection(arr) {
-    __link('HTMLCollection', __collectionProto);
-    const list = Object.create(__collectionProto);
+    const list = Object.create(__link('HTMLCollection', __collectionProto));
     for (let i = 0; i < arr.length; i++) list[i] = arr[i];
     Object.defineProperty(list, '__ptLen', { value: arr.length, enumerable: false, configurable: true });
     return list;
@@ -64,8 +63,7 @@
   // `querySelectorAll` отдаёт NodeList — не живой, как у childNodes, а слепок;
   // это разные вещи в браузере и разные ответы на `Object.prototype.toString`.
   function __staticNodeList(arr) {
-    __link('NodeList', __nodeListProto);
-    const list = Object.create(__nodeListProto);
+    const list = Object.create(__link('NodeList', __nodeListProto));
     for (let i = 0; i < arr.length; i++) list[i] = arr[i];
     Object.defineProperty(list, '__ptLen', { value: arr.length, enumerable: false, configurable: true });
     return list;
@@ -76,10 +74,10 @@
   // `a.childNodes === a.childNodes`, — поэтому он кэшируется на узле, а индексы
   // пересобираются при каждом обращении.
   function __nodeList(node) {
-    __link('NodeList', __nodeListProto);
+    const proto = __link('NodeList', __nodeListProto);
     let list = node.__ptList;
     if (!list) {
-      list = Object.create(__nodeListProto);
+      list = Object.create(proto);
       Object.defineProperty(node, '__ptList', { value: list, enumerable: false, writable: true });
     }
     const kids = node.__ptKids, prev = list.__ptLen | 0;
@@ -92,9 +90,15 @@
   // объявляются позже этого файла, а список создаётся уже на странице. Члены
   // переезжают на `Iface.prototype`, а наш объект становится его наследником —
   // так `list instanceof NodeList` истинно, и `constructor` тот, что нужно.
+  // Возвращает прототип, на котором надо строить сам список. Раньше члены
+  // переезжали на интерфейс, а пустая заготовка оставалась в цепочке лишним
+  // уровнем: у Chrome `Object.getPrototypeOf(document.querySelectorAll('*'))`
+  // это сам `NodeList.prototype`, а у нас — пустой объект перед ним. Так было у
+  // всех списков разом, и любой обход прототипов это видел.
   const __link = (name, proto) => {
     const I = globalThis[name];
-    if (!I || proto.__ptLinked) return;
+    if (!I || !I.prototype) return proto;
+    if (proto.__ptLinked) return I.prototype;
     proto.__ptLinked = true;
     for (const k of Reflect.ownKeys(proto)) {
       if (k === '__ptLinked') continue;
@@ -104,6 +108,7 @@
     for (const k of Reflect.ownKeys(proto)) {
       if (k !== '__ptLinked') delete proto[k];
     }
+    return I.prototype;
   };
   const __nodeListProto = {
     get [Symbol.toStringTag]() { return 'NodeList'; },
@@ -149,8 +154,7 @@
     get ownerElement() { return this.__ptOwner; },
   };
   function __attr(el, name, value) {
-    __link('Attr', __attrProto);
-    const a = Object.create(__attrProto);
+    const a = Object.create(__link('Attr', __attrProto));
     Object.defineProperty(a, '__ptName', { value: name });
     Object.defineProperty(a, '__ptValue', { value: value });
     Object.defineProperty(a, '__ptOwner', { value: el });
@@ -174,8 +178,7 @@
       return { next: () => i < self.length ? { value: self[i++], done: false } : { value: undefined, done: true } }; },
   };
   function __namedNodeMap(el) {
-    __link('NamedNodeMap', __namedNodeMapProto);
-    const map = Object.create(__namedNodeMapProto);
+    const map = Object.create(__link('NamedNodeMap', __namedNodeMapProto));
     let i = 0;
     for (const [name, value] of el.__ptAttrs) map[i++] = __attr(el, name, value);
     Object.defineProperty(map, '__ptLen', { value: i, enumerable: false, configurable: true });
@@ -217,10 +220,10 @@
     toString() { return this.value; },
   };
   function __tokenList(el) {
-    __link('DOMTokenList', __tokenListProto);
+    const proto = __link('DOMTokenList', __tokenListProto);
     let list = el.__ptTokenList;
     if (!list) {
-      list = Object.create(__tokenListProto);
+      list = Object.create(proto);
       Object.defineProperty(list, '__ptEl', { value: el });
       Object.defineProperty(list, '__ptTokens', {
         value: () => (el.getAttribute('class') || '').split(/\s+/).filter(Boolean),
@@ -631,7 +634,24 @@
     // присваивание в него молча пропадало.
     get activeElement() { return this.__ptActive || this.body || null; }
     set activeElement(v) { this.__ptActive = v; }
-    get styleSheets() { return []; }
+    // Список таблиц стилей — не массив: у браузера это `StyleSheetList`, и
+    // `Array.isArray(sr.styleSheets)` там ложно. Мы отдавали литерал массива, а
+    // виджет живёт как раз в теневом корне и читает его оттуда.
+    get styleSheets() {
+      const own = [];
+      const walk = (n) => {
+        for (const c of (n.__ptKids || [])) {
+          if (c.nodeType === ELEMENT_NODE) {
+            if (c.__ptLocal === 'style' || (c.__ptLocal === 'link' && /stylesheet/i.test(c.getAttribute('rel') || ''))) {
+              own.push(c);
+            }
+            walk(c);
+          }
+        }
+      };
+      walk(this);
+      return __styleSheetList(own);
+    }
     get adoptedStyleSheets() { return this.__ptAdopted || (this.__ptAdopted = []); }
     set adoptedStyleSheets(v) { this.__ptAdopted = v; }
     getElementById(id) { return firstMatch(this, e => e.id === id); }
@@ -1968,8 +1988,7 @@
       return { next: () => i < self.length ? { value: self[i++], done: false } : { value: undefined, done: true } }; },
   };
   function __cssRuleList(arr) {
-    __link('CSSRuleList', __ruleListProto);
-    const list = Object.create(__ruleListProto);
+    const list = Object.create(__link('CSSRuleList', __ruleListProto));
     for (let i = 0; i < arr.length; i++) list[i] = arr[i];
     Object.defineProperty(list, '__ptLen', { value: arr.length, enumerable: false, configurable: true });
     return list;
@@ -1986,8 +2005,7 @@
     toString() { return this.mediaText; },
   };
   function __mediaList(text) {
-    __link('MediaList', __mediaListProto);
-    const m = Object.create(__mediaListProto);
+    const m = Object.create(__link('MediaList', __mediaListProto));
     Object.defineProperty(m, '__ptMedia', {
       value: String(text || '').split(',').map((s) => s.trim()).filter(Boolean),
       writable: true, enumerable: false,
@@ -2098,11 +2116,11 @@
   // пересобираются только когда сменился текст.
   globalThis.__pt_sheetFor = (owner) => __sheetFor(owner);
   function __sheetFor(owner) {
-    __link('CSSStyleSheet', __sheetProto);
+    const proto = __link('CSSStyleSheet', __sheetProto);
     const text = owner.__ptLocal === 'style' ? String(owner.textContent || '') : '';
     let sheet = owner.__ptSheet;
     if (!sheet) {
-      sheet = Object.create(__sheetProto);
+      sheet = Object.create(proto);
       Object.defineProperty(owner, '__ptSheet', { value: sheet, writable: true, enumerable: false });
       const href = owner.__ptLocal === 'link' ? (owner.href || null) : null;
       Object.defineProperty(sheet, 'ownerNode', { value: owner, enumerable: true, configurable: true });
@@ -2129,8 +2147,7 @@
       return { next: () => i < self.length ? { value: self[i++], done: false } : { value: undefined, done: true } }; },
   };
   function __styleSheetList(owners) {
-    __link('StyleSheetList', __sheetListProto);
-    const list = Object.create(__sheetListProto);
+    const list = Object.create(__link('StyleSheetList', __sheetListProto));
     for (let i = 0; i < owners.length; i++) list[i] = __sheetFor(owners[i]);
     Object.defineProperty(list, '__ptLen', { value: owners.length, enumerable: false, configurable: true });
     return list;
