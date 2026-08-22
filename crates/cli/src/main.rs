@@ -223,8 +223,13 @@ async fn eval_and_print(ctx: &BrowserContext, js: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         ctx.run_event_loop().await.ok();
+        // `evaluate` отдаёт результат строкой, а не логическим значением, и
+        // сравнение с `Bool(true)` не совпадало никогда — каждый `--eval` ждал
+        // все пятнадцать секунд до упора, даже когда ответ был готов сразу.
         let done = ctx.evaluate("globalThis.__outDone === true").await;
-        if matches!(done, Ok(serde_json::Value::Bool(true))) || Instant::now() > deadline {
+        let ready = matches!(&done, Ok(serde_json::Value::Bool(true)))
+            || matches!(&done, Ok(serde_json::Value::String(s)) if s == "true");
+        if ready || Instant::now() > deadline {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -397,6 +402,46 @@ async fn main() -> Result<()> {
                   }
                   try { Object.defineProperty(E.prototype, 'constructor', { value: Wrapped, writable: true, configurable: true }); } catch (e2) {}
                   globalThis.Error = globalThis.__pt_native ? __pt_native(Wrapped) : Wrapped;
+                })();"#;
+                c.add_frame_init_script(probe.to_string());
+                c.add_init_script(probe.to_string());
+            }
+            // Откуда шлют маяк ошибки. Челлендж стучит на `/eb/`, когда у него
+            // что-то не сложилось, — а браузер на том же месте не стучит вовсе.
+            // Тело маяка зашифровано, но место, откуда его отправили, читается
+            // из стека. Пробник нарочно узкий: один крючок на отправку и ничего
+            // больше — всякая лишняя подмена меняет то, что мы измеряем.
+            if std::env::var("NOKK_TRACE_BEACON").is_ok() {
+                let probe = r#"(() => {
+                  try {
+                    const S = XMLHttpRequest.prototype.send;
+                    const O = XMLHttpRequest.prototype.open;
+                    XMLHttpRequest.prototype.open = function (m, u) {
+                      this.__ptU = String(u);
+                      return O.apply(this, arguments);
+                    };
+                    XMLHttpRequest.prototype.send = function (b) {
+                      try {
+                        if (/\/eb\//.test(this.__ptU || '')) {
+                          const at = String(new Error().stack || '(без стека)');
+                          for (const line of at.split('\n').slice(0, 14)) {
+                            console.error('[beacon] ' + line.trim().slice(0, 220));
+                          }
+                          console.error('[beacon] размер=' + ((b && b.length) || 0));
+                        }
+                      } catch (e) {}
+                      return S.apply(this, arguments);
+                    };
+                    // Заодно то, что челлендж сам считает ошибкой: он зовёт
+                    // `console.error` перед маяком далеко не всегда, но своё
+                    // отклонённое обещание отдаёт в общий обработчик.
+                    addEventListener('unhandledrejection', (e) => {
+                      try { console.error('[beacon] отклонено: ' + String((e.reason && e.reason.stack) || e.reason).slice(0, 300)); } catch (x) {}
+                    });
+                    addEventListener('error', (e) => {
+                      try { console.error('[beacon] ошибка: ' + String(e.message || '') + ' @ ' + String(e.filename || '').slice(-40) + ':' + e.lineno); } catch (x) {}
+                    });
+                  } catch (e) {}
                 })();"#;
                 c.add_frame_init_script(probe.to_string());
                 c.add_init_script(probe.to_string());

@@ -1431,6 +1431,7 @@ dependencies = [
  "tiny-skia",
  "tokio",
  "tracing",
+ "ttf-parser",
  "v8",
 ]
 

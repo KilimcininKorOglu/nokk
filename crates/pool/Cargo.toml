@@ -14,7 +14,7 @@ default = []
 # Opt-in real off-screen rasterization: back the JS canvas with a real tiny-skia
 # 2D rasterizer (genuine getImageData/toDataURL pixels) instead of the default JS
 # synthesis. Heavier build; see docs/rendering.md. Not on by default.
-render = ["dep:tiny-skia", "dep:ab_glyph"]
+render = ["dep:tiny-skia", "dep:ab_glyph", "dep:ttf-parser"]
 # Opt-in real WebGL: back the JS WebGL context with a headless Mesa GL context
 # (surfaceless EGL). Separate from `render` because it links a real GL stack;
 # EGL is loaded dynamically, so it *builds* anywhere but only *runs* where Mesa/EGL
@@ -30,6 +30,7 @@ thiserror = { workspace = true }
 # (pure Rust, no GPU). A bundled Liberation Sans (fonts/) gives fillText real,
 # deterministic glyphs.
 tiny-skia = { version = "0.11", optional = true }
+ttf-parser = { version = "0.25", optional = true, default-features = false, features = ["std", "opentype-layout"] }
 ab_glyph = { version = "0.2", optional = true }
 
 # Headless GL stack for the optional `webgl` feature. `khronos-egl` in `dynamic`

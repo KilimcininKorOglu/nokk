@@ -58,6 +58,12 @@ const FAMILIES: &[(&str, &[&str])] = &[
     ("dejavu serif", &["DejaVuSerif.ttf"]),
     ("dejavu sans mono", &["DejaVuSansMono.ttf"]),
     ("noto sans mono", &["NotoSansMono-Regular.ttf"]),
+    // Метрически совместимые имена: этих файлов на машине нет, но fontconfig
+    // подменяет их Liberation, и браузер отвечает шириной подмены — то есть
+    // считает семейство существующим.
+    ("arimo", &["LiberationSans-Regular.ttf"]),
+    ("tinos", &["LiberationSerif-Regular.ttf"]),
+    ("cousine", &["LiberationMono-Regular.ttf"]),
     // `system-ui` — шрифт рабочего стола; Chrome спрашивает его у системы
     // и получает здесь Cantarell.
     ("system-ui", &["Cantarell-Regular.otf", "NotoSans-Regular.ttf", "DejaVuSans.ttf"]),
@@ -77,6 +83,71 @@ thread_local! {
     /// the challenge's beacon PNG lands on a canvas on every round — so the
     /// decode happens once and the pixels stay.
     static IMAGES: RefCell<HashMap<String, (u32, u32, Vec<u8>)>> = RefCell::new(HashMap::new());
+}
+
+/// Указатель «семейство → файл», построенный по самим шрифтам. Таблица имён у
+/// нас была на девятнадцать семейств, а на машине их две сотни: страница,
+/// перебирающая шрифты измерением — а это самый ходовой способ, — находила у
+/// нас одиннадцать против двадцати трёх у браузера. Имя семейства читается из
+/// таблицы `name` самого файла, а не угадывается по его названию.
+fn font_index() -> &'static std::collections::HashMap<String, (std::path::PathBuf, bool)> {
+    static INDEX: std::sync::OnceLock<std::collections::HashMap<String, (std::path::PathBuf, bool)>> =
+        std::sync::OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut out = std::collections::HashMap::new();
+        for dir in FONT_DIRS {
+            let mut stack = vec![std::path::PathBuf::from(dir)];
+            while let Some(d) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&d) else {
+                    continue;
+                };
+                for e in entries.flatten() {
+                    let path = e.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                        continue;
+                    }
+                    let ext = path
+                        .extension()
+                        .and_then(|x| x.to_str())
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    if ext != "ttf" && ext != "otf" && ext != "ttc" {
+                        continue;
+                    }
+                    let Ok(bytes) = std::fs::read(&path) else {
+                        continue;
+                    };
+                    let Ok(face) = ttf_parser::Face::parse(&bytes, 0) else {
+                        continue;
+                    };
+                    // Обычное начертание предпочтительнее, но семейство,
+                    // у которого есть только наклонное — а такие бывают, Z003
+                    // из них, — всё равно существует, и браузер его находит.
+                    let plain = !face.is_bold() && !face.is_italic();
+                    for name in face.names() {
+                        // 1 — семейство, 16 — типографское семейство.
+                        if name.name_id != 1 && name.name_id != 16 {
+                            continue;
+                        }
+                        let Some(text) = name.to_string() else { continue };
+                        let key = text.to_lowercase();
+                        match out.entry(key) {
+                            std::collections::hash_map::Entry::Vacant(v) => {
+                                v.insert((path.clone(), plain));
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut o) => {
+                                if plain && !o.get().1 {
+                                    o.insert((path.clone(), true));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    })
 }
 
 /// Найти файл шрифта по имени в системных каталогах.
@@ -150,12 +221,20 @@ fn resolve(families: &str, bold: bool, italic: bool) -> Option<&'static FontVec>
         if name.is_empty() {
             continue;
         }
-        let Some((_, files)) = FAMILIES.iter().find(|(f, _)| *f == name) else {
+        if let Some((_, files)) = FAMILIES.iter().find(|(f, _)| *f == name) {
+            for file in *files {
+                if let Some(f) = face(file, bold, italic) {
+                    return Some(f);
+                }
+            }
             continue;
-        };
-        for file in *files {
-            if let Some(f) = face(file, bold, italic) {
-                return Some(f);
+        }
+        // Не в таблице подмен — значит ищем семейство как оно есть.
+        if let Some((path, _)) = font_index().get(&name) {
+            if let Some(file) = path.file_name().and_then(|n| n.to_str()) {
+                if let Some(f) = face(file, bold, italic) {
+                    return Some(f);
+                }
             }
         }
     }
