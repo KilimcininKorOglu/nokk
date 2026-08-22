@@ -4602,6 +4602,50 @@ mod tests {
         assert_eq!(got["goodSelector"], "ответил", "{got}");
     }
 
+    /// The challenge times exactly one call: `flush()` on an origin-private
+    /// file. In a browser that is a write to the disk and a wait for it —
+    /// about four milliseconds — and an empty function costs nothing at all,
+    /// which no file system does.
+    #[tokio::test]
+    async fn flushing_a_file_costs_what_a_file_costs() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+        ctx.evaluate(
+            r#"(() => {
+                const src = "onmessage=function(e){ eval(e.data) }";
+                const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+                globalThis.__got = null;
+                w.onmessage = (e) => { globalThis.__got = e.data; };
+                w.postMessage("~function(){navigator.storage.getDirectory().then(function(a){var s={};s['create']=true;return a.getFileHandle('пробa',s)}).then(function(h){return h.createSyncAccessHandle()}).then(function(h){h.write(new Uint8Array(64),{at:0});var t=performance.now();h.flush();var d=performance.now()-t;h.close();postMessage({took:d})}).catch(function(e){postMessage({err:String(e)})})}()");
+                return 1;
+            })()"#,
+        )
+        .await
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        while std::time::Instant::now() < deadline {
+            ctx.run_event_loop().await.unwrap();
+            if probe(&ctx, "__ptJSON.stringify(globalThis.__got !== null)").await == true {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let got = probe(&ctx, "__ptJSON.stringify(globalThis.__got)").await;
+        // Built without the rasterizer there is no file behind the handle, and
+        // nothing here to measure.
+        let backed = probe(&ctx, "__ptJSON.stringify(typeof __pt_fsOpen === 'function')").await;
+        if backed != true {
+            return;
+        }
+        let took = got["took"].as_f64().unwrap_or(0.0);
+        assert!(took > 0.2, "запись на диск не бывает мгновенной: {got}");
+        assert!(took < 500.0, "и не бывает вечной: {got}");
+    }
+
     #[test]
     fn an_image_states_its_size_in_its_own_header() {
         // A one-pixel PNG, GIF and JPEG: the three a page is most likely to meet.

@@ -64,6 +64,10 @@ pub fn install(scope: &mut v8::HandleScope) {
         bind(scope, "__pt_canvasPutImageData", canvas_put_image_data);
         bind(scope, "__pt_canvasGetImageData", canvas_get_image_data);
         bind(scope, "__pt_imageBytes", image_bytes);
+        bind(scope, "__pt_fsOpen", fs_open);
+        bind(scope, "__pt_fsFlush", fs_flush);
+        bind(scope, "__pt_fsRead", fs_read);
+        bind(scope, "__pt_fsClose", fs_close);
         bind(scope, "__pt_canvasDrawImage", canvas_draw_image);
     }
 
@@ -374,6 +378,146 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
     base64::engine::general_purpose::STANDARD
         .decode(s.as_bytes())
         .map_err(|_| ())
+}
+
+/// Файлы источника (OPFS) — настоящие.
+///
+/// Всё дерево живёт в памяти, и это ничему не мешало, пока не выяснилось, что
+/// челлендж засекает ровно `flush()`: у браузера это запись на диск и ожидание
+/// её завершения, около четырёх миллисекунд, а пустая функция стоит ноль.
+/// Столько не стоит ни одна настоящая файловая система, и ноль виден сразу.
+/// Поэтому синхронная ручка держит за собой файл во временном каталоге:
+/// содержимое по-прежнему в памяти, а `flush` честно кладёт его на диск.
+#[cfg(feature = "render")]
+mod opfs {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    thread_local! {
+        static FILES: RefCell<HashMap<u32, File>> = RefCell::new(HashMap::new());
+        static NEXT: RefCell<u32> = const { RefCell::new(0) };
+    }
+
+    /// Один каталог на процесс, внутри временного. Имя файла — из ключа, а всё,
+    /// что не буква и не цифра, заменяется: путь приходит со страницы.
+    fn path_for(key: &str) -> std::path::PathBuf {
+        let safe: String = key
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .take(80)
+            .collect();
+        let dir = std::env::temp_dir().join(format!("nokk-opfs-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(safe)
+    }
+
+    pub fn open(key: &str) -> u32 {
+        let Ok(file) = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path_for(key))
+        else {
+            return 0;
+        };
+        NEXT.with(|n| {
+            let mut n = n.borrow_mut();
+            *n += 1;
+            let id = *n;
+            FILES.with(|f| f.borrow_mut().insert(id, file));
+            id
+        })
+    }
+
+    /// Записать и сбросить на диск — то, за что браузер платит миллисекундами.
+    pub fn flush(id: u32, bytes: &[u8]) -> bool {
+        FILES.with(|f| {
+            let mut map = f.borrow_mut();
+            let Some(file) = map.get_mut(&id) else {
+                return false;
+            };
+            if file.seek(SeekFrom::Start(0)).is_err() {
+                return false;
+            }
+            if file.write_all(bytes).is_err() {
+                return false;
+            }
+            // Длину правим, только если она изменилась, и сбрасываем данные без
+            // метаданных: браузер платит за `flush` около четырёх миллисекунд,
+            // а полный `sync_all` втрое дороже — это уже другая машина.
+            if file.metadata().map(|m| m.len()).unwrap_or(0) != bytes.len() as u64 {
+                let _ = file.set_len(bytes.len() as u64);
+            }
+            file.sync_data().is_ok()
+        })
+    }
+
+    pub fn read_all(id: u32) -> Vec<u8> {
+        FILES.with(|f| {
+            let mut map = f.borrow_mut();
+            let Some(file) = map.get_mut(&id) else {
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            if file.seek(SeekFrom::Start(0)).is_err() {
+                return Vec::new();
+            }
+            let _ = file.read_to_end(&mut out);
+            out
+        })
+    }
+
+    pub fn close(id: u32) {
+        FILES.with(|f| f.borrow_mut().remove(&id));
+    }
+}
+
+/// `__pt_fsOpen(key)` → handle, or 0 when the file could not be opened.
+#[cfg(feature = "render")]
+fn fs_open(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let key = arg_string(scope, args.get(0));
+    rv.set_uint32(opfs::open(&key));
+}
+
+/// `__pt_fsFlush(handle, bytes)` → true when the bytes reached the disk.
+#[cfg(feature = "render")]
+fn fs_flush(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let bytes = arg_bytes(args.get(1));
+    rv.set_bool(opfs::flush(id, &bytes));
+}
+
+/// `__pt_fsRead(handle)` → everything the file holds.
+#[cfg(feature = "render")]
+fn fs_read(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let bytes = opfs::read_all(id);
+    set_bytes(scope, &mut rv, &bytes);
+}
+
+/// `__pt_fsClose(handle)`
+#[cfg(feature = "render")]
+fn fs_close(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    opfs::close(arg_usize(scope, args.get(0)) as u32);
 }
 
 /// `__pt_canvasGetImageData(id, x, y, w, h)` → straight-alpha RGBA `Uint8Array`.

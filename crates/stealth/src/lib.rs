@@ -1961,6 +1961,13 @@ const CLONE_TEMPLATE: &str = r##"  // ── Структурное клонир
 "##;
 
 const OPFS_TEMPLATE: &str = r##"  // ── Origin Private File System ───────────────────────────────────────────
+  // Обращение к файловой системе источника у браузера идёт через границу
+  // процесса: `getDirectory()`, `getFileHandle()` и `createSyncAccessHandle()`
+  // возвращаются не в том же такте, а следующей задачей. У нас они решались
+  // мгновенно, и цепочка из трёх таких вызовов занимала ноль миллисекунд —
+  // столько не занимает ни одна настоящая. Челлендж эту цепочку и засекает.
+  const soon = (v) => new Promise((res) => { setTimeout(() => res(v), 0); });
+
   // Челлендж просит у воркера файл в OPFS, берёт синхронную ручку, пишет байт
   // и засекает `flush()` — а у нас `getDirectory()` отвечал отказом «доступ
   // запрещён», которого в защищённом контексте Chrome не бывает никогда.
@@ -2055,7 +2062,7 @@ const OPFS_TEMPLATE: &str = r##"  // ── Origin Private File System ───
         child = { kind: 'file', name: key, data: new Uint8Array(0), parent: n };
         n.children.set(key, child);
       }
-      return Promise.resolve(makeHandle(FileH, child));
+      return soon(makeHandle(FileH, child));
     });
     put(Dir, 'getDirectoryHandle', function getDirectoryHandle(name, opts) {
       const n = node(this);
@@ -2066,7 +2073,7 @@ const OPFS_TEMPLATE: &str = r##"  // ── Origin Private File System ───
         child = { kind: 'directory', name: key, children: new Map(), parent: n };
         n.children.set(key, child);
       }
-      return Promise.resolve(makeHandle(Dir, child));
+      return soon(makeHandle(Dir, child));
     });
     put(Dir, 'removeEntry', function removeEntry(name) {
       const n = node(this);
@@ -2149,8 +2156,16 @@ const OPFS_TEMPLATE: &str = r##"  // ── Origin Private File System ───
     if (Sync) {
       put(FileH, 'createSyncAccessHandle', function createSyncAccessHandle() {
         const h = Object.create(Sync.prototype);
-        STATE.set(h, { file: node(this), closed: false });
-        return Promise.resolve(h);
+        const f = node(this);
+        // За ручкой стоит настоящий файл: содержимое по-прежнему в памяти, но
+        // `flush()` кладёт его на диск и ждёт — за это браузер и платит своими
+        // четырьмя миллисекундами, а пустая функция стоила ноль.
+        let fd = 0;
+        try {
+          if (typeof __pt_fsOpen === 'function') fd = __pt_fsOpen(String(f.name || 'opfs')) | 0;
+        } catch (e) {}
+        STATE.set(h, { file: f, closed: false, fd });
+        return soon(h);
       });
       put(Sync, 'write', function write(buf, opts) {
         const st = node(this);
@@ -2165,12 +2180,20 @@ const OPFS_TEMPLATE: &str = r##"  // ── Origin Private File System ───
       });
       put(Sync, 'getSize', function getSize() { return node(this).file.data.length; });
       put(Sync, 'truncate', function truncate(size) { const st = node(this); st.file.data = st.file.data.slice(0, size | 0); });
-      put(Sync, 'flush', function flush() {});
-      put(Sync, 'close', function close() { node(this).closed = true; });
+      put(Sync, 'flush', function flush() {
+        const st = node(this);
+        if (!st.fd) return;
+        try { __pt_fsFlush(st.fd, st.file.data); } catch (e) {}
+      });
+      put(Sync, 'close', function close() {
+        const st = node(this);
+        st.closed = true;
+        if (st.fd) { try { __pt_fsClose(st.fd); } catch (e) {} st.fd = 0; }
+      });
     }
 
     const root = { kind: 'directory', name: '', children: new Map(), parent: null };
-    return () => Promise.resolve(makeHandle(Dir, root));
+    return () => soon(makeHandle(Dir, root));
   })();
 "##;
 
