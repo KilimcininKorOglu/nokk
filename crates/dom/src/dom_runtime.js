@@ -1199,19 +1199,21 @@
     // box so coordinate + visibility tooling works, hidden/detached ones an empty
     // one. See __relayout / __boxOf below.
     getBoundingClientRect() { const r = __rectFromBox(__boxOf(this)); r.toJSON = function () { return this; }; return r; }
-    getClientRects() { const b = __boxOf(this); if (!b) return []; const r = __rectFromBox(b); r.toJSON = function () { return this; }; return [r]; }
+    getClientRects() { const b = __boxOf(this); if (!b) return __ptRectList([]); const r = __rectFromBox(b); r.toJSON = function () { return this; }; return __ptRectList([r]); }
     get parentElement() { const p = this.parentNode; return p && p.nodeType === ELEMENT_NODE ? p : null; }
     // Layout-metric accessors derived from the synthetic box. `documentElement`'s
     // client size is the viewport (drivers clamp click boxes to it).
     // `clientWidth` — поле содержимого вместе с отступами, но без рамок, и
     // целым числом; `offsetWidth` — то же с рамками. Раньше оба отдавали одну
     // и ту же коробку, и элемент с рамкой отвечал на них одинаково.
-    get clientWidth() { const d = this.ownerDocument || globalThis.document; if (d && this === d.documentElement) return LAYOUT.W; const b = __boxOf(this); return b ? Math.round(b.w - b.bx) : 0; }
-    get clientHeight() { const d = this.ownerDocument || globalThis.document; if (d && this === d.documentElement) return LAYOUT.H; const b = __boxOf(this); return b ? Math.round(b.h - b.by) : 0; }
+    get clientWidth() { const d = this.ownerDocument || globalThis.document; if (d && this === d.documentElement) return LAYOUT.W; const b = __boxOf(this); return b ? Math.round(b.w - b.bx - (b.bar ? b.bar[0] : 0)) : 0; }
+    get clientHeight() { const d = this.ownerDocument || globalThis.document; if (d && this === d.documentElement) return LAYOUT.H; const b = __boxOf(this); return b ? Math.round(b.h - b.by - (b.bar ? b.bar[1] : 0)) : 0; }
     get clientTop() { return 0; }
     get clientLeft() { return 0; }
-    get scrollWidth() { return this.clientWidth; }
-    get scrollHeight() { return this.clientHeight; }
+    // Область прокрутки — по содержимому: `scrollWidth` у блока со скрытым
+    // переполнением больше видимой части, и страницы это читают.
+    get scrollWidth() { const b = __boxOf(this); return b ? Math.round(Math.max(this.clientWidth, b.sw)) : this.clientWidth; }
+    get scrollHeight() { const b = __boxOf(this); return b ? Math.round(Math.max(this.clientHeight, b.sh)) : this.clientHeight; }
     get scrollTop() { return 0; }
     get scrollLeft() { return 0; }
     get offsetWidth() { const b = __boxOf(this); return b ? Math.round(b.w) : 0; }
@@ -1335,7 +1337,13 @@
     get activeElement() { return this.__ptActive || this.body || null; }
     set activeElement(v) { this.__ptActive = v; }
     elementFromPoint(x, y) { return __elementFromPoint(x, y); }
-    elementsFromPoint(x, y) { const e = __elementFromPoint(x, y); return e ? [e] : []; }
+    // Не один элемент, а вся стопка под точкой: браузер отдаёт цепочку от
+    // самого глубокого до `<html>`.
+    elementsFromPoint(x, y) {
+      const out = [];
+      for (let e = __elementFromPoint(x, y); e && e.nodeType === ELEMENT_NODE; e = e.parentNode) out.push(e);
+      return out;
+    }
     get nodeName() { return '#document'; }
     get head() { return this.documentElement && __tags(this.documentElement, 'head')[0] || null; }
     get body() { return this.documentElement && __tags(this.documentElement, 'body')[0] || null; }
@@ -3665,20 +3673,29 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       toString() { return ''; },
       // Страницы меряют текст через диапазон — это второй по ходовости способ
       // после `measureText`, — а он отвечал нулями, то есть «текста нет».
-      getBoundingClientRect() {
+      // Прямоугольник тут не один: браузер отдаёт по одному на каждую строку,
+      // и по ним видно, как текст разложился.
+      getClientRects() {
         const node = start;
         const el = node && node.nodeType === ELEMENT_NODE ? node
                  : (node && node.parentNode) || null;
-        if (!el || el.nodeType !== ELEMENT_NODE) {
-          return { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0 };
-        }
-        const b = __boxOf(el);
-        if (!b) return { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0 };
-        return { x: b.cx, y: b.cy, left: b.cx, top: b.cy,
-                 right: b.cx + b.cw, bottom: b.cy + b.ch,
-                 width: b.cw, height: b.ch };
+        const b = el && el.nodeType === ELEMENT_NODE ? __boxOf(el) : null;
+        if (!b) return __ptRectList([]);
+        const h = (b.asc || 0) + (b.desc || 0);
+        const rows = (b.lines && b.lines.length ? b.lines : [{ width: b.cw }]);
+        return __ptRectList(rows.map((ln, i) => {
+          const y = b.cy + i * (b.line || h);
+          return { x: b.cx, y, left: b.cx, top: y, right: b.cx + ln.width,
+                   bottom: y + h, width: ln.width, height: h };
+        }));
       },
-      getClientRects() { return []; },
+      getBoundingClientRect() {
+        const list = this.getClientRects();
+        if (!list.length) return { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0 };
+        let l = Infinity, t = Infinity, r2 = -Infinity, b2 = -Infinity;
+        for (const q of list) { l = Math.min(l, q.left); t = Math.min(t, q.top); r2 = Math.max(r2, q.right); b2 = Math.max(b2, q.bottom); }
+        return { x: l, y: t, left: l, top: t, right: r2, bottom: b2, width: r2 - l, height: b2 - t };
+      },
       deleteContents() {}, extractContents() { return document.createDocumentFragment(); },
       cloneContents() { return document.createDocumentFragment(); },
       insertNode(n) { if (start && start.appendChild) start.appendChild(n); },
@@ -3972,10 +3989,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (typeof __pt_canvasMeasureText === 'function') {
       try {
         const m = __pt_canvasMeasureText('', fs, family || 'sans-serif', false, false);
-        return { line: Math.round(m[7] || fs * 1.15), asc: m[5] || Math.round(fs * 0.9) };
+        return { line: Math.round(m[7] || fs * 1.15), asc: m[5] || Math.round(fs * 0.9), desc: m[6] || Math.round(fs * 0.2) };
       } catch (e) {}
     }
-    return { line: Math.round(fs * 1.15), asc: Math.round(fs * 0.9) };
+    return { line: Math.round(fs * 1.15), asc: Math.round(fs * 0.9), desc: Math.round(fs * 0.2) };
   }
   const __normalLine = (fs, family) => __fontBox(fs, family).line;
 
@@ -3985,6 +4002,36 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       catch (e) {}
     }
     return String(text).length * fs * 0.5;
+  }
+
+  // Перенос по словам. Абзац в браузере занимает столько строк, сколько
+  // требует его ширина, а у нас любой текст умещался в одну — и абзац шириной
+  // сто двадцать пикселей отвечал высотой восемнадцать вместо семидесяти двух.
+  // Разрыв жадный, по пробелам, хвостовой пробел в ширину строки не входит —
+  // как в браузере.
+  function __wrapLines(text, maxWidth, fs, family, bold) {
+    const words = String(text).split(' ').filter((w) => w.length);
+    const out = [];
+    if (!words.length) return out;
+    if (!(maxWidth > 0)) {
+      const all = words.join(' ');
+      return [{ text: all, width: Math.round(__textWidth(all, fs, family, bold, false) * 64) / 64 }];
+    }
+    let line = '';
+    for (const w of words) {
+      const next = line ? line + ' ' + w : w;
+      const width = __textWidth(next, fs, family, bold, false);
+      if (line && width > maxWidth) {
+        out.push({ text: line, width: __textWidth(line, fs, family, bold, false) });
+        line = w;
+      } else {
+        line = next;
+      }
+    }
+    if (line) out.push({ text: line, width: __textWidth(line, fs, family, bold, false) });
+    // Ширины строк браузер, как и всё остальное, держит в шестьдесят четвёртых.
+    for (const l of out) l.width = Math.round(l.width * 64) / 64;
+    return out;
   }
 
   const __OWN_TEXT = (el) => {
@@ -4022,6 +4069,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return null;
   }
 
+  // Поля, которые блочным элементам даёт таблица стилей самого браузера. Без
+  // них абзацы и заголовки лежат вплотную, и вся страница ниже съезжает вверх.
+  const UA_MARGIN = {
+    p: [16, 0], blockquote: [16, 40], figure: [16, 40], ul: [16, 0], ol: [16, 0],
+    dl: [16, 0], dd: [0, 40], pre: [16, 0], hr: [8, 8], form: [0, 0],
+    h1: [21.44, 0], h2: [19.92, 0], h3: [18.72, 0], h4: [21.28, 0], h5: [22.18, 0], h6: [24.98, 0],
+  };
+
   function __layoutOne(el, originX, originY, availW, strut) {
     // В порядке документа, не после детей: попадание в точку ищется с конца
     // списка, и глубокий элемент должен стоять там позже своего родителя.
@@ -4055,9 +4110,17 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       bt = br = bb = bl = w;
     }
     const display = String(cs.get('display') || CS_DISPLAY[tag] || 'block').toLowerCase();
+    const ovAll = String(cs.get('overflow') || '').toLowerCase();
+    const ovX = String(cs.get('overflow-x') || ovAll || 'visible').toLowerCase();
+    const ovY = String(cs.get('overflow-y') || ovAll || 'visible').toLowerCase();
     const inlineish = __INLINEISH.test(display);
     const position = String(cs.get('position') || 'static').toLowerCase();
 
+    const uam = UA_MARGIN[tag];
+    if (uam) {
+      if (!mt && !mb) { mt = uam[0]; mb = uam[0]; }
+      if (!ml && !mr) { ml = uam[1]; mr = uam[1]; }
+    }
     const ua = __uaBox(el, tag);
     if (ua) {
       if (!pt_ && !pb && ua.p) { pt_ = ua.p[0]; pb = ua.p[0]; }
@@ -4102,11 +4165,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const fbox = __fontBox(fs, family);
     const lineH = fbox.line;
     const contentX = boxX + bl + pl, contentY = boxY + bt + pt_;
-    let y = contentY, widest = 0;
+    let y = contentY, widest = 0, deepest = 0;
     for (const c of boxedKids) {
       const cb = __layoutOne(c, contentX, y, cw, fbox);
       if (!cb) continue;
       widest = Math.max(widest, cb.x - contentX + cb.w);
+      deepest = Math.max(deepest, cb.y - contentY + cb.h);
       const cpos = String(__cascadeFor(c).get('position') || 'static').toLowerCase();
       if (cpos === 'absolute' || cpos === 'fixed') continue;
       // Строчный элемент занимает не свою высоту, а высоту строки, и стоит в
@@ -4118,17 +4182,24 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (inlineish && explicitW == null && boxedKids.length) cw = widest;
 
     let ch;
+    let lines = null;
+    const ownText = __OWN_TEXT(el);
+    if (ownText && !boxedKids.length) {
+      lines = __wrapLines(ownText, inlineish && explicitW == null ? 0 : cw, fs, family, bold);
+      if (inlineish && explicitW == null && lines.length === 1) cw = lines[0].width;
+    }
     if (explicitH != null) ch = explicitH;
     else if (attrH != null) ch = attrH;
     else if (boxedKids.length) ch = Math.max(0, y - contentY);
-    else ch = __OWN_TEXT(el) || inlineish ? Math.round(__normalLine(fs, family)) : 0;
+    else if (lines && lines.length) ch = lines.length * lineH;
+    else ch = inlineish ? Math.round(lineH) : 0;
 
     // Строчный элемент высок настолько, насколько высоки его чернила, а не
     // строка целиком. Заменяемого это не касается: у `<iframe width height>`
     // размер назван в атрибуте, и он главнее.
     if (inlineish && display === 'inline' && !frame
-        && explicitH == null && attrH == null && !boxedKids.length) {
-      ch = Math.round(fs * 1.1719);
+        && explicitH == null && attrH == null && !boxedKids.length && !(lines && lines.length)) {
+      ch = fbox.asc + fbox.desc;
     }
     if (ua && explicitH == null && attrH == null) ch = ua.h;
 
@@ -4142,8 +4213,21 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       h: q(ch + pt_ + pb + bt + bb),
       cw: q(cw), ch: q(ch), cx: q(contentX), cy: q(contentY),
       bx: bl + br, by: bt + bb, mb,
-      line: lineH, inline: inlineish, lineTop: q(boxY),
+      line: lineH, inline: inlineish, lineTop: q(boxY), lines,
+      asc: fbox.asc, desc: fbox.desc,
+      // Область прокрутки — по содержимому, а не по самой коробке; полоса
+      // прокрутки, если она есть, отъедает пятнадцать пикселей у видимой части.
+      sw: q(Math.max(cw, widest)), sh: q(Math.max(ch, deepest)),
+      bar: [0, 0],
     };
+    // Полоса прокрутки занимает место: у блока с `overflow: auto`, чьё
+    // содержимое не влезает, видимая часть на пятнадцать пикселей уже и ниже.
+    // Мы отвечали полным размером, то есть страницей без полос вообще.
+    {
+      const needX = (ovX === 'scroll') || (ovX === 'auto' && widest > cw + 0.5);
+      const needY = (ovY === 'scroll') || (ovY === 'auto' && deepest > ch + 0.5);
+      box.bar = [needY ? 15 : 0, needX ? 15 : 0];
+    }
     if (box.inline && strut) {
       // Выравнивание по базовой линии, а не по центру: браузер ставит строчный
       // элемент так, чтобы его базовая линия легла на базовую линию строки.
@@ -4360,6 +4444,15 @@ const CS_REPLACED = {"block-size":"65px","border-block-end-style":"inset","borde
     if (!el || el.nodeType !== ELEMENT_NODE) return null;
     __relayout();
     return el.__ptBoxV === __layoutBuilt ? el.__ptBox : null; // detached/hidden → no box
+  }
+
+  /// Список прямоугольников: у браузера это `DOMRectList`, а не массив, и имя
+  /// объекта читают.
+  function __ptRectList(items) {
+    const list = items.slice();
+    list.item = function item(i) { return this[i] || null; };
+    try { Object.defineProperty(list, Symbol.toStringTag, { value: 'DOMRectList', configurable: true }); } catch (e) {}
+    return list;
   }
 
   function __rectFromBox(b) {

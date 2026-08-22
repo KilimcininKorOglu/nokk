@@ -5555,6 +5555,73 @@ mod tests {
         }
     }
 
+    /// Текст переносится по строкам, а прокрутка знает своё содержимое. Абзац
+    /// шириной сто двадцать пикселей отвечал высотой восемнадцать вместо
+    /// семидесяти двух — в одну строку укладывалось что угодно, — а
+    /// `Range.getClientRects()` отдавал пустой список, то есть «текста нет».
+    /// Блок с `overflow: auto` называл видимую часть равной себе, без места под
+    /// полосу, и `scrollWidth` равным `clientWidth`. Числа сверены с Chrome 151.
+    /// Ширины строк настоящие только со сборкой `render`: без неё текст меряется
+    /// на глаз, и перенос ложится по другим словам.
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn text_wraps_and_a_scroll_box_knows_its_content() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<html><head><style>body{margin:8px;font:16px Arial}\
+             #sc{width:100px;height:40px;overflow:auto}#sc div{width:300px;height:200px}\
+             #wrap{width:120px}</style></head><body>\
+             <div id=\"sc\"><div>x</div></div>\
+             <p id=\"wrap\">one two three four five six seven eight nine ten</p>\
+             </body></html>",
+        )
+        .await
+        .unwrap();
+
+        let p = probe(
+            &ctx,
+            r#"(() => {
+              const q = (v) => Math.round(v * 1e4) / 1e4;
+              const sc = document.getElementById('sc');
+              const w = document.getElementById('wrap');
+              const r = document.createRange();
+              r.selectNodeContents(w.firstChild);
+              return __ptJSON.stringify({
+                scroll: [sc.clientWidth, sc.clientHeight, sc.scrollWidth, sc.scrollHeight],
+                wrap: [q(w.getBoundingClientRect().width), q(w.getBoundingClientRect().height)],
+                rects: [...r.getClientRects()].map((b) => [q(b.x), q(b.y), q(b.width), q(b.height)]),
+                tag: Object.prototype.toString.call(r.getClientRects()),
+                stack: document.elementsFromPoint(10, 70).map((n) => n.localName),
+              });
+            })()"#,
+        )
+        .await;
+
+        // Полоса прокрутки занимает пятнадцать пикселей, содержимое — 300×200.
+        assert_eq!(p["scroll"], serde_json::json!([85, 25, 300, 200]));
+        // Четыре строки по восемнадцать пикселей.
+        assert_eq!(p["wrap"], serde_json::json!([120, 72]));
+        assert_eq!(
+            p["rects"],
+            serde_json::json!([
+                [8, 64, 96.9531, 17],
+                [8, 82, 80.9219, 17],
+                [8, 100, 116.5313, 17],
+                [8, 118, 22.25, 17]
+            ]),
+            "one rectangle per line, exactly where Chrome puts them"
+        );
+        assert_eq!(p["tag"], "[object DOMRectList]");
+        assert_eq!(
+            p["stack"],
+            serde_json::json!(["p", "body", "html"]),
+            "the whole stack under the point, not just the topmost"
+        );
+    }
+
     /// Звуковой отпечаток — тот самый, который снимают все: треугольник на
     /// 10 кГц через компрессор со стандартными полями, сумма модулей отсчётов
     /// с 4500 по 5000. У Chrome 151 это 124.0435; у нас было 11.87, потому что

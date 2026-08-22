@@ -6799,6 +6799,15 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     else if (/pointer\s*:\s*coarse|hover\s*:\s*none/i.test(query)) matches = false;
     else if (/orientation\s*:\s*landscape/i.test(query)) matches = w >= h;
     else if (/orientation\s*:\s*portrait/i.test(query)) matches = w < h;
+    // Обычная вкладка — это `display-mode: browser`; мы отвечали «нет», то
+    // есть «страница открыта не в браузере». Остальные режимы — приложения.
+    else if (/display-mode\s*:\s*browser/i.test(query)) matches = true;
+    else if (/display-mode\s*:\s*(standalone|fullscreen|minimal-ui|window-controls-overlay|picture-in-picture)/i.test(query)) matches = false;
+    else if (/scripting\s*:\s*enabled/i.test(query)) matches = true;
+    else if (/update\s*:\s*fast/i.test(query)) matches = true;
+    else if (/color-gamut\s*:\s*srgb/i.test(query)) matches = true;
+    else if (/forced-colors\s*:\s*none/i.test(query)) matches = true;
+    else if (/inverted-colors\s*:\s*none/i.test(query)) matches = true;
     else {
       const maxW = num(/max-width\s*:\s*(\d+(?:\.\d+)?)px/i), minW = num(/min-width\s*:\s*(\d+(?:\.\d+)?)px/i);
       const maxH = num(/max-height\s*:\s*(\d+(?:\.\d+)?)px/i), minH = num(/min-height\s*:\s*(\d+(?:\.\d+)?)px/i);
