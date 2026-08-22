@@ -1919,6 +1919,8 @@
   const __cssValue = (prop, value) => {
     let v = __cssZero(__cssHex(String(value).trim().replace(/\s+/g, ' ')));
     if (prop === 'animation') return __cssAnimation(v);
+    // Список семейств браузер печатает с пробелом после запятой.
+    if (prop === 'font-family') return v.replace(/\s*,\s*/g, ', ');
     // Составляющие сокращённой записи, равные начальному значению, браузер не
     // печатает: `flex-flow: column nowrap` возвращается как `column`.
     if (prop === 'flex-flow') v = v.replace(/\s+nowrap$/, '');
@@ -3075,6 +3077,212 @@
                                         svgProto.get('SVGElement') || null;
   }
 
+
+  // Измерительные члены SVG. Интерфейсы у нас были правильные, а методов не
+  // было ни одного: `getBBox`, `getTotalLength`, `getPointAtLength`,
+  // `getScreenCTM`, `circle.cx` — всё бросало или отдавало пустоту. Это
+  // отдельный измерительный тракт, и им тоже снимают отпечаток: текст меряют
+  // не только холстом, но и рамкой `<text>`.
+  {
+    const P = (n) => (globalThis.__pt_svgProto ? __pt_svgProto(n) : null);
+    const wrap = (name, val) => {
+      const C = globalThis[name];
+      const o = C && C.prototype ? Object.create(C.prototype) : {};
+      try {
+        if (C && C.prototype && !Object.getOwnPropertyDescriptor(C.prototype, Symbol.toStringTag)) {
+          Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true });
+        }
+      } catch (e) {}
+      for (const [k, v] of Object.entries(val)) {
+        Object.defineProperty(o, k, { value: v, enumerable: true, configurable: true, writable: true });
+      }
+      return o;
+    };
+    const svgLength = (v) => wrap('SVGLength', {
+      unitType: 1, value: v, valueInSpecifiedUnits: v, valueAsString: String(v),
+      newValueSpecifiedUnits() {}, convertToSpecifiedUnits() {},
+    });
+    const animLength = (get) => wrap('SVGAnimatedLength', {
+      get baseVal() { return svgLength(get()); },
+      get animVal() { return svgLength(get()); },
+    });
+    const svgRect = (x, y, w, h) => wrap('SVGRect', { x, y, width: w, height: h });
+    const svgPoint = (x, y) => wrap('SVGPoint', { x, y, matrixTransform() { return svgPoint(x, y); } });
+    const svgMatrix = () => wrap('SVGMatrix', {
+      a: 1, b: 0, c: 0, d: 1, e: 0, f: 0,
+      multiply() { return svgMatrix(); }, inverse() { return svgMatrix(); },
+      translate() { return svgMatrix(); }, scale() { return svgMatrix(); },
+      rotate() { return svgMatrix(); }, flipX() { return svgMatrix(); }, flipY() { return svgMatrix(); },
+      skewX() { return svgMatrix(); }, skewY() { return svgMatrix(); },
+      scaleNonUniform() { return svgMatrix(); }, rotateFromVector() { return svgMatrix(); },
+    });
+    const num = (el, name, dflt) => {
+      const v = parseFloat(el.getAttribute && el.getAttribute(name));
+      return Number.isFinite(v) ? v : (dflt || 0);
+    };
+
+    // Разбор атрибута `d`: точки контура, по которым считаются и рамка, и
+    // длина. Кривые разбиваются на отрезки — так же поступает и браузер, только
+    // с меньшим шагом.
+    const pathPoints = (d) => {
+      const out = [];
+      const toks = String(d || '').match(/[MmLlHhVvCcSsQqTtAaZz]|-?[\d.]+(?:e-?\d+)?/g) || [];
+      let i = 0, x = 0, y = 0, sx = 0, sy = 0, cmd = '';
+      const n = () => parseFloat(toks[i++]) || 0;
+      const push = (px, py) => out.push([px, py]);
+      const bez = (x0, y0, x1, y1, x2, y2, x3, y3) => {
+        for (let t = 1; t <= 16; t++) {
+          const u = t / 16, m = 1 - u;
+          push(m*m*m*x0 + 3*m*m*u*x1 + 3*m*u*u*x2 + u*u*u*x3,
+               m*m*m*y0 + 3*m*m*u*y1 + 3*m*u*u*y2 + u*u*u*y3);
+        }
+      };
+      while (i < toks.length) {
+        if (/[A-Za-z]/.test(toks[i])) cmd = toks[i++];
+        const rel = cmd === cmd.toLowerCase();
+        const C = cmd.toUpperCase();
+        if (C === 'M') { const a = n(), b = n(); x = rel ? x + a : a; y = rel ? y + b : b; sx = x; sy = y; push(x, y); cmd = rel ? 'l' : 'L'; }
+        else if (C === 'L') { const a = n(), b = n(); x = rel ? x + a : a; y = rel ? y + b : b; push(x, y); }
+        else if (C === 'H') { const a = n(); x = rel ? x + a : a; push(x, y); }
+        else if (C === 'V') { const a = n(); y = rel ? y + a : a; push(x, y); }
+        else if (C === 'C') {
+          const x1 = n(), y1 = n(), x2 = n(), y2 = n(), x3 = n(), y3 = n();
+          const ax1 = rel ? x + x1 : x1, ay1 = rel ? y + y1 : y1;
+          const ax2 = rel ? x + x2 : x2, ay2 = rel ? y + y2 : y2;
+          const ax3 = rel ? x + x3 : x3, ay3 = rel ? y + y3 : y3;
+          bez(x, y, ax1, ay1, ax2, ay2, ax3, ay3); x = ax3; y = ay3;
+        } else if (C === 'Q') {
+          const x1 = n(), y1 = n(), x2 = n(), y2 = n();
+          const ax1 = rel ? x + x1 : x1, ay1 = rel ? y + y1 : y1;
+          const ax2 = rel ? x + x2 : x2, ay2 = rel ? y + y2 : y2;
+          bez(x, y, x + 2/3*(ax1-x), y + 2/3*(ay1-y), ax2 + 2/3*(ax1-ax2), ay2 + 2/3*(ay1-ay2), ax2, ay2);
+          x = ax2; y = ay2;
+        } else if (C === 'Z') { push(sx, sy); x = sx; y = sy; }
+        else { i++; }
+      }
+      return out;
+    };
+
+    const boxOfPoints = (pts) => {
+      if (!pts.length) return [0, 0, 0, 0];
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const [px, py] of pts) { x0 = Math.min(x0, px); y0 = Math.min(y0, py); x1 = Math.max(x1, px); y1 = Math.max(y1, py); }
+      return [x0, y0, x1 - x0, y1 - y0];
+    };
+    const lenOfPoints = (pts) => {
+      let L = 0;
+      for (let k = 1; k < pts.length; k++) L += Math.hypot(pts[k][0] - pts[k-1][0], pts[k][1] - pts[k-1][1]);
+      return L;
+    };
+    const outline = (el) => {
+      const t = (el.localName || '').toLowerCase();
+      if (t === 'path') return pathPoints(el.getAttribute('d'));
+      if (t === 'line') return [[num(el, 'x1'), num(el, 'y1')], [num(el, 'x2'), num(el, 'y2')]];
+      if (t === 'rect') { const x = num(el, 'x'), y = num(el, 'y'), w = num(el, 'width'), h = num(el, 'height');
+        return [[x, y], [x + w, y], [x + w, y + h], [x, y + h], [x, y]]; }
+      if (t === 'circle') { const cx = num(el, 'cx'), cy = num(el, 'cy'), r = num(el, 'r');
+        return [[cx - r, cy - r], [cx + r, cy + r]]; }
+      if (t === 'ellipse') { const cx = num(el, 'cx'), cy = num(el, 'cy'), rx = num(el, 'rx'), ry = num(el, 'ry');
+        return [[cx - rx, cy - ry], [cx + rx, cy + ry]]; }
+      if (t === 'polyline' || t === 'polygon') {
+        const nums = String(el.getAttribute('points') || '').match(/-?[\d.]+/g) || [];
+        const pts = []; for (let k = 0; k + 1 < nums.length; k += 2) pts.push([+nums[k], +nums[k+1]]);
+        return pts;
+      }
+      return [];
+    };
+
+    const graphics = P('SVGGraphicsElement');
+    const geometry = P('SVGGeometryElement');
+    const textContent = P('SVGTextContentElement');
+    const def = (proto, name, value) => {
+      if (!proto) return;
+      try { Object.defineProperty(proto, name, { value, writable: true, enumerable: true, configurable: true }); } catch (e) {}
+    };
+    const acc = (proto, name, get) => {
+      if (!proto) return;
+      try { Object.defineProperty(proto, name, { get, enumerable: true, configurable: true }); } catch (e) {}
+    };
+
+    def(graphics, 'getBBox', function getBBox() {
+      const t = (this.localName || '').toLowerCase();
+      if (t === 'text' || t === 'tspan') {
+        // Рамка текста: ширина — измеренная и округлённая вверх до
+        // шестьдесят четвёртой пикселя, подъём и высота — из метрик гарнитуры.
+        // Проверено на трёх кеглях.
+        const cs = getComputedStyle(this);
+        const fs = parseFloat(cs.fontSize) || 16;
+        const fam = cs.fontFamily || 'sans-serif';
+        const w = Math.ceil(__textWidth(this.textContent || '', fs, fam, false, false) * 64) / 64;
+        const fb = __fontBox(fs, fam);
+        return svgRect(num(this, 'x'), -fb.asc, w, fb.asc + fb.desc);
+      }
+      const kids = [...(this.__ptKids || [])].filter((k) => k.nodeType === ELEMENT_NODE);
+      if (!outline(this).length && kids.length) {
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        for (const k of kids) {
+          if (!k.getBBox) continue;
+          const b = k.getBBox();
+          x0 = Math.min(x0, b.x); y0 = Math.min(y0, b.y);
+          x1 = Math.max(x1, b.x + b.width); y1 = Math.max(y1, b.y + b.height);
+        }
+        if (x0 !== Infinity) return svgRect(x0, y0, x1 - x0, y1 - y0);
+      }
+      const [x, y, w, h] = boxOfPoints(outline(this));
+      return svgRect(x, y, w, h);
+    });
+    def(graphics, 'getCTM', function getCTM() { return svgMatrix(); });
+    def(graphics, 'getScreenCTM', function getScreenCTM() { return svgMatrix(); });
+    def(geometry, 'getTotalLength', function getTotalLength() { return lenOfPoints(outline(this)); });
+    def(geometry, 'getPointAtLength', function getPointAtLength(at) {
+      const pts = outline(this);
+      let left = Math.max(0, +at || 0);
+      for (let k = 1; k < pts.length; k++) {
+        const dx = pts[k][0] - pts[k-1][0], dy = pts[k][1] - pts[k-1][1];
+        const seg = Math.hypot(dx, dy);
+        if (left <= seg || k === pts.length - 1) {
+          const u = seg ? left / seg : 0;
+          return svgPoint(pts[k-1][0] + dx * u, pts[k-1][1] + dy * u);
+        }
+        left -= seg;
+      }
+      return svgPoint(pts.length ? pts[0][0] : 0, pts.length ? pts[0][1] : 0);
+    });
+    def(geometry, 'isPointInFill', function isPointInFill(pt) {
+      const [x, y, w, h] = boxOfPoints(outline(this));
+      const px = pt && pt.x || 0, py = pt && pt.y || 0;
+      return px >= x && px <= x + w && py >= y && py <= y + h;
+    });
+    def(geometry, 'isPointInStroke', function isPointInStroke(pt) { return this.isPointInFill(pt); });
+    acc(geometry, 'pathLength', function pathLength() { return animLength(() => num(this, 'pathLength')); });
+    def(textContent, 'getComputedTextLength', function getComputedTextLength() { return this.getBBox().width; });
+    def(textContent, 'getNumberOfChars', function getNumberOfChars() { return String(this.textContent || '').length; });
+
+    // Геометрические атрибуты — не строки, а `SVGAnimatedLength`.
+    const GEOM_ATTRS = {
+      SVGCircleElement: ['cx', 'cy', 'r'],
+      SVGEllipseElement: ['cx', 'cy', 'rx', 'ry'],
+      SVGRectElement: ['x', 'y', 'width', 'height', 'rx', 'ry'],
+      SVGLineElement: ['x1', 'y1', 'x2', 'y2'],
+      SVGSVGElement: ['x', 'y', 'width', 'height'],
+      SVGImageElement: ['x', 'y', 'width', 'height'],
+      SVGTextPositioningElement: ['x', 'y', 'dx', 'dy'],
+    };
+    for (const [iface, attrs] of Object.entries(GEOM_ATTRS)) {
+      const proto = P(iface) || (globalThis[iface] && globalThis[iface].prototype);
+      for (const a of attrs) acc(proto, a, function () { return animLength(() => num(this, a)); });
+    }
+    const svgEl = P('SVGSVGElement');
+    acc(svgEl, 'viewBox', function viewBox() {
+      const n = String(this.getAttribute('viewBox') || '').match(/-?[\d.]+/g) || [];
+      const r = svgRect(+n[0] || 0, +n[1] || 0, +n[2] || 0, +n[3] || 0);
+      return wrap('SVGAnimatedRect', { baseVal: r, animVal: r });
+    });
+    def(svgEl, 'createSVGPoint', function createSVGPoint() { return svgPoint(0, 0); });
+    def(svgEl, 'createSVGRect', function createSVGRect() { return svgRect(0, 0, 0, 0); });
+    def(svgEl, 'createSVGMatrix', function createSVGMatrix() { return svgMatrix(); });
+    def(svgEl, 'createSVGLength', function createSVGLength() { return svgLength(0); });
+  }
 
   // `hidden` — отражаемый атрибут HTMLElement: мы его читали внутри себя, но
   // наружу не отдавали вовсе, хотя в браузере он есть у каждого элемента.
@@ -4423,6 +4631,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     q: 'inline', s: 'inline', u: 'inline', sub: 'inline', sup: 'inline', mark: 'inline',
     time: 'inline', var: 'inline', samp: 'inline', kbd: 'inline', bdi: 'inline', bdo: 'inline',
     img: 'inline', iframe: 'inline', canvas: 'inline', video: 'inline', audio: 'inline',
+    circle: 'inline', path: 'inline', line: 'inline', g: 'inline', text: 'inline',
+    rect: 'inline', ellipse: 'inline', polyline: 'inline', polygon: 'inline',
     object: 'inline', embed: 'inline', svg: 'inline', input: 'inline-block',
     button: 'inline-block', select: 'inline-block', textarea: 'inline-block',
     meter: 'inline-block', progress: 'inline-block', li: 'list-item', table: 'table',
@@ -4434,6 +4644,53 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   };
   const CS_REPLACED_TAGS = new Set(['iframe', 'img', 'canvas', 'video', 'audio', 'object', 'embed']);
   const CS_CAMEL = (n) => n.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+
+  // Наследуемые свойства. У нас их не наследовал никто: `<div>` внутри `<body>`
+  // с заданным шрифтом отвечал шрифтом по умолчанию, то есть противоречил
+  // собственной странице. Список — из спецификации; проверен на Chrome по
+  // цвету, шрифту, высоте строки и выключке.
+  const CSS_INHERITED = new Set([
+    'azimuth', 'border-collapse', 'border-spacing', 'caption-side', 'caret-color',
+    'color', 'color-scheme', 'cursor', 'direction', 'empty-cells', 'font',
+    'font-family', 'font-feature-settings', 'font-kerning', 'font-language-override',
+    'font-optical-sizing', 'font-palette', 'font-size', 'font-size-adjust',
+    'font-stretch', 'font-style', 'font-synthesis-small-caps', 'font-synthesis-style',
+    'font-synthesis-weight', 'font-variant', 'font-variant-alternates',
+    'font-variant-caps', 'font-variant-east-asian', 'font-variant-emoji',
+    'font-variant-ligatures', 'font-variant-numeric', 'font-variant-position',
+    'font-variation-settings', 'font-weight', 'forced-color-adjust', 'hyphenate-character',
+    'hyphenate-limit-chars', 'hyphens', 'image-orientation', 'image-rendering',
+    'letter-spacing', 'line-break', 'line-height', 'list-style', 'list-style-image',
+    'list-style-position', 'list-style-type', 'math-depth', 'math-shift', 'math-style',
+    'orphans', 'overflow-wrap', 'paint-order', 'pointer-events', 'print-color-adjust',
+    'quotes', 'ruby-align', 'ruby-position', 'scrollbar-color', 'speak',
+    'tab-size', 'text-align', 'text-align-last', 'text-anchor', 'text-autospace',
+    'text-combine-upright', 'text-decoration-skip-ink', 'text-emphasis-color',
+    'text-emphasis-position', 'text-emphasis-style', 'text-indent', 'text-justify',
+    'text-orientation', 'text-rendering', 'text-shadow', 'text-size-adjust',
+    'text-spacing-trim', 'text-transform', 'text-underline-offset',
+    'text-underline-position', 'text-wrap-mode', 'text-wrap-style', 'visibility',
+    'white-space-collapse', 'widows', 'word-break', 'word-spacing', 'writing-mode',
+    'fill', 'fill-opacity', 'fill-rule', 'stroke', 'stroke-dasharray',
+    'stroke-dashoffset', 'stroke-linecap', 'stroke-linejoin', 'stroke-miterlimit',
+    'stroke-opacity', 'stroke-width', 'clip-rule', 'color-interpolation',
+    'color-rendering', 'dominant-baseline', 'marker-end', 'marker-mid', 'marker-start',
+    'shape-rendering', 'stop-color', 'stop-opacity', '-webkit-font-smoothing',
+    '-webkit-locale', '-webkit-text-fill-color', '-webkit-text-stroke-color',
+    '-webkit-text-stroke-width', '-webkit-rtl-ordering', '-webkit-line-break',
+    '-webkit-text-orientation', '-webkit-text-security', '-webkit-user-modify',
+    '-webkit-writing-mode', '-webkit-border-horizontal-spacing',
+    '-webkit-border-vertical-spacing', '-webkit-ruby-position',
+    '-webkit-tap-highlight-color', '-webkit-text-combine',
+  ]);
+  /// Значение наследуемого свойства: ближайший предок, который его назвал.
+  const __inheritedValue = (el, prop) => {
+    for (let e = el && el.parentNode; e && e.nodeType === ELEMENT_NODE; e = e.parentNode) {
+      const raw = __cascadeFor(e).get(prop);
+      if (raw != null) return __resolveLength(raw, prop, __usedFontSize(e), e);
+    }
+    return null;
+  };
 
   globalThis.getComputedStyle = (el, pseudo) => {
     const map = new Map();
@@ -4462,6 +4719,12 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       __relayout();
       const cascade = el ? __cascadeFor(el) : new Map();
       const fs = el ? __usedFontSize(el) : 16;
+      // Сначала унаследованное от предков, потом своё поверх.
+      for (const prop of CSS_INHERITED) {
+        if (cascade.has(prop)) continue;
+        const v = __inheritedValue(el, prop);
+        if (v != null) map.set(prop, v);
+      }
       for (const [n, raw] of cascade) {
         const v = __resolveLength(raw, n, fs, el);
         map.set(n, v);
