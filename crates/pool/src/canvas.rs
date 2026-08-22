@@ -322,6 +322,80 @@ pub fn draw_image(id: u32, url: &str, dx: f32, dy: f32, dw: f32, dh: f32) -> boo
     })
 }
 
+/// `drawImage(sourceCanvas, …)` — один холст на другом. Браузер принимает
+/// холстом всё, у чего есть пиксели: элемент, `OffscreenCanvas`, `ImageBitmap`,
+/// — а у нас `drawImage` их отвергал, хотя собственный текст ошибки перечислял
+/// их среди допустимых. Сборщик Cloudflare рисует так свой `OffscreenCanvas` и
+/// получал исключение вместо картинки.
+pub fn blit(dst_id: u32, src_id: u32, dx: f32, dy: f32, dw: f32, dh: f32) -> bool {
+    if dst_id == src_id {
+        return false;
+    }
+    // Пиксели источника снимаются заранее: две записи в одну карту сразу не
+    // взять, а копия здесь короче, чем разделение хранилища.
+    let src = CANVASES.with(|c| {
+        c.borrow().get(&src_id).map(|pm| {
+            (
+                pm.width() as i64,
+                pm.height() as i64,
+                pm.data().to_vec(),
+            )
+        })
+    });
+    let Some((sw, sh, src)) = src else {
+        return false;
+    };
+    if sw <= 0 || sh <= 0 {
+        return false;
+    }
+    let dw = if dw > 0.0 { dw.round() as i64 } else { sw };
+    let dh = if dh > 0.0 { dh.round() as i64 } else { sh };
+    if dw <= 0 || dh <= 0 {
+        return false;
+    }
+    CANVASES.with(|c| {
+        let mut c = c.borrow_mut();
+        let Some(pm) = c.get_mut(&dst_id) else {
+            return false;
+        };
+        let (cw, ch) = (pm.width() as i64, pm.height() as i64);
+        let dst = pm.pixels_mut();
+        let (ox, oy) = (dx.round() as i64, dy.round() as i64);
+        for ty in 0..dh {
+            let py = oy + ty;
+            if py < 0 || py >= ch {
+                continue;
+            }
+            let sy = (ty * sh / dh).clamp(0, sh - 1);
+            for tx in 0..dw {
+                let px = ox + tx;
+                if px < 0 || px >= cw {
+                    continue;
+                }
+                let sx = (tx * sw / dw).clamp(0, sw - 1);
+                let si = ((sy * sw + sx) * 4) as usize;
+                // Источник уже помножен на альфу — как и приёмник, — поэтому
+                // складываем по «source-over» прямо в этом виде.
+                let (sr, sg, sb, sa) = (src[si], src[si + 1], src[si + 2], src[si + 3]);
+                let di = (py * cw + px) as usize;
+                let old = dst[di];
+                let inv = 255 - sa as u16;
+                let over = |s: u8, d: u8| -> u8 {
+                    (s as u16 + (d as u16 * inv + 127) / 255).min(255) as u8
+                };
+                dst[di] = tiny_skia::PremultipliedColorU8::from_rgba(
+                    over(sr, old.red()),
+                    over(sg, old.green()),
+                    over(sb, old.blue()),
+                    over(sa, old.alpha()),
+                )
+                .unwrap_or(old);
+            }
+        }
+        true
+    })
+}
+
 /// Straight alpha to premultiplied, the form tiny-skia stores.
 fn mul(c: u8, a: u8) -> u8 {
     ((u16::from(c) * u16::from(a) + 127) / 255) as u8

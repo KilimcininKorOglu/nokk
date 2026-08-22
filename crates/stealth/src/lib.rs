@@ -4870,6 +4870,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         __pt_canvasFillRect(id, x, y, w, h, v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, 48);
       },
       put(data, x, y, w, h) { sync(); __pt_canvasPutImageData(id, x, y, w, h, data); },
+      id() { sync(); return id; },
+      // Один холст на другом: пиксели переносит движок, с масштабированием и
+      // наложением по альфе, как это делает браузер.
+      blit(srcId, dx, dy, dw, dh) {
+        sync();
+        if (typeof __pt_canvasBlit !== 'function' || !srcId) return false;
+        try { return !!__pt_canvasBlit(id, srcId, dx, dy, dw, dh); } catch (e) { return false; }
+      },
       read(x, y, w, h, dst) {
         sync();
         const b = __pt_canvasGetImageData(id, x | 0, y | 0, w | 0, h | 0);
@@ -5073,6 +5081,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
   const make2DContext = (canvas) => {
     const S = makeSurface(canvas);
+    // Пометка для `drawImage`: по холсту надо уметь найти его пиксели. Скрытая,
+    // как и всё наше, — страница её не перечислит.
+    try { Object.defineProperty(canvas, '__ptSurf', { value: S, configurable: true }); } catch (e) {}
     const note = S.note, solid = S.solid, stamp = S.stamp;
     let bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;     // current path bounding box
     let tainted = false;                        // shown something from elsewhere
@@ -5265,7 +5276,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         // текст у него длинный и дословный.
         const drawable = img && (img.localName === 'img' || img.localName === 'canvas' ||
           img.localName === 'video' || img.__ptC2d || img.__ptGl1 || img.__ptGl2 ||
-          typeof img.src === 'string' || img.__ptImageBitmap);
+          typeof img.src === 'string' || img.__ptImageBitmap || img.__ptO || img.__ptSurf);
         if (!drawable) {
           throw new TypeError("Failed to execute 'drawImage' on 'CanvasRenderingContext2D': " +
             "The provided value is not of type '(CSSImageValue or HTMLCanvasElement or " +
@@ -5278,6 +5289,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         // холст обратно, должна увидеть картинку. Челлендж именно так читает
         // присланный им маячок. Штамп остаётся на случай, когда декодировать
         // нечего — чужой формат, `blob:`, другой холст.
+        // Другой холст рисуется своими пикселями, а не штампом: `OffscreenCanvas`
+        // держит настоящий элемент внутри, `ImageBitmap` — свою поверхность.
+        const from = img && (img.__ptSurf
+          || (img.__ptO && img.__ptO.c && img.__ptO.c.__ptSurf)
+          || (img.__ptImageBitmap && img.__ptImageBitmap.surf));
+        if (from && S.blit && S.blit(from.id(), x || 0, y || 0, w || 0, h || 0)) return;
         const src = img && (img.currentSrc || img.src);
         if (src && S.image && S.image(src, x || 0, y || 0, w || 0, h || 0)) return;
         stamp(x || 0, y || 0, w || (img && img.width) || 32, h || (img && img.height) || 32);

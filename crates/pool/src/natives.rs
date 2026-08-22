@@ -70,6 +70,7 @@ pub fn install(scope: &mut v8::PinScope) {
         bind(scope, "__pt_fsRead", fs_read);
         bind(scope, "__pt_fsClose", fs_close);
         bind(scope, "__pt_canvasDrawImage", canvas_draw_image);
+        bind(scope, "__pt_canvasBlit", canvas_blit);
     }
 
     // Optional real WebGL (the `webgl` feature) — a headless Mesa GL context. Their
@@ -385,6 +386,22 @@ fn canvas_draw_image(
     let dw = arg_f32(scope, args.get(4));
     let dh = arg_f32(scope, args.get(5));
     rv.set_bool(crate::canvas::draw_image(id, &url, dx, dy, dw, dh));
+}
+
+/// `__pt_canvasBlit(dstId, srcId, dx, dy, dw, dh)` → true when it was drawn.
+#[cfg(feature = "render")]
+fn canvas_blit(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let dst = arg_usize(scope, args.get(0)) as u32;
+    let src = arg_usize(scope, args.get(1)) as u32;
+    let dx = arg_f32(scope, args.get(2));
+    let dy = arg_f32(scope, args.get(3));
+    let dw = arg_f32(scope, args.get(4));
+    let dh = arg_f32(scope, args.get(5));
+    rv.set_bool(crate::canvas::blit(dst, src, dx, dy, dw, dh));
 }
 
 /// Standard base64, decoded here so no crate feature has to reach the isolate.

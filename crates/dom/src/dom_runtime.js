@@ -1785,7 +1785,18 @@
     set height(v) { this.__ptO.h = v | 0; if (this.__ptO.c) this.__ptO.c.height = v | 0; }
     getContext(type, attrs) { const c = this.__ptO.c; return c ? c.getContext(type, attrs) : null; }
     convertToBlob(opts) { return Promise.resolve(new Blob([], { type: (opts && opts.type) || 'image/png' })); }
-    transferToImageBitmap() { return {}; }
+    // Настоящий ImageBitmap: он должен нести пиксели холста, иначе `drawImage`
+    // им рисует пустоту. Возвращался пустой объект — сборщик отпечатков
+    // получал из него ничего.
+    transferToImageBitmap() {
+      const c = this.__ptO.c;
+      const b = Object.create((globalThis.ImageBitmap && globalThis.ImageBitmap.prototype) || Object.prototype);
+      Object.defineProperty(b, '__ptImageBitmap', { value: { surf: c && c.__ptSurf } });
+      Object.defineProperty(b, 'width', { value: this.__ptO.w, enumerable: true });
+      Object.defineProperty(b, 'height', { value: this.__ptO.h, enumerable: true });
+      Object.defineProperty(b, 'close', { value: function close() {}, writable: true, configurable: true });
+      return b;
+    }
   }
 
   globalThis.Worker = Worker;

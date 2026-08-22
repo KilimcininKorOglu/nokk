@@ -5555,6 +5555,60 @@ mod tests {
         }
     }
 
+    /// `drawImage` рисует всем, чем рисует браузер. Он отвергал
+    /// `OffscreenCanvas` и `ImageBitmap` — притом что собственный текст ошибки
+    /// перечислял их среди допустимых, — а холст-источник подменял штампом
+    /// вместо пикселей. Сборщик Cloudflare рисует так свой `OffscreenCanvas`, и
+    /// в трассировке это было видно как `THROW ctx2d.drawImage(...)`. Пиксели
+    /// настоящие только со сборкой `render`; без неё холст отвечает штампом.
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn draw_image_takes_every_source_a_browser_takes() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+
+        let p = probe(
+            &ctx,
+            r#"(() => {
+              const px = (x, c, i, j) => Array.from(x.getImageData(i, j, 1, 1).data).join(',');
+              const off = new OffscreenCanvas(16, 16);
+              const oc = off.getContext('2d');
+              oc.fillStyle = '#f00'; oc.fillRect(0, 0, 16, 16);
+              const el = document.createElement('canvas');
+              el.width = 8; el.height = 8;
+              const ec = el.getContext('2d');
+              ec.fillStyle = '#00f'; ec.fillRect(0, 0, 8, 8);
+              const c = document.createElement('canvas');
+              c.width = 48; c.height = 48;
+              const x = c.getContext('2d');
+              const out = { threw: [] };
+              const draw = (what, src, dx, dy) => {
+                try { x.drawImage(src, dx, dy); } catch (e) { out.threw.push(what + ': ' + e.name); }
+              };
+              draw('offscreen', off, 0, 0);
+              draw('bitmap', off.transferToImageBitmap(), 16, 16);
+              draw('canvas', el, 0, 32);
+              out.offscreen = px(x, 0, 4, 4);
+              out.bitmap = px(x, 0, 20, 20);
+              out.canvas = px(x, 0, 2, 34);
+              out.bitmapIsBitmap = Object.prototype.toString.call(off.transferToImageBitmap());
+              return __ptJSON.stringify(out);
+            })()"#,
+        )
+        .await;
+
+        assert_eq!(
+            p["threw"],
+            serde_json::json!([]),
+            "a source a browser accepts was refused"
+        );
+        assert_eq!(p["offscreen"], "255,0,0,255", "OffscreenCanvas pixels did not arrive");
+        assert_eq!(p["bitmap"], "255,0,0,255", "ImageBitmap pixels did not arrive");
+        assert_eq!(p["canvas"], "0,0,255,255", "canvas pixels did not arrive");
+        assert_eq!(p["bitmapIsBitmap"], "[object ImageBitmap]");
+    }
+
     /// `performance.memory` — показания, а не три постоянные величины. Три
     /// константы стояли здесь и не двигались ни на байт: страница, которая
     /// выделяет память и перечитывает `usedJSHeapSize`, в браузере видит
