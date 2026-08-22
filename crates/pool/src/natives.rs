@@ -269,8 +269,17 @@ fn canvas_measure_text(
     let bold = args.get(3).boolean_value(scope);
     let italic = args.get(4).boolean_value(scope);
     let m = crate::canvas::measure_text(&text, size, &families, bold, italic);
-    let out = v8::Array::new(scope, 7);
-    for (i, v) in [m.width, m.left, m.right, m.ascent, m.descent, m.font_ascent, m.font_descent]
+    let out = v8::Array::new(scope, 8);
+    for (i, v) in [
+        m.width,
+        m.left,
+        m.right,
+        m.ascent,
+        m.descent,
+        m.font_ascent,
+        m.font_descent,
+        m.line,
+    ]
         .into_iter()
         .enumerate()
     {

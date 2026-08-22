@@ -1203,16 +1203,19 @@
     get parentElement() { const p = this.parentNode; return p && p.nodeType === ELEMENT_NODE ? p : null; }
     // Layout-metric accessors derived from the synthetic box. `documentElement`'s
     // client size is the viewport (drivers clamp click boxes to it).
-    get clientWidth() { const d = this.ownerDocument || globalThis.document; if (d && this === d.documentElement) return LAYOUT.W; const b = __boxOf(this); return b ? b.w : 0; }
-    get clientHeight() { const d = this.ownerDocument || globalThis.document; if (d && this === d.documentElement) return LAYOUT.H; const b = __boxOf(this); return b ? b.h : 0; }
+    // `clientWidth` — поле содержимого вместе с отступами, но без рамок, и
+    // целым числом; `offsetWidth` — то же с рамками. Раньше оба отдавали одну
+    // и ту же коробку, и элемент с рамкой отвечал на них одинаково.
+    get clientWidth() { const d = this.ownerDocument || globalThis.document; if (d && this === d.documentElement) return LAYOUT.W; const b = __boxOf(this); return b ? Math.round(b.w - b.bx) : 0; }
+    get clientHeight() { const d = this.ownerDocument || globalThis.document; if (d && this === d.documentElement) return LAYOUT.H; const b = __boxOf(this); return b ? Math.round(b.h - b.by) : 0; }
     get clientTop() { return 0; }
     get clientLeft() { return 0; }
     get scrollWidth() { return this.clientWidth; }
     get scrollHeight() { return this.clientHeight; }
     get scrollTop() { return 0; }
     get scrollLeft() { return 0; }
-    get offsetWidth() { const b = __boxOf(this); return b ? b.w : 0; }
-    get offsetHeight() { const b = __boxOf(this); return b ? b.h : 0; }
+    get offsetWidth() { const b = __boxOf(this); return b ? Math.round(b.w) : 0; }
+    get offsetHeight() { const b = __boxOf(this); return b ? Math.round(b.h) : 0; }
     get offsetTop() { const b = __boxOf(this); return b ? b.y : 0; }
     get offsetLeft() { const b = __boxOf(this); return b ? b.x : 0; }
     get offsetParent() { return __boxOf(this) ? this.parentElement : null; }
@@ -3234,7 +3237,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   };
   let __layoutSeq = 0;      // bumped on every DOM mutation
   let __layoutBuilt = -1;   // __layoutSeq the current boxes were built at
-  let __rows = [];          // row index → element occupying it
+  let __rows = [];          // элементы в порядке наложения
+  let __boxes = [];         // то же, для поиска попадания в точку
   let __mouseDownEl = null;
   let __hoverEl = null; // element the pointer is currently over
 
@@ -3659,7 +3663,21 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       cloneRange() { const c = __range(); c.setStart(start, startOff); c.setEnd(end, endOff); return c; },
       detach() {},
       toString() { return ''; },
-      getBoundingClientRect() { return { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0 }; },
+      // Страницы меряют текст через диапазон — это второй по ходовости способ
+      // после `measureText`, — а он отвечал нулями, то есть «текста нет».
+      getBoundingClientRect() {
+        const node = start;
+        const el = node && node.nodeType === ELEMENT_NODE ? node
+                 : (node && node.parentNode) || null;
+        if (!el || el.nodeType !== ELEMENT_NODE) {
+          return { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0 };
+        }
+        const b = __boxOf(el);
+        if (!b) return { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0 };
+        return { x: b.cx, y: b.cy, left: b.cx, top: b.cy,
+                 right: b.cx + b.cw, bottom: b.cy + b.ch,
+                 width: b.cw, height: b.ch };
+      },
       getClientRects() { return []; },
       deleteContents() {}, extractContents() { return document.createDocumentFragment(); },
       cloneContents() { return document.createDocumentFragment(); },
@@ -3817,38 +3835,327 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return false;
   }
 
-  // Минимальный CSS: из таблиц берём только правила, которые прячут. Полного
-  // каскада у нас нет, но `display:none` игнорировать нельзя — спрятанный
-  // классом блок занимал строку, и содержимое виджета выходило втрое выше
-  // настоящего, а точка клика уезжала мимо.
-  const __HIDE_RE = /(?:^|[;{])\s*(?:display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse))\s*(?:;|$)/i;
+  // Каскад. Раньше из таблиц вычитывались одним регулярным выражением только
+  // правила, которые прячут, — всё остальное страница объявляла впустую:
+  // `getComputedStyle` элемента с `width: 200px` в таблице отвечал шириной
+  // окна, противореча собственному CSS страницы. Теперь правила разбираются
+  // по-настоящему: селекторы сопоставляются, специфичность считается, а
+  // объявления накладываются в порядке возрастания веса.
+  const __SPEC_ATTR = /\[[^\]]*\]/g;
+  function __specificity(sel) {
+    const s = String(sel).replace(__SPEC_ATTR, '[]');
+    const ids = (s.match(/#[\w-]+/g) || []).length;
+    const cls = (s.match(/\.[\w-]+|\[\]|:(?!:)[a-zA-Z-]+/g) || []).length;
+    const tags = (s.match(/(?:^|[\s>+~])([a-zA-Z][\w-]*)/g) || []).length
+               + (s.match(/::[\w-]+/g) || []).length;
+    return ids * 10000 + cls * 100 + tags;
+  }
+
+  // Условие @media: считаем то, что действительно влияет на размеры, — ширину
+  // и высоту окна. Про остальное честнее ответить «нет», чем применить наугад.
+  function __mediaApplies(cond) {
+    const c = String(cond || '').toLowerCase().trim();
+    if (!c || c === 'all' || c === 'screen') return true;
+    if (/print|speech/.test(c)) return false;
+    if (/prefers-color-scheme:\s*dark/.test(c)) return false;
+    if (/prefers-reduced-motion:\s*reduce/.test(c)) return false;
+    let ok = true;
+    const px = (v) => parseFloat(v) || 0;
+    for (const m of c.matchAll(/\((min|max)-(width|height):\s*([\d.]+)px\)/g)) {
+      const have = m[2] === 'width' ? LAYOUT.W : LAYOUT.H;
+      ok = ok && (m[1] === 'min' ? have >= px(m[3]) : have <= px(m[3]));
+    }
+    return ok;
+  }
+
+  let __rules = [];                       // {root, sel, spec, order, style}
+  let __styleCache = new WeakMap();
   let __hiddenBySheet = new WeakSet();
+
   function __collectHidden() {
+    __rules = [];
+    __styleCache = new WeakMap();
     __hiddenBySheet = new WeakSet();
-    const sheets = [];
-    const scan = (node, root) => {
-      for (const n of (node.__ptKids || [])) {
-        if (n.nodeType !== ELEMENT_NODE) continue;
-        if (n.tagName === 'STYLE') sheets.push([root, n.textContent || '']);
-        if (n.__ptShadow) scan(n.__ptShadow, n.__ptShadow);
-        scan(n, root);
-      }
-    };
     const doc = globalThis.document;
     if (!doc || !doc.documentElement) return;
-    scan(doc.documentElement, doc.documentElement);
-    for (const [root, css] of sheets) {
-      for (const chunk of String(css).split('}')) {
-        const brace = chunk.indexOf('{');
-        if (brace < 0) continue;
-        const sel = chunk.slice(0, brace).trim();
-        // `@media` и прочие блочные правила пропускаем целиком: применить их
-        // мы не умеем, а «не спрятано» — безопасная сторона ошибки.
-        if (!sel || sel.charCodeAt(0) === 64) continue;
-        if (!__HIDE_RE.test(chunk.slice(brace + 1))) continue;
-        try { for (const el of query(root, sel)) __hiddenBySheet.add(el); } catch (e) {}
+    let order = 0;
+    const take = (root, rules) => {
+      for (const r of rules || []) {
+        if (r.type === 4 || r.type === 12) {          // @media / @supports
+          if (r.type !== 4 || __mediaApplies(r.conditionText)) take(root, r.cssRules);
+          continue;
+        }
+        if (r.type !== 1 || !r.selectorText) continue;
+        for (const one of String(r.selectorText).split(',')) {
+          const sel = one.trim();
+          if (!sel) continue;
+          __rules.push({ root, sel, spec: __specificity(sel), order: order++, style: r.style });
+        }
+      }
+    };
+    const sheetsOf = (node, root) => {
+      for (const n of (node.__ptKids || [])) {
+        if (n.nodeType !== ELEMENT_NODE) continue;
+        if (n.tagName === 'STYLE' && n.sheet) take(root, n.sheet.cssRules);
+        if (n.__ptShadow) sheetsOf(n.__ptShadow, n.__ptShadow);
+        sheetsOf(n, root);
+      }
+    };
+    sheetsOf(doc.documentElement, doc.documentElement);
+    // Спрятанное собирается тем же проходом: скрытие — просто одно из
+    // объявлений, и отдельного правила для него больше не нужно.
+    for (const r of __rules) {
+      const d = r.style;
+      if (!d) continue;
+      const disp = String(d.getPropertyValue('display') || '').toLowerCase();
+      const vis = String(d.getPropertyValue('visibility') || '').toLowerCase();
+      if (disp !== 'none' && vis !== 'hidden' && vis !== 'collapse') continue;
+      try { for (const el of query(r.root, r.sel)) __hiddenBySheet.add(el); } catch (e) {}
+    }
+  }
+
+  /// Объявления, дошедшие до элемента: сначала таблицы по весу, потом его
+  /// собственный атрибут `style`.
+  function __cascadeFor(el) {
+    if (!el || el.nodeType !== ELEMENT_NODE) return new Map();
+    const hit = __styleCache.get(el);
+    if (hit) return hit;
+    const out = new Map();
+    const won = [];
+    for (const r of __rules) {
+      let ok = false;
+      try { ok = matchesSelector(el, r.sel); } catch (e) {}
+      if (ok) won.push(r);
+    }
+    won.sort((a, b) => (a.spec - b.spec) || (a.order - b.order));
+    for (const r of won) {
+      const d = r.style;
+      for (let i = 0; i < d.length; i++) {
+        const n = d.item(i);
+        out.set(n, d.getPropertyValue(n));
       }
     }
+    const own = el.style;
+    if (own) for (let i = 0; i < own.length; i++) out.set(own.item(i), own.getPropertyValue(own.item(i)));
+    __styleCache.set(el, out);
+    return out;
+  }
+
+  // Раскладка. Была строчная модель: каждый лист занимал двадцать пикселей, а
+  // ширину брал во всё окно, — и любой элемент отвечал одним и тем же размером
+  // независимо от своего CSS. Теперь считается обычный блочный поток: отступы,
+  // рамки, поля, проценты и `em` от кегля, ширина строки — из метрик гарнитуры.
+  // Точность браузера здесь не самоцель, но числа читает сборщик отпечатков, и
+  // элемент шириной во всё окно там, где в стиле написано двести пикселей, —
+  // это не приблизительность, а противоречие.
+  const __BLOCKISH = /^(block|flow-root|list-item|table|flex|grid|table-cell|table-row|table-caption)$/;
+  const __INLINEISH = /^(inline|inline-block|inline-flex|inline-grid|inline-table)$/;
+
+  function __lengthPx(raw, fs, base) {
+    if (raw == null) return null;
+    const v = String(raw).trim();
+    let m;
+    if ((m = /^(-?[\d.]+)px$/.exec(v))) return parseFloat(m[1]);
+    if ((m = /^(-?[\d.]+)$/.exec(v))) return parseFloat(m[1]);
+    if ((m = /^(-?[\d.]+)(em|rem)$/.exec(v))) return parseFloat(m[1]) * (m[2] === 'rem' ? 16 : fs);
+    if ((m = /^(-?[\d.]+)pt$/.exec(v))) return parseFloat(m[1]) * 4 / 3;
+    if ((m = /^(-?[\d.]+)%$/.exec(v))) {
+      return base == null ? null : Math.round(parseFloat(m[1]) / 100 * base * 64) / 64;
+    }
+    return null;
+  }
+
+  // Высота строки при `line-height: normal` и подъём до базовой линии — из
+  // самой гарнитуры, а не из доли кегля: у Liberation Sans строка это 1,15
+  // кегля, у другой гарнитуры своё.
+  function __fontBox(fs, family) {
+    if (typeof __pt_canvasMeasureText === 'function') {
+      try {
+        const m = __pt_canvasMeasureText('', fs, family || 'sans-serif', false, false);
+        return { line: Math.round(m[7] || fs * 1.15), asc: m[5] || Math.round(fs * 0.9) };
+      } catch (e) {}
+    }
+    return { line: Math.round(fs * 1.15), asc: Math.round(fs * 0.9) };
+  }
+  const __normalLine = (fs, family) => __fontBox(fs, family).line;
+
+  function __textWidth(text, fs, family, bold, italic) {
+    if (typeof __pt_canvasMeasureText === 'function') {
+      try { return __pt_canvasMeasureText(String(text), fs, family || 'sans-serif', !!bold, !!italic)[0] || 0; }
+      catch (e) {}
+    }
+    return String(text).length * fs * 0.5;
+  }
+
+  const __OWN_TEXT = (el) => {
+    let t = '';
+    for (const c of (el.__ptKids || [])) if (c.nodeType === TEXT_NODE) t += c.data || '';
+    return t.replace(/\s+/g, ' ').trim();
+  };
+
+  // Размеры, которые элементам даёт сам движок браузера, а не страница. Сняты
+  // с Chrome 151: флажок 13×13, поле ввода 177×15 в рамке 2 и отступе 2/1,
+  // кнопка сжимается по надписи с отступом 6/1. У полей формы свой кегль —
+  // 13,3333 пикселя, — и без него надписи на кнопках меряются не тем.
+  const UA_FORM_FONT = 13.3333;
+  function __uaBox(el, tag) {
+    if (tag === 'input') {
+      const t = String((el.getAttribute && el.getAttribute('type')) || 'text').toLowerCase();
+      if (t === 'checkbox') return { w: 13, h: 13, p: [0, 0], b: 0, m: [3, 3] };
+      if (t === 'radio') return { w: 13, h: 13, p: [0, 0], b: 0, m: [3, 3] };
+      if (t === 'range') return { w: 129, h: 16, p: [0, 0], b: 0, m: [2, 2] };
+      if (t === 'file') return { w: 253, h: 21, p: [0, 0], b: 0, m: [0, 0] };
+      if (t === 'submit' || t === 'button' || t === 'reset') {
+        // Ненадписанная кнопка отправки подписана движком, а не страницей.
+        const dflt = t === 'submit' ? 'Submit' : t === 'reset' ? 'Reset' : '';
+        return { label: true, dflt, h: 15, p: [1, 6], b: 2, m: [0, 0] };
+      }
+      if (t === 'hidden') return null;
+      return { w: 177, h: 15, p: [1, 2], b: 2, m: [0, 0] };
+    }
+    if (tag === 'button') return { label: true, h: 15, p: [1, 6], b: 2, m: [0, 0] };
+    // У списка размер задан по внешней рамке, а не по содержимому.
+    if (tag === 'select') return { w: 28, h: 17, p: [0, 0], b: 1, m: [0, 0] };
+    if (tag === 'textarea') return { w: 195, h: 36, p: [2, 2], b: 1, m: [0, 0] };
+    if (tag === 'iframe') return { w: 300, h: 150, p: [0, 0], b: 2, m: [0, 0] };
+    if (tag === 'img' || tag === 'canvas' || tag === 'video') return { w: 0, h: 0, p: [0, 0], b: 0, m: [0, 0] };
+    return null;
+  }
+
+  function __layoutOne(el, originX, originY, availW, strut) {
+    // В порядке документа, не после детей: попадание в точку ищется с конца
+    // списка, и глубокий элемент должен стоять там позже своего родителя.
+    __boxes.push(el);
+    const cs = __cascadeFor(el);
+    const fs = __usedFontSize(el);
+    const tag = (el.localName || '').toLowerCase();
+    const family = String(cs.get('font-family') || (cs.get('font') || '')).trim() || 'sans-serif';
+    const bold = /(^|\s)(bold|[5-9]00)(\s|$)/i.test(String(cs.get('font-weight') || cs.get('font') || ''));
+    const len = (name, base) => __lengthPx(cs.get(name), fs, base);
+    const side = (prefix, suffix) => {
+      const all = cs.get(prefix);
+      const one = ['top', 'right', 'bottom', 'left'].map((k) => len(prefix + '-' + k, availW));
+      if (all != null) {
+        const parts = String(all).trim().split(/\s+/);
+        const pick = (i) => parts[[0, 1, 2, 3].map((k) => Math.min(k, parts.length - 1))[i]];
+        ['top', 'right', 'bottom', 'left'].forEach((k, i) => {
+          if (one[i] == null) one[i] = __lengthPx(pick(i), fs, availW);
+        });
+      }
+      return one.map((v) => v || 0);
+    };
+    let [mt, mr, mb, ml] = side('margin');
+    let [pt_, pr, pb, pl] = side('padding');
+    let [bt, br, bb, bl] = ['top', 'right', 'bottom', 'left']
+      .map((k) => len('border-' + k + '-width', availW) || 0);
+    const borderAll = cs.get('border') || cs.get('border-width');
+    if (borderAll != null && !bt && !br && !bb && !bl) {
+      const m = /(-?[\d.]+)px/.exec(String(borderAll));
+      const w = m && !/\bnone\b/.test(String(borderAll)) ? parseFloat(m[1]) : 0;
+      bt = br = bb = bl = w;
+    }
+    const display = String(cs.get('display') || CS_DISPLAY[tag] || 'block').toLowerCase();
+    const inlineish = __INLINEISH.test(display);
+    const position = String(cs.get('position') || 'static').toLowerCase();
+
+    const ua = __uaBox(el, tag);
+    if (ua) {
+      if (!pt_ && !pb && ua.p) { pt_ = ua.p[0]; pb = ua.p[0]; }
+      if (!pl && !pr && ua.p) { pl = ua.p[1]; pr = ua.p[1]; }
+      if (!bt && !br && !bb && !bl && ua.b) { bt = br = bb = bl = ua.b; }
+      if (!mt && !mb && ua.m) { mt = ua.m[0]; mb = ua.m[0]; }
+      if (!ml && !mr && ua.m) { ml = ua.m[1]; mr = ua.m[1]; }
+    }
+    const explicitW = len('width', availW);
+    const explicitH = len('height', availW);
+    const frame = tag === 'iframe' || tag === 'img' || tag === 'canvas' || tag === 'video';
+    const attrW = frame && el.getAttribute ? __lengthPx(el.getAttribute('width'), fs, availW) : null;
+    const attrH = frame && el.getAttribute ? __lengthPx(el.getAttribute('height'), fs, availW) : null;
+
+    let cw = explicitW != null ? explicitW : attrW;
+    if (cw == null && ua) {
+      cw = ua.label
+        ? __textWidth((el.getAttribute && el.getAttribute('value')) || __OWN_TEXT(el) || ua.dflt || '',
+                      fs, family, bold, false)
+        : ua.w;
+    }
+    if (cw == null && !inlineish) cw = Math.max(0, availW - ml - mr - bl - br - pl - pr);
+
+    let boxX = originX + ml, boxY = originY + mt;
+    if (position === 'absolute' || position === 'fixed') {
+      const left = len('left', availW), top = len('top', availW);
+      if (left != null) boxX = left;
+      if (top != null) boxY = top;
+    }
+
+    const kids = [];
+    if (el.__ptShadow) for (const c of el.__ptShadow.__ptKids) kids.push(c);
+    for (const c of (el.__ptKids || [])) kids.push(c);
+    const boxedKids = kids.filter((c) => c.nodeType === ELEMENT_NODE && !__isHiddenEl(c));
+
+    // Строчный элемент сжимается по содержимому: по детям, а если их нет — по
+    // собственному тексту, измеренному настоящей гарнитурой.
+    if (cw == null) {
+      cw = boxedKids.length ? 0 : __textWidth(__OWN_TEXT(el), fs, family, bold, false);
+    }
+
+    const fbox = __fontBox(fs, family);
+    const lineH = fbox.line;
+    const contentX = boxX + bl + pl, contentY = boxY + bt + pt_;
+    let y = contentY, widest = 0;
+    for (const c of boxedKids) {
+      const cb = __layoutOne(c, contentX, y, cw, fbox);
+      if (!cb) continue;
+      widest = Math.max(widest, cb.x - contentX + cb.w);
+      const cpos = String(__cascadeFor(c).get('position') || 'static').toLowerCase();
+      if (cpos === 'absolute' || cpos === 'fixed') continue;
+      // Строчный элемент занимает не свою высоту, а высоту строки, и стоит в
+      // ней по центру просвета: без этого следующий блок подъезжал вверх.
+      // Строчный ребёнок занимает строку целиком, а не свою высоту: за ним
+      // следующий блок встаёт на высоту строки ниже.
+      y = cb.inline ? cb.lineTop + Math.max(lineH, cb.h) : cb.y + cb.h + (cb.mb || 0);
+    }
+    if (inlineish && explicitW == null && boxedKids.length) cw = widest;
+
+    let ch;
+    if (explicitH != null) ch = explicitH;
+    else if (attrH != null) ch = attrH;
+    else if (boxedKids.length) ch = Math.max(0, y - contentY);
+    else ch = __OWN_TEXT(el) || inlineish ? Math.round(__normalLine(fs, family)) : 0;
+
+    // Строчный элемент высок настолько, насколько высоки его чернила, а не
+    // строка целиком. Заменяемого это не касается: у `<iframe width height>`
+    // размер назван в атрибуте, и он главнее.
+    if (inlineish && display === 'inline' && !frame
+        && explicitH == null && attrH == null && !boxedKids.length) {
+      ch = Math.round(fs * 1.1719);
+    }
+    if (ua && explicitH == null && attrH == null) ch = ua.h;
+
+    // Браузер держит длины в шестьдесят четвёртых пикселя, и это видно:
+    // ширина строки 72.26171875 у нас против 72.265625 у Chrome — та же
+    // величина, округлённая до его шага.
+    const q = (v) => Math.round(v * 64) / 64;
+    const box = {
+      x: q(boxX), y: q(boxY),
+      w: q(cw + pl + pr + bl + br),
+      h: q(ch + pt_ + pb + bt + bb),
+      cw: q(cw), ch: q(ch), cx: q(contentX), cy: q(contentY),
+      bx: bl + br, by: bt + bb, mb,
+      line: lineH, inline: inlineish, lineTop: q(boxY),
+    };
+    if (box.inline && strut) {
+      // Выравнивание по базовой линии, а не по центру: браузер ставит строчный
+      // элемент так, чтобы его базовая линия легла на базовую линию строки.
+      // `<span>` в тринадцать пикселей внутри шестнадцатипиксельного текста
+      // опускается ровно на разницу подъёмов — на два пикселя.
+      const shift = Math.max(0, strut.asc - fbox.asc);
+      box.y = q(box.y + shift);
+      box.cy = q(box.cy + shift);
+    }
+    el.__ptBox = box;
+    el.__ptBoxV = __layoutBuilt;
+    return box;
   }
 
   function __relayout() {
@@ -3856,43 +4163,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __layoutBuilt = __layoutSeq;
     __collectHidden();
     __rows = [];
-    let row = 0;
-    // Строку занимает лист — то, что действительно что-то рисует. Контейнер
-    // охватывает своих детей, а не встаёт над ними отдельной полосой: в
-    // браузере вложенные обёртки лежат друг на друге, и точка внутри виджета
-    // попадает в самый глубокий элемент, а не в его обёртку. Пока строки
-    // раздавались всем подряд, iframe виджета оказывался ниже рамки своего
-    // хоста — кликнуть по нему было нечем.
-    const walk = (el) => {
-      if (!el || el.nodeType !== ELEMENT_NODE) return;
-      if (__isHiddenEl(el)) return;               // display:none hides the subtree
-      const kids = [];
-      if (el.__ptShadow) for (const c of el.__ptShadow.__ptKids) kids.push(c);
-      for (const c of el.__ptKids) kids.push(c);
-      const boxed = kids.some((c) => c.nodeType === ELEMENT_NODE && !__isHiddenEl(c));
-      // An element that states its own size gets it. The row layout is a stand-in
-      // for what we do not compute, not a licence to contradict the page: a widget
-      // sized 300x65 reported back as 1280x20 reads as clipped, and code that
-      // measures before deciding whether it is visible — Cloudflare's loader
-      // measures its widget's iframe exactly this way — decides wrong.
-      const sized = __declaredSize(el);
-      const start = row;
-      if (boxed) {
-        for (const c of kids) walk(c);
-      } else {
-        __rows[row] = el;
-        row++;
-      }
-      const span = Math.max(row - start, 1) * LAYOUT.ROW;
-      el.__ptBox = {
-        x: 0, y: start * LAYOUT.ROW,
-        w: sized.w != null ? sized.w : LAYOUT.W,
-        h: sized.h != null ? sized.h : span,
-      };
-      el.__ptBoxV = __layoutBuilt;
-    };
-    const de = globalThis.document && globalThis.document.documentElement;
-    if (de) walk(de);
+    __boxes = [];
+    const doc = globalThis.document;
+    const de = doc && doc.documentElement;
+    if (!de) return;
+    __layoutOne(de, 0, 0, LAYOUT.W);
+    // Порядок обхода — порядок наложения: попадание в точку ищется с конца, то
+    // есть от самого глубокого и позднего, как в браузере.
+    __rows = __boxes;
   }
 
   // Width/height an element declares for itself: the CSS `width`/`height` it was
@@ -3951,10 +4229,14 @@ const CS_REPLACED = {"block-size":"65px","border-block-end-style":"inset","borde
     if (CS_REPLACED_TAGS.has(tag)) for (const [k, v] of Object.entries(CS_REPLACED)) map.set(k, v);
     if (CS_DISPLAY[tag]) map.set('display', CS_DISPLAY[tag]);
     // Заявленное автором поверх умолчаний, потом — использованные размеры.
+    // Автор — это и таблицы стилей, а не только атрибут `style`: элемент с
+    // `width: 200px` в таблице отвечал шириной окна, противореча CSS страницы.
     try {
-      const own = el && el.style;
-      if (own) for (let i = 0; i < own.length; i++) {
-        const n = own.item(i), v = own.getPropertyValue(n);
+      __relayout();
+      const cascade = el ? __cascadeFor(el) : new Map();
+      const fs = el ? __usedFontSize(el) : 16;
+      for (const [n, raw] of cascade) {
+        const v = __resolveLength(raw, n, fs, el);
         map.set(n, v);
         // Сокращённые свойства браузер раскрывает в длинные, и меряют обычно
         // именно длинные: `border: 0` — это и `border-top-width: 0px`.
@@ -3967,18 +4249,30 @@ const CS_REPLACED = {"block-size":"65px","border-block-end-style":"inset","borde
           const parts = v.trim().split(/\s+/);
           const pick = (i) => parts[[0, 1, 2, 3].map((k) => Math.min(k, parts.length - 1))[i]] || '0px';
           sides.forEach((side, i) => map.set(n + '-' + side, pick(i)));
+        } else if (n === 'font') {
+          const m = /(\d+(?:\.\d+)?)px/.exec(v);
+          if (m) map.set('font-size', m[1] + 'px');
         }
       }
+      if (el) map.set('font-size', __usedFontSize(el) + 'px');
     } catch (e) {}
     try {
       if (el && el.nodeType === ELEMENT_NODE) {
         if (__isHiddenEl(el)) map.set('display', 'none');
         const b = __boxOf(el);
         if (b) {
-          map.set('width', b.w + 'px'); map.set('height', b.h + 'px');
-          map.set('inline-size', b.w + 'px'); map.set('block-size', b.h + 'px');
-          map.set('perspective-origin', (b.w / 2) + 'px ' + (b.h / 2) + 'px');
-          map.set('transform-origin', (b.w / 2) + 'px ' + (b.h / 2) + 'px');
+          // Браузер называет здесь поле содержимого: у элемента с рамкой и
+          // отступами `width` — это его `width` из CSS, а не внешний размер.
+          // Браузер печатает вычисленную длину с четырьмя знаками после
+          // запятой: `72.2656px`, не `72.265625px`.
+          const q = (v) => {
+            const r = Math.round(v * 1e4) / 1e4;
+            return (Number.isInteger(r) ? r : parseFloat(r.toFixed(4))) + 'px';
+          };
+          map.set('width', q(b.cw)); map.set('height', q(b.ch));
+          map.set('inline-size', q(b.cw)); map.set('block-size', q(b.ch));
+          map.set('perspective-origin', q(b.w / 2) + ' ' + q(b.h / 2));
+          map.set('transform-origin', q(b.w / 2) + ' ' + q(b.h / 2));
         }
       }
     } catch (e) {}
@@ -4012,6 +4306,56 @@ const CS_REPLACED = {"block-size":"65px","border-block-end-style":"inset","borde
     });
   };
 
+  /// Кегль, действующий на элементе: он наследуется, а `em` считается от него.
+  function __usedFontSize(el) {
+    let size = 16;
+    const chain = [];
+    for (let e = el; e && e.nodeType === ELEMENT_NODE; e = e.parentNode) chain.push(e);
+    // Поля формы не наследуют кегль страницы: движок браузера даёт им свой.
+    const own = (el && el.localName) || '';
+    if (own === 'input' || own === 'button' || own === 'select' || own === 'textarea') {
+      size = UA_FORM_FONT;
+      const raw = __cascadeFor(el).get('font-size');
+      if (raw == null) return size;
+    }
+    for (let i = chain.length - 1; i >= 0; i--) {
+      const raw = __cascadeFor(chain[i]).get('font-size');
+      if (raw == null) continue;
+      const v = String(raw).trim();
+      let m;
+      if ((m = /^(-?[\d.]+)px$/.exec(v))) size = parseFloat(m[1]);
+      else if ((m = /^(-?[\d.]+)(?:em|rem)$/.exec(v))) size = parseFloat(m[1]) * size;
+      else if ((m = /^(-?[\d.]+)%$/.exec(v))) size = parseFloat(m[1]) / 100 * size;
+      else if ((m = /^(-?[\d.]+)pt$/.exec(v))) size = parseFloat(m[1]) * 4 / 3;
+    }
+    return Math.round(size * 1e4) / 1e4;
+  }
+
+  /// Длина в пикселях, как её отдаёт браузер: `em` от кегля, проценты — от
+  /// ширины родителя, всё прочее как есть.
+  const __LENGTH_PROPS = /^(width|height|min-|max-|margin|padding|border-.*-width|top|right|bottom|left|inset|gap|font-size|line-height|text-indent|letter-spacing|word-spacing|outline-width|border-spacing|column-gap|row-gap)/;
+  function __resolveLength(raw, prop, fontSize, el) {
+    const v = String(raw);
+    if (!__LENGTH_PROPS.test(prop) || !/[\d.](?:em|rem|pt|%)/.test(v)) return v;
+    return v.replace(/(-?[\d.]+)(em|rem|pt|%)/g, (m, n, unit) => {
+      const x = parseFloat(n);
+      if (unit === 'pt') return (x * 4 / 3) + 'px';
+      if (unit === 'em') return (x * fontSize) + 'px';
+      if (unit === 'rem') return (x * 16) + 'px';
+      // Проценты по вертикали считаются тоже от ширины — так в спецификации.
+      const base = __containingWidth(el);
+      return base != null ? (Math.round(x / 100 * base * 64) / 64) + 'px' : m;
+    });
+  }
+
+  /// Ширина содержимого блока, в котором лежит элемент.
+  function __containingWidth(el) {
+    const parent = el && el.parentNode;
+    if (!parent || parent.nodeType !== ELEMENT_NODE) return LAYOUT.W;
+    const b = parent.__ptBoxV === __layoutBuilt ? parent.__ptBox : null;
+    return b ? b.cw : LAYOUT.W;
+  }
+
   function __boxOf(el) {
     if (!el || el.nodeType !== ELEMENT_NODE) return null;
     __relayout();
@@ -4025,9 +4369,14 @@ const CS_REPLACED = {"block-size":"65px","border-block-end-style":"inset","borde
 
   function __elementFromPoint(x, y) {
     __relayout();
-    if (y == null || y < 0) return null;
-    const el = __rows[Math.floor(y / LAYOUT.ROW)];
-    return el || null;
+    if (x == null || y == null || x < 0 || y < 0) return null;
+    // Самый глубокий и самый поздний из тех, чья коробка накрывает точку.
+    for (let i = __boxes.length - 1; i >= 0; i--) {
+      const el = __boxes[i], b = el.__ptBox;
+      if (!b || b.w <= 0 || b.h <= 0) continue;
+      if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) return el;
+    }
+    return null;
   }
 
   function __focusableAncestor(el) {
@@ -4102,7 +4451,18 @@ const CS_REPLACED = {"block-size":"65px","border-block-end-style":"inset","borde
             || n.tagName === 'BUTTON'
             || role === 'checkbox' || role === 'button' || role === 'switch';
           if (control && (shadowed || !widgetOnly)) {
-            const r = n.getBoundingClientRect();
+            // Настоящий флажок виджета спрятан: нулевого размера, с прозрачной
+            // подложкой поверх. Человек нажимает не его, а то, что видит, —
+            // ближайшую обёртку с настоящей коробкой. Пока раскладка была
+            // выдуманной, невидимый вход отвечал размером во всё окно и промаха
+            // не было; с настоящей раскладкой промах появился.
+            let r = n.getBoundingClientRect();
+            if (!(r.width > 0 && r.height > 0)) {
+              for (let a = n.parentNode; a && a.nodeType === ELEMENT_NODE; a = a.parentNode) {
+                const ar = a.getBoundingClientRect();
+                if (ar.width > 0 && ar.height > 0 && ar.width <= 400 && ar.height <= 200) { r = ar; break; }
+              }
+            }
             if (r.width > 0 && r.height > 0) {
               seen.push({ tag: n.tagName, type: type || role,
                           x: r.x + Math.min(r.width, 24) / 2,
@@ -4135,6 +4495,24 @@ const CS_REPLACED = {"block-size":"65px","border-block-end-style":"inset","borde
   };
 
 
+  /// Поле, которое активирует подпись под указателем: либо названное в `for`,
+  /// либо первое поле внутри самой подписи. Ничего не нашлось — null.
+  function __labelFor(el) {
+    for (let e = el; e && e.nodeType === ELEMENT_NODE; e = e.parentNode) {
+      if (e.tagName !== 'LABEL') continue;
+      const id = e.getAttribute && e.getAttribute('for');
+      if (id) {
+        const root = e.getRootNode ? e.getRootNode() : (globalThis.document || null);
+        const found = root && root.getElementById ? root.getElementById(id)
+                    : (globalThis.document && globalThis.document.getElementById(id));
+        if (found) return found;
+      }
+      const inner = e.querySelector && e.querySelector('input, select, textarea, button');
+      if (inner) return inner;
+    }
+    return null;
+  }
+
   globalThis.__pt_mouse = (type, x, y, button, clickCount) => {
     const el = __elementFromPoint(x, y) || (globalThis.document && globalThis.document.body);
     if (!el) return false;
@@ -4165,14 +4543,26 @@ const CS_REPLACED = {"block-size":"65px","border-block-end-style":"inset","borde
       send(new PointerEvent('pointerup', ptr()));
       send(new MouseEvent('mouseup', base));
       if (__mouseDownEl === el) {
-        // Нажатие на чекбокс/радио переключает его до того, как всплывёт click,
-        // — обработчик читает уже новое состояние.
-        if (el.tagName === 'INPUT' && /^(checkbox|radio)$/i.test(el.getAttribute('type') || '')) {
-          el.checked = el.getAttribute('type').toLowerCase() === 'radio' ? true : !el.checked;
-          el.dispatchEvent(__ptTrust(new Event('input', { bubbles: true })));
-          el.dispatchEvent(__ptTrust(new Event('change', { bubbles: true })));
-        }
+        const toggle = (c) => {
+          // Нажатие на чекбокс/радио переключает его до того, как всплывёт
+          // click, — обработчик читает уже новое состояние.
+          c.checked = String(c.getAttribute('type')).toLowerCase() === 'radio' ? true : !c.checked;
+          c.dispatchEvent(__ptTrust(new Event('input', { bubbles: true })));
+          c.dispatchEvent(__ptTrust(new Event('change', { bubbles: true })));
+        };
+        const isBox = (n) => n && n.tagName === 'INPUT'
+          && /^(checkbox|radio)$/i.test(n.getAttribute('type') || '');
+        if (isBox(el)) toggle(el);
         send(new MouseEvent('click', base));
+        // Нажатие на подпись — это нажатие на её поле. Виджет прячет свой
+        // флажок нулевым размером и кладёт поверх видимую обёртку внутри
+        // `<label>`; человек попадает в обёртку, а переключается флажок.
+        const lbl = __labelFor(el);
+        if (lbl && lbl !== el) {
+          if (isBox(lbl)) toggle(lbl);
+          lbl.dispatchEvent(__ptTrust(new MouseEvent('click', base)));
+          if (lbl.focus) lbl.focus();
+        }
       }
       __mouseDownEl = null;
     } else if (type === 'mouseMoved') {

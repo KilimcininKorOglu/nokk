@@ -7146,9 +7146,9 @@ mod tests {
             v => panic!("expected the probe result, got {v:?}"),
         };
         assert_eq!(out["connected"], true);
-        assert_eq!((out["w"].as_i64(), out["h"].as_i64()), (Some(300), Some(65)),
+        assert_eq!((out["w"].as_i64(), out["h"].as_i64()), (Some(304), Some(69)),
                    "an element in a closed shadow root is laid out like any other");
-        assert_eq!(out["offset"], serde_json::json!([300, 65]));
+        assert_eq!(out["offset"], serde_json::json!([304, 69]));
     }
 
     /// An element that states its own size reports it. The row layout stands in
@@ -7181,9 +7181,13 @@ mod tests {
             Value::String(s) => serde_json::from_str::<Value>(&s).unwrap(),
             v => panic!("expected the probe result, got {v:?}"),
         };
-        assert_eq!(out["attr"], serde_json::json!([300, 65]), "width/height attributes");
-        assert_eq!(out["style"], serde_json::json!([300, 65]), "and inline CSS");
-        assert_eq!(out["offset"], serde_json::json!([300, 65]), "offsetWidth/Height agree");
+        // Объявленный размер — это поле содержимого: движок браузера рисует
+        // вокруг `<iframe>` рамку в два пикселя, и внешняя коробка на четыре
+        // пикселя больше. Проверено на Chrome 151: голый `<iframe>` отдаёт
+        // 304×154 при содержимом 300×150.
+        assert_eq!(out["attr"], serde_json::json!([304, 69]), "width/height attributes");
+        assert_eq!(out["style"], serde_json::json!([304, 69]), "and inline CSS");
+        assert_eq!(out["offset"], serde_json::json!([304, 69]), "offsetWidth/Height agree");
         assert_eq!(out["plainHasBox"], true, "an unsized element still has a box");
     }
 

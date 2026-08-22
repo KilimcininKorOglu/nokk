@@ -200,6 +200,10 @@ pub struct TextMetrics {
     pub descent: f32,
     pub font_ascent: f32,
     pub font_descent: f32,
+    /// Высота строки при `line-height: normal` — подъём, спуск и просвет
+    /// гарнитуры. У Liberation Sans это ровно 1,15 кегля, и раскладка без неё
+    /// не сходится с браузерной ни на пиксель.
+    pub line: f32,
 }
 
 /// Cap per-side pixels so a hostile page can't request an absurd allocation.
@@ -710,6 +714,9 @@ pub fn measure_text(
         descent: if flat { 0.0 } else { ink_b },
         font_ascent: (font.ascent_unscaled() / upem * size_px).round(),
         font_descent: (-font.descent_unscaled() / upem * size_px).round(),
+        line: (font.ascent_unscaled() - font.descent_unscaled() + font.line_gap_unscaled())
+            / upem
+            * size_px,
     }
 }
 
