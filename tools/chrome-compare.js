@@ -69,6 +69,21 @@ const HOOK = `(() => {
           const n = globalThis.__ptJoinN++;
           let host = '?';
           try { host = location.host.slice(0, 12); } catch (e) {}
+          // Из чего склеен отчёт: сколько кусков и какой длины. Сравнение
+          // поэлементно показывает, какое именно поле у кого короче.
+          if (out.length > 50000 && String(sep) === '' && this.length !== out.length && !globalThis.__ptPartsDone) {
+            globalThis.__ptPartsDone = 1;
+            try {
+              const lens = Array.prototype.map.call(this, (x) => String(x == null ? '' : x).length);
+              const big = lens.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]).slice(0, 25);
+              console.log('[parts] n=' + lens.length + ' total=' + out.length +
+                    ' крупнейшие: ' + big.map(([v, i]) => i + ':' + v).join(' '));
+              const buckets = [0, 0, 0, 0, 0];
+              for (const v of lens) buckets[v < 10 ? 0 : v < 100 ? 1 : v < 1000 ? 2 : v < 10000 ? 3 : 4]++;
+              console.log('[parts] по размеру: <10=' + buckets[0] + ' <100=' + buckets[1] +
+                    ' <1k=' + buckets[2] + ' <10k=' + buckets[3] + ' >=10k=' + buckets[4]);
+            } catch (e) {}
+          }
           if (String(sep) === '|' && out.length > 5000 && (globalThis.__ptCssN = (globalThis.__ptCssN || 0) + 1) <= 2) {
             for (let i = 0; i < out.length; i += 4000) {
               console.log('[C' + globalThis.__ptCssN + ' @' + i + '] ' + out.slice(i, i + 4000));
@@ -96,7 +111,18 @@ const HOOK = `(() => {
   // расхождения подряд.
   try {
     const N = Object.create(null);
+    const L = Object.create(null);
     const bump = (k) => { N[k] = (N[k] || 0) + 1; };
+    // Сколько знаков всего вернул каждый метод: вызовы у нас с браузером
+    // сходятся, значит разница в отчёте — в длине ответов.
+    const grew = (k, v) => {
+      try {
+        const n = v == null ? 0 : (typeof v === 'string' ? v.length
+          : (typeof v === 'number' || typeof v === 'boolean' ? String(v).length
+          : (v.length !== undefined && typeof v.length === 'number' ? v.length : 0)));
+        L[k] = (L[k] || 0) + n;
+      } catch (e) {}
+    };
     const wrapProto = (obj, label, names) => {
       if (!obj) return;
       for (const n of names) {
@@ -106,16 +132,42 @@ const HOOK = `(() => {
         if (typeof d.value === 'function') {
           const f = d.value;
           try {
-            Object.defineProperty(obj, n, { ...d, value: function (...a) { bump(label + '.' + n); return f.apply(this, a); } });
+            Object.defineProperty(obj, n, { ...d, value: function (...a) {
+              bump(label + '.' + n);
+              const r = f.apply(this, a);
+              grew(label + '.' + n, r);
+              return r;
+            } });
           } catch (e) {}
         } else if (typeof d.get === 'function') {
           const g = d.get;
           try {
-            Object.defineProperty(obj, n, { ...d, get: function () { bump(label + '.' + n); return g.call(this); } });
+            Object.defineProperty(obj, n, { ...d, get: function () {
+              bump(label + '.' + n);
+              const r = g.call(this);
+              grew(label + '.' + n, r);
+              return r;
+            } });
           } catch (e) {}
         }
       }
     };
+    // Через TextEncoder.encode проходит сам отчёт: его куски видны здесь в
+    // открытом виде, до сжатия и шифрования. Записываем длину каждого и начало.
+    try {
+      const TE = globalThis.TextEncoder && TextEncoder.prototype;
+      const enc = TE && TE.encode;
+      if (enc) {
+        let n = 0;
+        Object.defineProperty(TE, 'encode', { value: function (x) {
+          const s = String(x == null ? '' : x);
+          if (s.length > 200) {
+            console.log('[enc ' + (n++) + '] ' + s.length + ' :: ' + s.slice(0, 120).replace(/\\n/g, ' '));
+          }
+          return enc.call(this, x);
+        }, writable: true, configurable: true });
+      }
+    } catch (e) {}
     const C2 = globalThis.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype;
     wrapProto(C2, 'ctx2d', ['fillText','strokeText','measureText','fillRect','getImageData','putImageData',
       'drawImage','arc','ellipse','bezierCurveTo','beginPath','closePath','fill','stroke','createLinearGradient',
@@ -146,8 +198,8 @@ const HOOK = `(() => {
     globalThis.__ptCounts = () => N;
     // Выгружаем на исходе прогона: печатаем по строке на имя.
     setTimeout(() => {
-      const rows = Object.entries(N).sort((a, b) => b[1] - a[1]);
-      for (const [k, v] of rows) console.log('[count] ' + v + ' ' + k);
+      const rows = Object.entries(N).sort((a, b) => (L[b[0]] || 0) - (L[a[0]] || 0));
+      for (const [k, v] of rows) console.log('[count] ' + v + ' вызовов, ' + (L[k] || 0) + ' знаков — ' + k);
     }, 26000);
   } catch (e) {}
 
@@ -179,7 +231,7 @@ const HOOK = `(() => {
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* /.test(String(t)))
+      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[parts|^\[enc /.test(String(t)))
         lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
     }
     if (m.method === 'Target.attachedToTarget') {

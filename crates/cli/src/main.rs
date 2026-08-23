@@ -436,7 +436,16 @@ async fn main() -> Result<()> {
                     // видит: сборщик у браузера зовёт эти вещи, и надо знать,
                     // доходит ли до них наш прогон.
                     const N = Object.create(null);
+                    const L = Object.create(null);
                     const bump = (k) => { N[k] = (N[k] || 0) + 1; };
+                    const grew = (k, v) => {
+                      try {
+                        const n = v == null ? 0 : (typeof v === 'string' ? v.length
+                          : (typeof v === 'number' || typeof v === 'boolean' ? String(v).length
+                          : (v.length !== undefined && typeof v.length === 'number' ? v.length : 0)));
+                        L[k] = (L[k] || 0) + n;
+                      } catch (e) {}
+                    };
                     const count = (obj, label, names) => {
                       if (!obj) return;
                       for (const n of names) {
@@ -444,12 +453,45 @@ async fn main() -> Result<()> {
                         if (typeof f !== 'function') continue;
                         try {
                           Object.defineProperty(obj, n, {
-                            value: function (...a) { bump(label + '.' + n); return f.apply(this, a); },
+                            value: function (...a) {
+                              bump(label + '.' + n);
+                              const r = f.apply(this, a);
+                              grew(label + '.' + n, r);
+                              return r;
+                            },
                             writable: true, enumerable: false, configurable: true,
                           });
                         } catch (e) {}
                       }
                     };
+                    // Отчёт проходит через `TextEncoder.encode` до сжатия и
+                    // шифрования: его куски видны здесь в открытом виде. Крючок
+                    // ставится с повтором — сам кодировщик появляется позже
+                    // пробника.
+                    {
+                      let en = 0;
+                      const arm = () => {
+                        const TE = globalThis.TextEncoder && globalThis.TextEncoder.prototype;
+                        const enc = TE && TE.encode;
+                        if (!enc || enc.__ptWrapped) return !!enc;
+                        const wrapped = function (x) {
+                          const s = String(x == null ? '' : x);
+                          if (s.length > 200) {
+                            console.error('[enc ' + (en++) + '] ' + s.length + ' :: ' + s.slice(0, 120).replace(/\n/g, ' '));
+                          }
+                          return enc.call(this, x);
+                        };
+                        wrapped.__ptWrapped = true;
+                        try {
+                          Object.defineProperty(TE, 'encode', { value: wrapped, writable: true, configurable: true });
+                          return true;
+                        } catch (e) { return false; }
+                      };
+                      if (!arm()) {
+                        let tries = 0;
+                        const t = setInterval(() => { if (arm() || ++tries > 40) clearInterval(t); }, 25);
+                      }
+                    }
                     count(globalThis.OfflineAudioContext && OfflineAudioContext.prototype, 'audio',
                           ['startRendering', 'createOscillator', 'createDynamicsCompressor']);
                     count(globalThis.HTMLMediaElement && HTMLMediaElement.prototype, 'media', ['canPlayType']);
@@ -457,7 +499,9 @@ async fn main() -> Result<()> {
                     count(globalThis, 'win', ['atob', 'btoa', 'matchMedia', 'getComputedStyle']);
                     count(globalThis.RTCPeerConnection && RTCPeerConnection.prototype, 'rtc', ['getStats']);
                     setTimeout(() => {
-                      for (const k of Object.keys(N)) console.error('[count] ' + N[k] + ' ' + k);
+                      for (const k of Object.keys(N).sort((a, b) => (L[b] || 0) - (L[a] || 0))) {
+                        console.error('[count] ' + N[k] + ' вызовов, ' + (L[k] || 0) + ' знаков — ' + k);
+                      }
                     }, 24000);
                     // Заодно то, что челлендж сам считает ошибкой: он зовёт
                     // `console.error` перед маяком далеко не всегда, но своё
@@ -563,6 +607,20 @@ async fn main() -> Result<()> {
                           }
                           let host = '?';
                           try { host = location.host.slice(0, 12); } catch (e) {}
+                          // Из чего склеен отчёт: длины кусков по порядку.
+                          if (out.length > 50000 && String(sep) === '' && this.length !== out.length && !globalThis.__ptPartsDone) {
+            globalThis.__ptPartsDone = 1;
+            try {
+              const lens = Array.prototype.map.call(this, (x) => String(x == null ? '' : x).length);
+              const big = lens.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]).slice(0, 25);
+              console.error('[parts] n=' + lens.length + ' total=' + out.length +
+                    ' крупнейшие: ' + big.map(([v, i]) => i + ':' + v).join(' '));
+              const buckets = [0, 0, 0, 0, 0];
+              for (const v of lens) buckets[v < 10 ? 0 : v < 100 ? 1 : v < 1000 ? 2 : v < 10000 ? 3 : 4]++;
+              console.error('[parts] по размеру: <10=' + buckets[0] + ' <100=' + buckets[1] +
+                    ' <1k=' + buckets[2] + ' <10k=' + buckets[3] + ' >=10k=' + buckets[4]);
+            } catch (e) {}
+          }
                           // Перечисление стилей — целиком: сравнивать его с
                           // браузером надо построчно, а кадр к концу прогона
                           // уже снесён, файлом не забрать.
