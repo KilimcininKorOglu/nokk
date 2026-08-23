@@ -4958,8 +4958,8 @@ mod tests {
         assert_eq!(out["isCtx"], true, "{out}");
         assert_eq!(out["canvasBack"], true, "{out}");
         // Рисование при этом целое, и два холста по-прежнему различимы.
-        assert_eq!(out["style"], "#f60", "{out}");
-        assert_eq!(out["otherStyle"], "#0af", "{out}");
+        assert_eq!(out["style"], "#ff6600", "{out}");
+        assert_eq!(out["otherStyle"], "#00aaff", "{out}");
         assert_eq!(out["painted"], serde_json::json!([255, 102, 0, 255]), "{out}");
         assert_eq!(out["differ"], true, "{out}");
         assert_eq!(out["ownGl"], 0, "{out}");

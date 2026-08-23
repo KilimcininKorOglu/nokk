@@ -5155,34 +5155,185 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // plus the per-session seed. Different drawings therefore differ, an identical
   // drawing is stable, and results vary across sessions the way device text
   // rendering does.
-  const parseColor = (c) => {
-    c = String(c == null ? '#000000' : c).trim().toLowerCase();
-    const named = { black: [0,0,0,255], white: [255,255,255,255], red: [255,0,0,255],
-      lime: [0,255,0,255], green: [0,128,0,255], blue: [0,0,255,255],
-      yellow: [255,255,0,255], transparent: [0,0,0,0] };
-    if (named[c]) return named[c].slice();
-    let m = /^#([0-9a-f]{3})$/.exec(c);
-    if (m) return [parseInt(m[1][0] + m[1][0], 16), parseInt(m[1][1] + m[1][1], 16), parseInt(m[1][2] + m[1][2], 16), 255];
-    m = /^#([0-9a-f]{6})$/.exec(c);
-    if (m) return [parseInt(m[1].slice(0,2), 16), parseInt(m[1].slice(2,4), 16), parseInt(m[1].slice(4,6), 16), 255];
-    m = /^rgba?\(([^)]+)\)$/.exec(c);
-    if (m) {
-      const p = m[1].split(',').map((x) => parseFloat(x));
-      return [p[0] | 0, p[1] | 0, p[2] | 0, p.length > 3 ? Math.round(Math.max(0, Math.min(1, p[3])) * 255) : 255];
+  // Все именованные цвета CSS, снятые с Chrome: страница называет цвет словом
+  // куда чаще, чем шестнадцатеричным кодом, а мы знали восемь имён из ста
+  // сорока восьми и красили остальное чёрным.
+  const CSS_NAMES = Object.create(null);
+  for (const pair of 'aliceblue:f0f8ff,antiquewhite:faebd7,aqua:00ffff,aquamarine:7fffd4,azure:f0ffff,beige:f5f5dc,bisque:ffe4c4,black:000000,blanchedalmond:ffebcd,blue:0000ff,blueviolet:8a2be2,brown:a52a2a,burlywood:deb887,cadetblue:5f9ea0,chartreuse:7fff00,chocolate:d2691e,coral:ff7f50,cornflowerblue:6495ed,cornsilk:fff8dc,crimson:dc143c,cyan:00ffff,darkblue:00008b,darkcyan:008b8b,darkgoldenrod:b8860b,darkgray:a9a9a9,darkgreen:006400,darkgrey:a9a9a9,darkkhaki:bdb76b,darkmagenta:8b008b,darkolivegreen:556b2f,darkorange:ff8c00,darkorchid:9932cc,darkred:8b0000,darksalmon:e9967a,darkseagreen:8fbc8f,darkslateblue:483d8b,darkslategray:2f4f4f,darkslategrey:2f4f4f,darkturquoise:00ced1,darkviolet:9400d3,deeppink:ff1493,deepskyblue:00bfff,dimgray:696969,dimgrey:696969,dodgerblue:1e90ff,firebrick:b22222,floralwhite:fffaf0,forestgreen:228b22,fuchsia:ff00ff,gainsboro:dcdcdc,ghostwhite:f8f8ff,gold:ffd700,goldenrod:daa520,gray:808080,green:008000,greenyellow:adff2f,grey:808080,honeydew:f0fff0,hotpink:ff69b4,indianred:cd5c5c,indigo:4b0082,ivory:fffff0,khaki:f0e68c,lavender:e6e6fa,lavenderblush:fff0f5,lawngreen:7cfc00,lemonchiffon:fffacd,lightblue:add8e6,lightcoral:f08080,lightcyan:e0ffff,lightgoldenrodyellow:fafad2,lightgray:d3d3d3,lightgreen:90ee90,lightgrey:d3d3d3,lightpink:ffb6c1,lightsalmon:ffa07a,lightseagreen:20b2aa,lightskyblue:87cefa,lightslategray:778899,lightslategrey:778899,lightsteelblue:b0c4de,lightyellow:ffffe0,lime:00ff00,limegreen:32cd32,linen:faf0e6,magenta:ff00ff,maroon:800000,mediumaquamarine:66cdaa,mediumblue:0000cd,mediumorchid:ba55d3,mediumpurple:9370db,mediumseagreen:3cb371,mediumslateblue:7b68ee,mediumspringgreen:00fa9a,mediumturquoise:48d1cc,mediumvioletred:c71585,midnightblue:191970,mintcream:f5fffa,mistyrose:ffe4e1,moccasin:ffe4b5,navajowhite:ffdead,navy:000080,oldlace:fdf5e6,olive:808000,olivedrab:6b8e23,orange:ffa500,orangered:ff4500,orchid:da70d6,palegoldenrod:eee8aa,palegreen:98fb98,paleturquoise:afeeee,palevioletred:db7093,papayawhip:ffefd5,peachpuff:ffdab9,peru:cd853f,pink:ffc0cb,plum:dda0dd,powderblue:b0e0e6,purple:800080,rebeccapurple:663399,red:ff0000,rosybrown:bc8f8f,royalblue:4169e1,saddlebrown:8b4513,salmon:fa8072,sandybrown:f4a460,seagreen:2e8b57,seashell:fff5ee,sienna:a0522d,silver:c0c0c0,skyblue:87ceeb,slateblue:6a5acd,slategray:708090,slategrey:708090,snow:fffafa,springgreen:00ff7f,steelblue:4682b4,tan:d2b48c,teal:008080,thistle:d8bfd8,tomato:ff6347,turquoise:40e0d0,violet:ee82ee,wheat:f5deb3,white:ffffff,whitesmoke:f5f5f5,yellow:ffff00,yellowgreen:9acd32'.split(',')) {
+    const i = pair.indexOf(':');
+    CSS_NAMES[pair.slice(0, i)] = pair.slice(i + 1);
+  }
+  const hue2rgb = (h, s2, l) => {
+    h = ((h % 360) + 360) % 360;
+    const a = s2 * Math.min(l, 1 - l);
+    const f = (n) => { const k = (n + h / 30) % 12; return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)); };
+    return [f(0), f(8), f(4)];
+  };
+  // Lab и Oklab — через XYZ D50 и D65 соответственно; матрицы стандартные.
+  const lab2srgb = (L, a, b) => {
+    const fy = (L + 16) / 116, fx = fy + a / 500, fz = fy - b / 200;
+    const e = 216 / 24389, k = 24389 / 27;
+    const f3 = (t) => (t * t * t > e ? t * t * t : (116 * t - 16) / k);
+    const X = f3(fx) * 0.3457 / 0.3585, Y = (L > k * e ? Math.pow(fy, 3) : L / k), Z = f3(fz) * (1 - 0.3457 - 0.3585) / 0.3585;
+    // D50 → D65 (Брэдфорд) и XYZ → линейный sRGB, свёрнуто в одну матрицу.
+    const M = [3.1341359569958707, -1.6173863321612538, -0.4906619460083532,
+      -0.978795502912089, 1.916142228104716, 0.03344668406522899,
+      0.07195537988411677, -0.2289768264158322, 1.405386058324125];
+    const r = M[0] * X + M[1] * Y + M[2] * Z, g2 = M[3] * X + M[4] * Y + M[5] * Z, b2 = M[6] * X + M[7] * Y + M[8] * Z;
+    return [LIN_TO_SRGB(r), LIN_TO_SRGB(g2), LIN_TO_SRGB(b2)];
+  };
+  const oklab2srgb = (L, a, b) => {
+    const l = Math.pow(L + 0.3963377774 * a + 0.2158037573 * b, 3);
+    const m = Math.pow(L - 0.1055613458 * a - 0.0638541728 * b, 3);
+    const s2 = Math.pow(L - 0.0894841775 * a - 1.2914855480 * b, 3);
+    return [
+      LIN_TO_SRGB(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s2),
+      LIN_TO_SRGB(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s2),
+      LIN_TO_SRGB(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s2),
+    ];
+  };
+  // Разбор одного числа доводом: проценты, доли, углы и ключевое `none`.
+  const num = (t, scale, isHue) => {
+    t = String(t).trim();
+    if (t === 'none') return 0;
+    if (/%$/.test(t)) return (parseFloat(t) || 0) / 100 * (scale === undefined ? 1 : scale);
+    let v = parseFloat(t) || 0;
+    if (isHue) {
+      if (/grad$/.test(t)) v *= 0.9;
+      else if (/rad$/.test(t)) v *= 180 / Math.PI;
+      else if (/turn$/.test(t)) v *= 360;
     }
-    // Запись `color(<пространство> …)`: цвет пересчитывается в sRGB и режется
-    // по краям — байтами шире единицы не сказать.
-    m = /^color\(\s*([a-z0-9-]+)\s+([^)\/]+?)(?:\s*\/\s*([^)]+))?\s*\)$/.exec(c);
+    return v;
+  };
+  const splitArgs = (t) => {
+    const slash = t.indexOf('/');
+    const head = (slash < 0 ? t : t.slice(0, slash)).trim();
+    const alpha = slash < 0 ? null : t.slice(slash + 1).trim();
+    return [head.split(/[\s,]+/).filter(Boolean), alpha];
+  };
+  // Цвет в четыре байта. Всё, что браузер понимает записью, понимаем и мы;
+  // непонятое — не чёрный, а отказ: в браузере `fillStyle` тогда не меняется.
+  const parseColorRaw = (c) => {
+    let t = String(c == null ? '' : c).trim().toLowerCase();
+    if (!t) return null;
+    if (t === 'transparent') return [0, 0, 0, 0];
+    if (t === 'currentcolor') return [0, 0, 0, 255];
+    if (CSS_NAMES[t]) t = '#' + CSS_NAMES[t];
+    let m = /^#([0-9a-f]{3,8})$/.exec(t);
     if (m) {
-      const q = m[2].trim().split(/\s+/).map((x) => parseFloat(x) || 0);
-      const al = m[3] === undefined ? 1 : (parseFloat(m[3]) || 0);
-      const rgb = m[1] === 'display-p3'
-        ? convertSpace([q[0] || 0, q[1] || 0, q[2] || 0], 'display-p3', 'srgb')
-        : [q[0] || 0, q[1] || 0, q[2] || 0];
-      const b8 = (v) => Math.round(Math.max(0, Math.min(1, v)) * 255);
-      return [b8(rgb[0]), b8(rgb[1]), b8(rgb[2]), b8(al)];
+      const h = m[1];
+      const dup = (x) => parseInt(x + x, 16);
+      if (h.length === 3) return [dup(h[0]), dup(h[1]), dup(h[2]), 255];
+      if (h.length === 4) return [dup(h[0]), dup(h[1]), dup(h[2]), dup(h[3])];
+      if (h.length === 6) return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16), 255];
+      if (h.length === 8) return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16),
+        parseInt(h.slice(4, 6), 16), parseInt(h.slice(6, 8), 16)];
+      return null;
     }
-    return [0, 0, 0, 255];
+    m = /^([a-z-]+)\(([^]*)\)$/.exec(t);
+    if (!m) return null;
+    const fn = m[1];
+    const b255 = (v) => Math.max(0, Math.min(255, Math.round(v)));
+    const unit = (v) => Math.max(0, Math.min(255, Math.round(v * 255)));
+    if (fn === 'color-mix') {
+      // Смешение в sRGB: только эта форма и встречается на страницах.
+      const body = m[2].replace(/^in\s+[a-z0-9-]+\s*,?/, '');
+      const parts = body.split(',').map((x) => x.trim()).filter(Boolean);
+      if (parts.length !== 2) return null;
+      const one = (x) => {
+        const pm = /\s([0-9.]+)%$/.exec(x);
+        return { col: parseColorRaw(pm ? x.slice(0, pm.index) : x), w: pm ? parseFloat(pm[1]) / 100 : null };
+      };
+      const A = one(parts[0]), B = one(parts[1]);
+      if (!A.col || !B.col) return null;
+      let wa = A.w, wb = B.w;
+      if (wa == null && wb == null) { wa = wb = 0.5; }
+      else if (wa == null) { wa = 1 - wb; } else if (wb == null) { wb = 1 - wa; }
+      const sum = wa + wb || 1;
+      wa /= sum; wb /= sum;
+      const out = [b255(A.col[0] * wa + B.col[0] * wb), b255(A.col[1] * wa + B.col[1] * wb),
+        b255(A.col[2] * wa + B.col[2] * wb), b255(A.col[3] * wa + B.col[3] * wb)];
+      // Смесь браузер записывает уже посчитанной, долями в sRGB — и берёт
+      // долю до округления в байт, иначе половина стала бы «0.502».
+      const mix = (i) => (A.col[i] * wa + B.col[i] * wb) / 255;
+      const f = (i) => String(Math.round(mix(i) * 10000) / 10000);
+      out.css = 'color(srgb ' + f(0) + ' ' + f(1) + ' ' + f(2) +
+        (out[3] >= 255 ? '' : ' / ' + Math.round(out[3] / 255 * 1000) / 1000) + ')';
+      return out;
+    }
+    const [args, alphaTxt] = splitArgs(m[2]);
+    const alpha = alphaTxt !== null ? num(alphaTxt, 1) : (args.length > 3 ? num(args[3], 1) : 1);
+    const A255 = Math.max(0, Math.min(255, Math.round(alpha * 255)));
+    if (fn === 'rgb' || fn === 'rgba') {
+      const ch = (x) => (/%$/.test(x) ? unit(parseFloat(x) / 100) : b255(parseFloat(x) || 0));
+      return [ch(args[0] || '0'), ch(args[1] || '0'), ch(args[2] || '0'), A255];
+    }
+    if (fn === 'hsl' || fn === 'hsla') {
+      const rgb = hue2rgb(num(args[0], undefined, true), num(args[1], 1), num(args[2], 1));
+      return [unit(rgb[0]), unit(rgb[1]), unit(rgb[2]), A255];
+    }
+    if (fn === 'hwb') {
+      const h = num(args[0], undefined, true);
+      let w = num(args[1], 1), bl = num(args[2], 1);
+      if (w + bl >= 1) { const g2 = w / (w + bl); return [unit(g2), unit(g2), unit(g2), A255]; }
+      const rgb = hue2rgb(h, 1, 0.5).map((v) => v * (1 - w - bl) + w);
+      return [unit(rgb[0]), unit(rgb[1]), unit(rgb[2]), A255];
+    }
+    if (fn === 'lab' || fn === 'lch' || fn === 'oklab' || fn === 'oklch') {
+      const ok = fn[0] === 'o';
+      const Lmax = ok ? 1 : 100;
+      const L = /%$/.test(args[0] || '') ? parseFloat(args[0]) / 100 * Lmax : (parseFloat(args[0]) || 0);
+      let a, b;
+      if (fn === 'lch' || fn === 'oklch') {
+        const C = /%$/.test(args[1] || '') ? parseFloat(args[1]) / 100 * (ok ? 0.4 : 150) : (parseFloat(args[1]) || 0);
+        const H = num(args[2], undefined, true) * Math.PI / 180;
+        a = C * Math.cos(H); b = C * Math.sin(H);
+      } else {
+        const S2 = ok ? 0.4 : 125;
+        a = /%$/.test(args[1] || '') ? parseFloat(args[1]) / 100 * S2 : (parseFloat(args[1]) || 0);
+        b = /%$/.test(args[2] || '') ? parseFloat(args[2]) / 100 * S2 : (parseFloat(args[2]) || 0);
+      }
+      const rgb = ok ? oklab2srgb(L, a, b) : lab2srgb(L, a, b);
+      const out = [unit(rgb[0]), unit(rgb[1]), unit(rgb[2]), A255];
+      // Современные записи браузер не переводит в шестнадцатеричную: он
+      // отдаёт их в своём же пространстве, только с приведёнными числами.
+      const nn = (x) => String(/%$/.test(String(x)) ? parseFloat(x) : (parseFloat(x) || 0));
+      out.css = fn + '(' + [nn(args[0]), nn(args[1]), nn(args[2])].join(' ') +
+        (alpha >= 1 ? '' : ' / ' + alpha) + ')';
+      return out;
+    }
+    if (fn === 'color') {
+      const space = args[0];
+      const q = [num(args[1], 1), num(args[2], 1), num(args[3], 1)];
+      const rgb = space === 'display-p3' ? convertSpace(q, 'display-p3', 'srgb') : q;
+      const al = alphaTxt !== null ? num(alphaTxt, 1) : (args.length > 4 ? num(args[4], 1) : 1);
+      const out = [unit(rgb[0]), unit(rgb[1]), unit(rgb[2]), Math.max(0, Math.min(255, Math.round(al * 255)))];
+      const nn = (x) => String(parseFloat(x) || 0);
+      out.css = 'color(' + space + ' ' + [nn(args[1]), nn(args[2]), nn(args[3])].join(' ') +
+        (al >= 1 ? '' : ' / ' + al) + ')';
+      return out;
+    }
+    return null;
+  };
+  const parseColor = (c) => parseColorRaw(c) || [0, 0, 0, 255];
+  // Запись цвета обратно: браузер отдаёт `#rrggbb`, а полупрозрачный —
+  // `rgba(r, g, b, a)`. Мы возвращали строку страницы как есть.
+  const serializeColor = (rgba) => {
+    if (!rgba) return '#000000';
+    if (rgba.css) return rgba.css;
+    if (rgba[3] >= 255) {
+      const h = (v) => (v | 0).toString(16).padStart(2, '0');
+      return '#' + h(rgba[0]) + h(rgba[1]) + h(rgba[2]);
+    }
+    // Альфа пишется кратчайшей дробью, которая возвращается в тот же байт:
+    // 128 из 255 браузер называет «0.5», а не «0.502».
+    const n = rgba[3] | 0;
+    let a = String(n / 255);
+    for (let places = 1; places <= 3; places++) {
+      const d = Math.round(n / 255 * Math.pow(10, places)) / Math.pow(10, places);
+      if (Math.round(d * 255) === n) { a = String(d); break; }
+    }
+    return 'rgba(' + (rgba[0] | 0) + ', ' + (rgba[1] | 0) + ', ' + (rgba[2] | 0) + ', ' + a + ')';
   };
 
   // Цветовые пространства холста. Страница заливает холст цветом в записи
@@ -5431,6 +5582,16 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
             // молча, оставляя прежнее; мы записывали что угодно.
             const allowed = CTX2D_ENUMS[name];
             if (allowed && allowed.indexOf(String(v)) < 0) return;
+            // Цвет хранится не строкой страницы, а разобранным и записанным
+            // обратно: браузер отдаёт `#rrggbb`, полупрозрачный — `rgba(…)`,
+            // а нераспознанное значение оставляет прежним.
+            if ((name === 'fillStyle' || name === 'strokeStyle' || name === 'shadowColor') &&
+                (v === null || typeof v !== 'object')) {
+              const rgba = parseColorRaw(v);
+              if (!rgba) return;
+              t[name] = serializeColor(rgba);
+              return;
+            }
             t[name] = v;
           },
         };
@@ -5771,6 +5932,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       },
       arcTo(x1, y1, x2, y2) { note('arcTo|' + [x1, y1, x2, y2]); pathPoint(x1, y1); pathPoint(x2, y2); lineV(x1, y1); lineV(x2, y2); },
       ellipse(x, y, rx, ry, rot, a0, a1, ccw) {
+        needArgs(arguments.length, 7, 'ellipse', 'CanvasRenderingContext2D');
         note('ellipse|' + [x, y, rx, ry]);
         pathPoint((+x || 0) - (+rx || 0), (+y || 0) - (+ry || 0)); pathPoint((+x || 0) + (+rx || 0), (+y || 0) + (+ry || 0));
         // Approximate as a circle of radius rx then squash y — good enough, deterministic.
@@ -5936,11 +6098,27 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
             return makeImageData(f, w, h, want, 'rgba-float16');
           }
           const u = new Uint8ClampedArray(n);
-          // Половина округляется вниз: у браузера 0.5 читается как 127, а не
-          // как 128, и это видно на каждом ровном полутоне.
-          const b8 = (t) => Math.floor(Math.max(0, Math.min(1, t)) * 255 + 0.5 - 1e-9);
+          // Округление у браузера зависит от пространства, и это измерено, а
+          // не выведено: на холсте sRGB 0.5 читается как 128, на display-p3 —
+          // как 127, при этом 0.25 в обоих даёт 64. То есть в p3 половина
+          // уходит вниз, в sRGB — вверх.
+          const down = want === 'display-p3';
+          const b8 = (t) => {
+            const x = Math.max(0, Math.min(1, t)) * 255;
+            return down ? Math.floor(x + 0.5 - 1e-9) : Math.round(x);
+          };
+          const al = b8(uniform.a);
+          // Полупрозрачный цвет холст хранит помноженным на альфу, и обратно
+          // выходит уже не тем: 136 при альфе 128 читается как 135. Быстрый
+          // путь обязан повторить и это, иначе он честнее самого браузера.
+          const trip = (t) => {
+            const c = b8(t);
+            if (al >= 255 || al === 0) return al === 0 ? 0 : c;
+            const pm = Math.floor((c * al + 127) / 255);
+            return Math.min(255, Math.floor((pm * 255 + al / 2) / al));
+          };
           for (let i = 0; i < n; i += 4) {
-            u[i] = b8(v[0]); u[i + 1] = b8(v[1]); u[i + 2] = b8(v[2]); u[i + 3] = b8(uniform.a);
+            u[i] = trip(v[0]); u[i + 1] = trip(v[1]); u[i + 2] = trip(v[2]); u[i + 3] = al;
           }
           return makeImageData(u, w, h, want, o && o.pixelFormat);
         }
