@@ -533,54 +533,6 @@ async fn main() -> Result<()> {
                         }
                         for (const N of ['CanvasRenderingContext2D', 'OffscreenCanvasRenderingContext2D']) {
                           const C = globalThis[N] && globalThis[N].prototype;
-                          if (!C || C.__ptAll) continue;
-                          try { Object.defineProperty(C, '__ptAll', { value: 1 }); } catch (e) {}
-                          for (const k of Object.getOwnPropertyNames(C)) {
-                            let d;
-                            try { d = Object.getOwnPropertyDescriptor(C, k); } catch (e) { continue; }
-                            if (!d || typeof d.value !== 'function' || k === 'constructor' || k === 'getImageData') continue;
-                            const f = d.value;
-                            try {
-                              C[k] = function () {
-                                const cv = this && this.canvas;
-                                if (cv && ((cv.width === 48 && cv.height === 48) || (cv.width === 49 && cv.height === 44))) {
-                                  const a = [];
-                                  for (let i = 0; i < Math.min(arguments.length, 6); i++) {
-                                    const v = arguments[i];
-                                    if (v && typeof v === 'object') {
-                        a.push((v.localName || (v.constructor && v.constructor.name) || 'об') +
-                          '<' + (v.width !== undefined ? v.width + 'x' + v.height : '?') + '>' +
-                          (typeof v.src === 'string' ? ' src=' + v.src.slice(0, 46) : ''));
-                      } else a.push(String(v).slice(0, 40));
-                                  }
-                                  console.error('[c48] ' + cv.width + ' ' + k + '(' + a.join(',') + ')' +
-                                    (cv.width !== 2 ? '' : (() => { try { const r = f.apply(this, arguments);
-                                      return ' -> ' + (r && typeof r === 'object' ? (r.data
-                                        ? Object.prototype.toString.call(r.data) + '[' + [].slice.call(r.data).join(',') + '] ' + r.colorSpace + '/' + r.pixelFormat
-                                        : JSON.stringify(r)) : String(r)); } catch (e) { return ' -> бросил ' + e.name; } })()));
-                                }
-                                return f.apply(this, arguments);
-                              };
-                            } catch (e) {}
-                          }
-                          for (const k of ['fillStyle', 'font', 'globalAlpha', 'globalCompositeOperation', 'strokeStyle']) {
-                            const d = Object.getOwnPropertyDescriptor(C, k);
-                            if (!d || !d.set) continue;
-                            try {
-                              Object.defineProperty(C, k, {
-                                get: d.get,
-                                set: function (v) {
-                                  const cv = this && this.canvas;
-                                  if (cv && cv.width === 48 && cv.height === 48) console.error('[c48] ' + k + ' = ' + String(v).slice(0, 60));
-                                  return d.set.call(this, v);
-                                },
-                                enumerable: d.enumerable, configurable: true,
-                              });
-                            } catch (e) {}
-                          }
-                        }
-                        for (const N of ['CanvasRenderingContext2D', 'OffscreenCanvasRenderingContext2D']) {
-                          const C = globalThis[N] && globalThis[N].prototype;
                           if (!C || !C.getImageData || C.__ptGid) continue;
                           try { Object.defineProperty(C, '__ptGid', { value: 1 }); } catch (e) {}
                           const gi = C.getImageData;
