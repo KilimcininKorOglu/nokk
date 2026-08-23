@@ -1861,7 +1861,19 @@
       }
       return g;
     }
-    convertToBlob(opts) { return Promise.resolve(new Blob([], { type: (opts && opts.type) || 'image/png' })); }
+    // Настоящая картинка, а не пустой `Blob`: страница, которая снимает холст
+    // и меряет длину снимка, получала ноль.
+    convertToBlob(opts) {
+      const c = this.__ptO.c;
+      const type = (opts && opts.type) || 'image/png';
+      try {
+        if (c && c.toDataURL && globalThis.__pt_blobFromDataUrl) {
+          return Promise.resolve(globalThis.__pt_blobFromDataUrl(
+            c.toDataURL(type, opts && opts.quality)));
+        }
+      } catch (e) { return Promise.reject(e); }
+      return Promise.resolve(new Blob([], { type }));
+    }
     // Настоящий ImageBitmap: он должен нести пиксели холста, иначе `drawImage`
     // им рисует пустоту. Возвращался пустой объект — сборщик отпечатков
     // получал из него ничего.

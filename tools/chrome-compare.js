@@ -195,18 +195,127 @@ const HOOK = `(() => {
       ['convertToBlob', 'transferToImageBitmap']);
     // Какие именно контексты просят у офскрина и что получают.
     try {
-      const OP = globalThis.OffscreenCanvas && OffscreenCanvas.prototype;
-      const og = OP && OP.getContext;
-      if (og) {
-        Object.defineProperty(OP, 'getContext', { value: function (t, a) {
-          let r, err = '';
-          try { r = og.call(this, t, a); } catch (e) { err = e.name; }
-          console.log('[octx] ' + t + ' ' + this.width + 'x' + this.height + ' -> ' +
-                      (err || (r ? Object.prototype.toString.call(r) : String(r))));
-          if (err) throw new TypeError(err);
-          return r;
-        }, writable: true, configurable: true });
-      }
+          for (const N of ['WebGLRenderingContext', 'WebGL2RenderingContext']) {
+            const W = globalThis[N] && globalThis[N].prototype;
+            if (!W || !W.readPixels || W.__ptRp) continue;
+            try { Object.defineProperty(W, '__ptRp', { value: 1 }); } catch (e) {}
+            const rp = W.readPixels;
+            W.readPixels = function (x, y, w, h, f, t, p) {
+              console.log('[rp] ' + N + ' ' + w + 'x' + h);
+              return rp.apply(this, arguments);
+            };
+          }
+          const HC = globalThis.HTMLCanvasElement && globalThis.HTMLCanvasElement.prototype;
+          if (HC && HC.getContext && !HC.__ptGc) {
+            try { Object.defineProperty(HC, '__ptGc', { value: 1 }); } catch (e) {}
+            const hg = HC.getContext;
+            HC.getContext = function (ty, a) {
+              const r = hg.apply(this, arguments);
+              console.log('[ectx] ' + ty + ' ' + this.width + 'x' + this.height +
+                  ' -> ' + (r ? 'ok' : String(r)));
+              return r;
+            };
+          }
+          for (const N of ['CanvasRenderingContext2D', 'OffscreenCanvasRenderingContext2D']) {
+            const C = globalThis[N] && globalThis[N].prototype;
+            if (!C || C.__ptAll) continue;
+            try { Object.defineProperty(C, '__ptAll', { value: 1 }); } catch (e) {}
+            for (const k of Object.getOwnPropertyNames(C)) {
+              let d;
+              try { d = Object.getOwnPropertyDescriptor(C, k); } catch (e) { continue; }
+              if (!d || typeof d.value !== 'function' || k === 'constructor' || k === 'getImageData') continue;
+              const f = d.value;
+              try {
+                C[k] = function () {
+                  const cv = this && this.canvas;
+                  if (cv && cv.width === 48 && cv.height === 48) {
+                    const a = [];
+                    for (let i = 0; i < Math.min(arguments.length, 6); i++) {
+                      const v = arguments[i];
+                      a.push(typeof v === 'object' && v ? (v.localName || v.constructor && v.constructor.name || 'об') : String(v).slice(0, 40));
+                    }
+                    console.log('[c48] ' + k + '(' + a.join(',') + ')');
+                  }
+                  return f.apply(this, arguments);
+                };
+              } catch (e) {}
+            }
+            for (const k of ['fillStyle', 'font', 'globalAlpha', 'globalCompositeOperation', 'strokeStyle']) {
+              const d = Object.getOwnPropertyDescriptor(C, k);
+              if (!d || !d.set) continue;
+              try {
+                Object.defineProperty(C, k, {
+                  get: d.get,
+                  set: function (v) {
+                    const cv = this && this.canvas;
+                    if (cv && cv.width === 48 && cv.height === 48) console.log('[c48] ' + k + ' = ' + String(v).slice(0, 60));
+                    return d.set.call(this, v);
+                  },
+                  enumerable: d.enumerable, configurable: true,
+                });
+              } catch (e) {}
+            }
+          }
+          for (const N of ['CanvasRenderingContext2D', 'OffscreenCanvasRenderingContext2D']) {
+            const C = globalThis[N] && globalThis[N].prototype;
+            if (!C || !C.getImageData || C.__ptGid) continue;
+            try { Object.defineProperty(C, '__ptGid', { value: 1 }); } catch (e) {}
+            const gi = C.getImageData;
+            C.getImageData = function (x, y, w, h) {
+              console.log('[gid] ' + w + 'x' + h + ' на ' + (this.canvas ? this.canvas.width + 'x' + this.canvas.height : '?'));
+              return gi.apply(this, arguments);
+            };
+          }
+          const gpu = globalThis.navigator && globalThis.navigator.gpu;
+          if (gpu && !gpu.__ptG) {
+            try { Object.defineProperty(gpu, '__ptG', { value: 1 }); } catch (e) {}
+            for (const k of ['requestAdapter', 'getPreferredCanvasFormat']) {
+              const f = gpu[k];
+              if (typeof f !== 'function') continue;
+              gpu[k] = function () {
+                let r;
+                try { r = f.apply(this, arguments); } catch (e) { console.log('[gpu] ' + k + ' бросил ' + e.name); throw e; }
+                if (r && typeof r.then === 'function') {
+                  return r.then((v) => { console.log('[gpu] ' + k + ' -> ' + (v ? 'объект' : String(v))); return v; },
+                                (e) => { console.log('[gpu] ' + k + ' отказ ' + e); throw e; });
+                }
+                console.log('[gpu] ' + k + ' -> ' + String(r));
+                return r;
+              };
+            }
+          }
+          const OP = globalThis.OffscreenCanvas && globalThis.OffscreenCanvas.prototype;
+          const og = OP && OP.getContext;
+          if (og) {
+            let seq = 0;
+            Object.defineProperty(OP, 'getContext', { value: function (ty, a) {
+              let r, err = '';
+              try { r = og.call(this, ty, a); } catch (e) { err = e.name; }
+              const id = ++seq;
+              console.log('[octx] #' + id + ' ' + ty + ' ' + this.width + 'x' + this.height +
+                  ' настройки=' + (a ? JSON.stringify(a) : '-') + ' -> ' + (err || (r ? 'ok' : String(r))));
+              // Для холста 49x44 — след первых операций: по нему видно, чем
+              // третий отличается от первых двух.
+              if (r && ty === '2d' && this.width * this.height === 2156) {
+                let n = 0;
+                const seen = Object.create(null);
+                for (const k of Object.getOwnPropertyNames(Object.getPrototypeOf(r))) {
+                  let d;
+                  try { d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(r), k); } catch (e) { continue; }
+                  if (!d || typeof d.value !== 'function') continue;
+                  const f = d.value;
+                  try {
+                    r[k] = function (...args) {
+                      if (n < 26 && !seen[k]) { seen[k] = 1; console.log('[cop] #' + id + ' ' + (n++) + ' ' + k); }
+                      return f.apply(this, args);
+                    };
+                  } catch (e) {}
+                }
+              }
+              if (err) throw new TypeError(err);
+              return r;
+            }, writable: true, configurable: true });
+          }
     } catch (e) {}
     wrapProto(globalThis.Worker && Worker.prototype, 'worker', ['postMessage', 'terminate']);
     wrapProto(globalThis.SVGGraphicsElement && SVGGraphicsElement.prototype, 'svg', ['getBBox','getCTM','getScreenCTM']);
@@ -256,7 +365,7 @@ const HOOK = `(() => {
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[parts|^\[enc |^\[octx\]/.test(String(t)))
+      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[parts|^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
         lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
     }
     if (m.method === 'Target.attachedToTarget') {

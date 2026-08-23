@@ -410,7 +410,23 @@ pub fn draw_image(id: u32, url: &str, dx: f32, dy: f32, dw: f32, dh: f32) -> boo
 /// — а у нас `drawImage` их отвергал, хотя собственный текст ошибки перечислял
 /// их среди допустимых. Сборщик Cloudflare рисует так свой `OffscreenCanvas` и
 /// получал исключение вместо картинки.
-pub fn blit(dst_id: u32, src_id: u32, dx: f32, dy: f32, dw: f32, dh: f32) -> bool {
+///
+/// Вырезка задаётся в координатах источника: девятиаргументный `drawImage`
+/// берёт из картинки прямоугольник, а не её целиком, и без него страница,
+/// раскладывающая спрайт по клеткам, рисует одно и то же место.
+#[allow(clippy::too_many_arguments)]
+pub fn blit(
+    dst_id: u32,
+    src_id: u32,
+    sx: f32,
+    sy: f32,
+    sw_in: f32,
+    sh_in: f32,
+    dx: f32,
+    dy: f32,
+    dw: f32,
+    dh: f32,
+) -> bool {
     if dst_id == src_id {
         return false;
     }
@@ -425,9 +441,16 @@ pub fn blit(dst_id: u32, src_id: u32, dx: f32, dy: f32, dw: f32, dh: f32) -> boo
             )
         })
     });
-    let Some((sw, sh, src)) = src else {
+    let Some((full_w, full_h, src)) = src else {
         return false;
     };
+    if full_w <= 0 || full_h <= 0 {
+        return false;
+    }
+    // Прямоугольник источника: по умолчанию — вся картинка.
+    let (ox_s, oy_s) = (sx.round() as i64, sy.round() as i64);
+    let sw = if sw_in > 0.0 { sw_in.round() as i64 } else { full_w };
+    let sh = if sh_in > 0.0 { sh_in.round() as i64 } else { full_h };
     if sw <= 0 || sh <= 0 {
         return false;
     }
@@ -449,14 +472,17 @@ pub fn blit(dst_id: u32, src_id: u32, dx: f32, dy: f32, dw: f32, dh: f32) -> boo
             if py < 0 || py >= ch {
                 continue;
             }
-            let sy = (ty * sh / dh).clamp(0, sh - 1);
+            let sy = oy_s + (ty * sh / dh).clamp(0, sh - 1);
             for tx in 0..dw {
                 let px = ox + tx;
                 if px < 0 || px >= cw {
                     continue;
                 }
-                let sx = (tx * sw / dw).clamp(0, sw - 1);
-                let si = ((sy * sw + sx) * 4) as usize;
+                let sx = ox_s + (tx * sw / dw).clamp(0, sw - 1);
+                if sx < 0 || sx >= full_w || sy < 0 || sy >= full_h {
+                    continue;
+                }
+                let si = ((sy * full_w + sx) * 4) as usize;
                 // Источник уже помножен на альфу — как и приёмник, — поэтому
                 // складываем по «source-over» прямо в этом виде.
                 let (sr, sg, sb, sa) = (src[si], src[si + 1], src[si + 2], src[si + 3]);

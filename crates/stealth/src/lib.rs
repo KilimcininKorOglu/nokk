@@ -3081,6 +3081,250 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       });
     }
   } catch (e) {}
+  // `new ImageData(...)` не работал: конструктор был заглушкой из таблицы форм,
+  // и объект выходил без пикселей — `d.data.length` бросало. Страница, которая
+  // складывает картинку сама, а не читает её с холста, обрывалась здесь.
+  try {
+    const P0 = globalThis.ImageData && globalThis.ImageData.prototype;
+    if (P0 && !globalThis.__pt_imageDataReal) {
+      const err = (why) => {
+        const e = new (globalThis.DOMException || Error)(
+          "Failed to construct 'ImageData': " + why, 'InvalidStateError');
+        e.name = 'InvalidStateError';
+        return e;
+      };
+      const ctor = function ImageData(a, b, c) {
+        if (!(this instanceof ctor)) {
+          throw new TypeError("Failed to construct 'ImageData': " +
+            'Please use the \'new\' operator, this DOM object constructor cannot be called as a function.');
+        }
+        if (arguments.length < 2) {
+          throw new TypeError("Failed to construct 'ImageData': " +
+            '2 arguments required, but only ' + arguments.length + ' present.');
+        }
+        let data = null, w = 0, h = 0;
+        if (typeof a === 'number') {
+          w = a | 0; h = b | 0;
+          if (w <= 0) throw err('The source width is zero or not a number.');
+          if (h <= 0) throw err('The source height is zero or not a number.');
+          data = new Uint8ClampedArray(4 * w * h);
+        } else {
+          if (!(a instanceof Uint8ClampedArray)) {
+            throw new TypeError("Failed to construct 'ImageData': " +
+              "The provided value is not of type '(Uint8ClampedArray or Float16Array)'.");
+          }
+          data = a; w = b | 0;
+          if (data.length % 4) throw err('The input data length is not a multiple of 4.');
+          if (w <= 0) throw err('The source width is zero or not a number.');
+          const rows = data.length / 4 / w;
+          if (arguments.length >= 3 && typeof c === 'number') {
+            h = c | 0;
+            if (h <= 0) throw err('The source height is zero or not a number.');
+            if (data.length !== 4 * w * h) {
+              throw err('The input data length is not equal to (4 * width * height).');
+            }
+          } else {
+            if (rows !== Math.floor(rows)) {
+              throw err('The input data length is not a multiple of (4 * width).');
+            }
+            h = rows;
+          }
+        }
+        const o = globalThis.__pt_makeImageData(data, w, h);
+        Object.setPrototypeOf(o, Object.getPrototypeOf(this) || P0);
+        return o;
+      };
+      Object.defineProperty(ctor, 'prototype', { value: P0, writable: false, enumerable: false });
+      try { Object.defineProperty(ctor, 'length', { value: 2, configurable: true }); } catch (e) {}
+      try { Object.defineProperty(P0, 'constructor', { value: ctor, writable: true, configurable: true }); } catch (e) {}
+      globalThis.ImageData = globalThis.__pt_native ? __pt_native(ctor) : ctor;
+      globalThis.__pt_imageDataReal = true;
+    }
+  } catch (e) {}
+
+  // `createImageBitmap` была заглушкой: она отдавала обещание, разрешённое в
+  // `undefined`. Всё, что рисует снимком, обрывалось на первом же обращении к
+  // его ширине — а сборщик отпечатков только так и работает с картинками.
+  // Здесь она настоящая: снимок несёт пиксели источника, знает свой размер,
+  // закрывается и принимает вырезку и изменение размера.
+  try {
+    const D = globalThis.document;
+    // Здесь не видно помощника из холстового слоя, а имя у метода должно быть
+    // родное: одно и то же делает `__pt_native`.
+    const mask = (f, name) => {
+      try { Object.defineProperty(f, 'name', { value: name, configurable: true }); } catch (e) {}
+      return globalThis.__pt_native ? globalThis.__pt_native(f) : f;
+    };
+    const newCanvas = (w, h) => {
+      if (!D || !D.createElement) return null;
+      const el = D.createElement('canvas');
+      el.width = w; el.height = h;
+      return el;
+    };
+    // Прототип снимка оформляется один раз: в браузере ни ширина, ни высота не
+    // лежат на самом объекте — они читаются с прототипа, и `close` их обнуляет.
+    const shape = () => {
+      const B = globalThis.ImageBitmap;
+      const P = B && B.prototype;
+      if (!P || P.__ptShaped) return P;
+      try { Object.defineProperty(P, '__ptShaped', { value: true }); } catch (e) {}
+      const dim = (k) => ({
+        get: mask(function () {
+          const st = this && this.__ptImageBitmap;
+          return st ? (st.closed ? 0 : st[k] | 0) : undefined;
+        }, 'get ' + k),
+        enumerable: true, configurable: true,
+      });
+      try { Object.defineProperty(P, 'width', dim('w')); } catch (e) {}
+      try { Object.defineProperty(P, 'height', dim('h')); } catch (e) {}
+      try {
+        Object.defineProperty(P, 'close', {
+          value: mask(function close() {
+            const st = this && this.__ptImageBitmap;
+            if (st) st.closed = true;
+          }, 'close'),
+          writable: true, enumerable: true, configurable: true,
+        });
+      } catch (e) {}
+      try {
+        if (!Object.getOwnPropertyDescriptor(P, Symbol.toStringTag)) {
+          Object.defineProperty(P, Symbol.toStringTag, { value: 'ImageBitmap', configurable: true });
+        }
+      } catch (e) {}
+      return P;
+    };
+    const makeBitmap = (surf, w, h) => {
+      const P = shape();
+      const b = Object.create(P || Object.prototype);
+      Object.defineProperty(b, '__ptImageBitmap', { value: { surf, w: w | 0, h: h | 0, closed: false } });
+      return b;
+    };
+    globalThis.__pt_makeBitmap = makeBitmap;
+
+    // Снимок из `Blob`: размер читается из заголовка самой картинки, а
+    // рисуется она через data-ссылку — тем же путём, что и `<img>`.
+    const fromBlob = (b) => {
+      let bin = '';
+      try { bin = b.__ptText ? b.__ptText() : ''; } catch (e) { bin = ''; }
+      if (!bin) return null;
+      let w = 0, h = 0;
+      const at = (i) => bin.charCodeAt(i) & 0xff;
+      if (bin.charCodeAt(0) === 0x89 && bin.slice(1, 4) === 'PNG') {
+        w = (at(16) << 24) | (at(17) << 16) | (at(18) << 8) | at(19);
+        h = (at(20) << 24) | (at(21) << 16) | (at(22) << 8) | at(23);
+      } else if (at(0) === 0xff && at(1) === 0xd8) {
+        for (let i = 2; i + 9 < bin.length;) {
+          if (at(i) !== 0xff) { i++; continue; }
+          const m = at(i + 1), len = (at(i + 2) << 8) | at(i + 3);
+          if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+            h = (at(i + 5) << 8) | at(i + 6); w = (at(i + 7) << 8) | at(i + 8); break;
+          }
+          i += 2 + len;
+        }
+      }
+      if (w <= 0 || h <= 0) return null;
+      let url = '';
+      try { url = 'data:' + (b.type || 'image/png') + ';base64,' + btoa(bin); } catch (e) { return null; }
+      return { src: url, width: w, height: h, naturalWidth: w, naturalHeight: h };
+    };
+
+    const intrinsic = (src) => {
+      if (!src || typeof src !== 'object') return null;
+      const st = src.__ptImageBitmap;
+      if (st) return [st.closed ? 0 : st.w, st.closed ? 0 : st.h];
+      if (src.__ptO) return [src.__ptO.w | 0, src.__ptO.h | 0];
+      if (src.naturalWidth) return [src.naturalWidth | 0, src.naturalHeight | 0];
+      if (src.videoWidth) return [src.videoWidth | 0, src.videoHeight | 0];
+      if (src.codedWidth) return [src.codedWidth | 0, src.codedHeight | 0];
+      if (typeof src.width === 'number') return [src.width | 0, src.height | 0];
+      return null;
+    };
+    const accepted = (src) => !!(src && typeof src === 'object' && (
+      src.localName === 'img' || src.localName === 'canvas' || src.localName === 'video' ||
+      src.__ptImageBitmap || src.__ptO || src.__ptSurf || src.__ptC2d ||
+      (src.data && typeof src.width === 'number' && typeof src.height === 'number') ||
+      (globalThis.Blob && src instanceof globalThis.Blob) ||
+      typeof src.src === 'string'));
+
+    const fn = function createImageBitmap(image) {
+      const n = arguments.length;
+      if (n < 1) {
+        return Promise.reject(new TypeError(
+          "Failed to execute 'createImageBitmap' on 'Window': " +
+          '1 argument required, but only 0 present.'));
+      }
+      if (!accepted(image)) {
+        return Promise.reject(new TypeError(
+          "Failed to execute 'createImageBitmap' on 'Window': " +
+          "The provided value is not of type '(Blob or CSSImageValue or HTMLCanvasElement or " +
+          "HTMLImageElement or HTMLVideoElement or ImageBitmap or ImageData or OffscreenCanvas " +
+          "or SVGImageElement or VideoFrame)'."));
+      }
+      let sx = 0, sy = 0, sw = 0, sh = 0, opts = null, cropped = false;
+      if (n >= 5 && typeof arguments[1] === 'number') {
+        sx = arguments[1] | 0; sy = arguments[2] | 0;
+        sw = arguments[3] | 0; sh = arguments[4] | 0;
+        opts = arguments[5] || null;
+        cropped = true;
+        if (sw === 0 || sh === 0) {
+          const e = new (globalThis.DOMException || Error)(
+            "Failed to execute 'createImageBitmap' on 'Window': The crop rect width is 0.",
+            'RangeError');
+          e.name = 'RangeError';
+          return Promise.reject(e);
+        }
+      } else {
+        opts = (n >= 2 ? arguments[1] : null) || null;
+      }
+      if (globalThis.Blob && image instanceof globalThis.Blob) {
+        const shim = fromBlob(image);
+        if (!shim) {
+          const e = new (globalThis.DOMException || Error)(
+            "Failed to execute 'createImageBitmap' on 'Window': " +
+            'The source image could not be decoded.', 'InvalidStateError');
+          e.name = 'InvalidStateError';
+          return Promise.reject(e);
+        }
+        image = shim;
+      }
+      const size = intrinsic(image);
+      if (!size || size[0] <= 0 || size[1] <= 0) {
+        const e = new (globalThis.DOMException || Error)(
+          "Failed to execute 'createImageBitmap' on 'Window': The source image " +
+          'width is 0.', 'InvalidStateError');
+        e.name = 'InvalidStateError';
+        return Promise.reject(e);
+      }
+      if (!cropped) { sw = size[0]; sh = size[1]; }
+      let ow = sw, oh = sh;
+      const rw = opts && opts.resizeWidth | 0, rh = opts && opts.resizeHeight | 0;
+      if (rw > 0 && rh > 0) { ow = rw; oh = rh; }
+      else if (rw > 0) { ow = rw; oh = Math.max(1, Math.round(sh * rw / sw)); }
+      else if (rh > 0) { oh = rh; ow = Math.max(1, Math.round(sw * rh / sh)); }
+
+      const out = newCanvas(ow, oh);
+      const g = out && out.getContext('2d');
+      if (g) {
+        try {
+          if (image.data && typeof image.width === 'number' && !image.localName) {
+            // Из `ImageData` рисовать нельзя: он ложится на промежуточный
+            // холст, а уже тот переносится с вырезкой и масштабом.
+            const tmp = newCanvas(size[0], size[1]);
+            const tg = tmp && tmp.getContext('2d');
+            if (tg) { tg.putImageData(image, 0, 0); g.drawImage(tmp, sx, sy, sw, sh, 0, 0, ow, oh); }
+          } else {
+            g.drawImage(image, sx, sy, sw, sh, 0, 0, ow, oh);
+          }
+        } catch (e) {}
+      }
+      const surf = out && out.__ptSurf;
+      return Promise.resolve(makeBitmap(surf, ow, oh));
+    };
+    Object.defineProperty(globalThis, 'createImageBitmap', {
+      value: globalThis.__pt_native ? __pt_native(fn) : fn,
+      writable: true, enumerable: true, configurable: true,
+    });
+  } catch (e) {}
   // Статические члены расставляются по таблице после того, как их определил
   // слой DOM, — и заглушка затирает настоящую проверку кодеков. Возвращаем её
   // здесь: ответ тот же, что у `canPlayType`, только логический.
@@ -4938,10 +5182,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       id() { sync(); return id; },
       // Один холст на другом: пиксели переносит движок, с масштабированием и
       // наложением по альфе, как это делает браузер.
-      blit(srcId, dx, dy, dw, dh) {
+      blit(srcId, sx, sy, sw, sh, dx, dy, dw, dh) {
         sync();
         if (typeof __pt_canvasBlit !== 'function' || !srcId) return false;
-        try { return !!__pt_canvasBlit(id, srcId, dx, dy, dw, dh); } catch (e) { return false; }
+        try { return !!__pt_canvasBlit(id, srcId, sx, sy, sw, sh, dx, dy, dw, dh); }
+        catch (e) { return false; }
       },
       read(x, y, w, h, dst) {
         sync();
@@ -5023,6 +5268,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   const CTX2D_METHODS = ['clip','createConicGradient','createImageData','createLinearGradient','createPattern','createRadialGradient','drawFocusIfNeeded','drawImage','fill','fillText','getContextAttributes','getImageData','getLineDash','getTransform','isContextLost','isPointInPath','isPointInStroke','measureText','reset','roundRect','setLineDash','strokeText','arc','arcTo','beginPath','bezierCurveTo','clearRect','closePath','ellipse','fillRect','lineTo','moveTo','putImageData','quadraticCurveTo','rect','resetTransform','restore','rotate','save','scale','setTransform','stroke','strokeRect','transform','translate'];
   const CTX2D_ATTRS = ['canvas','lang','font','textAlign','textBaseline','direction','fontKerning','fontStretch','fontVariantCaps','letterSpacing','textRendering','wordSpacing','globalCompositeOperation','filter','imageSmoothingQuality','strokeStyle','fillStyle','shadowColor','lineCap','lineJoin','globalAlpha','imageSmoothingEnabled','shadowOffsetX','shadowOffsetY','shadowBlur','lineWidth','miterLimit','lineDashOffset'];
   const CTX_IMPL = new WeakMap();
+  // `save()`/`restore()` в браузере откатывают не только матрицу, но и всё
+  // состояние рисования. Мы не откатывали ничего.
+  const SAVED = ['fillStyle', 'strokeStyle', 'globalAlpha', 'globalCompositeOperation',
+    'lineWidth', 'lineCap', 'lineJoin', 'miterLimit', 'lineDashOffset', 'font',
+    'textAlign', 'textBaseline', 'direction', 'letterSpacing', 'wordSpacing',
+    'fontKerning', 'fontStretch', 'fontVariantCaps', 'textRendering',
+    'shadowBlur', 'shadowColor', 'shadowOffsetX', 'shadowOffsetY', 'filter',
+    'imageSmoothingEnabled', 'imageSmoothingQuality'];
   // Движку нужна внутренняя сторона контекста (снять пиксели), а странице — нет.
   globalThis.__pt_ctxImpl = (pub) => CTX_IMPL.get(pub) || pub;
   // Значения, которые браузер принимает у перечислимых свойств контекста:
@@ -5098,6 +5351,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // спрашивают `Object.prototype.toString`. `data` у него — собственное
   // свойство, остальное с прототипа.
   const IMAGE_DATA = new WeakMap();
+  // Конструктор `ImageData` ставится позже — таблица форм ещё не создала его
+  // класс, когда этот слой выполняется, — поэтому сборщик виден снаружи.
   const makeImageData = (data, w, h) => {
     const C = globalThis.ImageData;
     if (typeof C !== 'function' || !C.prototype) return { data, width: w, height: h, colorSpace: 'srgb' };
@@ -5127,6 +5382,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     try { Object.defineProperty(o, 'data', { value: data, enumerable: true }); } catch (e) {}
     return o;
   };
+  globalThis.__pt_makeImageData = makeImageData;
 
   // A canvas that has been shown something from another origin stops being
   // readable: the browser refuses `getImageData` and `toDataURL` on it. We
@@ -5177,8 +5433,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     let bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;     // current path bounding box
     let tainted = false;                        // shown something from elsewhere
 
-    const pathPoint = (x, y) => {
-      x = +x || 0; y = +y || 0;
+    const pathPoint = (ux, uy) => {
+      const x = tX(+ux || 0, +uy || 0), y = tY(+ux || 0, +uy || 0);
       if (bx1 <= bx0 && by1 <= by0) { bx0 = x; by0 = y; bx1 = x; by1 = y; }
       bx0 = Math.min(bx0, x); by0 = Math.min(by0, y); bx1 = Math.max(bx1, x); by1 = Math.max(by1, y);
     };
@@ -5188,9 +5444,31 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // rasterizer: curves and arcs are tessellated to line segments here so the
     // Rust side stays a trivial, robust decoder. Built only when the surface is
     // native; the JS fallback keeps using the bounding-box stamp above.
+    // Матрица холста. `translate`/`scale`/`rotate` были заметками в журнале и
+    // ничего не двигали: страница, которая масштабирует холст и рисует по
+    // крупным координатам — а так рисует всякий сборщик отпечатков, — получала
+    // пустую картинку, потому что всё уезжало за край. Точки пути ложатся в
+    // список уже преобразованными, как и в браузере: матрица применяется в тот
+    // миг, когда точка добавлена, а не когда путь рисуется.
+    let M = [1, 0, 0, 1, 0, 0];
+    const mStack = [];
+    const tX = (x, y) => M[0] * x + M[2] * y + M[4];
+    const tY = (x, y) => M[1] * x + M[3] * y + M[5];
+    const tScale = () => Math.sqrt(Math.abs(M[0] * M[3] - M[1] * M[2])) || 1;
+    const plain = () => M[0] === 1 && M[1] === 0 && M[2] === 0 && M[3] === 1 && M[4] === 0 && M[5] === 0;
+    const mulM = (a, b, c, d, e, f) => {
+      M = [
+        M[0] * a + M[2] * b, M[1] * a + M[3] * b,
+        M[0] * c + M[2] * d, M[1] * c + M[3] * d,
+        M[0] * e + M[2] * f + M[4], M[1] * e + M[3] * f + M[5],
+      ];
+    };
+
     let verbs = [], cx = 0, cy = 0, sub = false;
-    const moveV = (x, y) => { x = +x || 0; y = +y || 0; verbs.push(0, x, y); cx = x; cy = y; sub = true; };
-    const lineV = (x, y) => { x = +x || 0; y = +y || 0; if (!sub) return moveV(x, y); verbs.push(1, x, y); cx = x; cy = y; };
+    // Текущая точка хранится в координатах страницы, а в список идут
+    // преобразованные: иначе кривая считалась бы по смешанным системам.
+    const moveV = (x, y) => { x = +x || 0; y = +y || 0; verbs.push(0, tX(x, y), tY(x, y)); cx = x; cy = y; sub = true; };
+    const lineV = (x, y) => { x = +x || 0; y = +y || 0; if (!sub) return moveV(x, y); verbs.push(1, tX(x, y), tY(x, y)); cx = x; cy = y; };
     const closeV = () => { if (sub) { verbs.push(4); sub = false; } };
     const sampleN = (fn) => { const N = 18; for (let k = 1; k <= N; k++) fn(k / N); };
     const cubicV = (c1x, c1y, c2x, c2y, x, y) => {
@@ -5242,8 +5520,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       if (b === 'top' || b === 'hanging') oy += size * 0.8;
       else if (b === 'middle') oy += size * 0.3;
       else if (b === 'bottom' || b === 'ideographic') oy -= size * 0.2;
-      if (S.native) S.text(t, ox, oy, size, rgba, fontFamily(this.font), fontBold(this.font), fontItalic(this.font));
-      else stamp(ox, oy - size, w, size * 1.3);
+      // Текст тоже живёт в преобразованных координатах, и кегль растёт вместе
+      // с масштабом. Наклон и поворот здесь приближаются равномерным
+      // масштабом — глифы движок кладёт по горизонтали.
+      if (S.native) {
+        S.text(t, tX(ox, oy), tY(ox, oy), size * tScale(), rgba,
+          fontFamily(this.font), fontBold(this.font), fontItalic(this.font));
+      } else stamp(tX(ox, oy), tY(ox, oy) - size, w, size * 1.3);
     };
 
     // Gradient fillStyle/strokeStyle: real objects carrying coords + stops, flattened
@@ -5263,11 +5546,24 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
     const gradOf = (v) => (v && GRAD.get(v)) || null;
     const encodeGrad = (g) => {
-      const a = [g.type, g.coords[0], g.coords[1], g.coords[2], g.coords[3], g.coords[4], g.coords[5], g.stops.length];
+      // Градиент задан в координатах страницы, а движок заливает по холсту:
+      // его точки и радиусы идут через ту же матрицу, что и путь.
+      const c = g.coords;
+      const k = tScale();
+      const co = [tX(c[0], c[1]), tY(c[0], c[1]), tX(c[2], c[3]), tY(c[2], c[3]),
+        (+c[4] || 0) * k, (+c[5] || 0) * k];
+      const a = [g.type, co[0], co[1], co[2], co[3], co[4], co[5], g.stops.length];
       for (let k = 0; k < g.stops.length; k++) { const s = g.stops[k]; a.push(s[0], s[1][0], s[1][1], s[1][2], s[1][3]); }
       return a;
     };
-    const rectVerbs = (x, y, w, h) => { const X = +x || 0, Y = +y || 0, W2 = +w || 0, H2 = +h || 0; return [0, X, Y, 1, X + W2, Y, 1, X + W2, Y + H2, 1, X, Y + H2, 4]; };
+    // Углы прямоугольника тоже проходят через матрицу: под поворотом это уже
+    // не прямоугольник, и браузер рисует ромб.
+    const rectVerbs = (x, y, w, h) => {
+      const X = +x || 0, Y = +y || 0, W2 = +w || 0, H2 = +h || 0;
+      const p = (px, py) => [tX(px, py), tY(px, py)];
+      const a = p(X, Y), b = p(X + W2, Y), c = p(X + W2, Y + H2), d = p(X, Y + H2);
+      return [0, a[0], a[1], 1, b[0], b[1], 1, c[0], c[1], 1, d[0], d[1], 4];
+    };
 
     // Холст без документа — offscreen, и контекст у него свой интерфейс:
     // в воркере `CanvasRenderingContext2D` не существует вовсе, там есть
@@ -5306,6 +5602,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         note('fillRect|' + [x, y, w, h, this.fillStyle]);
         const fs = this.fillStyle;
         if (S.native && gradOf(fs)) S.fillPathGradient(rectVerbs(x, y, w, h), false, encodeGrad(gradOf(fs)));
+        else if (S.native && !plain()) S.fillPath(rectVerbs(x, y, w, h), false, parseColor(fs));
         else solid(x, y, w, h, parseColor(fs));
       },
       clearRect(x, y, w, h) { note('clearRect|' + [x, y, w, h]); solid(x, y, w, h, [0, 0, 0, 0]); },
@@ -5313,8 +5610,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         note('strokeRect|' + [x, y, w, h, this.strokeStyle, this.lineWidth]);
         const X = +x || 0, Y = +y || 0, W2 = +w || 0, H2 = +h || 0;
         if (S.native) {
-          S.strokePath([0, X, Y, 1, X + W2, Y, 1, X + W2, Y + H2, 1, X, Y + H2, 4],
-            Math.max(0, +this.lineWidth || 1), parseColor(this.strokeStyle));
+          S.strokePath(rectVerbs(X, Y, W2, H2),
+            Math.max(0, +this.lineWidth || 1) * tScale(), parseColor(this.strokeStyle));
           return;
         }
         const lw = Math.max(1, this.lineWidth | 0);
@@ -5363,21 +5660,63 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       },
       stroke() {
         note('stroke|' + [this.strokeStyle, this.lineWidth]);
-        if (S.native) S.strokePath(verbs, Math.max(0, +this.lineWidth || 1), parseColor(this.strokeStyle));
+        if (S.native) S.strokePath(verbs, Math.max(0, +this.lineWidth || 1) * tScale(), parseColor(this.strokeStyle));
         else paintPath();
       },
       clip() { note('clip'); },
 
-      save() { note('save'); }, restore() { note('restore'); },
-      translate(x, y) { note('translate|' + [x, y]); }, scale(x, y) { note('scale|' + [x, y]); },
-      rotate(a) { note('rotate|' + a); },
-      setTransform() { note('setTransform|' + [].slice.call(arguments)); },
-      transform() { note('transform|' + [].slice.call(arguments)); },
-      resetTransform() { note('resetTransform'); },
+      save() {
+        note('save');
+        const t = CTX_IMPL.get(this) || this;
+        const style = {};
+        for (const k of SAVED) style[k] = t[k];
+        mStack.push({ m: M.slice(), style });
+      },
+      restore() {
+        note('restore');
+        const top = mStack.pop();
+        if (!top) return;
+        M = top.m;
+        const t = CTX_IMPL.get(this) || this;
+        for (const k of SAVED) t[k] = top.style[k];
+      },
+      translate(x, y) { note('translate|' + [x, y]); mulM(1, 0, 0, 1, +x || 0, +y || 0); },
+      scale(x, y) { note('scale|' + [x, y]); mulM(+x || 0, 0, 0, +y || 0, 0, 0); },
+      rotate(a) {
+        note('rotate|' + a);
+        const r = +a || 0, c = Math.cos(r), n = Math.sin(r);
+        mulM(c, n, -n, c, 0, 0);
+      },
+      setTransform(a, b, c, d, e, f) {
+        note('setTransform|' + [].slice.call(arguments));
+        if (a && typeof a === 'object') {
+          M = [+a.a || 0, +a.b || 0, +a.c || 0, +a.d || 0, +a.e || 0, +a.f || 0];
+          return;
+        }
+        M = arguments.length ? [+a || 0, +b || 0, +c || 0, +d || 0, +e || 0, +f || 0] : [1, 0, 0, 1, 0, 0];
+      },
+      transform(a, b, c, d, e, f) {
+        note('transform|' + [].slice.call(arguments));
+        mulM(+a || 0, +b || 0, +c || 0, +d || 0, +e || 0, +f || 0);
+      },
+      resetTransform() { note('resetTransform'); M = [1, 0, 0, 1, 0, 0]; },
+      getTransform() {
+        const D = globalThis.DOMMatrix;
+        return D ? new D([M[0], M[1], M[2], M[3], M[4], M[5]])
+          : { a: M[0], b: M[1], c: M[2], d: M[3], e: M[4], f: M[5] };
+      },
       setLineDash(d) { note('setLineDash|' + d); }, getLineDash() { return []; },
 
-      drawImage(img, x, y, w, h) {
+      drawImage(img, a1, a2, a3, a4, a5, a6, a7, a8) {
         needArgs(arguments.length, 3, 'drawImage', 'CanvasRenderingContext2D');
+        // Три формы: (img,dx,dy), (img,dx,dy,dw,dh) и вырезка из источника
+        // (img,sx,sy,sw,sh,dx,dy,dw,dh). Девятиаргументную мы молча читали как
+        // пятиаргументную — спрайт рисовался целиком и не туда.
+        const crop = arguments.length >= 9;
+        const sx = crop ? +a1 || 0 : 0, sy = crop ? +a2 || 0 : 0;
+        const sw = crop ? +a3 || 0 : 0, sh = crop ? +a4 || 0 : 0;
+        const x = crop ? +a5 || 0 : +a1 || 0, y = crop ? +a6 || 0 : +a2 || 0;
+        const w = crop ? +a7 || 0 : +a3 || 0, h = crop ? +a8 || 0 : +a4 || 0;
         // Рисовать можно только тем, чем умеет браузер; всё прочее — отказ, и
         // текст у него длинный и дословный.
         const drawable = img && (img.localName === 'img' || img.localName === 'canvas' ||
@@ -5389,7 +5728,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
             "HTMLImageElement or HTMLVideoElement or ImageBitmap or OffscreenCanvas or " +
             "SVGImageElement or VideoFrame)'.");
         }
-        note('drawImage|' + [x, y, w, h, img && (img.src || img.localName)]);
+        note('drawImage|' + [sx, sy, sw, sh, x, y, w, h, img && (img.src || img.localName)]);
         if (taints(img)) tainted = true;
         // Сперва настоящие пиксели: страница, которая рисует картинку и читает
         // холст обратно, должна увидеть картинку. Челлендж именно так читает
@@ -5400,10 +5739,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const from = img && (img.__ptSurf
           || (img.__ptO && img.__ptO.c && img.__ptO.c.__ptSurf)
           || (img.__ptImageBitmap && img.__ptImageBitmap.surf));
-        if (from && S.blit && S.blit(from.id(), x || 0, y || 0, w || 0, h || 0)) return;
+        if (from && S.blit && S.blit(from.id(), sx, sy, sw, sh, x, y, w, h)) return;
         const src = img && (img.currentSrc || img.src);
-        if (src && S.image && S.image(src, x || 0, y || 0, w || 0, h || 0)) return;
-        stamp(x || 0, y || 0, w || (img && img.width) || 32, h || (img && img.height) || 32);
+        if (src && S.image && S.image(src, x, y, w, h)) return;
+        stamp(x, y, w || (img && img.width) || 32, h || (img && img.height) || 32);
       },
       putImageData(data, x, y) {
         needArgs(arguments.length, 3, 'putImageData', 'CanvasRenderingContext2D');
@@ -6058,7 +6397,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
                 try {
                   const src = bm.__ptImageBitmap && bm.__ptImageBitmap.surf;
                   const dst = el.__ptSurf;
-                  if (src && dst && dst.blit) dst.blit(src.id(), 0, 0, 0, 0);
+                  if (src && dst && dst.blit) dst.blit(src.id(), 0, 0, 0, 0, 0, 0, 0, 0);
                 } catch (e) {}
               }, 'transferFromImageBitmap'),
               writable: true, enumerable: true, configurable: true,
@@ -6092,14 +6431,33 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       if (!p || !p.w || !p.h) return 'data:,';
       return __pt_pngDataUrl(p.w, p.h, p.data) || 'data:,';
     }, 'toDataURL');
-    proto.toBlob = mask(function toBlob(cb) {
+    // Data-URL в настоящий `Blob`: тело раскодировано, тип взят из самой
+    // ссылки. Один и тот же путь у `toBlob` элемента и у `convertToBlob`
+    // офскрина.
+    if (!globalThis.__pt_blobFromDataUrl) {
+      globalThis.__pt_blobFromDataUrl = (url) => {
+        let type = 'image/png', body = '';
+        try {
+          const head = String(url).slice(5, String(url).indexOf(','));
+          if (head) type = head.replace(';base64', '') || type;
+          const b64 = String(url).slice(String(url).indexOf(',') + 1);
+          body = /;base64/.test(head) ? atob(b64) : decodeURIComponent(b64);
+        } catch (e) { body = ''; }
+        return new Blob([body], { type });
+      };
+    }
+    proto.toBlob = mask(function toBlob(cb, type, quality) {
       if (arguments.length < 1) {
         throw new TypeError("Failed to execute 'toBlob' on 'HTMLCanvasElement': " +
           '1 argument required, but only 0 present.');
       }
       if (typeof cb !== 'function') return;
-      const url = this.toDataURL();
-      cb({ size: Math.max(0, url.length - 22), type: 'image/png' });
+      // Настоящий `Blob` с настоящим PNG внутри: раньше отдавался литерал с
+      // выдуманным размером, и всё, что читает снимок байтами — `arrayBuffer`,
+      // `FileReader`, отправка на сервер — получало пустоту. И зовут обратно
+      // не сразу: в браузере кодирование уходит в задачу.
+      const url = this.toDataURL(type, quality);
+      Promise.resolve().then(() => { cb(globalThis.__pt_blobFromDataUrl(url)); });
     }, 'toBlob');
   }
 

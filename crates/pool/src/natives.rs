@@ -397,7 +397,7 @@ fn canvas_draw_image(
     rv.set_bool(crate::canvas::draw_image(id, &url, dx, dy, dw, dh));
 }
 
-/// `__pt_canvasBlit(dstId, srcId, dx, dy, dw, dh)` → true when it was drawn.
+/// `__pt_canvasBlit(dstId, srcId, sx, sy, sw, sh, dx, dy, dw, dh)` → true when drawn.
 #[cfg(feature = "render")]
 fn canvas_blit(
     scope: &mut v8::PinScope,
@@ -406,11 +406,15 @@ fn canvas_blit(
 ) {
     let dst = arg_usize(scope, args.get(0)) as u32;
     let src = arg_usize(scope, args.get(1)) as u32;
-    let dx = arg_f32(scope, args.get(2));
-    let dy = arg_f32(scope, args.get(3));
-    let dw = arg_f32(scope, args.get(4));
-    let dh = arg_f32(scope, args.get(5));
-    rv.set_bool(crate::canvas::blit(dst, src, dx, dy, dw, dh));
+    let sx = arg_f32(scope, args.get(2));
+    let sy = arg_f32(scope, args.get(3));
+    let sw = arg_f32(scope, args.get(4));
+    let sh = arg_f32(scope, args.get(5));
+    let dx = arg_f32(scope, args.get(6));
+    let dy = arg_f32(scope, args.get(7));
+    let dw = arg_f32(scope, args.get(8));
+    let dh = arg_f32(scope, args.get(9));
+    rv.set_bool(crate::canvas::blit(dst, src, sx, sy, sw, sh, dx, dy, dw, dh));
 }
 
 /// Standard base64, decoded here so no crate feature has to reach the isolate.
