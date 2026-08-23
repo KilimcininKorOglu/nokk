@@ -1879,6 +1879,11 @@
     // получал из него ничего.
     transferToImageBitmap() {
       const c = this.__ptO.c;
+      // Снимок собирается тем же помощником, что и `createImageBitmap`: у него
+      // размеры на прототипе, тег имени и рабочий `close`, как в браузере.
+      if (globalThis.__pt_makeBitmap) {
+        return globalThis.__pt_makeBitmap(c && c.__ptSurf, this.__ptO.w, this.__ptO.h);
+      }
       const b = Object.create((globalThis.ImageBitmap && globalThis.ImageBitmap.prototype) || Object.prototype);
       Object.defineProperty(b, '__ptImageBitmap', { value: { surf: c && c.__ptSurf } });
       Object.defineProperty(b, 'width', { value: this.__ptO.w, enumerable: true });

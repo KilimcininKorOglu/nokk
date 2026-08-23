@@ -167,7 +167,7 @@ const HOOK = `(() => {
               at = String(new Error().stack || '').split('\\n').slice(2, 5)
                 .map((x) => x.trim().replace(/^at /, '').slice(0, 46)).join(' < ');
             } catch (e) {}
-            console.log('[enc ' + (n++) + '] ' + s.length + ' коды: ' + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
+            console.log('[enc ' + (n++) + '] ' + s.length + ' | ненулевых=' + (() => { let n = 0, sum = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { n++; sum = (sum * 31 + c) >>> 0; } } return n + ' сумма=' + sum; })() + ' коды: ' + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
           }
           return enc.call(this, x);
         }, writable: true, configurable: true });
@@ -228,11 +228,15 @@ const HOOK = `(() => {
               try {
                 C[k] = function () {
                   const cv = this && this.canvas;
-                  if (cv && cv.width === 48 && cv.height === 48) {
+                  if (cv && ((cv.width === 48 && cv.height === 48) || (cv.width === 49 && cv.height === 44))) {
                     const a = [];
                     for (let i = 0; i < Math.min(arguments.length, 6); i++) {
                       const v = arguments[i];
-                      a.push(typeof v === 'object' && v ? (v.localName || v.constructor && v.constructor.name || 'об') : String(v).slice(0, 40));
+                      if (v && typeof v === 'object') {
+                        a.push((v.localName || (v.constructor && v.constructor.name) || 'об') +
+                          '<' + (v.width !== undefined ? v.width + 'x' + v.height : '?') + '>' +
+                          (typeof v.src === 'string' ? ' src=' + v.src.slice(0, 46) : ''));
+                      } else a.push(String(v).slice(0, 40));
                     }
                     console.log('[c48] ' + k + '(' + a.join(',') + ')');
                   }
@@ -365,7 +369,7 @@ const HOOK = `(() => {
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[parts|^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
+      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[parts|^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
         lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
     }
     if (m.method === 'Target.attachedToTarget') {

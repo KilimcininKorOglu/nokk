@@ -1918,6 +1918,24 @@ const CLONE_TEMPLATE: &str = r##"  // ── Структурное клонир
         try { surf = (v.__ptO.c && v.__ptO.c.__ptSurf && v.__ptO.c.__ptSurf.id()) || 0; } catch (e) {}
         return { $: 'offscreen', w: v.__ptO.w | 0, h: v.__ptO.h | 0, s: surf };
       }
+      // Снимок тоже переживает границу: за ним едет номер поверхности, и на
+      // той стороне он снова умеет рисоваться. Без этого воркер рисовал холст,
+      // отдавал снимок — а главный поток получал объект без пикселей, и
+      // `drawImage` его отвергал.
+      if (tag === '[object ImageBitmap]' || v.__ptImageBitmap) {
+        const st = v.__ptImageBitmap;
+        const w = (st ? st.w : v.width) | 0, h = (st ? st.h : v.height) | 0;
+        // Через границу едут сами пиксели, а не номер поверхности: поверхности
+        // живут в своём потоке, и на той стороне чужой номер ничего не значит.
+        // Воркер, который рисует холст и отдаёт снимок обратно, — как раз то,
+        // чем собирают отпечаток холста.
+        let bits = '';
+        try {
+          const pm = st && st.surf && st.surf.pixels ? st.surf.pixels() : null;
+          if (pm && pm.data) bits = b64(pm.data.subarray ? pm.data.subarray(0, w * h * 4) : pm.data);
+        } catch (e) { bits = ''; }
+        return { $: 'bitmap', w, h, b: bits };
+      }
       if (tag === '[object Date]') return { $: 'date', t: v.getTime() };
       if (tag === '[object RegExp]') return { $: 're', s: v.source, f: v.flags };
       if (tag === '[object Error]' || v instanceof Error) {
@@ -1980,6 +1998,28 @@ const CLONE_TEMPLATE: &str = r##"  // ── Структурное клонир
         } catch (e) {}
         made.push(off);
         return off;
+      }
+      if (kind === 'bitmap') {
+        const w = v.w | 0, h = v.h | 0;
+        let surf = null;
+        try {
+          if (v.b && globalThis.OffscreenCanvas) {
+            const off = new globalThis.OffscreenCanvas(w, h);
+            const g = off.getContext('2d');
+            const bytes = unb64(v.b);
+            if (g && globalThis.__pt_makeImageData) {
+              g.putImageData(globalThis.__pt_makeImageData(
+                new Uint8ClampedArray(bytes.buffer, bytes.byteOffset, Math.min(bytes.length, w * h * 4)),
+                w, h), 0, 0);
+            }
+            surf = off.__ptO && off.__ptO.c && off.__ptO.c.__ptSurf;
+          }
+        } catch (e) { surf = null; }
+        const bm = globalThis.__pt_makeBitmap
+          ? globalThis.__pt_makeBitmap(surf, w, h)
+          : { width: w, height: h, close() {} };
+        made.push(bm);
+        return bm;
       }
       if (kind === 'date') { const d = new Date(v.t); made.push(d); return d; }
       if (kind === 're') { const r = new RegExp(v.s, v.f); made.push(r); return r; }
