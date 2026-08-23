@@ -3134,6 +3134,8 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         return e;
       };
       const ctor = function ImageData(a, b, c) {
+        const settings = [].slice.call(arguments).filter(
+          (x) => x && typeof x === 'object' && !ArrayBuffer.isView(x)).pop() || null;
         if (!(this instanceof ctor)) {
           throw new TypeError("Failed to construct 'ImageData': " +
             'Please use the \'new\' operator, this DOM object constructor cannot be called as a function.');
@@ -3149,9 +3151,15 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
           if (h <= 0) throw err('The source height is zero or not a number.');
           data = new Uint8ClampedArray(4 * w * h);
         } else {
-          if (!(a instanceof Uint8ClampedArray)) {
+          const f16 = globalThis.Float16Array && a instanceof globalThis.Float16Array;
+          if (!(a instanceof Uint8ClampedArray) && !f16) {
             throw new TypeError("Failed to construct 'ImageData': " +
               "The provided value is not of type '(Uint8ClampedArray or Float16Array)'.");
+          }
+          // Половинная точность допустима только вместе с явным форматом
+          // пикселей, и браузер говорит об этом отдельной ошибкой.
+          if (f16 && !(settings && settings.pixelFormat === 'rgba-float16')) {
+            throw err('Float16Array must use rgba-float16 pixel format.');
           }
           data = a; w = b | 0;
           if (data.length % 4) throw err('The input data length is not a multiple of 4.');
@@ -3170,7 +3178,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
             h = rows;
           }
         }
-        const o = globalThis.__pt_makeImageData(data, w, h);
+        const o = globalThis.__pt_makeImageData(data, w, h, settings && settings.colorSpace);
         Object.setPrototypeOf(o, Object.getPrototypeOf(this) || P0);
         return o;
       };
@@ -5393,7 +5401,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   const IMAGE_DATA = new WeakMap();
   // Конструктор `ImageData` ставится позже — таблица форм ещё не создала его
   // класс, когда этот слой выполняется, — поэтому сборщик виден снаружи.
-  const makeImageData = (data, w, h) => {
+  const makeImageData = (data, w, h, space) => {
     const C = globalThis.ImageData;
     if (typeof C !== 'function' || !C.prototype) return { data, width: w, height: h, colorSpace: 'srgb' };
     const P = C.prototype;
@@ -5409,7 +5417,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       };
       acc('width', (st) => st.w);
       acc('height', (st) => st.h);
-      acc('colorSpace', () => 'srgb');
+      acc('colorSpace', (st) => st.cs || 'srgb');
       try {
         if (!Object.getOwnPropertyDescriptor(P, Symbol.toStringTag)) {
           Object.defineProperty(P, Symbol.toStringTag, { value: 'ImageData', configurable: true });
@@ -5417,7 +5425,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       } catch (e) {}
     }
     const o = Object.create(P);
-    IMAGE_DATA.set(o, { w, h });
+    IMAGE_DATA.set(o, { w, h, cs: space === 'display-p3' ? 'display-p3' : 'srgb' });
     // `data` — единственное собственное свойство: так и в браузере.
     try { Object.defineProperty(o, 'data', { value: data, enumerable: true }); } catch (e) {}
     return o;
@@ -5464,7 +5472,17 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     return new (globalThis.DOMException || Error)(msg, 'IndexSizeError');
   };
 
-  const make2DContext = (canvas) => {
+  const make2DContext = (canvas, attrs) => {
+    // Настройки, с которыми контекст попросили, браузер помнит и отдаёт
+    // обратно — вместе с цветовым пространством пикселей. Мы отвечали
+    // выдуманным набором, и проба, сверяющая запрошенное с полученным,
+    // обрывалась на четвёртом холсте.
+    const A = attrs && typeof attrs === 'object' ? attrs : {};
+    const CS = A.colorSpace === 'display-p3' ? 'display-p3' : 'srgb';
+    const CT = A.colorType === 'float16' ? 'float16' : 'unorm8';
+    const WRF = !!A.willReadFrequently;
+    const ALPHA = A.alpha === undefined ? true : !!A.alpha;
+    const DESYNC = !!A.desynchronized;
     const S = makeSurface(canvas);
     // Пометка для `drawImage`: по холсту надо уметь найти его пиксели. Скрытая,
     // как и всё наше, — страница её не перечислит.
@@ -5829,7 +5847,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         if (w === 0) throw sizeError('getImageData', 'The source width is 0.');
         if (h === 0) throw sizeError('getImageData', 'The source height is 0.');
         const out = S.read(x, y, w, h, new Uint8ClampedArray(Math.max(0, w * h * 4)));
-        return makeImageData(out, w, h);
+        const o = arguments.length > 4 ? arguments[4] : null;
+        return makeImageData(out, w, h, (o && o.colorSpace) || CS);
       },
       createImageData(w, h) {
         needArgs(arguments.length, 1, 'createImageData', 'CanvasRenderingContext2D');
@@ -5837,7 +5856,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         if (arguments.length > 1 && (h | 0) === 0) {
           throw sizeError('createImageData', 'The source height is zero or not a number.');
         }
-        return makeImageData(new Uint8ClampedArray(Math.max(0, (w | 0) * (h | 0) * 4)), w | 0, h | 0);
+        const o = arguments.length > 2 ? arguments[2] : null;
+        return makeImageData(new Uint8ClampedArray(Math.max(0, (w | 0) * (h | 0) * 4)),
+          w | 0, h | 0, (o && o.colorSpace) || CS);
       },
       createLinearGradient(x0, y0, x1, y1) { note('linearGradient|' + [x0, y0, x1, y1]); return makeGradient(0, [+x0 || 0, +y0 || 0, +x1 || 0, +y1 || 0, 0, 0]); },
       createRadialGradient(x0, y0, r0, x1, y1, r1) { note('radialGradient|' + [x0, y0, r0, x1, y1, r1]); return makeGradient(1, [+x0 || 0, +y0 || 0, +x1 || 0, +y1 || 0, +r0 || 0, +r1 || 0]); },
@@ -5854,7 +5875,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       getTransform() {
         return globalThis.DOMMatrix ? new DOMMatrix() : undefined;
       },
-      getContextAttributes() { return { alpha: true, colorSpace: 'srgb', desynchronized: false, willReadFrequently: false }; },
+      getContextAttributes() {
+        return { alpha: ALPHA, colorSpace: CS, colorType: CT, desynchronized: DESYNC,
+          toneMapping: { mode: 'standard' }, willReadFrequently: WRF };
+      },
       // Hidden (filtered) accessor the canvas element uses to encode itself.
       __ptPixels() { return S.pixels(); },
       __ptTainted() { return tainted; },
@@ -6365,7 +6389,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   const proto = (globalThis.HTMLCanvasElement && globalThis.HTMLCanvasElement.prototype)
     || (globalThis.HTMLElement && globalThis.HTMLElement.prototype);
   if (proto) {
-    proto.getContext = mask(function getContext(type) {
+    proto.getContext = mask(function getContext(type, ctxAttrs) {
       if (this.localName !== 'canvas') return null;
       // A canvas keeps the first context type it was given; a real browser
       // returns null for a conflicting request rather than a second context.
@@ -6457,7 +6481,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       }
       if (t !== '2d' && t !== 'webgl' && t !== 'webgl2') return null;
       this.__ptCtxType = t;
-      if (t === '2d') return this.__ptC2d || (this.__ptC2d = make2DContext(this));
+      if (t === '2d') return this.__ptC2d || (this.__ptC2d = make2DContext(this, ctxAttrs));
       if (t === 'webgl') return this.__ptGl1 || (this.__ptGl1 = makeGL(this, 1));
       return this.__ptGl2 || (this.__ptGl2 = makeGL(this, 2));
     }, 'getContext');
