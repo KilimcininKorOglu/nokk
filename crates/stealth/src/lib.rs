@@ -3178,7 +3178,8 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
             h = rows;
           }
         }
-        const o = globalThis.__pt_makeImageData(data, w, h, settings && settings.colorSpace);
+        const o = globalThis.__pt_makeImageData(data, w, h,
+          settings && settings.colorSpace, settings && settings.pixelFormat);
         Object.setPrototypeOf(o, Object.getPrototypeOf(this) || P0);
         return o;
       };
@@ -5169,7 +5170,61 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       const p = m[1].split(',').map((x) => parseFloat(x));
       return [p[0] | 0, p[1] | 0, p[2] | 0, p.length > 3 ? Math.round(Math.max(0, Math.min(1, p[3])) * 255) : 255];
     }
+    // Запись `color(<пространство> …)`: цвет пересчитывается в sRGB и режется
+    // по краям — байтами шире единицы не сказать.
+    m = /^color\(\s*([a-z0-9-]+)\s+([^)\/]+?)(?:\s*\/\s*([^)]+))?\s*\)$/.exec(c);
+    if (m) {
+      const q = m[2].trim().split(/\s+/).map((x) => parseFloat(x) || 0);
+      const al = m[3] === undefined ? 1 : (parseFloat(m[3]) || 0);
+      const rgb = m[1] === 'display-p3'
+        ? convertSpace([q[0] || 0, q[1] || 0, q[2] || 0], 'display-p3', 'srgb')
+        : [q[0] || 0, q[1] || 0, q[2] || 0];
+      const b8 = (v) => Math.round(Math.max(0, Math.min(1, v)) * 255);
+      return [b8(rgb[0]), b8(rgb[1]), b8(rgb[2]), b8(al)];
+    }
     return [0, 0, 0, 255];
+  };
+
+  // Цветовые пространства холста. Страница заливает холст цветом в записи
+  // `color(display-p3 …)` и читает его обратно во всех сочетаниях пространства
+  // и точности — по тому, как браузер пересчитывает, её и узнают. Мы этой
+  // записи не понимали вовсе и отдавали чёрный.
+  const SRGB_TO_LIN = (v) => (v <= 0.04045 ? v / 12.92 : Math.sign(v) * Math.pow((Math.abs(v) + 0.055) / 1.055, 2.4));
+  const LIN_TO_SRGB = (v) => (Math.abs(v) <= 0.0031308 ? v * 12.92
+    : Math.sign(v) * (1.055 * Math.pow(Math.abs(v), 1 / 2.4) - 0.055));
+  // Матрицы линейных пространств, обе через XYZ D65 и свёрнутые заранее.
+  const P3_TO_SRGB = [1.2249401762805587, -0.2249401762805586, 0,
+    -0.04205697751790907, 1.0420569775179091, 0,
+    -0.019636239203287, -0.07863715131854902, 1.0982734115802371];
+  const SRGB_TO_P3 = [0.8224621, 0.1775380, 0, 0.0331941, 0.9668058, 0,
+    0.0170827, 0.0723974, 0.9105199];
+  const applyM = (m, r, g, b) => [
+    m[0] * r + m[1] * g + m[2] * b,
+    m[3] * r + m[4] * g + m[5] * b,
+    m[6] * r + m[7] * g + m[8] * b,
+  ];
+  // Пересчёт между пространствами идёт по линейному свету, а не по кодам.
+  const convertSpace = (rgb, from, to) => {
+    if (from === to) return rgb.slice();
+    const lin = rgb.map(SRGB_TO_LIN);
+    const out = applyM(from === 'display-p3' ? P3_TO_SRGB : SRGB_TO_P3, lin[0], lin[1], lin[2]);
+    return out.map(LIN_TO_SRGB);
+  };
+  // `color(<пространство> r g b / a)` и всё привычное — числами от нуля до
+  // единицы в названном пространстве.
+  const parseColorFloat = (c) => {
+    const t = String(c == null ? '#000000' : c).trim().toLowerCase();
+    const m = /^color\(\s*([a-z0-9-]+)\s+([^)\/]+?)(?:\s*\/\s*([^)]+))?\s*\)$/.exec(t);
+    if (m) {
+      const parts = m[2].trim().split(/\s+/).map((x) => (x === 'none' ? 0 : parseFloat(x) || 0));
+      const a = m[3] === undefined ? 1 : (/%$/.test(m[3].trim())
+        ? parseFloat(m[3]) / 100 : parseFloat(m[3]));
+      const space = m[1] === 'display-p3' ? 'display-p3' : 'srgb';
+      return { rgb: [parts[0] || 0, parts[1] || 0, parts[2] || 0],
+        a: Number.isFinite(a) ? a : 1, space };
+    }
+    const b = parseColor(c);
+    return { rgb: [b[0] / 255, b[1] / 255, b[2] / 255], a: b[3] / 255, space: 'srgb' };
   };
 
   // With the optional `render` build, the `__pt_canvas*` natives back the surface
@@ -5401,7 +5456,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   const IMAGE_DATA = new WeakMap();
   // Конструктор `ImageData` ставится позже — таблица форм ещё не создала его
   // класс, когда этот слой выполняется, — поэтому сборщик виден снаружи.
-  const makeImageData = (data, w, h, space) => {
+  const makeImageData = (data, w, h, space, format) => {
     const C = globalThis.ImageData;
     if (typeof C !== 'function' || !C.prototype) return { data, width: w, height: h, colorSpace: 'srgb' };
     const P = C.prototype;
@@ -5418,6 +5473,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       acc('width', (st) => st.w);
       acc('height', (st) => st.h);
       acc('colorSpace', (st) => st.cs || 'srgb');
+      acc('pixelFormat', (st) => st.pf || 'rgba-unorm8');
       try {
         if (!Object.getOwnPropertyDescriptor(P, Symbol.toStringTag)) {
           Object.defineProperty(P, Symbol.toStringTag, { value: 'ImageData', configurable: true });
@@ -5425,7 +5481,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       } catch (e) {}
     }
     const o = Object.create(P);
-    IMAGE_DATA.set(o, { w, h, cs: space === 'display-p3' ? 'display-p3' : 'srgb' });
+    IMAGE_DATA.set(o, { w, h, cs: space === 'display-p3' ? 'display-p3' : 'srgb',
+      pf: format === 'rgba-float16' ? 'rgba-float16' : 'rgba-unorm8' });
     // `data` — единственное собственное свойство: так и в браузере.
     try { Object.defineProperty(o, 'data', { value: data, enumerable: true }); } catch (e) {}
     return o;
@@ -5487,7 +5544,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // Пометка для `drawImage`: по холсту надо уметь найти его пиксели. Скрытая,
     // как и всё наше, — страница её не перечислит.
     try { Object.defineProperty(canvas, '__ptSurf', { value: S, configurable: true }); } catch (e) {}
-    const note = S.note, solid = S.solid, stamp = S.stamp;
+    // Однородная заливка запоминается точным цветом: восемь бит на канал не
+    // вмещают ни значений шире единицы, ни разницы в третьем знаке, а
+    // пересчёт между пространствами их даёт. Любое другое рисование эту
+    // запись отменяет — тогда пиксели читаются с поверхности, как обычно.
+    let uniform = null;
+    const note = (m) => { uniform = null; S.note(m); };
+    const solid = S.solid, stamp = S.stamp;
     let bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;     // current path bounding box
     let tainted = false;                        // shown something from elsewhere
 
@@ -5662,8 +5725,20 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         if (S.native && gradOf(fs)) S.fillPathGradient(rectVerbs(x, y, w, h), false, encodeGrad(gradOf(fs)));
         else if (S.native && !plain()) S.fillPath(rectVerbs(x, y, w, h), false, parseColor(fs));
         else solid(x, y, w, h, parseColor(fs));
+        if (!gradOf(fs) && plain() && (+x || 0) <= 0 && (+y || 0) <= 0 &&
+            (+w || 0) >= (canvas.width | 0) && (+h || 0) >= (canvas.height | 0)) {
+          const c = parseColorFloat(fs);
+          uniform = { rgb: convertSpace(c.rgb, c.space, CS), a: c.a };
+        }
       },
-      clearRect(x, y, w, h) { note('clearRect|' + [x, y, w, h]); solid(x, y, w, h, [0, 0, 0, 0]); },
+      clearRect(x, y, w, h) {
+        note('clearRect|' + [x, y, w, h]);
+        solid(x, y, w, h, [0, 0, 0, 0]);
+        if (plain() && (+x || 0) <= 0 && (+y || 0) <= 0 &&
+            (+w || 0) >= (canvas.width | 0) && (+h || 0) >= (canvas.height | 0)) {
+          uniform = { rgb: [0, 0, 0], a: 0 };
+        }
+      },
       strokeRect(x, y, w, h) {
         note('strokeRect|' + [x, y, w, h, this.strokeStyle, this.lineWidth]);
         const X = +x || 0, Y = +y || 0, W2 = +w || 0, H2 = +h || 0;
@@ -5846,9 +5921,46 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         w = w | 0; h = h | 0;
         if (w === 0) throw sizeError('getImageData', 'The source width is 0.');
         if (h === 0) throw sizeError('getImageData', 'The source height is 0.');
-        const out = S.read(x, y, w, h, new Uint8ClampedArray(Math.max(0, w * h * 4)));
         const o = arguments.length > 4 ? arguments[4] : null;
-        return makeImageData(out, w, h, (o && o.colorSpace) || CS);
+        const want = (o && o.colorSpace === 'display-p3') ? 'display-p3'
+          : ((o && o.colorSpace === 'srgb') ? 'srgb' : CS);
+        const half = o && o.pixelFormat === 'rgba-float16' && globalThis.Float16Array;
+        if (uniform) {
+          // Холст залит ровным цветом — значение известно точно, и пересчёт
+          // в запрошенное пространство считается по нему, а не по байтам.
+          const v = convertSpace(uniform.rgb, CS, want);
+          const n = Math.max(0, w * h * 4);
+          if (half) {
+            const f = new globalThis.Float16Array(n);
+            for (let i = 0; i < n; i += 4) { f[i] = v[0]; f[i + 1] = v[1]; f[i + 2] = v[2]; f[i + 3] = uniform.a; }
+            return makeImageData(f, w, h, want, 'rgba-float16');
+          }
+          const u = new Uint8ClampedArray(n);
+          // Половина округляется вниз: у браузера 0.5 читается как 127, а не
+          // как 128, и это видно на каждом ровном полутоне.
+          const b8 = (t) => Math.floor(Math.max(0, Math.min(1, t)) * 255 + 0.5 - 1e-9);
+          for (let i = 0; i < n; i += 4) {
+            u[i] = b8(v[0]); u[i + 1] = b8(v[1]); u[i + 2] = b8(v[2]); u[i + 3] = b8(uniform.a);
+          }
+          return makeImageData(u, w, h, want, o && o.pixelFormat);
+        }
+        const out = S.read(x, y, w, h, new Uint8ClampedArray(Math.max(0, w * h * 4)));
+        // Половинная точность: браузер отдаёт те же пиксели долями единицы, а
+        // не байтами. Холст с `colorType: float16` только этого чтения и ждёт.
+        if (want !== CS) {
+          for (let i = 0; i < out.length; i += 4) {
+            const v = convertSpace([out[i] / 255, out[i + 1] / 255, out[i + 2] / 255], CS, want);
+            out[i] = Math.round(Math.max(0, Math.min(1, v[0])) * 255);
+            out[i + 1] = Math.round(Math.max(0, Math.min(1, v[1])) * 255);
+            out[i + 2] = Math.round(Math.max(0, Math.min(1, v[2])) * 255);
+          }
+        }
+        if (half) {
+          const f = new globalThis.Float16Array(out.length);
+          for (let i = 0; i < out.length; i++) f[i] = out[i] / 255;
+          return makeImageData(f, w, h, want, 'rgba-float16');
+        }
+        return makeImageData(out, w, h, want, o && o.pixelFormat);
       },
       createImageData(w, h) {
         needArgs(arguments.length, 1, 'createImageData', 'CanvasRenderingContext2D');
@@ -5857,8 +5969,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           throw sizeError('createImageData', 'The source height is zero or not a number.');
         }
         const o = arguments.length > 2 ? arguments[2] : null;
-        return makeImageData(new Uint8ClampedArray(Math.max(0, (w | 0) * (h | 0) * 4)),
-          w | 0, h | 0, (o && o.colorSpace) || CS);
+        const n = Math.max(0, (w | 0) * (h | 0) * 4);
+        if (o && o.pixelFormat === 'rgba-float16' && globalThis.Float16Array) {
+          return makeImageData(new globalThis.Float16Array(n), w | 0, h | 0,
+            o.colorSpace || CS, 'rgba-float16');
+        }
+        return makeImageData(new Uint8ClampedArray(n), w | 0, h | 0,
+          (o && o.colorSpace) || CS, o && o.pixelFormat);
       },
       createLinearGradient(x0, y0, x1, y1) { note('linearGradient|' + [x0, y0, x1, y1]); return makeGradient(0, [+x0 || 0, +y0 || 0, +x1 || 0, +y1 || 0, 0, 0]); },
       createRadialGradient(x0, y0, r0, x1, y1, r1) { note('radialGradient|' + [x0, y0, r0, x1, y1, r1]); return makeGradient(1, [+x0 || 0, +y0 || 0, +x1 || 0, +y1 || 0, +r0 || 0, +r1 || 0]); },

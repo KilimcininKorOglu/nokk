@@ -228,7 +228,7 @@ const HOOK = `(() => {
               try {
                 C[k] = function () {
                   const cv = this && this.canvas;
-                  if (cv && ((cv.width === 48 && cv.height === 48) || (cv.width === 49 && cv.height === 44))) {
+                  if (cv && (globalThis.__ptN = (globalThis.__ptN || 0) + 1) < 600) {
                     const a = [];
                     for (let i = 0; i < Math.min(arguments.length, 6); i++) {
                       const v = arguments[i];
@@ -238,7 +238,11 @@ const HOOK = `(() => {
                           (typeof v.src === 'string' ? ' src=' + v.src.slice(0, 46) : ''));
                       } else a.push(String(v).slice(0, 40));
                     }
-                    console.log('[c48] ' + k + '(' + a.join(',') + ')');
+                    console.log('[c48] ' + cv.width + ' ' + k + '(' + a.join(',') + ')' +
+                      (cv.width !== 2 ? '' : (() => { try { const r = f.apply(this, arguments);
+                        return ' -> ' + (r && typeof r === 'object' ? (r.data
+                          ? Object.prototype.toString.call(r.data) + '[' + [].slice.call(r.data).join(',') + '] ' + r.colorSpace + '/' + r.pixelFormat
+                          : JSON.stringify(r)) : String(r)); } catch (e) { return ' -> бросил ' + e.name; } })()));
                   }
                   return f.apply(this, arguments);
                 };
@@ -252,7 +256,7 @@ const HOOK = `(() => {
                   get: d.get,
                   set: function (v) {
                     const cv = this && this.canvas;
-                    if (cv && cv.width === 48 && cv.height === 48) console.log('[c48] ' + k + ' = ' + String(v).slice(0, 60));
+                    if (cv) console.log('[c48] ' + k + ' = ' + String(v).slice(0, 60));
                     return d.set.call(this, v);
                   },
                   enumerable: d.enumerable, configurable: true,
@@ -266,8 +270,18 @@ const HOOK = `(() => {
             try { Object.defineProperty(C, '__ptGid', { value: 1 }); } catch (e) {}
             const gi = C.getImageData;
             C.getImageData = function (x, y, w, h) {
-              console.log('[gid] ' + w + 'x' + h + ' на ' + (this.canvas ? this.canvas.width + 'x' + this.canvas.height : '?'));
-              return gi.apply(this, arguments);
+              const r = gi.apply(this, arguments);
+              let show = '';
+              if (w * h <= 4) {
+                try {
+                  show = ' -> ' + Object.prototype.toString.call(r.data) +
+                    '[' + [].slice.call(r.data).join(',') + '] ' + r.colorSpace + '/' + r.pixelFormat +
+                    ' настройки=' + JSON.stringify(arguments[4] || null) +
+                    ' холст=' + JSON.stringify(this.getContextAttributes ? this.getContextAttributes() : null);
+                } catch (e) { show = ' -> ' + e.name; }
+              }
+              console.log('[gid] ' + w + 'x' + h + ' на ' + (this.canvas ? this.canvas.width + 'x' + this.canvas.height : '?') + show);
+              return r;
             };
           }
           const gpu = globalThis.navigator && globalThis.navigator.gpu;

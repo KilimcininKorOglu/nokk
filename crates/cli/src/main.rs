@@ -553,7 +553,11 @@ async fn main() -> Result<()> {
                           (typeof v.src === 'string' ? ' src=' + v.src.slice(0, 46) : ''));
                       } else a.push(String(v).slice(0, 40));
                                   }
-                                  console.error('[c48] ' + k + '(' + a.join(',') + ')');
+                                  console.error('[c48] ' + cv.width + ' ' + k + '(' + a.join(',') + ')' +
+                                    (cv.width !== 2 ? '' : (() => { try { const r = f.apply(this, arguments);
+                                      return ' -> ' + (r && typeof r === 'object' ? (r.data
+                                        ? Object.prototype.toString.call(r.data) + '[' + [].slice.call(r.data).join(',') + '] ' + r.colorSpace + '/' + r.pixelFormat
+                                        : JSON.stringify(r)) : String(r)); } catch (e) { return ' -> бросил ' + e.name; } })()));
                                 }
                                 return f.apply(this, arguments);
                               };
@@ -581,8 +585,18 @@ async fn main() -> Result<()> {
                           try { Object.defineProperty(C, '__ptGid', { value: 1 }); } catch (e) {}
                           const gi = C.getImageData;
                           C.getImageData = function (x, y, w, h) {
-                            console.error('[gid] ' + w + 'x' + h + ' на ' + (this.canvas ? this.canvas.width + 'x' + this.canvas.height : '?'));
-                            return gi.apply(this, arguments);
+                            const r = gi.apply(this, arguments);
+                            let show = '';
+                            if (w * h <= 4) {
+                              try {
+                                show = ' -> ' + Object.prototype.toString.call(r.data) + '[' + [].slice.call(r.data).join(',') + '] ' +
+                                  r.colorSpace + '/' + r.pixelFormat + ' настройки=' + JSON.stringify(arguments[4] || null) +
+                                  ' холст=' + JSON.stringify(this.getContextAttributes ? this.getContextAttributes() : null);
+                              } catch (e) { show = ' -> ' + e.name; }
+                            }
+                            console.error('[gid] ' + w + 'x' + h + ' на ' + (this.canvas ? this.canvas.width + 'x' + this.canvas.height : '?') + show);
+                            return r;
+                            
                           };
                         }
                         const gpu = globalThis.navigator && globalThis.navigator.gpu;
