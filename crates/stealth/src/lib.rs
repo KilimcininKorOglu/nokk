@@ -6068,10 +6068,25 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // Какие расширения страница успела попросить: часть значений видна только
     // после этого.
     const asked = new Set();
+    // Буфер рисования следует за размером холста: страница ставит холст 1×1,
+    // берёт контекст, потом растит его до 16×16 и читает — у нас читался
+    // прежний один пиксель, а дальше поле нулей. Окно вывода при этом не
+    // трогается, как и требует спецификация: его задаёт сама страница.
+    let vp = [0, 0, canvas.width || 300, canvas.height || 150];
+    let bw = canvas.width || 300, bh = canvas.height || 150;
+    const syncSize = () => {
+      const w = canvas.width || 300, h = canvas.height || 150;
+      if (w === bw && h === bh) return;
+      bw = w; bh = h;
+      if (typeof __pt_glResize === 'function' && canvas.__ptGlId) {
+        try { __pt_glResize(canvas.__ptGlId, w, h); } catch (e) {}
+      }
+    };
     const gl = Object.assign({}, C, {
-      canvas, drawingBufferWidth: canvas.width || 300, drawingBufferHeight: canvas.height || 150,
+      canvas,
       drawingBufferColorSpace: 'srgb', unpackColorSpace: 'srgb',
       getParameter(p){
+        if (p === 0x0BA2) { syncSize(); return new Int32Array(vp); }   // VIEWPORT
         if (Object.prototype.hasOwnProperty.call(EXT_PARAMS, p)) {
           const [v, need, onlyVer] = EXT_PARAMS[p];
           if ((!onlyVer || onlyVer === ver) && !asked.has(need)) return null;
@@ -6139,6 +6154,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
       getContextAttributes_: null,
     });
+    // Размеры буфера — живые: `Object.assign` вызвал бы геттер и запомнил
+    // число, поэтому они ставятся отдельно, уже после сборки объекта.
+    for (const [name, get] of [['drawingBufferWidth', () => { syncSize(); return bw; }],
+                               ['drawingBufferHeight', () => { syncSize(); return bh; }]]) {
+      Object.defineProperty(gl, name, { get, enumerable: true, configurable: true });
+    }
     const iface = (n) => (globalThis[n] ? globalThis[n].prototype : Object.prototype);
     // WebGL fingerprinting renders a scene and reads it back (readPixels, or
     // toDataURL on the canvas). With every call a no-op the readback was all
@@ -6152,6 +6173,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       const GW = canvas.width || 300, GH = canvas.height || 150;
       __pt_glCreate(gid, GW, GH);
       __pt_glViewport(gid, 0, 0, GW, GH);
+      try { Object.defineProperty(canvas, '__ptGlId', { value: gid, configurable: true }); } catch (e) {}
       const shProto = iface('WebGLShader'), prProto = iface('WebGLProgram'), bfProto = iface('WebGLBuffer');
       const txProto = iface('WebGLTexture'), fbProto = iface('WebGLFramebuffer');
       const rbProto = iface('WebGLRenderbuffer'), vaProto = iface('WebGLVertexArrayObject');
@@ -6210,13 +6232,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         uniform1i(l, x) { __pt_glUniform1i(gid, L(l), x | 0); },
         uniformMatrix4fv(l, transpose, v) { __pt_glUniformMatrix4(gid, L(l), transpose ? 1 : 0, new Float32Array(v)); },
         clearColor(r, g, b, a) { const q = (v) => Math.max(0, Math.min(255, Math.round((+v || 0) * 255))); clearRGBA = [q(r), q(g), q(b), q(a)]; },
-        clear(mask) { __pt_glClear(gid, clearRGBA[0], clearRGBA[1], clearRGBA[2], clearRGBA[3], mask | 0); },
-        viewport(x, y, w, h) { __pt_glViewport(gid, x | 0, y | 0, w | 0, h | 0); },
+        clear(mask) { syncSize(); __pt_glClear(gid, clearRGBA[0], clearRGBA[1], clearRGBA[2], clearRGBA[3], mask | 0); },
+        viewport(x, y, w, h) { syncSize(); vp = [x | 0, y | 0, w | 0, h | 0]; __pt_glViewport(gid, x | 0, y | 0, w | 0, h | 0); },
         enable(cap) { __pt_glEnable(gid, cap >>> 0, 1); },
         disable(cap) { __pt_glEnable(gid, cap >>> 0, 0); },
         blendFunc(s, d) { __pt_glBlendFunc(gid, s >>> 0, d >>> 0); },
         depthFunc(f) { __pt_glDepthFunc(gid, f >>> 0); },
-        drawArrays(mode, first, count) { __pt_glDrawArrays(gid, mode >>> 0, first | 0, count | 0); },
+        drawArrays(mode, first, count) { syncSize(); __pt_glDrawArrays(gid, mode >>> 0, first | 0, count | 0); },
         drawElements(mode, count, type, offset) { __pt_glDrawElements(gid, mode >>> 0, count | 0, type >>> 0, offset | 0); },
         // --- textures: the classic fingerprint scene is a textured quad, and a
         // stubbed sampler reads black, collapsing every scene to one readback.
@@ -6270,7 +6292,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         deleteFramebuffer(o) { __pt_glDelete(gid, 4, H(o)); },
         deleteRenderbuffer(o) { __pt_glDelete(gid, 5, H(o)); },
         deleteVertexArray(o) { __pt_glDelete(gid, 6, H(o)); },
-        readPixels(x, y, w, h, format, type, dst) {
+        readPixels(x, y, w, h, format, type, dst) { syncSize();
           if (!dst) return dst;
           // Straight from the bound framebuffer (which may be an offscreen target
           // of its own size), bottom-up — exactly the order WebGL specifies.
@@ -6317,7 +6339,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           S.note('clear|' + mask);
           if ((mask | 0) & C.COLOR_BUFFER_BIT) { const p = S.pixels(); S.solid(0, 0, p.w, p.h, clearRGBA); }
         },
-        viewport(x, y, w, h) { S.note('viewport|' + [x, y, w, h]); },
+        viewport(x, y, w, h) { vp = [x | 0, y | 0, w | 0, h | 0]; S.note('viewport|' + [x, y, w, h]); },
         shaderSource(sh, src) { S.note('shaderSource|' + src); },
         bufferData(target, data) { S.note('bufferData|' + [target, data && (data.length || data.byteLength)]); },
         uniform1f(l, v) { S.note('uniform1f|' + v); },

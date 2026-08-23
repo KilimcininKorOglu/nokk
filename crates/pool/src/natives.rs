@@ -80,6 +80,7 @@ pub fn install(scope: &mut v8::PinScope) {
         bind(scope, "__pt_glAvailable", gl_available);
         bind(scope, "__pt_glCreate", gl_create);
         bind(scope, "__pt_glDestroy", gl_destroy);
+        bind(scope, "__pt_glResize", gl_resize);
         bind(scope, "__pt_glClear", gl_clear);
         bind(scope, "__pt_glViewport", gl_viewport);
         bind(scope, "__pt_glEnable", gl_enable);
@@ -607,6 +608,20 @@ fn gl_create(
     _rv: v8::ReturnValue,
 ) {
     crate::webgl::create(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_usize(scope, args.get(1)) as u32,
+        arg_usize(scope, args.get(2)) as u32,
+    );
+}
+
+/// `__pt_glResize(id, w, h)` — холст сменил размер, буфер рисования следом.
+#[cfg(feature = "webgl")]
+fn gl_resize(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::webgl::resize(
         arg_usize(scope, args.get(0)) as u32,
         arg_usize(scope, args.get(1)) as u32,
         arg_usize(scope, args.get(2)) as u32,

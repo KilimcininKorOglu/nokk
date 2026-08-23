@@ -38,6 +38,11 @@ struct GlSurface {
     /// means "the canvas", which here is this object rather than the window-system
     /// framebuffer 0 (surfaceless: there isn't one).
     fbo: glow::NativeFramebuffer,
+    /// Хранилища цвета и глубины: холст можно увеличить после того, как
+    /// контекст уже создан, и тогда буфер рисования пересоздаётся под новый
+    /// размер — иначе чтение вернёт один пиксель и поле нулей.
+    color_rb: glow::NativeRenderbuffer,
+    depth_rb: glow::NativeRenderbuffer,
     // Held for lifetime/cleanup; the context must stay current on this thread.
     _egl: &'static EglInstance,
     display: egl::Display,
@@ -166,13 +171,16 @@ fn make_surface(w: i32, h: i32) -> Result<GlSurface, String> {
         // RGB upload). Also what the size checks in `tex_image_2d` assume.
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
         gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
-        fbo
+        (fbo, rb, depth)
     };
+    let (fbo, color_rb, depth_rb) = fbo;
     Ok(GlSurface {
         gl,
         w,
         h,
         fbo,
+        color_rb,
+        depth_rb,
         _egl: egl_i,
         display,
         context,
@@ -180,6 +188,37 @@ fn make_surface(w: i32, h: i32) -> Result<GlSurface, String> {
 }
 
 /// Drop a GL surface and its context.
+/// Изменение размера холста после создания контекста. По спецификации буфер
+/// рисования пересоздаётся и очищается, а окно вывода остаётся прежним.
+pub fn resize(id: u32, w: u32, h: u32) {
+    let (w, h) = (w.clamp(1, 8192) as i32, h.clamp(1, 8192) as i32);
+    SURFACES.with(|s| {
+        let mut m = s.borrow_mut();
+        let Some(surf) = m.get_mut(&id) else {
+            return;
+        };
+        if surf.w == w && surf.h == h {
+            return;
+        }
+        unsafe {
+            surf.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(surf.fbo));
+            surf.gl
+                .bind_renderbuffer(glow::RENDERBUFFER, Some(surf.color_rb));
+            surf.gl
+                .renderbuffer_storage(glow::RENDERBUFFER, glow::RGBA8, w, h);
+            surf.gl
+                .bind_renderbuffer(glow::RENDERBUFFER, Some(surf.depth_rb));
+            surf.gl
+                .renderbuffer_storage(glow::RENDERBUFFER, glow::DEPTH_COMPONENT24, w, h);
+            surf.gl.bind_renderbuffer(glow::RENDERBUFFER, None);
+            surf.gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            surf.gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+        }
+        surf.w = w;
+        surf.h = h;
+    });
+}
+
 pub fn destroy(id: u32) {
     SURFACES.with(|s| {
         if let Some(surf) = s.borrow_mut().remove(&id) {
