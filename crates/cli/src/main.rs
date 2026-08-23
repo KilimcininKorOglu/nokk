@@ -477,7 +477,12 @@ async fn main() -> Result<()> {
                         const wrapped = function (x) {
                           const s = String(x == null ? '' : x);
                           if (s.length > 200) {
-                            console.error('[enc ' + (en++) + '] ' + s.length + ' :: ' + s.slice(0, 120).replace(/\n/g, ' '));
+                            let at = '';
+                            try {
+                              at = String(new Error().stack || '').split('\n').slice(2, 5)
+                                .map((x) => x.trim().replace(/^at /, '').slice(0, 46)).join(' < ');
+                            } catch (e) {}
+                            console.error('[enc ' + (en++) + '] ' + s.length + ' коды: ' + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
                           }
                           return enc.call(this, x);
                         };
@@ -495,6 +500,11 @@ async fn main() -> Result<()> {
                     count(globalThis.OfflineAudioContext && OfflineAudioContext.prototype, 'audio',
                           ['startRendering', 'createOscillator', 'createDynamicsCompressor']);
                     count(globalThis.HTMLMediaElement && HTMLMediaElement.prototype, 'media', ['canPlayType']);
+                    count(globalThis.HTMLCanvasElement && HTMLCanvasElement.prototype, 'canvas',
+                          ['transferControlToOffscreen', 'toDataURL', 'toBlob', 'captureStream', 'getContext']);
+                    count(globalThis.OffscreenCanvas && OffscreenCanvas.prototype, 'off',
+                          ['getContext', 'convertToBlob', 'transferToImageBitmap']);
+                    count(globalThis.Worker && Worker.prototype, 'worker', ['postMessage', 'terminate']);
                     count(globalThis.Navigator && Navigator.prototype, 'nav', ['getGamepads']);
                     count(globalThis, 'win', ['atob', 'btoa', 'matchMedia', 'getComputedStyle']);
                     count(globalThis.RTCPeerConnection && RTCPeerConnection.prototype, 'rtc', ['getStats']);

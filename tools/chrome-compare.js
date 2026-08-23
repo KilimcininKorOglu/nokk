@@ -162,7 +162,12 @@ const HOOK = `(() => {
         Object.defineProperty(TE, 'encode', { value: function (x) {
           const s = String(x == null ? '' : x);
           if (s.length > 200) {
-            console.log('[enc ' + (n++) + '] ' + s.length + ' :: ' + s.slice(0, 120).replace(/\\n/g, ' '));
+            let at = '';
+            try {
+              at = String(new Error().stack || '').split('\\n').slice(2, 5)
+                .map((x) => x.trim().replace(/^at /, '').slice(0, 46)).join(' < ');
+            } catch (e) {}
+            console.log('[enc ' + (n++) + '] ' + s.length + ' коды: ' + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
           }
           return enc.call(this, x);
         }, writable: true, configurable: true });
@@ -184,6 +189,11 @@ const HOOK = `(() => {
       'querySelectorAll','getElementById','createRange','elementFromPoint','elementsFromPoint']);
     wrapProto(Navigator.prototype, 'nav', ['getGamepads','javaEnabled','sendBeacon']);
     wrapProto(globalThis.HTMLMediaElement && HTMLMediaElement.prototype, 'media', ['canPlayType']);
+    wrapProto(globalThis.HTMLCanvasElement && HTMLCanvasElement.prototype, 'canvas',
+      ['transferControlToOffscreen', 'toDataURL', 'toBlob', 'captureStream', 'getContext']);
+    wrapProto(globalThis.OffscreenCanvas && OffscreenCanvas.prototype, 'off',
+      ['getContext', 'convertToBlob', 'transferToImageBitmap']);
+    wrapProto(globalThis.Worker && Worker.prototype, 'worker', ['postMessage', 'terminate']);
     wrapProto(globalThis.SVGGraphicsElement && SVGGraphicsElement.prototype, 'svg', ['getBBox','getCTM','getScreenCTM']);
     wrapProto(globalThis.SVGGeometryElement && SVGGeometryElement.prototype, 'svg', ['getTotalLength','getPointAtLength','isPointInFill']);
     wrapProto(globalThis.RTCPeerConnection && RTCPeerConnection.prototype, 'rtc', ['createOffer','setLocalDescription','getStats','createDataChannel']);

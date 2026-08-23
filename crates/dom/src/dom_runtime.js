@@ -1847,6 +1847,16 @@
     }
   }
 
+  // Передача холста воркеру: сам метод ставится позже, из слоя невидимости —
+  // таблица форм интерфейсов затирает его заглушкой, если поставить здесь.
+  globalThis.__pt_makeTransferred = (canvas) => {
+    const off = Object.create(OffscreenCanvas.prototype);
+    Object.defineProperty(off, '__ptO', {
+      value: { c: canvas, w: canvas.width | 0, h: canvas.height | 0 },
+    });
+    return off;
+  };
+
   globalThis.Worker = Worker;
   globalThis.SharedWorker = SharedWorker;
   globalThis.OffscreenCanvas = OffscreenCanvas;

@@ -1911,6 +1911,13 @@ const CLONE_TEMPLATE: &str = r##"  // ── Структурное клонир
       const id = seen.size;
       seen.set(v, id);
       const tag = Object.prototype.toString.call(v);
+      // Переданный холст переживает границу воркера: за ним едет номер
+      // поверхности, по которому воркер рисует на той же самой.
+      if (tag === '[object OffscreenCanvas]' && v.__ptO) {
+        let surf = 0;
+        try { surf = (v.__ptO.c && v.__ptO.c.__ptSurf && v.__ptO.c.__ptSurf.id()) || 0; } catch (e) {}
+        return { $: 'offscreen', w: v.__ptO.w | 0, h: v.__ptO.h | 0, s: surf };
+      }
       if (tag === '[object Date]') return { $: 'date', t: v.getTime() };
       if (tag === '[object RegExp]') return { $: 're', s: v.source, f: v.flags };
       if (tag === '[object Error]' || v instanceof Error) {
@@ -1960,6 +1967,20 @@ const CLONE_TEMPLATE: &str = r##"  // ── Структурное клонир
       if (kind === 'nf') return Number(v.v);
       if (kind === 'big') return globalThis.BigInt ? BigInt(v.v) : Number(v.v);
       if (kind === 'ref') return made[v.i];
+      // Холст, переданный воркеру: собираем `OffscreenCanvas` того же размера.
+      // Номер поверхности едет с ним, чтобы рисование попало на ту же самую,
+      // когда воркер живёт в том же потоке.
+      if (kind === 'offscreen') {
+        let off = null;
+        try {
+          off = new globalThis.OffscreenCanvas(v.w || 0, v.h || 0);
+          if (v.s && off.__ptO && off.__ptO.c) {
+            try { Object.defineProperty(off.__ptO.c, '__ptSurfId', { value: v.s, configurable: true }); } catch (e) {}
+          }
+        } catch (e) {}
+        made.push(off);
+        return off;
+      }
       if (kind === 'date') { const d = new Date(v.t); made.push(d); return d; }
       if (kind === 're') { const r = new RegExp(v.s, v.f); made.push(r); return r; }
       if (kind === 'err') {
@@ -3035,6 +3056,31 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
   // оформляется лениво. Так что здесь верность имени уступает верности
   // поведения, и это осознанный размен, а не недоделка.
   try { if (globalThis.__pt_sinkAudioMethods) __pt_sinkAudioMethods(); } catch (e) {}
+  // Передача холста воркеру. Метод возвращал `undefined`, и сборщик, который
+  // отдаёт холст воркеру и рисует там, обрывался целиком: из отчёта пропадали
+  // и снимок 44×49, и чтение 32×32 из WebGL — двенадцать тысяч знаков, львиная
+  // доля всей недостачи. Ставится здесь, а не в слое DOM: таблица форм
+  // интерфейсов затирает его заглушкой.
+  try {
+    const CP = globalThis.HTMLCanvasElement && globalThis.HTMLCanvasElement.prototype;
+    if (CP && globalThis.__pt_makeTransferred) {
+      const fn = function transferControlToOffscreen() {
+        if (this.__ptTransferred) {
+          const e = new (globalThis.DOMException || Error)(
+            "Failed to execute 'transferControlToOffscreen' on 'HTMLCanvasElement': Cannot transfer control from a canvas for more than one time.",
+            'InvalidStateError');
+          e.name = 'InvalidStateError';
+          throw e;
+        }
+        try { Object.defineProperty(this, '__ptTransferred', { value: true, configurable: true }); } catch (e) {}
+        return __pt_makeTransferred(this);
+      };
+      Object.defineProperty(CP, 'transferControlToOffscreen', {
+        value: globalThis.__pt_native ? __pt_native(fn) : fn,
+        writable: true, enumerable: true, configurable: true,
+      });
+    }
+  } catch (e) {}
   // Статические члены расставляются по таблице после того, как их определил
   // слой DOM, — и заглушка затирает настоящую проверку кодеков. Возвращаем её
   // здесь: ответ тот же, что у `canPlayType`, только логический.
