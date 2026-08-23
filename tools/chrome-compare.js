@@ -192,7 +192,22 @@ const HOOK = `(() => {
     wrapProto(globalThis.HTMLCanvasElement && HTMLCanvasElement.prototype, 'canvas',
       ['transferControlToOffscreen', 'toDataURL', 'toBlob', 'captureStream', 'getContext']);
     wrapProto(globalThis.OffscreenCanvas && OffscreenCanvas.prototype, 'off',
-      ['getContext', 'convertToBlob', 'transferToImageBitmap']);
+      ['convertToBlob', 'transferToImageBitmap']);
+    // Какие именно контексты просят у офскрина и что получают.
+    try {
+      const OP = globalThis.OffscreenCanvas && OffscreenCanvas.prototype;
+      const og = OP && OP.getContext;
+      if (og) {
+        Object.defineProperty(OP, 'getContext', { value: function (t, a) {
+          let r, err = '';
+          try { r = og.call(this, t, a); } catch (e) { err = e.name; }
+          console.log('[octx] ' + t + ' ' + this.width + 'x' + this.height + ' -> ' +
+                      (err || (r ? Object.prototype.toString.call(r) : String(r))));
+          if (err) throw new TypeError(err);
+          return r;
+        }, writable: true, configurable: true });
+      }
+    } catch (e) {}
     wrapProto(globalThis.Worker && Worker.prototype, 'worker', ['postMessage', 'terminate']);
     wrapProto(globalThis.SVGGraphicsElement && SVGGraphicsElement.prototype, 'svg', ['getBBox','getCTM','getScreenCTM']);
     wrapProto(globalThis.SVGGeometryElement && SVGGeometryElement.prototype, 'svg', ['getTotalLength','getPointAtLength','isPointInFill']);
@@ -241,7 +256,7 @@ const HOOK = `(() => {
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[parts|^\[enc /.test(String(t)))
+      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[parts|^\[enc |^\[octx\]/.test(String(t)))
         lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
     }
     if (m.method === 'Target.attachedToTarget') {

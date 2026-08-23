@@ -422,6 +422,11 @@ async fn main() -> Result<()> {
                     };
                     XMLHttpRequest.prototype.send = function (b) {
                       try {
+                        // Отчёт уходит — значит сбор закончен, самое время
+                        // высыпать счётчики.
+                        if (/\/fo\//.test(this.__ptU || '') && b && b.length > 50000) {
+                          try { globalThis.__ptDumpCounts && __ptDumpCounts(); } catch (e) {}
+                        }
                         if (/\/eb\//.test(this.__ptU || '')) {
                           const at = String(new Error().stack || '(без стека)');
                           for (const line of at.split('\n').slice(0, 14)) {
@@ -503,16 +508,34 @@ async fn main() -> Result<()> {
                     count(globalThis.HTMLCanvasElement && HTMLCanvasElement.prototype, 'canvas',
                           ['transferControlToOffscreen', 'toDataURL', 'toBlob', 'captureStream', 'getContext']);
                     count(globalThis.OffscreenCanvas && OffscreenCanvas.prototype, 'off',
-                          ['getContext', 'convertToBlob', 'transferToImageBitmap']);
+                          ['convertToBlob', 'transferToImageBitmap']);
+                    try {
+                      const OP = globalThis.OffscreenCanvas && globalThis.OffscreenCanvas.prototype;
+                      const og = OP && OP.getContext;
+                      if (og) {
+                        Object.defineProperty(OP, 'getContext', { value: function (ty, a) {
+                          let r, err = '';
+                          try { r = og.call(this, ty, a); } catch (e) { err = e.name; }
+                          console.error('[octx] ' + ty + ' ' + this.width + 'x' + this.height + ' -> ' +
+                                        (err || (r ? Object.prototype.toString.call(r) : String(r))));
+                          if (err) throw new TypeError(err);
+                          return r;
+                        }, writable: true, configurable: true });
+                      }
+                    } catch (e) {}
                     count(globalThis.Worker && Worker.prototype, 'worker', ['postMessage', 'terminate']);
                     count(globalThis.Navigator && Navigator.prototype, 'nav', ['getGamepads']);
                     count(globalThis, 'win', ['atob', 'btoa', 'matchMedia', 'getComputedStyle']);
                     count(globalThis.RTCPeerConnection && RTCPeerConnection.prototype, 'rtc', ['getStats']);
-                    setTimeout(() => {
+                    // Выгрузка в момент отправки отчёта, а не по таймеру: кадр
+                    // виджета к сроку успевает исчезнуть, и счётчики пропадали
+                    // вместе с ним.
+                    globalThis.__ptDumpCounts = () => {
                       for (const k of Object.keys(N).sort((a, b) => (L[b] || 0) - (L[a] || 0))) {
                         console.error('[count] ' + N[k] + ' вызовов, ' + (L[k] || 0) + ' знаков — ' + k);
                       }
-                    }, 24000);
+                    };
+                    setTimeout(() => { try { __ptDumpCounts(); } catch (e) {} }, 24000);
                     // Заодно то, что челлендж сам считает ошибкой: он зовёт
                     // `console.error` перед маяком далеко не всегда, но своё
                     // отклонённое обещание отдаёт в общий обработчик.

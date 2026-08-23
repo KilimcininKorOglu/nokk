@@ -5025,6 +5025,23 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   const CTX_IMPL = new WeakMap();
   // Движку нужна внутренняя сторона контекста (снять пиксели), а странице — нет.
   globalThis.__pt_ctxImpl = (pub) => CTX_IMPL.get(pub) || pub;
+  // Значения, которые браузер принимает у перечислимых свойств контекста:
+  // недопустимое он молча отвергает, оставляя прежнее, а мы записывали что дали.
+  const CTX2D_ENUMS = {
+    globalCompositeOperation: ['source-over','source-in','source-out','source-atop','destination-over',
+      'destination-in','destination-out','destination-atop','lighter','copy','xor','multiply','screen',
+      'overlay','darken','lighten','color-dodge','color-burn','hard-light','soft-light','difference',
+      'exclusion','hue','saturation','color','luminosity','plus-darker','plus-lighter'],
+    textAlign: ['start','end','left','right','center'],
+    textBaseline: ['top','hanging','middle','alphabetic','ideographic','bottom'],
+    direction: ['ltr','rtl','inherit'],
+    imageSmoothingQuality: ['low','medium','high'],
+    fontKerning: ['auto','normal','none'],
+    textRendering: ['auto','optimizeSpeed','optimizeLegibility','geometricPrecision'],
+    lineCap: ['butt','round','square'],
+    lineJoin: ['round','bevel','miter'],
+  };
+
   const publishContext = (impl, C, methods, attrs) => {
     if (!C || !C.prototype) return impl;
     const P = C.prototype;
@@ -5052,7 +5069,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
             const t = CTX_IMPL.get(this) || this;
             return Object.prototype.hasOwnProperty.call(t, name) ? t[name] : undefined;
           },
-          set [name](v) { const t = CTX_IMPL.get(this) || this; t[name] = v; },
+          set [name](v) {
+            const t = CTX_IMPL.get(this) || this;
+            // Недопустимое значение перечислимого свойства браузер отвергает
+            // молча, оставляя прежнее; мы записывали что угодно.
+            const allowed = CTX2D_ENUMS[name];
+            if (allowed && allowed.indexOf(String(v)) < 0) return;
+            t[name] = v;
+          },
         };
         const d0 = Object.getOwnPropertyDescriptor(acc, name);
         const get = d0.get, set = d0.set;
@@ -5269,6 +5293,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // Из 3051 вопроса, что задаёт кадр челленджа, только на один мы отвечали
       // пустотой: у браузера фильтр холста — строка `none`, а не `undefined`.
       filter: 'none',
+      // Остальные умолчания контекста: их не было вовсе, и страница читала
+      // `undefined` там, где браузер называет значение. Сняты с Chrome 151.
+      imageSmoothingEnabled: true, imageSmoothingQuality: 'low',
+      letterSpacing: '0px', wordSpacing: '0px',
+      fontKerning: 'auto', fontStretch: 'normal', fontVariantCaps: 'normal',
+      textRendering: 'auto', direction: 'ltr', lang: 'inherit',
+      miterLimit: 10, lineDashOffset: 0, lineCap: 'butt', lineJoin: 'miter',
+      shadowOffsetX: 0, shadowOffsetY: 0,
 
       fillRect(x, y, w, h) {
         note('fillRect|' + [x, y, w, h, this.fillStyle]);
@@ -5997,6 +6029,51 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const ctx = Object.create(P);
         globalThis.__pt_gpuCtxOwner.set(ctx, this);
         try { Object.defineProperty(this, '__ptGpuCtx', { value: ctx, configurable: true, enumerable: false }); } catch (e) {}
+        return ctx;
+      }
+      // `bitmaprenderer` — двенадцатый контекст, за которым сборщик и приходит:
+      // в паре с `transferToImageBitmap` он показывает снимок. Мы отвечали
+      // null, и вся эта ветка не давала ничего.
+      if (t === 'bitmaprenderer') {
+        if (this.__ptBmpCtx) return this.__ptBmpCtx;
+        const C = globalThis.ImageBitmapRenderingContext;
+        const P = C && C.prototype;
+        if (!P) return null;
+        if (!P.__ptShaped) {
+          try { Object.defineProperty(P, '__ptShaped', { value: true }); } catch (e) {}
+          const owner = new WeakMap();
+          globalThis.__pt_bmpCtxOwner = owner;
+          try {
+            Object.defineProperty(P, 'canvas', {
+              get: mask(function canvas() { return owner.get(this); }, 'get canvas'),
+              enumerable: true, configurable: true,
+            });
+          } catch (e) {}
+          try {
+            Object.defineProperty(P, 'transferFromImageBitmap', {
+              value: mask(function transferFromImageBitmap(bm) {
+                // Снимок ложится на холст: страница потом читает его обратно.
+                const el = globalThis.__pt_bmpCtxOwner.get(this);
+                if (!el || !bm) return;
+                try {
+                  const src = bm.__ptImageBitmap && bm.__ptImageBitmap.surf;
+                  const dst = el.__ptSurf;
+                  if (src && dst && dst.blit) dst.blit(src.id(), 0, 0, 0, 0);
+                } catch (e) {}
+              }, 'transferFromImageBitmap'),
+              writable: true, enumerable: true, configurable: true,
+            });
+          } catch (e) {}
+          try {
+            if (!Object.getOwnPropertyDescriptor(P, Symbol.toStringTag)) {
+              Object.defineProperty(P, Symbol.toStringTag, { value: 'ImageBitmapRenderingContext', configurable: true });
+            }
+          } catch (e) {}
+        }
+        const ctx = Object.create(P);
+        globalThis.__pt_bmpCtxOwner.set(ctx, this);
+        try { Object.defineProperty(this, '__ptBmpCtx', { value: ctx, configurable: true, enumerable: false }); } catch (e) {}
+        this.__ptCtxType = t;
         return ctx;
       }
       if (t !== '2d' && t !== 'webgl' && t !== 'webgl2') return null;

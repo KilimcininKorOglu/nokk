@@ -1831,7 +1831,36 @@
     set width(v) { this.__ptO.w = v | 0; if (this.__ptO.c) this.__ptO.c.width = v | 0; }
     get height() { return this.__ptO.h; }
     set height(v) { this.__ptO.h = v | 0; if (this.__ptO.c) this.__ptO.c.height = v | 0; }
-    getContext(type, attrs) { const c = this.__ptO.c; return c ? c.getContext(type, attrs) : null; }
+    getContext(type, attrs) {
+      // У офскрина свой набор имён: `experimental-webgl` и прочие браузер здесь
+      // не принимает вовсе, а отвечает отказом.
+      const t = String(type);
+      if (t !== '2d' && t !== 'webgl' && t !== 'webgl2' && t !== 'bitmaprenderer' && t !== 'webgpu') {
+        throw new TypeError("Failed to execute 'getContext' on 'OffscreenCanvas': The provided value '"
+          + t + "' is not a valid enum value of type OffscreenRenderingContextType.");
+      }
+      const c = this.__ptO.c;
+      const g = c ? c.getContext(t, attrs) : null;
+      // Двумерный контекст офскрина — отдельный интерфейс, и страница читает
+      // его имя: `OffscreenCanvasRenderingContext2D`, не `CanvasRenderingContext2D`.
+      if (g && t === '2d' && globalThis.OffscreenCanvasRenderingContext2D) {
+        try {
+          const P = globalThis.OffscreenCanvasRenderingContext2D.prototype;
+          if (P && Object.getPrototypeOf(g) !== P) {
+            if (!P.__ptLinked) {
+              Object.setPrototypeOf(P, Object.getPrototypeOf(g));
+              Object.defineProperty(P, '__ptLinked', { value: true });
+              if (!Object.getOwnPropertyDescriptor(P, Symbol.toStringTag)) {
+                Object.defineProperty(P, Symbol.toStringTag,
+                  { value: 'OffscreenCanvasRenderingContext2D', configurable: true });
+              }
+            }
+            Object.setPrototypeOf(g, P);
+          }
+        } catch (e) {}
+      }
+      return g;
+    }
     convertToBlob(opts) { return Promise.resolve(new Blob([], { type: (opts && opts.type) || 'image/png' })); }
     // Настоящий ImageBitmap: он должен нести пиксели холста, иначе `drawImage`
     // им рисует пустоту. Возвращался пустой объект — сборщик отпечатков
