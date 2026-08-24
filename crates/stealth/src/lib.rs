@@ -2652,7 +2652,11 @@ __OPFS__
         return Promise.resolve(Object.create(GPUDevice.prototype));
       });
       const adapter = Object.create(GPUAdapter.prototype);
-      meth(GPU_.prototype, 'requestAdapter', function () { return Promise.resolve(adapter); });
+      meth(GPU_.prototype, 'requestAdapter', function (opts) {
+        // Программного запасного адаптера на этой машине нет — как и у Chrome.
+        if (opts && opts.forceFallbackAdapter) return Promise.resolve(null);
+        return Promise.resolve(adapter);
+      });
       meth(GPU_.prototype, 'getPreferredCanvasFormat', function () { return 'rgba8unorm'; });
       const wgsl = mkWgsl(WGSL);
       defg(GPU_.prototype, 'wgslLanguageFeatures', function () { return wgsl; });
@@ -3376,6 +3380,295 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         globalThis[orig.name] = globalThis.__pt_native ? __pt_native(ctor) : ctor;
       }
       if (globalThis.WebKitCSSMatrix) globalThis.WebKitCSSMatrix = globalThis.DOMMatrix;
+    }
+  } catch (e) {}
+
+  // WebGPU: объекты были пустыми оболочками, и вся ветка сбора — отрисовка
+  // треугольника в текстуру и чтение её обратно — обрывалась на первом же
+  // `createShaderModule`. Из отчёта пропадал блок в 4096 байт.
+  //
+  // Рисует всё это наш же GL: WGSL переводится в GLSL ES, а дальше идёт
+  // обычный конвейер. Перевод узкий — ровно те построения, которыми пишут
+  // такие пробы: точки входа с `@builtin`/`@location`, векторные типы,
+  // литеральные массивы и арифметика. Чего не знает — не переводит, и тогда
+  // конвейер честно отказывает, а не рисует наугад.
+  try {
+    const G = globalThis;
+    const iface = (n) => (G[n] && G[n].prototype) || null;
+    const put = (P, name, fn) => {
+      if (!P) return;
+      try {
+        Object.defineProperty(P, name, {
+          value: G.__pt_native ? G.__pt_native(fn) : fn,
+          writable: true, enumerable: true, configurable: true,
+        });
+      } catch (e) {}
+    };
+    const getter = (P, name, fn) => {
+      if (!P) return;
+      try { Object.defineProperty(P, name, { get: fn, enumerable: true, configurable: true }); } catch (e) {}
+    };
+    const mk = (n) => (iface(n) ? Object.create(iface(n)) : {});
+    const ST = new WeakMap();
+    const st = (o) => ST.get(o) || {};
+
+    // ---- WGSL -> GLSL ES 3.00 ------------------------------------------
+    const wgslNum = (t) => t.replace(/(^|[^\w.])\.(\d)/g, '$10.$2');
+    const wgslTypes = (t) => t
+      .replace(/\bvec2f\b/g, 'vec2').replace(/\bvec3f\b/g, 'vec3').replace(/\bvec4f\b/g, 'vec4')
+      .replace(/\bvec2<f32>/g, 'vec2').replace(/\bvec3<f32>/g, 'vec3').replace(/\bvec4<f32>/g, 'vec4')
+      .replace(/\bf32\b/g, 'float').replace(/\bi32\b/g, 'int').replace(/\bu32\b/g, 'uint');
+    // Целые внутри векторных сборок должны стать вещественными.
+    const floatLits = (t) => t.replace(/vec([234])\(([^()]*)\)/g, (m, n, args) =>
+      'vec' + n + '(' + args.split(',').map((a) => {
+        const s = a.trim();
+        return /^-?\d+$/.test(s) ? s + '.0' : a;
+      }).join(',') + ')');
+    const entry = (code, kind) => {
+      // Скобки в списке доводов вложенные — `@builtin(vertex_index) i:u32`, —
+      // поэтому список берём счётом скобок, а не выражением.
+      const head = new RegExp('@' + kind + '\\s+fn\\s+(\\w+)\\s*\\(', 'm');
+      const h = head.exec(code);
+      if (!h) return null;
+      let d = 1, k = h.index + h[0].length;
+      for (; k < code.length && d; k++) {
+        if (code[k] === '(') d++;
+        else if (code[k] === ')') d--;
+      }
+      const params = code.slice(h.index + h[0].length, k - 1);
+      const rest = /^\s*->\s*([^{]*)\{/.exec(code.slice(k));
+      if (!rest) return null;
+      const m = { 1: h[1], 2: params, 3: rest[1], index: h.index,
+        0: code.slice(h.index, k + rest[0].length) };
+      // Тело — до парной закрывающей скобки.
+      let depth = 1, i = m.index + m[0].length;
+      for (; i < code.length && depth; i++) {
+        if (code[i] === '{') depth++;
+        else if (code[i] === '}') depth--;
+      }
+      return { name: m[1], params: m[2], ret: m[3].trim(), body: code.slice(m.index + m[0].length, i - 1) };
+    };
+    const translate = (code) => {
+      const v = entry(code, 'vertex'), f = entry(code, 'fragment');
+      if (!v || !f) return null;
+      const prep = (b) => floatLits(wgslTypes(wgslNum(b)))
+        .replace(/\bvar\s+(\w+)\s*=\s*array<([^,]+),\s*(\d+)>\s*\(/g, '$2 $1[$3] = $2[$3](')
+        .replace(/\blet\s+/g, 'float ')
+        .replace(/\bvar\s+/g, 'float ');
+      let vs = prep(v.body), fs = prep(f.body);
+      // Довод с номером вершины становится встроенной переменной GL.
+      const vi = /@builtin\(vertex_index\)\s*(\w+)/.exec(v.params);
+      if (vi) vs = vs.replace(new RegExp('\\b' + vi[1] + '\\b', 'g'), 'gl_VertexID');
+      const ii = /@builtin\(instance_index\)\s*(\w+)/.exec(v.params);
+      if (ii) vs = vs.replace(new RegExp('\\b' + ii[1] + '\\b', 'g'), 'gl_InstanceID');
+      if (!/@builtin\(position\)/.test(v.ret)) return null;
+      vs = vs.replace(/return\s+([^;]+);/g, 'gl_Position = $1;');
+      if (!/@location\(0\)/.test(f.ret)) return null;
+      fs = fs.replace(/return\s+([^;]+);/g, '__pt_out = $1;');
+      // Непереведённое остаётся с решёткой WGSL — это признак отказа.
+      if (/[@]|array<|->/.test(vs + fs)) return null;
+      return {
+        vs: '#version 300 es\nvoid main() {\n' + vs + '\n}\n',
+        fs: '#version 300 es\nprecision highp float;\nout vec4 __pt_out;\nvoid main() {\n' + fs + '\n}\n',
+      };
+    };
+
+    // ---- рисование через наш GL ----------------------------------------
+    const glFor = (w, h) => {
+      const c = new G.OffscreenCanvas(w, h);
+      const gl = c.getContext('webgl2') || c.getContext('webgl');
+      return gl;
+    };
+    const runPass = (tex, pass) => {
+      const gl = tex.gl;
+      if (!gl) return;
+      gl.viewport(0, 0, tex.w, tex.h);
+      const cv = pass.clear || { r: 0, g: 0, b: 0, a: 0 };
+      if (pass.loadOp === 'clear') {
+        gl.clearColor(+cv.r || 0, +cv.g || 0, +cv.b || 0, cv.a === undefined ? 1 : +cv.a);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      }
+      for (const d of pass.draws) {
+        const p = d.pipeline && d.pipeline.program;
+        if (!p) continue;
+        gl.useProgram(p);
+        gl.drawArrays(gl.TRIANGLES, d.first | 0, d.count | 0);
+      }
+    };
+
+    const GPUDeviceP = iface('GPUDevice');
+    const GPUQueueP = iface('GPUQueue');
+    if (GPUDeviceP && GPUQueueP) {
+      put(GPUDeviceP, 'createShaderModule', function createShaderModule(desc) {
+        const o = mk('GPUShaderModule');
+        ST.set(o, { code: String((desc && desc.code) || '') });
+        return o;
+      });
+      put(GPUDeviceP, 'createTexture', function createTexture(desc) {
+        const size = (desc && desc.size) || [1, 1];
+        const w = (Array.isArray(size) ? size[0] : size.width) | 0;
+        const h = (Array.isArray(size) ? (size[1] === undefined ? 1 : size[1]) : size.height) | 0;
+        const o = mk('GPUTexture');
+        ST.set(o, { w: Math.max(1, w), h: Math.max(1, h), gl: glFor(Math.max(1, w), Math.max(1, h)),
+          format: (desc && desc.format) || 'rgba8unorm' });
+        return o;
+      });
+      put(GPUDeviceP, 'createBuffer', function createBuffer(desc) {
+        const o = mk('GPUBuffer');
+        const n = Math.max(0, (desc && desc.size) | 0);
+        ST.set(o, { size: n, bytes: new Uint8Array(n), mapped: null });
+        return o;
+      });
+      put(GPUDeviceP, 'createRenderPipeline', function createRenderPipeline(desc) {
+        const o = mk('GPURenderPipeline');
+        const mod = desc && desc.vertex && desc.vertex.module;
+        const src = mod ? st(mod).code : '';
+        ST.set(o, { src });
+        return o;
+      });
+      put(GPUDeviceP, 'createCommandEncoder', function createCommandEncoder() {
+        const o = mk('GPUCommandEncoder');
+        ST.set(o, { cmds: [] });
+        return o;
+      });
+      put(GPUDeviceP, 'createBindGroup', function createBindGroup() { return mk('GPUBindGroup'); });
+      put(GPUDeviceP, 'createPipelineLayout', function createPipelineLayout() { return mk('GPUPipelineLayout'); });
+      put(GPUDeviceP, 'createSampler', function createSampler() { return mk('GPUSampler'); });
+      put(GPUDeviceP, 'createComputePipeline', function createComputePipeline() { return mk('GPUComputePipeline'); });
+      put(GPUDeviceP, 'pushErrorScope', function pushErrorScope() {});
+      put(GPUDeviceP, 'popErrorScope', function popErrorScope() { return Promise.resolve(null); });
+
+      const TexP = iface('GPUTexture');
+      put(TexP, 'createView', function createView() {
+        const o = mk('GPUTextureView');
+        ST.set(o, { tex: this });
+        return o;
+      });
+      put(TexP, 'destroy', function destroy() {});
+      for (const [k, f] of [['width', (s) => s.w], ['height', (s) => s.h], ['depthOrArrayLayers', () => 1],
+        ['mipLevelCount', () => 1], ['sampleCount', () => 1], ['dimension', () => '2d'],
+        ['format', (s) => s.format || 'rgba8unorm'], ['usage', () => 0]]) {
+        getter(TexP, k, function () { return f(st(this)); });
+      }
+
+      const EncP = iface('GPUCommandEncoder');
+      put(EncP, 'beginRenderPass', function beginRenderPass(desc) {
+        const at = (desc && desc.colorAttachments && desc.colorAttachments[0]) || {};
+        const view = at.view;
+        const tex = view ? st(view).tex : null;
+        const pass = { tex, loadOp: at.loadOp, clear: at.clearValue, draws: [] };
+        st(this).cmds.push({ kind: 'pass', pass });
+        const o = mk('GPURenderPassEncoder');
+        ST.set(o, { pass });
+        return o;
+      });
+      put(EncP, 'copyTextureToBuffer', function copyTextureToBuffer(src, dst, size) {
+        st(this).cmds.push({ kind: 'copy', tex: src && src.texture, buf: dst && dst.buffer,
+          bytesPerRow: (dst && dst.bytesPerRow) | 0, size });
+      });
+      put(EncP, 'copyBufferToBuffer', function copyBufferToBuffer() {});
+      put(EncP, 'finish', function finish() {
+        const o = mk('GPUCommandBuffer');
+        ST.set(o, { cmds: st(this).cmds.slice() });
+        return o;
+      });
+
+      const PassP = iface('GPURenderPassEncoder');
+      put(PassP, 'setPipeline', function setPipeline(p) { st(this).pending = p; });
+      put(PassP, 'setBindGroup', function setBindGroup() {});
+      put(PassP, 'setVertexBuffer', function setVertexBuffer() {});
+      put(PassP, 'draw', function draw(count, instances, first) {
+        st(this).pass.draws.push({ pipeline: st(this).pending, count: count | 0, first: first | 0 });
+      });
+      put(PassP, 'drawIndexed', function drawIndexed() {});
+      put(PassP, 'end', function end() {});
+
+      put(GPUQueueP, 'submit', function submit(list) {
+        for (const cb of (list || [])) {
+          for (const c of (st(cb).cmds || [])) {
+            if (c.kind === 'pass') {
+              const tex = c.pass.tex ? st(c.pass.tex) : null;
+              if (!tex || !tex.gl) continue;
+              // Конвейеры собираются здесь: программа живёт в том же
+              // контексте, в который рисуют.
+              for (const d of c.pass.draws) {
+                const ps = d.pipeline ? st(d.pipeline) : null;
+                if (!ps || ps.program !== undefined) continue;
+                const t = translate(ps.src || '');
+                ps.program = null;
+                if (!t) continue;
+                const gl = tex.gl;
+                const vs = gl.createShader(gl.VERTEX_SHADER);
+                gl.shaderSource(vs, t.vs); gl.compileShader(vs);
+                const fs = gl.createShader(gl.FRAGMENT_SHADER);
+                gl.shaderSource(fs, t.fs); gl.compileShader(fs);
+                if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS) ||
+                    !gl.getShaderParameter(fs, gl.COMPILE_STATUS)) continue;
+                const pr = gl.createProgram();
+                gl.attachShader(pr, vs); gl.attachShader(pr, fs); gl.linkProgram(pr);
+                if (!gl.getProgramParameter(pr, gl.LINK_STATUS)) continue;
+                ps.program = pr;
+              }
+              for (const d of c.pass.draws) d.pipeline = d.pipeline ? st(d.pipeline) : null;
+              runPass(tex, c.pass);
+            } else if (c.kind === 'copy') {
+              const tex = c.tex ? st(c.tex) : null;
+              const buf = c.buf ? st(c.buf) : null;
+              if (!tex || !buf || !tex.gl) continue;
+              const gl = tex.gl;
+              const px = new Uint8Array(tex.w * tex.h * 4);
+              gl.readPixels(0, 0, tex.w, tex.h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+              // Строки в буфере выровнены: `bytesPerRow` больше ширины.
+              const stride = c.bytesPerRow || tex.w * 4;
+              for (let y = 0; y < tex.h; y++) {
+                const from = y * tex.w * 4, to = y * stride;
+                if (to + tex.w * 4 > buf.bytes.length) break;
+                buf.bytes.set(px.subarray(from, from + tex.w * 4), to);
+              }
+            }
+          }
+        }
+      });
+      put(GPUQueueP, 'writeBuffer', function writeBuffer() {});
+      put(GPUQueueP, 'writeTexture', function writeTexture() {});
+      put(GPUQueueP, 'onSubmittedWorkDone', function onSubmittedWorkDone() { return Promise.resolve(); });
+
+      const BufP = iface('GPUBuffer');
+      put(BufP, 'mapAsync', function mapAsync() { return Promise.resolve(); });
+      put(BufP, 'getMappedRange', function getMappedRange(offset, size) {
+        const s = st(this);
+        const o = offset | 0;
+        const n = size === undefined ? s.size - o : size | 0;
+        const out = new ArrayBuffer(Math.max(0, n));
+        new Uint8Array(out).set(s.bytes.subarray(o, o + n));
+        s.mapped = out;
+        return out;
+      });
+      put(BufP, 'unmap', function unmap() { st(this).mapped = null; });
+      put(BufP, 'destroy', function destroy() {});
+      getter(BufP, 'size', function () { return st(this).size || 0; });
+      getter(BufP, 'usage', function () { return 0; });
+      getter(BufP, 'mapState', function () { return st(this).mapped ? 'mapped' : 'unmapped'; });
+    }
+
+    // Настройка холста: страница спрашивает её обратно.
+    const CtxP = iface('GPUCanvasContext');
+    if (CtxP) {
+      const CONF = new WeakMap();
+      put(CtxP, 'configure', function configure(desc) { CONF.set(this, desc || null); });
+      put(CtxP, 'unconfigure', function unconfigure() { CONF.delete(this); });
+      put(CtxP, 'getConfiguration', function getConfiguration() {
+        const d = CONF.get(this);
+        if (!d) return null;
+        return {
+          device: d.device, format: d.format,
+          usage: d.usage === undefined ? 0x10 : d.usage,
+          viewFormats: d.viewFormats ? Array.from(d.viewFormats) : [],
+          colorSpace: d.colorSpace || 'srgb',
+          toneMapping: d.toneMapping || { mode: 'standard' },
+          alphaMode: d.alphaMode || 'opaque',
+        };
+      });
     }
   } catch (e) {}
 
@@ -6974,9 +7267,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
               enumerable: true, configurable: true,
             });
           } catch (e) {}
-          put('configure', function configure() {});
-          put('unconfigure', function unconfigure() {});
-          put('getConfiguration', function getConfiguration() { return null; });
+          // Настоящие `configure`/`getConfiguration` уже стоят на прототипе —
+          // заглушка ставится только если их там нет.
+          if (typeof P.configure !== 'function') put('configure', function configure() {});
+          if (typeof P.unconfigure !== 'function') put('unconfigure', function unconfigure() {});
+          if (typeof P.getConfiguration !== 'function') {
+            put('getConfiguration', function getConfiguration() { return null; });
+          }
           put('getCurrentTexture', function getCurrentTexture() {
             const T = globalThis.GPUTexture;
             return T && T.prototype ? Object.create(T.prototype) : {};

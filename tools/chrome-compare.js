@@ -299,6 +299,39 @@ const HOOK = `(() => {
               return r;
             };
           }
+          // Полный след WebGPU: какие объекты и какие вызовы.
+          if (!globalThis.__ptGpuTrace) {
+            globalThis.__ptGpuTrace = 1;
+            const names = Object.getOwnPropertyNames(globalThis).filter((n) => /^GPU/.test(n));
+            for (const n of names) {
+              const C = globalThis[n];
+              const P = C && C.prototype;
+              if (!P) continue;
+              for (const k of Object.getOwnPropertyNames(P)) {
+                let d;
+                try { d = Object.getOwnPropertyDescriptor(P, k); } catch (e) { continue; }
+                if (!d || typeof d.value !== 'function' || k === 'constructor') continue;
+                const f = d.value;
+                try {
+                  P[k] = function (...args) {
+                    const a = args.map((v) => {
+                      if (v === null || v === undefined) return String(v);
+                      if (typeof v === 'object') {
+                        try { return JSON.stringify(v).slice(0, 1400); }
+                        catch (e) { return (v.constructor && v.constructor.name) || 'об'; }
+                      }
+                      return String(v).slice(0, 40);
+                    });
+                    const r = f.apply(this, args);
+                    const shown = r && typeof r === 'object'
+                      ? ((r.constructor && r.constructor.name) || 'об') : String(r).slice(0, 30);
+                    console.log('[gpu] ' + n + '.' + k + '(' + a.join(' | ') + ') -> ' + shown);
+                    return r;
+                  };
+                } catch (e) {}
+              }
+            }
+          }
           const gpu = globalThis.navigator && globalThis.navigator.gpu;
           if (gpu && !gpu.__ptG) {
             try { Object.defineProperty(gpu, '__ptG', { value: 1 }); } catch (e) {}
