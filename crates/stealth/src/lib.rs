@@ -7609,43 +7609,52 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // Перенос алгоритма Google из WebKit/Blink (DynamicsCompressorKernel), с его
   // же значениями по умолчанию: предзадержка 6 мс, зоны отпускания
   // 0.09/0.16/0.42/0.98, добавочное усиление 0 дБ, смешивание 1.
-  const dbToLin = (db) => Math.pow(10, 0.05 * db);
-  const linToDb = (x) => (x ? 20 * Math.log10(x) : -1000);
+  // У браузера это одинарная точность: `powf(10, 0.05f*db)` и `20*log10f(x)`.
+  // От их округления зависит, куда попадёт двоичный поиск коэффициента колена,
+  // а он определён лишь до трёх десятитысячных — и уезжает на весь выход.
+  const dbToLin = (db) => Math.fround(Math.pow(10, Math.fround(0.05 * db)));
+  const linToDb = (x) => (x ? Math.fround(20 * Math.fround(Math.log10(x))) : -1000);
 
   function compressorKernel(input, rate, opts) {
     const dbThreshold = opts.threshold, dbKnee = opts.knee, ratio = opts.ratio;
-    const linearThreshold = dbToLin(dbThreshold);
-    const slope = 1 / ratio;
+    const f1 = Math.fround;
+    const linearThreshold = f1(dbToLin(dbThreshold));
+    const slope = f1(1 / ratio);
 
+    // Поиск коэффициента колена идёт одинарной точностью: пятнадцать
+    // делений оставляют его определённым лишь до трёх десятитысячных, и
+    // именно на этом уровне двойной счёт расходится с браузерным. Разница
+    // выходит постоянным множителем на весь выход — полторы десятитысячных.
     const kneeCurve = (x, k) => x < linearThreshold
       ? x
-      : linearThreshold + (1 - Math.exp(-k * (x - linearThreshold))) / k;
+      : f1(linearThreshold + f1(f1(1 - f1(Math.exp(f1(-k * f1(x - linearThreshold))))) / k));
     const slopeAt = (x, k) => {
       if (x < linearThreshold) return 1;
-      const x2 = x * 1.001;
-      const xDb = linToDb(x), x2Db = linToDb(x2);
-      return (linToDb(kneeCurve(x2, k)) - linToDb(kneeCurve(x, k))) / (x2Db - xDb);
+      const x2 = f1(x * 1.001);
+      const xDb = f1(linToDb(x)), x2Db = f1(linToDb(x2));
+      const yDb = f1(linToDb(kneeCurve(x, k))), y2Db = f1(linToDb(kneeCurve(x2, k)));
+      return f1(f1(y2Db - yDb) / f1(x2Db - xDb));
     };
     // Коэффициент колена ищется двоичным поиском по наклону — пятнадцать шагов,
     // как в исходнике.
     let minK = 0.1, maxK = 10000, k = 5;
     {
-      const x = dbToLin(dbThreshold + dbKnee);
+      const x = f1(dbToLin(f1(dbThreshold + dbKnee)));
       for (let i = 0; i < 15; i++) {
         if (slopeAt(x, k) < slope) maxK = k; else minK = k;
-        k = Math.sqrt(minK * maxK);
+        k = f1(Math.sqrt(f1(minK * maxK)));
       }
     }
-    const kneeThresholdDb = dbThreshold + dbKnee;
-    const kneeThreshold = dbToLin(kneeThresholdDb);
-    const ykneeThresholdDb = linToDb(kneeCurve(kneeThreshold, k));
+    const kneeThresholdDb = f1(dbThreshold + dbKnee);
+    const kneeThreshold = f1(dbToLin(kneeThresholdDb));
+    const ykneeThresholdDb = f1(linToDb(kneeCurve(kneeThreshold, k)));
     const saturate = (x) => x < kneeThreshold
       ? kneeCurve(x, k)
-      : dbToLin(ykneeThresholdDb + slope * (linToDb(x) - kneeThresholdDb));
+      : f1(dbToLin(f1(ykneeThresholdDb + f1(slope * f1(f1(linToDb(x)) - kneeThresholdDb)))));
 
     // Компенсирующее усиление: без него компрессор с порогом −50 дБ душит сигнал
     // на два порядка, а браузер его возвращает — в степени 0,6, «на слух».
-    const masterLinearGain = dbToLin(0) * Math.pow(1 / saturate(1), 0.6);
+    const masterLinearGain = f1(dbToLin(0) * f1(Math.pow(f1(1 / f1(saturate(1))), 0.6)));
 
     const attackFrames = Math.max(0.001, opts.attack) * rate;
     const releaseFrames = rate * opts.release;
@@ -7676,11 +7685,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     for (let d = 0; d < nDivisions; d++) {
       if (!Number.isFinite(detectorAverage)) detectorAverage = 1;
       const desiredGain = detectorAverage;
-      const scaledDesiredGain = Math.asin(desiredGain) / (0.5 * Math.PI);
+      const scaledDesiredGain = Math.fround(Math.asin(desiredGain) / (0.5 * Math.PI));
 
       let envelopeRate;
       const isReleasing = scaledDesiredGain > compressorGain;
-      let compressionDiffDb = linToDb(compressorGain / scaledDesiredGain);
+      let compressionDiffDb = Math.fround(linToDb(Math.fround(compressorGain / scaledDesiredGain)));
       if (isReleasing) {
         maxAttackCompressionDiffDb = -1;
         if (!Number.isFinite(compressionDiffDb)) compressionDiffDb = -1;
@@ -7688,33 +7697,40 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         x = 0.25 * (x + 12);
         const x2 = x * x, x3 = x2 * x, x4 = x2 * x2;
         const rf = kA + kB * x + kC * x2 + kD * x3 + kE * x4;
-        envelopeRate = dbToLin(5 / rf);
+        envelopeRate = Math.fround(dbToLin(Math.fround(5 / rf)));
       } else {
         if (!Number.isFinite(compressionDiffDb)) compressionDiffDb = 1;
         if (maxAttackCompressionDiffDb === -1 || maxAttackCompressionDiffDb < compressionDiffDb) {
           maxAttackCompressionDiffDb = compressionDiffDb;
         }
         const effAttenDiffDb = Math.max(0.5, maxAttackCompressionDiffDb);
-        envelopeRate = 1 - Math.pow(0.25 / effAttenDiffDb, 1 / attackFrames);
+        envelopeRate = Math.fround(1 - Math.fround(Math.pow(Math.fround(0.25 / effAttenDiffDb), 1 / attackFrames)));
       }
 
+      // Всё это в браузере считается одинарной точностью, и накопитель
+      // за сорок тысяч отсчётов уходит от двойного счёта на пять
+      // стотысячных. Округляем каждый шаг так же, как он.
+      const f = Math.fround;
       for (let n = 0; n < nDivisionFrames; n++) {
         const undelayed = input[frame];
         delay[writeIndex] = undelayed;
-        const absInput = Math.abs(undelayed);
-        const shaped = saturate(absInput);
-        const attenuation = absInput <= 0.0001 ? 1 : shaped / absInput;
-        const attenuationDb = Math.max(2, -linToDb(attenuation));
-        const satReleaseRate = dbToLin(attenuationDb / satReleaseFrames) - 1;
+        const absInput = f(Math.abs(undelayed));
+        const shaped = f(saturate(absInput));
+        const attenuation = absInput <= 0.0001 ? 1 : f(shaped / absInput);
+        const attenuationDb = f(Math.max(2, f(-linToDb(attenuation))));
+        const satReleaseRate = f(f(dbToLin(f(attenuationDb / satReleaseFrames))) - 1);
         const rate2 = attenuation > detectorAverage ? satReleaseRate : 1;
-        detectorAverage = Math.min(1, detectorAverage + (attenuation - detectorAverage) * rate2);
+        detectorAverage = f(Math.min(1, f(detectorAverage + f(f(attenuation - detectorAverage) * rate2))));
         if (!Number.isFinite(detectorAverage)) detectorAverage = 1;
 
-        if (envelopeRate < 1) compressorGain += (scaledDesiredGain - compressorGain) * envelopeRate;
-        else compressorGain = Math.min(1, compressorGain * envelopeRate);
+        if (envelopeRate < 1) {
+          compressorGain = f(compressorGain + f(f(scaledDesiredGain - compressorGain) * envelopeRate));
+        } else {
+          compressorGain = f(Math.min(1, f(compressorGain * envelopeRate)));
+        }
 
-        const postWarp = Math.sin(0.5 * Math.PI * compressorGain);
-        out[frame] = delay[readIndex] * masterLinearGain * postWarp;
+        const postWarp = f(Math.sin(f(0.5 * Math.PI * compressorGain)));
+        out[frame] = f(f(delay[readIndex] * masterLinearGain) * postWarp);
 
         frame++;
         readIndex = (readIndex + 1) & MASK;
