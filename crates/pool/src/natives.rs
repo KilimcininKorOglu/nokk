@@ -212,7 +212,8 @@ fn canvas_fill_rect(
         arg_usize(scope, args.get(7)) as u8,
         arg_usize(scope, args.get(8)) as u8,
     ];
-    crate::canvas::fill_rect(id, x, y, w, h, rgba, &arg_f32s(args.get(9)));
+    crate::canvas::fill_rect(id, x, y, w, h, rgba, &arg_f32s(args.get(9)),
+        arg_usize(scope, args.get(10)) as u32);
 }
 
 /// `__pt_canvasClearRect(id, x, y, w, h)`
@@ -307,7 +308,8 @@ fn canvas_fill_path(
         arg_usize(scope, args.get(5)) as u8,
         arg_usize(scope, args.get(6)) as u8,
     ];
-    crate::canvas::fill_path(id, &verbs, even_odd, rgba, &arg_f32s(args.get(7)));
+    crate::canvas::fill_path(id, &verbs, even_odd, rgba, &arg_f32s(args.get(7)),
+        arg_usize(scope, args.get(8)) as u32);
 }
 
 /// `__pt_canvasFillPathGradient(id, verbsF32, evenOdd, gradF32)` — gradient fill.
@@ -321,7 +323,8 @@ fn canvas_fill_path_gradient(
     let verbs = arg_f32s(args.get(1));
     let even_odd = arg_usize(scope, args.get(2)) != 0;
     let grad = arg_f32s(args.get(3));
-    crate::canvas::fill_path_grad(id, &verbs, even_odd, &grad, &arg_f32s(args.get(4)));
+    crate::canvas::fill_path_grad(id, &verbs, even_odd, &grad, &arg_f32s(args.get(4)),
+        arg_usize(scope, args.get(5)) as u32);
 }
 
 /// `__pt_canvasStrokePath(id, verbsF32, lineWidth, r, g, b, a, shadowF32)` — stroke a path.
@@ -340,7 +343,8 @@ fn canvas_stroke_path(
         arg_usize(scope, args.get(5)) as u8,
         arg_usize(scope, args.get(6)) as u8,
     ];
-    crate::canvas::stroke_path(id, &verbs, line_width, rgba, &arg_f32s(args.get(7)));
+    crate::canvas::stroke_path(id, &verbs, line_width, rgba, &arg_f32s(args.get(7)),
+        arg_usize(scope, args.get(8)) as u32);
 }
 
 /// `__pt_canvasPutImageData(id, x, y, w, h, data)` — overwrite from straight-alpha RGBA.

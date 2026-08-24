@@ -3191,6 +3191,194 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     }
   } catch (e) {}
 
+  // `DOMMatrix` была заглушкой: все её поля отдавали `undefined`, и любая
+  // страница, читающая преобразование — через `getTransform`, через
+  // `WebKitCSSMatrix`, через разбор строки `transform` — получала пустоту.
+  try {
+    const RO = globalThis.DOMMatrixReadOnly, MM = globalThis.DOMMatrix;
+    if (MM && MM.prototype && !globalThis.__pt_matrixReal) {
+      globalThis.__pt_matrixReal = true;
+      const ST = new WeakMap();
+      const ident = () => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+      const stateOf = (o) => { let v = ST.get(o); if (!v) { v = { m: ident(), d2: true }; ST.set(o, v); } return v; };
+      // Порядок в массиве — по столбцам, как в спецификации: m11..m44.
+      const IDX = { m11: 0, m12: 1, m13: 2, m14: 3, m21: 4, m22: 5, m23: 6, m24: 7,
+        m31: 8, m32: 9, m33: 10, m34: 11, m41: 12, m42: 13, m43: 14, m44: 15 };
+      const ALIAS = { a: 'm11', b: 'm12', c: 'm21', d: 'm22', e: 'm41', f: 'm42' };
+      const fromInit = (o, init) => {
+        const st = stateOf(o);
+        if (init === undefined || init === null) return o;
+        if (typeof init === 'string') {
+          // Строка вида `matrix(a, b, c, d, e, f)` или `matrix3d(...)`.
+          const m = /^\s*matrix(3d)?\(([^)]*)\)\s*$/.exec(init);
+          if (!m) { if (String(init).trim()) throw new (globalThis.DOMException || Error)(
+            "Failed to construct 'DOMMatrix': Failed to parse '" + init + "'.", 'SyntaxError'); return o; }
+          const n = m[2].split(',').map((x) => parseFloat(x) || 0);
+          if (m[1]) { st.m = n.slice(0, 16); st.d2 = false; }
+          else { st.m = ident(); st.m[0] = n[0]; st.m[1] = n[1]; st.m[4] = n[2];
+            st.m[5] = n[3]; st.m[12] = n[4]; st.m[13] = n[5]; st.d2 = true; }
+          return o;
+        }
+        const arr = Array.from(init);
+        if (arr.length === 6) {
+          st.m = ident(); st.m[0] = +arr[0] || 0; st.m[1] = +arr[1] || 0; st.m[4] = +arr[2] || 0;
+          st.m[5] = +arr[3] || 0; st.m[12] = +arr[4] || 0; st.m[13] = +arr[5] || 0; st.d2 = true;
+        } else if (arr.length === 16) {
+          st.m = arr.map((x) => +x || 0); st.d2 = false;
+        } else {
+          const e = new TypeError("Failed to construct 'DOMMatrix': " +
+            'Failed to construct matrix: The sequence must contain 6 elements for a 2D matrix or 16 elements for a 3D matrix.');
+          throw e;
+        }
+        return o;
+      };
+      const mulm = (A, B) => {            // A · B, оба по столбцам
+        const r = new Array(16).fill(0);
+        for (let c = 0; c < 4; c++) for (let rr = 0; rr < 4; rr++) {
+          let v = 0;
+          for (let k = 0; k < 4; k++) v += A[k * 4 + rr] * B[c * 4 + k];
+          r[c * 4 + rr] = v;
+        }
+        return r;
+      };
+      const make = (Cls, m, d2) => { const o = Object.create(Cls.prototype); ST.set(o, { m: m.slice(), d2 }); return o; };
+      const shape = (Cls, writable) => {
+        const P = Cls && Cls.prototype;
+        if (!P || P.__ptMatrixShaped) return;
+        try { Object.defineProperty(P, '__ptMatrixShaped', { value: true }); } catch (e) {}
+        const put = (name, get, set) => {
+          try { Object.defineProperty(P, name, { get, set, enumerable: true, configurable: true }); } catch (e) {}
+        };
+        for (const k of Object.keys(IDX)) {
+          const i = IDX[k];
+          put(k, function () { return stateOf(this).m[i]; },
+            writable ? function (v) { const st = stateOf(this); st.m[i] = +v || 0;
+              if (i !== 0 && i !== 1 && i !== 4 && i !== 5 && i !== 12 && i !== 13) st.d2 = false; } : undefined);
+        }
+        for (const k of Object.keys(ALIAS)) {
+          const i = IDX[ALIAS[k]];
+          put(k, function () { return stateOf(this).m[i]; },
+            writable ? function (v) { stateOf(this).m[i] = +v || 0; } : undefined);
+        }
+        put('is2D', function () { return stateOf(this).d2; }, undefined);
+        put('isIdentity', function () {
+          const m = stateOf(this).m, I = ident();
+          for (let i = 0; i < 16; i++) if (m[i] !== I[i]) return false;
+          return true;
+        }, undefined);
+        const method = (name, fn) => {
+          try { Object.defineProperty(P, name, { value: fn, writable: true, enumerable: true, configurable: true }); } catch (e) {}
+        };
+        method('multiply', function (other) {
+          const st = stateOf(this), o = other ? stateOf(other) : { m: ident(), d2: true };
+          return make(globalThis.DOMMatrix, mulm(st.m, o.m), st.d2 && o.d2);
+        });
+        method('translate', function (tx, ty, tz) {
+          const t = ident(); t[12] = +tx || 0; t[13] = +ty || 0; t[14] = +tz || 0;
+          const st = stateOf(this);
+          return make(globalThis.DOMMatrix, mulm(st.m, t), st.d2 && !tz);
+        });
+        method('scale', function (sx, sy, sz) {
+          const t = ident(); const x = sx === undefined ? 1 : +sx || 0;
+          t[0] = x; t[5] = sy === undefined ? x : +sy || 0; t[10] = sz === undefined ? 1 : +sz || 0;
+          const st = stateOf(this);
+          return make(globalThis.DOMMatrix, mulm(st.m, t), st.d2 && (sz === undefined || sz === 1));
+        });
+        method('rotate', function (deg) {
+          const r = (+deg || 0) * Math.PI / 180, cs = Math.cos(r), sn = Math.sin(r);
+          const t = ident(); t[0] = cs; t[1] = sn; t[4] = -sn; t[5] = cs;
+          const st = stateOf(this);
+          return make(globalThis.DOMMatrix, mulm(st.m, t), st.d2);
+        });
+        method('flipX', function () { const t = ident(); t[0] = -1;
+          return make(globalThis.DOMMatrix, mulm(stateOf(this).m, t), stateOf(this).d2); });
+        method('flipY', function () { const t = ident(); t[5] = -1;
+          return make(globalThis.DOMMatrix, mulm(stateOf(this).m, t), stateOf(this).d2); });
+        method('inverse', function () {
+          const m = stateOf(this).m;
+          const det = m[0] * m[5] - m[1] * m[4];
+          if (!det) return make(globalThis.DOMMatrix, new Array(16).fill(NaN), false);
+          const r = ident();
+          r[0] = m[5] / det; r[1] = -m[1] / det; r[4] = -m[4] / det; r[5] = m[0] / det;
+          r[12] = (m[4] * m[13] - m[5] * m[12]) / det;
+          r[13] = (m[1] * m[12] - m[0] * m[13]) / det;
+          return make(globalThis.DOMMatrix, r, true);
+        });
+        method('transformPoint', function (pt) {
+          const m = stateOf(this).m;
+          const x = (pt && +pt.x) || 0, y = (pt && +pt.y) || 0, z = (pt && +pt.z) || 0;
+          const w = pt && pt.w !== undefined ? +pt.w : 1;
+          const X = m[0] * x + m[4] * y + m[8] * z + m[12] * w;
+          const Y = m[1] * x + m[5] * y + m[9] * z + m[13] * w;
+          const Z = m[2] * x + m[6] * y + m[10] * z + m[14] * w;
+          const W = m[3] * x + m[7] * y + m[11] * z + m[15] * w;
+          const P2 = globalThis.DOMPoint || globalThis.DOMPointReadOnly;
+          return P2 ? new P2(X, Y, Z, W) : { x: X, y: Y, z: Z, w: W };
+        });
+        method('toFloat32Array', function () { return new Float32Array(stateOf(this).m); });
+        method('toFloat64Array', function () { return new Float64Array(stateOf(this).m); });
+        method('toJSON', function () {
+          const st = stateOf(this), o = {};
+          for (const k of Object.keys(IDX)) o[k] = st.m[IDX[k]];
+          for (const k of Object.keys(ALIAS)) o[k] = st.m[IDX[ALIAS[k]]];
+          o.is2D = st.d2; o.isIdentity = this.isIdentity;
+          return o;
+        });
+        method('toString', function () {
+          const st = stateOf(this), m = st.m;
+          if (st.d2) return 'matrix(' + [m[0], m[1], m[4], m[5], m[12], m[13]].join(', ') + ')';
+          return 'matrix3d(' + m.join(', ') + ')';
+        });
+        try {
+          if (!Object.getOwnPropertyDescriptor(P, Symbol.toStringTag)) {
+            Object.defineProperty(P, Symbol.toStringTag, { value: Cls.name, configurable: true });
+          }
+        } catch (e) {}
+      };
+      shape(RO, false);
+      shape(MM, true);
+      // Конструкторы: у обоих одна и та же разборка довода.
+      for (const Cls of [RO, MM]) {
+        if (!Cls) continue;
+        const orig = Cls;
+        const ctor = function (init) {
+          if (!(this instanceof ctor)) {
+            throw new TypeError("Failed to construct '" + orig.name + "': " +
+              'Please use the \'new\' operator, this DOM object constructor cannot be called as a function.');
+          }
+          const o = Object.create(new.target && new.target.prototype ? new.target.prototype : orig.prototype);
+          stateOf(o);
+          return fromInit(o, init);
+        };
+        Object.defineProperty(ctor, 'prototype', { value: orig.prototype, writable: false, enumerable: false });
+        try { Object.defineProperty(ctor, 'name', { value: orig.name, configurable: true }); } catch (e) {}
+        try { Object.defineProperty(orig.prototype, 'constructor', { value: ctor, writable: true, configurable: true }); } catch (e) {}
+        for (const st of ['fromMatrix', 'fromFloat32Array', 'fromFloat64Array']) {
+          try {
+            Object.defineProperty(ctor, st, {
+              value: function (v) {
+                const o = Object.create(orig.prototype);
+                stateOf(o);
+                if (st === 'fromMatrix' && v && typeof v === 'object' && !ArrayBuffer.isView(v) && !Array.isArray(v)) {
+                  const src = ST.get(v);
+                  if (src) { ST.set(o, { m: src.m.slice(), d2: src.d2 }); return o; }
+                  const arr = [];
+                  for (const k of Object.keys(IDX)) arr[IDX[k]] = v[k] === undefined ? ident()[IDX[k]] : +v[k] || 0;
+                  ST.set(o, { m: arr, d2: v.is2D !== false });
+                  return o;
+                }
+                return fromInit(o, v);
+              },
+              writable: true, enumerable: false, configurable: true,
+            });
+          } catch (e) {}
+        }
+        globalThis[orig.name] = globalThis.__pt_native ? __pt_native(ctor) : ctor;
+      }
+      if (globalThis.WebKitCSSMatrix) globalThis.WebKitCSSMatrix = globalThis.DOMMatrix;
+    }
+  } catch (e) {}
+
   // `createImageBitmap` была заглушкой: она отдавала обещание, разрешённое в
   // `undefined`. Всё, что рисует снимком, обрывалось на первом же обращении к
   // его ширине — а сборщик отпечатков только так и работает с картинками.
@@ -5415,16 +5603,16 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         sync();
         if ((rgba[3] | 0) === 0) __pt_canvasClearRect(id, x, y, w, h);
         else __pt_canvasFillRect(id, x, y, w, h, rgba[0], rgba[1], rgba[2], rgba[3],
-          new Float32Array(arguments[5] || []));
+          new Float32Array(arguments[5] || []), arguments[6] | 0);
       },
       // Real glyphs. `y` is the alphabetic baseline, matching canvas semantics.
       text(t, x, y, size, rgba, fam, b, i, sh) { sync(); __pt_canvasFillText(id, String(t), x, y, size, rgba[0], rgba[1], rgba[2], rgba[3], fam || '', !!b, !!i, new Float32Array(sh || [])); },
       width(t, size, fam, b, i) { return __pt_canvasMeasureText(String(t), size, fam || '', !!b, !!i); },
       // Real vector paths: JS tessellates curves/arcs to a move/line/close verb
       // stream, tiny-skia fills or strokes it.
-      fillPath(verbs, evenOdd, rgba, sh) { sync(); __pt_canvasFillPath(id, new Float32Array(verbs), evenOdd ? 1 : 0, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(sh || [])); },
-      fillPathGradient(verbs, evenOdd, grad, sh) { sync(); __pt_canvasFillPathGradient(id, new Float32Array(verbs), evenOdd ? 1 : 0, new Float32Array(grad), new Float32Array(sh || [])); },
-      strokePath(verbs, lw, rgba, sh) { sync(); __pt_canvasStrokePath(id, new Float32Array(verbs), lw, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(sh || [])); },
+      fillPath(verbs, evenOdd, rgba, sh, mode) { sync(); __pt_canvasFillPath(id, new Float32Array(verbs), evenOdd ? 1 : 0, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(sh || []), mode | 0); },
+      fillPathGradient(verbs, evenOdd, grad, sh, mode) { sync(); __pt_canvasFillPathGradient(id, new Float32Array(verbs), evenOdd ? 1 : 0, new Float32Array(grad), new Float32Array(sh || []), mode | 0); },
+      strokePath(verbs, lw, rgba, sh, mode) { sync(); __pt_canvasStrokePath(id, new Float32Array(verbs), lw, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(sh || []), mode | 0); },
       // Images we still can't rasterize: a deterministic semi-transparent fill
       // keyed by the op-log, so the drawing still influences the pixels stably.
       stamp(x, y, w, h) {
@@ -5711,8 +5899,42 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // пересчёт между пространствами их даёт. Любое другое рисование эту
     // запись отменяет — тогда пиксели читаются с поверхности, как обычно.
     let uniform = null;
+    // Смена размера холста сбрасывает контекст: браузер возвращает матрицу,
+    // цвета, тень, наложение, шрифт и путь к исходным значениям и очищает
+    // растр. Мы этого не делали, и следующее рисование шло поверх прежней
+    // матрицы — на холсте, который перед этим уже масштабировали, всё
+    // выходило вчетверо мельче.
+    let lastW = canvas.width | 0, lastH = canvas.height | 0;
+    const DEFAULTS = {
+      fillStyle: '#000000', strokeStyle: '#000000', font: '10px sans-serif',
+      globalAlpha: 1, globalCompositeOperation: 'source-over', filter: 'none',
+      lineWidth: 1, lineCap: 'butt', lineJoin: 'miter', miterLimit: 10, lineDashOffset: 0,
+      shadowBlur: 0, shadowColor: 'rgba(0, 0, 0, 0)', shadowOffsetX: 0, shadowOffsetY: 0,
+      textAlign: 'start', textBaseline: 'alphabetic', direction: 'ltr', lang: 'inherit',
+      letterSpacing: '0px', wordSpacing: '0px', fontKerning: 'auto', fontStretch: 'normal',
+      fontVariantCaps: 'normal', textRendering: 'auto',
+      imageSmoothingEnabled: true, imageSmoothingQuality: 'low',
+    };
+    const checkResize = () => {
+      const w = canvas.width | 0, h = canvas.height | 0;
+      if (w === lastW && h === lastH) return;
+      lastW = w; lastH = h;
+      M = [1, 0, 0, 1, 0, 0];
+      mStack.length = 0;
+      verbs = []; sub = false; cx = 0; cy = 0;
+      bx0 = by0 = bx1 = by1 = 0;
+      uniform = null;
+      tainted = false;
+      for (const k of Object.keys(DEFAULTS)) impl[k] = DEFAULTS[k];
+    };
     // Тень рисуется, когда её цвет непрозрачен и есть размытие или снос —
     // ровно как в браузере. Описание: [размытие, сносX, сносY, r, g, b, a].
+    // Порядок совпадает с таблицей в движке.
+    const GCO = ['source-over','source-in','source-out','source-atop','destination-over',
+      'destination-in','destination-out','destination-atop','lighter','copy','xor','multiply',
+      'screen','overlay','darken','lighten','color-dodge','color-burn','hard-light','soft-light',
+      'difference','exclusion','hue','saturation','color','luminosity'];
+    const modeOf = (ctx) => Math.max(0, GCO.indexOf(String(ctx.globalCompositeOperation)));
     const shadowOf = function (ctx) {
       const col = parseColorRaw(ctx.shadowColor);
       if (!col || !col[3]) return null;
@@ -5721,7 +5943,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       if (blur <= 0 && dx === 0 && dy === 0) return null;
       return [blur, tX(dx, dy) - tX(0, 0), tY(dx, dy) - tY(0, 0), col[0], col[1], col[2], col[3]];
     };
-    const note = (m) => { uniform = null; S.note(m); };
+    const note = (m) => { checkResize(); uniform = null; S.note(m); };
+    // Холст зовёт это, когда ему меняют размер: сброс должен случиться сразу,
+    // а не при следующем рисовании — страница читает состояние и без него.
+    try { Object.defineProperty(canvas, '__ptCtxResize', { value: checkResize, configurable: true }); } catch (e) {}
     const solid = S.solid, stamp = S.stamp;
     let bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;     // current path bounding box
     let tainted = false;                        // shown something from elsewhere
@@ -5895,8 +6120,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         note('fillRect|' + [x, y, w, h, this.fillStyle]);
         const fs = this.fillStyle;
         const sh = shadowOf(this);
-        if (S.native && gradOf(fs)) S.fillPathGradient(rectVerbs(x, y, w, h), false, encodeGrad(gradOf(fs)), sh);
-        else if (S.native && (!plain() || sh)) S.fillPath(rectVerbs(x, y, w, h), false, parseColor(fs), sh);
+        const md = modeOf(this);
+        if (S.native && gradOf(fs)) S.fillPathGradient(rectVerbs(x, y, w, h), false, encodeGrad(gradOf(fs)), sh, md);
+        else if (S.native && (!plain() || sh || md)) S.fillPath(rectVerbs(x, y, w, h), false, parseColor(fs), sh, md);
         else solid(x, y, w, h, parseColor(fs));
         if (!gradOf(fs) && plain() && (+x || 0) <= 0 && (+y || 0) <= 0 &&
             (+w || 0) >= (canvas.width | 0) && (+h || 0) >= (canvas.height | 0)) {
@@ -5917,7 +6143,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const X = +x || 0, Y = +y || 0, W2 = +w || 0, H2 = +h || 0;
         if (S.native) {
           S.strokePath(rectVerbs(X, Y, W2, H2),
-            Math.max(0, +this.lineWidth || 1) * tScale(), parseColor(this.strokeStyle), shadowOf(this));
+            Math.max(0, +this.lineWidth || 1) * tScale(), parseColor(this.strokeStyle),
+            shadowOf(this), modeOf(this));
           return;
         }
         const lw = Math.max(1, this.lineWidth | 0);
@@ -5963,13 +6190,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         if (!S.native) return paintPath();
         const fs = this.fillStyle;
         const sh = shadowOf(this);
-        if (gradOf(fs)) S.fillPathGradient(verbs, String(rule) === 'evenodd', encodeGrad(gradOf(fs)), sh);
-        else S.fillPath(verbs, String(rule) === 'evenodd', parseColor(fs), sh);
+        if (gradOf(fs)) S.fillPathGradient(verbs, String(rule) === 'evenodd', encodeGrad(gradOf(fs)), sh, modeOf(this));
+        else S.fillPath(verbs, String(rule) === 'evenodd', parseColor(fs), sh, modeOf(this));
       },
       stroke() {
         note('stroke|' + [this.strokeStyle, this.lineWidth]);
         if (S.native) S.strokePath(verbs, Math.max(0, +this.lineWidth || 1) * tScale(),
-          parseColor(this.strokeStyle), shadowOf(this));
+          parseColor(this.strokeStyle), shadowOf(this), modeOf(this));
         else paintPath();
       },
       clip() { note('clip'); },
@@ -6180,9 +6407,6 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       createConicGradient(angle, x, y) {
         note('conicGradient|' + [angle, x, y]);
         return makeGradient(2, [+x || 0, +y || 0, 0, 0, +angle || 0, 0]);
-      },
-      getTransform() {
-        return globalThis.DOMMatrix ? new DOMMatrix() : undefined;
       },
       getContextAttributes() {
         return { alpha: ALPHA, colorSpace: CS, colorType: CT, desynchronized: DESYNC,

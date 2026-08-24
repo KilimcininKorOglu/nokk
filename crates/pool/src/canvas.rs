@@ -518,7 +518,7 @@ pub fn destroy(id: u32) {
 }
 
 /// `fillRect(x, y, w, h)` with a straight-alpha RGBA color.
-pub fn fill_rect(id: u32, x: f32, y: f32, w: f32, h: f32, rgba: [u8; 4], sh: &[f32]) {
+pub fn fill_rect(id: u32, x: f32, y: f32, w: f32, h: f32, rgba: [u8; 4], sh: &[f32], mode: u32) {
     CANVASES.with(|c| {
         if let Some(pm) = c.borrow_mut().get_mut(&id) {
             if let Some(rect) = Rect::from_xywh(x, y, w, h) {
@@ -532,6 +532,7 @@ pub fn fill_rect(id: u32, x: f32, y: f32, w: f32, h: f32, rgba: [u8; 4], sh: &[f
             let mut paint = Paint::default();
             paint.set_color_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
             paint.anti_alias = true;
+            paint.blend_mode = blend_mode(mode);
             if let Some(rect) = Rect::from_xywh(x, y, w, h) {
                 pm.fill_rect(rect, &paint, Transform::identity(), None);
             }
@@ -689,7 +690,42 @@ where
     );
 }
 
-pub fn fill_path(id: u32, verbs: &[f32], even_odd: bool, rgba: [u8; 4], sh: &[f32]) {
+/// `globalCompositeOperation` числом. Страница переключает наложение и рисует
+/// пересекающиеся круги — по цвету в пересечении её и узнают; мы наложение
+/// не читали вовсе, и поверх ложился просто последний круг.
+fn blend_mode(i: u32) -> tiny_skia::BlendMode {
+    use tiny_skia::BlendMode as B;
+    match i {
+        1 => B::SourceIn,
+        2 => B::SourceOut,
+        3 => B::SourceAtop,
+        4 => B::DestinationOver,
+        5 => B::DestinationIn,
+        6 => B::DestinationOut,
+        7 => B::DestinationAtop,
+        8 => B::Plus,
+        9 => B::Source,
+        10 => B::Xor,
+        11 => B::Multiply,
+        12 => B::Screen,
+        13 => B::Overlay,
+        14 => B::Darken,
+        15 => B::Lighten,
+        16 => B::ColorDodge,
+        17 => B::ColorBurn,
+        18 => B::HardLight,
+        19 => B::SoftLight,
+        20 => B::Difference,
+        21 => B::Exclusion,
+        22 => B::Hue,
+        23 => B::Saturation,
+        24 => B::Color,
+        25 => B::Luminosity,
+        _ => B::SourceOver,
+    }
+}
+
+pub fn fill_path(id: u32, verbs: &[f32], even_odd: bool, rgba: [u8; 4], sh: &[f32], mode: u32) {
     let Some(path) = path_from_verbs(verbs) else {
         return;
     };
@@ -705,6 +741,7 @@ pub fn fill_path(id: u32, verbs: &[f32], even_odd: bool, rgba: [u8; 4], sh: &[f3
             let mut paint = Paint::default();
             paint.set_color_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
             paint.anti_alias = true;
+            paint.blend_mode = blend_mode(mode);
             let rule = if even_odd {
                 FillRule::EvenOdd
             } else {
@@ -775,7 +812,7 @@ fn shader_from_grad(g: &[f32]) -> Option<Shader<'static>> {
 
 /// `fill()` a tessellated path with a linear/radial gradient (see
 /// [`shader_from_grad`] for the descriptor layout).
-pub fn fill_path_grad(id: u32, verbs: &[f32], even_odd: bool, grad: &[f32], sh: &[f32]) {
+pub fn fill_path_grad(id: u32, verbs: &[f32], even_odd: bool, grad: &[f32], sh: &[f32], mode: u32) {
     let Some(path) = path_from_verbs(verbs) else {
         return;
     };
@@ -796,6 +833,7 @@ pub fn fill_path_grad(id: u32, verbs: &[f32], even_odd: bool, grad: &[f32], sh: 
             let paint = Paint {
                 shader,
                 anti_alias: true,
+                blend_mode: blend_mode(mode),
                 ..Paint::default()
             };
             let rule = if even_odd {
@@ -809,7 +847,7 @@ pub fn fill_path_grad(id: u32, verbs: &[f32], even_odd: bool, grad: &[f32], sh: 
 }
 
 /// `stroke()` a tessellated path with `line_width` and a straight-alpha color.
-pub fn stroke_path(id: u32, verbs: &[f32], line_width: f32, rgba: [u8; 4], sh: &[f32]) {
+pub fn stroke_path(id: u32, verbs: &[f32], line_width: f32, rgba: [u8; 4], sh: &[f32], mode: u32) {
     let Some(path) = path_from_verbs(verbs) else {
         return;
     };
@@ -828,6 +866,7 @@ pub fn stroke_path(id: u32, verbs: &[f32], line_width: f32, rgba: [u8; 4], sh: &
             let mut paint = Paint::default();
             paint.set_color_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
             paint.anti_alias = true;
+            paint.blend_mode = blend_mode(mode);
             pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
         }
     });
@@ -1055,7 +1094,7 @@ mod tests {
     #[test]
     fn fill_then_read_is_exact() {
         create(1, 4, 4);
-        fill_rect(1, 0.0, 0.0, 4.0, 4.0, [255, 0, 0, 255], &[]);
+        fill_rect(1, 0.0, 0.0, 4.0, 4.0, [255, 0, 0, 255], &[], 0);
         let px = get_image_data(1, 0, 0, 1, 1);
         assert_eq!(px, vec![255, 0, 0, 255], "opaque red fill reads back red");
         clear_rect(1, 0.0, 0.0, 4.0, 4.0);
@@ -1086,7 +1125,7 @@ mod tests {
         create(3, 20, 20);
         // A filled triangle: (2,2) (18,2) (10,18).
         let verbs = [0.0, 2.0, 2.0, 1.0, 18.0, 2.0, 1.0, 10.0, 18.0, 4.0];
-        fill_path(3, &verbs, false, [0, 0, 255, 255], &[]);
+        fill_path(3, &verbs, false, [0, 0, 255, 255], &[], 0);
         // Center of mass ~ (10, 7) is inside; a far corner is outside.
         let inside = get_image_data(3, 10, 7, 1, 1);
         let corner = get_image_data(3, 0, 19, 1, 1);
@@ -1110,7 +1149,7 @@ mod tests {
         let verbs = [
             0.0, 0.0, 0.0, 1.0, 20.0, 0.0, 1.0, 20.0, 4.0, 1.0, 0.0, 4.0, 4.0,
         ];
-        fill_path_grad(4, &verbs, false, &grad, &[]);
+        fill_path_grad(4, &verbs, false, &grad, &[], 0);
         let left = get_image_data(4, 1, 2, 1, 1);
         let right = get_image_data(4, 18, 2, 1, 1);
         assert!(

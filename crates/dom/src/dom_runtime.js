@@ -1300,14 +1300,21 @@
       // Без атрибута ширина картинки — её собственная, та, что в файле.
       return this.tagName === 'IMG' ? this.naturalWidth : 0;
     }
-    set width(v) { this.setAttribute('width', String(Math.max(0, v | 0))); }
+    set width(v) {
+      this.setAttribute('width', String(Math.max(0, v | 0)));
+      // Смена размера холста сбрасывает состояние его контекста.
+      if (this.__ptCtxResize) this.__ptCtxResize();
+    }
     get height() {
       const v = parseInt(this.getAttribute('height'), 10);
       if (Number.isFinite(v)) return v;
       if (this.tagName === 'CANVAS') return 150;
       return this.tagName === 'IMG' ? this.naturalHeight : 0;
     }
-    set height(v) { this.setAttribute('height', String(Math.max(0, v | 0))); }
+    set height(v) {
+      this.setAttribute('height', String(Math.max(0, v | 0)));
+      if (this.__ptCtxResize) this.__ptCtxResize();
+    }
     // Собственный размер картинки: ноль, пока она не загружена, и настоящий —
     // после. У нас его не было вовсе, и всё, что меряет нарисованное, видело
     // картинку нулевого размера.
@@ -1828,7 +1835,10 @@
       Object.defineProperty(this, '__ptO', { value: { c, w: width | 0, h: height | 0 } });
     }
     get width() { return this.__ptO.w; }
-    set width(v) { this.__ptO.w = v | 0; if (this.__ptO.c) this.__ptO.c.width = v | 0; }
+    set width(v) {
+      this.__ptO.w = v | 0;
+      if (this.__ptO.c) this.__ptO.c.width = v | 0;
+    }
     get height() { return this.__ptO.h; }
     set height(v) { this.__ptO.h = v | 0; if (this.__ptO.c) this.__ptO.c.height = v | 0; }
     getContext(type, attrs) {

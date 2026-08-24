@@ -239,7 +239,7 @@ const HOOK = `(() => {
               try {
                 C[k] = function () {
                   const cv = this && this.canvas;
-                  if (cv && cv.width === 48 && cv.height === 48) {
+                  if (cv && ((cv.width === 48 && cv.height === 48) || (cv.width === 49 && cv.height === 44))) {
                     const a = [];
                     for (let i = 0; i < arguments.length; i++) {
                       const v = arguments[i];
@@ -271,7 +271,7 @@ const HOOK = `(() => {
                   get: d.get,
                   set: function (v) {
                     const cv = this && this.canvas;
-                    if (cv && cv.width === 48 && cv.height === 48) console.log('[c48] #' + globalThis.__ptCvId(cv) + ' ' + k + ' = ' + String(v).slice(0, 60));
+                    if (cv && ((cv.width === 48 && cv.height === 48) || (cv.width === 49 && cv.height === 44))) console.log('[c48] #' + globalThis.__ptCvId(cv) + ' ' + k + ' = ' + String(v).slice(0, 60));
                     return d.set.call(this, v);
                   },
                   enumerable: d.enumerable, configurable: true,
