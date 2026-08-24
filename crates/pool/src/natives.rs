@@ -73,6 +73,9 @@ pub fn install(scope: &mut v8::PinScope) {
         bind(scope, "__pt_canvasBlit", canvas_blit);
     }
 
+    // Классический скрипт страницы исполняется настоящим скриптом.
+    bind(scope, "__pt_evalScript", eval_script);
+
     // Optional real WebGL (the `webgl` feature) — a headless Mesa GL context. Their
     // presence tells the JS WebGL context to draw for real instead of stamping.
     #[cfg(feature = "webgl")]
@@ -1399,6 +1402,51 @@ fn make_realm(
         }
     }
     rv.set(global.into());
+}
+
+/// `__pt_evalScript(code, url)` — исполнить классический скрипт страницы так,
+/// как это делает браузер: настоящим скриптом со своим источником, а не через
+/// `eval`. От этого зависит вид следа вызовов: у `eval` V8 приписывает к
+/// каждому кадру «eval at <имя вызвавшей функции>», и наше внутреннее имя
+/// торчало в стеке любой страницы — метка, которую видно с первой же ошибки.
+fn eval_script(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let code = arg_string(scope, args.get(0));
+    let url = arg_string(scope, args.get(1));
+    let Some(src) = v8::String::new(scope, &code) else {
+        return;
+    };
+    let Some(name) = v8::String::new(scope, &url) else {
+        return;
+    };
+    let origin = v8::ScriptOrigin::new(
+        scope,
+        name.into(),
+        0,
+        0,
+        false,
+        0,
+        None,
+        false,
+        false,
+        false,
+        None,
+    );
+    let mut source = v8::script_compiler::Source::new(src, Some(&origin));
+    let Some(script) = v8::script_compiler::compile(
+        scope,
+        &mut source,
+        v8::script_compiler::CompileOptions::NoCompileOptions,
+        v8::script_compiler::NoCacheReason::NoReason,
+    ) else {
+        return;
+    };
+    if let Some(v) = script.run(scope) {
+        rv.set(v);
+    }
 }
 
 fn random_bytes(

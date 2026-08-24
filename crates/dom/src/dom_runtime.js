@@ -1136,8 +1136,14 @@
         __scriptOps.push({ op: 'load', id, src: '', code: String(code), module: true });
         return;
       }
-      // Indirect eval: a classic script runs in global scope, not in ours.
-      try { (0, eval)(code); } catch (e) { __pt_reportError(e, 'inline script'); }
+      // Не `eval`, а настоящий скрипт: V8 приписывает каждому кадру стека
+      // «eval at <имя вызвавшей функции>», и наше внутреннее имя торчало в
+      // следе вызовов любой страницы — метка, видная с первой же ошибки.
+      // Запасной путь остаётся на случай сборки без этого встроенного.
+      try {
+        if (typeof __pt_evalScript === 'function') __pt_evalScript(String(code), '');
+        else (0, eval)(code);
+      } catch (e) { __pt_reportError(e, 'inline script'); }
     }
 
     __ptConnectFrame() {

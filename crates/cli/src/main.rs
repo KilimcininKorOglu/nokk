@@ -555,6 +555,30 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                             
                           };
                         }
+                        // Челлендж ловит свои исключения сам и докладывает о них
+                        // на `/eb/`. Ловушка на самом рождении ошибки — самое
+                        // лёгкое, что можно поставить: конструктор, а не метод.
+                        if (!globalThis.__ptErrHook) {
+                          globalThis.__ptErrHook = 1;
+                          let shown = 0;
+                          for (const N of ['Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError']) {
+                            const C = globalThis[N];
+                            if (typeof C !== 'function') continue;
+                            const W = function (...a) {
+                              const e = new C(...a);
+                              if (shown++ < 40) {
+                                try {
+                                  console.error('[бросок] ' + N + ': ' + String(a[0]).slice(0, 120) +
+                                    ' | ' + String(e.stack || '').split('\\n').slice(1, 4).join(' <- ').slice(0, 260));
+                                } catch (x) {}
+                              }
+                              return e;
+                            };
+                            W.prototype = C.prototype;
+                            try { Object.defineProperty(W, 'name', { value: N }); } catch (x) {}
+                            try { globalThis[N] = W; } catch (x) {}
+                          }
+                        }
                         const gpu = globalThis.navigator && globalThis.navigator.gpu;
                         if (gpu && !gpu.__ptG) {
                           try { Object.defineProperty(gpu, '__ptG', { value: 1 }); } catch (e) {}
