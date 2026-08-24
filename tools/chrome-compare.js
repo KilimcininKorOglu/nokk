@@ -167,7 +167,7 @@ const HOOK = `(() => {
               at = String(new Error().stack || '').split('\\n').slice(2, 5)
                 .map((x) => x.trim().replace(/^at /, '').slice(0, 46)).join(' < ');
             } catch (e) {}
-            console.log('[enc ' + (n++) + '] ' + s.length + ' | ненулевых=' + (() => { let n = 0, sum = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { n++; sum = (sum * 31 + c) >>> 0; } } return n + ' сумма=' + sum; })() + ' коды: ' + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
+            console.log('[enc ' + (n++) + '] ' + s.length + ' | ненулевых=' + (() => { let n = 0, sum = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { n++; sum = (sum * 31 + c) >>> 0; } } return n + ' сумма=' + sum; })() + (/^\{"0":"accent-color"/.test(s) ? ' полностью: ' + s : (s.length > 14000 ? ' текст: ' + s.slice(0, 200).replace(/[^\x20-\x7e]/g, '.') : ' коды: ')) + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
           }
           return enc.call(this, x);
         }, writable: true, configurable: true });

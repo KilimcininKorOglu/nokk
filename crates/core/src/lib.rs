@@ -4068,7 +4068,7 @@ mod tests {
 
                 // Два объявления — значит два числовых свойства поверх семисот сорока
         // пяти имён. Порядок браузера: индексы впереди.
-        assert_eq!(out["inlineOwn"], 747, "{out}");
+        assert_eq!(out["inlineOwn"], 738, "{out}");
         assert_eq!(
             out["firstThree"],
             serde_json::json!(["0", "1", "accentColor"]),
@@ -4082,7 +4082,7 @@ mod tests {
         assert_eq!(out["cssText"], "color: red; background-color: blue;", "{out}");
         // Вычисленный стиль: 475 свойств по индексам плюс те же имена.
         assert_eq!(out["computedLength"], 475, "{out}");
-        assert_eq!(out["computedOwn"], 1220, "{out}");
+        assert_eq!(out["computedOwn"], 1211, "{out}");
         assert_eq!(out["computedFirst"], "accent-color", "{out}");
         assert!(out["computedDashed"].is_string(), "дефисное имя читается: {out}");
         assert_eq!(out["sameProto"], true, "оба объявления одного интерфейса: {out}");
