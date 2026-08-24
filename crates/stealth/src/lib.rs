@@ -5938,10 +5938,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const shadowOf = function (ctx) {
       const col = parseColorRaw(ctx.shadowColor);
       if (!col || !col[3]) return null;
-      const blur = Math.max(0, +ctx.shadowBlur || 0) * tScale();
+      // Ни размытие, ни снос матрица не трогает: тень живёт в координатах
+      // холста, а не страницы. Масштабируя её вместе с фигурой, мы делали
+      // размытие на масштабе 0.384 втрое уже, чем у браузера.
+      const blur = Math.max(0, +ctx.shadowBlur || 0);
       const dx = (+ctx.shadowOffsetX || 0), dy = (+ctx.shadowOffsetY || 0);
       if (blur <= 0 && dx === 0 && dy === 0) return null;
-      return [blur, tX(dx, dy) - tX(0, 0), tY(dx, dy) - tY(0, 0), col[0], col[1], col[2], col[3]];
+      return [blur, dx, dy, col[0], col[1], col[2], col[3]];
     };
     const note = (m) => { checkResize(); uniform = null; S.note(m); };
     // Холст зовёт это, когда ему меняют размер: сброс должен случиться сразу,

@@ -589,42 +589,59 @@ fn path_from_verbs(verbs: &[f32]) -> Option<tiny_skia::Path> {
 ///
 /// Гаусс приближается тремя проходами коробчатого размытия — так делает и
 /// Skia; сигма у Chrome равна половине `shadowBlur`.
-fn box_blur(data: &mut [u8], w: usize, h: usize, radius: usize) {
-    if radius == 0 || w == 0 || h == 0 {
+fn gaussian_blur(data: &mut [u8], w: usize, h: usize, sigma: f32) {
+    if sigma <= 0.0 || w == 0 || h == 0 {
         return;
     }
-    let mut tmp = vec![0u8; data.len()];
-    let win = (radius * 2 + 1) as u32;
-    // по строкам
+    // Настоящее ядро, а не три коробчатых прохода: приближение коробками
+    // давало вдвое более широкую тень, чем у браузера, и хвост уходил не туда.
+    let radius = ((sigma * 3.0).ceil() as usize).min(128);
+    let mut kernel = Vec::with_capacity(radius * 2 + 1);
+    let denom = 2.0 * sigma * sigma;
+    let mut total = 0.0f32;
+    for i in 0..=(radius * 2) {
+        let x = i as f32 - radius as f32;
+        let v = (-(x * x) / denom).exp();
+        kernel.push(v);
+        total += v;
+    }
+    for v in kernel.iter_mut() {
+        *v /= total;
+    }
+    let at = |i: isize, lo: isize, hi: isize| i.clamp(lo, hi) as usize;
+    // Промежуточный проход держим в вещественных числах: округление до байта
+    // между проходами заметно расширяет хвост тени.
+    let mut tmp = vec![0.0f32; data.len()];
     for y in 0..h {
-        for ch in 0..4 {
-            let row = y * w * 4;
-            let mut sum: u32 = 0;
-            for x in 0..=radius.min(w - 1) {
-                sum += u32::from(data[row + x * 4 + ch]);
+        let row = y * w * 4;
+        for x in 0..w {
+            let mut acc = [0.0f32; 4];
+            for (k, wgt) in kernel.iter().enumerate() {
+                let sx = at(x as isize + k as isize - radius as isize, 0, w as isize - 1);
+                let si = row + sx * 4;
+                for ch in 0..4 {
+                    acc[ch] += f32::from(data[si + ch]) * wgt;
+                }
             }
-            sum += u32::from(data[row + ch]) * radius as u32;
-            for x in 0..w {
-                tmp[row + x * 4 + ch] = (sum / win) as u8;
-                let add = data[row + (x + radius + 1).min(w - 1) * 4 + ch];
-                let sub = data[row + x.saturating_sub(radius) * 4 + ch];
-                sum = sum + u32::from(add) - u32::from(sub);
+            let di = row + x * 4;
+            for ch in 0..4 {
+                tmp[di + ch] = acc[ch];
             }
         }
     }
-    // по столбцам
     for x in 0..w {
-        for ch in 0..4 {
-            let mut sum: u32 = 0;
-            for y in 0..=radius.min(h - 1) {
-                sum += u32::from(tmp[(y * w + x) * 4 + ch]);
+        for y in 0..h {
+            let mut acc = [0.0f32; 4];
+            for (k, wgt) in kernel.iter().enumerate() {
+                let sy = at(y as isize + k as isize - radius as isize, 0, h as isize - 1);
+                let si = (sy * w + x) * 4;
+                for ch in 0..4 {
+                    acc[ch] += tmp[si + ch] * wgt;
+                }
             }
-            sum += u32::from(tmp[x * 4 + ch]) * radius as u32;
-            for y in 0..h {
-                data[(y * w + x) * 4 + ch] = (sum / win) as u8;
-                let add = tmp[((y + radius + 1).min(h - 1) * w + x) * 4 + ch];
-                let sub = tmp[(y.saturating_sub(radius) * w + x) * 4 + ch];
-                sum = sum + u32::from(add) - u32::from(sub);
+            let di = (y * w + x) * 4;
+            for ch in 0..4 {
+                data[di + ch] = acc[ch].round().clamp(0.0, 255.0) as u8;
             }
         }
     }
@@ -671,13 +688,8 @@ where
     };
     draw(&mut scratch, color);
     if blur > 0.0 {
-        // Сигма — половина заявленного размытия; коробчатый радиус под неё.
-        let sigma = blur / 2.0;
-        let r = ((sigma * 1.88).round() as usize).min(64);
-        let data = scratch.data_mut();
-        for _ in 0..3 {
-            box_blur(data, w as usize, h as usize, r);
-        }
+        // Сигма — половина заявленного размытия, как в спецификации холста.
+        gaussian_blur(scratch.data_mut(), w as usize, h as usize, blur / 2.0);
     }
     let paint = tiny_skia::PixmapPaint::default();
     pm.draw_pixmap(
