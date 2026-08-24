@@ -212,7 +212,7 @@ fn canvas_fill_rect(
         arg_usize(scope, args.get(7)) as u8,
         arg_usize(scope, args.get(8)) as u8,
     ];
-    crate::canvas::fill_rect(id, x, y, w, h, rgba);
+    crate::canvas::fill_rect(id, x, y, w, h, rgba, &arg_f32s(args.get(9)));
 }
 
 /// `__pt_canvasClearRect(id, x, y, w, h)`
@@ -254,7 +254,8 @@ fn canvas_fill_text(
     let families = arg_string(scope, args.get(9));
     let bold = args.get(10).boolean_value(scope);
     let italic = args.get(11).boolean_value(scope);
-    crate::canvas::fill_text(id, &text, x, y, size, rgba, &families, bold, italic);
+    crate::canvas::fill_text(id, &text, x, y, size, rgba, &families, bold, italic,
+        &arg_f32s(args.get(12)));
 }
 
 /// `__pt_canvasMeasureText(text, size)` → advance width in CSS px (a number).
@@ -306,7 +307,7 @@ fn canvas_fill_path(
         arg_usize(scope, args.get(5)) as u8,
         arg_usize(scope, args.get(6)) as u8,
     ];
-    crate::canvas::fill_path(id, &verbs, even_odd, rgba);
+    crate::canvas::fill_path(id, &verbs, even_odd, rgba, &arg_f32s(args.get(7)));
 }
 
 /// `__pt_canvasFillPathGradient(id, verbsF32, evenOdd, gradF32)` — gradient fill.
@@ -320,10 +321,10 @@ fn canvas_fill_path_gradient(
     let verbs = arg_f32s(args.get(1));
     let even_odd = arg_usize(scope, args.get(2)) != 0;
     let grad = arg_f32s(args.get(3));
-    crate::canvas::fill_path_grad(id, &verbs, even_odd, &grad);
+    crate::canvas::fill_path_grad(id, &verbs, even_odd, &grad, &arg_f32s(args.get(4)));
 }
 
-/// `__pt_canvasStrokePath(id, verbsF32, lineWidth, r, g, b, a)` — stroke a path.
+/// `__pt_canvasStrokePath(id, verbsF32, lineWidth, r, g, b, a, shadowF32)` — stroke a path.
 #[cfg(feature = "render")]
 fn canvas_stroke_path(
     scope: &mut v8::PinScope,
@@ -339,7 +340,7 @@ fn canvas_stroke_path(
         arg_usize(scope, args.get(5)) as u8,
         arg_usize(scope, args.get(6)) as u8,
     ];
-    crate::canvas::stroke_path(id, &verbs, line_width, rgba);
+    crate::canvas::stroke_path(id, &verbs, line_width, rgba, &arg_f32s(args.get(7)));
 }
 
 /// `__pt_canvasPutImageData(id, x, y, w, h, data)` — overwrite from straight-alpha RGBA.

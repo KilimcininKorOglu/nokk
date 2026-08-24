@@ -216,6 +216,17 @@ const HOOK = `(() => {
               return r;
             };
           }
+          const CG = globalThis.CanvasGradient && globalThis.CanvasGradient.prototype;
+          if (CG && CG.addColorStop && !CG.__ptS) {
+            try { Object.defineProperty(CG, '__ptS', { value: 1 }); } catch (e) {}
+            const acs = CG.addColorStop;
+            CG.addColorStop = function (o, c) { console.log('[stop] ' + o + ' ' + c); return acs.apply(this, arguments); };
+          }
+          if (!globalThis.__ptCvId) {
+            const map = new WeakMap(); let seq = 0;
+            globalThis.__ptCvId = (cv) => { if (!cv) return '?';
+              if (!map.has(cv)) map.set(cv, ++seq); return map.get(cv); };
+          }
           for (const N of ['CanvasRenderingContext2D', 'OffscreenCanvasRenderingContext2D']) {
             const C = globalThis[N] && globalThis[N].prototype;
             if (!C || C.__ptAll) continue;
@@ -228,9 +239,9 @@ const HOOK = `(() => {
               try {
                 C[k] = function () {
                   const cv = this && this.canvas;
-                  if (cv && (globalThis.__ptN = (globalThis.__ptN || 0) + 1) < 600) {
+                  if (cv && cv.width === 48 && cv.height === 48) {
                     const a = [];
-                    for (let i = 0; i < Math.min(arguments.length, 6); i++) {
+                    for (let i = 0; i < arguments.length; i++) {
                       const v = arguments[i];
                       if (v && typeof v === 'object') {
                         a.push((v.localName || (v.constructor && v.constructor.name) || 'об') +
@@ -238,7 +249,7 @@ const HOOK = `(() => {
                           (typeof v.src === 'string' ? ' src=' + v.src.slice(0, 46) : ''));
                       } else a.push(String(v).slice(0, 40));
                     }
-                    console.log('[c48] ' + cv.width + ' ' + k + '(' + a.join(',') + ')' +
+                    console.log('[c48] #' + globalThis.__ptCvId(cv) + ' ' + cv.width + ' ' + k + '(' + a.join(',') + ')' +
                       (cv.width !== 2 ? '' : (() => { try { const r = f.apply(this, arguments);
                         return ' -> ' + (r && typeof r === 'object' ? (r.data
                           ? Object.prototype.toString.call(r.data) + '[' + [].slice.call(r.data).join(',') + '] ' + r.colorSpace + '/' + r.pixelFormat
@@ -248,7 +259,11 @@ const HOOK = `(() => {
                 };
               } catch (e) {}
             }
-            for (const k of ['fillStyle', 'font', 'globalAlpha', 'globalCompositeOperation', 'strokeStyle']) {
+            for (const k of ['fillStyle', 'font', 'globalAlpha', 'globalCompositeOperation', 'strokeStyle',
+              'lineWidth', 'lineCap', 'lineJoin', 'miterLimit', 'lineDashOffset', 'shadowBlur',
+              'shadowColor', 'shadowOffsetX', 'shadowOffsetY', 'filter', 'textAlign', 'textBaseline',
+              'imageSmoothingEnabled', 'imageSmoothingQuality', 'letterSpacing', 'wordSpacing',
+              'direction', 'fontKerning', 'fontStretch', 'fontVariantCaps', 'textRendering']) {
               const d = Object.getOwnPropertyDescriptor(C, k);
               if (!d || !d.set) continue;
               try {
@@ -256,7 +271,7 @@ const HOOK = `(() => {
                   get: d.get,
                   set: function (v) {
                     const cv = this && this.canvas;
-                    if (cv) console.log('[c48] ' + k + ' = ' + String(v).slice(0, 60));
+                    if (cv && cv.width === 48 && cv.height === 48) console.log('[c48] #' + globalThis.__ptCvId(cv) + ' ' + k + ' = ' + String(v).slice(0, 60));
                     return d.set.call(this, v);
                   },
                   enumerable: d.enumerable, configurable: true,
@@ -280,7 +295,7 @@ const HOOK = `(() => {
                     ' холст=' + JSON.stringify(this.getContextAttributes ? this.getContextAttributes() : null);
                 } catch (e) { show = ' -> ' + e.name; }
               }
-              console.log('[gid] ' + w + 'x' + h + ' на ' + (this.canvas ? this.canvas.width + 'x' + this.canvas.height : '?') + show);
+              console.log('[gid] #' + globalThis.__ptCvId(this.canvas) + ' ' + w + 'x' + h + ' на ' + (this.canvas ? this.canvas.width + 'x' + this.canvas.height : '?') + show);
               return r;
             };
           }
@@ -383,7 +398,7 @@ const HOOK = `(() => {
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[parts|^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
+      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[parts|^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
         lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
     }
     if (m.method === 'Target.attachedToTarget') {

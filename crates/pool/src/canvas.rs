@@ -518,9 +518,17 @@ pub fn destroy(id: u32) {
 }
 
 /// `fillRect(x, y, w, h)` with a straight-alpha RGBA color.
-pub fn fill_rect(id: u32, x: f32, y: f32, w: f32, h: f32, rgba: [u8; 4]) {
+pub fn fill_rect(id: u32, x: f32, y: f32, w: f32, h: f32, rgba: [u8; 4], sh: &[f32]) {
     CANVASES.with(|c| {
         if let Some(pm) = c.borrow_mut().get_mut(&id) {
+            if let Some(rect) = Rect::from_xywh(x, y, w, h) {
+                paint_shadow(pm, sh, |sp, col| {
+                    let mut p2 = Paint::default();
+                    p2.set_color_rgba8(col[0], col[1], col[2], col[3]);
+                    p2.anti_alias = true;
+                    sp.fill_rect(rect, &p2, Transform::identity(), None);
+                });
+            }
             let mut paint = Paint::default();
             paint.set_color_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
             paint.anti_alias = true;
@@ -573,12 +581,127 @@ fn path_from_verbs(verbs: &[f32]) -> Option<tiny_skia::Path> {
 
 /// `fill()` a tessellated path with a straight-alpha RGBA color. `even_odd`
 /// selects the fill rule (canvas `'evenodd'` vs default nonzero winding).
-pub fn fill_path(id: u32, verbs: &[f32], even_odd: bool, rgba: [u8; 4]) {
+/// Тень холста. Браузер рисует её так: та же фигура, залитая цветом тени,
+/// размытая по Гауссу и сдвинутая, — а поверх уже сама фигура. Без этого
+/// отпечаток холста теряет почти всю краску: размытая тень покрывает весь
+/// холст слабой альфой, и в отчёте это тысячи ненулевых байт.
+///
+/// Гаусс приближается тремя проходами коробчатого размытия — так делает и
+/// Skia; сигма у Chrome равна половине `shadowBlur`.
+fn box_blur(data: &mut [u8], w: usize, h: usize, radius: usize) {
+    if radius == 0 || w == 0 || h == 0 {
+        return;
+    }
+    let mut tmp = vec![0u8; data.len()];
+    let win = (radius * 2 + 1) as u32;
+    // по строкам
+    for y in 0..h {
+        for ch in 0..4 {
+            let row = y * w * 4;
+            let mut sum: u32 = 0;
+            for x in 0..=radius.min(w - 1) {
+                sum += u32::from(data[row + x * 4 + ch]);
+            }
+            sum += u32::from(data[row + ch]) * radius as u32;
+            for x in 0..w {
+                tmp[row + x * 4 + ch] = (sum / win) as u8;
+                let add = data[row + (x + radius + 1).min(w - 1) * 4 + ch];
+                let sub = data[row + x.saturating_sub(radius) * 4 + ch];
+                sum = sum + u32::from(add) - u32::from(sub);
+            }
+        }
+    }
+    // по столбцам
+    for x in 0..w {
+        for ch in 0..4 {
+            let mut sum: u32 = 0;
+            for y in 0..=radius.min(h - 1) {
+                sum += u32::from(tmp[(y * w + x) * 4 + ch]);
+            }
+            sum += u32::from(tmp[x * 4 + ch]) * radius as u32;
+            for y in 0..h {
+                data[(y * w + x) * 4 + ch] = (sum / win) as u8;
+                let add = tmp[((y + radius + 1).min(h - 1) * w + x) * 4 + ch];
+                let sub = tmp[(y.saturating_sub(radius) * w + x) * 4 + ch];
+                sum = sum + u32::from(add) - u32::from(sub);
+            }
+        }
+    }
+}
+
+/// `[blur, dx, dy, r, g, b, a]` — пусто, когда тени нет.
+fn shadow_of(sh: &[f32]) -> Option<(f32, f32, f32, [u8; 4])> {
+    if sh.len() < 7 {
+        return None;
+    }
+    let a = sh[6].round().clamp(0.0, 255.0) as u8;
+    if a == 0 {
+        return None;
+    }
+    let (blur, dx, dy) = (sh[0].max(0.0), sh[1], sh[2]);
+    if blur <= 0.0 && dx == 0.0 && dy == 0.0 {
+        return None;
+    }
+    Some((
+        blur,
+        dx,
+        dy,
+        [
+            sh[3].round().clamp(0.0, 255.0) as u8,
+            sh[4].round().clamp(0.0, 255.0) as u8,
+            sh[5].round().clamp(0.0, 255.0) as u8,
+            a,
+        ],
+    ))
+}
+
+/// Нарисовать тень фигуры: `draw` кладёт фигуру цветом тени на чистый холст
+/// того же размера, дальше размытие и снос.
+fn paint_shadow<F>(pm: &mut tiny_skia::Pixmap, sh: &[f32], draw: F)
+where
+    F: FnOnce(&mut tiny_skia::Pixmap, [u8; 4]),
+{
+    let Some((blur, dx, dy, color)) = shadow_of(sh) else {
+        return;
+    };
+    let (w, h) = (pm.width(), pm.height());
+    let Some(mut scratch) = tiny_skia::Pixmap::new(w, h) else {
+        return;
+    };
+    draw(&mut scratch, color);
+    if blur > 0.0 {
+        // Сигма — половина заявленного размытия; коробчатый радиус под неё.
+        let sigma = blur / 2.0;
+        let r = ((sigma * 1.88).round() as usize).min(64);
+        let data = scratch.data_mut();
+        for _ in 0..3 {
+            box_blur(data, w as usize, h as usize, r);
+        }
+    }
+    let paint = tiny_skia::PixmapPaint::default();
+    pm.draw_pixmap(
+        dx.round() as i32,
+        dy.round() as i32,
+        scratch.as_ref(),
+        &paint,
+        Transform::identity(),
+        None,
+    );
+}
+
+pub fn fill_path(id: u32, verbs: &[f32], even_odd: bool, rgba: [u8; 4], sh: &[f32]) {
     let Some(path) = path_from_verbs(verbs) else {
         return;
     };
     CANVASES.with(|c| {
         if let Some(pm) = c.borrow_mut().get_mut(&id) {
+            let rule0 = if even_odd { FillRule::EvenOdd } else { FillRule::Winding };
+            paint_shadow(pm, sh, |sp, col| {
+                let mut p2 = Paint::default();
+                p2.set_color_rgba8(col[0], col[1], col[2], col[3]);
+                p2.anti_alias = true;
+                sp.fill_path(&path, &p2, rule0, Transform::identity(), None);
+            });
             let mut paint = Paint::default();
             paint.set_color_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
             paint.anti_alias = true;
@@ -652,7 +775,7 @@ fn shader_from_grad(g: &[f32]) -> Option<Shader<'static>> {
 
 /// `fill()` a tessellated path with a linear/radial gradient (see
 /// [`shader_from_grad`] for the descriptor layout).
-pub fn fill_path_grad(id: u32, verbs: &[f32], even_odd: bool, grad: &[f32]) {
+pub fn fill_path_grad(id: u32, verbs: &[f32], even_odd: bool, grad: &[f32], sh: &[f32]) {
     let Some(path) = path_from_verbs(verbs) else {
         return;
     };
@@ -661,6 +784,15 @@ pub fn fill_path_grad(id: u32, verbs: &[f32], even_odd: bool, grad: &[f32]) {
     };
     CANVASES.with(|c| {
         if let Some(pm) = c.borrow_mut().get_mut(&id) {
+            // Тень у градиентной заливки — сплошная, цветом тени: браузер
+            // размывает силуэт фигуры, а не её раскраску.
+            let rule0 = if even_odd { FillRule::EvenOdd } else { FillRule::Winding };
+            paint_shadow(pm, sh, |sp, col| {
+                let mut p2 = Paint::default();
+                p2.set_color_rgba8(col[0], col[1], col[2], col[3]);
+                p2.anti_alias = true;
+                sp.fill_path(&path, &p2, rule0, Transform::identity(), None);
+            });
             let paint = Paint {
                 shader,
                 anti_alias: true,
@@ -677,19 +809,25 @@ pub fn fill_path_grad(id: u32, verbs: &[f32], even_odd: bool, grad: &[f32]) {
 }
 
 /// `stroke()` a tessellated path with `line_width` and a straight-alpha color.
-pub fn stroke_path(id: u32, verbs: &[f32], line_width: f32, rgba: [u8; 4]) {
+pub fn stroke_path(id: u32, verbs: &[f32], line_width: f32, rgba: [u8; 4], sh: &[f32]) {
     let Some(path) = path_from_verbs(verbs) else {
         return;
     };
     CANVASES.with(|c| {
         if let Some(pm) = c.borrow_mut().get_mut(&id) {
-            let mut paint = Paint::default();
-            paint.set_color_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
-            paint.anti_alias = true;
             let stroke = Stroke {
                 width: line_width.max(0.0),
                 ..Stroke::default()
             };
+            paint_shadow(pm, sh, |sp, col| {
+                let mut p2 = Paint::default();
+                p2.set_color_rgba8(col[0], col[1], col[2], col[3]);
+                p2.anti_alias = true;
+                sp.stroke_path(&path, &p2, &stroke, Transform::identity(), None);
+            });
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
+            paint.anti_alias = true;
             pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
         }
     });
@@ -731,6 +869,7 @@ pub fn fill_text(
     families: &str,
     bold: bool,
     italic: bool,
+    sh: &[f32],
 ) {
     if size_px <= 0.0 || text.is_empty() {
         return;
@@ -743,9 +882,10 @@ pub fn fill_text(
         let Some(pm) = map.get_mut(&id) else {
             return;
         };
-        let (pw, ph) = (pm.width() as i32, pm.height() as i32);
-        let data = pm.data_mut();
-        {
+        // Тень у надписи — те же глифы цветом тени, размытые и снесённые.
+        // Челлендж рисует текст именно с тенью, и без неё пропадает не только
+        // размытое пятно, но и почти всё покрытие холста.
+        let glyphs = |target: &mut [u8], tw: i32, th: i32, colour: [u8; 4]| {
             let scale = px_scale(font, size_px);
             let scaled = font.as_scaled(scale);
             let mut caret = x;
@@ -757,14 +897,23 @@ pub fn fill_text(
                     og.draw(|gx, gy, coverage| {
                         let px = bb.min.x as i32 + gx as i32;
                         let py = bb.min.y as i32 + gy as i32;
-                        if px < 0 || py < 0 || px >= pw || py >= ph {
+                        if px < 0 || py < 0 || px >= tw || py >= th {
                             return;
                         }
-                        blend_over(data, ((py * pw + px) * 4) as usize, rgba, coverage);
+                        blend_over(target, ((py * tw + px) * 4) as usize, colour, coverage);
                     });
                 }
                 caret += scaled.h_advance(gid);
             }
+        };
+        paint_shadow(pm, sh, |sp, col| {
+            let (sw, shh) = (sp.width() as i32, sp.height() as i32);
+            glyphs(sp.data_mut(), sw, shh, col);
+        });
+        let (pw, ph) = (pm.width() as i32, pm.height() as i32);
+        let data = pm.data_mut();
+        {
+            glyphs(data, pw, ph, rgba);
         }
     });
 }
@@ -906,7 +1055,7 @@ mod tests {
     #[test]
     fn fill_then_read_is_exact() {
         create(1, 4, 4);
-        fill_rect(1, 0.0, 0.0, 4.0, 4.0, [255, 0, 0, 255]);
+        fill_rect(1, 0.0, 0.0, 4.0, 4.0, [255, 0, 0, 255], &[]);
         let px = get_image_data(1, 0, 0, 1, 1);
         assert_eq!(px, vec![255, 0, 0, 255], "opaque red fill reads back red");
         clear_rect(1, 0.0, 0.0, 4.0, 4.0);
@@ -922,7 +1071,7 @@ mod tests {
     fn fill_text_draws_real_glyph_pixels() {
         create(2, 40, 40);
         // Baseline near the bottom so a 24px 'H' lands inside the surface.
-        fill_text(2, "H", 4.0, 30.0, 24.0, [0, 0, 0, 255], "sans-serif", false, false);
+        fill_text(2, "H", 4.0, 30.0, 24.0, [0, 0, 0, 255], "sans-serif", false, false, &[]);
         let px = get_image_data(2, 0, 0, 40, 40);
         let opaque = px.chunks_exact(4).filter(|p| p[3] > 0).count();
         assert!(
@@ -937,7 +1086,7 @@ mod tests {
         create(3, 20, 20);
         // A filled triangle: (2,2) (18,2) (10,18).
         let verbs = [0.0, 2.0, 2.0, 1.0, 18.0, 2.0, 1.0, 10.0, 18.0, 4.0];
-        fill_path(3, &verbs, false, [0, 0, 255, 255]);
+        fill_path(3, &verbs, false, [0, 0, 255, 255], &[]);
         // Center of mass ~ (10, 7) is inside; a far corner is outside.
         let inside = get_image_data(3, 10, 7, 1, 1);
         let corner = get_image_data(3, 0, 19, 1, 1);
@@ -961,7 +1110,7 @@ mod tests {
         let verbs = [
             0.0, 0.0, 0.0, 1.0, 20.0, 0.0, 1.0, 20.0, 4.0, 1.0, 0.0, 4.0, 4.0,
         ];
-        fill_path_grad(4, &verbs, false, &grad);
+        fill_path_grad(4, &verbs, false, &grad, &[]);
         let left = get_image_data(4, 1, 2, 1, 1);
         let right = get_image_data(4, 18, 2, 1, 1);
         assert!(

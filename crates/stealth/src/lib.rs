@@ -5414,16 +5414,17 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       solid(x, y, w, h, rgba) {
         sync();
         if ((rgba[3] | 0) === 0) __pt_canvasClearRect(id, x, y, w, h);
-        else __pt_canvasFillRect(id, x, y, w, h, rgba[0], rgba[1], rgba[2], rgba[3]);
+        else __pt_canvasFillRect(id, x, y, w, h, rgba[0], rgba[1], rgba[2], rgba[3],
+          new Float32Array(arguments[5] || []));
       },
       // Real glyphs. `y` is the alphabetic baseline, matching canvas semantics.
-      text(t, x, y, size, rgba, fam, b, i) { sync(); __pt_canvasFillText(id, String(t), x, y, size, rgba[0], rgba[1], rgba[2], rgba[3], fam || '', !!b, !!i); },
+      text(t, x, y, size, rgba, fam, b, i, sh) { sync(); __pt_canvasFillText(id, String(t), x, y, size, rgba[0], rgba[1], rgba[2], rgba[3], fam || '', !!b, !!i, new Float32Array(sh || [])); },
       width(t, size, fam, b, i) { return __pt_canvasMeasureText(String(t), size, fam || '', !!b, !!i); },
       // Real vector paths: JS tessellates curves/arcs to a move/line/close verb
       // stream, tiny-skia fills or strokes it.
-      fillPath(verbs, evenOdd, rgba) { sync(); __pt_canvasFillPath(id, new Float32Array(verbs), evenOdd ? 1 : 0, rgba[0], rgba[1], rgba[2], rgba[3]); },
-      fillPathGradient(verbs, evenOdd, grad) { sync(); __pt_canvasFillPathGradient(id, new Float32Array(verbs), evenOdd ? 1 : 0, new Float32Array(grad)); },
-      strokePath(verbs, lw, rgba) { sync(); __pt_canvasStrokePath(id, new Float32Array(verbs), lw, rgba[0], rgba[1], rgba[2], rgba[3]); },
+      fillPath(verbs, evenOdd, rgba, sh) { sync(); __pt_canvasFillPath(id, new Float32Array(verbs), evenOdd ? 1 : 0, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(sh || [])); },
+      fillPathGradient(verbs, evenOdd, grad, sh) { sync(); __pt_canvasFillPathGradient(id, new Float32Array(verbs), evenOdd ? 1 : 0, new Float32Array(grad), new Float32Array(sh || [])); },
+      strokePath(verbs, lw, rgba, sh) { sync(); __pt_canvasStrokePath(id, new Float32Array(verbs), lw, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(sh || [])); },
       // Images we still can't rasterize: a deterministic semi-transparent fill
       // keyed by the op-log, so the drawing still influences the pixels stably.
       stamp(x, y, w, h) {
@@ -5710,6 +5711,16 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // пересчёт между пространствами их даёт. Любое другое рисование эту
     // запись отменяет — тогда пиксели читаются с поверхности, как обычно.
     let uniform = null;
+    // Тень рисуется, когда её цвет непрозрачен и есть размытие или снос —
+    // ровно как в браузере. Описание: [размытие, сносX, сносY, r, g, b, a].
+    const shadowOf = function (ctx) {
+      const col = parseColorRaw(ctx.shadowColor);
+      if (!col || !col[3]) return null;
+      const blur = Math.max(0, +ctx.shadowBlur || 0) * tScale();
+      const dx = (+ctx.shadowOffsetX || 0), dy = (+ctx.shadowOffsetY || 0);
+      if (blur <= 0 && dx === 0 && dy === 0) return null;
+      return [blur, tX(dx, dy) - tX(0, 0), tY(dx, dy) - tY(0, 0), col[0], col[1], col[2], col[3]];
+    };
     const note = (m) => { uniform = null; S.note(m); };
     const solid = S.solid, stamp = S.stamp;
     let bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;     // current path bounding box
@@ -5807,7 +5818,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // масштабом — глифы движок кладёт по горизонтали.
       if (S.native) {
         S.text(t, tX(ox, oy), tY(ox, oy), size * tScale(), rgba,
-          fontFamily(this.font), fontBold(this.font), fontItalic(this.font));
+          fontFamily(this.font), fontBold(this.font), fontItalic(this.font), shadowOf(this));
       } else stamp(tX(ox, oy), tY(ox, oy) - size, w, size * 1.3);
     };
 
@@ -5883,8 +5894,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       fillRect(x, y, w, h) {
         note('fillRect|' + [x, y, w, h, this.fillStyle]);
         const fs = this.fillStyle;
-        if (S.native && gradOf(fs)) S.fillPathGradient(rectVerbs(x, y, w, h), false, encodeGrad(gradOf(fs)));
-        else if (S.native && !plain()) S.fillPath(rectVerbs(x, y, w, h), false, parseColor(fs));
+        const sh = shadowOf(this);
+        if (S.native && gradOf(fs)) S.fillPathGradient(rectVerbs(x, y, w, h), false, encodeGrad(gradOf(fs)), sh);
+        else if (S.native && (!plain() || sh)) S.fillPath(rectVerbs(x, y, w, h), false, parseColor(fs), sh);
         else solid(x, y, w, h, parseColor(fs));
         if (!gradOf(fs) && plain() && (+x || 0) <= 0 && (+y || 0) <= 0 &&
             (+w || 0) >= (canvas.width | 0) && (+h || 0) >= (canvas.height | 0)) {
@@ -5905,7 +5917,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const X = +x || 0, Y = +y || 0, W2 = +w || 0, H2 = +h || 0;
         if (S.native) {
           S.strokePath(rectVerbs(X, Y, W2, H2),
-            Math.max(0, +this.lineWidth || 1) * tScale(), parseColor(this.strokeStyle));
+            Math.max(0, +this.lineWidth || 1) * tScale(), parseColor(this.strokeStyle), shadowOf(this));
           return;
         }
         const lw = Math.max(1, this.lineWidth | 0);
@@ -5950,12 +5962,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         note('fill|' + this.fillStyle);
         if (!S.native) return paintPath();
         const fs = this.fillStyle;
-        if (gradOf(fs)) S.fillPathGradient(verbs, String(rule) === 'evenodd', encodeGrad(gradOf(fs)));
-        else S.fillPath(verbs, String(rule) === 'evenodd', parseColor(fs));
+        const sh = shadowOf(this);
+        if (gradOf(fs)) S.fillPathGradient(verbs, String(rule) === 'evenodd', encodeGrad(gradOf(fs)), sh);
+        else S.fillPath(verbs, String(rule) === 'evenodd', parseColor(fs), sh);
       },
       stroke() {
         note('stroke|' + [this.strokeStyle, this.lineWidth]);
-        if (S.native) S.strokePath(verbs, Math.max(0, +this.lineWidth || 1) * tScale(), parseColor(this.strokeStyle));
+        if (S.native) S.strokePath(verbs, Math.max(0, +this.lineWidth || 1) * tScale(),
+          parseColor(this.strokeStyle), shadowOf(this));
         else paintPath();
       },
       clip() { note('clip'); },
