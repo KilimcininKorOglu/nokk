@@ -168,6 +168,10 @@ const HOOK = `(() => {
                 .map((x) => x.trim().replace(/^at /, '').slice(0, 46)).join(' < ');
             } catch (e) {}
             console.log('[enc ' + (n++) + '] ' + s.length + ' | ненулевых=' + (() => { let n = 0, sum = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { n++; sum = (sum * 31 + c) >>> 0; } } return n + ' сумма=' + sum; })() + (s.length > 14000 ? ' текст: ' + s.slice(0, 90).replace(/[^\x20-\x7e]/g, '.') : ' коды: ') + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
+if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__ptD || {})[s.length]) {
+  globalThis.__ptD[s.length] = 1;
+  for (let q = 0; q < s.length; q += 250) console.log('[кус ' + s.length + ':' + (q / 300) + '] ' + s.slice(q, q + 300));
+}
           }
           return enc.call(this, x);
         }, writable: true, configurable: true });
@@ -431,7 +435,7 @@ const HOOK = `(() => {
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[parts|^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
+      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[parts|^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
         lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
     }
     if (m.method === 'Target.attachedToTarget') {

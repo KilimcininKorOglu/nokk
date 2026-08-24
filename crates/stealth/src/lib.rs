@@ -7815,11 +7815,17 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       const thr = comp ? Math.pow(10, (comp.threshold.value || -24) / 20) : 1;
       const ratio = comp ? (comp.ratio.value || 12) : 1;
       let data = new Float32Array(len);
+      // Фаза не считается заново из номера отсчёта, а накапливается: браузер
+      // прибавляет шаг, посчитанный в одинарной точности, к двойному счётчику
+      // и оттого понемногу уходит от точного синуса. Разница видна в шестом
+      // знаке — и это ровно то, чем звуковой отпечаток отличает движки.
+      const tsize = oscTables(type, this.sampleRate).size;
+      const incr = Math.fround(Math.fround(freq) * Math.fround(tsize / this.sampleRate));
+      let idx = 0;
       for (let i = 0; i < len; i++) {
-        const t = i / this.sampleRate;
-        // Осциллятор звучит в полную амплитуду: половина здесь была ошибкой,
-        // и синус из-за неё расходился с браузером ровно вдвое.
-        data[i] = oscWaveAt(type, freq * t, freq, this.sampleRate) * amp;
+        data[i] = oscWaveAt(type, idx / tsize, freq, this.sampleRate) * amp;
+        idx += incr;
+        idx -= Math.floor(idx / tsize) * tsize;
       }
       if (comp) {
         data = compressorKernel(data, this.sampleRate, {
