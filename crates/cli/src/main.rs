@@ -481,13 +481,13 @@ async fn main() -> Result<()> {
                         if (!enc || enc.__ptWrapped) return !!enc;
                         const wrapped = function (x) {
                           const s = String(x == null ? '' : x);
-                          if (s.length > 200) {
+                          if (s.length > 30 && (globalThis.__encN = (globalThis.__encN || 0) + 1) < 70) {
                             let at = '';
                             try {
                               at = String(new Error().stack || '').split('\n').slice(2, 5)
                                 .map((x) => x.trim().replace(/^at /, '').slice(0, 46)).join(' < ');
                             } catch (e) {}
-                            console.error('[enc ' + (en++) + '] ' + Math.round(performance.now()) + 'мс ' + s.length + ' | ненулевых=' + (() => { let n = 0, sum = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { n++; sum = (sum * 31 + c) >>> 0; } } return n + ' сумма=' + sum; })() + (s.length > 14000 ? ' текст: ' + s.slice(0, 90).replace(/[^\x20-\x7e]/g, '.') : ' коды: ') + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
+                            console.error('[enc ' + (en++) + '] ' + Math.round(performance.now()) + 'мс ' + s.length + ' | ненулевых=' + (() => { let n = 0, sum = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { n++; sum = (sum * 31 + c) >>> 0; } } return n + ' сумма=' + sum; })() + (s.length < 2000 || s.length > 14000 ? ' текст: ' + s.slice(0, 400).replace(/[^\x20-\x7e]/g, '.') : ' коды: ') + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
 if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__ptD || {})[s.length]) {
   globalThis.__ptD[s.length] = 1;
   for (let q = 0; q < s.length; q += 250) console.error('[кус ' + s.length + ':' + (q / 300) + '] ' + s.slice(q, q + 300));

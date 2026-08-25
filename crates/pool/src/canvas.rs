@@ -46,7 +46,11 @@ const FAMILIES: &[(&str, &[&str])] = &[
     ("arial", &["LiberationSans-Regular.ttf", "Arimo-Regular.ttf"]),
     ("helvetica", &["LiberationSans-Regular.ttf", "Arimo-Regular.ttf"]),
     ("liberation sans", &["LiberationSans-Regular.ttf"]),
-    ("serif", &["DejaVuSerif.ttf", "LiberationSerif-Regular.ttf"]),
+    // Родовой `serif` браузер на этой машине разрешает в Liberation Serif, а не
+    // в DejaVu: измерено — «mmmmmmmmmmlli» на 72 пикселях даёт у него 620.05, а
+    // у DejaVu 751.82. Двадцать процентов разницы видит любая страница, меряющая
+    // текст, и это была единственная родовая семья, где мы расходились.
+    ("serif", &["LiberationSerif-Regular.ttf", "Tinos-Regular.ttf", "DejaVuSerif.ttf"]),
     ("times new roman", &["LiberationSerif-Regular.ttf", "Tinos-Regular.ttf"]),
     ("times", &["LiberationSerif-Regular.ttf", "Tinos-Regular.ttf"]),
     ("liberation serif", &["LiberationSerif-Regular.ttf"]),
@@ -213,6 +217,63 @@ fn face(file: &str, bold: bool, italic: bool) -> Option<&'static FontVec> {
         }
     }
     load(file)
+}
+
+/// Все семейства списка по порядку — для поглифной подмены.
+///
+/// Браузер берёт знак из первого семейства, где он есть, а не из первого
+/// семейства вообще: шрифт вроде «Noto Color Emoji» латиницы не содержит, и
+/// строка на нём меряется запасным. Мы мерили самим найденным шрифтом, и
+/// страница, перебирающая шрифты измерением, видела найденными и те, которых
+/// у неё быть не может.
+fn resolve_chain(families: &str, bold: bool, italic: bool) -> Vec<&'static FontVec> {
+    let mut out: Vec<&'static FontVec> = Vec::new();
+    let mut push = |f: &'static FontVec| {
+        if !out.iter().any(|g| std::ptr::eq(*g, f)) {
+            out.push(f);
+        }
+    };
+    for raw in families.split(',') {
+        let name = raw.trim().trim_matches(['"', '\'']).to_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        if let Some((_, files)) = FAMILIES.iter().find(|(f, _)| *f == name) {
+            for file in *files {
+                if let Some(f) = face(file, bold, italic) {
+                    push(f);
+                    break;
+                }
+            }
+            continue;
+        }
+        if let Some((path, _)) = font_index().get(&name) {
+            if let Some(file) = path.file_name().and_then(|n| n.to_str()) {
+                if let Some(f) = face(file, bold, italic) {
+                    push(f);
+                }
+            }
+        }
+    }
+    if let Some(f) = FAMILIES
+        .iter()
+        .find(|(f, _)| *f == FALLBACK_FAMILY)
+        .and_then(|(_, files)| files.iter().find_map(|f| face(f, bold, italic)))
+        .or_else(bundled)
+    {
+        push(f);
+    }
+    out
+}
+
+/// Шрифт, которым рисуется этот знак: первый в цепочке, где он есть.
+fn face_for(chain: &[&'static FontVec], ch: char) -> &'static FontVec {
+    for f in chain {
+        if f.glyph_id(ch).0 != 0 {
+            return f;
+        }
+    }
+    chain[0]
 }
 
 fn resolve(families: &str, bold: bool, italic: bool) -> Option<&'static FontVec> {
@@ -925,9 +986,11 @@ pub fn fill_text(
     if size_px <= 0.0 || text.is_empty() {
         return;
     }
-    let Some(font) = resolve(families, bold, italic) else {
+    let chain = resolve_chain(families, bold, italic);
+    if chain.is_empty() {
         return;
-    };
+    }
+    let font = chain[0];
     CANVASES.with(|c| {
         let mut map = c.borrow_mut();
         let Some(pm) = map.get_mut(&id) else {
@@ -941,9 +1004,11 @@ pub fn fill_text(
             let scaled = font.as_scaled(scale);
             let mut caret = x;
             for ch in text.chars() {
-                let gid = font.glyph_id(ch);
-                let glyph = gid.with_scale_and_position(scale, ab_glyph::point(caret, y));
-                if let Some(og) = font.outline_glyph(glyph) {
+                let cf = face_for(&chain, ch);
+                let cscale = px_scale(cf, size_px);
+                let gid = cf.glyph_id(ch);
+                let glyph = gid.with_scale_and_position(cscale, ab_glyph::point(caret, y));
+                if let Some(og) = cf.outline_glyph(glyph) {
                     let bb = og.px_bounds();
                     og.draw(|gx, gy, coverage| {
                         let px = bb.min.x as i32 + gx as i32;
@@ -954,7 +1019,7 @@ pub fn fill_text(
                         blend_over(target, ((py * tw + px) * 4) as usize, colour, coverage);
                     });
                 }
-                caret += scaled.h_advance(gid);
+                caret += cf.as_scaled(cscale).h_advance(gid);
             }
         };
         paint_shadow(pm, sh, |sp, col| {
@@ -980,9 +1045,11 @@ pub fn measure_text(
     if size_px <= 0.0 {
         return TextMetrics::default();
     }
-    let Some(font) = resolve(families, bold, italic) else {
+    let chain = resolve_chain(families, bold, italic);
+    if chain.is_empty() {
         return TextMetrics::default();
-    };
+    }
+    let font = chain[0];
     let scale = px_scale(font, size_px);
     let scaled = font.as_scaled(scale);
     let upem = font.units_per_em().unwrap_or(1000.0);
@@ -996,19 +1063,27 @@ pub fn measure_text(
     let (mut ink_t, mut ink_b) = (f32::MAX, f32::MIN);
     let mut caret = 0.0f32;
     for ch in text.chars() {
-        let gid = font.glyph_id(ch);
-        if let Some(o) = font.outline(gid) {
-            ink_l = ink_l.min(caret + o.bounds.min.x * f);
-            ink_r = ink_r.max(caret + o.bounds.max.x * f);
+        // Знак берётся из первого семейства цепочки, где он есть, — как в
+        // браузере. Кегль при подмене считается по метрикам того шрифта.
+        let cf = face_for(&chain, ch);
+        let cscale = px_scale(cf, size_px);
+        let cscaled = cf.as_scaled(cscale);
+        let cupem = cf.units_per_em().unwrap_or(1000.0);
+        let cf_ratio = size_px / cupem;
+        let gid = cf.glyph_id(ch);
+        if let Some(o) = cf.outline(gid) {
+            ink_l = ink_l.min(caret + o.bounds.min.x * cf_ratio);
+            ink_r = ink_r.max(caret + o.bounds.max.x * cf_ratio);
         }
-        let glyph = gid.with_scale_and_position(scale, ab_glyph::point(caret, 0.0));
-        if let Some(og) = font.outline_glyph(glyph) {
+        let glyph = gid.with_scale_and_position(cscale, ab_glyph::point(caret, 0.0));
+        if let Some(og) = cf.outline_glyph(glyph) {
             let bb = og.px_bounds();
             ink_t = ink_t.min(bb.min.y);
             ink_b = ink_b.max(bb.max.y);
         }
-        caret += scaled.h_advance(gid);
+        caret += cscaled.h_advance(gid);
     }
+    let _ = f;
     let none = ink_l > ink_r;
     let flat = ink_t > ink_b;
     TextMetrics {

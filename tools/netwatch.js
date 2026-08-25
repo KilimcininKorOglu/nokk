@@ -32,7 +32,7 @@ const get = (p) => new Promise((res, rej) => { const t = (n) => http.get({host:'
   const list = await get('/json/list'); const page = list.find(t => t.type === 'page');
   const ws = new WebSocket(page.webSocketDebuggerUrl); let id = 0;
   const send = (m, p = {}, s) => ws.send(JSON.stringify({ id: ++id, method: m, params: p, ...(s?{sessionId:s}:{}) }));
-  const urls = new Map(); const rows = []; const sent = [];
+  const urls = new Map(); const got = new Map(); const rows = []; const sent = [];
   ws.addEventListener('message', (ev) => {
     const m = JSON.parse(ev.data);
     if (m.method === 'Network.requestWillBeSent') {
@@ -42,12 +42,17 @@ const get = (p) => new Promise((res, rej) => { const t = (n) => http.get({host:'
       // «сколько рассказали» и «что дали в ответ», и сравнивать надо оба ряда.
       if (/challenge-platform/.test(q.url)) {
         const n = q.postData ? q.postData.length : (q.postDataEntries ? -1 : 0);
-        sent.push([m.params.timestamp, q.method, n, q.url.replace(/^https:\/\//, '').slice(0, 62)]);
+        sent.push([m.params.timestamp, q.method, n, q.url.replace(/^https:\/\//, '').slice(0, 62), m.params.requestId]);
+        if (/\/fo\//.test(q.url) && q.method === 'POST' && !globalThis.__hdrShown) {
+          globalThis.__hdrShown = 1;
+          console.log('— заголовки первого POST:');
+          for (const k of Object.keys(q.headers)) console.log('   ' + k + ': ' + String(q.headers[k]).slice(0, 90));
+        }
       }
     }
     if (m.method === 'Network.loadingFinished') {
       const u = urls.get(m.params.requestId) || '';
-      if (/challenge-platform|turnstile/.test(u)) rows.push([m.params.encodedDataLength, u.replace(/^https:\/\//,'').slice(0, 70)]);
+      if (/challenge-platform|turnstile/.test(u)) { got.set(m.params.requestId, m.params.encodedDataLength); rows.push([m.params.encodedDataLength, u.replace(/^https:\/\//,'').slice(0, 70)]); }
       // Тело нужно целиком: по его длине видно, какую программу дали. Просят
       // его после завершения загрузки, страницы это не касается.
       if (/\/fo\//.test(u) && m.params.encodedDataLength > 100000) {
@@ -72,9 +77,9 @@ const get = (p) => new Promise((res, rej) => { const t = (n) => http.get({host:'
     setTimeout(() => {
       const t0 = sent.length ? sent[0][0] : 0;
       console.log('— разговор с челленджем, по порядку:');
-      for (const [t, meth, n, u] of sent) {
+      for (const [t, meth, n, u, rid] of sent) {
         console.log('  ' + String(Math.round((t - t0) * 1000)).padStart(6) + 'ms ' +
-                    meth.padEnd(5) + String(n).padStart(7) + ' байт → ' + u.replace(/^challenges\.cloudflare\.com\/cdn-cgi\/challenge-platform\/h\/b\//, ''));
+                    meth.padEnd(5) + String(n).padStart(7) + ' байт, ответ ' + (got.get(rid) === undefined ? '?' : got.get(rid)) + ' → ' + u.replace(/^challenges\.cloudflare\.com\/cdn-cgi\/challenge-platform\/h\/b\//, ''));
       }
       console.log('— самые крупные ответы:');
       for (const [n, u] of rows.sort((a,b)=>b[0]-a[0]).slice(0, 5)) console.log('  ' + String(n).padStart(9), u);
