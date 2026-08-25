@@ -1436,7 +1436,26 @@ impl BrowserContext {
                 let d = std::time::Duration::from_millis(next_timer_ms as u64);
                 if waited + d <= idle_wait && std::time::Instant::now() + d < deadline {
                     waited += d;
-                    tokio::time::sleep(d).await;
+                    // Ждать чужой таймер — не значит замереть. Кадры живут по
+                    // своим часам, и пока страница ждёт секунду до следующего
+                    // тика, виджет в кадре должен успеть свои двести. Сон
+                    // целиком держал его ровно столько, сколько ждала страница,
+                    // и это давало те самые провалы в секунды.
+                    let until = std::time::Instant::now() + d;
+                    loop {
+                        let left = until.saturating_duration_since(std::time::Instant::now());
+                        if left.is_zero() {
+                            break;
+                        }
+                        tokio::time::sleep(left.min(FRAME_PUMP_EVERY)).await;
+                        if self.has_frames()
+                            && last_frame_pump.elapsed() >= FRAME_PUMP_EVERY
+                            && std::time::Instant::now() < deadline
+                        {
+                            last_frame_pump = std::time::Instant::now();
+                                    self.pump_frames().await?;
+                        }
+                    }
                     continue;
                 }
             }
@@ -1452,6 +1471,7 @@ impl BrowserContext {
                 break;
             }
         }
+        
         Ok(total_timers)
     }
 
