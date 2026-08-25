@@ -1107,6 +1107,12 @@ impl BrowserContext {
         // can point `document.currentScript` at the running node (document.write
         // positioning); `__pt_endScript` clears it afterward.
         for (idx, script) in page.scripts.iter().enumerate() {
+            // Ход кадрам перед каждым скриптом документа, каким бы он ни был.
+            // Страница вроде chess.com грузит их десятками — и модулями тоже,
+            // а модуль уходит из этого цикла раньше, чем доходит до конца.
+            if index == self.index {
+                self.frames_take_a_turn().await;
+            }
             // `<script nomodule>` is addressed to a browser without modules. We
             // have them, so we are not the audience — and a site that ships both
             // halves (every Vite build does) runs its whole app twice if we take
@@ -1188,9 +1194,6 @@ impl BrowserContext {
                 tracing::debug!(error = %e, script = %whose, %head, "page script threw");
             }
             let _ = self.eval_in(index, "__pt_endScript()").await;
-            if index == self.index {
-                self.frames_take_a_turn().await;
-            }
         }
 
         // Fire lifecycle events. Draining the loop afterwards is the *caller's*

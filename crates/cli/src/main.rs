@@ -1529,7 +1529,16 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                         if seen_controls.insert(what.clone()) {
                             pressed += 1;
                             tracing::info!(control = %what, "pressed the challenge widget");
-                            tokio::time::sleep(Duration::from_millis(1_500)).await;
+                            // Полторы секунды после нажатия — не сон, а работа:
+                            // спящий движок не качает ни страницу, ни кадры, а
+                            // виджет как раз в эти полторы секунды и считает.
+                            // Его собственные часы видели здесь провал, какого
+                            // у браузера не бывает.
+                            let until = Instant::now() + Duration::from_millis(1_500);
+                            while Instant::now() < until {
+                                let _ = ctx.run_event_loop().await;
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
                         }
                     }
                 }
