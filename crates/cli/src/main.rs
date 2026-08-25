@@ -589,8 +589,12 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                             const now = performance.now();
                             const lag = now - last - 4;
                             if (lag > worst) worst = lag;
+                            if (lag > 400) {
+                              console.error('[стоп] с ' + Math.round(last) + 'мс по ' + Math.round(now) +
+                                            'мс, простой ' + Math.round(lag) + 'мс');
+                            }
                             last = now;
-                            if (++ticks % 250 === 0) {
+                            if (++ticks % 100 === 0) {
                               console.error('[лаг] ' + Math.round(now) + 'мс тиков=' + ticks +
                                             ' худшая задержка=' + Math.round(worst) + 'мс');
                               worst = 0;

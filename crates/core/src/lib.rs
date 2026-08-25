@@ -623,6 +623,7 @@ impl Engine {
         tracing::debug!(?worker, index, "context created");
         Ok(BrowserContext {
             frame_pump_count: std::sync::atomic::AtomicUsize::new(0),
+            last_frame_turn: std::sync::Mutex::new(std::time::Instant::now()),
             engine: self.inner.clone(),
             client,
             worker,
@@ -794,6 +795,9 @@ pub struct BrowserContext {
     _permit: tokio::sync::OwnedSemaphorePermit,
     _load: nokk_pool::ContextLoadGuard,    /// Счётчик пульсов кадров: дорогие довески идут не на каждом.
     frame_pump_count: std::sync::atomic::AtomicUsize,
+    /// Когда кадры получали ход в последний раз — чтобы давать его и во
+    /// время долгих последовательностей вроде загрузки скриптов страницы.
+    last_frame_turn: std::sync::Mutex<std::time::Instant>,
 
 }
 
@@ -1184,6 +1188,9 @@ impl BrowserContext {
                 tracing::debug!(error = %e, script = %whose, %head, "page script threw");
             }
             let _ = self.eval_in(index, "__pt_endScript()").await;
+            if index == self.index {
+                self.frames_take_a_turn().await;
+            }
         }
 
         // Fire lifecycle events. Draining the loop afterwards is the *caller's*
@@ -2707,6 +2714,28 @@ impl BrowserContext {
     /// Drain what every live frame queued (its `parent.postMessage` calls) and
     /// give each one an event-loop turn, so a frame's own timers and fetches make
     /// progress rather than freezing the moment its document finished loading.
+    /// Дать кадрам ход, если с прошлого прошло достаточно. Зовётся из
+    /// длинных последовательностей главного документа: пока страница по
+    /// очереди качает и исполняет свои скрипты, виджет в кадре иначе стоит
+    /// целыми секундами — у браузера он живёт в своём процессе и не ждёт.
+    async fn frames_take_a_turn(&self) {
+        if !self.has_frames() {
+            return;
+        }
+        {
+            let Ok(mut last) = self.last_frame_turn.lock() else {
+                return;
+            };
+            if last.elapsed() < FRAME_PUMP_EVERY {
+                return;
+            }
+            *last = std::time::Instant::now();
+        }
+        // Вложенность здесь настоящая: пульс кадров может сам грузить
+        // документ, а тот — снова дать ход кадрам. Значит через кучу.
+        let _ = Box::pin(self.pump_frames()).await;
+    }
+
     async fn pump_frames(&self) -> Result<usize, EngineError> {
         let frames: Vec<(u32, usize)> = self
             .frames
