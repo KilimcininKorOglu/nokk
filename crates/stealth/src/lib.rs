@@ -86,10 +86,19 @@ impl StealthProfile {
     }
 }
 
-/// The Chrome major version every profile's UA / client hints report. **Must**
-/// match the TLS emulation (`nokk_net::FingerprintClient::EMULATION` = Chrome
-/// 148) or the JS UA and the ClientHello disagree — an instant anti-bot tell.
-pub const CHROME_MAJOR: &str = "148";
+/// The Chrome major version every profile's UA / client hints report.
+///
+/// Держится за тем, что мы на самом деле показываем: граф свойств, порядок
+/// вычисленного стиля, пределы WebGL и всё прочее сняты с Chrome 151, и версия
+/// в заголовке обязана говорить то же самое. Браузер, который зовётся 148, а
+/// внутри устроен как 151, виден по любому свойству, добавленному между ними.
+///
+/// Рукопожатие TLS при этом идёт по самому новому набору, какой знает
+/// `wreq-util` (Chrome 149): между 149 и 151 ClientHello не менялся, а разрыв
+/// в три версии по свойствам — менялся, и заметно.
+pub const CHROME_MAJOR: &str = "151";
+/// Полная версия сборки — та же, что у Chrome, с которого снят отпечаток.
+pub const CHROME_FULL: &str = "151.0.7922.173";
 
 /// The OS a fingerprint profile emulates. The network layer maps this to a wreq
 /// `EmulationOS` so the TLS ClientHello matches the profile's UA and platform.
@@ -191,7 +200,7 @@ impl FingerprintProfile {
             user_agent: ua.to_string(),
             platform: platform.to_string(),
             ua_platform: ua_platform.to_string(),
-            chrome_major: CHROME_MAJOR.parse().unwrap_or(148),
+            chrome_major: CHROME_MAJOR.parse().unwrap_or(151),
             languages: vec!["en-US".into(), "en".into()],
             hardware_concurrency: hw,
             device_memory_gb: device_memory_gb(),
@@ -211,7 +220,7 @@ impl FingerprintProfile {
         match self {
             Self::ChromeLinux => common(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
-                 Chrome/148.0.0.0 Safari/537.36",
+                 Chrome/151.0.0.0 Safari/537.36",
                 8,
                 "Google Inc. (Intel)",
                 // Снято с Chrome 148 на живой машине с Mesa: у ANGLE своя форма —
@@ -221,14 +230,14 @@ impl FingerprintProfile {
             ),
             Self::ChromeWindows => common(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
-                 Chrome/148.0.0.0 Safari/537.36",
+                 Chrome/151.0.0.0 Safari/537.36",
                 16,
                 "Google Inc. (NVIDIA)",
                 "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002503) Direct3D11 vs_5_0 ps_5_0, D3D11)",
             ),
             Self::ChromeMac => common(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-                 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+                 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
                 8,
                 "Google Inc. (Apple)",
                 "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
@@ -554,6 +563,7 @@ pub fn bootstrap_script(profile: &StealthProfile) -> String {
         .replace("__MEM__", &profile.device_memory_gb.to_string())
         .replace("__WEBGL_VENDOR__", &quoted(&profile.webgl_vendor))
         .replace("__WEBGL_RENDERER__", &quoted(&profile.webgl_renderer))
+        .replace("__CHROME_FULL__", CHROME_FULL)
         .replace("__CHROME_MAJOR__", &profile.chrome_major.to_string())
         .replace("__UA_PLATFORM__", &quoted(&profile.ua_platform))
         .replace("__SCREEN_W__", &profile.screen_width.to_string())
@@ -681,7 +691,7 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
     deviceMemory: __MEM__, maxTouchPoints: 0, webdriver: false, onLine: true, cookieEnabled: true,
     doNotTrack: null, pdfViewerEnabled: true,
     userAgentData: { brands: [
-      { brand: "Chromium", version: "__CHROME_MAJOR__" }, { brand: "Google Chrome", version: "__CHROME_MAJOR__" }, { brand: "Not.A/Brand", version: "24" }
+      { brand: "Not=A?Brand", version: "99" }, { brand: "Google Chrome", version: "__CHROME_MAJOR__" }, { brand: "Chromium", version: "__CHROME_MAJOR__" }
     ], mobile: false, platform: __UA_PLATFORM__ },
   });
   win.navigator = Object.create(NavigatorProto);
@@ -1693,7 +1703,8 @@ pub fn web_surface_script() -> String {
         "{WEB_SURFACE_TEMPLATE}\n{}\n{}\n{}",
         WEB_BODIES_TEMPLATE
             .replace("__CLONE__", CLONE_TEMPLATE)
-            .replace("__OPFS__", OPFS_TEMPLATE),
+            .replace("__OPFS__", OPFS_TEMPLATE)
+            .replace("__CHROME_FULL__", CHROME_FULL),
         WINDOW_SHAPE_TEMPLATE.replace("__WINDOW_ENUMERABLE__", WINDOW_ENUMERABLE),
         IFACE_STATICS_TEMPLATE
             .replace("__IFACE_STATICS__", IFACE_STATICS)
@@ -2576,7 +2587,7 @@ __OPFS__
     if (UA) {
       // Значения уже есть (их ставит слой отпечатка) — забираем их до пересадки.
       const brands = UA.brands, mobile = UA.mobile, platform = UA.platform;
-      const HIGH = {"architecture":"x86","bitness":"64","formFactors":["Desktop"],"fullVersionList":[{"brand":"Chromium","version":"148.0.7778.178"},{"brand":"Google Chrome","version":"148.0.7778.178"},{"brand":"Not/A)Brand","version":"99.0.0.0"}],"model":"","platformVersion":"","uaFullVersion":"148.0.7778.178","wow64":false};
+      const HIGH = {"architecture":"x86","bitness":"64","formFactors":["Desktop"],"fullVersionList":[{"brand":"Not=A?Brand","version":"99.0.0.0"},{"brand":"Google Chrome","version":"__CHROME_FULL__"},{"brand":"Chromium","version":"__CHROME_FULL__"}],"model":"","platformVersion":"","uaFullVersion":"__CHROME_FULL__","wow64":false};
       const UAD = rebrand(UA, 'NavigatorUAData');
       meth(UAD.prototype, 'toJSON', function () { return { brands: brands, mobile: mobile, platform: platform }; });
       meth(UAD.prototype, 'getHighEntropyValues', function (hints) {
@@ -8991,8 +9002,8 @@ mod tests {
         );
         assert!(win.contains("width: 1920") && win.contains("height: 1080"));
         assert!(
-            win.contains(r#"version: "148""#),
-            "client-hints brand version not 148"
+            win.contains(r#"version: "151""#),
+            "client-hints brand version not 151"
         );
         assert!(win.contains("Win32"), "navigator.platform not Win32");
 
@@ -9016,11 +9027,11 @@ mod tests {
             "UA: {}",
             p.user_agent
         );
-        assert!(!p.user_agent.contains("Chrome/148"));
+        assert!(!p.user_agent.contains("Chrome/151"));
         // The bootstrap's userAgentData brand version follows the field.
         let js = bootstrap_script(&p);
         assert!(js.contains(r#"version: "131""#));
-        assert!(!js.contains(r#"version: "148""#));
+        assert!(!js.contains(r#"version: "151""#));
     }
 
     #[test]

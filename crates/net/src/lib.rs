@@ -117,8 +117,9 @@ impl EmulationOs {
 }
 
 /// The Chrome major version emulated by default — current stable. Keep in step
-/// with `nokk_stealth::CHROME_MAJOR`.
-pub const DEFAULT_CHROME_MAJOR: u32 = 148;
+/// with `nokk_stealth::CHROME_MAJOR`. Само рукопожатие идёт по самому новому
+/// набору, какой знает `wreq-util` — см. [`profile_for_major`].
+pub const DEFAULT_CHROME_MAJOR: u32 = 151;
 
 /// Map a Chrome major version to the matching wreq TLS/HTTP emulation profile.
 ///
@@ -156,6 +157,10 @@ pub fn profile_for_major(major: u32) -> wreq_util::Profile {
         147 => P::Chrome147,
         148 => P::Chrome148,
         149 => P::Chrome149,
+        // Отпечаток снят с Chrome 151, а самый новый набор рукопожатия у
+        // `wreq-util` — 149. ClientHello между ними не менялся, поэтому версии
+        // выше сводятся к нему, а не падают в умолчание с предупреждением.
+        150..=152 => P::Chrome149,
         other => {
             tracing::warn!(
                 requested = other,
