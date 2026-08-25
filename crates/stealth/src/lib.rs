@@ -4784,7 +4784,20 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       fire(this, 'loadstart');
       // Помечаем запрос как XHR: в перечне ресурсов браузер называет его
       // `xmlhttprequest`, а не `fetch`, и это видно снаружи.
+      // Тип содержимого браузер ставит сам, если страница его не задала:
+      // строка уходит как `text/plain;charset=UTF-8`, форма — своим типом.
+      // Мы не ставили ничего, и запрос выглядел не как из браузера.
       const headers = Object.assign({}, b.headers, { 'x-pt-kind': 'xhr' });
+      if (body != null && !Object.keys(headers).some((k) => k.toLowerCase() === 'content-type')) {
+        if (typeof body === 'string') headers['Content-Type'] = 'text/plain;charset=UTF-8';
+        else if (globalThis.URLSearchParams && body instanceof URLSearchParams) {
+          headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
+        } else if (globalThis.Blob && body instanceof globalThis.Blob && body.type) {
+          headers['Content-Type'] = body.type;
+        } else if (globalThis.Document && body instanceof globalThis.Document) {
+          headers['Content-Type'] = 'text/html;charset=UTF-8';
+        }
+      }
       fetch(b.url, { method: b.method, headers, body })
         .then(async (r) => {
           if (b.aborted) return;

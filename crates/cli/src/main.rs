@@ -621,6 +621,32 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                             };
                           }
                         }
+                        // Из чего складывается первый обмен: он уходит до всякого
+                        // кодировщика текста, значит собирается иначе: JSON или склейка.
+                        if (!globalThis.__ptEarly) {
+                          globalThis.__ptEarly = 1;
+                          let n = 0;
+                          const JS = JSON.stringify;
+                          JSON.stringify = function (v) {
+                            const r = JS.apply(this, arguments);
+                            if (typeof r === 'string' && r.length > 80 && n++ < 24) {
+                              console.error('[json ' + Math.round(performance.now()) + 'мс ' + r.length + '] ' + r.slice(0, 300));
+                            }
+                            return r;
+                          };
+                          const B = globalThis.btoa;
+                          if (B) {
+                            let m = 0;
+                            globalThis.btoa = function (x) {
+                              const s = String(x);
+                              if (s.length > 80 && m++ < 16) {
+                                console.error('[btoa ' + Math.round(performance.now()) + 'мс ' + s.length + '] ' +
+                                    s.slice(0, 200).replace(/[^\x20-\x7e]/g, '.'));
+                              }
+                              return B.apply(this, arguments);
+                            };
+                          }
+                        }
                         const OP = globalThis.OffscreenCanvas && globalThis.OffscreenCanvas.prototype;
                         const og = OP && OP.getContext;
                         if (og) {
