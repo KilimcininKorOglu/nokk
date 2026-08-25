@@ -487,7 +487,7 @@ async fn main() -> Result<()> {
                               at = String(new Error().stack || '').split('\n').slice(2, 5)
                                 .map((x) => x.trim().replace(/^at /, '').slice(0, 46)).join(' < ');
                             } catch (e) {}
-                            console.error('[enc ' + (en++) + '] ' + s.length + ' | ненулевых=' + (() => { let n = 0, sum = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { n++; sum = (sum * 31 + c) >>> 0; } } return n + ' сумма=' + sum; })() + (s.length > 14000 ? ' текст: ' + s.slice(0, 90).replace(/[^\x20-\x7e]/g, '.') : ' коды: ') + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
+                            console.error('[enc ' + (en++) + '] ' + Math.round(performance.now()) + 'мс ' + s.length + ' | ненулевых=' + (() => { let n = 0, sum = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { n++; sum = (sum * 31 + c) >>> 0; } } return n + ' сумма=' + sum; })() + (s.length > 14000 ? ' текст: ' + s.slice(0, 90).replace(/[^\x20-\x7e]/g, '.') : ' коды: ') + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
 if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__ptD || {})[s.length]) {
   globalThis.__ptD[s.length] = 1;
   for (let q = 0; q < s.length; q += 250) console.error('[кус ' + s.length + ':' + (q / 300) + '] ' + s.slice(q, q + 300));
@@ -566,10 +566,10 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                             if (typeof C !== 'function') continue;
                             const W = function (...a) {
                               const e = new C(...a);
-                              if (shown++ < 40) {
+                              if (shown++ < 120) {
                                 try {
                                   console.error('[бросок] ' + N + ': ' + String(a[0]).slice(0, 120) +
-                                    ' | ' + String(e.stack || '').split('\\n').slice(1, 4).join(' <- ').slice(0, 260));
+                                    ' | ' + String(e.stack || '').split(String.fromCharCode(10)).slice(1, 4).join(' <- ').slice(0, 300));
                                 } catch (x) {}
                               }
                               return e;
@@ -578,6 +578,26 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                             try { Object.defineProperty(W, 'name', { value: N }); } catch (x) {}
                             try { globalThis[N] = W; } catch (x) {}
                           }
+                        }
+                        // Задержка цикла событий в этом кадре: если страница-хозяин
+                        // занимает поток, челлендж просто ждёт, и его собственные
+                        // часы показывают секунды там, где у браузера доли.
+                        if (!globalThis.__ptLagProbe) {
+                          globalThis.__ptLagProbe = 1;
+                          let last = performance.now(), worst = 0, ticks = 0;
+                          const tick = () => {
+                            const now = performance.now();
+                            const lag = now - last - 4;
+                            if (lag > worst) worst = lag;
+                            last = now;
+                            if (++ticks % 250 === 0) {
+                              console.error('[лаг] ' + Math.round(now) + 'мс тиков=' + ticks +
+                                            ' худшая задержка=' + Math.round(worst) + 'мс');
+                              worst = 0;
+                            }
+                            setTimeout(tick, 4);
+                          };
+                          setTimeout(tick, 4);
                         }
                         const gpu = globalThis.navigator && globalThis.navigator.gpu;
                         if (gpu && !gpu.__ptG) {
@@ -692,7 +712,7 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                           : (typeof b === 'string' ? b.length
                           : (b.byteLength !== undefined ? b.byteLength
                           : (b.size !== undefined ? b.size : (b.length || 0))));
-                        console.error('[send] bytes=' + size + ' kind=' + Object.prototype.toString.call(b) +
+                        console.error('[send] ' + Math.round(performance.now()) + 'мс bytes=' + size + ' kind=' + Object.prototype.toString.call(b) +
                                       ' url=' + String(this.__ptU || '').slice(-40));
                       } catch (e) {}
                       // Маяк `/eb/` — единственное место, где челлендж сам

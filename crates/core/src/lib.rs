@@ -622,6 +622,7 @@ impl Engine {
             .map_err(EngineError::Js)?;
         tracing::debug!(?worker, index, "context created");
         Ok(BrowserContext {
+            frame_pump_count: std::sync::atomic::AtomicUsize::new(0),
             engine: self.inner.clone(),
             client,
             worker,
@@ -791,7 +792,9 @@ pub struct BrowserContext {
     /// times a second, or leaving its `setInterval` frozen between commands.
     next_timer_at: std::sync::Mutex<Option<std::time::Instant>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
-    _load: nokk_pool::ContextLoadGuard,
+    _load: nokk_pool::ContextLoadGuard,    /// Счётчик пульсов кадров: дорогие довески идут не на каждом.
+    frame_pump_count: std::sync::atomic::AtomicUsize,
+
 }
 
 /// What a caller outside the engine can know about a live frame.
@@ -1375,6 +1378,18 @@ impl BrowserContext {
                     .dispatch(self.worker, move |iso| iso.eval(index, &settle))
                     .await?
                     .map_err(EngineError::Js)?;
+                // Между загрузками кадрам дают ход. Страница вроде chess.com
+                // тянет сотню файлов подряд, и пока они идут по очереди, виджет
+                // в кадре стоит: его собственные часы показывали восемь секунд
+                // там, где у браузера полторы. Браузеру это даётся само —
+                // чужой источник живёт в своём потоке.
+                if self.has_frames()
+                    && last_frame_pump.elapsed() >= FRAME_PUMP_EVERY
+                    && std::time::Instant::now() < deadline
+                {
+                    last_frame_pump = std::time::Instant::now();
+                    self.pump_frames().await?;
+                }
             }
 
             // 6. Frames get a turn on a clock of their own, whether or not the page
@@ -1390,8 +1405,12 @@ impl BrowserContext {
                 && last_frame_pump.elapsed() >= FRAME_PUMP_EVERY
                 && std::time::Instant::now() < deadline
             {
+                let gap = last_frame_pump.elapsed().as_millis() as u64;
                 last_frame_pump = std::time::Instant::now();
+                let t = std::time::Instant::now();
                 frames_ran = self.pump_frames().await?;
+                tracing::debug!(target: "nokk::pace", gap_ms = gap,
+                    pump_ms = t.elapsed().as_millis() as u64, frames_ran, "круг кадров");
             }
 
             if busy || frames_ran > 0 || !frame_ops.is_empty() {
@@ -2700,7 +2719,14 @@ impl BrowserContext {
             // считать: у виджета Turnstile первое же, что делает программа, —
             // читает `performance`, а пустая лента там значит «я ничего не
             // грузил», чего про живой документ не бывает.
-            self.flush_resource_timings(index).await;
+            // Ленту времён и размер кадра пересчитываем не на каждом пульсе:
+            // каждый из них — отдельный заход в изолят, и вместе они стоили
+            // больше, чем сама работа кадра.
+            let full = self.frame_pump_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8 == 0;
+            if full {
+                self.flush_resource_timings(index).await;
+            }
+            let t_slice = std::time::Instant::now();
             let ran = self
                 .engine
                 .pool
@@ -2710,6 +2736,7 @@ impl BrowserContext {
                 .await?
                 .unwrap_or(0);
             work += ran as usize;
+            tracing::debug!(target: "nokk::pace", frame = id, ran, slice_ms = t_slice.elapsed().as_millis() as u64, "срез кадра");
             let qjson = self.eval_in(index, DRAIN_IO).await?;
             let queues: Value = match qjson {
                 Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
@@ -2721,9 +2748,12 @@ impl BrowserContext {
             // Кадр узнаёт свой размер не один раз: стили доезжают позже вставки,
             // и элемент может измениться. Браузер в этом случае меняет окно
             // кадра — делаем то же, пока размер не устоится.
-            if let Ok(Value::String(text)) = self
-                .eval_in(self.index, &format!("__pt_frameBox({id})"))
-                .await
+            let boxed = if full {
+                self.eval_in(self.index, &format!("__pt_frameBox({id})")).await
+            } else {
+                Ok(Value::Null)
+            };
+            if let Ok(Value::String(text)) = boxed
             {
                 if let Ok(v) = serde_json::from_str::<Vec<f64>>(&text) {
                     if v.len() == 2 && v[0] > 0.0 && v[1] > 0.0 {
