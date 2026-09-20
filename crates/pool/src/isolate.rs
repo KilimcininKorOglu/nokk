@@ -269,6 +269,10 @@ impl Isolate {
         isolate.set_slot(DynamicImports::default());
         isolate.set_host_initialize_import_meta_object_callback(import_meta);
         isolate.set_host_import_module_dynamically_callback(import_dynamically);
+        // Как читается `error.stack`. С этим крючком V8 больше не зовёт
+        // `Error.prepareStackTrace` сам — зовём мы, из `__pt_formatStack`, уже
+        // без кадров собственного движка.
+        isolate.set_prepare_stack_trace_callback(prepare_stack_trace);
 
         // Install the graceful-OOM callback once, if a cap is in effect.
         let heap_state = max_heap_mb.map(|mb| {
@@ -770,6 +774,47 @@ fn compile_module<'s>(
 /// V8 asks the embedder to load an `import()`, and waits on the promise we
 /// hand back. Everything here is bookkeeping: make the promise, remember the
 /// resolver by id, and queue what was asked for the driver to fetch.
+/// Стек ошибки, каким его увидит страница. V8 зовёт это, когда у ошибки в
+/// первый раз читают `stack`, и отдаёт разобранные кадры; дальше решает JS —
+/// `__pt_formatStack` из общего пролога: он выбрасывает кадры самого движка
+/// (безымянный скрипт с позицией — диспетчер событий, XHR, таймеры) и зовёт
+/// `Error.prepareStackTrace` страницы, если та его ставила. Без этого всякий
+/// `new Error()` внутри обработчика показывал нашу кухню, которой в браузере
+/// на этом месте нет вовсе.
+fn prepare_stack_trace<'s, 'a>(
+    scope: &mut v8::PinScope<'s, 'a>,
+    error: v8::Local<'s, v8::Value>,
+    sites: v8::Local<'s, v8::Array>,
+) -> v8::Local<'s, v8::Value> {
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let formatter = v8::String::new(scope, "__pt_formatStack")
+        .and_then(|k| global.get(scope, k.into()))
+        .and_then(|v| v8::Local::<v8::Function>::try_from(v).ok());
+    if let Some(f) = formatter {
+        let undef: v8::Local<v8::Value> = v8::undefined(scope).into();
+        if let Some(v) = f.call(scope, undef, &[error, sites.into()]) {
+            return v;
+        }
+        // Формат бросил — пусть бросок и дойдёт до читателя, как дошёл бы у V8.
+        return v8::undefined(scope).into();
+    }
+    // Пролога нет (голый контекст): собрать по умолчанию, кадр за кадром.
+    let mut out = String::from("Error");
+    for i in 0..sites.length() {
+        if let Some(site) = sites.get_index(scope, i) {
+            if let Some(s) = site.to_string(scope) {
+                out.push_str("\n    at ");
+                out.push_str(&s.to_rust_string_lossy(scope));
+            }
+        }
+    }
+    match v8::String::new(scope, &out) {
+        Some(s) => s.into(),
+        None => v8::undefined(scope).into(),
+    }
+}
+
 fn import_dynamically<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     _host_defined_options: v8::Local<'s, v8::Data>,

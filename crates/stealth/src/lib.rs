@@ -596,7 +596,7 @@ pub fn bootstrap_script(profile: &StealthProfile) -> String {
         if fast_timers() { "true" } else { "false" },
     );
 
-    format!("{env}\n{intl}\n{timers}\n{PERFORMANCE_TEMPLATE}\n{CRYPTO_TEMPLATE}\n{FETCH_TEMPLATE}")
+    format!("{env}\n{intl}\n{timers}\n{STACK_TEMPLATE}\n{PERFORMANCE_TEMPLATE}\n{CRYPTO_TEMPLATE}\n{FETCH_TEMPLATE}")
 }
 
 /// Whether timers collapse their delays instead of waiting them out
@@ -4061,6 +4061,51 @@ const WEB_SURFACE_TEMPLATE: &str = r##"(() => {
 /// own-property list is empty — everything lives on the prototype), reports a
 /// coarsened monotonic `now()`, and carries the legacy `timing`/`navigation`
 /// blocks plus Chrome's `memory`.
+/// Разбор стека ошибки. В браузере между обработчиком события и его вызовом
+/// нет ни одного кадра JS — диспетчер там код браузера, и в `Error().stack` он
+/// не виден. У нас диспетчер написан на JS, и всякий `new Error()` внутри
+/// обработчика показывал `fire`, `__ptDispatch` и позицию в безымянном
+/// скрипте: движок, расписавшийся в стеке. V8 отдаёт готовый разбор сюда
+/// (`SetPrepareStackTraceCallback`), здесь свои кадры отсеиваются, а строка
+/// собирается ровно так, как собрал бы сам V8 — включая вызов того
+/// `Error.prepareStackTrace`, который поставила страница: она получает свой же
+/// список, только без наших кадров.
+const STACK_TEMPLATE: &str = r##"(() => {
+  const ours = (f) => {
+    try {
+      // Адрес, а не имя ресурса: у встроенного скрипта имени нет вовсе, а
+      // адрес ему даёт `//# sourceURL` — ровно как в браузере.
+      const from = typeof f.getScriptNameOrSourceURL === 'function'
+        ? (f.getScriptNameOrSourceURL() || f.getFileName())
+        : f.getFileName();
+      if (from) return false;                 // скрипт с адресом — страницы
+      if (f.isEval()) return false;           // eval/Function — тоже её
+      return f.getLineNumber() != null;       // безымянный, но с позицией — наш
+    } catch (e) { return false; }
+  };
+  globalThis.__pt_formatStack = (err, sites) => {
+    let keep = sites;
+    try { keep = Array.prototype.filter.call(sites, (f) => !ours(f)); } catch (e) {}
+    try {
+      const mine = Error.prepareStackTrace;
+      if (typeof mine === 'function') return mine(err, keep);
+    } catch (e) {}
+    let head = 'Error';
+    try {
+      const n = err == null ? undefined : err.name;
+      const m = err == null ? undefined : err.message;
+      const name = n === undefined ? 'Error' : String(n);
+      const msg = m === undefined || m === null || m === '' ? '' : String(m);
+      head = !name ? msg : (!msg ? name : name + ': ' + msg);
+    } catch (e) {}
+    let out = head;
+    for (let i = 0; i < keep.length; i++) {
+      try { out += '\n    at ' + String(keep[i]); } catch (e) {}
+    }
+    return out;
+  };
+})();"##;
+
 const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   // У браузера начало отсчёта тоже не целое: оно снято с тех же часов, что и
   // `now()`, и несёт доли миллисекунды.

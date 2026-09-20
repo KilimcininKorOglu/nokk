@@ -1150,6 +1150,14 @@ impl BrowserContext {
             // threw" says nothing on a page that runs forty of them.
             let mut whose = String::from("inline");
             let code = match script {
+                // Встроенный скрипт — тоже скрипт с адресом: в браузере кадры
+                // стека внутри него названы адресом документа, а не пустотой.
+                // Без имени каждый такой кадр читается как `<anonymous>` —
+                // видно всякому, кто разбирает `new Error().stack`, а его
+                // разбирают.
+                nokk_dom::Script::Inline(code) if !base_url.is_empty() => {
+                    format!("{code}\n//# sourceURL={base_url}")
+                }
                 nokk_dom::Script::Inline(code) => code.clone(),
                 nokk_dom::Script::External(src) => match resolve_url(base_url, src) {
                     Some(abs) => {
@@ -8916,6 +8924,71 @@ opacity: 0.9; flex-flow: column; }",
         assert_eq!(out["document"], "object");
         assert_eq!(out["eval"], "4", "the realm answers straight away");
         assert_eq!(out["parentIsUs"], true);
+    }
+
+    /// Стек ошибки — часть отпечатка: его снимают и разбирают. В браузере между
+    /// обработчиком события и местом вызова нет ни одного кадра JS, а у нас
+    /// диспетчер написан на JS, и всякий `new Error()` внутри обработчика
+    /// показывал `fire`, `__ptDispatch` и позицию в безымянном скрипте. Заодно
+    /// встроенный скрипт обязан называться адресом документа, а не пустотой.
+    #[tokio::test]
+    async fn a_stack_shows_the_page_and_not_the_engine() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><body><script>
+              const out = {};
+              const b = document.createElement('button');
+              document.body.appendChild(b);
+              b.addEventListener('click', () => { out.listener = new Error('ай').stack; });
+              b.dispatchEvent(new MouseEvent('click'));
+              out.builtin = [1].map(() => new Error().stack)[0];
+              const mine = (e, sites) => sites.map((f) => typeof f.getFileName);
+              Error.prepareStackTrace = mine;
+              out.sites = new Error().stack;
+              out.identity = Error.prepareStackTrace === mine;
+              Error.prepareStackTrace = undefined;
+              window.__stacks = out;
+            </script></body></html>"#,
+        )
+        .await
+        .unwrap();
+
+        let out = probe(&ctx, "__ptJSON.stringify(window.__stacks)").await;
+        let listener = out["listener"].as_str().unwrap_or_default();
+        assert!(
+            listener.starts_with("Error: ай\n    at "),
+            "заголовок и кадры как у V8: {listener}"
+        );
+        assert!(
+            listener.contains("https://example.com/:"),
+            "кадр обработчика назван адресом документа: {listener}"
+        );
+        for engine_frame in ["__ptDispatch", "fire (", "dispatchEvent"] {
+            assert!(
+                !listener.contains(engine_frame),
+                "кадров движка в стеке страницы быть не должно ({engine_frame}): {listener}"
+            );
+        }
+        assert!(
+            !listener.contains("(<anonymous>:"),
+            "и безымянных скриптов с позицией тоже: {listener}"
+        );
+        let builtin = out["builtin"].as_str().unwrap_or_default();
+        assert!(
+            builtin.contains("at Array.map (<anonymous>)"),
+            "встроенное V8 в стеке остаётся, как в браузере: {builtin}"
+        );
+        assert_eq!(
+            out["identity"], true,
+            "страница читает свой же `prepareStackTrace`"
+        );
+        assert_eq!(
+            out["sites"][0], "function",
+            "и получает настоящие кадры, а не строки"
+        );
     }
 
     /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`

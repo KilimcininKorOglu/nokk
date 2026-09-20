@@ -1141,7 +1141,12 @@
       // следе вызовов любой страницы — метка, видная с первой же ошибки.
       // Запасной путь остаётся на случай сборки без этого встроенного.
       try {
-        if (typeof __pt_evalScript === 'function') __pt_evalScript(String(code), '');
+        // Адрес — документа: у встроенного скрипта своего нет, и браузер
+        // называет его кадры стека адресом страницы. Пустое имя превращало их
+        // в `<anonymous>` — метку, видную всякому, кто читает `Error().stack`.
+        let where_ = '';
+        try { where_ = String((this.ownerDocument && this.ownerDocument.URL) || location.href || ''); } catch (e) {}
+        if (typeof __pt_evalScript === 'function') __pt_evalScript(String(code), where_);
         else (0, eval)(code);
       } catch (e) { __pt_reportError(e, 'inline script'); }
     }
