@@ -9195,6 +9195,55 @@ opacity: 0.9; flex-flow: column; }",
         assert_eq!(later["gpu"], true, "и WebGPU поверх нашего GL строится: {later}");
     }
 
+    /// Разбор разметки и фабрики `new Image`/`new Audio` шли через те же
+    /// имена, что видит страница: присваивание `innerHTML` показывало
+    /// десятки `createElement`/`appendChild`/`setAttribute` всякому, кто их
+    /// обернул. В браузере эта работа внутри движка и не видна никому.
+    #[tokio::test]
+    async fn building_markup_does_not_call_the_page_back() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const seen = [];
+            const wrap = (obj, name) => {
+              const F = obj[name];
+              obj[name] = function (...a) { seen.push(name); return F.apply(this, a); };
+            };
+            for (const n of ['createTextNode', 'createComment', 'createDocumentFragment'])
+              wrap(Document.prototype, n);
+            wrap(Node.prototype, 'appendChild');
+            wrap(Node.prototype, 'insertBefore');
+            wrap(Element.prototype, 'setAttribute');
+            const host = document.body;
+            host.innerHTML = '<p class=x>привет <b>мир</b><!--тут--></p>';
+            const img = new Image(5, 7);
+            const audio = new Audio('/x.mp3');
+            return __ptJSON.stringify({
+              seen,
+              markup: host.innerHTML,
+              img: img.width + 'x' + img.height,
+              audio: audio.getAttribute('src'),
+            });
+        })()"#).await;
+
+        assert_eq!(
+            out["seen"].as_array().map(Vec::len),
+            Some(0),
+            "страница не должна видеть ни одного внутреннего вызова: {out}"
+        );
+        assert_eq!(
+            out["markup"], "<p class=\"x\">привет <b>мир</b><!--тут--></p>",
+            "и разметка при этом разбирается: {out}"
+        );
+        assert_eq!(out["img"], "5x7");
+        assert_eq!(out["audio"], "/x.mp3");
+    }
+
     /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`
     /// is the idiom every collector uses, Cloudflare's included — the URL is dead
     /// one line after the worker starts. Reading the blob when the engine got

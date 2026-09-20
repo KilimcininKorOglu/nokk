@@ -289,7 +289,7 @@
             'HierarchyRequestError');
         }
       }
-      return this.insertBefore(child, null);
+      return __ptInsert.call(this, child, null);
     }
     insertBefore(child, ref) {
       __needArgs(arguments.length, 2, 'insertBefore', 'Node');
@@ -645,7 +645,7 @@
       // Разметка шаблона разбирается в его содержимое — таков разбор у него.
       const host = this.__ptLocal === 'template' ? __templateContent(this) : this;
       host.__ptKids = [];
-      for (const n of parseFragment(String(html))) host.appendChild(n);
+      for (const n of parseFragment(String(html))) __ptAdd.call(host, n);
     }
     get children() { return this.__ptKids.filter(n => n.nodeType === ELEMENT_NODE); }
     get firstElementChild() { return this.children[0] || null; }
@@ -1233,7 +1233,7 @@
       // Разметка шаблона разбирается в его содержимое — таков разбор у него.
       const host = this.__ptLocal === 'template' ? __templateContent(this) : this;
       host.__ptKids = [];
-      for (const n of parseFragment(String(html))) host.appendChild(n);
+      for (const n of parseFragment(String(html))) __ptAdd.call(host, n);
     }
     get outerHTML() { return serializeNode(this); }
     // Rendered text (hidden subtrees excluded, whitespace collapsed) — an
@@ -1974,6 +1974,14 @@
       return b;
     }
   }
+
+  // Свои же методы, снятые до страницы. Внутренние вставки не должны идти
+  // через имена, которые страница может подменить: в браузере ни
+  // `appendChild` изнутри `innerHTML`, ни `setAttribute` изнутри `new Image`
+  // не видны никому, а у нас каждая такая мелочь всплывала в чужом крючке.
+  const __ptInsert = Node.prototype.insertBefore;
+  const __ptAdd = Node.prototype.appendChild;
+  const __ptSetAttr = Element.prototype.setAttribute;
 
   // Холст для собственных нужд движка. Ни `document.createElement`, ни
   // `getContext` со страницы здесь не участвуют: всякий, кто их обернул — а
@@ -2983,7 +2991,19 @@
   // covers the markup scripts typically inject.
   function parseFragment(html) {
     const doc = globalThis.document;
-    const root = doc.createDocumentFragment();
+    // Разбор идёт мимо имён, которые видит страница: в браузере присваивание
+    // `innerHTML` не зовёт ни `createElement`, ни `appendChild`, ни
+    // `setAttribute`, а у нас каждая вставка разметки показывала их десятками
+    // всякому, кто эти методы обернул.
+    const O = globalThis.__pt_orig || {};
+    const mk = (name, self, args) => (O[name] ? O[name].apply(self, args) : self[name].apply(self, args));
+    const frag = () => mk('createDocumentFragment', doc, []);
+    const text = (t) => mk('createTextNode', doc, [t]);
+    const note = (t) => mk('createComment', doc, [t]);
+    const elem = (t) => mk('createElement', doc, [t]);
+    const put = (parent, child) => __ptAdd.call(parent, child);
+    const attr = (el, n, v) => __ptSetAttr.call(el, n, v);
+    const root = frag();
     const stack = [root];
     const top = () => stack[stack.length - 1];
     let i = 0;
@@ -2992,23 +3012,23 @@
         if (html.startsWith('<!--', i)) {
           const end = html.indexOf('-->', i + 4);
           const stop = end < 0 ? html.length : end;
-          top().appendChild(doc.createComment(html.slice(i + 4, stop)));
+          put(top(), note(html.slice(i + 4, stop)));
           i = end < 0 ? html.length : end + 3; continue;
         }
         const close = html[i + 1] === '/';
         const m = /^<\/?([a-zA-Z][\w-]*)((?:[^>"']|"[^"]*"|'[^']*')*)\/?>/.exec(html.slice(i));
-        if (!m) { top().appendChild(doc.createTextNode('<')); i++; continue; }
+        if (!m) { put(top(), text('<')); i++; continue; }
         const tag = m[1].toLowerCase();
         if (close) {
           for (let s = stack.length - 1; s > 0; s--) if (stack[s].localName === tag) { stack.length = s; break; }
         } else {
-          const el = doc.createElement(tag);
+          const el = elem(tag);
           for (const am of m[2].matchAll(/([\w-]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g)) {
             let v = am[2] || '';
             if (v && (v[0] === '"' || v[0] === "'")) v = v.slice(1, -1);
-            el.setAttribute(am[1], v);
+            attr(el, am[1], v);
           }
-          top().appendChild(el);
+          put(top(), el);
           const selfClose = m[0].endsWith('/>') || VOID.has(tag);
           if (!selfClose) stack.push(el);
         }
@@ -3016,8 +3036,8 @@
       } else {
         const next = html.indexOf('<', i);
         const stop = next < 0 ? html.length : next;
-        const text = html.slice(i, stop);
-        if (text) top().appendChild(doc.createTextNode(unescapeEntities(text)));
+        const chunk = html.slice(i, stop);
+        if (chunk) put(top(), text(unescapeEntities(chunk)));
         i = stop;
       }
     }
@@ -4419,9 +4439,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   const __ptImageCtor = (function () {
     'use strict';
     return function Image(w, h) {
-      const el = document.createElement('img');
-      if (w !== undefined) el.width = w | 0;
-      if (h !== undefined) el.height = h | 0;
+      const O = globalThis.__pt_orig;
+      const el = O && O.createElement
+        ? O.createElement.call(document, 'img')
+        : document.createElement('img');
+      if (w !== undefined) __ptSetAttr.call(el, 'width', String(w | 0));
+      if (h !== undefined) __ptSetAttr.call(el, 'height', String(h | 0));
       return el;
     };
   })();
@@ -4438,8 +4461,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   globalThis.Audio = (function () {
     'use strict';
     return function Audio(src) {
-      const el = document.createElement('audio');
-      if (src !== undefined) el.src = String(src);
+      const O = globalThis.__pt_orig;
+      const el = O && O.createElement
+        ? O.createElement.call(document, 'audio')
+        : document.createElement('audio');
+      if (src !== undefined) __ptSetAttr.call(el, 'src', String(src));
       return el;
     };
   })();

@@ -1487,7 +1487,19 @@ pub fn late_originals_script() -> String {
     const C = globalThis.HTMLCanvasElement && HTMLCanvasElement.prototype;
     if (C) { keep.getContext = C.getContext; keep.toDataURL = C.toDataURL; }
     const D = globalThis.Document && Document.prototype;
-    if (D) keep.createElement = D.createElement;
+    if (D) {
+      keep.createElement = D.createElement;
+      keep.createTextNode = D.createTextNode;
+      keep.createComment = D.createComment;
+      keep.createDocumentFragment = D.createDocumentFragment;
+    }
+    const N = globalThis.Node && Node.prototype;
+    if (N) { keep.appendChild = N.appendChild; keep.insertBefore = N.insertBefore; }
+    const E = globalThis.Element && Element.prototype;
+    if (E) keep.setAttribute = E.setAttribute;
+    Object.defineProperty(globalThis, '__pt_orig',
+      { value: keep, enumerable: false, configurable: true, writable: true });
+    // Старое имя — для слоёв, снятых до переименования.
     Object.defineProperty(globalThis, '__pt_canvasOrig',
       { value: keep, enumerable: false, configurable: true, writable: true });
   } catch (e) {}
