@@ -1497,6 +1497,18 @@ pub fn late_originals_script() -> String {
     if (N) { keep.appendChild = N.appendChild; keep.insertBefore = N.insertBefore; }
     const E = globalThis.Element && Element.prototype;
     if (E) keep.setAttribute = E.setAttribute;
+    // Методы GL — целиком: наш WebGPU лежит поверх WebGL и зовёт их десятками,
+    // а страница может обернуть любой. Снимок делается один раз, отсюда.
+    for (const N of ['WebGLRenderingContext', 'WebGL2RenderingContext']) {
+      const C = globalThis[N];
+      if (!C || !C.prototype) continue;
+      const table = Object.create(null);
+      for (const k of Object.getOwnPropertyNames(C.prototype)) {
+        const d = Object.getOwnPropertyDescriptor(C.prototype, k);
+        if (d && typeof d.value === 'function') table[k] = d.value;
+      }
+      keep[N] = table;
+    }
     Object.defineProperty(globalThis, '__pt_orig',
       { value: keep, enumerable: false, configurable: true, writable: true });
     // Старое имя — для слоёв, снятых до переименования.
@@ -3535,13 +3547,37 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     // Холст под наш GL — внутренний: WebGPU у нас лежит поверх WebGL, и через
     // `OffscreenCanvas.getContext` страница видела бы лишний контекст, которого
     // у браузера здесь нет.
+    // Контекст, закрытый от страницы: методы берутся из снимка, снятого до
+    // неё, а не с прототипа, который она могла обернуть. Наружу этот заслон не
+    // выходит — им пользуется только наш же WebGPU.
+    const shield = (gl) => {
+      const keep = globalThis.__pt_orig;
+      if (!gl || !keep) return gl;
+      const table = (globalThis.WebGL2RenderingContext && gl instanceof WebGL2RenderingContext
+        ? keep.WebGL2RenderingContext : keep.WebGLRenderingContext) || null;
+      if (!table) return gl;
+      const bound = new Map();
+      return new Proxy(gl, {
+        get(t, k) {
+          const own = table[k];
+          if (typeof own === 'function') {
+            let f = bound.get(k);
+            if (!f) { f = own.bind(t); bound.set(k, f); }
+            return f;
+          }
+          const v = t[k];
+          return typeof v === 'function' ? v.bind(t) : v;
+        },
+      });
+    };
     const glFor = (w, h) => {
       if (globalThis.__pt_privateCanvas && globalThis.__pt_privateCtx) {
         const c = globalThis.__pt_privateCanvas(w, h);
-        return globalThis.__pt_privateCtx(c, 'webgl2') || globalThis.__pt_privateCtx(c, 'webgl');
+        return shield(globalThis.__pt_privateCtx(c, 'webgl2')
+          || globalThis.__pt_privateCtx(c, 'webgl'));
       }
       const c = new G.OffscreenCanvas(w, h);
-      return c.getContext('webgl2') || c.getContext('webgl');
+      return shield(c.getContext('webgl2') || c.getContext('webgl'));
     };
     const runPass = (tex, pass) => {
       const gl = tex.gl;
