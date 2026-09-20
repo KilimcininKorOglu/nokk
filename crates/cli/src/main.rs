@@ -413,6 +413,7 @@ async fn main() -> Result<()> {
             // больше — всякая лишняя подмена меняет то, что мы измеряем.
             if std::env::var("NOKK_TRACE_BEACON").is_ok() {
                 let probe = r#"(() => {
+                  globalThis.__ptEncMin = __ENCMIN__;
                   try {
                     const S = XMLHttpRequest.prototype.send;
                     const O = XMLHttpRequest.prototype.open;
@@ -496,7 +497,7 @@ async fn main() -> Result<()> {
                         if (!enc || enc.__ptWrapped) return !!enc;
                         const wrapped = function (x) {
                           const s = String(x == null ? '' : x);
-                          if (s.length > 30 && (globalThis.__encN = (globalThis.__encN || 0) + 1) < 70) {
+                          if (s.length > (globalThis.__ptEncMin || 30) && (globalThis.__encN = (globalThis.__encN || 0) + 1) < 70) {
                             let at = '';
                             try {
                               at = String(new Error().stack || '').split('\n').slice(2, 5)
@@ -524,6 +525,24 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                     count(globalThis.OfflineAudioContext && OfflineAudioContext.prototype, 'audio',
                           ['startRendering', 'createOscillator', 'createDynamicsCompressor']);
                     count(globalThis.HTMLMediaElement && HTMLMediaElement.prototype, 'media', ['canPlayType']);
+                    // Что именно спрашивают про кодеки и что мы ответили:
+                    // Chrome на том же списке даёт другие слова, а список
+                    // нужен целиком, чтобы сверить его offline.
+                    try {
+                      const M = globalThis.HTMLMediaElement && HTMLMediaElement.prototype;
+                      const C = M && M.canPlayType;
+                      if (C && !C.__ptSaid) {
+                        const V = function canPlayType(t) {
+                          const r = C.apply(this, arguments);
+                          try { console.error('[кодек] ' + String(t) + ' -> ' + String(r)); } catch (e) {}
+                          return r;
+                        };
+                        V.__ptSaid = 1;
+                        Object.defineProperty(M, 'canPlayType',
+                          { value: globalThis.__pt_native ? __pt_native(V) : V,
+                            writable: true, enumerable: false, configurable: true });
+                      }
+                    } catch (e) {}
                     count(globalThis.HTMLCanvasElement && HTMLCanvasElement.prototype, 'canvas',
                           ['transferControlToOffscreen', 'toDataURL', 'toBlob', 'captureStream', 'getContext']);
                     count(globalThis.OffscreenCanvas && OffscreenCanvas.prototype, 'off',
@@ -729,8 +748,15 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                     });
                   } catch (e) {}
                 })();"#;
-                c.add_frame_init_script(probe.to_string());
-                c.add_init_script(probe.to_string());
+                // Порог, ниже которого куски отчёта в лог не идут: мелочь
+                // топит вывод, но иногда именно короткий кусок и отличается
+                // (список шрифтов у Chrome — 71 знак).
+                let probe = probe.replace(
+                    "__ENCMIN__",
+                    &std::env::var("NOKK_ENC_MIN").unwrap_or_else(|_| "30".into()),
+                );
+                c.add_frame_init_script(probe.clone());
+                c.add_init_script(probe);
             }
             // Исходник чужой программы. Её строят `new Function`, и это
             // единственное место, где она видна текстом: то, что приходит по

@@ -3521,27 +3521,48 @@
     def(svgEl, 'createSVGLength', function createSVGLength() { return svgLength(0); });
   }
 
-  // Опрос кодеков — стандартный блок отпечатка, и у нас его не было вовсе:
-  // `video.canPlayType` не существовал, вызов бросал. Ответы сняты с Chrome 151
-  // на тридцати восьми типах; правило из них выводится однозначно — известный
-  // контейнер без кодеков это «maybe», с известными кодеками «probably», всё
-  // прочее пустая строка.
+  // Опрос кодеков — стандартный блок отпечатка, и он идёт в отчёт челленджа
+  // целиком. Прежнее правило («известный контейнер плюс известный кодек —
+  // significa probably») было втрое шире браузерного: Chrome сверяет кодек
+  // именно с контейнером, и 220 ответов из 597 у нас расходились. Таблица
+  // снята с Chrome 151 на этой машине перебором 597 строк; `audio/mpeg`,
+  // `audio/aac` и `audio/flac` сами себе кодек, поэтому без списка кодеков
+  // отвечают `probably`, остальные известные — `maybe`.
   {
-    const CONTAINERS = new Set(['video/mp4', 'video/webm', 'video/ogg', 'video/3gpp',
-                                'audio/mp4', 'audio/ogg', 'audio/wav', 'audio/webm', 'audio/x-m4a']);
-    // Эти типа сами себе кодек: контейнер и содержимое одно и то же.
+    const FAMILY = {
+      'video/mp4': ['avc1.', 'avc3.', 'hev1.', 'hvc1.', 'av01.', 'vp09.', 'mp4a.40.',
+                    'mp4a.69', 'mp4a.6b', 'mp3', 'opus', 'flac'],
+      'video/webm': ['vp8', 'vp9', 'vp09.', 'av01.', 'opus', 'vorbis'],
+      'video/ogg': ['vp8', 'opus', 'vorbis', 'flac'],
+      'video/3gpp': ['avc1.', 'avc3.', 'mp4a.40.'],
+      'video/x-matroska': ['avc1.', 'avc3.', 'hev1.', 'hvc1.', 'av01.', 'vp8', 'vp09.',
+                           'mp4a.40.', 'mp4a.69', 'mp4a.6b', 'mp3', 'opus', 'vorbis', 'flac', '1'],
+      'application/x-mpegurl': ['avc1.', 'avc3.', 'mp4a.40.', 'mp4a.69', 'mp4a.6b', 'mp3'],
+      'application/vnd.apple.mpegurl': ['avc1.', 'avc3.', 'mp4a.40.', 'mp4a.69', 'mp4a.6b', 'mp3'],
+      'audio/mp4': ['mp4a.40.', 'mp4a.69', 'mp4a.6b', 'mp3', 'opus', 'flac'],
+      'audio/ogg': ['opus', 'vorbis', 'flac'],
+      'audio/webm': ['opus', 'vorbis'],
+      'audio/wav': ['1'],
+      'audio/x-wav': ['1'],
+      'audio/x-m4a': ['mp4a.40.'],
+      'audio/mpeg': ['mp3', 'mp4a.69', 'mp4a.6b'],
+      'audio/aac': [],
+      'audio/flac': [],
+    };
+    // Эти типы сами себе кодек: контейнер и содержимое одно и то же.
     const SINGLE = new Set(['audio/mpeg', 'audio/aac', 'audio/flac']);
-    const CODEC_OK = /^(avc1\.|avc3\.|hev1\.|hvc1\.|av01\.|vp8$|vp9$|vp09\.|vorbis$|opus$|mp4a\.40\.|flac$|1$|mp3$|ec-3$|ac-3$)/;
     const canPlay = function canPlayType(type) {
       const t = String(type == null ? '' : type).trim();
       const semi = t.indexOf(';');
       const mime = (semi < 0 ? t : t.slice(0, semi)).trim().toLowerCase();
       const rest = semi < 0 ? '' : t.slice(semi + 1);
       const m = /codecs\s*=\s*"?([^"]*)"?/i.exec(rest);
-      const codecs = m ? m[1].split(',').map((c) => c.trim()).filter(Boolean) : [];
-      if (!CONTAINERS.has(mime) && !SINGLE.has(mime)) return '';
+      const codecs = m ? m[1].split(',').map((c) => c.trim().toLowerCase()).filter(Boolean) : [];
+      const allowed = FAMILY[mime];
+      if (!allowed) return '';
       if (!codecs.length) return SINGLE.has(mime) ? 'probably' : 'maybe';
-      return codecs.every((c) => CODEC_OK.test(c)) ? 'probably' : '';
+      const fits = (c) => allowed.some((a) => (a.charAt(a.length - 1) === '.' ? c.indexOf(a) === 0 : c === a));
+      return codecs.every(fits) ? 'probably' : '';
     };
     const M = globalThis.HTMLMediaElement && globalThis.HTMLMediaElement.prototype;
     if (M) {

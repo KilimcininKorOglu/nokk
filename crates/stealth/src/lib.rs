@@ -3877,12 +3877,38 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
   } catch (e) {}
   // Статические члены расставляются по таблице после того, как их определил
   // слой DOM, — и заглушка затирает настоящую проверку кодеков. Возвращаем её
-  // здесь: ответ тот же, что у `canPlayType`, только логический.
+  // здесь. Это **не** `canPlayType`, хотя раньше отвечало через него: у
+  // потокового источника свой список, снятый с Chrome 151 перебором 597 строк.
+  // Он и шире (`video/mp2t` поддержан, хотя `canPlayType` про него молчит), и
+  // уже (`mp3`, `mp4a.69` и `video/x-matroska` не поддержаны вовсе).
   try {
-    const V = globalThis.document && globalThis.document.createElement
-      ? globalThis.document.createElement('video') : null;
-    if (V && typeof V.canPlayType === 'function' && globalThis.MediaSource) {
-      const fn = function isTypeSupported(type) { return V.canPlayType(type) === 'probably'; };
+    if (globalThis.MediaSource) {
+      const MSE = {
+        'video/mp4': ['avc1.', 'avc3.', 'hev1.', 'hvc1.', 'av01.', 'vp09.', 'mp4a.40.2',
+                      'mp4a.40.5', 'opus', 'flac'],
+        'video/webm': ['vp8', 'vp9', 'vp09.', 'av01.', 'opus', 'vorbis'],
+        'video/mp2t': ['avc1.', 'avc3.', 'mp4a.40.', 'mp4a.69', 'mp4a.6b', 'mp3'],
+        'audio/mp4': ['mp4a.40.2', 'mp4a.40.5', 'opus', 'flac'],
+        'audio/webm': ['opus', 'vorbis'],
+        'audio/mpeg': [],
+        'audio/aac': [],
+      };
+      // Без списка кодеков соглашаются только эти три: остальным контейнерам
+      // мало имени.
+      const BARE = new Set(['audio/mpeg', 'audio/aac', 'video/mp2t']);
+      const fn = function isTypeSupported(type) {
+        const t = String(type == null ? '' : type).trim();
+        const semi = t.indexOf(';');
+        const mime = (semi < 0 ? t : t.slice(0, semi)).trim().toLowerCase();
+        const rest = semi < 0 ? '' : t.slice(semi + 1);
+        const m = /codecs\s*=\s*"?([^"]*)"?/i.exec(rest);
+        const codecs = m ? m[1].split(',').map((c) => c.trim().toLowerCase()).filter(Boolean) : [];
+        const allowed = MSE[mime];
+        if (!allowed) return false;
+        if (!codecs.length) return BARE.has(mime);
+        return codecs.every((c) => allowed.some(
+          (a) => (a.charAt(a.length - 1) === '.' ? c.indexOf(a) === 0 : c === a)));
+      };
       Object.defineProperty(globalThis.MediaSource, 'isTypeSupported', {
         value: globalThis.__pt_native ? __pt_native(fn) : fn,
         writable: true, enumerable: false, configurable: true,

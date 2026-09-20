@@ -9062,6 +9062,75 @@ opacity: 0.9; flex-flow: column; }",
         );
     }
 
+    /// Опрос кодеков идёт в отчёт челленджа целиком, а наше правило было
+    /// втрое шире браузерного — «известный контейнер плюс известный кодек».
+    /// Chrome сверяет кодек именно с контейнером, и у потокового источника
+    /// список свой, не равный `canPlayType`. Обе таблицы сняты перебором 597
+    /// строк на Chrome 151; здесь закреплены те ответы, на которых прежнее
+    /// правило ошибалось.
+    #[tokio::test]
+    async fn codecs_are_answered_container_by_container() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const v = document.createElement('video');
+            const a = document.createElement('audio');
+            const ask = (t) => (t.slice(0, 5) === 'audio' ? a : v).canPlayType(t);
+            return __ptJSON.stringify({
+              mp4ac3: ask('audio/mp4; codecs="ac-3"'),
+              mp4ec3: ask('audio/mp4; codecs="ec-3"'),
+              mp4vp8: ask('video/mp4; codecs="vp8"'),
+              mp4avc: ask('video/mp4; codecs="avc1.42E01E"'),
+              mp4pair: ask('video/mp4; codecs="avc1.42E01E, mp4a.40.2"'),
+              webmAvc: ask('video/webm; codecs="avc1.42E01E"'),
+              webmVp9: ask('video/webm; codecs="vp9"'),
+              theora: ask('video/ogg; codecs="theora"'),
+              mkvBare: ask('video/x-matroska;'),
+              mkvVp8: ask('video/x-matroska; codecs="vp8"'),
+              hls: ask('application/x-mpegurl;'),
+              mpegBare: ask('audio/mpeg;'),
+              mpegOpus: ask('audio/mpeg; codecs="opus"'),
+              wavPcm: ask('audio/x-wav; codecs="1"'),
+              mseTs: MediaSource.isTypeSupported('video/mp2t;'),
+              mseMp4Mp3: MediaSource.isTypeSupported('video/mp4; codecs="mp3"'),
+              mseMp4Avc: MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"'),
+              mseMkv: MediaSource.isTypeSupported('video/x-matroska; codecs="vp8"'),
+              mseAacBare: MediaSource.isTypeSupported('audio/aac;'),
+              mseMp4Bare: MediaSource.isTypeSupported('audio/mp4;'),
+            });
+        })()"#).await;
+
+        for (key, want) in [
+            ("mp4ac3", ""),
+            ("mp4ec3", ""),
+            ("mp4vp8", ""),
+            ("mp4avc", "probably"),
+            ("mp4pair", "probably"),
+            ("webmAvc", ""),
+            ("webmVp9", "probably"),
+            ("theora", ""),
+            ("mkvBare", "maybe"),
+            ("mkvVp8", "probably"),
+            ("hls", "maybe"),
+            ("mpegBare", "probably"),
+            ("mpegOpus", ""),
+            ("wavPcm", "probably"),
+        ] {
+            assert_eq!(out[key], want, "{key} отвечает не как браузер: {out}");
+        }
+        assert_eq!(out["mseTs"], true, "поток MPEG-TS источник принимает");
+        assert_eq!(out["mseMp4Mp3"], false, "а mp3 в mp4 — нет, хотя canPlayType про него говорит `probably`");
+        assert_eq!(out["mseMp4Avc"], true);
+        assert_eq!(out["mseMkv"], false, "матрёшку потоковый источник не берёт вовсе");
+        assert_eq!(out["mseAacBare"], true);
+        assert_eq!(out["mseMp4Bare"], false);
+    }
+
     /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`
     /// is the idiom every collector uses, Cloudflare's included — the URL is dead
     /// one line after the worker starts. Reading the blob when the engine got
