@@ -280,6 +280,7 @@
 
     appendChild(child) {
       __needArgs(arguments.length, 1, 'appendChild', 'Node');
+      __needNode(child, 1, 'appendChild');
       // Узел не может содержать сам себя — и своего предка тоже.
       for (let p = this; p; p = p.parentNode) {
         if (p === child) {
@@ -291,12 +292,21 @@
       return this.insertBefore(child, null);
     }
     insertBefore(child, ref) {
+      __needArgs(arguments.length, 2, 'insertBefore', 'Node');
+      __needNode(child, 1, 'insertBefore');
+      // Второй параметр у браузера — `Node?`: `undefined` для него та же
+      // пустота, что и `null`, и означает «в конец».
+      if (ref !== null && ref !== undefined) {
+        __needNode(ref, 2, 'insertBefore');
+        __needChild(this, ref, 'insertBefore',
+          'The node before which the new node is to be inserted is not a child of this node.');
+      }
       if (child.nodeType === DOCUMENT_FRAGMENT_NODE) {
         for (const c of child.__ptKids.slice()) this.insertBefore(c, ref);
         return child;
       }
       if (child.parentNode) child.parentNode.removeChild(child);
-      const i = ref ? this.__ptKids.indexOf(ref) : -1;
+      const i = (ref === null || ref === undefined) ? -1 : this.__ptKids.indexOf(ref);
       if (i < 0) this.__ptKids.push(child); else this.__ptKids.splice(i, 0, child);
       child.parentNode = this;
       __markDirty();
@@ -312,6 +322,7 @@
     }
     removeChild(child) {
       __needArgs(arguments.length, 1, 'removeChild', 'Node');
+      __needNode(child, 1, 'removeChild');
       const i = this.__ptKids.indexOf(child);
       if (i < 0) {
         throw new (globalThis.DOMException || Error)(
@@ -331,7 +342,15 @@
       });
       return child;
     }
-    replaceChild(nw, old) { this.insertBefore(nw, old); return this.removeChild(old); }
+    replaceChild(nw, old) {
+      __needArgs(arguments.length, 2, 'replaceChild', 'Node');
+      __needNode(nw, 1, 'replaceChild');
+      __needNode(old, 2, 'replaceChild');
+      __needChild(this, old, 'replaceChild',
+        'The node to be replaced is not a child of this node.');
+      this.insertBefore(nw, old);
+      return this.removeChild(old);
+    }
     cloneNode(deep) {
       const c = this.__ptShallowClone();
       if (deep) for (const ch of this.__ptKids) c.appendChild(ch.cloneNode(true));
@@ -572,6 +591,9 @@
   class DocumentFragment extends Node {
     constructor() { super(DOCUMENT_FRAGMENT_NODE); }
     get [Symbol.toStringTag]() { return 'DocumentFragment'; }
+    // Обрывок тоже копируется: без этого `cloneNode` на нём падал, а через
+    // него ходят `importNode` и содержимое `<template>`.
+    __ptShallowClone() { const f = new DocumentFragment(); f.ownerDocument = this.ownerDocument; return f; }
     get children() { return __collection(this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE)); }
     get childElementCount() { return this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE).length; }
     get firstElementChild() { return this.__ptKids.find((n) => n.nodeType === ELEMENT_NODE) || null; }
@@ -1524,6 +1546,35 @@
     createComment(t) { const n = new Comment(t); n.ownerDocument = this; return n; }
     createDocumentFragment() { const f = new DocumentFragment(); f.ownerDocument = this; return f; }
     createEvent() { return new Event(''); }
+    // Копия чужого узла для этого документа. Имени хватало в перечне свойств,
+    // а вызов возвращал пустоту — и страница, которая кладёт содержимое
+    // шаблона в тело (челлендж Cloudflare делает ровно это), спотыкалась на
+    // следующей строке: `replaceChild(undefined, …)`.
+    importNode(node, deep) {
+      __needArgs(arguments.length, 1, 'importNode', 'Document');
+      __needNode(node, 1, 'importNode', 'Document');
+      if (node.nodeType === DOCUMENT_NODE) {
+        throw new (globalThis.DOMException || Error)(
+          "Failed to execute 'importNode' on 'Document': The node provided is a document, " +
+          "which may not be imported.", 'NotSupportedError');
+      }
+      const copy = node.cloneNode(!!deep);
+      __walkTree(copy, (n) => { n.ownerDocument = this; });
+      return copy;
+    }
+    // Тот же узел, но уже наш: у прежнего родителя его больше нет.
+    adoptNode(node) {
+      __needArgs(arguments.length, 1, 'adoptNode', 'Document');
+      __needNode(node, 1, 'adoptNode', 'Document');
+      if (node.nodeType === DOCUMENT_NODE) {
+        throw new (globalThis.DOMException || Error)(
+          "Failed to execute 'adoptNode' on 'Document': The node provided is a document, " +
+          "which may not be adopted.", 'NotSupportedError');
+      }
+      if (node.parentNode) node.parentNode.removeChild(node);
+      __walkTree(node, (n) => { n.ownerDocument = this; });
+      return node;
+    }
 
     getElementById(id) { return this.documentElement ? this.documentElement.getElementById(id) : null; }
     getElementsByTagName(t) { return __collection(this.documentElement ? __tags(this.documentElement, t) : []); }
@@ -2820,6 +2871,25 @@
     if (got >= want) return;
     throw new TypeError("Failed to execute '" + method + "' on '" + iface + "': " +
       want + " argument" + (want === 1 ? '' : 's') + " required, but only " + got + " present.");
+  };
+
+  // Не узел там, где нужен узел. Браузер отвечает своим `TypeError` ещё до
+  // всякой работы, и текст у него слово в слово такой; у нас вместо него
+  // вылезало внутреннее «Cannot read properties of undefined», то есть
+  // подпись движка. Чужой код это читает: челлендж Cloudflare нарочно зовёт
+  // `replaceChild` не тем и сверяет, что ему ответили.
+  const __needNode = (v, n, method, iface) => {
+    if (v !== null && typeof v === 'object' && typeof v.nodeType === 'number') return;
+    throw new TypeError("Failed to execute '" + method + "' on '" + (iface || 'Node') + "': " +
+      "parameter " + n + " is not of type 'Node'.");
+  };
+
+  // Узел, перед которым (или вместо которого) просят вставить, обязан быть
+  // ребёнком. Браузер на чужом узле бросает `NotFoundError` своими словами.
+  const __needChild = (parent, ref, method, what) => {
+    if (parent.__ptKids.indexOf(ref) >= 0) return;
+    throw new (globalThis.DOMException || Error)(
+      "Failed to execute '" + method + "' on 'Node': " + what, 'NotFoundError');
   };
 
   function matchesSelector(el, selector) {

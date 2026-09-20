@@ -538,6 +538,13 @@ pub fn native_intl() -> bool {
         || std::env::var("NOKK_NATIVE_INTL").is_ok()
 }
 
+/// Показывать ли странице кадры самого движка в `error.stack`. Обычно нет —
+/// в браузере их там нет вовсе (см. [`STACK_TEMPLATE`]); `NOKK_STACK_RAW=1`
+/// возвращает их, когда разбираешь, обо что споткнулась чужая программа.
+fn stack_raw() -> bool {
+    std::env::var("NOKK_STACK_RAW").is_ok()
+}
+
 pub fn bootstrap_script(profile: &StealthProfile) -> String {
     // `appVersion` is the userAgent without the leading "Mozilla/".
     let app_version = profile
@@ -596,7 +603,9 @@ pub fn bootstrap_script(profile: &StealthProfile) -> String {
         if fast_timers() { "true" } else { "false" },
     );
 
-    format!("{env}\n{intl}\n{timers}\n{STACK_TEMPLATE}\n{PERFORMANCE_TEMPLATE}\n{CRYPTO_TEMPLATE}\n{FETCH_TEMPLATE}")
+    let stack = STACK_TEMPLATE.replace("__STACK_RAW__", if stack_raw() { "true" } else { "false" });
+
+    format!("{env}\n{intl}\n{timers}\n{stack}\n{PERFORMANCE_TEMPLATE}\n{CRYPTO_TEMPLATE}\n{FETCH_TEMPLATE}")
 }
 
 /// Whether timers collapse their delays instead of waiting them out
@@ -4085,7 +4094,12 @@ const STACK_TEMPLATE: &str = r##"(() => {
   };
   globalThis.__pt_formatStack = (err, sites) => {
     let keep = sites;
-    try { keep = Array.prototype.filter.call(sites, (f) => !ours(f)); } catch (e) {}
+    // Сырой стек — для разбора собственных поломок: с ним видно, в каком
+    // месте движка встала чужая программа. Наружу такой стек показывать
+    // нельзя, поэтому только по отдельной переменной окружения.
+    if (!__STACK_RAW__) {
+      try { keep = Array.prototype.filter.call(sites, (f) => !ours(f)); } catch (e) {}
+    }
     try {
       const mine = Error.prepareStackTrace;
       if (typeof mine === 'function') return mine(err, keep);

@@ -8995,6 +8995,73 @@ opacity: 0.9; flex-flow: column; }",
         );
     }
 
+    /// `importNode` стояло в перечне имён, но вызов возвращал пустоту — и
+    /// страница, которая кладёт содержимое шаблона в тело (челлендж Cloudflare
+    /// делает ровно это), падала строкой ниже, на `replaceChild(undefined, …)`.
+    /// Сообщения об ошибке — тоже поверхность отпечатка: чужой код зовёт эти
+    /// методы не тем нарочно и сверяет ответ с браузерным дословно.
+    #[tokio::test]
+    async fn a_document_imports_a_node_and_complains_like_a_browser() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const say = (f) => { try { f(); return 'без ошибки'; }
+                                 catch (e) { return e.constructor.name + ': ' + e.message; } };
+            const t = document.createElement('template');
+            t.innerHTML = '<div id=a><span>x</span></div>';
+            const div = document.createElement('div');
+            document.body.appendChild(div);
+            document.body.replaceChild(document.importNode(t.content, true), div);
+            const loose = document.createElement('b');
+            document.body.appendChild(loose);
+            const taken = document.adoptNode(loose);
+            return __ptJSON.stringify({
+              imported: !!document.body.querySelector('#a'),
+              shallow: document.importNode(t.content, false).childNodes.length,
+              adopted: taken === loose && taken.parentNode === null,
+              noArgs: say(() => document.importNode()),
+              notNode: say(() => document.importNode(undefined, true)),
+              wholeDoc: say(() => document.importNode(document, true)),
+              replaceNothing: say(() => document.body.replaceChild(undefined, document.body.firstChild)),
+              replaceStranger: say(() => document.body.replaceChild(div, document.createElement('i'))),
+              insertOnce: say(() => document.body.insertBefore(div)),
+            });
+        })()"#).await;
+
+        assert_eq!(out["imported"], true, "содержимое шаблона легло в тело");
+        assert_eq!(out["shallow"], 0, "без `deep` копируется только сам узел");
+        assert_eq!(out["adopted"], true);
+        assert_eq!(
+            out["noArgs"],
+            "TypeError: Failed to execute 'importNode' on 'Document': 1 argument required, but only 0 present."
+        );
+        assert_eq!(
+            out["notNode"],
+            "TypeError: Failed to execute 'importNode' on 'Document': parameter 1 is not of type 'Node'."
+        );
+        assert_eq!(
+            out["wholeDoc"],
+            "DOMException: Failed to execute 'importNode' on 'Document': The node provided is a document, which may not be imported."
+        );
+        assert_eq!(
+            out["replaceNothing"],
+            "TypeError: Failed to execute 'replaceChild' on 'Node': parameter 1 is not of type 'Node'."
+        );
+        assert_eq!(
+            out["replaceStranger"],
+            "DOMException: Failed to execute 'replaceChild' on 'Node': The node to be replaced is not a child of this node."
+        );
+        assert_eq!(
+            out["insertOnce"],
+            "TypeError: Failed to execute 'insertBefore' on 'Node': 2 arguments required, but only 1 present."
+        );
+    }
+
     /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`
     /// is the idiom every collector uses, Cloudflare's included — the URL is dead
     /// one line after the worker starts. Reading the blob when the engine got

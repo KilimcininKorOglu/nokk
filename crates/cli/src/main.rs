@@ -573,6 +573,27 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                         // Челлендж ловит свои исключения сам и докладывает о них
                         // на `/eb/`. Ловушка на самом рождении ошибки — самое
                         // лёгкое, что можно поставить: конструктор, а не метод.
+                        // Маяк `/eb/` уходит зашифрованным, но перед шифром
+                        // челлендж сериализует пойманную ошибку сам —
+                        // `JSON.stringify(err, Object.getOwnPropertyNames(err))`.
+                        // Здесь она видна открытым текстом. Крючок срабатывает
+                        // только на ошибке: всё прочее идёт мимо него нетронутым.
+                        if (!globalThis.__ptJsonHook) {
+                          globalThis.__ptJsonHook = 1;
+                          const S = JSON.stringify;
+                          JSON.stringify = function (v, ...rest) {
+                            try {
+                              if (v instanceof Error) {
+                                console.error('[пойман] ' + Math.round(performance.now()) + 'мс ' +
+                                  String(v.name) + ': ' + String(v.message).slice(0, 200) + ' | поля: ' +
+                                  Object.getOwnPropertyNames(v).join(',') + ' | ' +
+                                  String(v.stack || '').split(String.fromCharCode(10)).slice(0, 5)
+                                    .map((l) => l.trim()).join(' <- ').slice(0, 300));
+                              }
+                            } catch (x) {}
+                            return S.call(this, v, ...rest);
+                          };
+                        }
                         if (!globalThis.__ptErrHook) {
                           globalThis.__ptErrHook = 1;
                           let shown = 0;
@@ -732,6 +753,93 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                     };
                     const mask = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
                     const wrap = (host) => {
+                      // Маяк `/eb/` уходит зашифрованным, но пойманную ошибку
+                      // челлендж сериализует до шифра — и `JSON` для этого
+                      // берёт не наш, а чистый, из области. Здесь она видна
+                      // открытым текстом. Жалуемся в консоль кадра: своей у
+                      // области нет, её никто не вычитывает.
+                      try {
+                        const J = host.JSON;
+                        if (J && typeof J.stringify === 'function' && !J.stringify.__ptSeen) {
+                          const S = J.stringify;
+                          const V = function stringify(v) {
+                            try {
+                              if (v && typeof v === 'object' && typeof v.stack === 'string') {
+                                console.error('[пойман] ' + Math.round(performance.now()) + 'мс ' +
+                                  String(v.name) + ': ' + String(v.message).slice(0, 200) +
+                                  ' | поля: ' + Object.getOwnPropertyNames(v).join(',') + ' | ' +
+                                  String(v.stack).split(String.fromCharCode(10)).slice(0, 6)
+                                    .map((l) => l.trim()).join(' <- ').slice(0, 320));
+                              }
+                            } catch (e) {}
+                            return S.apply(this, arguments);
+                          };
+                          V.__ptSeen = 1;
+                          J.stringify = mask(V);
+                        }
+                      } catch (e) {}
+                      // Чем зовут подмену узла. Чистые ссылки челлендж берёт
+                      // из области, поэтому крючок ставится там же; соседние
+                      // `appendChild`/`insertBefore` не трогаем — они на
+                      // горячем пути, и обёртка на них меняет ход сбора.
+                      try {
+                        // Кольцо последних обращений к тем местам, откуда
+                        // берут узлы: когда подмена получает пустоту, надо
+                        // знать, что её родило.
+                        if (!globalThis.__ptRing) globalThis.__ptRing = [];
+                        const ring = globalThis.__ptRing;
+                        const note = (what, got) => {
+                          try {
+                            ring.push(Math.round(performance.now()) + 'мс ' + what + ' -> ' +
+                              (got === undefined ? 'undefined' : got === null ? 'null'
+                                : (typeof got === 'object' ? String(got.nodeName || Object.prototype.toString.call(got)) : typeof got)));
+                            if (ring.length > 16) ring.shift();
+                          } catch (e) {}
+                        };
+                        const watch = (obj, label, names) => {
+                          if (!obj) return;
+                          for (const n of names) {
+                            try {
+                              const F = obj[n];
+                              if (typeof F !== 'function' || F.__ptSeen) continue;
+                              const V = function (...a) {
+                                const r = F.apply(this, a);
+                                note(label + '.' + n + '(' + a.map((x) => typeof x === 'string' ? x.slice(0, 24) : typeof x).join(',') + ')', r);
+                                return r;
+                              };
+                              V.__ptSeen = 1;
+                              Object.defineProperty(obj, n,
+                                { value: mask(V), writable: true, enumerable: false, configurable: true });
+                            } catch (e) {}
+                          }
+                        };
+                        const D = host.Document && host.Document.prototype;
+                        watch(D, 'doc', ['createElement', 'createElementNS', 'createTextNode', 'createComment',
+                                         'createDocumentFragment', 'importNode', 'adoptNode', 'getElementById',
+                                         'querySelector', 'createRange', 'getElementsByTagName', 'write']);
+                        watch(host.Node && host.Node.prototype, 'node', ['cloneNode']);
+                        watch(host.Element && host.Element.prototype, 'el', ['attachShadow', 'closest', 'querySelector']);
+                        watch(host.DOMParser && host.DOMParser.prototype, 'parser', ['parseFromString']);
+                        const P = host.Node && host.Node.prototype;
+                        if (P && typeof P.replaceChild === 'function' && !P.replaceChild.__ptSeen) {
+                          const F = P.replaceChild;
+                          const V = function replaceChild(...a) {
+                            try {
+                              console.error('[замена] ' + Math.round(performance.now()) + 'мс на ' +
+                                (this && this.nodeName) + ' аргументов=' + a.length + ' [' +
+                                a.map((x) => x === undefined ? 'undefined' : x === null ? 'null'
+                                  : (typeof x === 'object' ? String(x.nodeName) : typeof x + ':' + String(x).slice(0, 20))).join(', ') + ']');
+                              if (a[0] === undefined || a[0] === null) {
+                                for (const line of (globalThis.__ptRing || [])) console.error('[до замены] ' + line);
+                              }
+                            } catch (e) {}
+                            return F.apply(this, a);
+                          };
+                          V.__ptSeen = 1;
+                          Object.defineProperty(P, 'replaceChild',
+                            { value: mask(V), writable: true, enumerable: false, configurable: true });
+                        }
+                      } catch (e) {}
                       const G = host.Function;
                       if (typeof G !== 'function' || G.__ptSeen) return;
                       const W = function Function(...a) { keep(a); return new G(...a); };
@@ -1832,6 +1940,16 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
             // обе, иначе легко сличить не то с тем.
             for (js, tag) in [
                 ("typeof __pt_vmSrc === 'string' ? __pt_vmSrc : ''", "js"),
+                // Самый большой встроенный скрипт документа: у кадра виджета
+                // там и толкователь, и сам сбор — то место, куда указывают
+                // смещения в стеке чужих ошибок.
+                (
+                    "(() => { let big = ''; for (const e of document.scripts) \
+                       if (!e.src && e.textContent && e.textContent.length > big.length) \
+                         big = e.textContent; \
+                     return big; })()",
+                    "doc",
+                ),
                 ("typeof __ptProg === 'string' ? __ptProg : ''", "join"),
                 // Склейки помельче — отчёт, перечисление стилей — по одной
                 // на файл: сравнивать их с браузером построчно можно только
