@@ -427,6 +427,21 @@ async fn main() -> Result<()> {
                         if (/\/fo\//.test(this.__ptU || '') && b && b.length > 50000) {
                           try { globalThis.__ptDumpCounts && __ptDumpCounts(); } catch (e) {}
                         }
+                        // Оракул по размерам: какая программа пришла в ответ на
+                        // первый POST и чем ответили на отчёт. Расшифрованная
+                        // длина, а не сжатая, — сравнивать с Chrome через
+                        // `tools/netwatch.js`.
+                        if (/\/cdn-cgi\/challenge-platform\//.test(this.__ptU || '')) {
+                          const url = this.__ptU, t0 = Math.round(performance.now());
+                          const sent = (b && b.length) || 0;
+                          this.addEventListener('loadend', () => {
+                            let got = 0;
+                            try { got = (this.responseText || '').length; } catch (e) {}
+                            console.error('[xhr] ' + t0 + 'мс тело=' + sent + ' → ' + this.status +
+                                          ' ответ=' + got + ' за ' + (Math.round(performance.now()) - t0) +
+                                          'мс ' + url.slice(-46));
+                          });
+                        }
                         if (/\/eb\//.test(this.__ptU || '')) {
                           const at = String(new Error().stack || '(без стека)');
                           for (const line of at.split('\n').slice(0, 14)) {
@@ -561,15 +576,30 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                         if (!globalThis.__ptErrHook) {
                           globalThis.__ptErrHook = 1;
                           let shown = 0;
+                          const E0 = globalThis.Error;
                           for (const N of ['Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError']) {
                             const C = globalThis[N];
                             if (typeof C !== 'function') continue;
                             const W = function (...a) {
                               const e = new C(...a);
+                              // Челлендж занижает `stackTraceLimit` и ставит свой
+                              // `prepareStackTrace`: прочитанный поверх них стек —
+                              // его пересказ, а не наш. Снимаем на время чтения,
+                              // иначе имена скриптов подменяются на `<anonymous>`
+                              // и путь до кода читается неверно.
+                              const lim = E0.stackTraceLimit, prep = E0.prepareStackTrace;
+                              try { E0.stackTraceLimit = 30; E0.prepareStackTrace = undefined; } catch (x) {}
+                              const snap = String(e.stack || '');
+                              try { E0.stackTraceLimit = lim; E0.prepareStackTrace = prep; } catch (x) {}
                               if (shown++ < 120) {
                                 try {
-                                  console.error('[бросок] ' + N + ': ' + String(a[0]).slice(0, 120) +
-                                    ' | ' + String(e.stack || '').split(String.fromCharCode(10)).slice(1, 4).join(' <- ').slice(0, 300));
+                                  // Шесть кадров, а не три: своя ошибка у
+                                  // челленджа без сообщения, и единственное, что
+                                  // о ней говорит, — кто её строил и из какого
+                                  // шага сбора.
+                                  console.error('[бросок] ' + Math.round(performance.now()) + 'мс ' + N + ': ' + String(a[0]).slice(0, 90) +
+                                    ' | ' + snap.split(String.fromCharCode(10)).slice(1, 8)
+                                      .map((l) => l.trim().replace(/^at /, '')).join(' <- ').slice(0, 460));
                                 } catch (x) {}
                               }
                               return e;
@@ -680,6 +710,84 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                 })();"#;
                 c.add_frame_init_script(probe.to_string());
                 c.add_init_script(probe.to_string());
+            }
+            // Исходник чужой программы. Её строят `new Function`, и это
+            // единственное место, где она видна текстом: то, что приходит по
+            // сети, — шифр, а стек внутри неё указывает смещением, немым без
+            // исходника. Крючок один, на конструкторе, и снимается вместе с
+            // `NOKK_DUMP_VM`.
+            if std::env::var("NOKK_DUMP_VM").is_ok() {
+                let probe = r#"(() => {
+                  try {
+                    const F = globalThis.Function;
+                    const keep = (a) => {
+                      try {
+                        const t = String(a.length ? a[a.length - 1] : '');
+                        if (t.length > (globalThis.__ptVmMin || 20000) &&
+                            (!globalThis.__pt_vmSrc || t.length > globalThis.__pt_vmSrc.length)) {
+                          globalThis.__pt_vmSrc = t;
+                          console.error('[vmsrc] ' + Math.round(performance.now()) + 'мс ' + t.length + ' знаков');
+                        }
+                      } catch (e) {}
+                    };
+                    const mask = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
+                    const wrap = (host) => {
+                      const G = host.Function;
+                      if (typeof G !== 'function' || G.__ptSeen) return;
+                      const W = function Function(...a) { keep(a); return new G(...a); };
+                      W.__ptSeen = 1;
+                      W.prototype = G.prototype;
+                      try {
+                        Object.defineProperty(G.prototype, 'constructor',
+                          { value: W, writable: true, configurable: true });
+                      } catch (e) {}
+                      try { host.Function = mask(W); } catch (e) {}
+                      // Тем же именем зовут и родню `Function`: тело кода
+                      // компилируют через конструктор асинхронной функции или
+                      // генератора ровно так же, а глаз на них никто не держит.
+                      // Родню берём у самой области, а не у себя, — иначе
+                      // подменишь свою и не заметишь чужую.
+                      let kin = [];
+                      try {
+                        kin = new G('return [Object.getPrototypeOf(async function(){}).constructor,' +
+                                    ' Object.getPrototypeOf(function*(){}).constructor]')();
+                      } catch (e) {}
+                      for (const C of kin) {
+                        try {
+                          if (typeof C !== 'function' || C.__ptSeen) continue;
+                          const V = function (...a) { keep(a); return new C(...a); };
+                          V.__ptSeen = 1;
+                          V.prototype = C.prototype;
+                          Object.defineProperty(C.prototype, 'constructor',
+                            { value: mask(V), writable: true, configurable: true });
+                        } catch (e) {}
+                      }
+                    };
+                    globalThis.__ptVmMin = __VMMIN__;
+                    wrap(globalThis);
+                    console.error('[vmsrc] крючок стоит, порог ' + globalThis.__ptVmMin);
+                    // Чужая программа берёт `Function` не у нас, а из чистой
+                    // области — пустого однородного кадра, за `contentWindow`.
+                    // Там наши правки ещё не стояли; ставим их на самом выходе
+                    // области, пока её никому не отдали.
+                    const R = globalThis.__pt_makeRealm;
+                    if (typeof R === 'function') {
+                      globalThis.__pt_makeRealm = mask(function __pt_makeRealm() {
+                        const g = R.apply(this, arguments);
+                        try { if (g) wrap(g); } catch (e) {}
+                        return g;
+                      });
+                    }
+                  } catch (e) {}
+                })();"#;
+                // Порог — чтобы не топить лог в мелочи страницы; своим числом
+                // его опускают, когда ищут, чем вообще компилируют.
+                let probe = probe.replace(
+                    "__VMMIN__",
+                    &std::env::var("NOKK_VM_MIN").unwrap_or_else(|_| "20000".into()),
+                );
+                c.add_frame_init_script(probe.clone());
+                c.add_init_script(probe);
             }
             // Наблюдение за крючками челленджа: программа, пришедшая с сервера,
             // зовёт виджет через его же таблицу колбэков, и увидеть, какие из
@@ -1656,100 +1764,6 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                     }
                 }
             }
-            // Хвост: чем страница и каждый фрейм занимались последними, по порядку.
-            // Исходник программы челленджа — по требованию: 600+ КБ в лог не
-            // кладут, а для чтения стека он нужен целиком.
-            if let Ok(path) = std::env::var("NOKK_DUMP_VM") {
-                let mut where_: Vec<Option<u32>> = vec![None];
-                where_.extend(ctx.frame_list().iter().map(|f| Some(f.id)));
-                // Две большие строки, а не одна: источник, который отдают
-                // `Function`, и та, что склеивается из ответа `/fo/`. Они
-                // разные — начала не совпадают, — и сравнивать с браузером надо
-                // обе, иначе легко сличить не то с тем.
-                for (js, tag) in [
-                    ("typeof __pt_vmSrc === 'string' ? __pt_vmSrc : ''", "js"),
-                    ("typeof __ptProg === 'string' ? __ptProg : ''", "join"),
-                    // Склейки помельче — отчёт, перечисление стилей — по одной
-                    // на файл: сравнивать их с браузером построчно можно только
-                    // целиком.
-                    ("(globalThis.__ptJoins||[]).map(j => j[0] + '\\u0000' + j[1]).join('\\u0001')", "joins"),
-                ] {
-                for slot in where_.clone() {
-                    let out = match slot {
-                        None => ctx.evaluate(js).await,
-                        Some(id) => ctx.evaluate_in_frame(id, js).await,
-                    };
-                    if let Ok(serde_json::Value::String(src)) = out {
-                        if src.len() > 1000 {
-                            let name = match slot {
-                                None => format!("{path}.page.{tag}"),
-                                Some(id) => format!("{path}.frame{id}.{tag}"),
-                            };
-                            if tag == "joins" {
-                                for part in src.split('\u{1}') {
-                                    let Some((n, body)) = part.split_once('\u{0}') else {
-                                        continue;
-                                    };
-                                    let name = format!("{name}.{n}");
-                                    if std::fs::write(&name, body).is_ok() {
-                                        eprintln!("# склейка сохранена: {name} ({} байт)", body.len());
-                                    }
-                                }
-                            } else if std::fs::write(&name, &src).is_ok() {
-                                eprintln!("# программа сохранена: {name} ({} байт)", src.len());
-                            }
-                        }
-                    }
-                }
-                }
-            }
-            // Спросить одно и то же у страницы и у каждого её кадра. Кадр
-            // челленджа чужого происхождения, со страницы в него не заглянуть, а
-            // движок ходит туда сам — и без этого половина сравнений с браузером
-            // невозможна.
-            if let Ok(js) = std::env::var("NOKK_EVAL_FRAMES") {
-                let mut where_: Vec<Option<u32>> = vec![None];
-                where_.extend(ctx.frame_list().iter().map(|f| Some(f.id)));
-                for slot in where_ {
-                    let out = match slot {
-                        None => ctx.evaluate(&js).await,
-                        Some(id) => ctx.evaluate_in_frame(id, &js).await,
-                    };
-                    let label = slot
-                        .map(|i| format!("frame {i}"))
-                        .unwrap_or_else(|| "page".to_string());
-                    match out {
-                        Ok(v) => eprintln!("# {label}: {}", render(&v)),
-                        Err(e) => eprintln!("# {label}: ошибка: {e}"),
-                    }
-                }
-            }
-            // Ошибки, которые чужая программа построила у себя в кадре: их не
-            // прочитать со страницы — кадр чужого происхождения, — но движок
-            // ходит в него сам.
-            if std::env::var("NOKK_TRACE_THROWS").is_ok() {
-                let js = "typeof __pt_throwTail === 'function' ? __pt_throwTail(20) : ''";
-                let mut where_: Vec<Option<u32>> = vec![None];
-                where_.extend(ctx.frame_list().iter().map(|f| Some(f.id)));
-                for slot in where_ {
-                    let out = match slot {
-                        None => ctx.evaluate(js).await,
-                        Some(id) => ctx.evaluate_in_frame(id, js).await,
-                    };
-                    if let Ok(serde_json::Value::String(text)) = out {
-                        if text.is_empty() {
-                            continue;
-                        }
-                        let label = slot
-                            .map(|i| format!("frame {i}"))
-                            .unwrap_or_else(|| "page".to_string());
-                        eprintln!("# броски {label}:");
-                        for line in text.lines() {
-                            eprintln!("#   {line}");
-                        }
-                    }
-                }
-            }
             let tail = match std::env::var("NOKK_TRACE_HEAD") {
                 Ok(_) => "typeof __pt_probeHead === 'function' ? __pt_probeHead(400000) : ''",
                 Err(_) => "typeof __pt_probeTail === 'function' ? __pt_probeTail(40) : ''",
@@ -1799,6 +1813,104 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                     .await
                 {
                     dump(format!("frame {} {}", f.id, f.url), v);
+                }
+            }
+        }
+
+        // Три инструмента ниже — свои собственные: каждый включается своей
+        // переменной. Раньше они стояли внутри ветки трассировщика проб и
+        // молча ничего не делали без неё — а она сама меняет то, что мерят.
+        // Хвост: чем страница и каждый фрейм занимались последними, по порядку.
+        // Исходник программы челленджа — по требованию: 600+ КБ в лог не
+        // кладут, а для чтения стека он нужен целиком.
+        if let Ok(path) = std::env::var("NOKK_DUMP_VM") {
+            let mut where_: Vec<Option<u32>> = vec![None];
+            where_.extend(ctx.frame_list().iter().map(|f| Some(f.id)));
+            // Две большие строки, а не одна: источник, который отдают
+            // `Function`, и та, что склеивается из ответа `/fo/`. Они
+            // разные — начала не совпадают, — и сравнивать с браузером надо
+            // обе, иначе легко сличить не то с тем.
+            for (js, tag) in [
+                ("typeof __pt_vmSrc === 'string' ? __pt_vmSrc : ''", "js"),
+                ("typeof __ptProg === 'string' ? __ptProg : ''", "join"),
+                // Склейки помельче — отчёт, перечисление стилей — по одной
+                // на файл: сравнивать их с браузером построчно можно только
+                // целиком.
+                ("(globalThis.__ptJoins||[]).map(j => j[0] + '\\u0000' + j[1]).join('\\u0001')", "joins"),
+            ] {
+            for slot in where_.clone() {
+                let out = match slot {
+                    None => ctx.evaluate(js).await,
+                    Some(id) => ctx.evaluate_in_frame(id, js).await,
+                };
+                if let Ok(serde_json::Value::String(src)) = out {
+                    if src.len() > 1000 {
+                        let name = match slot {
+                            None => format!("{path}.page.{tag}"),
+                            Some(id) => format!("{path}.frame{id}.{tag}"),
+                        };
+                        if tag == "joins" {
+                            for part in src.split('\u{1}') {
+                                let Some((n, body)) = part.split_once('\u{0}') else {
+                                    continue;
+                                };
+                                let name = format!("{name}.{n}");
+                                if std::fs::write(&name, body).is_ok() {
+                                    eprintln!("# склейка сохранена: {name} ({} байт)", body.len());
+                                }
+                            }
+                        } else if std::fs::write(&name, &src).is_ok() {
+                            eprintln!("# программа сохранена: {name} ({} байт)", src.len());
+                        }
+                    }
+                }
+            }
+            }
+        }
+        // Спросить одно и то же у страницы и у каждого её кадра. Кадр
+        // челленджа чужого происхождения, со страницы в него не заглянуть, а
+        // движок ходит туда сам — и без этого половина сравнений с браузером
+        // невозможна.
+        if let Ok(js) = std::env::var("NOKK_EVAL_FRAMES") {
+            let mut where_: Vec<Option<u32>> = vec![None];
+            where_.extend(ctx.frame_list().iter().map(|f| Some(f.id)));
+            for slot in where_ {
+                let out = match slot {
+                    None => ctx.evaluate(&js).await,
+                    Some(id) => ctx.evaluate_in_frame(id, &js).await,
+                };
+                let label = slot
+                    .map(|i| format!("frame {i}"))
+                    .unwrap_or_else(|| "page".to_string());
+                match out {
+                    Ok(v) => eprintln!("# {label}: {}", render(&v)),
+                    Err(e) => eprintln!("# {label}: ошибка: {e}"),
+                }
+            }
+        }
+        // Ошибки, которые чужая программа построила у себя в кадре: их не
+        // прочитать со страницы — кадр чужого происхождения, — но движок
+        // ходит в него сам.
+        if std::env::var("NOKK_TRACE_THROWS").is_ok() {
+            let js = "typeof __pt_throwTail === 'function' ? __pt_throwTail(20) : ''";
+            let mut where_: Vec<Option<u32>> = vec![None];
+            where_.extend(ctx.frame_list().iter().map(|f| Some(f.id)));
+            for slot in where_ {
+                let out = match slot {
+                    None => ctx.evaluate(js).await,
+                    Some(id) => ctx.evaluate_in_frame(id, js).await,
+                };
+                if let Ok(serde_json::Value::String(text)) = out {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let label = slot
+                        .map(|i| format!("frame {i}"))
+                        .unwrap_or_else(|| "page".to_string());
+                    eprintln!("# броски {label}:");
+                    for line in text.lines() {
+                        eprintln!("#   {line}");
+                    }
                 }
             }
         }

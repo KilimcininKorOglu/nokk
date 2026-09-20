@@ -2252,7 +2252,11 @@ impl BrowserContext {
         let Some(lines) = queues["console"].as_array() else {
             return;
         };
-        for line in lines.iter().take(64) {
+        // No cap here: the queue itself is bounded (the page's `console` stops
+        // recording past 256 lines between drains), and a second, smaller cap
+        // only threw away the tail of a burst — the half of a probe's output
+        // that mattered, silently.
+        for line in lines.iter() {
             let level = line[0].as_str().unwrap_or("log");
             let text = line[1].as_str().unwrap_or("");
             if text.is_empty() {

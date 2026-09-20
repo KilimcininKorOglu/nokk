@@ -1382,6 +1382,7 @@ fn make_realm(
             return;
         }
     };
+    tracing::debug!(target: "nokk::realm", "a page asked for a fresh realm");
     let context = v8::Context::new(scope, v8::ContextOptions::default());
     // Same origin, in V8's own terms: without a shared security token every
     // property read across the boundary answers "no access", which is exactly
@@ -1416,6 +1417,7 @@ fn eval_script(
 ) {
     let code = arg_string(scope, args.get(0));
     let url = arg_string(scope, args.get(1));
+    tracing::debug!(target: "nokk::script", bytes = code.len(), url = %url, "inline script");
     let Some(src) = v8::String::new(scope, &code) else {
         return;
     };
