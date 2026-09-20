@@ -435,6 +435,9 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
         nokk_stealth::fingerprint_script(profile),
         nokk_stealth::web_surface_script(),
     );
+    // И последним — снимок методов, которыми движок пользуется сам: он должен
+    // лечь поверх всех слоёв, но раньше любого скрипта страницы.
+    let base = format!("{base}\n{}", nokk_stealth::late_originals_script());
     // Diagnostic only, and last so it wraps a finished surface. Reading
     // `__pt_probeLog()` afterwards says what the page asked us and what we said.
     match std::env::var("NOKK_TRACE_PROBES").ok().as_deref() {
@@ -9129,6 +9132,67 @@ opacity: 0.9; flex-flow: column; }",
         assert_eq!(out["mseMkv"], false, "матрёшку потоковый источник не берёт вовсе");
         assert_eq!(out["mseAacBare"], true);
         assert_eq!(out["mseMp4Bare"], false);
+    }
+
+    /// Наш офскрин — настоящий `<canvas>` под капотом, и он делал свою работу
+    /// теми же именами, что видит страница: сборщик, обернувший
+    /// `HTMLCanvasElement.prototype.getContext`, считал по лишнему вызову на
+    /// каждый офскрин, которого в браузере нет вовсе (у Cloudflare это видно
+    /// прямо в ленте: двенадцать офскринов — двенадцать чужих `getContext`).
+    #[tokio::test]
+    async fn an_offscreen_canvas_leaves_no_trace_on_the_page() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const seen = (window.__seen = []);
+            const G = HTMLCanvasElement.prototype.getContext;
+            HTMLCanvasElement.prototype.getContext = function (t) { seen.push('ctx:' + t); return G.apply(this, arguments); };
+            const C = Document.prototype.createElement;
+            Document.prototype.createElement = function (t) { seen.push('el:' + t); return C.apply(this, arguments); };
+            const U = HTMLCanvasElement.prototype.toDataURL;
+            HTMLCanvasElement.prototype.toDataURL = function () { seen.push('url'); return U.apply(this, arguments); };
+            const off = new OffscreenCanvas(16, 16);
+            const g = off.getContext('2d');
+            g.fillStyle = '#f0f';
+            g.fillRect(0, 0, 8, 8);
+            const px = Array.from(g.getImageData(0, 0, 1, 1).data);
+            const bmp = off.transferToImageBitmap();
+            // И то, что движок делает сам: снимок через `createImageBitmap`
+            // строится на своём холсте, WebGPU у нас лежит поверх WebGL — ни
+            // того, ни другого странице видеть не положено.
+            Promise.all([
+              createImageBitmap(off, 0, 0, 4, 4),
+              (navigator.gpu ? navigator.gpu.requestAdapter().then((a) => a && a.requestDevice()) : null),
+            ]).then(([cut, dev]) => { window.__cut = cut.width + 'x' + cut.height; window.__gpu = !!dev; });
+            return __ptJSON.stringify({
+              seen, px, bmp: bmp.width + 'x' + bmp.height,
+              tag: Object.prototype.toString.call(g),
+            });
+        })()"#).await;
+        // Снимок и устройство приходят обещаниями — дать кругу событий доделать.
+        ctx.run_event_loop().await.unwrap();
+        let later = probe(
+            &ctx,
+            "__ptJSON.stringify({ cut: window.__cut || '', gpu: !!window.__gpu,                seen: (window.__seen || []).length })",
+        )
+        .await;
+
+        assert_eq!(
+            out["seen"].as_array().map(Vec::len),
+            Some(0),
+            "страница не должна видеть ни одного вызова: {out}"
+        );
+        assert_eq!(out["px"][0], 255, "и при этом офскрин рисует: {out}");
+        assert_eq!(out["px"][2], 255);
+        assert_eq!(out["bmp"], "16x16");
+        assert_eq!(out["tag"], "[object OffscreenCanvasRenderingContext2D]");
+        assert_eq!(later["cut"], "4x4", "снимок с вырезкой при этом делается: {later}");
+        assert_eq!(later["gpu"], true, "и WebGPU поверх нашего GL строится: {later}");
     }
 
     /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`

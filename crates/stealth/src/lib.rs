@@ -1471,6 +1471,30 @@ const WORKER_NAVIGATOR: &str = r#"["appCodeName", "appName", "appVersion", "conn
 const WORKER_SCOPE: &str = r#"["atob", "btoa", "caches", "clearInterval", "clearTimeout", "createImageBitmap", "crossOriginIsolated", "crypto", "fetch", "fonts", "importScripts", "indexedDB", "isSecureContext", "location", "navigator", "onerror", "onlanguagechange", "onrejectionhandled", "onunhandledrejection", "origin", "performance", "queueMicrotask", "reportError", "scheduler", "self", "setInterval", "setTimeout", "structuredClone", "trustedTypes"]"#;
 const WORKER_SCOPE_ENUMERABLE: &str = r#"["atob", "btoa", "caches", "clearInterval", "clearTimeout", "createImageBitmap", "crossOriginIsolated", "crypto", "fetch", "fonts", "importScripts", "indexedDB", "isSecureContext", "location", "navigator", "onerror", "onlanguagechange", "onrejectionhandled", "onunhandledrejection", "origin", "performance", "queueMicrotask", "reportError", "scheduler", "self", "setInterval", "setTimeout", "structuredClone", "trustedTypes"]"#;
 
+/// Последний кусок пролога: прячет для внутреннего пользования те методы
+/// холста и документа, через которые `OffscreenCanvas` делает свою работу.
+///
+/// Наш офскрин — это настоящий `<canvas>` под капотом, и он звал `getContext`,
+/// `toDataURL` и `createElement` теми же именами, что видит страница. Всякий,
+/// кто обернул `HTMLCanvasElement.prototype.getContext` — а сборщики отпечатков
+/// оборачивают, — видел лишний вызов на каждый офскрин; в браузере его нет
+/// вовсе. Ссылки снимаются последними, поверх всех слоёв, так что внутрь
+/// по-прежнему попадает то же, что получила бы страница.
+pub fn late_originals_script() -> String {
+    r#"(() => {
+  try {
+    const keep = {};
+    const C = globalThis.HTMLCanvasElement && HTMLCanvasElement.prototype;
+    if (C) { keep.getContext = C.getContext; keep.toDataURL = C.toDataURL; }
+    const D = globalThis.Document && Document.prototype;
+    if (D) keep.createElement = D.createElement;
+    Object.defineProperty(globalThis, '__pt_canvasOrig',
+      { value: keep, enumerable: false, configurable: true, writable: true });
+  } catch (e) {}
+})();"#
+        .to_string()
+}
+
 pub fn worker_scope_script(name: &str, url: &str) -> String {
     format!(
         r##"(() => {{
@@ -2025,7 +2049,9 @@ const CLONE_TEMPLATE: &str = r##"  // ── Структурное клонир
         try {
           if (v.b && globalThis.OffscreenCanvas) {
             const off = new globalThis.OffscreenCanvas(w, h);
-            const g = off.getContext('2d');
+            const g = globalThis.__pt_privateCtx
+              ? globalThis.__pt_privateCtx(off.__ptO && off.__ptO.c, '2d')
+              : off.getContext('2d');
             const bytes = unb64(v.b);
             if (g && globalThis.__pt_makeImageData) {
               g.putImageData(globalThis.__pt_makeImageData(
@@ -3494,10 +3520,16 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     };
 
     // ---- рисование через наш GL ----------------------------------------
+    // Холст под наш GL — внутренний: WebGPU у нас лежит поверх WebGL, и через
+    // `OffscreenCanvas.getContext` страница видела бы лишний контекст, которого
+    // у браузера здесь нет.
     const glFor = (w, h) => {
+      if (globalThis.__pt_privateCanvas && globalThis.__pt_privateCtx) {
+        const c = globalThis.__pt_privateCanvas(w, h);
+        return globalThis.__pt_privateCtx(c, 'webgl2') || globalThis.__pt_privateCtx(c, 'webgl');
+      }
       const c = new G.OffscreenCanvas(w, h);
-      const gl = c.getContext('webgl2') || c.getContext('webgl');
-      return gl;
+      return c.getContext('webgl2') || c.getContext('webgl');
     };
     const runPass = (tex, pass) => {
       const gl = tex.gl;
@@ -3705,12 +3737,19 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       try { Object.defineProperty(f, 'name', { value: name, configurable: true }); } catch (e) {}
       return globalThis.__pt_native ? globalThis.__pt_native(f) : f;
     };
+    // Свой холст, не страницын: через `document.createElement` его видел бы
+    // всякий, кто обернул этот метод, — а в браузере `createImageBitmap`
+    // никаких элементов не создаёт.
     const newCanvas = (w, h) => {
+      if (globalThis.__pt_privateCanvas) return globalThis.__pt_privateCanvas(w, h);
       if (!D || !D.createElement) return null;
       const el = D.createElement('canvas');
       el.width = w; el.height = h;
       return el;
     };
+    const ctx2d = (c) => (globalThis.__pt_privateCtx
+      ? globalThis.__pt_privateCtx(c, '2d')
+      : (c && c.getContext('2d')));
     // Прототип снимка оформляется один раз: в браузере ни ширина, ни высота не
     // лежат на самом объекте — они читаются с прототипа, и `close` их обнуляет.
     const shape = () => {
@@ -3853,14 +3892,14 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       else if (rh > 0) { oh = rh; ow = Math.max(1, Math.round(sw * rh / sh)); }
 
       const out = newCanvas(ow, oh);
-      const g = out && out.getContext('2d');
+      const g = out && ctx2d(out);
       if (g) {
         try {
           if (image.data && typeof image.width === 'number' && !image.localName) {
             // Из `ImageData` рисовать нельзя: он ложится на промежуточный
             // холст, а уже тот переносится с вырезкой и масштабом.
             const tmp = newCanvas(size[0], size[1]);
-            const tg = tmp && tmp.getContext('2d');
+            const tg = tmp && ctx2d(tmp);
             if (tg) { tg.putImageData(image, 0, 0); g.drawImage(tmp, sx, sy, sw, sh, 0, 0, ow, oh); }
           } else {
             g.drawImage(image, sx, sy, sw, sh, 0, 0, ow, oh);

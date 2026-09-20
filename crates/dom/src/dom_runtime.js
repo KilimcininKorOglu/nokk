@@ -1882,7 +1882,13 @@
   // OffscreenCanvas maps to a detached <canvas>, reusing its 2D/WebGL contexts.
   class OffscreenCanvas {
     constructor(width, height) {
-      let c = globalThis.document ? globalThis.document.createElement('canvas') : null;
+      // Через снятые заранее ссылки, а не через имена, которые видит
+      // страница: в браузере `new OffscreenCanvas` не трогает ни
+      // `document.createElement`, ни `HTMLCanvasElement.prototype.getContext`,
+      // а у нас каждый офскрин тянул за собой лишний, видимый вызов.
+      let c = globalThis.__pt_privateCanvas
+        ? globalThis.__pt_privateCanvas(width, height)
+        : (globalThis.document ? globalThis.document.createElement('canvas') : null);
       // В воркере документа нет вовсе, а OffscreenCanvas там есть и рисует —
       // ради него он в воркере и существует. Холст без документа: методы те же,
       // что у элемента, размеры свои. Без этого `getContext('2d')` в воркере
@@ -1912,7 +1918,9 @@
           + t + "' is not a valid enum value of type OffscreenRenderingContextType.");
       }
       const c = this.__ptO.c;
-      const g = c ? c.getContext(t, attrs) : null;
+      const orig = globalThis.__pt_canvasOrig;
+      const get = (orig && orig.getContext) || (c && c.getContext);
+      const g = c && get ? get.call(c, t, attrs) : null;
       // Двумерный контекст офскрина — отдельный интерфейс, и страница читает
       // его имя: `OffscreenCanvasRenderingContext2D`, не `CanvasRenderingContext2D`.
       if (g && t === '2d' && globalThis.OffscreenCanvasRenderingContext2D) {
@@ -1938,10 +1946,12 @@
     convertToBlob(opts) {
       const c = this.__ptO.c;
       const type = (opts && opts.type) || 'image/png';
+      const orig = globalThis.__pt_canvasOrig;
+      const url = (orig && orig.toDataURL) || (c && c.toDataURL);
       try {
-        if (c && c.toDataURL && globalThis.__pt_blobFromDataUrl) {
+        if (c && url && globalThis.__pt_blobFromDataUrl) {
           return Promise.resolve(globalThis.__pt_blobFromDataUrl(
-            c.toDataURL(type, opts && opts.quality)));
+            url.call(c, type, opts && opts.quality)));
         }
       } catch (e) { return Promise.reject(e); }
       return Promise.resolve(new Blob([], { type }));
@@ -1964,6 +1974,33 @@
       return b;
     }
   }
+
+  // Холст для собственных нужд движка. Ни `document.createElement`, ни
+  // `getContext` со страницы здесь не участвуют: всякий, кто их обернул — а
+  // сборщики отпечатков оборачивают, — иначе видит нашу кухню
+  // (`createImageBitmap`, WebGPU поверх GL) как свои вызовы, которых в
+  // браузере на этом месте нет.
+  globalThis.__pt_privateCanvas = (w, h) => {
+    const orig = globalThis.__pt_canvasOrig;
+    let c = null;
+    if (globalThis.document) {
+      c = (orig && orig.createElement)
+        ? orig.createElement.call(globalThis.document, 'canvas')
+        : globalThis.document.createElement('canvas');
+    } else {
+      const proto = globalThis.__pt_canvasProto;
+      c = { localName: 'canvas', width: w | 0, height: h | 0 };
+      if (proto) { c.getContext = proto.getContext; c.toDataURL = proto.toDataURL; }
+    }
+    if (c) { c.width = w | 0; c.height = h | 0; }
+    return c;
+  };
+  globalThis.__pt_privateCtx = (c, type, attrs) => {
+    if (!c) return null;
+    const orig = globalThis.__pt_canvasOrig;
+    const get = (orig && orig.getContext) || c.getContext;
+    return get ? get.call(c, type, attrs) : null;
+  };
 
   // Передача холста воркеру: сам метод ставится позже, из слоя невидимости —
   // таблица форм интерфейсов затирает его заглушкой, если поставить здесь.
