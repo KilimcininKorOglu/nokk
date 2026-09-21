@@ -9323,6 +9323,9 @@ opacity: 0.9; flex-flow: column; }",
               minBox: box.minHeight, displayBox: box.display,
               caretBox: box.caretColor,
               colourLnk: lnk.color, cursorLnk: lnk.cursor, decorLnk: lnk.textDecorationLine,
+              fontW: w.font, fontBox: box.font, transitionBox: box.transition,
+              webkitBox: box.webkitBorderAfter, webkitAlias: w.webkitFlexDirection,
+              strokeLnk: lnk.webkitTextStroke,
             });
         })()"#).await;
 
@@ -9346,6 +9349,15 @@ opacity: 0.9; flex-flow: column; }",
         assert_eq!(out["displayBox"], "block");
         assert_eq!(out["caretBox"], "rgb(17, 17, 17)", "`currentColor` — это цвет элемента");
         assert_eq!(out["colourLnk"], "rgb(102, 51, 153)");
+        assert_eq!(out["fontW"], "16px / 22.4px system-ui, sans-serif",
+                   "сокращение `font` печатается целиком, с межстрочным: {out}");
+        assert_eq!(out["fontBox"], "italic small-caps 700 14px / 21px Georgia, serif");
+        assert_eq!(out["transitionBox"], "0.2s ease-in-out");
+        assert_eq!(out["webkitBox"], "2px solid rgb(0, 120, 212)",
+                   "вендорные имена логических сторон отвечают тем же: {out}");
+        assert_eq!(out["webkitAlias"], "row",
+                   "а `webkitFlexDirection` — просто другое имя для `flex-direction`");
+        assert_eq!(out["strokeLnk"], "0px rgb(102, 51, 153)");
         assert_eq!(out["cursorLnk"], "pointer", "у ссылки свой стиль от браузера");
         assert_eq!(out["decorLnk"], "underline");
     }

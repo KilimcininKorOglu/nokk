@@ -5527,6 +5527,32 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     set('border', (bt && bt === edge('border-right') && bt === edge('border-bottom') && bt === edge('border-left')) ? bt : '');
     set('column-rule', g('column-rule-width') + ' ' + g('column-rule-color'));
     set('row-rule', g('row-rule-width') + ' ' + g('row-rule-color'));
+    // Общая линейка колонок и рядов: браузер печатает её, когда обе совпадают.
+    set('rule-width', two(g('row-rule-width'), g('column-rule-width')));
+    set('rule-style', two(g('row-rule-style'), g('column-rule-style')));
+    set('rule-color', two(g('row-rule-color'), g('column-rule-color')));
+    set('rule', g('rule-width') + ' ' + g('rule-color'));
+    // Старые вебкитовские имена логических сторон — те же значения.
+    for (const [old_, now] of [['webkit-border-before', 'border-block-start'],
+      ['webkit-border-after', 'border-block-end'],
+      ['webkit-border-start', 'border-inline-start'],
+      ['webkit-border-end', 'border-inline-end'],
+      ['webkit-margin-before', 'margin-block-start'], ['webkit-margin-after', 'margin-block-end'],
+      ['webkit-margin-start', 'margin-inline-start'], ['webkit-margin-end', 'margin-inline-end'],
+      ['webkit-padding-before', 'padding-block-start'], ['webkit-padding-after', 'padding-block-end'],
+      ['webkit-padding-start', 'padding-inline-start'], ['webkit-padding-end', 'padding-inline-end'],
+      ['webkit-logical-width', 'inline-size'], ['webkit-logical-height', 'block-size'],
+      ['webkit-min-logical-width', 'min-inline-size'], ['webkit-min-logical-height', 'min-block-size'],
+      ['webkit-max-logical-width', 'max-inline-size'], ['webkit-max-logical-height', 'max-block-size'],
+      ['webkit-perspective-origin', 'perspective-origin'],
+      ['webkit-transform-origin', 'transform-origin']]) {
+      map.set(old_, g(now));
+      for (const tail of ['-width', '-style', '-color']) if (g(now + tail)) map.set(old_ + tail, g(now + tail));
+    }
+    // Обводка текста: ширина и цвет вместе, как её печатает браузер.
+    map.set('webkit-text-stroke-color', g('-webkit-text-stroke-color'));
+    map.set('webkit-text-stroke-width', g('-webkit-text-stroke-width'));
+    map.set('webkit-text-stroke', g('-webkit-text-stroke-width') + ' ' + g('-webkit-text-stroke-color'));
     // Обвод браузер пишет цветом, стилем и шириной — именно в этом порядке.
     set('outline', g('outline-color') + ' ' + g('outline-style') + ' ' + g('outline-width'));
     set('background', g('background-color') + ' ' + g('background-image') + ' ' + g('background-repeat') +
@@ -5537,7 +5563,18 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     set('background-position-y', bp[1] || bp[0] || '');
     set('flex', g('flex-grow') + ' ' + g('flex-shrink') + ' ' + g('flex-basis'));
     set('flex-flow', g('flex-direction') + ' ' + g('flex-wrap'));
-    set('font', g('font-size') + ' ' + g('font-family'));
+    // Шрифт браузер печатает целиком: начертание, капитель, насыщенность,
+    // кегль с межстрочным через косую черту и семейство.
+    {
+      const bits = [];
+      if (g('font-style') && g('font-style') !== 'normal') bits.push(g('font-style'));
+      if (g('font-variant-caps') && g('font-variant-caps') !== 'normal') bits.push(g('font-variant-caps'));
+      if (g('font-weight') && g('font-weight') !== '400') bits.push(g('font-weight'));
+      const lh = g('line-height');
+      bits.push(lh && lh !== 'normal' ? g('font-size') + ' / ' + lh : g('font-size'));
+      bits.push(g('font-family'));
+      set('font', bits.filter(Boolean).join(' '));
+    }
     set('font-synthesis', ['weight', 'style', 'small-caps']
       .filter((p) => g('font-synthesis-' + p) === 'auto').join(' ') || 'none');
     set('list-style', g('list-style-position') + ' ' + g('list-style-image') + ' ' + g('list-style-type'));
@@ -5549,9 +5586,15 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     set('place-content', two(g('align-content'), g('justify-content')));
     set('place-items', two(g('align-items'), g('justify-items')));
     set('place-self', two(g('align-self'), g('justify-self')));
-    set('grid-row', two(g('grid-row-start'), g('grid-row-end')));
-    set('grid-column', two(g('grid-column-start'), g('grid-column-end')));
-    set('grid-area', four(g('grid-row-start'), g('grid-column-start'), g('grid-row-end'), g('grid-column-end')));
+    // Части сетки браузер разделяет косой чертой, а пустой конец опускает.
+    for (const axis of ['row', 'column']) {
+      const a = g('grid-' + axis + '-start'), b = g('grid-' + axis + '-end');
+      set('grid-' + axis, !b || b === 'auto' || b === a ? a : a + ' / ' + b);
+    }
+    {
+      const quad = [g('grid-row-start'), g('grid-column-start'), g('grid-row-end'), g('grid-column-end')];
+      set('grid-area', quad.every((x) => x === 'auto') ? 'auto' : quad.join(' / '));
+    }
     set('grid-template', g('grid-template-rows') === 'none' && g('grid-template-columns') === 'none' &&
       g('grid-template-areas') === 'none' ? 'none' : '');
     set('grid', g('grid-template') === 'none'
@@ -5562,8 +5605,15 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     set('columns', two(g('column-width'), g('column-count')) === 'auto auto' ? 'auto'
       : two(g('column-width'), g('column-count')));
     set('animation', g('animation-name') === 'none' && g('animation-duration') === '0s' ? 'none' : '');
-    set('transition', g('transition-duration') === '0s' && g('transition-delay') === '0s'
-      ? g('transition-property') : '');
+    // Переход: браузер опускает то, что стоит на своём начальном значении.
+    {
+      const dur = g('transition-duration'), ease = g('transition-timing-function');
+      const delay = g('transition-delay'), prop = g('transition-property');
+      set('transition', dur === '0s' && delay === '0s' ? prop
+        : [prop && prop !== 'all' ? prop : '', dur,
+           ease && ease !== 'ease' ? ease : '', delay && delay !== '0s' ? delay : '']
+          .filter(Boolean).join(' '));
+    }
     // Пробелы: браузер сводит их к одному слову, когда сочетание известное.
     const wsc = g('white-space-collapse'), twm = g('text-wrap-mode');
     set('white-space', wsc === 'collapse' && twm === 'wrap' ? 'normal'
@@ -5600,8 +5650,18 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     const own = (name, d) => { try { Object.defineProperty(decl, name, d); } catch (e) {} };
     for (let i = 0; i < names.length; i++) own(String(i), { value: names[i], enumerable: true, configurable: true });
     for (const name of CSS_PROPS) {
-      const dashed = name.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase()).toLowerCase();
-      own(name, { get: () => map.get(dashed) || '', enumerable: true, configurable: true });
+      // `webkitBorderAfter` — это `-webkit-border-after`: у вендорных имён
+      // дефис ведущий. А `webkitAlignItems` своего свойства не имеет вовсе —
+      // это просто другое имя для `align-items`, и браузер отвечает по нему
+      // тем же значением.
+      const plain = name.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase()).toLowerCase();
+      const keys = /^(webkit|moz|ms|o)-/.test(plain)
+        ? ['-' + plain, plain, plain.replace(/^(webkit|moz|ms|o)-/, '')]
+        : [plain];
+      own(name, {
+        get: () => { for (const k of keys) { const v = map.get(k); if (v) return v; } return ''; },
+        enumerable: true, configurable: true,
+      });
     }
     return new Proxy(decl, {
       get: (t, p) => {
