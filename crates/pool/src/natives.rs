@@ -43,6 +43,9 @@ pub fn install(scope: &mut v8::PinScope) {
     bind(scope, "__pt_aescbc", aes_cbc_op);
     bind(scope, "__pt_pngDataUrl", png_data_url);
     bind(scope, "__pt_hrtime", hrtime);
+    bind(scope, "__pt_waveTable", wave_table);
+    bind(scope, "__pt_waveTableCustom", wave_table_custom);
+    bind(scope, "__pt_compress", compress);
     bind(scope, "__pt_heapStats", heap_stats);
 
     // Optional real 2D rasterization (the `render` feature). Their presence is the
@@ -1350,6 +1353,101 @@ fn arg_string(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> String {
 
 fn arg_usize(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> usize {
     value.integer_value(scope).unwrap_or(0).max(0) as usize
+}
+
+/// Отдать числа в JS как `Float32Array`.
+fn set_floats(scope: &mut v8::PinScope, rv: &mut v8::ReturnValue, values: &[f32]) {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for v in values {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let n = values.len();
+    let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+    let buf = v8::ArrayBuffer::with_backing_store(scope, &store);
+    match v8::Float32Array::new(scope, buf, 0, n) {
+        Some(arr) => rv.set(arr.into()),
+        None => rv.set_null(),
+    }
+}
+
+/// Разобрать `Float32Array` (или обычный массив чисел) из довода.
+fn arg_floats(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> Vec<f32> {
+    if let Ok(arr) = v8::Local::<v8::Array>::try_from(value) {
+        let n = arr.length() as usize;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let v = arr
+                .get_index(scope, i as u32)
+                .and_then(|x| x.number_value(scope))
+                .unwrap_or(0.0);
+            out.push(v as f32);
+        }
+        return out;
+    }
+    let bytes = arg_bytes(value);
+    bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
+/// `__pt_waveTable(shape, sampleRate, rangeIndex)` — таблица волны готовой
+/// формы, та же до последнего бита, что строит браузер.
+fn wave_table(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let shape = arg_string(scope, args.get(0));
+    let rate = arg_f32_any(scope, args.get(1));
+    let range = arg_usize(scope, args.get(2));
+    let table = crate::wavetable::basic_table(&shape, rate, range);
+    set_floats(scope, &mut rv, &table);
+}
+
+/// `__pt_waveTableCustom(real, imag, sampleRate, rangeIndex, disableNormalization)`
+/// — то же для формы, заданной страницей через `createPeriodicWave`.
+fn wave_table_custom(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let real = arg_floats(scope, args.get(0));
+    let imag = arg_floats(scope, args.get(1));
+    let rate = arg_f32_any(scope, args.get(2));
+    let range = arg_usize(scope, args.get(3));
+    let plain = args.get(4).boolean_value(scope);
+    let table = crate::wavetable::custom_table(&real, &imag, rate, range, plain);
+    set_floats(scope, &mut rv, &table);
+}
+
+/// `__pt_compress(samples, rate, threshold, knee, ratio, attack, release)` —
+/// сжиматель звука. Отдаёт отсчёты, а последним числом — показание затухания,
+/// которое страница читает у узла как `reduction`.
+fn compress(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let input = arg_floats(scope, args.get(0));
+    let rate = arg_f32_any(scope, args.get(1));
+    let out = crate::compressor::process(
+        &input,
+        rate,
+        arg_f32_any(scope, args.get(2)),
+        arg_f32_any(scope, args.get(3)),
+        arg_f32_any(scope, args.get(4)),
+        arg_f32_any(scope, args.get(5)),
+        arg_f32_any(scope, args.get(6)),
+    );
+    let mut all = out.samples;
+    all.push(out.reduction);
+    set_floats(scope, &mut rv, &all);
+}
+
+/// Число из довода — без оглядки на то, собрана ли отрисовка.
+fn arg_f32_any(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> f32 {
+    value.number_value(scope).unwrap_or(0.0) as f32
 }
 
 /// Return `bytes` to JS as a `Uint8Array`.

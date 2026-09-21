@@ -8065,15 +8065,29 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // гармониками, и обрезать их здесь нельзя: ряд треугольника сходится как
     // 1/n², и уже на пятистах гармониках масштаб уходит на шесть сотых процента,
     // а это ровно то, на сколько наш отпечаток расходился с браузерным.
-    const full = build(maxPartials);
-    let peak = 0;
-    for (let i = 0; i < size; i++) peak = Math.max(peak, Math.abs(full[i]));
-    const scale = peak ? 1 / peak : 1;
+    // Самая полная таблица нужна только своему расчёту — ради множителя
+    // нормировки; движок нормирует сам.
+    let scale = 1;
+    if (typeof __pt_waveTable !== 'function') {
+      const full = build(maxPartials);
+      let peak = 0;
+      for (let i = 0; i < size; i++) peak = Math.max(peak, Math.abs(full[i]));
+      scale = peak ? 1 / peak : 1;
+    }
     const tables = new Array(ranges);
     const partialsFor = (r) => Math.floor(Math.pow(2, -r * OSC_CENTS / 1200) * maxPartials);
+    // Таблицу строит движок тем же обратным преобразованием, что браузер, и
+    // в той же одинарной точности: отпечаток по звуку — это её содержимое до
+    // последнего разряда, и считать её честно в двойной точности мало.
+    // Запасной путь — свой расчёт поворотом — остаётся для лёгкой сборки.
+    const native = typeof __pt_waveTable === 'function';
     const made = { size, ranges, scale, lowest: (rate / 2) / maxPartials,
                    get(r) {
                      if (!tables[r]) {
+                       if (native) {
+                         const t = __pt_waveTable(type, rate, r);
+                         if (t && t.length === size) { tables[r] = t; return t; }
+                       }
                        const src = build(partialsFor(r));
                        const t = new Float32Array(size);
                        for (let i = 0; i < size; i++) t[i] = src[i] * scale;
@@ -8124,7 +8138,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // У браузера это одинарная точность: `powf(10, 0.05f*db)` и `20*log10f(x)`.
   // От их округления зависит, куда попадёт двоичный поиск коэффициента колена,
   // а он определён лишь до трёх десятитысячных — и уезжает на весь выход.
-  const dbToLin = (db) => Math.fround(Math.pow(10, Math.fround(0.05 * db)));
+  // Множитель у браузера — `float`-постоянная: `0.05f` это
+  // 0.0500000007450580596923828125, и произведение с ним округляется иначе,
+  // чем с двойным 0.05.
+  const dbToLin = (db) => Math.fround(Math.pow(10, Math.fround(Math.fround(0.05) * db)));
   const linToDb = (x) => (x ? Math.fround(20 * Math.fround(Math.log10(x))) : -1000);
 
   function compressorKernel(input, rate, opts) {
@@ -8149,7 +8166,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
     // Коэффициент колена ищется двоичным поиском по наклону — пятнадцать шагов,
     // как в исходнике.
-    let minK = 0.1, maxK = 10000, k = 5;
+    // Границы поиска — тоже одинарной точности: у браузера это `float`, и
+    // десятая доля в нём не ровная.
+    let minK = f1(0.1), maxK = f1(10000), k = f1(5);
     {
       const x = f1(dbToLin(f1(dbThreshold + dbKnee)));
       for (let i = 0; i < 15; i++) {
@@ -8166,23 +8185,35 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
     // Компенсирующее усиление: без него компрессор с порогом −50 дБ душит сигнал
     // на два порядка, а браузер его возвращает — в степени 0,6, «на слух».
-    const masterLinearGain = f1(dbToLin(0) * f1(Math.pow(f1(1 / f1(saturate(1))), 0.6)));
+    // Степень у браузера — `float`-постоянная: `0.6f` это
+    // 0.60000002384185791015625, и возведение в неё даёт другое число, чем в
+    // ровную шесть десятых. Множитель общий на весь выход, и ошибка в нём
+    // видна в каждом отсчёте.
+    const masterLinearGain = f1(Math.pow(f1(1 / f1(saturate(1))), f1(0.6)));
 
-    const attackFrames = Math.max(0.001, opts.attack) * rate;
-    const releaseFrames = rate * opts.release;
-    const satReleaseFrames = 0.0025 * rate;
-    const y1 = releaseFrames * 0.09, y2 = releaseFrames * 0.16;
-    const y3 = releaseFrames * 0.42, y4 = releaseFrames * 0.98;
-    const kA = 0.9999999999999998 * y1 + 1.8432219684323923e-16 * y2
-             - 1.9373394351676423e-16 * y3 + 8.824516011816245e-18 * y4;
-    const kB = -1.5788320352845888 * y1 + 2.3305837032074286 * y2
-             - 0.9141194204840429 * y3 + 0.1623677525612032 * y4;
-    const kC = 0.5334142869106424 * y1 - 1.272736789213631 * y2
-             + 0.9258856042207512 * y3 - 0.18656310191776226 * y4;
-    const kD = 0.08783463138207234 * y1 - 0.1694162967925622 * y2
-             + 0.08588057951595272 * y3 - 0.00429891410546283 * y4;
-    const kE = -0.042416883008123074 * y1 + 0.1115693827987602 * y2
-             - 0.09764676325265872 * y3 + 0.028494263462021576 * y4;
+    // Все постоянные и все действия — одинарной точности и в том же порядке,
+    // что у браузера: там это `constexpr float`, посчитанный из долей зоны
+    // отпускания, а не двойное число, округлённое в конце. Разница выходит на
+    // седьмом знаке каждого отсчёта — ровно там, где страница и смотрит.
+    const PI_OVER_TWO = f1(Math.PI / 2);
+    const z1 = f1(0.09), z2 = f1(0.16), z3 = f1(0.42), z4 = f1(0.98);
+    const mul = (c, z) => f1(f1(c) * z);
+    const kABase = f1(f1(f1(mul(0.9999999999999998, z1) + mul(1.8432219684323923e-16, z2))
+                       - mul(1.9373394351676423e-16, z3)) + mul(8.824516011816245e-18, z4));
+    const kBBase = f1(f1(f1(mul(-1.5788320352845888, z1) + mul(2.3305837032074286, z2))
+                       - mul(0.9141194204840429, z3)) + mul(0.1623677525612032, z4));
+    const kCBase = f1(f1(f1(mul(0.5334142869106424, z1) - mul(1.272736789213631, z2))
+                       + mul(0.9258856042207512, z3)) - mul(0.18656310191776226, z4));
+    const kDBase = f1(f1(f1(mul(0.08783463138207234, z1) - mul(0.1694162967925622, z2))
+                       + mul(0.08588057951595272, z3)) - mul(0.00429891410546283, z4));
+    const kEBase = f1(f1(f1(mul(-0.042416883008123074, z1) + mul(0.1115693827987602, z2))
+                       - mul(0.09764676325265872, z3)) + mul(0.028494263462021576, z4));
+    const attackFrames = f1(f1(Math.max(f1(0.001), f1(opts.attack))) * f1(rate));
+    const releaseFrames = f1(f1(rate) * f1(opts.release));
+    const satReleaseFrames = f1(f1(0.0025) * f1(rate));
+    const kA = f1(releaseFrames * kABase), kB = f1(releaseFrames * kBBase);
+    const kC = f1(releaseFrames * kCBase), kD = f1(releaseFrames * kDBase);
+    const kE = f1(releaseFrames * kEBase);
 
     const MASK = 1023;
     const delay = new Float32Array(1024);
@@ -8199,26 +8230,31 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     for (let d = 0; d < nDivisions; d++) {
       if (!Number.isFinite(detectorAverage)) detectorAverage = 1;
       const desiredGain = detectorAverage;
-      const scaledDesiredGain = Math.fround(Math.asin(desiredGain) / (0.5 * Math.PI));
+      // Обратный синус берётся одинарной точностью и делится на половину
+      // числа «пи» — тоже одинарной: у браузера это `asinf` и `float`-делитель.
+      const scaledDesiredGain = f1(f1(Math.asin(desiredGain)) / PI_OVER_TWO);
 
       let envelopeRate;
       const isReleasing = scaledDesiredGain > compressorGain;
-      let compressionDiffDb = Math.fround(linToDb(Math.fround(compressorGain / scaledDesiredGain)));
+      let compressionDiffDb = scaledDesiredGain === 0
+        ? (isReleasing ? -1 : 1)
+        : f1(linToDb(f1(compressorGain / scaledDesiredGain)));
       if (isReleasing) {
         maxAttackCompressionDiffDb = -1;
         if (!Number.isFinite(compressionDiffDb)) compressionDiffDb = -1;
         let x = Math.min(0, Math.max(-12, compressionDiffDb));
-        x = 0.25 * (x + 12);
-        const x2 = x * x, x3 = x2 * x, x4 = x2 * x2;
-        const rf = kA + kB * x + kC * x2 + kD * x3 + kE * x4;
-        envelopeRate = Math.fround(dbToLin(Math.fround(5 / rf)));
+        x = f1(f1(0.25) * f1(x + 12));
+        const x2 = f1(x * x), x3 = f1(x2 * x), x4 = f1(x2 * x2);
+        const rf = f1(f1(f1(f1(kA + f1(kB * x)) + f1(kC * x2)) + f1(kD * x3)) + f1(kE * x4));
+        envelopeRate = f1(dbToLin(f1(5 / rf)));
       } else {
         if (!Number.isFinite(compressionDiffDb)) compressionDiffDb = 1;
         if (maxAttackCompressionDiffDb === -1 || maxAttackCompressionDiffDb < compressionDiffDb) {
           maxAttackCompressionDiffDb = compressionDiffDb;
         }
-        const effAttenDiffDb = Math.max(0.5, maxAttackCompressionDiffDb);
-        envelopeRate = Math.fround(1 - Math.fround(Math.pow(Math.fround(0.25 / effAttenDiffDb), 1 / attackFrames)));
+        const effAttenDiffDb = f1(Math.max(f1(0.5), maxAttackCompressionDiffDb));
+        const x = f1(f1(0.25) / effAttenDiffDb);
+        envelopeRate = f1(1 - f1(Math.pow(x, f1(1 / attackFrames))));
       }
 
       // Всё это в браузере считается одинарной точностью, и накопитель
@@ -8243,8 +8279,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           compressorGain = f(Math.min(1, f(compressorGain * envelopeRate)));
         }
 
-        const postWarp = f(Math.sin(f(0.5 * Math.PI * compressorGain)));
-        out[frame] = f(f(delay[readIndex] * masterLinearGain) * postWarp);
+        // Довод синуса — произведение одинарной точности: у браузера половина
+        // числа «пи» лежит отдельной `float`-постоянной, а не считается в
+        // двойной и округляется потом.
+        const postWarp = f(Math.sin(f(PI_OVER_TWO * compressorGain)));
+        // Сперва перемножаются усиления, и только потом на них множится
+        // отсчёт: порядок виден в последнем разряде каждого числа.
+        const totalGain = f(masterLinearGain * postWarp);
+        out[frame] = f(delay[readIndex] * totalGain);
         // Показание затухания: браузер держит не последнее значение, а
         // сглаженный минимум в децибелах — падает мгновенно, отпускает с
         // постоянной 0,325 с. Страница читает его как `compressor.reduction`.
@@ -8342,8 +8384,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // Раньше здесь всегда рисовался осциллятор со сжимателем, чем бы страница
     // ни соединила узлы: источник из буфера отдавал чужие числа, а
     // `compressor.reduction` — ноль там, где браузер даёт −20 дБ.
-    __ptRender(chans, len) {
+    __ptRender(chans, want) {
       const rate = this.sampleRate;
+      // Браузер считает целыми квантами по сто двадцать восемь кадров, а в
+      // буфер отдаёт сколько просили: последние кадры незаконченного кванта
+      // всё равно посчитаны. Без этого у нас хвост оставался тишиной, а у
+      // браузера там обычный звук.
+      const len = Math.ceil(want / 128) * 128;
       const zero = () => new Float32Array(len);
       const pv = (p, dflt) => (p && typeof p.value === 'number' ? p.value : dflt);
       const stateOf = (n) => (globalThis.__pt_audioState && __pt_audioState.get(n)) || n;
@@ -8369,17 +8416,108 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       };
       // Осциллятор: шаг фазы в одинарной точности копится в двойном счётчике,
       // как в браузере.
+      // Осциллятор считает не отсчёт за отсчётом в двойной точности, а так,
+      // как считает браузер на этой машине: указатель в таблице идёт
+      // четвёрками в одинарной точности, а раз в квант из ста двадцати восьми
+      // кадров пересчитывается из двойной — «чтобы накопленная ошибка не
+      // уходила дальше». Без этого к тысячному отсчёту расходится седьмой
+      // знак, а страница складывает все сорок четыре тысячи.
+      const f32 = Math.fround;
+      // Приведение указателя в пределы таблицы теми же действиями, что в
+      // `WrapVirtualIndexVector`: деление, отсечение к нулю, поправка на
+      // единицу, если отсекли не в ту сторону.
+      const wrap32 = (x, size, invSize) => {
+        const r = f32(x * invSize);
+        let fl = Math.trunc(r) | 0;
+        if (r < f32(fl)) fl -= 1;
+        return f32(x - f32(f32(fl) * size));
+      };
       const oscillate = (node) => {
         const type = node.type || 'sine';
         const freq = pv(node.frequency, 440) * Math.pow(2, pv(node.detune, 0) / 1200);
-        const tsize = oscTables(type, rate).size;
-        const incr = Math.fround(Math.fround(freq) * Math.fround(tsize / rate));
+        const T = oscTables(type, rate);
+        const tsize = T.size;
+        const mask = tsize - 1;
+        const invSize32 = f32(1 / tsize);
+        const incr = f32(f32(freq) * f32(tsize / rate));
         const out = zero();
-        let idx = 0;
-        for (let i = 0; i < len; i++) {
-          out[i] = oscWaveAt(type, idx / tsize, freq, rate);
-          idx += incr;
-          idx -= Math.floor(idx / tsize) * tsize;
+        // Пара таблиц и доля между ними — одна на весь прогон: частота
+        // постоянная.
+        // Полоса высот считается в одинарной точности — как в браузере, где
+        // и частота, и логарифм, и доля между таблицами `float`. В двойной
+        // доля выходила на единицу младшего разряда другой, и с ней
+        // расходился каждый отсчёт, где таблицы отличаются.
+        const af = f32(Math.abs(freq));
+        const ratio = af > 0 ? f32(af / f32(T.lowest)) : 0.5;
+        let pitch = f32(1 + f32(f32(f32(Math.log2(ratio)) * 1200) / OSC_CENTS));
+        pitch = Math.min(Math.max(pitch, 0), T.ranges - 1);
+        const r1 = Math.trunc(pitch);
+        const r2 = r1 < T.ranges - 1 ? r1 + 1 : r1;
+        const between = f32(pitch - r1);
+        const higher = T.get(r1), lower = T.get(r2);
+        let vri = 0;                      // двойная точность, между квантами
+        // Первый квант браузер считает иначе, чем остальные: пока у частоты
+        // есть запись во времени (её оставляет присваивание `value`), идёт
+        // «пооткрытный» путь с двойным указателем; дальше — четвёрками в
+        // одинарной. Видно это сразу: в первом кванте отсчёты сходятся с
+        // двойным счётом до бита, а со второго — только с четвёрочным.
+        const invSize = f32(1 / tsize);
+        const wrap32 = (x) => {
+          const r = f32(x * invSize);
+          let fl = Math.trunc(r) | 0;
+          if (r < f32(fl)) fl -= 1;
+          return f32(x - f32(f32(fl) * tsize));
+        };
+        const pick = (v) => {
+          const i0 = Math.trunc(v) & mask;
+          const i1 = (i0 + 1) & mask;
+          const frac = f32(f32(v) - i0);
+          const sh = f32(higher[i0] + f32(frac * f32(higher[i1] - higher[i0])));
+          const sl = f32(lower[i0] + f32(frac * f32(lower[i1] - lower[i0])));
+          return f32(sh + f32(between * f32(sl - sh)));
+        };
+        let quantum = 0;
+        for (let start = 0; start < len; start += 128, quantum++) {
+          const n = Math.min(128, len - start);
+          if (quantum === 0) {
+            let v = vri;
+            for (let k = 0; k < n; k++) {
+              out[start + k] = pick(v);
+              v += incr;
+              v -= Math.floor(v / tsize) * tsize;
+            }
+          } else {
+            // Четыре указателя идут вместе, каждый шаг — четыре приращения,
+            // и после каждого шага все четыре приводятся в пределы таблицы.
+            let v0 = wrap32(f32(vri));
+            let v1 = wrap32(f32(vri + incr));
+            let v2 = wrap32(f32(vri + f32(2 * incr)));
+            let v3 = wrap32(f32(vri + f32(3 * incr)));
+            const step = f32(4 * incr);
+            let k = 0;
+            const loops = Math.floor(n / 4);
+            for (let loop = 0; loop < loops; loop++, k += 4) {
+              out[start + k] = pick(v0);
+              out[start + k + 1] = pick(v1);
+              out[start + k + 2] = pick(v2);
+              out[start + k + 3] = pick(v3);
+              v0 = wrap32(f32(v0 + step));
+              v1 = wrap32(f32(v1 + step));
+              v2 = wrap32(f32(v2 + step));
+              v3 = wrap32(f32(v3 + step));
+            }
+            // Хвост кванта — по одному, в двойной точности.
+            let tail = vri + f32(k * incr);
+            tail -= Math.floor(tail / tsize) * tsize;
+            for (; k < n; k++) {
+              out[start + k] = pick(tail);
+              tail += incr;
+              tail -= Math.floor(tail / tsize) * tsize;
+            }
+          }
+          // Между квантами указатель пересчитывается от начала кванта.
+          vri += f32(n * incr);
+          vri -= Math.floor(vri / tsize) * tsize;
         }
         return out;
       };
@@ -8487,13 +8625,25 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         }
         if (kind === 'biquad') return biquad(node, input);
         if (kind === 'compressor') {
-          const res = compressorKernel(input, rate, {
+          const opts = {
             threshold: pv(node.threshold, -24), knee: pv(node.knee, 30),
             ratio: pv(node.ratio, 12), attack: pv(node.attack, 0.003),
             release: pv(node.release, 0.25),
-          });
-          // `reduction` страница читает прямо: у браузера это последнее
-          // затухание в децибелах, а у нас стоял ноль.
+          };
+          // Считает движок: у браузера степени и логарифмы берутся из
+          // системной библиотеки, а здешняя математика округляет иначе — и
+          // расходится весь звук, начиная с коэффициента колена. Свой расчёт
+          // остаётся для лёгкой сборки.
+          if (typeof __pt_compress === 'function') {
+            const got = __pt_compress(input, rate, opts.threshold, opts.knee,
+                                      opts.ratio, opts.attack, opts.release);
+            if (got && got.length === input.length + 1) {
+              // `reduction` страница читает прямо: последнее число — оно.
+              try { node.reduction = got[input.length]; } catch (e) {}
+              return got.subarray(0, input.length);
+            }
+          }
+          const res = compressorKernel(input, rate, opts);
           try { node.reduction = compressorKernel.lastReduction; } catch (e) {}
           return res;
         }
@@ -8524,7 +8674,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         return out;
       };
       const data = sumInputs(dest, 0);
-      return bufferOf(data, chans, len, rate);
+      // Наружу — ровно столько кадров, сколько просили.
+      return bufferOf(data.length === want ? data : data.subarray(0, want), chans, want, rate);
     }
   }
   const audioTag = (Ctor, name) => { try { Object.defineProperty(Ctor.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {} return Ctor; };

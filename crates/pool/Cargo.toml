@@ -9,6 +9,10 @@ repository.workspace = true
 keywords = ["v8", "isolate", "concurrency", "browser", "pool"]
 categories = ["concurrency", "web-programming"]
 
+[build-dependencies]
+# Сборка вендорённого PFFFT (см. build.rs и vendor/pffft).
+cc = "1"
+
 [features]
 default = []
 # Opt-in real off-screen rasterization: back the JS canvas with a real tiny-skia

@@ -23,6 +23,8 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
 #[cfg(feature = "render")]
 mod canvas;
+mod compressor;
+mod wavetable;
 mod isolate;
 mod natives;
 // Some GL ops (viewport, …) are the API surface the `__pt_gl*` natives wire next;

@@ -5781,6 +5781,8 @@ mod tests {
               const ac = new AudioContext();
               return __ptJSON.stringify({
                 sum,
+                joined: Array.from(d).join('|').length,
+                mid: Array.from(d.slice(4500, 4504)),
                 rate: ac.sampleRate,
                 baseLatency: ac.baseLatency,
                 state: ac.state,
@@ -5792,9 +5794,27 @@ mod tests {
         .await;
 
         let sum = p["sum"].as_f64().expect("the sum is a number");
+        // Сверка побитная: страница склеивает все сорок четыре тысячи
+        // отсчётов и читает каждый разряд, а звук одинаков на всякой машине с
+        // той же сборкой браузера. Числа сняты с Chrome 151 здесь же.
         assert!(
-            (sum - 124.0435).abs() < 0.05,
-            "the audio fingerprint is {sum}, Chrome 151 gives 124.0435"
+            (sum - 124.04347527516074).abs() < 1e-12,
+            "сумма модулей {sum}, у Chrome 151 — 124.04347527516074"
+        );
+        assert_eq!(p["joined"], 882861, "длина склейки отсчётов: {p}");
+        let mid: Vec<f64> = p["mid"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            mid,
+            vec![
+                -0.10808052122592926,
+                -0.3909117579460144,
+                -0.005692707374691963,
+                0.3892313539981842
+            ],
+            "отсчёты бит в бит: {p}"
         );
         // Живой контекст: частота карты, задержка буфера, остановлен до жеста.
         assert_eq!(p["rate"], 48000);
