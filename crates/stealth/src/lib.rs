@@ -7968,10 +7968,16 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const virt = (phase - Math.floor(phase)) * T.size;
     const i0 = Math.floor(virt) % T.size;
     const i1 = (i0 + 1) % T.size;
-    const frac = virt - Math.floor(virt);
-    const sHigher = (1 - frac) * higher[i0] + frac * higher[i1];
-    const sLower = (1 - frac) * lower[i0] + frac * lower[i1];
-    return (1 - between) * sHigher + between * sLower;
+    const frac = Math.fround(Math.fround(virt) - Math.fround(Math.floor(virt)));
+    // Именно так, как в браузере: `a + f*(b-a)` в одинарной точности, а не
+    // `(1-f)*a + f*b` — на хромовской таблице первая запись даёт все
+    // шестьдесят четыре отсчёта бит в бит, вторая ошибается на единицу
+    // младшего разряда в каждом четвёртом.
+    const f32 = Math.fround;
+    const lerp = (a, b, t) => f32(a + f32(t * f32(b - a)));
+    const sHigher = lerp(higher[i0], higher[i1], frac);
+    const sLower = lerp(lower[i0], lower[i1], frac);
+    return lerp(sHigher, sLower, between);
   };
 
   // Компрессор. Здесь стояло «выше порога делим на степень сжатия», и это
