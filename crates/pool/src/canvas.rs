@@ -85,7 +85,57 @@ pub fn has_local_font(name: &str) -> bool {
     if key.is_empty() {
         return false;
     }
-    font_index().contains_key(&key)
+    local_index().contains(&key)
+}
+
+/// Имена, по которым ищет `local()`: полное имя начертания (запись 4) и имя
+/// PostScript (запись 6). Именно они, а не семейство: у Chrome `local(
+/// "Cantarell")` не находится, а `local("Cantarell Regular")` и
+/// `local("Cantarell-Regular")` находятся — проверено на этой машине.
+fn local_index() -> &'static std::collections::HashSet<String> {
+    static INDEX: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut out = std::collections::HashSet::new();
+        for dir in FONT_DIRS {
+            let mut stack = vec![std::path::PathBuf::from(dir)];
+            while let Some(d) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&d) else {
+                    continue;
+                };
+                for e in entries.flatten() {
+                    let path = e.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                        continue;
+                    }
+                    let ext = path
+                        .extension()
+                        .and_then(|x| x.to_str())
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    if ext != "ttf" && ext != "otf" && ext != "ttc" {
+                        continue;
+                    }
+                    let Ok(bytes) = std::fs::read(&path) else {
+                        continue;
+                    };
+                    let Ok(face) = ttf_parser::Face::parse(&bytes, 0) else {
+                        continue;
+                    };
+                    for name in face.names() {
+                        if name.name_id != 4 && name.name_id != 6 {
+                            continue;
+                        }
+                        if let Some(text) = name.to_string() {
+                            out.insert(text.trim().to_lowercase());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    })
 }
 
 /// Основной шрифт браузера: им меряется всё, для чего семейство не нашлось.
