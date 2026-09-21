@@ -9436,6 +9436,74 @@ variationSettings,weight",
         assert_eq!(out["sizeAfter"], 0);
     }
 
+    /// Звуковой контекст считает граф, а не подменяет его синтезом: раньше
+    /// здесь всегда рисовался осциллятор со сжимателем, чем бы страница ни
+    /// соединила узлы, и источник из буфера отдавал чужие числа. Сжиматель
+    /// при этом обязан показывать затухание — браузер держит в `reduction`
+    /// сглаженный минимум в децибелах, и его читают прямо. Числа сняты с
+    /// Chrome 151 на том же графе.
+    #[tokio::test]
+    async fn an_audio_graph_is_rendered_node_by_node() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        ctx.evaluate(r#"(() => {
+            const run = async () => {
+              const ac = new OfflineAudioContext(1, 8192, 44100);
+              const buf = ac.createBuffer(1, 8192, 44100);
+              const d = buf.getChannelData(0);
+              for (let i = 0; i < 8192; i++) d[i] = Math.sin(i * 0.07) * (0.2 + 0.8 * Math.sin(i * 0.0004));
+              const src = ac.createBufferSource();
+              src.buffer = buf;
+              const comp = ac.createDynamicsCompressor();
+              comp.threshold.value = -50; comp.knee.value = 40; comp.ratio.value = 12;
+              comp.attack.value = 0; comp.release.value = 0.25;
+              const gain = ac.createGain();
+              gain.gain.value = 0.5;
+              src.connect(comp); comp.connect(gain); gain.connect(ac.destination);
+              src.start(0);
+              const out = (await ac.startRendering()).getChannelData(0);
+              // И граф, который ни к чему не подключён, молчит — как в браузере.
+              const mute = new OfflineAudioContext(1, 128, 44100);
+              const lone = mute.createOscillator();
+              lone.start(0);
+              const silence = (await mute.startRendering()).getChannelData(0);
+              window.__audio = {
+                samples: [out[500], out[1000], out[4000]],
+                reduction: comp.reduction,
+                silent: Array.from(silence).every((x) => x === 0),
+              };
+            };
+            run();
+        })()"#).await.unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        let out = probe(&ctx, "__ptJSON.stringify(window.__audio)").await;
+        let got: Vec<f64> = out["samples"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
+            .unwrap_or_default();
+        // Усилитель вдвое тише сжимателя — значит граф пройден целиком.
+        let want = [-0.05188492, 0.11460970, -0.13615012];
+        assert_eq!(got.len(), 3, "три отсчёта: {out}");
+        for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "отсчёт {i}: {a} против браузерного {b} ({out})"
+            );
+        }
+        let reduction = out["reduction"].as_f64().unwrap_or_default();
+        assert!(
+            (reduction + 20.2256).abs() < 1e-3,
+            "затухание сжимателя как у браузера: {reduction} ({out})"
+        );
+        assert_eq!(out["silent"], true, "неподключённый узел молчит: {out}");
+    }
+
     /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`
     /// is the idiom every collector uses, Cloudflare's included — the URL is dead
     /// one line after the worker starts. Reading the blob when the engine got

@@ -7810,10 +7810,21 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
   const makeNode = (ctx, kind, extra) => {
     const state = Object.assign({
+      __ptOut: [],
       context: ctx, numberOfInputs: 1, numberOfOutputs: 1, channelCount: 2,
       channelCountMode: 'max', channelInterpretation: 'speakers', __ptKind: kind,
-      connect(dst) { ctx.__ptEdges.push(kind + '>' + (dst && dst.__ptKind || 'destination')); return dst && dst.connect ? dst : undefined; },
-      disconnect() {}, start() {}, stop() {},
+      connect(dst) {
+        ctx.__ptEdges.push(kind + '>' + (dst && dst.__ptKind || 'destination'));
+        // Ребро запоминается ссылкой, а не именем вида: иначе граф из двух
+        // усилителей неотличим от графа с одним, и считать его нечем.
+        try {
+          const to = (globalThis.__pt_audioState && __pt_audioState.get(dst)) || dst;
+          if (to && typeof to === 'object') state.__ptOut.push(to);
+        } catch (e) {}
+        return dst && dst.connect ? dst : undefined;
+      },
+      disconnect() { state.__ptOut.length = 0; },
+      start() {}, stop() {},
       addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
     }, extra || {});
     const iface = NODE_IFACE[kind];
@@ -7847,6 +7858,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     if (!P) { ctx.__ptNodes.push(state); return state; }
     const node = Object.create(P);
     NODE_STATE.set(node, state);
+    try {
+      if (!globalThis.__pt_audioState) {
+        Object.defineProperty(globalThis, '__pt_audioState',
+          { value: NODE_STATE, enumerable: false, configurable: true, writable: true });
+      }
+    } catch (e) {}
     Object.defineProperty(node, '__ptKind', { value: kind, enumerable: false, configurable: true });
     ctx.__ptNodes.push(state);
     return node;
@@ -8034,6 +8051,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     let readIndex = 0;
     let writeIndex = Math.min(Math.floor(0.006 * rate), 1023);
     let detectorAverage = 0, compressorGain = 1, maxAttackCompressionDiffDb = -1;
+    let meteringGain = 0;
+    const meteringReleaseK = Math.fround(1 - Math.exp(-1 / (rate * 0.325)));
 
     const out = new Float32Array(input.length);
     const nDivisionFrames = 32;
@@ -8088,12 +8107,21 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
         const postWarp = f(Math.sin(f(0.5 * Math.PI * compressorGain)));
         out[frame] = f(f(delay[readIndex] * masterLinearGain) * postWarp);
+        // Показание затухания: браузер держит не последнее значение, а
+        // сглаженный минимум в децибелах — падает мгновенно, отпускает с
+        // постоянной 0,325 с. Страница читает его как `compressor.reduction`.
+        const dbRealGain = f(20 * Math.log10(postWarp));
+        if (dbRealGain < meteringGain) meteringGain = dbRealGain;
+        else meteringGain = f(meteringGain + f(f(dbRealGain - meteringGain) * meteringReleaseK));
 
         frame++;
         readIndex = (readIndex + 1) & MASK;
         writeIndex = (writeIndex + 1) & MASK;
       }
     }
+    // Затухание, которое страница читает у самого узла: браузер держит там
+    // последнее значение в децибелах — отрицательное, когда сжиматель работал.
+    compressorKernel.lastReduction = meteringGain;
     return out;
   }
 
@@ -8172,41 +8200,193 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     suspend() { this.state = 'suspended'; return Promise.resolve(); }
     close() { this.state = 'closed'; return Promise.resolve(); }
     addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
-    // Render the graph to one channel of samples: the oscillator's waveform at
-    // its frequency, shaped by any compressor, plus tiny per-session jitter.
+    // Граф считается обходом от приёмника, а не подменяется синтезом.
+    // Раньше здесь всегда рисовался осциллятор со сжимателем, чем бы страница
+    // ни соединила узлы: источник из буфера отдавал чужие числа, а
+    // `compressor.reduction` — ноль там, где браузер даёт −20 дБ.
     __ptRender(chans, len) {
-      const nodes = this.__ptNodes;
-      const osc = nodes.find((n) => n.__ptKind === 'oscillator');
-      const comp = nodes.find((n) => n.__ptKind === 'compressor');
-      const gain = nodes.find((n) => n.__ptKind === 'gain');
-      const freq = osc && osc.frequency ? osc.frequency.value : 440;
-      const type = osc ? osc.type : 'sine';
-      const amp = gain && gain.gain ? gain.gain.value : 1;
-      // Дрожи здесь больше нет. Её подмешивали, чтобы отпечаток звука был у
-      // каждой личности свой, — но у настоящих машин он один и тот же для
-      // одной сборки браузера, и «свой» означало «ничей известный».
-      const thr = comp ? Math.pow(10, (comp.threshold.value || -24) / 20) : 1;
-      const ratio = comp ? (comp.ratio.value || 12) : 1;
-      let data = new Float32Array(len);
-      // Фаза не считается заново из номера отсчёта, а накапливается: браузер
-      // прибавляет шаг, посчитанный в одинарной точности, к двойному счётчику
-      // и оттого понемногу уходит от точного синуса. Разница видна в шестом
-      // знаке — и это ровно то, чем звуковой отпечаток отличает движки.
-      const tsize = oscTables(type, this.sampleRate).size;
-      const incr = Math.fround(Math.fround(freq) * Math.fround(tsize / this.sampleRate));
-      let idx = 0;
-      for (let i = 0; i < len; i++) {
-        data[i] = oscWaveAt(type, idx / tsize, freq, this.sampleRate) * amp;
-        idx += incr;
-        idx -= Math.floor(idx / tsize) * tsize;
+      const rate = this.sampleRate;
+      const zero = () => new Float32Array(len);
+      const pv = (p, dflt) => (p && typeof p.value === 'number' ? p.value : dflt);
+      const stateOf = (n) => (globalThis.__pt_audioState && __pt_audioState.get(n)) || n;
+      const dest = stateOf(this.destination);
+      // Кто во что входит.
+      const inputsOf = new Map();
+      for (const n of this.__ptNodes) {
+        for (const to of (n.__ptOut || [])) {
+          if (!inputsOf.has(to)) inputsOf.set(to, []);
+          inputsOf.get(to).push(n);
+        }
       }
-      if (comp) {
-        data = compressorKernel(data, this.sampleRate, {
-          threshold: comp.threshold.value, knee: comp.knee.value, ratio: comp.ratio.value,
-          attack: comp.attack.value, release: comp.release.value,
-        });
-      }
-      return bufferOf(data, chans, len, this.sampleRate);
+      const cache = new Map();
+      const sumInputs = (node, depth) => {
+        const ins = inputsOf.get(node) || [];
+        if (!ins.length) return zero();
+        const out = zero();
+        for (const src of ins) {
+          const d = pull(src, depth + 1);
+          for (let i = 0; i < len; i++) out[i] = Math.fround(out[i] + d[i]);
+        }
+        return out;
+      };
+      // Осциллятор: шаг фазы в одинарной точности копится в двойном счётчике,
+      // как в браузере.
+      const oscillate = (node) => {
+        const type = node.type || 'sine';
+        const freq = pv(node.frequency, 440) * Math.pow(2, pv(node.detune, 0) / 1200);
+        const tsize = oscTables(type, rate).size;
+        const incr = Math.fround(Math.fround(freq) * Math.fround(tsize / rate));
+        const out = zero();
+        let idx = 0;
+        for (let i = 0; i < len; i++) {
+          out[i] = oscWaveAt(type, idx / tsize, freq, rate);
+          idx += incr;
+          idx -= Math.floor(idx / tsize) * tsize;
+        }
+        return out;
+      };
+      const fromBuffer = (node) => {
+        const out = zero();
+        const buf = node.buffer;
+        let src = null;
+        try { src = buf && buf.getChannelData ? buf.getChannelData(0) : null; } catch (e) {}
+        if (!src) return out;
+        const loop = !!node.loop;
+        for (let i = 0; i < len; i++) {
+          out[i] = i < src.length ? src[i] : (loop && src.length ? src[i % src.length] : 0);
+        }
+        return out;
+      };
+      // Двухполюсный фильтр: коэффициенты те же, что в `biquad.cc`.
+      const biquad = (node, input) => {
+        const out = zero();
+        const nyq = rate / 2;
+        const f = Math.min(1, Math.max(0, pv(node.frequency, 350)
+          * Math.pow(2, pv(node.detune, 0) / 1200) / nyq));
+        const q = pv(node.Q, 1), gainDb = pv(node.gain, 0);
+        const w0 = Math.PI * f;
+        let b0 = 1, b1 = 0, b2 = 0, a0 = 1, a1 = 0, a2 = 0;
+        const alphaQ = Math.sin(w0) / (2 * Math.max(1e-9, q));
+        const type = node.type || 'lowpass';
+        if (type === 'lowpass' || type === 'highpass') {
+          const g = Math.pow(10, 0.05 * (q));
+          const alpha = Math.sin(w0) / (2 * g);
+          const cosw = Math.cos(w0);
+          if (type === 'lowpass') { b0 = (1 - cosw) / 2; b1 = 1 - cosw; b2 = b0; }
+          else { b0 = (1 + cosw) / 2; b1 = -(1 + cosw); b2 = b0; }
+          a0 = 1 + alpha; a1 = -2 * cosw; a2 = 1 - alpha;
+        } else if (type === 'bandpass') {
+          const cosw = Math.cos(w0);
+          b0 = alphaQ; b1 = 0; b2 = -alphaQ; a0 = 1 + alphaQ; a1 = -2 * cosw; a2 = 1 - alphaQ;
+        } else if (type === 'notch' || type === 'allpass') {
+          const cosw = Math.cos(w0);
+          if (type === 'notch') { b0 = 1; b1 = -2 * cosw; b2 = 1; }
+          else { b0 = 1 - alphaQ; b1 = -2 * cosw; b2 = 1 + alphaQ; }
+          a0 = 1 + alphaQ; a1 = -2 * cosw; a2 = 1 - alphaQ;
+        } else if (type === 'peaking' || type === 'lowshelf' || type === 'highshelf') {
+          const A = Math.pow(10, gainDb / 40);
+          const cosw = Math.cos(w0), sinw = Math.sin(w0);
+          if (type === 'peaking') {
+            b0 = 1 + alphaQ * A; b1 = -2 * cosw; b2 = 1 - alphaQ * A;
+            a0 = 1 + alphaQ / A; a1 = -2 * cosw; a2 = 1 - alphaQ / A;
+          } else {
+            const s = 1, alpha = sinw / 2 * Math.sqrt((A + 1 / A) * (1 / s - 1) + 2);
+            const twoSqrtAAlpha = 2 * Math.sqrt(A) * alpha;
+            if (type === 'lowshelf') {
+              b0 = A * ((A + 1) - (A - 1) * cosw + twoSqrtAAlpha);
+              b1 = 2 * A * ((A - 1) - (A + 1) * cosw);
+              b2 = A * ((A + 1) - (A - 1) * cosw - twoSqrtAAlpha);
+              a0 = (A + 1) + (A - 1) * cosw + twoSqrtAAlpha;
+              a1 = -2 * ((A - 1) + (A + 1) * cosw);
+              a2 = (A + 1) + (A - 1) * cosw - twoSqrtAAlpha;
+            } else {
+              b0 = A * ((A + 1) + (A - 1) * cosw + twoSqrtAAlpha);
+              b1 = -2 * A * ((A - 1) + (A + 1) * cosw);
+              b2 = A * ((A + 1) + (A - 1) * cosw - twoSqrtAAlpha);
+              a0 = (A + 1) - (A - 1) * cosw + twoSqrtAAlpha;
+              a1 = 2 * ((A - 1) - (A + 1) * cosw);
+              a2 = (A + 1) - (A - 1) * cosw - twoSqrtAAlpha;
+            }
+          }
+        }
+        const n0 = b0 / a0, n1 = b1 / a0, n2 = b2 / a0, d1 = a1 / a0, d2 = a2 / a0;
+        let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+        for (let i = 0; i < len; i++) {
+          const x = input[i];
+          const y = n0 * x + n1 * x1 + n2 * x2 - d1 * y1 - d2 * y2;
+          x2 = x1; x1 = x; y2 = y1; y1 = y;
+          out[i] = Math.fround(y);
+        }
+        return out;
+      };
+      const shape = (node, input) => {
+        const kind = node.__ptKind;
+        if (kind === 'gain') {
+          const g = pv(node.gain, 1);
+          const out = zero();
+          for (let i = 0; i < len; i++) out[i] = Math.fround(input[i] * g);
+          return out;
+        }
+        if (kind === 'delay') {
+          const shift = Math.max(0, Math.round(pv(node.delayTime, 0) * rate));
+          const out = zero();
+          for (let i = shift; i < len; i++) out[i] = input[i - shift];
+          return out;
+        }
+        if (kind === 'waveshaper') {
+          const curve = node.curve;
+          if (!curve || !curve.length) return input;
+          const out = zero();
+          const n = curve.length;
+          for (let i = 0; i < len; i++) {
+            const x = Math.min(1, Math.max(-1, input[i]));
+            const t = (x + 1) * 0.5 * (n - 1);
+            const k = Math.min(n - 2, Math.floor(t));
+            const frac = t - k;
+            out[i] = Math.fround(curve[k] * (1 - frac) + curve[k + 1] * frac);
+          }
+          return out;
+        }
+        if (kind === 'biquad') return biquad(node, input);
+        if (kind === 'compressor') {
+          const res = compressorKernel(input, rate, {
+            threshold: pv(node.threshold, -24), knee: pv(node.knee, 30),
+            ratio: pv(node.ratio, 12), attack: pv(node.attack, 0.003),
+            release: pv(node.release, 0.25),
+          });
+          // `reduction` страница читает прямо: у браузера это последнее
+          // затухание в децибелах, а у нас стоял ноль.
+          try { node.reduction = compressorKernel.lastReduction; } catch (e) {}
+          return res;
+        }
+        if (kind === 'stereopanner' || kind === 'panner') {
+          const out = zero();
+          const pan = Math.min(1, Math.max(-1, pv(node.pan, 0)));
+          const g = Math.cos((pan + 1) * Math.PI / 4);
+          for (let i = 0; i < len; i++) out[i] = Math.fround(input[i] * g);
+          return out;
+        }
+        // Всё прочее — сквозной проход: анализатор, свёртка, обработчик.
+        return input;
+      };
+      const pull = (node, depth) => {
+        if (!node || depth > 32) return zero();
+        if (cache.has(node)) return cache.get(node);
+        cache.set(node, zero());
+        let out;
+        const kind = node.__ptKind;
+        if (kind === 'oscillator') out = oscillate(node);
+        else if (kind === 'buffersource') out = fromBuffer(node);
+        else if (kind === 'constant') {
+          out = zero();
+          const v = pv(node.offset, 1);
+          for (let i = 0; i < len; i++) out[i] = v;
+        } else out = shape(node, sumInputs(node, depth));
+        cache.set(node, out);
+        return out;
+      };
+      const data = sumInputs(dest, 0);
+      return bufferOf(data, chans, len, rate);
     }
   }
   const audioTag = (Ctor, name) => { try { Object.defineProperty(Ctor.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {} return Ctor; };
