@@ -16,7 +16,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
+use ab_glyph::{Font, FontVec, PxScale};
 use tiny_skia::{
     Color, FillRule, GradientStop, LinearGradient, Paint, PathBuilder, Pixmap, Point,
     RadialGradient, Rect, Shader, SpreadMode, Stroke, Transform,
@@ -146,6 +146,9 @@ thread_local! {
     /// Разобранные файлы шрифтов, по имени файла. Разбор недёшев, а страница,
     /// перебирающая семейства ради отпечатка, спрашивает их сотнями.
     static LOADED: RefCell<HashMap<String, Option<&'static FontVec>>> =
+        RefCell::new(HashMap::new());
+    /// Раскладчики, по адресу шрифта.
+    static SHAPERS: RefCell<HashMap<usize, Option<&'static rustybuzz::Face<'static>>>> =
         RefCell::new(HashMap::new());
     /// Decoded images, by address. A page draws the same picture many times —
     /// the challenge's beacon PNG lands on a canvas on every round — so the
@@ -330,6 +333,122 @@ fn resolve_chain(families: &str, bold: bool, italic: bool) -> Vec<&'static FontV
     out
 }
 
+/// Раскладчик строки для этого шрифта. Разбор лица недёшев, а страница меряет
+/// надписи сотнями, поэтому он живёт до конца процесса, как и сам шрифт.
+fn shaper(font: &'static FontVec) -> Option<&'static rustybuzz::Face<'static>> {
+    SHAPERS.with(|m| {
+        let key = font as *const FontVec as usize;
+        if let Some(hit) = m.borrow().get(&key) {
+            return *hit;
+        }
+        let got = rustybuzz::Face::from_slice(font.as_slice(), 0)
+            .map(|f| &*Box::leak(Box::new(f)) as &'static rustybuzz::Face<'static>);
+        m.borrow_mut().insert(key, got);
+        got
+    })
+}
+
+/// Разложенный знак: глиф, шрифт и его начало в пикселях.
+struct Shaped {
+    font: &'static FontVec,
+    id: ab_glyph::GlyphId,
+    x: f64,
+}
+
+/// Перевести длину из единиц шрифта в пиксели так, как это делает FreeType, а
+/// за ним Skia и браузер: кегль хранится в 26.6, множитель — в 16.16, и
+/// результат остаётся дробью со знаменателем 65536.
+///
+/// Разница видна на шрифтах с 1000 единицами на кегль: `16px "Noto Sans Mono"`
+/// даёт у браузера 9.600021362304688 на знак, а честное `600*16/1000` — ровно
+/// 9.6. На сорока знаках это уже тысячная доля пикселя, и страница, меряющая
+/// строку, видит чужое число. У шрифтов с 2048 единицами деление точное, и там
+/// расхождения не было.
+fn ft_px(units: i32, upem: i64, size_px: f32) -> f64 {
+    if upem <= 0 {
+        return 0.0;
+    }
+    // FT_DivFix: кегль в 26.6, поднятый в 16.16, делится на единицы с
+    // округлением к ближайшему.
+    let size26_6 = (size_px as f64 * 64.0).round() as i64;
+    let x_scale = ((size26_6 << 16) + upem / 2) / upem;
+    // FT_MulFix со знаком: округление к ближайшему по модулю.
+    let a = (units as i64) * 1024;
+    let prod = a * x_scale;
+    let fixed = if prod >= 0 {
+        (prod + 0x8000) >> 16
+    } else {
+        -((-prod + 0x8000) >> 16)
+    };
+    fixed as f64 / 65536.0
+}
+
+/// Уложить кусок строки одним шрифтом.
+fn shape_run(
+    out: &mut Vec<Shaped>,
+    caret: &mut f64,
+    font: &'static FontVec,
+    text: &str,
+    size_px: f32,
+) {
+    let upem = font.units_per_em().unwrap_or(1000.0) as i64;
+    if let Some(face) = shaper(font) {
+        let mut buf = rustybuzz::UnicodeBuffer::new();
+        buf.push_str(text);
+        buf.guess_segment_properties();
+        let laid = rustybuzz::shape(face, &[], buf);
+        let (infos, pos) = (laid.glyph_infos(), laid.glyph_positions());
+        for (info, p) in infos.iter().zip(pos.iter()) {
+            out.push(Shaped {
+                font,
+                id: ab_glyph::GlyphId(info.glyph_id as u16),
+                x: *caret + ft_px(p.x_offset, upem, size_px),
+            });
+            *caret += ft_px(p.x_advance, upem, size_px);
+        }
+        return;
+    }
+    for ch in text.chars() {
+        let id = font.glyph_id(ch);
+        out.push(Shaped { font, id, x: *caret });
+        *caret += ft_px(font.h_advance_unscaled(id) as i32, upem, size_px);
+    }
+}
+
+/// Разложить строку так, как её раскладывает браузер: по словам, внутри слова —
+/// первым шрифтом цепочки, где знак есть, с лигатурами и кернингом самого
+/// шрифта.
+///
+/// Словами — не для красоты: раскладка у браузера словарная (слово ложится в
+/// кеш целиком), и пара, разделённая пробелом, кернингом не подгоняется. У
+/// Liberation Serif пара «пробел + W» сдвинута на 37 единиц, и «To Wave» без
+/// этого правила выходило на три сотых пикселя уже браузерной.
+fn shape(chain: &[&'static FontVec], text: &str, size_px: f32) -> (Vec<Shaped>, f64) {
+    let mut out: Vec<Shaped> = Vec::new();
+    let mut caret = 0.0f64;
+    let mut run = String::new();
+    let mut run_font: Option<&'static FontVec> = None;
+    for ch in text.chars() {
+        let cf = face_for(chain, ch);
+        let breaks = ch == ' ' || run_font.is_some_and(|f| !std::ptr::eq(f, cf));
+        if breaks && !run.is_empty() {
+            shape_run(&mut out, &mut caret, run_font.unwrap_or(chain[0]), &run, size_px);
+            run.clear();
+        }
+        run.push(ch);
+        run_font = Some(cf);
+        if ch == ' ' {
+            shape_run(&mut out, &mut caret, cf, &run, size_px);
+            run.clear();
+            run_font = None;
+        }
+    }
+    if !run.is_empty() {
+        shape_run(&mut out, &mut caret, run_font.unwrap_or(chain[0]), &run, size_px);
+    }
+    (out, caret)
+}
+
 /// Шрифт, которым рисуется этот знак: первый в цепочке, где он есть.
 fn face_for(chain: &[&'static FontVec], ch: char) -> &'static FontVec {
     for f in chain {
@@ -397,17 +516,17 @@ fn px_scale<F: Font>(font: &F, size_px: f32) -> PxScale {
 /// Метрики строки, как их возвращает `measureText`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TextMetrics {
-    pub width: f32,
-    pub left: f32,
-    pub right: f32,
-    pub ascent: f32,
-    pub descent: f32,
-    pub font_ascent: f32,
-    pub font_descent: f32,
+    pub width: f64,
+    pub left: f64,
+    pub right: f64,
+    pub ascent: f64,
+    pub descent: f64,
+    pub font_ascent: f64,
+    pub font_descent: f64,
     /// Высота строки при `line-height: normal` — подъём, спуск и просвет
     /// гарнитуры. У Liberation Sans это ровно 1,15 кегля, и раскладка без неё
     /// не сходится с браузерной ни на пиксель.
-    pub line: f32,
+    pub line: f64,
 }
 
 /// Cap per-side pixels so a hostile page can't request an absurd allocation.
@@ -1054,7 +1173,6 @@ pub fn fill_text(
     if chain.is_empty() {
         return;
     }
-    let font = chain[0];
     CANVASES.with(|c| {
         let mut map = c.borrow_mut();
         let Some(pm) = map.get_mut(&id) else {
@@ -1063,15 +1181,14 @@ pub fn fill_text(
         // Тень у надписи — те же глифы цветом тени, размытые и снесённые.
         // Челлендж рисует текст именно с тенью, и без неё пропадает не только
         // размытое пятно, но и почти всё покрытие холста.
+        let (glyphs_of, _) = shape(&chain, text, size_px);
         let glyphs = |target: &mut [u8], tw: i32, th: i32, colour: [u8; 4]| {
-            let scale = px_scale(font, size_px);
-            let scaled = font.as_scaled(scale);
-            let mut caret = x;
-            for ch in text.chars() {
-                let cf = face_for(&chain, ch);
+            for g in &glyphs_of {
+                let cf = g.font;
                 let cscale = px_scale(cf, size_px);
-                let gid = cf.glyph_id(ch);
-                let glyph = gid.with_scale_and_position(cscale, ab_glyph::point(caret, y));
+                let glyph = g
+                    .id
+                    .with_scale_and_position(cscale, ab_glyph::point(x + g.x as f32, y));
                 if let Some(og) = cf.outline_glyph(glyph) {
                     let bb = og.px_bounds();
                     og.draw(|gx, gy, coverage| {
@@ -1083,7 +1200,6 @@ pub fn fill_text(
                         blend_over(target, ((py * tw + px) * 4) as usize, colour, coverage);
                     });
                 }
-                caret += cf.as_scaled(cscale).h_advance(gid);
             }
         };
         paint_shadow(pm, sh, |sp, col| {
@@ -1114,44 +1230,38 @@ pub fn measure_text(
         return TextMetrics::default();
     }
     let font = chain[0];
-    let scale = px_scale(font, size_px);
-    let scaled = font.as_scaled(scale);
     let upem = font.units_per_em().unwrap_or(1000.0);
     // Границы чернил: браузер отдаёт их целыми по вертикали и дробными по
     // горизонтали — так же, как получаются из растеризованного контура.
     // По горизонтали браузер отдаёт границы чернил дробными, по вертикали —
     // целыми: первые берутся из контура, вторые из растра. Поэтому и здесь два
     // источника, а не один.
-    let f = size_px / upem;
-    let (mut ink_l, mut ink_r) = (f32::MAX, f32::MIN);
-    let (mut ink_t, mut ink_b) = (f32::MAX, f32::MIN);
-    let mut caret = 0.0f32;
-    for ch in text.chars() {
+    let (mut ink_l, mut ink_r) = (f64::MAX, f64::MIN);
+    let (mut ink_t, mut ink_b) = (f64::MAX, f64::MIN);
+    let (glyphs, width) = shape(&chain, text, size_px);
+    for g in &glyphs {
         // Знак берётся из первого семейства цепочки, где он есть, — как в
         // браузере. Кегль при подмене считается по метрикам того шрифта.
-        let cf = face_for(&chain, ch);
+        let cf = g.font;
         let cscale = px_scale(cf, size_px);
-        let cscaled = cf.as_scaled(cscale);
-        let cupem = cf.units_per_em().unwrap_or(1000.0);
-        let cf_ratio = size_px / cupem;
-        let gid = cf.glyph_id(ch);
-        if let Some(o) = cf.outline(gid) {
-            ink_l = ink_l.min(caret + o.bounds.min.x * cf_ratio);
-            ink_r = ink_r.max(caret + o.bounds.max.x * cf_ratio);
-        }
-        let glyph = gid.with_scale_and_position(cscale, ab_glyph::point(caret, 0.0));
+        // Коробка чернил считается в своих координатах знака и только потом
+        // сдвигается на его место в строке. Браузер меряет так же: у одиночной
+        // «A» правая граница ровно 7 (целая), а у «AV» — 12.928, где 5.928 это
+        // дробное начало «V» после кернинга, а 7 — её собственная коробка.
+        // Округляли бы после сдвига — обе вышли бы целыми.
+        let glyph = g.id.with_scale_and_position(cscale, ab_glyph::point(0.0, 0.0));
         if let Some(og) = cf.outline_glyph(glyph) {
             let bb = og.px_bounds();
-            ink_t = ink_t.min(bb.min.y);
-            ink_b = ink_b.max(bb.max.y);
+            ink_l = ink_l.min(g.x + bb.min.x as f64);
+            ink_r = ink_r.max(g.x + bb.max.x as f64);
+            ink_t = ink_t.min(bb.min.y as f64);
+            ink_b = ink_b.max(bb.max.y as f64);
         }
-        caret += cscaled.h_advance(gid);
     }
-    let _ = f;
     let none = ink_l > ink_r;
     let flat = ink_t > ink_b;
     TextMetrics {
-        width: caret,
+        width,
         // Левую границу браузер отсекает к нулю, а не округляет: чернила,
         // начавшиеся на восемь десятых пикселя правее начала, дают 0, а на
         // полтора — −1. Проверено на двух гарнитурах.
@@ -1159,11 +1269,11 @@ pub fn measure_text(
         right: if none { 0.0 } else { ink_r },
         ascent: if flat { 0.0 } else { -ink_t },
         descent: if flat { 0.0 } else { ink_b },
-        font_ascent: (font.ascent_unscaled() / upem * size_px).round(),
-        font_descent: (-font.descent_unscaled() / upem * size_px).round(),
-        line: (font.ascent_unscaled() - font.descent_unscaled() + font.line_gap_unscaled())
+        font_ascent: (font.ascent_unscaled() / upem * size_px).round() as f64,
+        font_descent: (-font.descent_unscaled() / upem * size_px).round() as f64,
+        line: ((font.ascent_unscaled() - font.descent_unscaled() + font.line_gap_unscaled())
             / upem
-            * size_px,
+            * size_px) as f64,
     }
 }
 
@@ -1269,6 +1379,79 @@ mod tests {
             "glyph 'H' must cover real pixels, got {opaque}"
         );
         destroy(2);
+    }
+
+    #[test]
+    fn a_pair_of_letters_is_kerned_like_the_browser() {
+        // «AV» уже, чем «A» и «V» порознь: пара подогнана самим шрифтом.
+        let av = measure_text("AV", 16.0, "Liberation Sans", false, false).width;
+        let a = measure_text("A", 16.0, "Liberation Sans", false, false).width;
+        let v = measure_text("V", 16.0, "Liberation Sans", false, false).width;
+        assert!(
+            av < a + v - 0.5,
+            "кернинг пары не применён: {av} против {} порознь",
+            a + v
+        );
+        // Chrome на этой машине: 20.156 против 21.344 без кернинга.
+        assert!(
+            (av - 20.15625).abs() < 0.001,
+            "ширина «AV» разошлась с браузерной: {av}"
+        );
+    }
+
+    #[test]
+    fn a_space_breaks_the_kerning_pair() {
+        // Раскладка у браузера словарная: пара через пробел не подгоняется,
+        // хотя у Liberation Serif для «пробел + W» кернинг в шрифте есть.
+        let whole = measure_text("To Wave", 16.0, "Liberation Serif", false, false).width;
+        let to = measure_text("To", 16.0, "Liberation Serif", false, false).width;
+        let space = measure_text(" ", 16.0, "Liberation Serif", false, false).width;
+        let wave = measure_text("Wave", 16.0, "Liberation Serif", false, false).width;
+        assert!(
+            (whole - (to + space + wave)).abs() < 1e-9,
+            "слова должны складываться без подгонки: {whole} против {}",
+            to + space + wave
+        );
+    }
+
+    #[test]
+    fn a_ligature_narrows_the_string() {
+        // У DejaVu Sans «ffi» — одна лигатура шириной 1980 единиц против 2011
+        // у трёх знаков порознь. Браузер её ставит, и надпись выходит уже.
+        let ffi = measure_text("ffi", 16.0, "DejaVu Sans", false, false).width;
+        let apart = measure_text("f", 16.0, "DejaVu Sans", false, false).width * 2.0
+            + measure_text("i", 16.0, "DejaVu Sans", false, false).width;
+        assert!(
+            ffi < apart - 0.2,
+            "лигатура не подставлена: {ffi} против {apart}"
+        );
+    }
+
+    #[test]
+    fn lengths_scale_through_the_same_fixed_point_as_the_browser() {
+        // 600 единиц при 1000 на кегль и 16 пикселях: у браузера ровно
+        // 9.600021362304688, а не 9.6 — кегль идёт через 26.6, множитель через
+        // 16.16. Шрифты с 2048 единицами делятся точно, и там разницы нет.
+        assert_eq!(ft_px(600, 1000, 16.0), 9.600021362304688);
+        assert_eq!(ft_px(600, 1000, 13.0), 7.8000030517578125);
+        assert_eq!(ft_px(1366, 2048, 16.0), 10.671875);
+        assert_eq!(ft_px(-143, 2048, 16.0), -1.1171875, "кернинг со знаком");
+        assert_eq!(ft_px(0, 1000, 16.0), 0.0);
+    }
+
+    #[test]
+    fn the_ink_box_is_rounded_in_the_glyph_own_space() {
+        // У одиночной «A» правая граница чернил целая, а у «AV» — дробная:
+        // коробка знака округляется в его координатах и только потом едет на
+        // своё место в строке. Браузер даёт 7 и 12.928.
+        let a = measure_text("A", 10.0, "Liberation Sans", false, false);
+        let av = measure_text("AV", 10.0, "Liberation Sans", false, false);
+        assert_eq!(a.right, 7.0, "правая граница одиночной «A»");
+        assert!(
+            (av.right - 12.928).abs() < 0.001,
+            "правая граница «AV»: {}",
+            av.right
+        );
     }
 
     #[test]
