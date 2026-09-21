@@ -2389,7 +2389,8 @@
       const m = mapOf(this), k = String(p).toLowerCase();
       // Имена с приставкой поставщика спрашивают и с дефисом впереди:
       // `-webkit-logical-width` — то же свойство, что у нас без него.
-      return m.get(k) || (k.charCodeAt(0) === 45 ? m.get(k.slice(1)) || '' : '');
+      return m.get(k) || (k.charCodeAt(0) === 45 ? m.get(k.slice(1)) || '' : '')
+        || __longhandFrom(m, k);
     });
     def('item', function item(i) { return namesOf(this)[i] || ''; });
     def('removeProperty', function removeProperty(p) {
@@ -2476,6 +2477,35 @@
     return out;
   };
 
+  /// Значение длинного свойства, написанного сокращением. Браузер хранит
+  /// разложенное: после `style.border = '1px solid'` он отвечает `1px` на
+  /// `style.borderTopWidth`, а мы держали только саму запись и отвечали
+  /// пустотой — вместе с ней пропадала и рамка из раскладки.
+  const __longhandFrom = (m, key) => {
+    for (const [short, value] of m) {
+      const list = CSS_LONGHANDS[short];
+      if (!list || !list.includes(key)) continue;
+      const pairs = typeof __ptExpand === 'function' ? __ptExpand(short, value) : null;
+      if (!pairs) continue;
+      for (const [k, v] of pairs) if (k === key) return v;
+    }
+    // И наоборот: сокращение, собранное из длинных. `border: 1px solid`
+    // отвечает `solid` на `borderStyle`, потому что все четыре стороны
+    // одинаковы; разнобой браузер сокращением не печатает.
+    const own = CSS_LONGHANDS[key];
+    if (own && !m.has(key)) {
+      let same = null;
+      for (const n of own) {
+        const v = m.get(n) || __longhandFrom(m, n);
+        if (!v) return '';
+        if (same == null) same = v;
+        else if (same !== v) return '';
+      }
+      if (same != null) return same;
+    }
+    return '';
+  };
+
   /// Имена, которые перечисляет объявление: сокращения раскрыты, порядок как у
   /// браузера — в порядке появления, без повторов.
   const __styleNames = (m) => {
@@ -2492,7 +2522,7 @@
     for (const name of CSS_PROPS) {
       const key = dash(name).toLowerCase();
       Object.defineProperty(target, name, {
-        get() { return map.get(key) || ''; },
+        get() { return map.get(key) || __longhandFrom(map, key); },
         set(v) { if (v === '' || v == null) map.delete(key); else map.set(key, __cssValue(key, v)); },
         enumerable: true, configurable: true,
       });
@@ -2837,7 +2867,7 @@
     for (const name of CSS_PROPS) {
       const key = dash(name);
       Object.defineProperty(target, name, {
-        get() { return read().get(key) || ''; },
+        get() { const m = read(); return m.get(key) || __longhandFrom(m, key); },
         set(v) {
           const m = read();
           if (v === '' || v == null) m.delete(key); else m.set(key, __cssValue(key, v));
@@ -2848,7 +2878,10 @@
     }
     return new Proxy(target, {
       get: (t, p) => {
-        if (typeof p === 'string' && !(p in t)) return read().get(dash(p)) || '';
+        if (typeof p === 'string' && !(p in t)) {
+          const m = read(), k = dash(p);
+          return m.get(k) || __longhandFrom(m, k);
+        }
         const v = t[p];
         return typeof v === 'function' ? v.bind(t) : v;
       },
@@ -3095,6 +3128,11 @@
         const tag = m[1].toLowerCase();
         if (close) {
           for (let s = stack.length - 1; s > 0; s--) if (stack[s].localName === tag) { stack.length = s; break; }
+        } else if (tag === 'html' || tag === 'head' || tag === 'body') {
+          // Разбор куска разметки: браузер такие теги внутрь не вставляет —
+          // их содержимое просто переезжает в текущего родителя. Мы делали
+          // из них узлы, и `div.innerHTML = '<html><body></body></html>'`
+          // давал двух детей там, где у браузера пусто.
         } else {
           const el = elem(tag);
           for (const am of m[2].matchAll(/([\w-]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g)) {
@@ -5313,7 +5351,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         lineH = /^[\d.]+$/.test(t) ? parseFloat(t) * fs : (__lengthPx(t, fs, availW) || fbox.line);
       }
     }
-    const contentX = boxX + bl + pl, contentY = boxY + bt + pt_;
+    const contentX = boxX + bl + pl;
+    let contentY = boxY + bt + pt_;
+    // Поля детей, убежавшие наружу через пустой край родителя.
+    let escapedTop = 0, escapedBottom = 0;
     let y = contentY, widest = 0, deepest = 0;
     // Гибкий контейнер: дети ложатся в ряд (или в столбец), свободное место
     // делится по `flex-grow`, нехватка — по `flex-shrink`, а поперёк они по
@@ -5429,6 +5470,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       // новую строку, и два `<span>` подряд стояли лесенкой, а не рядом,
       // как у браузера.
       let i = 0;
+      // Поля соседних блоков схлопываются: между двумя абзацами у браузера
+      // шестнадцать пикселей, а не тридцать два. Поле первого и последнего
+      // ребёнка уходит наружу, если у родителя нет ни рамки, ни отступа с
+      // этой стороны, — и становится полем самого родителя.
+      let carry = 0;          // нижнее поле предыдущего блока, ждёт схлопывания
+      let firstFlow = true;
       const positionOf = (c) => String(__cascadeFor(c).get('position') || 'static').toLowerCase();
       while (i < boxedKids.length) {
         const c = boxedKids[i];
@@ -5446,9 +5493,19 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
           const cb = __layoutOne(c, contentX, y, cw, fbox);
           i++;
           if (!cb) continue;
+          const cmt = cb.mt || 0;
+          // Наружу — только у первого в потоке и только через пустой край.
+          // У соседей поля схлопываются в большее из двух: коробка встала на
+          // своё поле, и добрать надо лишь разницу.
+          const escapes = firstFlow && !bt && !pt_;
+          const shift = escapes ? -cmt : Math.max(0, carry - cmt);
+          if (escapes) escapedTop = Math.max(escapedTop, cmt);
+          if (shift) __ptShiftBox(c, cb.x, cb.y + shift);
           widest = Math.max(widest, cb.x - contentX + cb.w);
           deepest = Math.max(deepest, cb.y - contentY + cb.h);
-          y = cb.y + cb.h + (cb.mb || 0);
+          y = cb.y + cb.h;
+          carry = cb.mb || 0;
+          firstFlow = false;
           continue;
         }
         const run = [];
@@ -5456,12 +5513,31 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
                && positionOf(boxedKids[i]) !== 'absolute' && positionOf(boxedKids[i]) !== 'fixed') {
           run.push(boxedKids[i++]);
         }
-        const done = __layoutInlineRun(run, contentX, y, cw, fbox, lineH);
+        // Строка соседствует с блоком через полное поле: схлопывать нечему.
+        const done = __layoutInlineRun(run, contentX, y + carry, cw, fbox, lineH);
         y = done.y;
+        carry = 0;
+        firstFlow = false;
         widest = Math.max(widest, done.widest);
         deepest = Math.max(deepest, y - contentY);
       }
+      // Нижнее поле последнего ребёнка остаётся внутри только тогда, когда
+      // край родителя не пуст.
+      if (carry && (bb || pb)) y += carry;
+      else if (carry) escapedBottom = carry;
     }
+    // Убежавшее поле становится полем самого родителя: блок с абзацем внутри
+    // стоит у браузера на шестнадцать пикселей ниже, чем встал бы без этого,
+    // а дети внутри — там же, где были.
+    if (escapedTop > mt) {
+      const delta = escapedTop - mt;
+      for (const c of boxedKids) {
+        if (c.__ptBox) __ptShiftBox(c, c.__ptBox.x, c.__ptBox.y + delta);
+      }
+      boxY += delta; contentY += delta; y += delta;
+      mt = escapedTop;
+    }
+    if (escapedBottom > mb) mb = escapedBottom;
     if (inlineish && explicitW == null && !forcedW && boxedKids.length) cw = widest;
 
     let ch;

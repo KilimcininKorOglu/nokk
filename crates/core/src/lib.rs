@@ -4612,7 +4612,14 @@ mod tests {
         // отдельно проверяем, что это не ровная десятая, как было у нас.
         let min = got["min"].as_f64().expect("число");
         let want = 1_677_721.0 / 16_777_216.0;
-        assert!((min - want).abs() < 1e-15, "разрешение часов: {min} против {want}");
+        // Допуск — шаг решётки: разность двух соседних отметок иногда
+        // округляется в соседнюю, и строгое равенство здесь ловит не подмену
+        // часов, а удачу замера.
+        let step = 1.0 / 16_777_216.0;
+        assert!(
+            (min - want).abs() < 2.0 * step,
+            "разрешение часов: {min} против {want}"
+        );
         assert!(
             (min - 0.1_f64).abs() > 1e-9,
             "ровная десятая — признак часов, считающих от нуля: {min}"
@@ -9675,6 +9682,52 @@ variationSettings,weight",
                 "соседние отметки отстоят на 16,6 или 16,7: {v} ({out})"
             );
         }
+    }
+
+    /// Поля соседних блоков схлопываются, а поле первого и последнего ребёнка
+    /// уходит наружу через пустой край родителя. Без этого между двумя
+    /// абзацами выходило вдвое больше места, чем у браузера, и вся геометрия
+    /// ниже уезжала. Заодно: разбор куска разметки не делает узлов из
+    /// `<html>`/`<body>`, а сокращение в стиле читается длинными именами.
+    /// Числа сняты с Chrome 151 на той же разметке.
+    #[tokio::test]
+    async fn margins_collapse_the_way_the_browser_collapses_them() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<!doctype html><html><head><style>body{margin:0;font:16px/19px system-ui}
+               p{margin:16px 0}</style></head><body>
+               <div id=a><p>a</p><p>b</p></div>
+               <div id=b><div style="margin:8px"></div></div>
+               <div id=c style="border:1px solid"><p>a</p></div>
+               <div id=d></div>
+               </body></html>"#,
+        )
+        .await
+        .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            document.getElementById('d').innerHTML = '<html><body></body></html>';
+            const pick = (id) => { const e = document.getElementById(id);
+              const base = e.getBoundingClientRect();
+              return { h: parseFloat(getComputedStyle(e).height),
+                kids: [...e.children].map((c) => Math.round(c.getBoundingClientRect().y - base.y)) };
+            };
+            return __ptJSON.stringify({ a: pick('a'), b: pick('b'), c: pick('c'), d: pick('d'),
+              border: document.getElementById('c').style.borderTopWidth });
+        })()"#).await;
+
+        assert_eq!(out["a"]["h"], 54.0, "два абзаца: 19 + 16 + 19, а не вшестеро: {out}");
+        assert_eq!(out["a"]["kids"][0], 0.0, "поле первого ушло наружу: {out}");
+        assert_eq!(out["a"]["kids"][1], 35.0, "между абзацами одно поле, не два: {out}");
+        assert_eq!(out["b"]["h"], 0.0, "пустой блок схлопывается целиком: {out}");
+        assert_eq!(out["c"]["h"], 51.0, "рамка держит поле внутри: {out}");
+        assert_eq!(out["c"]["kids"][0], 17.0, "рамка плюс поле: {out}");
+        assert_eq!(out["d"]["h"], 0.0, "`<html>` в куске разметки узлом не становится: {out}");
+        assert_eq!(out["d"]["kids"].as_array().map(|a| a.len()), Some(0), "и детей не даёт: {out}");
+        assert_eq!(out["border"], "1px", "сокращение читается длинным именем: {out}");
     }
 
     /// Строчные дети ложатся в одну строку, переносятся по ширине и стоят на

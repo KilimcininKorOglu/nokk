@@ -203,7 +203,7 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
                 ' связан=' + (el && el.isConnected) +
                 ' псевдо=' + String(ps) +
                 ' док=' + (el && el.ownerDocument === document) +
-                ' цвет=' + (r && r.color) + ' кегль=' + (r && r.fontSize));
+                ' цвет=' + (r && r.color) + ' кегль=' + (r && r.fontSize) +' дети=' + (el && el.children ? Array.prototype.map.call(el.children, (k) => k.nodeName + (k.getAttribute && k.getAttribute('style') ? '[' + k.getAttribute('style').slice(0, 40) + ']' : '')).join(',').slice(0, 160) : '?') + ' текст=' + JSON.stringify(String((el && el.textContent) || '').slice(0, 40)));
             }
           } catch (e) {}
           return r;
