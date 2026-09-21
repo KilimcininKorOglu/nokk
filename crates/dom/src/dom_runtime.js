@@ -1149,6 +1149,11 @@
         try { Object.defineProperty(w, k, { value: v, configurable: true }); } catch (e) {}
       }
       Object.defineProperty(this, '__ptRealm', { value: w, configurable: true, enumerable: false });
+      try { __realmFrames.add(this); } catch (e) {}
+      // Окно кадра — его собственная коробка, а не окно страницы. Кадр
+      // 300×150 внутри так и отвечает, и тело в нём шириной 284, как в
+      // браузере; мы отдавали ширину страницы.
+      try { __ptTellFrame(this, __boxOf(this)); } catch (e) {}
       // Пустое окно — не пустой документ: у браузера там html/head/body, и
       // страница туда пишет. `srcdoc` кладётся тем же путём.
       try {
@@ -2380,7 +2385,12 @@
     acc('parentRule', function parentRule() { return null; });
     acc('cssFloat', function cssFloat() { return mapOf(this).get('float') || ''; });
     def('getPropertyPriority', function getPropertyPriority() { return ''; });
-    def('getPropertyValue', function getPropertyValue(p) { return mapOf(this).get(String(p).toLowerCase()) || ''; });
+    def('getPropertyValue', function getPropertyValue(p) {
+      const m = mapOf(this), k = String(p).toLowerCase();
+      // Имена с приставкой поставщика спрашивают и с дефисом впереди:
+      // `-webkit-logical-width` — то же свойство, что у нас без него.
+      return m.get(k) || (k.charCodeAt(0) === 45 ? m.get(k.slice(1)) || '' : '');
+    });
     def('item', function item(i) { return namesOf(this)[i] || ''; });
     def('removeProperty', function removeProperty(p) {
       const k = dash(String(p)).toLowerCase(), m = mapOf(this), had = m.get(k) || '';
@@ -2734,7 +2744,8 @@
     def('getPropertyValue', function getPropertyValue(p) {
       const s = st(this); if (!s) return '';
       const k = String(p).toLowerCase();
-      return s.computed ? (s.map.get(k) || '') : (s.read().get(k) || '');
+      const m = s.computed ? s.map : s.read();
+      return m.get(k) || (k.charCodeAt(0) === 45 ? m.get(k.slice(1)) || '' : '');
     });
     def('getPropertyPriority', function getPropertyPriority() { return ''; });
     def('setProperty', function setProperty(p, v) {
@@ -4090,10 +4101,25 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // Окно кадра — это его собственный `<iframe>`, а не страница: у виджета
   // Turnstile внутри 300×65, и он этот размер читает. Движок сообщает его сюда
   // сразу после создания контекста.
+  // Кадр с `display: none` браузер не раскладывает вовсе: у тела внутри
+  // ширина остаётся `auto`, а не числом. Признак ставит хозяйская страница,
+  // когда видит, что у её `<iframe>` коробки нет.
+  let __rendered = true;
+  globalThis.__pt_setRendered = (on) => {
+    on = !!on;
+    if (on === __rendered) return;
+    __rendered = on;
+    __layoutBuilt = -1;
+  };
+
+  // Пересчитать раскладку этого документа. Зовёт соседний реалм: окно
+  // страницы меряет узлы своего кадра, а раскладывает их кадр сам.
+  globalThis.__pt_relayout = () => { try { __relayout(); } catch (e) {} };
+
   globalThis.__pt_setViewport = (w, h) => {
     w = Math.max(0, Math.round(Number(w) || 0));
     h = Math.max(0, Math.round(Number(h) || 0));
-    if (!w || !h) return;
+    if (w === LAYOUT.W && h === LAYOUT.H && __rendered) return;
     LAYOUT.W = w; LAYOUT.H = h;
     for (const [name, value] of [['innerWidth', w], ['innerHeight', h]]) {
       try {
@@ -4703,17 +4729,27 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   const __UNRENDERED = new Set(['HEAD', 'META', 'STYLE', 'SCRIPT', 'LINK', 'TITLE',
     'BASE', 'NOSCRIPT', 'TEMPLATE', 'PARAM', 'SOURCE', 'TRACK']);
 
-  function __isHiddenEl(el) {
+  // Коробки нет вовсе: `display: none` и то, что браузер не раскладывает
+  // никогда. Не путать с невидимым — `visibility: hidden` место занимает, и
+  // браузер отдаёт у такого элемента настоящий прямоугольник.
+  function __isUnboxed(el) {
     if (__UNRENDERED.has(el.tagName)) return true;
-    if (__hiddenBySheet.has(el)) return true;
+    if (__noneBySheet.has(el)) return true;
     if (el.hasAttribute && __ptHasA(el, 'hidden')) return true;
     // Скрытое поле формы ничего не занимает — и строки тоже.
     if (el.tagName === 'INPUT' && /^hidden$/i.test(__ptGetA(el, 'type') || '')) return true;
     const s = el.style;
+    if (s && String(s.display || '').toLowerCase() === 'none') return true;
+    return false;
+  }
+
+  function __isHiddenEl(el) {
+    if (__isUnboxed(el)) return true;
+    if (__hiddenBySheet.has(el)) return true;
+    const s = el.style;
     if (s) {
-      const d = String(s.display || '').toLowerCase();
       const v = String(s.visibility || '').toLowerCase();
-      if (d === 'none' || v === 'hidden' || v === 'collapse') return true;
+      if (v === 'hidden' || v === 'collapse') return true;
     }
     return false;
   }
@@ -4752,16 +4788,16 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   }
 
   let __rules = [];                       // {root, sel, spec, order, style}
+  let __foreignRules = new WeakMap();     // документ → его правила
   let __styleCache = new WeakMap();
   let __hiddenBySheet = new WeakSet();
+  let __noneBySheet = new WeakSet();
 
-  function __collectHidden() {
-    __rules = [];
-    __styleCache = new WeakMap();
-    __hiddenBySheet = new WeakSet();
-    const doc = globalThis.document;
-    if (!doc || !doc.documentElement) return;
-    let order = 0;
+  // Правила одного дерева: таблицы стилей, которые в нём лежат, разобранные
+  // в плоский список. Вынесено из сбора, потому что документов бывает больше
+  // одного — см. `__rulesFor`.
+  function __gatherRules(docEl, out) {
+    const state = { order: out.length };
     const take = (root, rules) => {
       for (const r of rules || []) {
         if (r.type === 4 || r.type === 12) {          // @media / @supports
@@ -4772,7 +4808,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         for (const one of String(r.selectorText).split(',')) {
           const sel = one.trim();
           if (!sel) continue;
-          __rules.push({ root, sel, spec: __specificity(sel), order: order++, style: r.style });
+          out.push({ root, sel, spec: __specificity(sel), order: state.order++, style: r.style });
         }
       }
     };
@@ -4786,7 +4822,34 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         sheetsOf(n, root);
       }
     };
-    sheetsOf(doc.documentElement, doc.documentElement);
+    sheetsOf(docEl, docEl);
+    return out;
+  }
+
+  // Чьи правила касаются этого элемента. Документ бывает не один: страница
+  // делает `document.implementation.createHTMLDocument()` — или заводит
+  // разборщик разметки — и меряет вычисленный стиль тела там. Стили хозяйской
+  // страницы туда не достают, и браузер отвечает умолчаниями: чёрным цветом и
+  // шестнадцатью пикселями. Мы отвечали цветом и кеглем страницы, и весь
+  // перечисленный стиль расходился с браузерным — челлендж снимает его целиком.
+  function __rulesFor(doc) {
+    if (!doc || doc === globalThis.document) return __rules;
+    let hit = __foreignRules.get(doc);
+    if (hit) return hit;
+    hit = doc.documentElement ? __gatherRules(doc.documentElement, []) : [];
+    __foreignRules.set(doc, hit);
+    return hit;
+  }
+
+  function __collectHidden() {
+    __rules = [];
+    __styleCache = new WeakMap();
+    __hiddenBySheet = new WeakSet();
+    __noneBySheet = new WeakSet();
+    __foreignRules = new WeakMap();
+    const doc = globalThis.document;
+    if (!doc || !doc.documentElement) return;
+    __gatherRules(doc.documentElement, __rules);
     // Спрятанное собирается тем же проходом: скрытие — просто одно из
     // объявлений, и отдельного правила для него больше не нужно.
     for (const r of __rules) {
@@ -4795,7 +4858,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const disp = String(d.getPropertyValue('display') || '').toLowerCase();
       const vis = String(d.getPropertyValue('visibility') || '').toLowerCase();
       if (disp !== 'none' && vis !== 'hidden' && vis !== 'collapse') continue;
-      try { for (const el of query(r.root, r.sel)) __hiddenBySheet.add(el); } catch (e) {}
+      try {
+        for (const el of query(r.root, r.sel)) {
+          __hiddenBySheet.add(el);
+          if (disp === 'none') __noneBySheet.add(el);
+        }
+      } catch (e) {}
     }
   }
 
@@ -4807,7 +4875,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (hit) return hit;
     const out = new Map();
     const won = [];
-    for (const r of __rules) {
+    for (const r of __rulesFor(el.ownerDocument)) {
       let ok = false;
       try { ok = matchesSelector(el, r.sel); } catch (e) {}
       if (ok) won.push(r);
@@ -4852,6 +4920,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if ((m = /^(-?[\d.]+)$/.exec(v))) return parseFloat(m[1]);
     if ((m = /^(-?[\d.]+)(em|rem)$/.exec(v))) return parseFloat(m[1]) * (m[2] === 'rem' ? 16 : fs);
     if ((m = /^(-?[\d.]+)pt$/.exec(v))) return parseFloat(m[1]) * 4 / 3;
+    // Доли окна. Без них `width: 60vw` ничего не значило, блок занимал всю
+    // строку, а вместе с ним уезжала и вся геометрия страницы.
+    if ((m = /^(-?[\d.]+)(vh|vw|vmin|vmax)$/.exec(v))) {
+      const u = m[2];
+      const vb = u === 'vh' ? LAYOUT.H : u === 'vw' ? LAYOUT.W
+        : u === 'vmin' ? Math.min(LAYOUT.W, LAYOUT.H) : Math.max(LAYOUT.W, LAYOUT.H);
+      return Math.round(parseFloat(m[1]) / 100 * vb * 64) / 64;
+    }
     if ((m = /^(-?[\d.]+)%$/.exec(v))) {
       return base == null ? null : Math.round(parseFloat(m[1]) / 100 * base * 64) / 64;
     }
@@ -4947,11 +5023,144 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   // Поля, которые блочным элементам даёт таблица стилей самого браузера. Без
   // них абзацы и заголовки лежат вплотную, и вся страница ниже съезжает вверх.
+  // Первое число — поле сверху и снизу в долях кегля, второе — по бокам в
+  // пикселях. В долях, а не в пикселях: у заголовка поле считается от его
+  // собственного кегля, и `h1` внутри блока с другим шрифтом отступает иначе.
   const UA_MARGIN = {
-    p: [16, 0], blockquote: [16, 40], figure: [16, 40], ul: [16, 0], ol: [16, 0],
-    dl: [16, 0], dd: [0, 40], pre: [16, 0], hr: [8, 8], form: [0, 0],
-    h1: [21.44, 0], h2: [19.92, 0], h3: [18.72, 0], h4: [21.28, 0], h5: [22.18, 0], h6: [24.98, 0],
+    p: [1, 0], blockquote: [1, 40], figure: [1, 40], ul: [1, 0], ol: [1, 0],
+    dir: [1, 0], menu: [1, 0], dl: [1, 0], dd: [0, 40], pre: [1, 0], form: [0, 0],
+    h1: [0.67, 0], h2: [0.83, 0], h3: [1, 0], h4: [1.33, 0], h5: [1.67, 0], h6: [2.33, 0],
   };
+  // Поля, заданные прямо в пикселях: у тела страницы это восемь пикселей со
+  // всех сторон, и без них вся раскладка стоит на восемь пикселей выше
+  // браузерной.
+  const UA_MARGIN_PX = { body: [8, 8], hr: [8, 0], fieldset: [0, 2] };
+
+  function __uaMargin(tag, fs) {
+    const px = UA_MARGIN_PX[tag];
+    if (px) return px;
+    const em = UA_MARGIN[tag];
+    return em ? [em[0] * (fs || 16), em[1]] : null;
+  }
+
+  // Направление письма по таблице браузера. Начальное значение —
+  // `normal`, а `isolate` браузер раздаёт блочным элементам списком, и в этот
+  // список не входят ни тело страницы, ни поля ввода. Мы отвечали `isolate`
+  // всему, что не строчное, и перечисленный стиль расходился.
+  const UA_BIDI = {
+    html: 'normal', body: 'normal', input: 'normal', button: 'normal', select: 'normal',
+    textarea: 'normal', fieldset: 'normal', option: 'normal', optgroup: 'normal',
+    meter: 'normal', progress: 'normal', details: 'normal', template: 'normal',
+    output: 'isolate',
+  };
+
+  // Кегль и насыщенность от таблицы браузера. Заголовок крупнее родителя в
+  // свою долю, `small` мельче в 1,2 раза, и всё это множится по цепочке —
+  // `small` внутри `small` мельче вдвойне, как в браузере.
+  const UA_FONT_SIZE = {
+    h1: 2, h2: 1.5, h3: 1.17, h4: 1, h5: 0.83, h6: 0.67,
+    small: 1 / 1.2, sub: 1 / 1.2, sup: 1 / 1.2, big: 1.2,
+  };
+  const UA_BOLD = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'b', 'strong', 'th']);
+
+  // Что браузер набирает моноширинным: свой кегль (13 пикселей против
+  // шестнадцати) и своё семейство. Поле области ввода — 13⅓, как у прочих
+  // полей.
+  const UA_MONO = new Set(['pre', 'code', 'kbd', 'samp', 'tt', 'textarea', 'xmp', 'plaintext', 'listing']);
+
+  // Строчный ли это уровень: такие дети ложатся в одну строку, а не столбиком.
+  function __isInlineLevel(el) {
+    const tag = (el.localName || '').toLowerCase();
+    const d = String(__cascadeFor(el).get('display') || CS_DISPLAY[tag] || 'block').toLowerCase();
+    return /^inline(-block|-flex|-grid|-table)?$/.test(d);
+  }
+
+  // Атомарный ли он — прямоугольник, который стоит в строке целиком:
+  // `inline-block`, картинка, поле ввода. Обычный `<span>` таким не считается:
+  // он разливается по строке и высоту берёт от своего шрифта.
+  const __ATOMIC_TAGS = new Set(['img', 'input', 'button', 'select', 'textarea', 'svg',
+    'canvas', 'video', 'audio', 'object', 'embed', 'iframe', 'meter', 'progress']);
+  function __isAtomicInline(el) {
+    const tag = (el.localName || '').toLowerCase();
+    const d = String(__cascadeFor(el).get('display') || CS_DISPLAY[tag] || 'block').toLowerCase();
+    return d !== 'inline' || __ATOMIC_TAGS.has(tag);
+  }
+
+  // Прогон строчных детей: слева направо, с переносом по ширине и
+  // выравниванием по базовой линии. Атомарный ребёнок стоит на базовой линии
+  // нижним краем — так браузер ставит `inline-block`.
+  function __layoutInlineRun(run, originX, originY, availW, strut, strutLine) {
+    const q = (v) => Math.floor(v * 64) / 64;
+    const sAsc = strut ? strut.asc : strutLine * 0.8;
+    const sDesc = Math.max(0, strutLine - sAsc);
+    let y = originY, widest = 0;
+    let line = [];
+    let lineW = 0;
+    const flush = () => {
+      if (!line.length) return;
+      // Пустые строчные коробки строки не делают: у браузера `<span></span>`
+      // не даёт ни высоты, ни строки.
+      const solid = line.some((it) => it.atomic || it.text);
+      let asc = solid ? sAsc : 0, desc = solid ? sDesc : 0;
+      for (const it of line) {
+        const over = it.atomic ? it.box.h + it.mt + it.mb : (it.box.asc || sAsc);
+        const under = it.atomic ? 0 : Math.max(0, (it.box.h || 0) - (it.box.asc || sAsc));
+        asc = Math.max(asc, over);
+        desc = Math.max(desc, under);
+      }
+      const height = solid ? asc + desc : 0;
+      for (const it of line) {
+        const top = it.atomic ? y + asc - it.box.h - it.mb : y + asc - (it.box.asc || sAsc);
+        __ptShiftBox(it.el, it.x, q(top));
+        widest = Math.max(widest, it.x + it.box.w + it.mr - originX);
+      }
+      y = q(y + height);
+      line = [];
+      lineW = 0;
+    };
+    for (const el of run) {
+      const box = __layoutOne(el, originX, y, availW, strut);
+      if (!box) continue;
+      const cs = __cascadeFor(el);
+      const cfs = __usedFontSize(el);
+      const m = (name) => __lengthPx(cs.get(name), cfs, availW) || 0;
+      const kids = (el.__ptKids || []).filter((k) => k.nodeType === ELEMENT_NODE);
+      const it = {
+        el, box, atomic: __isAtomicInline(el),
+        text: !!String(__OWN_TEXT(el) || '').trim() || kids.length > 0,
+        ml: m('margin-left'), mr: m('margin-right'), mt: m('margin-top'), mb: m('margin-bottom'),
+        x: 0,
+      };
+      const outer = box.w + it.ml + it.mr;
+      if (line.length && lineW + outer > availW + 0.5) flush();
+      it.x = q(originX + lineW + it.ml);
+      lineW += outer;
+      line.push(it);
+    }
+    flush();
+    return { y, widest };
+  }
+
+  // Переставить уже разложенную коробку вместе со всем, что внутри.
+  function __ptShiftBox(el, x, y) {
+    const b = el.__ptBox;
+    if (!b) return;
+    const dx = x - b.x, dy = y - b.y;
+    if (!dx && !dy) return;
+    const walk = (node) => {
+      const nb = node.__ptBox;
+      if (nb) {
+        nb.x += dx; nb.y += dy;
+        nb.cx += dx; nb.cy += dy;
+        if (nb.lineTop != null) nb.lineTop += dy;
+      }
+      for (const k of (node.__ptKids || [])) if (k.nodeType === ELEMENT_NODE) walk(k);
+      if (node.__ptShadow) {
+        for (const k of (node.__ptShadow.__ptKids || [])) if (k.nodeType === ELEMENT_NODE) walk(k);
+      }
+    };
+    walk(el);
+  }
 
   function __layoutOne(el, originX, originY, availW, strut, forced) {
     // В порядке документа, не после детей: попадание в точку ищется с конца
@@ -4960,8 +5169,23 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const cs = __cascadeFor(el);
     const fs = __usedFontSize(el);
     const tag = (el.localName || '').toLowerCase();
-    const family = String(cs.get('font-family') || (cs.get('font') || '')).trim() || 'sans-serif';
-    const bold = /(^|\s)(bold|[5-9]00)(\s|$)/i.test(String(cs.get('font-weight') || cs.get('font') || ''));
+    // Шрифт наследуется: у `<span>` внутри тела своего объявления нет, и без
+    // наследования он мерился запасной гарнитурой — а с ней не сходится ни
+    // ширина слова, ни высота строки.
+    let familyRaw = cs.get('font-family');
+    if (familyRaw == null) familyRaw = cs.get('font');
+    if (familyRaw == null && typeof __inheritedValue === 'function') {
+      familyRaw = __inheritedValue(el, 'font-family');
+    }
+    const family = String(familyRaw || '').trim() || 'sans-serif';
+    let weight = cs.get('font-weight') || cs.get('font');
+    // Таблица браузера сильнее наследования: `<b>` внутри обычного текста
+    // жирный, даже если у родителя насыщенность задана.
+    if (weight == null && UA_BOLD.has(tag)) weight = '700';
+    if (weight == null && typeof __inheritedValue === 'function') {
+      weight = __inheritedValue(el, 'font-weight');
+    }
+    const bold = /(^|\s)(bold|[5-9]00)(\s|$)/i.test(String(weight || ''));
     const len = (name, base) => __lengthPx(cs.get(name), fs, base);
     const side = (prefix, suffix) => {
       const all = cs.get(prefix);
@@ -4973,10 +5197,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
           if (one[i] == null) one[i] = __lengthPx(pick(i), fs, availW);
         });
       }
-      return one.map((v) => v || 0);
+      return one;
     };
-    let [mt, mr, mb, ml] = side('margin');
-    let [pt_, pr, pb, pl] = side('padding');
+    const rawM = side('margin');
+    // Ноль от автора — это заданное значение, а не молчание: страница с
+    // `body { margin: 0 }` не должна получать браузерные восемь пикселей.
+    const setM = rawM.map((v) => v != null);
+    let [mt, mr, mb, ml] = rawM.map((v) => v || 0);
+    let [pt_, pr, pb, pl] = side('padding').map((v) => v || 0);
     let [bt, br, bb, bl] = ['top', 'right', 'bottom', 'left']
       .map((k) => len('border-' + k + '-width', availW) || 0);
     const borderAll = cs.get('border') || cs.get('border-width');
@@ -4995,18 +5223,18 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const inlineish = __INLINEISH.test(display) && !(forced && forced.block);
     const position = String(cs.get('position') || 'static').toLowerCase();
 
-    const uam = UA_MARGIN[tag];
+    const uam = __uaMargin(tag, fs);
     if (uam) {
-      if (!mt && !mb) { mt = uam[0]; mb = uam[0]; }
-      if (!ml && !mr) { ml = uam[1]; mr = uam[1]; }
+      if (!setM[0] && !setM[2]) { mt = uam[0]; mb = uam[0]; }
+      if (!setM[3] && !setM[1]) { ml = uam[1]; mr = uam[1]; }
     }
     const ua = __uaBox(el, tag);
     if (ua) {
       if (!pt_ && !pb && ua.p) { pt_ = ua.p[0]; pb = ua.p[0]; }
       if (!pl && !pr && ua.p) { pl = ua.p[1]; pr = ua.p[1]; }
       if (!bt && !br && !bb && !bl && ua.b) { bt = br = bb = bl = ua.b; }
-      if (!mt && !mb && ua.m) { mt = ua.m[0]; mb = ua.m[0]; }
-      if (!ml && !mr && ua.m) { ml = ua.m[1]; mr = ua.m[1]; }
+      if (!setM[0] && !setM[2] && ua.m) { mt = ua.m[0]; mb = ua.m[0]; }
+      if (!setM[3] && !setM[1] && ua.m) { ml = ua.m[1]; mr = ua.m[1]; }
     }
     const explicitW = len('width', availW);
     const explicitH = len('height', availW);
@@ -5022,6 +5250,33 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         : ua.w;
     }
     if (cw == null && !inlineish) cw = Math.max(0, availW - ml - mr - bl - br - pl - pr);
+    // Пределы ширины: без них колонка с `max-width` растягивалась во всё
+    // окно, а вместе с ней уезжала и вся геометрия под ней.
+    if (cw != null) {
+      const maxW = len('max-width', availW);
+      const minW = len('min-width', availW);
+      if (maxW != null && cw > maxW) cw = maxW;
+      if (minW != null && cw < minW) cw = minW;
+    }
+    // `margin: 0 auto` — блок посередине. Мы клали его влево, и всякая
+    // страница с колонкой по центру отдавала не ту геометрию: челлендж
+    // спрашивает прямоугольники у полутора десятков узлов.
+    const autoSide = (name) => {
+      const v = cs.get(name);
+      if (v != null) return /^auto$/i.test(String(v).trim());
+      const all = cs.get('margin');
+      if (all == null) return false;
+      const parts = String(all).trim().split(/\s+/);
+      const i = name === 'margin-left' ? 3 : 1;
+      return /^auto$/i.test(parts[[0, 1, 2, 3].map((k) => Math.min(k, parts.length - 1))[i]] || '');
+    };
+    if (!inlineish && cw != null && (autoSide('margin-left') || autoSide('margin-right'))) {
+      const free = Math.max(0, availW - cw - bl - br - pl - pr);
+      const left = autoSide('margin-left'), right = autoSide('margin-right');
+      if (left && right) { ml = free / 2; mr = free / 2; }
+      else if (left) ml = free - mr;
+      else mr = free - ml;
+    }
     // Гибкий родитель назначает ребёнку длину сам — и до того, как тот
     // разложит своё содержимое, иначе строки обернутся не по той ширине.
     if (forced && forced.w != null) cw = Math.max(0, forced.w - pl - pr - bl - br);
@@ -5036,7 +5291,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const kids = [];
     if (el.__ptShadow) for (const c of el.__ptShadow.__ptKids) kids.push(c);
     for (const c of (el.__ptKids || [])) kids.push(c);
-    const boxedKids = kids.filter((c) => c.nodeType === ELEMENT_NODE && !__isHiddenEl(c));
+    const boxedKids = kids.filter((c) => c.nodeType === ELEMENT_NODE && !__isUnboxed(c));
 
     // Строчный элемент сжимается по содержимому: по детям, а если их нет — по
     // собственному тексту, измеренному настоящей гарнитурой.
@@ -5168,19 +5423,44 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         const p = String(__cascadeFor(c).get('position') || 'static').toLowerCase();
         if (p === 'absolute' || p === 'fixed') __layoutOne(c, contentX, contentY, cw, fbox);
       }
-    } else
-    for (const c of boxedKids) {
-      const cb = __layoutOne(c, contentX, y, cw, fbox);
-      if (!cb) continue;
-      widest = Math.max(widest, cb.x - contentX + cb.w);
-      deepest = Math.max(deepest, cb.y - contentY + cb.h);
-      const cpos = String(__cascadeFor(c).get('position') || 'static').toLowerCase();
-      if (cpos === 'absolute' || cpos === 'fixed') continue;
-      // Строчный элемент занимает не свою высоту, а высоту строки, и стоит в
-      // ней по центру просвета: без этого следующий блок подъезжал вверх.
-      // Строчный ребёнок занимает строку целиком, а не свою высоту: за ним
-      // следующий блок встаёт на высоту строки ниже.
-      y = cb.inline ? cb.lineTop + Math.max(lineH, cb.h) : cb.y + cb.h + (cb.mb || 0);
+    } else {
+      // Блоки ложатся друг под друга, строчные — в строку, и строка
+      // переносится по ширине содержимого. Раньше всякий ребёнок начинал
+      // новую строку, и два `<span>` подряд стояли лесенкой, а не рядом,
+      // как у браузера.
+      let i = 0;
+      const positionOf = (c) => String(__cascadeFor(c).get('position') || 'static').toLowerCase();
+      while (i < boxedKids.length) {
+        const c = boxedKids[i];
+        const cpos = positionOf(c);
+        if (cpos === 'absolute' || cpos === 'fixed') {
+          const cb = __layoutOne(c, contentX, y, cw, fbox);
+          if (cb) {
+            widest = Math.max(widest, cb.x - contentX + cb.w);
+            deepest = Math.max(deepest, cb.y - contentY + cb.h);
+          }
+          i++;
+          continue;
+        }
+        if (!__isInlineLevel(c)) {
+          const cb = __layoutOne(c, contentX, y, cw, fbox);
+          i++;
+          if (!cb) continue;
+          widest = Math.max(widest, cb.x - contentX + cb.w);
+          deepest = Math.max(deepest, cb.y - contentY + cb.h);
+          y = cb.y + cb.h + (cb.mb || 0);
+          continue;
+        }
+        const run = [];
+        while (i < boxedKids.length && __isInlineLevel(boxedKids[i])
+               && positionOf(boxedKids[i]) !== 'absolute' && positionOf(boxedKids[i]) !== 'fixed') {
+          run.push(boxedKids[i++]);
+        }
+        const done = __layoutInlineRun(run, contentX, y, cw, fbox, lineH);
+        y = done.y;
+        widest = Math.max(widest, done.widest);
+        deepest = Math.max(deepest, y - contentY);
+      }
     }
     if (inlineish && explicitW == null && !forcedW && boxedKids.length) cw = widest;
 
@@ -5196,7 +5476,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     else if (attrH != null) ch = attrH;
     else if (boxedKids.length) ch = Math.max(0, y - contentY);
     else if (lines && lines.length) ch = lines.length * lineH;
-    else ch = inlineish ? Math.round(lineH) : 0;
+    // Пустая строчная коробка высоты не имеет: `inline-block` без содержимого
+    // у браузера нулевой, а не в строку высотой.
+    else ch = (inlineish && display === 'inline') ? Math.round(lineH) : 0;
 
     // Строчный элемент высок настолько, насколько высоки его чернила, а не
     // строка целиком. Заменяемого это не касается: у `<iframe width height>`
@@ -5220,6 +5502,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       h: q(ch + pt_ + pb + bt + bb),
       cw: q(cw), ch: q(ch), cx: q(contentX), cy: q(contentY),
       bx: bl + br, by: bt + bb, mb,
+      mt: q(mt), mr: q(mr), ml: q(ml),
       line: lineH, inline: inlineish, lineTop: q(boxY), lines,
       asc: fbox.asc, desc: fbox.desc,
       // Область прокрутки — по содержимому, а не по самой коробке; полоса
@@ -5246,8 +5529,31 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     el.__ptBox = box;
     el.__ptBoxV = __layoutBuilt;
+    // Кадр поменял размер — у его окна поменялся и вид.
+    if (tag === 'iframe' && el.__ptRealm) __ptTellFrame(el, box);
     return box;
   }
+
+  // Сообщить окну кадра его размер. Кадра без коробки — `display: none` —
+  // браузер не раскладывает совсем, и об этом окну тоже надо сказать.
+  function __ptTellFrame(el, box) {
+    const w = el.__ptRealm;
+    if (!w) return;
+    try {
+      if (!box) {
+        if (typeof w.__pt_setRendered === 'function') w.__pt_setRendered(false);
+        return;
+      }
+      if (typeof w.__pt_setRendered === 'function') w.__pt_setRendered(true);
+      if (el.__ptSeenW === box.cw && el.__ptSeenH === box.ch) return;
+      el.__ptSeenW = box.cw; el.__ptSeenH = box.ch;
+      if (typeof w.__pt_setViewport === 'function') w.__pt_setViewport(box.cw, box.ch);
+    } catch (e) {}
+  }
+
+  // Кадры, у которых есть своё окно: после каждой раскладки им говорят,
+  // что с ними стало, — спрятанному тоже.
+  const __realmFrames = new Set();
 
   function __relayout() {
     if (__layoutBuilt === __layoutSeq) return;
@@ -5258,10 +5564,47 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const doc = globalThis.document;
     const de = doc && doc.documentElement;
     if (!de) return;
+    // Отметка раскладки держится на самом документе: коробки его узлов
+    // читает и соседний реалм — окно страницы меряет тело своего кадра, — а
+    // свой счётчик у каждого реалма собственный, и чужие коробки по нему
+    // выходили то пустыми, то устаревшими.
+    try {
+      Object.defineProperty(doc, '__ptLayoutV', { value: __layoutBuilt, configurable: true, enumerable: false, writable: true });
+      if (typeof doc.__ptRelayout !== 'function') {
+        Object.defineProperty(doc, '__ptRelayout', { value: () => __relayout(), configurable: true, enumerable: false });
+      }
+    } catch (e) {}
+    if (!__rendered) return;
     __layoutOne(de, 0, 0, LAYOUT.W);
+    // В режиме совместимости корень и тело тянутся на всё окно: у пустого
+    // кадра 300×150 браузер отвечает высотой 150 у `html` и 134 у тела, а не
+    // высотой строки. Кадр без доктайпа — обычное дело: `about:blank` и
+    // `srcdoc` идут именно так.
+    try {
+      if (doc.compatMode === 'BackCompat') {
+        const stretch = (el, avail) => {
+          const b = el && el.__ptBox;
+          if (!b || avail == null) return null;
+          const outer = b.h + (b.mt || 0) + (b.mb || 0);
+          if (outer >= avail) return b.ch;
+          const grown = avail - (b.mt || 0) - (b.mb || 0) - (b.by || 0);
+          b.ch = grown;
+          b.h = grown + (b.by || 0);
+          return grown;
+        };
+        const inner = stretch(de, LAYOUT.H);
+        stretch(doc.body, inner);
+      }
+    } catch (e) {}
     // Порядок обхода — порядок наложения: попадание в точку ищется с конца, то
     // есть от самого глубокого и позднего, как в браузере.
     __rows = __boxes;
+    // Спрятанные кадры в обход не попадают, а сказать им надо: пока им не
+    // скажут, внутри останется старая раскладка.
+    for (const f of __realmFrames) {
+      if (!f.isConnected) { __realmFrames.delete(f); continue; }
+      if (f.__ptBoxV !== __layoutBuilt) __ptTellFrame(f, null);
+    }
   }
 
   // Width/height an element declares for itself: the CSS `width`/`height` it was
@@ -5288,7 +5631,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // видно». Таблицы сняты с Chrome 148: порядок имён, значения по умолчанию для
   // блочного элемента и дельты для строчного и заменяемого.
 const CS_ORDER = ["accent-color","align-content","align-items","align-self","alignment-baseline","anchor-name","anchor-scope","animation-composition","animation-delay","animation-direction","animation-duration","animation-fill-mode","animation-iteration-count","animation-name","animation-play-state","animation-range-end","animation-range-start","animation-timeline","animation-timing-function","animation-trigger","app-region","appearance","aspect-ratio","backdrop-filter","backface-visibility","background-attachment","background-blend-mode","background-clip","background-color","background-image","background-origin","background-position","background-repeat","background-size","baseline-shift","baseline-source","block-size","border-block-end-color","border-block-end-style","border-block-end-width","border-block-start-color","border-block-start-style","border-block-start-width","border-bottom-color","border-bottom-left-radius","border-bottom-right-radius","border-bottom-style","border-bottom-width","border-collapse","border-end-end-radius","border-end-start-radius","border-image-outset","border-image-repeat","border-image-slice","border-image-source","border-image-width","border-inline-end-color","border-inline-end-style","border-inline-end-width","border-inline-start-color","border-inline-start-style","border-inline-start-width","border-left-color","border-left-style","border-left-width","border-right-color","border-right-style","border-right-width","border-shape","border-start-end-radius","border-start-start-radius","border-top-color","border-top-left-radius","border-top-right-radius","border-top-style","border-top-width","bottom","box-decoration-break","box-shadow","box-sizing","break-after","break-before","break-inside","buffered-rendering","caption-side","caret-animation","caret-color","caret-shape","clear","clip","clip-path","clip-rule","color","color-interpolation","color-interpolation-filters","color-rendering","color-scheme","column-count","column-fill","column-gap","column-height","column-rule-break","column-rule-color","column-rule-inset-cap-end","column-rule-inset-cap-start","column-rule-inset-junction-end","column-rule-inset-junction-start","column-rule-style","column-rule-visibility-items","column-rule-width","column-span","column-width","column-wrap","contain","contain-intrinsic-block-size","contain-intrinsic-height","contain-intrinsic-inline-size","contain-intrinsic-size","contain-intrinsic-width","container-name","container-type","content","content-visibility","corner-bottom-left-shape","corner-bottom-right-shape","corner-end-end-shape","corner-end-start-shape","corner-start-end-shape","corner-start-start-shape","corner-top-left-shape","corner-top-right-shape","counter-increment","counter-reset","counter-set","cursor","cx","cy","d","direction","display","dominant-baseline","dynamic-range-limit","empty-cells","field-sizing","fill","fill-opacity","fill-rule","filter","flex-basis","flex-direction","flex-grow","flex-line-count","flex-shrink","flex-wrap","float","flood-color","flood-opacity","font-family","font-feature-settings","font-kerning","font-language-override","font-optical-sizing","font-palette","font-size","font-size-adjust","font-stretch","font-style","font-synthesis-small-caps","font-synthesis-style","font-synthesis-weight","font-variant","font-variant-alternates","font-variant-caps","font-variant-east-asian","font-variant-emoji","font-variant-ligatures","font-variant-numeric","font-variant-position","font-variation-settings","font-weight","forced-color-adjust","grid-auto-columns","grid-auto-flow","grid-auto-rows","grid-column-end","grid-column-start","grid-row-end","grid-row-start","grid-template-areas","grid-template-columns","grid-template-rows","height","hyphenate-character","hyphenate-limit-chars","hyphens","image-orientation","image-rendering","initial-letter","inline-size","inset-block-end","inset-block-start","inset-inline-end","inset-inline-start","interactivity","interest-delay-end","interest-delay-start","interpolate-size","isolation","justify-content","justify-items","justify-self","left","letter-spacing","lighting-color","line-break","line-height","list-style-image","list-style-position","list-style-type","margin-block-end","margin-block-start","margin-bottom","margin-inline-end","margin-inline-start","margin-left","margin-right","margin-top","marker-end","marker-mid","marker-start","mask-clip","mask-composite","mask-image","mask-mode","mask-origin","mask-position","mask-repeat","mask-size","mask-type","math-depth","math-shift","math-style","max-block-size","max-height","max-inline-size","max-width","min-block-size","min-height","min-inline-size","min-width","mix-blend-mode","object-fit","object-position","object-view-box","offset-anchor","offset-distance","offset-path","offset-position","offset-rotate","opacity","order","orphans","outline-color","outline-offset","outline-style","outline-width","overflow-anchor","overflow-block","overflow-clip-margin","overflow-inline","overflow-wrap","overflow-x","overflow-y","overlay","overscroll-behavior-block","overscroll-behavior-inline","overscroll-behavior-x","overscroll-behavior-y","padding-block-end","padding-block-start","padding-bottom","padding-inline-end","padding-inline-start","padding-left","padding-right","padding-top","paint-order","perspective","perspective-origin","pointer-events","position","position-anchor","position-area","position-try-fallbacks","position-try-order","position-visibility","print-color-adjust","quotes","r","reading-flow","reading-order","resize","right","rotate","row-gap","row-rule-break","row-rule-color","row-rule-inset-cap-end","row-rule-inset-cap-start","row-rule-inset-junction-end","row-rule-inset-junction-start","row-rule-style","row-rule-visibility-items","row-rule-width","ruby-align","ruby-overhang","ruby-position","rule-overlap","rx","ry","scale","scroll-behavior","scroll-initial-target","scroll-margin-block-end","scroll-margin-block-start","scroll-margin-bottom","scroll-margin-inline-end","scroll-margin-inline-start","scroll-margin-left","scroll-margin-right","scroll-margin-top","scroll-marker-group","scroll-padding-block-end","scroll-padding-block-start","scroll-padding-bottom","scroll-padding-inline-end","scroll-padding-inline-start","scroll-padding-left","scroll-padding-right","scroll-padding-top","scroll-snap-align","scroll-snap-stop","scroll-snap-type","scroll-target-group","scroll-timeline-axis","scroll-timeline-name","scrollbar-color","scrollbar-gutter","scrollbar-width","shape-image-threshold","shape-margin","shape-outside","shape-rendering","speak","stop-color","stop-opacity","stroke","stroke-dasharray","stroke-dashoffset","stroke-linecap","stroke-linejoin","stroke-miterlimit","stroke-opacity","stroke-width","tab-size","table-layout","text-align","text-align-last","text-anchor","text-autospace","text-box-edge","text-box-trim","text-combine-upright","text-decoration","text-decoration-color","text-decoration-line","text-decoration-skip-ink","text-decoration-style","text-decoration-thickness","text-emphasis-color","text-emphasis-position","text-emphasis-style","text-fit","text-indent","text-justify","text-orientation","text-overflow","text-rendering","text-shadow","text-size-adjust","text-spacing-trim","text-transform","text-underline-offset","text-underline-position","text-wrap-mode","text-wrap-style","timeline-scope","timeline-trigger-activation-range-end","timeline-trigger-activation-range-start","timeline-trigger-active-range-end","timeline-trigger-active-range-start","timeline-trigger-name","timeline-trigger-source","top","touch-action","transform","transform-box","transform-origin","transform-style","transition-behavior","transition-delay","transition-duration","transition-property","transition-timing-function","translate","trigger-scope","unicode-bidi","user-select","vector-effect","vertical-align","view-timeline-axis","view-timeline-inset","view-timeline-name","view-transition-class","view-transition-group","view-transition-name","view-transition-scope","visibility","white-space-collapse","widows","width","will-change","word-break","word-spacing","writing-mode","x","y","z-index","zoom","-webkit-border-horizontal-spacing","-webkit-border-image","-webkit-border-vertical-spacing","-webkit-box-align","-webkit-box-decoration-break","-webkit-box-direction","-webkit-box-flex","-webkit-box-ordinal-group","-webkit-box-orient","-webkit-box-pack","-webkit-box-reflect","-webkit-font-smoothing","-webkit-line-break","-webkit-line-clamp","-webkit-locale","-webkit-mask-box-image","-webkit-mask-box-image-outset","-webkit-mask-box-image-repeat","-webkit-mask-box-image-slice","-webkit-mask-box-image-source","-webkit-mask-box-image-width","-webkit-mask-position-x","-webkit-mask-position-y","-webkit-rtl-ordering","-webkit-ruby-position","-webkit-tap-highlight-color","-webkit-text-combine","-webkit-text-decorations-in-effect","-webkit-text-fill-color","-webkit-text-orientation","-webkit-text-security","-webkit-text-stroke-color","-webkit-text-stroke-width","-webkit-user-drag","-webkit-user-modify","-webkit-writing-mode"];
-const CS_BASE = {"accent-color":"auto","align-content":"normal","align-items":"normal","align-self":"auto","alignment-baseline":"auto","anchor-name":"none","anchor-scope":"none","animation-composition":"replace","animation-delay":"0s","animation-direction":"normal","animation-duration":"0s","animation-fill-mode":"none","animation-iteration-count":"1","animation-name":"none","animation-play-state":"running","animation-range-end":"normal","animation-range-start":"normal","animation-timeline":"auto","animation-timing-function":"ease","animation-trigger":"none","app-region":"none","appearance":"none","aspect-ratio":"auto","backdrop-filter":"none","backface-visibility":"visible","background-attachment":"scroll","background-blend-mode":"normal","background-clip":"border-box","background-color":"rgba(0, 0, 0, 0)","background-image":"none","background-origin":"padding-box","background-position":"0% 0%","background-repeat":"repeat","background-size":"auto","baseline-shift":"0px","baseline-source":"auto","block-size":"18px","border-block-end-color":"rgb(0, 0, 0)","border-block-end-style":"none","border-block-end-width":"0px","border-block-start-color":"rgb(0, 0, 0)","border-block-start-style":"none","border-block-start-width":"0px","border-bottom-color":"rgb(0, 0, 0)","border-bottom-left-radius":"0px","border-bottom-right-radius":"0px","border-bottom-style":"none","border-bottom-width":"0px","border-collapse":"separate","border-end-end-radius":"0px","border-end-start-radius":"0px","border-image-outset":"0","border-image-repeat":"stretch","border-image-slice":"100%","border-image-source":"none","border-image-width":"1","border-inline-end-color":"rgb(0, 0, 0)","border-inline-end-style":"none","border-inline-end-width":"0px","border-inline-start-color":"rgb(0, 0, 0)","border-inline-start-style":"none","border-inline-start-width":"0px","border-left-color":"rgb(0, 0, 0)","border-left-style":"none","border-left-width":"0px","border-right-color":"rgb(0, 0, 0)","border-right-style":"none","border-right-width":"0px","border-shape":"none","border-start-end-radius":"0px","border-start-start-radius":"0px","border-top-color":"rgb(0, 0, 0)","border-top-left-radius":"0px","border-top-right-radius":"0px","border-top-style":"none","border-top-width":"0px","bottom":"auto","box-decoration-break":"slice","box-shadow":"none","box-sizing":"content-box","break-after":"auto","break-before":"auto","break-inside":"auto","buffered-rendering":"auto","caption-side":"top","caret-animation":"auto","caret-color":"rgb(0, 0, 0)","caret-shape":"auto","clear":"none","clip":"auto","clip-path":"none","clip-rule":"nonzero","color":"rgb(0, 0, 0)","color-interpolation":"srgb","color-interpolation-filters":"linearrgb","color-rendering":"auto","color-scheme":"normal","column-count":"auto","column-fill":"balance","column-gap":"normal","column-height":"auto","column-rule-break":"normal","column-rule-color":"rgb(0, 0, 0)","column-rule-inset-cap-end":"0px","column-rule-inset-cap-start":"0px","column-rule-inset-junction-end":"0px","column-rule-inset-junction-start":"0px","column-rule-style":"none","column-rule-visibility-items":"normal","column-rule-width":"3px","column-span":"none","column-width":"auto","column-wrap":"auto","contain":"none","contain-intrinsic-block-size":"none","contain-intrinsic-height":"none","contain-intrinsic-inline-size":"none","contain-intrinsic-size":"none","contain-intrinsic-width":"none","container-name":"none","container-type":"normal","content":"normal","content-visibility":"visible","corner-bottom-left-shape":"round","corner-bottom-right-shape":"round","corner-end-end-shape":"round","corner-end-start-shape":"round","corner-start-end-shape":"round","corner-start-start-shape":"round","corner-top-left-shape":"round","corner-top-right-shape":"round","counter-increment":"none","counter-reset":"none","counter-set":"none","cursor":"auto","cx":"0px","cy":"0px","d":"none","direction":"ltr","display":"block","dominant-baseline":"auto","dynamic-range-limit":"no-limit","empty-cells":"show","field-sizing":"fixed","fill":"rgb(0, 0, 0)","fill-opacity":"1","fill-rule":"nonzero","filter":"none","flex-basis":"auto","flex-direction":"row","flex-grow":"0","flex-line-count":"1","flex-shrink":"1","flex-wrap":"nowrap","float":"none","flood-color":"rgb(0, 0, 0)","flood-opacity":"1","font-family":"\"Times New Roman\"","font-feature-settings":"normal","font-kerning":"auto","font-language-override":"normal","font-optical-sizing":"auto","font-palette":"normal","font-size":"16px","font-size-adjust":"none","font-stretch":"100%","font-style":"normal","font-synthesis-small-caps":"auto","font-synthesis-style":"auto","font-synthesis-weight":"auto","font-variant":"normal","font-variant-alternates":"normal","font-variant-caps":"normal","font-variant-east-asian":"normal","font-variant-emoji":"normal","font-variant-ligatures":"normal","font-variant-numeric":"normal","font-variant-position":"normal","font-variation-settings":"normal","font-weight":"400","forced-color-adjust":"auto","grid-auto-columns":"auto","grid-auto-flow":"row","grid-auto-rows":"auto","grid-column-end":"auto","grid-column-start":"auto","grid-row-end":"auto","grid-row-start":"auto","grid-template-areas":"none","grid-template-columns":"none","grid-template-rows":"none","height":"18px","hyphenate-character":"auto","hyphenate-limit-chars":"auto","hyphens":"manual","image-orientation":"from-image","image-rendering":"auto","initial-letter":"normal","inline-size":"909px","inset-block-end":"auto","inset-block-start":"auto","inset-inline-end":"auto","inset-inline-start":"auto","interactivity":"auto","interest-delay-end":"normal","interest-delay-start":"normal","interpolate-size":"numeric-only","isolation":"auto","justify-content":"normal","justify-items":"normal","justify-self":"auto","left":"auto","letter-spacing":"normal","lighting-color":"rgb(255, 255, 255)","line-break":"auto","line-height":"normal","list-style-image":"none","list-style-position":"outside","list-style-type":"disc","margin-block-end":"0px","margin-block-start":"0px","margin-bottom":"0px","margin-inline-end":"0px","margin-inline-start":"0px","margin-left":"0px","margin-right":"0px","margin-top":"0px","marker-end":"none","marker-mid":"none","marker-start":"none","mask-clip":"border-box","mask-composite":"add","mask-image":"none","mask-mode":"match-source","mask-origin":"border-box","mask-position":"0% 0%","mask-repeat":"repeat","mask-size":"auto","mask-type":"luminance","math-depth":"0","math-shift":"normal","math-style":"normal","max-block-size":"none","max-height":"none","max-inline-size":"none","max-width":"none","min-block-size":"0px","min-height":"0px","min-inline-size":"0px","min-width":"0px","mix-blend-mode":"normal","object-fit":"fill","object-position":"50% 50%","object-view-box":"none","offset-anchor":"auto","offset-distance":"0px","offset-path":"none","offset-position":"normal","offset-rotate":"auto 0deg","opacity":"1","order":"0","orphans":"2","outline-color":"rgb(0, 0, 0)","outline-offset":"0px","outline-style":"none","outline-width":"3px","overflow-anchor":"auto","overflow-block":"visible","overflow-clip-margin":"0px","overflow-inline":"visible","overflow-wrap":"normal","overflow-x":"visible","overflow-y":"visible","overlay":"none","overscroll-behavior-block":"auto","overscroll-behavior-inline":"auto","overscroll-behavior-x":"auto","overscroll-behavior-y":"auto","padding-block-end":"0px","padding-block-start":"0px","padding-bottom":"0px","padding-inline-end":"0px","padding-inline-start":"0px","padding-left":"0px","padding-right":"0px","padding-top":"0px","paint-order":"normal","perspective":"none","perspective-origin":"454.5px 9px","pointer-events":"auto","position":"static","position-anchor":"normal","position-area":"none","position-try-fallbacks":"none","position-try-order":"normal","position-visibility":"anchors-visible","print-color-adjust":"economy","quotes":"auto","r":"0px","reading-flow":"normal","reading-order":"0","resize":"none","right":"auto","rotate":"none","row-gap":"normal","row-rule-break":"normal","row-rule-color":"rgb(0, 0, 0)","row-rule-inset-cap-end":"0px","row-rule-inset-cap-start":"0px","row-rule-inset-junction-end":"0px","row-rule-inset-junction-start":"0px","row-rule-style":"none","row-rule-visibility-items":"normal","row-rule-width":"3px","ruby-align":"space-around","ruby-overhang":"auto","ruby-position":"over","rule-overlap":"row-over-column","rx":"auto","ry":"auto","scale":"none","scroll-behavior":"auto","scroll-initial-target":"none","scroll-margin-block-end":"0px","scroll-margin-block-start":"0px","scroll-margin-bottom":"0px","scroll-margin-inline-end":"0px","scroll-margin-inline-start":"0px","scroll-margin-left":"0px","scroll-margin-right":"0px","scroll-margin-top":"0px","scroll-marker-group":"none","scroll-padding-block-end":"auto","scroll-padding-block-start":"auto","scroll-padding-bottom":"auto","scroll-padding-inline-end":"auto","scroll-padding-inline-start":"auto","scroll-padding-left":"auto","scroll-padding-right":"auto","scroll-padding-top":"auto","scroll-snap-align":"none","scroll-snap-stop":"normal","scroll-snap-type":"none","scroll-target-group":"none","scroll-timeline-axis":"block","scroll-timeline-name":"none","scrollbar-color":"auto","scrollbar-gutter":"auto","scrollbar-width":"auto","shape-image-threshold":"0","shape-margin":"0px","shape-outside":"none","shape-rendering":"auto","speak":"normal","stop-color":"rgb(0, 0, 0)","stop-opacity":"1","stroke":"none","stroke-dasharray":"none","stroke-dashoffset":"0px","stroke-linecap":"butt","stroke-linejoin":"miter","stroke-miterlimit":"4","stroke-opacity":"1","stroke-width":"1px","tab-size":"8","table-layout":"auto","text-align":"start","text-align-last":"auto","text-anchor":"start","text-autospace":"no-autospace","text-box-edge":"auto","text-box-trim":"none","text-combine-upright":"none","text-decoration":"none","text-decoration-color":"rgb(0, 0, 0)","text-decoration-line":"none","text-decoration-skip-ink":"auto","text-decoration-style":"solid","text-decoration-thickness":"auto","text-emphasis-color":"rgb(0, 0, 0)","text-emphasis-position":"over","text-emphasis-style":"none","text-fit":"none","text-indent":"0px","text-justify":"auto","text-orientation":"mixed","text-overflow":"clip","text-rendering":"auto","text-shadow":"none","text-size-adjust":"auto","text-spacing-trim":"normal","text-transform":"none","text-underline-offset":"auto","text-underline-position":"auto","text-wrap-mode":"wrap","text-wrap-style":"auto","timeline-scope":"none","timeline-trigger-activation-range-end":"normal","timeline-trigger-activation-range-start":"normal","timeline-trigger-active-range-end":"auto","timeline-trigger-active-range-start":"auto","timeline-trigger-name":"none","timeline-trigger-source":"auto","top":"auto","touch-action":"auto","transform":"none","transform-box":"view-box","transform-origin":"454.5px 9px","transform-style":"flat","transition-behavior":"normal","transition-delay":"0s","transition-duration":"0s","transition-property":"all","transition-timing-function":"ease","translate":"none","trigger-scope":"none","unicode-bidi":"isolate","user-select":"auto","vector-effect":"none","vertical-align":"baseline","view-timeline-axis":"block","view-timeline-inset":"auto","view-timeline-name":"none","view-transition-class":"none","view-transition-group":"normal","view-transition-name":"none","view-transition-scope":"none","visibility":"visible","white-space-collapse":"collapse","widows":"2","width":"909px","will-change":"auto","word-break":"normal","word-spacing":"0px","writing-mode":"horizontal-tb","x":"0px","y":"0px","z-index":"auto","zoom":"1","-webkit-border-horizontal-spacing":"0px","-webkit-border-image":"none","-webkit-border-vertical-spacing":"0px","-webkit-box-align":"stretch","-webkit-box-decoration-break":"slice","-webkit-box-direction":"normal","-webkit-box-flex":"0","-webkit-box-ordinal-group":"1","-webkit-box-orient":"horizontal","-webkit-box-pack":"start","-webkit-box-reflect":"none","-webkit-font-smoothing":"auto","-webkit-line-break":"auto","-webkit-line-clamp":"none","-webkit-locale":"auto","-webkit-mask-box-image":"none","-webkit-mask-box-image-outset":"0","-webkit-mask-box-image-repeat":"stretch","-webkit-mask-box-image-slice":"0 fill","-webkit-mask-box-image-source":"none","-webkit-mask-box-image-width":"auto","-webkit-mask-position-x":"0%","-webkit-mask-position-y":"0%","-webkit-rtl-ordering":"logical","-webkit-ruby-position":"before","-webkit-tap-highlight-color":"rgba(0, 0, 0, 0.18)","-webkit-text-combine":"none","-webkit-text-decorations-in-effect":"none","-webkit-text-fill-color":"rgb(0, 0, 0)","-webkit-text-orientation":"vertical-right","-webkit-text-security":"none","-webkit-text-stroke-color":"rgb(0, 0, 0)","-webkit-text-stroke-width":"0px","-webkit-user-drag":"auto","-webkit-user-modify":"read-only","-webkit-writing-mode":"horizontal-tb"};
+const CS_BASE = {"accent-color":"auto","align-content":"normal","align-items":"normal","align-self":"auto","alignment-baseline":"auto","anchor-name":"none","anchor-scope":"none","animation-composition":"replace","animation-delay":"0s","animation-direction":"normal","animation-duration":"0s","animation-fill-mode":"none","animation-iteration-count":"1","animation-name":"none","animation-play-state":"running","animation-range-end":"normal","animation-range-start":"normal","animation-timeline":"auto","animation-timing-function":"ease","animation-trigger":"none","app-region":"none","appearance":"none","aspect-ratio":"auto","backdrop-filter":"none","backface-visibility":"visible","background-attachment":"scroll","background-blend-mode":"normal","background-clip":"border-box","background-color":"rgba(0, 0, 0, 0)","background-image":"none","background-origin":"padding-box","background-position":"0% 0%","background-repeat":"repeat","background-size":"auto","baseline-shift":"0px","baseline-source":"auto","block-size":"auto","border-block-end-color":"rgb(0, 0, 0)","border-block-end-style":"none","border-block-end-width":"0px","border-block-start-color":"rgb(0, 0, 0)","border-block-start-style":"none","border-block-start-width":"0px","border-bottom-color":"rgb(0, 0, 0)","border-bottom-left-radius":"0px","border-bottom-right-radius":"0px","border-bottom-style":"none","border-bottom-width":"0px","border-collapse":"separate","border-end-end-radius":"0px","border-end-start-radius":"0px","border-image-outset":"0","border-image-repeat":"stretch","border-image-slice":"100%","border-image-source":"none","border-image-width":"1","border-inline-end-color":"rgb(0, 0, 0)","border-inline-end-style":"none","border-inline-end-width":"0px","border-inline-start-color":"rgb(0, 0, 0)","border-inline-start-style":"none","border-inline-start-width":"0px","border-left-color":"rgb(0, 0, 0)","border-left-style":"none","border-left-width":"0px","border-right-color":"rgb(0, 0, 0)","border-right-style":"none","border-right-width":"0px","border-shape":"none","border-start-end-radius":"0px","border-start-start-radius":"0px","border-top-color":"rgb(0, 0, 0)","border-top-left-radius":"0px","border-top-right-radius":"0px","border-top-style":"none","border-top-width":"0px","bottom":"auto","box-decoration-break":"slice","box-shadow":"none","box-sizing":"content-box","break-after":"auto","break-before":"auto","break-inside":"auto","buffered-rendering":"auto","caption-side":"top","caret-animation":"auto","caret-color":"rgb(0, 0, 0)","caret-shape":"auto","clear":"none","clip":"auto","clip-path":"none","clip-rule":"nonzero","color":"rgb(0, 0, 0)","color-interpolation":"srgb","color-interpolation-filters":"linearrgb","color-rendering":"auto","color-scheme":"normal","column-count":"auto","column-fill":"balance","column-gap":"normal","column-height":"auto","column-rule-break":"normal","column-rule-color":"rgb(0, 0, 0)","column-rule-inset-cap-end":"0px","column-rule-inset-cap-start":"0px","column-rule-inset-junction-end":"0px","column-rule-inset-junction-start":"0px","column-rule-style":"none","column-rule-visibility-items":"normal","column-rule-width":"3px","column-span":"none","column-width":"auto","column-wrap":"auto","contain":"none","contain-intrinsic-block-size":"none","contain-intrinsic-height":"none","contain-intrinsic-inline-size":"none","contain-intrinsic-size":"none","contain-intrinsic-width":"none","container-name":"none","container-type":"normal","content":"normal","content-visibility":"visible","corner-bottom-left-shape":"round","corner-bottom-right-shape":"round","corner-end-end-shape":"round","corner-end-start-shape":"round","corner-start-end-shape":"round","corner-start-start-shape":"round","corner-top-left-shape":"round","corner-top-right-shape":"round","counter-increment":"none","counter-reset":"none","counter-set":"none","cursor":"auto","cx":"0px","cy":"0px","d":"none","direction":"ltr","display":"block","dominant-baseline":"auto","dynamic-range-limit":"no-limit","empty-cells":"show","field-sizing":"fixed","fill":"rgb(0, 0, 0)","fill-opacity":"1","fill-rule":"nonzero","filter":"none","flex-basis":"auto","flex-direction":"row","flex-grow":"0","flex-line-count":"1","flex-shrink":"1","flex-wrap":"nowrap","float":"none","flood-color":"rgb(0, 0, 0)","flood-opacity":"1","font-family":"\"Times New Roman\"","font-feature-settings":"normal","font-kerning":"auto","font-language-override":"normal","font-optical-sizing":"auto","font-palette":"normal","font-size":"16px","font-size-adjust":"none","font-stretch":"100%","font-style":"normal","font-synthesis-small-caps":"auto","font-synthesis-style":"auto","font-synthesis-weight":"auto","font-variant":"normal","font-variant-alternates":"normal","font-variant-caps":"normal","font-variant-east-asian":"normal","font-variant-emoji":"normal","font-variant-ligatures":"normal","font-variant-numeric":"normal","font-variant-position":"normal","font-variation-settings":"normal","font-weight":"400","forced-color-adjust":"auto","grid-auto-columns":"auto","grid-auto-flow":"row","grid-auto-rows":"auto","grid-column-end":"auto","grid-column-start":"auto","grid-row-end":"auto","grid-row-start":"auto","grid-template-areas":"none","grid-template-columns":"none","grid-template-rows":"none","height":"auto","hyphenate-character":"auto","hyphenate-limit-chars":"auto","hyphens":"manual","image-orientation":"from-image","image-rendering":"auto","initial-letter":"normal","inline-size":"auto","inset-block-end":"auto","inset-block-start":"auto","inset-inline-end":"auto","inset-inline-start":"auto","interactivity":"auto","interest-delay-end":"normal","interest-delay-start":"normal","interpolate-size":"numeric-only","isolation":"auto","justify-content":"normal","justify-items":"normal","justify-self":"auto","left":"auto","letter-spacing":"normal","lighting-color":"rgb(255, 255, 255)","line-break":"auto","line-height":"normal","list-style-image":"none","list-style-position":"outside","list-style-type":"disc","margin-block-end":"0px","margin-block-start":"0px","margin-bottom":"0px","margin-inline-end":"0px","margin-inline-start":"0px","margin-left":"0px","margin-right":"0px","margin-top":"0px","marker-end":"none","marker-mid":"none","marker-start":"none","mask-clip":"border-box","mask-composite":"add","mask-image":"none","mask-mode":"match-source","mask-origin":"border-box","mask-position":"0% 0%","mask-repeat":"repeat","mask-size":"auto","mask-type":"luminance","math-depth":"0","math-shift":"normal","math-style":"normal","max-block-size":"none","max-height":"none","max-inline-size":"none","max-width":"none","min-block-size":"0px","min-height":"0px","min-inline-size":"0px","min-width":"0px","mix-blend-mode":"normal","object-fit":"fill","object-position":"50% 50%","object-view-box":"none","offset-anchor":"auto","offset-distance":"0px","offset-path":"none","offset-position":"normal","offset-rotate":"auto 0deg","opacity":"1","order":"0","orphans":"2","outline-color":"rgb(0, 0, 0)","outline-offset":"0px","outline-style":"none","outline-width":"3px","overflow-anchor":"auto","overflow-block":"visible","overflow-clip-margin":"0px","overflow-inline":"visible","overflow-wrap":"normal","overflow-x":"visible","overflow-y":"visible","overlay":"none","overscroll-behavior-block":"auto","overscroll-behavior-inline":"auto","overscroll-behavior-x":"auto","overscroll-behavior-y":"auto","padding-block-end":"0px","padding-block-start":"0px","padding-bottom":"0px","padding-inline-end":"0px","padding-inline-start":"0px","padding-left":"0px","padding-right":"0px","padding-top":"0px","paint-order":"normal","perspective":"none","perspective-origin":"50% 50%","pointer-events":"auto","position":"static","position-anchor":"normal","position-area":"none","position-try-fallbacks":"none","position-try-order":"normal","position-visibility":"anchors-visible","print-color-adjust":"economy","quotes":"auto","r":"0px","reading-flow":"normal","reading-order":"0","resize":"none","right":"auto","rotate":"none","row-gap":"normal","row-rule-break":"normal","row-rule-color":"rgb(0, 0, 0)","row-rule-inset-cap-end":"0px","row-rule-inset-cap-start":"0px","row-rule-inset-junction-end":"0px","row-rule-inset-junction-start":"0px","row-rule-style":"none","row-rule-visibility-items":"normal","row-rule-width":"3px","ruby-align":"space-around","ruby-overhang":"auto","ruby-position":"over","rule-overlap":"row-over-column","rx":"auto","ry":"auto","scale":"none","scroll-behavior":"auto","scroll-initial-target":"none","scroll-margin-block-end":"0px","scroll-margin-block-start":"0px","scroll-margin-bottom":"0px","scroll-margin-inline-end":"0px","scroll-margin-inline-start":"0px","scroll-margin-left":"0px","scroll-margin-right":"0px","scroll-margin-top":"0px","scroll-marker-group":"none","scroll-padding-block-end":"auto","scroll-padding-block-start":"auto","scroll-padding-bottom":"auto","scroll-padding-inline-end":"auto","scroll-padding-inline-start":"auto","scroll-padding-left":"auto","scroll-padding-right":"auto","scroll-padding-top":"auto","scroll-snap-align":"none","scroll-snap-stop":"normal","scroll-snap-type":"none","scroll-target-group":"none","scroll-timeline-axis":"block","scroll-timeline-name":"none","scrollbar-color":"auto","scrollbar-gutter":"auto","scrollbar-width":"auto","shape-image-threshold":"0","shape-margin":"0px","shape-outside":"none","shape-rendering":"auto","speak":"normal","stop-color":"rgb(0, 0, 0)","stop-opacity":"1","stroke":"none","stroke-dasharray":"none","stroke-dashoffset":"0px","stroke-linecap":"butt","stroke-linejoin":"miter","stroke-miterlimit":"4","stroke-opacity":"1","stroke-width":"1px","tab-size":"8","table-layout":"auto","text-align":"start","text-align-last":"auto","text-anchor":"start","text-autospace":"no-autospace","text-box-edge":"auto","text-box-trim":"none","text-combine-upright":"none","text-decoration":"none","text-decoration-color":"rgb(0, 0, 0)","text-decoration-line":"none","text-decoration-skip-ink":"auto","text-decoration-style":"solid","text-decoration-thickness":"auto","text-emphasis-color":"rgb(0, 0, 0)","text-emphasis-position":"over","text-emphasis-style":"none","text-fit":"none","text-indent":"0px","text-justify":"auto","text-orientation":"mixed","text-overflow":"clip","text-rendering":"auto","text-shadow":"none","text-size-adjust":"auto","text-spacing-trim":"normal","text-transform":"none","text-underline-offset":"auto","text-underline-position":"auto","text-wrap-mode":"wrap","text-wrap-style":"auto","timeline-scope":"none","timeline-trigger-activation-range-end":"normal","timeline-trigger-activation-range-start":"normal","timeline-trigger-active-range-end":"auto","timeline-trigger-active-range-start":"auto","timeline-trigger-name":"none","timeline-trigger-source":"auto","top":"auto","touch-action":"auto","transform":"none","transform-box":"view-box","transform-origin":"50% 50%","transform-style":"flat","transition-behavior":"normal","transition-delay":"0s","transition-duration":"0s","transition-property":"all","transition-timing-function":"ease","translate":"none","trigger-scope":"none","unicode-bidi":"isolate","user-select":"auto","vector-effect":"none","vertical-align":"baseline","view-timeline-axis":"block","view-timeline-inset":"auto","view-timeline-name":"none","view-transition-class":"none","view-transition-group":"normal","view-transition-name":"none","view-transition-scope":"none","visibility":"visible","white-space-collapse":"collapse","widows":"2","width":"auto","will-change":"auto","word-break":"normal","word-spacing":"0px","writing-mode":"horizontal-tb","x":"0px","y":"0px","z-index":"auto","zoom":"1","-webkit-border-horizontal-spacing":"0px","-webkit-border-image":"none","-webkit-border-vertical-spacing":"0px","-webkit-box-align":"stretch","-webkit-box-decoration-break":"slice","-webkit-box-direction":"normal","-webkit-box-flex":"0","-webkit-box-ordinal-group":"1","-webkit-box-orient":"horizontal","-webkit-box-pack":"start","-webkit-box-reflect":"none","-webkit-font-smoothing":"auto","-webkit-line-break":"auto","-webkit-line-clamp":"none","-webkit-locale":"auto","-webkit-mask-box-image":"none","-webkit-mask-box-image-outset":"0","-webkit-mask-box-image-repeat":"stretch","-webkit-mask-box-image-slice":"0 fill","-webkit-mask-box-image-source":"none","-webkit-mask-box-image-width":"auto","-webkit-mask-position-x":"0%","-webkit-mask-position-y":"0%","-webkit-rtl-ordering":"logical","-webkit-ruby-position":"before","-webkit-tap-highlight-color":"rgba(0, 0, 0, 0.18)","-webkit-text-combine":"none","-webkit-text-decorations-in-effect":"none","-webkit-text-fill-color":"rgb(0, 0, 0)","-webkit-text-orientation":"vertical-right","-webkit-text-security":"none","-webkit-text-stroke-color":"rgb(0, 0, 0)","-webkit-text-stroke-width":"0px","-webkit-user-drag":"auto","-webkit-user-modify":"read-only","-webkit-writing-mode":"horizontal-tb"};
 const CS_INLINE = {"block-size":"auto","display":"inline","height":"auto","inline-size":"auto","perspective-origin":"0px 0px","transform-origin":"0px 0px","unicode-bidi":"normal","width":"auto"};
 const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","border-block-end-width":"2px","border-block-start-style":"inset","border-block-start-width":"2px","border-bottom-style":"inset","border-bottom-width":"2px","border-inline-end-style":"inset","border-inline-end-width":"2px","border-inline-start-style":"inset","border-inline-start-width":"2px","border-left-style":"inset","border-left-width":"2px","border-right-style":"inset","border-right-width":"2px","border-top-style":"inset","border-top-width":"2px","display":"inline","height":"150px","inline-size":"300px","overflow-block":"clip","overflow-clip-margin":"content-box","overflow-inline":"clip","overflow-x":"clip","overflow-y":"clip","perspective-origin":"152px 77px","transform-origin":"152px 77px","unicode-bidi":"normal","width":"300px"};
   const CS_DISPLAY = {
@@ -5307,6 +5650,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     head: 'none', style: 'none', script: 'none', link: 'none', meta: 'none',
     title: 'none', template: 'none', base: 'none', param: 'none', source: 'none',
     track: 'none', option: 'block', optgroup: 'block',
+    output: 'inline', tt: 'inline', br: 'inline', wbr: 'inline',
+    col: 'table-column', colgroup: 'table-column-group', audio: 'none',
   };
   const CS_REPLACED_TAGS = new Set(['iframe', 'img', 'canvas', 'video', 'audio', 'object', 'embed']);
   const CS_CAMEL = (n) => n.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
@@ -5605,6 +5950,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     }
     if (CS_REPLACED_TAGS.has(tag)) for (const [k, v] of Object.entries(CS_REPLACED)) map.set(k, v);
     if (CS_DISPLAY[tag]) map.set('display', CS_DISPLAY[tag]);
+    if (UA_BIDI[tag]) map.set('unicode-bidi', UA_BIDI[tag]);
     // Заявленное автором поверх умолчаний, потом — использованные размеры.
     // Автор — это и таблицы стилей, а не только атрибут `style`: элемент с
     // `width: 200px` в таблице отвечал шириной окна, противореча CSS страницы.
@@ -5621,6 +5967,11 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         if (pairs) { for (const [k, val] of pairs) if (map.has(k)) map.set(k, val); continue; }
         if (map.has(prop)) map.set(prop, v);
       }
+      if (UA_BOLD.has(tag)) map.set('font-weight', '700');
+      // Моноширинное семейство браузер задаёт своей таблицей, а она сильнее
+      // наследования: `<pre>` внутри тела с заданным шрифтом всё равно
+      // набирается моноширинным.
+      if (UA_MONO.has(tag)) map.set('font-family', 'monospace');
       // Только длинные имена: сокращений в вычисленном стиле браузер не
       // показывает, но раскладывает их значения по длинным сам.
       const put = (k, raw) => {
@@ -5637,6 +5988,29 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         }
         put(n, v);
         written.add(n);
+      }
+      // Поля от таблицы стилей самого браузера: автор их перебивает, но там,
+      // где автор молчит, браузер печатает своё — у тела страницы восемь
+      // пикселей, у абзаца кегль, у заголовка доля кегля.
+      {
+        const q = (v) => (Math.round(v * 1e4) / 1e4) + 'px';
+        const uam = __uaMargin(tag, fs);
+        if (uam) {
+          for (const [k, v] of [['margin-top', uam[0]], ['margin-bottom', uam[0]],
+                                ['margin-left', uam[1]], ['margin-right', uam[1]]]) {
+            if (!written.has(k) && map.has(k)) map.set(k, q(v));
+          }
+        }
+        // `auto` браузер в вычисленном стиле не печатает: он отвечает тем
+        // полем, которое получилось на раскладке — у блока по центру это
+        // половина свободного места.
+        const ab = __boxOf(el);
+        if (ab) {
+          for (const [k, v] of [['margin-top', ab.mt], ['margin-bottom', ab.mb],
+                                ['margin-left', ab.ml], ['margin-right', ab.mr]]) {
+            if (v != null && /^auto$/i.test(String(map.get(k) || ''))) map.set(k, q(v));
+          }
+        }
       }
       // Цвет по записи браузера: всякая запись sRGB приводится к `rgb(…)`.
       for (const k of map.keys()) {
@@ -5730,7 +6104,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     } catch (e) {}
     try {
       if (el && el.nodeType === ELEMENT_NODE) {
-        if (__isHiddenEl(el)) map.set('display', 'none');
+        if (__isUnboxed(el)) map.set('display', 'none');
         const b = __boxOf(el);
         if (b) {
           // Браузер называет здесь поле содержимого: у элемента с рамкой и
@@ -5973,9 +6347,21 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       const raw = __cascadeFor(el).get('font-size');
       if (raw == null) return size;
     }
+    // Моноширинное набирается своим кеглем: у браузера это тринадцать
+    // пикселей, а не шестнадцать, и `pre` без своего правила отступает на
+    // тринадцать, а не на шестнадцать.
+    if (own !== 'textarea' && UA_MONO.has(own)) {
+      size = 13;
+      const raw = __cascadeFor(el).get('font-size');
+      if (raw == null) return size;
+    }
     for (let i = chain.length - 1; i >= 0; i--) {
       const raw = __cascadeFor(chain[i]).get('font-size');
-      if (raw == null) continue;
+      if (raw == null) {
+        const f = UA_FONT_SIZE[(chain[i].localName || '').toLowerCase()];
+        if (f) size *= f;
+        continue;
+      }
       const v = String(raw).trim();
       let m;
       if ((m = /^(-?[\d.]+)px$/.exec(v))) size = parseFloat(m[1]);
@@ -5991,12 +6377,19 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   const __LENGTH_PROPS = /^(width|height|min-|max-|margin|padding|border-.*-width|top|right|bottom|left|inset|gap|font-size|line-height|text-indent|letter-spacing|word-spacing|outline-width|border-spacing|column-gap|row-gap)/;
   function __resolveLength(raw, prop, fontSize, el) {
     const v = String(raw);
-    if (!__LENGTH_PROPS.test(prop) || !/[\d.](?:em|rem|pt|%)/.test(v)) return v;
-    return v.replace(/(-?[\d.]+)(em|rem|pt|%)/g, (m, n, unit) => {
+    if (!__LENGTH_PROPS.test(prop) || !/[\d.](?:em|rem|pt|%|vh|vw|vmin|vmax)/.test(v)) return v;
+    return v.replace(/(-?[\d.]+)(em|rem|pt|vmin|vmax|vh|vw|%)/g, (m, n, unit) => {
       const x = parseFloat(n);
       if (unit === 'pt') return (x * 4 / 3) + 'px';
       if (unit === 'em') return (x * fontSize) + 'px';
       if (unit === 'rem') return (x * 16) + 'px';
+      // Доли окна браузер тоже печатает пикселями: `margin: 15vh auto` в
+      // вычисленном стиле выходит числом, а не записью автора.
+      if (unit === 'vh' || unit === 'vw' || unit === 'vmin' || unit === 'vmax') {
+        const base = unit === 'vh' ? LAYOUT.H : unit === 'vw' ? LAYOUT.W
+          : unit === 'vmin' ? Math.min(LAYOUT.W, LAYOUT.H) : Math.max(LAYOUT.W, LAYOUT.H);
+        return (Math.round(x / 100 * base * 64) / 64) + 'px';
+      }
       // Проценты по вертикали считаются тоже от ширины — так в спецификации.
       const base = __containingWidth(el);
       return base != null ? (Math.round(x / 100 * base * 64) / 64) + 'px' : m;
@@ -6013,6 +6406,16 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
 
   function __boxOf(el) {
     if (!el || el.nodeType !== ELEMENT_NODE) return null;
+    const doc = el.ownerDocument;
+    if (doc && doc !== globalThis.document) {
+      // Узел чужого документа: раскладывает его тот реалм, которому он
+      // принадлежит, и отметку надо спрашивать у документа, а не у себя.
+      try {
+        const win = doc.defaultView;
+        if (win && typeof win.__pt_relayout === 'function') win.__pt_relayout();
+      } catch (e) {}
+      return doc.__ptLayoutV != null && el.__ptBoxV === doc.__ptLayoutV ? el.__ptBox : null;
+    }
     __relayout();
     return el.__ptBoxV === __layoutBuilt ? el.__ptBox : null; // detached/hidden → no box
   }

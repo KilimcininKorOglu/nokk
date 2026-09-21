@@ -16,6 +16,9 @@ const { spawn } = require('child_process');
 const http = require('http');
 
 const PORT = 9333, URL_ = process.argv[2], WAIT = +(process.argv[3] || 40000);
+// Какой кусок отчёта высыпать целиком: DUMPENC=30000-32000. То же окно, что
+// `NOKK_DUMP_ENC` у движка, иначе две ленты не сравнить.
+const [DUMP_LO, DUMP_HI] = (process.env.DUMPENC || '15000-16000').split('-').map(Number);
 const chrome = spawn('google-chrome', [
   `--remote-debugging-port=${PORT}`, '--user-data-dir=/tmp/cdp-profile', '--no-first-run',
   '--no-default-browser-check', '--window-size=1280,900',
@@ -154,6 +157,8 @@ const HOOK = `(() => {
     };
     // Через TextEncoder.encode проходит сам отчёт: его куски видны здесь в
     // открытом виде, до сжатия и шифрования. Записываем длину каждого и начало.
+    globalThis.__ptDumpLo = ${DUMP_LO};
+    globalThis.__ptDumpHi = ${DUMP_HI};
     try {
       const TE = globalThis.TextEncoder && TextEncoder.prototype;
       const enc = TE && TE.encode;
@@ -167,14 +172,44 @@ const HOOK = `(() => {
               at = String(new Error().stack || '').split('\\n').slice(2, 5)
                 .map((x) => x.trim().replace(/^at /, '').slice(0, 46)).join(' < ');
             } catch (e) {}
-            console.log('[enc ' + (n++) + '] ' + Math.round(performance.now()) + 'мс ' + s.length + ' | ненулевых=' + (() => { let n = 0, sum = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { n++; sum = (sum * 31 + c) >>> 0; } } return n + ' сумма=' + sum; })() + (s.length < 2000 || s.length > 14000 ? ' текст: ' + s.slice(0, 400).replace(/[^\x20-\x7e]/g, '.') : ' коды: ') + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
-if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__ptD || {})[s.length]) {
+            console.log('[enc ' + (n++) + '] ' + Math.round(performance.now()) + 'мс ' + (() => { try { return location.host.slice(0, 18) + ' '; } catch (e) { return '? '; } })() + s.length + ' | ненулевых=' + (() => { let n = 0, sum = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { n++; sum = (sum * 31 + c) >>> 0; } } return n + ' сумма=' + sum; })() + (s.length < 2000 || s.length > 14000 ? ' текст: ' + s.slice(0, 400).replace(/[^\x20-\x7e]/g, '.') : ' коды: ') + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
+if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__ptDumpHi || 16000) && !(globalThis.__ptD = globalThis.__ptD || {})[s.length]) {
   globalThis.__ptD[s.length] = 1;
   for (let q = 0; q < s.length; q += 250) console.log('[кус ' + s.length + ':' + (q / 300) + '] ' + s.slice(q, q + 300));
 }
           }
           return enc.call(this, x);
         }, writable: true, configurable: true });
+      }
+    } catch (e) {}
+    // Чей стиль перечисляют. Челлендж высыпает весь
+    // вычисленный стиль одного узла, и у нас он выходит на
+    // триста знаков длиннее хромовского: значит меряется не
+    // тот узел или не в том окружении. Крючок лёгкий —
+    // только приметы узла, по двадцать первых вызовов.
+    try {
+      const G = globalThis.getComputedStyle;
+      if (G && !G.__ptSaid) {
+        const V = function getComputedStyle(el, ps) {
+          const r = G.apply(this, arguments);
+          try {
+            if ((globalThis.__ptCsN = (globalThis.__ptCsN || 0) + 1) <= 20) {
+              const who = (n) => !n ? '-' : (n.nodeName || '?') +
+                (n.id ? '#' + n.id : '') +
+                (n.className && n.className.baseVal === undefined && typeof n.className === 'string' && n.className ? '.' + n.className.slice(0, 24) : '');
+              let chain = '', p = el;
+              for (let i = 0; i < 4 && p; i++) { chain += (i ? ' < ' : '') + who(p); p = p.parentNode; }
+              console.log('[cs] ' + who(el) + ' в цепочке ' + chain +
+                ' связан=' + (el && el.isConnected) +
+                ' псевдо=' + String(ps) +
+                ' док=' + (el && el.ownerDocument === document) +
+                ' цвет=' + (r && r.color) + ' кегль=' + (r && r.fontSize));
+            }
+          } catch (e) {}
+          return r;
+        };
+        V.__ptSaid = 1;
+        globalThis.getComputedStyle = V;
       }
     } catch (e) {}
     const C2 = globalThis.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype;
@@ -435,7 +470,7 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[parts|^\[звук |^\[json |^\[btoa |^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
+      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[cs\]|^\[parts|^\[звук |^\[json |^\[btoa |^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
         lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
     }
     if (m.method === 'Target.attachedToTarget') {

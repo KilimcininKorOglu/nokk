@@ -9677,6 +9677,153 @@ variationSettings,weight",
         }
     }
 
+    /// Строчные дети ложатся в одну строку, переносятся по ширине и стоят на
+    /// общей базовой линии, а пустая строчная коробка строки не делает. Раньше
+    /// всякий ребёнок начинал новую строку, и геометрия любого виджета —
+    /// а его меряют прямоугольниками — расходилась с браузерной.
+    ///
+    /// Проверяются отношения, а не числа: точные пиксели зависят от метрик
+    /// гарнитуры, а они есть только в сборке с `render`. Chrome 151 на этой
+    /// разметке даёт строку 19, слова 16 и 18 шириной, строчно-блочных на
+    /// базовой линии в 6 и 2 пикселях сверху и два переноса по 19.
+    #[tokio::test]
+    async fn inline_children_share_a_line_like_a_browser() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<!doctype html><html><head><style>body{margin:0;width:756px;font:16px system-ui}</style></head>
+               <body><div id=a><span>aa</span><span>bb</span></div>
+               <div id=b><span></span></div>
+               <div id=c><span style="display:inline-block;width:30px;height:10px"></span
+                 ><span style="display:inline-block;width:20px;height:14px"></span></div>
+               <div id=d><span style="display:inline-block;width:1000px"></span
+                 ><span style="display:inline-block;width:1000px"></span></div>
+               </body></html>"#,
+        )
+        .await
+        .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const pick = (id) => { const d = document.getElementById(id);
+              const base = d.getBoundingClientRect();
+              return { h: parseFloat(getComputedStyle(d).height),
+                kids: [...d.children].map((c) => { const r = c.getBoundingClientRect();
+                  return [Math.round(r.x - base.x), Math.round(r.y - base.y),
+                          Math.round(r.width), Math.round(r.height)]; }) };
+            };
+            return __ptJSON.stringify({ a: pick('a'), b: pick('b'), c: pick('c'), d: pick('d') });
+        })()"#).await;
+
+        let kids = |key: &str| -> Vec<Vec<f64>> {
+            out[key]["kids"]
+                .as_array()
+                .map(|a| a.iter().map(|r| r.as_array().unwrap().iter()
+                    .filter_map(|v| v.as_f64()).collect()).collect())
+                .unwrap_or_default()
+        };
+        let h = |key: &str| out[key]["h"].as_f64().unwrap_or_default();
+
+        let a = kids("a");
+        assert_eq!(a.len(), 2, "оба слова на месте: {out}");
+        assert_eq!(a[0][1], a[1][1], "оба слова на одной строке: {out}");
+        assert_eq!(a[1][0], a[0][2], "второе начинается там, где кончилось первое: {out}");
+        assert_eq!(a[0][3], h("a"), "высота строки — высота коробки: {out}");
+
+        assert_eq!(h("b"), 0.0, "пустая строчная коробка строки не делает: {out}");
+
+        let c = kids("c");
+        assert_eq!(c[0][0], 0.0, "первый строчно-блочный у левого края: {out}");
+        assert_eq!(c[1][0], 30.0, "второй сразу за ним: {out}");
+        assert_eq!(c[0][1] + c[0][3], c[1][1] + c[1][3],
+            "оба стоят нижним краем на общей базовой линии: {out}");
+        assert!(h("c") > c[0][1] + c[0][3], "под базовой линией остаётся спуск: {out}");
+
+        let d = kids("d");
+        assert_eq!(d[0][0], 0.0, "перенесённое начинается слева: {out}");
+        assert_eq!(d[1][0], 0.0, "и второе тоже: {out}");
+        assert!(d[1][1] > d[0][1], "второе ушло на новую строку: {out}");
+        assert_eq!(h("d"), 2.0 * h("a"), "две строки той же высоты: {out}");
+    }
+
+    /// Таблица стилей самого браузера: поля тела страницы, заголовков и
+    /// абзацев, направление письма и моноширинный кегль. Челлендж снимает
+    /// вычисленный стиль целиком, а эти значения одинаковы на всякой машине —
+    /// сверить их с браузером можно без сети. Числа сняты с Chrome 151.
+    #[tokio::test]
+    async fn the_browser_own_stylesheet_shows_through_computed_style() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><body><p>a</p><h1>b</h1><pre>c</pre><ul><li>d</li></ul>
+               <blockquote>e</blockquote><input><div>f</div></body></html>"#,
+        )
+        .await
+        .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const g = (sel) => { const cs = getComputedStyle(document.querySelector(sel));
+              return [cs.marginTop, cs.marginLeft, cs.unicodeBidi, cs.fontSize]; };
+            return __ptJSON.stringify({ body: g('body'), p: g('p'), h1: g('h1'), pre: g('pre'),
+              ul: g('ul'), quote: g('blockquote'), input: g('input'), div: g('div'),
+              h1w: getComputedStyle(document.querySelector('h1')).fontWeight });
+        })()"#).await;
+
+        let row = |key: &str| -> Vec<String> {
+            out[key]
+                .as_array()
+                .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(row("body"), ["8px", "8px", "normal", "16px"], "тело: {out}");
+        assert_eq!(row("p"), ["16px", "0px", "isolate", "16px"], "абзац — кегль сверху: {out}");
+        assert_eq!(row("h1"), ["21.44px", "0px", "isolate", "32px"], "заголовок — доля кегля: {out}");
+        assert_eq!(out["h1w"], "700", "и насыщенность от браузера: {out}");
+        assert_eq!(row("pre"), ["13px", "0px", "isolate", "13px"], "моноширинное: {out}");
+        assert_eq!(row("ul"), ["16px", "0px", "isolate", "16px"], "список: {out}");
+        assert_eq!(row("quote"), ["16px", "40px", "isolate", "16px"], "цитата: {out}");
+        assert_eq!(row("input"), ["0px", "0px", "normal", "13.3333px"], "поле ввода: {out}");
+        assert_eq!(row("div"), ["0px", "0px", "isolate", "16px"], "блок: {out}");
+    }
+
+    /// Стиль считается по тому документу, которому элемент принадлежит. Страница
+    /// заводит кадр и меряет его тело чужим окном — браузер отвечает своими
+    /// умолчаниями, потому что таблицы хозяйской страницы туда не достают. Мы
+    /// отвечали её цветом и кеглем, и весь перечисленный стиль расходился.
+    #[tokio::test]
+    async fn a_frame_body_is_styled_by_its_own_document() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><head><style>
+               body { font-size: 14px; color: rgb(10, 10, 10); font-family: Arial, sans-serif }
+               </style></head><body></body></html>"#,
+        )
+        .await
+        .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const f = document.createElement('iframe');
+            document.body.appendChild(f);
+            const cs = getComputedStyle(f.contentDocument.body);
+            const own = getComputedStyle(document.body);
+            return __ptJSON.stringify({ frame: [cs.color, cs.fontSize, cs.fontFamily, cs.marginTop],
+              host: [own.color, own.fontSize] });
+        })()"#).await;
+
+        let frame = out["frame"].as_array().expect("тело кадра меряется");
+        assert_eq!(frame[0], "rgb(0, 0, 0)", "цвет по умолчанию, не хозяйский: {out}");
+        assert_eq!(frame[1], "16px", "кегль по умолчанию: {out}");
+        assert_eq!(frame[2], "\"Times New Roman\"", "шрифт по умолчанию: {out}");
+        assert_eq!(frame[3], "8px", "поле от таблицы браузера: {out}");
+        assert_eq!(out["host"][0], "rgb(10, 10, 10)", "а хозяйский документ — свой: {out}");
+    }
+
     /// Гибкий контейнер: дети ложатся в ряд, свободное место делится по
     /// `flex-grow`, поперёк они выравниваются по правилу контейнера, а
     /// высота у них — строки из стиля, а не чернил гарнитуры. Виджет почти
@@ -10134,9 +10281,11 @@ variationSettings,weight",
         })()"#,
         )
         .await;
+        // Флажок стоит не в самом углу кадра: у тела страницы восемь пикселей
+        // поля от таблицы стилей браузера, и ещё три — своих у флажка.
         let (x, y) = (
-            rect["x"].as_f64().unwrap() + 10.0,
-            rect["y"].as_f64().unwrap() + 5.0,
+            rect["x"].as_f64().unwrap() + 16.0,
+            rect["y"].as_f64().unwrap() + 16.0,
         );
 
         for kind in ["mouseMoved", "mousePressed", "mouseReleased"] {

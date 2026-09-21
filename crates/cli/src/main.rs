@@ -506,8 +506,8 @@ async fn main() -> Result<()> {
                               at = String(new Error().stack || '').split('\n').slice(2, 5)
                                 .map((x) => x.trim().replace(/^at /, '').slice(0, 46)).join(' < ');
                             } catch (e) {}
-                            console.error('[enc ' + (en++) + '] ' + Math.round(performance.now()) + 'мс ' + s.length + ' | ненулевых=' + (() => { let n = 0, sum = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { n++; sum = (sum * 31 + c) >>> 0; } } return n + ' сумма=' + sum; })() + (s.length < 2000 || s.length > 14000 ? ' текст: ' + s.slice(0, 400).replace(/[^\x20-\x7e]/g, '.') : ' коды: ') + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
-if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__ptD || {})[s.length]) {
+                            console.error('[enc ' + (en++) + '] ' + Math.round(performance.now()) + 'мс ' + (() => { try { return location.host.slice(0, 18) + ' '; } catch (e) { return '? '; } })() + s.length + ' | ненулевых=' + (() => { let n = 0, sum = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { n++; sum = (sum * 31 + c) >>> 0; } } return n + ' сумма=' + sum; })() + (s.length < 2000 || s.length > 14000 ? ' текст: ' + s.slice(0, 400).replace(/[^\x20-\x7e]/g, '.') : ' коды: ') + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
+if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = globalThis.__ptD || {})[s.length]) {
   globalThis.__ptD[s.length] = 1;
   for (let q = 0; q < s.length; q += 250) console.error('[кус ' + s.length + ':' + (q / 300) + '] ' + s.slice(q, q + 300));
 }
@@ -525,6 +525,36 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                         const t = setInterval(() => { if (arm() || ++tries > 40) clearInterval(t); }, 25);
                       }
                     }
+                    // Чей стиль перечисляют. Челлендж высыпает весь
+                    // вычисленный стиль одного узла, и у нас он выходит на
+                    // триста знаков длиннее хромовского: значит меряется не
+                    // тот узел или не в том окружении. Крючок лёгкий —
+                    // только приметы узла, по двадцать первых вызовов.
+                    try {
+                      const G = globalThis.getComputedStyle;
+                      if (G && !G.__ptSaid) {
+                        const V = function getComputedStyle(el, ps) {
+                          const r = G.apply(this, arguments);
+                          try {
+                            if ((globalThis.__ptCsN = (globalThis.__ptCsN || 0) + 1) <= 20) {
+                              const who = (n) => !n ? '-' : (n.nodeName || '?') +
+                                (n.id ? '#' + n.id : '') +
+                                (n.className && n.className.baseVal === undefined && typeof n.className === 'string' && n.className ? '.' + n.className.slice(0, 24) : '');
+                              let chain = '', p = el;
+                              for (let i = 0; i < 4 && p; i++) { chain += (i ? ' < ' : '') + who(p); p = p.parentNode; }
+                              console.error('[cs] ' + who(el) + ' в цепочке ' + chain +
+                                ' связан=' + (el && el.isConnected) +
+                                ' псевдо=' + String(ps) +
+                                ' док=' + (el && el.ownerDocument === document) +
+                                ' цвет=' + (r && r.color) + ' кегль=' + (r && r.fontSize));
+                            }
+                          } catch (e) {}
+                          return r;
+                        };
+                        V.__ptSaid = 1;
+                        globalThis.getComputedStyle = globalThis.__pt_native ? __pt_native(V) : V;
+                      }
+                    } catch (e) {}
                     count(globalThis.OfflineAudioContext && OfflineAudioContext.prototype, 'audio',
                           ['startRendering', 'createOscillator', 'createDynamicsCompressor']);
                     count(globalThis.HTMLMediaElement && HTMLMediaElement.prototype, 'media', ['canPlayType']);
@@ -758,6 +788,13 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                     "__ENCMIN__",
                     &std::env::var("NOKK_ENC_MIN").unwrap_or_else(|_| "30".into()),
                 );
+                // Какой кусок высыпать целиком: `NOKK_DUMP_ENC=30000-32000`.
+                // По умолчанию — звуковой блок, его сверяли чаще всего. Тот же
+                // разброс задаётся Chrome через `DUMPENC` у `chrome-compare`,
+                // иначе сравнивать нечего.
+                let window = std::env::var("NOKK_DUMP_ENC").unwrap_or_else(|_| "15000-16000".into());
+                let (lo, hi) = window.split_once('-').unwrap_or(("15000", "16000"));
+                let probe = probe.replace("__DUMPLO__", lo.trim()).replace("__DUMPHI__", hi.trim());
                 c.add_frame_init_script(probe.clone());
                 c.add_init_script(probe);
             }
