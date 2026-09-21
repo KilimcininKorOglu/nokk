@@ -147,6 +147,9 @@ thread_local! {
     /// перебирающая семейства ради отпечатка, спрашивает их сотнями.
     static LOADED: RefCell<HashMap<String, Option<&'static FontVec>>> =
         RefCell::new(HashMap::new());
+    /// Каким шрифтом закрывается знак, не нашедшийся в названных семействах.
+    static FALLBACK: RefCell<HashMap<char, Option<&'static FontVec>>> =
+        RefCell::new(HashMap::new());
     /// Раскладчики, по адресу шрифта.
     static SHAPERS: RefCell<HashMap<usize, Option<&'static rustybuzz::Face<'static>>>> =
         RefCell::new(HashMap::new());
@@ -399,12 +402,19 @@ fn shape_run(
         let laid = rustybuzz::shape(face, &[], buf);
         let (infos, pos) = (laid.glyph_infos(), laid.glyph_positions());
         for (info, p) in infos.iter().zip(pos.iter()) {
+            let id = ab_glyph::GlyphId(info.glyph_id as u16);
             out.push(Shaped {
                 font,
-                id: ab_glyph::GlyphId(info.glyph_id as u16),
+                id,
                 x: *caret + ft_px(p.x_offset, upem, size_px),
             });
-            *caret += ft_px(p.x_advance, upem, size_px);
+            // У цветного шрифта знаки лежат картинками, и ширину браузер берёт
+            // из выбранной полосы, а не из таблицы ширин: смайлик при шестнадцати
+            // пикселях выходит 19.96, а не 19.92.
+            match raster_advance(face, ttf_parser::GlyphId(info.glyph_id as u16), size_px) {
+                Some(w) => *caret += w,
+                None => *caret += ft_px(p.x_advance, upem, size_px),
+            }
         }
         return;
     }
@@ -413,6 +423,34 @@ fn shape_run(
         out.push(Shaped { font, id, x: *caret });
         *caret += ft_px(font.h_advance_unscaled(id) as i32, upem, size_px);
     }
+}
+
+/// Ширина знака, нарисованного картинкой: полоса выбирается по кеглю, и
+/// ширина считается из её разрешения. Контурным шрифтам это не касается — там
+/// пусто.
+fn raster_advance(face: &rustybuzz::Face<'static>, id: ttf_parser::GlyphId, size_px: f32) -> Option<f64> {
+    let img = raster_image(face, id, size_px)?;
+    // Ширина остаётся дробью со знаменателем 65536, и остаток отбрасывается:
+    // у смайлика при шестнадцати пикселях выходит 19.963302612304688, а не
+    // 19.96330275229358, как при честном делении.
+    let exact = img.width as f64 * size_px as f64 / img.pixels_per_em as f64;
+    Some((exact * 65536.0).floor() / 65536.0)
+}
+
+/// Картинка знака из выбранной полосы — у цветных шрифтов контуров нет вовсе.
+fn raster_image<'a>(
+    face: &'a rustybuzz::Face<'static>,
+    id: ttf_parser::GlyphId,
+    size_px: f32,
+) -> Option<ttf_parser::RasterGlyphImage<'a>> {
+    if face.glyph_bounding_box(id).is_some() {
+        return None;
+    }
+    let img = face.glyph_raster_image(id, size_px.max(1.0) as u16)?;
+    if img.pixels_per_em == 0 || img.width == 0 {
+        return None;
+    }
+    Some(img)
 }
 
 /// Разложить строку так, как её раскладывает браузер: по словам, внутри слова —
@@ -429,7 +467,14 @@ fn shape(chain: &[&'static FontVec], text: &str, size_px: f32) -> (Vec<Shaped>, 
     let mut run = String::new();
     let mut run_font: Option<&'static FontVec> = None;
     for ch in text.chars() {
-        let cf = face_for(chain, ch);
+        // Соединитель и метки не выбирают шрифт сами: у смайлика из нескольких
+        // знаков они держат всю связку в одном шрифте, и тогда он сводится в
+        // один знак — как в браузере.
+        let cf = if clings_to_previous(ch) {
+            run_font.unwrap_or_else(|| face_for(chain, ch))
+        } else {
+            face_for(chain, ch)
+        };
         let breaks = ch == ' ' || run_font.is_some_and(|f| !std::ptr::eq(f, cf));
         if breaks && !run.is_empty() {
             shape_run(&mut out, &mut caret, run_font.unwrap_or(chain[0]), &run, size_px);
@@ -456,7 +501,70 @@ fn face_for(chain: &[&'static FontVec], ch: char) -> &'static FontVec {
             return f;
         }
     }
-    chain[0]
+    // Знака нет ни в одном названном семействе — браузер ищет его по всем
+    // установленным шрифтам, и для смайлика находит цветной. Мы же рисовали
+    // его первым шрифтом цепочки, то есть пустым прямоугольником, и ширина
+    // выходила чужая.
+    system_face(ch).unwrap_or(chain[0])
+}
+
+/// Семейства, которыми браузер закрывает знаки, не нашедшиеся в названных.
+/// Порядок как у fontconfig на этой машине: смайлики цветным шрифтом, дальше
+/// обычные.
+const FALLBACK_FAMILIES: &[&str] = &[
+    "NotoColorEmoji.ttf",
+    "DejaVuSans.ttf",
+    "NotoSansSymbols2-Regular.ttf",
+    "NotoSansMath-Regular.ttf",
+    "LiberationSans-Regular.ttf",
+    "NotoSansMono-Regular.ttf",
+];
+
+/// Шрифт из системы, в котором этот знак есть. Ответ запоминается: страница,
+/// меряющая сотни знаков, спрашивает одно и то же много раз.
+fn system_face(ch: char) -> Option<&'static FontVec> {
+    FALLBACK.with(|m| {
+        if let Some(hit) = m.borrow().get(&ch) {
+            return *hit;
+        }
+        let mut found = None;
+        for file in FALLBACK_FAMILIES {
+            if let Some(f) = load(file) {
+                if f.glyph_id(ch).0 != 0 {
+                    found = Some(f);
+                    break;
+                }
+            }
+        }
+        if found.is_none() {
+            // Ничего из списка не подошло — перебрать всё, что есть в системе,
+            // в постоянном порядке.
+            let mut names: Vec<_> = font_index().values().map(|(p, _)| p.clone()).collect();
+            names.sort();
+            names.dedup();
+            for path in names {
+                let Some(file) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if let Some(f) = load(file) {
+                    if f.glyph_id(ch).0 != 0 {
+                        found = Some(f);
+                        break;
+                    }
+                }
+            }
+        }
+        m.borrow_mut().insert(ch, found);
+        found
+    })
+}
+
+/// Знаки, которые не выбирают шрифт сами, а остаются со своим соседом:
+/// соединитель нулевой ширины, указатель начертания, тон кожи, метки.
+fn clings_to_previous(ch: char) -> bool {
+    matches!(ch as u32,
+        0x200D | 0xFE0E | 0xFE0F | 0x1F3FB..=0x1F3FF | 0x20E3
+        | 0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x20D0..=0x20F0 | 0xE0020..=0xE007F)
 }
 
 fn resolve(families: &str, bold: bool, italic: bool) -> Option<&'static FontVec> {
@@ -1256,6 +1364,18 @@ pub fn measure_text(
             ink_r = ink_r.max(g.x + bb.max.x as f64);
             ink_t = ink_t.min(bb.min.y as f64);
             ink_b = ink_b.max(bb.max.y as f64);
+        } else if let Some(img) = shaper(cf)
+            .and_then(|f| raster_image(f, ttf_parser::GlyphId(g.id.0), size_px))
+        {
+            // Знак нарисован картинкой: границы чернил — её края, приведённые
+            // к кеглю и округлённые наружу, как и у контурных.
+            let k = size_px as f64 / img.pixels_per_em as f64;
+            ink_l = ink_l.min(g.x + (img.x as f64 * k).floor());
+            ink_r = ink_r.max(g.x + ((img.x as f64 + img.width as f64) * k).ceil());
+            // `y` у картинки — от базовой линии до её низа, поэтому верх это
+            // `y + высота`.
+            ink_t = ink_t.min(-(((img.y as f64 + img.height as f64) * k).ceil()));
+            ink_b = ink_b.max((-(img.y as f64) * k).ceil());
         }
     }
     let none = ink_l > ink_r;
@@ -1451,6 +1571,35 @@ mod tests {
             (av.right - 12.928).abs() < 0.001,
             "правая граница «AV»: {}",
             av.right
+        );
+    }
+
+    /// Смайлик меряется цветным шрифтом, а не первым попавшимся: у браузера
+    /// он шириной 19.963302612304688 при шестнадцати пикселях, и связка из
+    /// нескольких знаков через соединитель — тоже, потому что сводится в один
+    /// знак. Числа сняты с Chrome 151 на этой машине.
+    #[test]
+    fn an_emoji_is_measured_by_the_colour_font() {
+        let one = measure_text("😀", 16.0, "sans-serif", false, false);
+        assert_eq!(
+            one.width, 19.963302612304688,
+            "ширина смайлика: {}",
+            one.width
+        );
+        assert_eq!((one.ascent, one.descent), (15.0, 4.0), "коробка чернил");
+        assert_eq!(one.right, 20.0, "правая граница");
+        for seq in ["👩‍❤️‍💋‍👨", "👨‍👩‍👧‍👦", "👨‍👩‍👦", "🇺🇦", "👍🏽"] {
+            let w = measure_text(seq, 16.0, "sans-serif", false, false).width;
+            assert_eq!(w, one.width, "связка «{seq}» — один знак, а не несколько");
+        }
+        // Кегль меняет ширину как у браузера: дробь со знаменателем 65536.
+        assert_eq!(
+            measure_text("😀", 11.0, "sans-serif", false, false).width,
+            13.724761962890625
+        );
+        assert_eq!(
+            measure_text("😀", 32.0, "sans-serif", false, false).width,
+            39.926605224609375
         );
     }
 

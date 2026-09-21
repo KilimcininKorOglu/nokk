@@ -204,13 +204,56 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
                 ' связан=' + (el && el.isConnected) +
                 ' псевдо=' + String(ps) +
                 ' док=' + (el && el.ownerDocument === document) +
-                ' цвет=' + (r && r.color) + ' кегль=' + (r && r.fontSize) +' дети=' + (el && el.children ? Array.prototype.map.call(el.children, (k) => k.nodeName + (k.getAttribute && k.getAttribute('style') ? '[' + k.getAttribute('style').slice(0, 40) + ']' : '')).join(',').slice(0, 160) : '?') + ' текст=' + JSON.stringify(String((el && el.textContent) || '').slice(0, 40)));
+                ' цвет=' + (r && r.color) + ' кегль=' + (r && r.fontSize) +' дети=' + (el && el.children ? Array.prototype.map.call(el.children, (k) => k.nodeName + (k.getAttribute && k.getAttribute('style') ? '[' + k.getAttribute('style').slice(0, 40) + ']' : '')).join(',').slice(0, 160) : '?') + ' текст=' + JSON.stringify(String((el && el.textContent) || '').slice(0, 40)) + ' откуда=' + (() => { try { return String(new Error().stack || '').split('\\n').slice(2, 4).map((x) => x.trim().replace(/^at /, '').slice(0, 60)).join(' < '); } catch (e) { return '?'; } })());
             }
           } catch (e) {}
           return r;
         };
         V.__ptSaid = 1;
         globalThis.getComputedStyle = V;
+      }
+    } catch (e) {}
+    // Чем меряют надписи в SVG: у эмодзи это способ узнать,
+    // какие последовательности браузер сводит в один знак.
+    try {
+      const P = globalThis.SVGTextContentElement && SVGTextContentElement.prototype;
+      for (const name of ['getComputedTextLength', 'getSubStringLength', 'getNumberOfChars',
+          'getExtentOfChar', 'getStartPositionOfChar', 'getEndPositionOfChar']) {
+        const f = P && P[name];
+        if (!f || f.__ptSaid) continue;
+        const V = function (...a) {
+          const r = f.apply(this, a);
+          try {
+            if ((globalThis.__ptSvgN = (globalThis.__ptSvgN || 0) + 1) <= 40) {
+              const show = (v) => (v && typeof v === 'object'
+                ? '{' + ['x', 'y', 'width', 'height'].map((k) => k + '=' + (v[k] === undefined ? '?' : v[k])).join(',') + '}'
+                : String(v));
+              console.log('[svg] ' + name + '(' + a.join(',') + ') текст=' +
+                JSON.stringify(String(this.textContent || '').slice(0, 12)) + ' -> ' + show(r));
+            }
+          } catch (e) {}
+          return r;
+        };
+        V.__ptSaid = 1;
+        try { Object.defineProperty(V, 'name', { value: name }); } catch (e) {}
+        Object.defineProperty(P, name, { value: V, writable: true, configurable: true });
+      }
+      const G = globalThis.SVGGraphicsElement && SVGGraphicsElement.prototype;
+      const bb = G && G.getBBox;
+      if (bb && !bb.__ptSaid) {
+        const V = function getBBox(...a) {
+          const r = bb.apply(this, a);
+          try {
+            if ((globalThis.__ptBBoxN = (globalThis.__ptBBoxN || 0) + 1) <= 40) {
+              console.log('[svg] getBBox текст=' +
+                JSON.stringify(String(this.textContent || '').slice(0, 12)) +
+                ' -> {' + [r.x, r.y, r.width, r.height].join(',') + '}');
+            }
+          } catch (e) {}
+          return r;
+        };
+        V.__ptSaid = 1;
+        Object.defineProperty(G, 'getBBox', { value: V, writable: true, configurable: true });
       }
     } catch (e) {}
     const C2 = globalThis.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype;
@@ -471,7 +514,7 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[cs\]|^\[хвост |^\[parts|^\[звук |^\[json |^\[btoa |^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
+      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[cs\]|^\[svg\]|^\[хвост |^\[parts|^\[звук |^\[json |^\[btoa |^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
         lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
     }
     if (m.method === 'Target.attachedToTarget') {
