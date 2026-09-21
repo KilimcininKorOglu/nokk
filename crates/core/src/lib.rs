@@ -9684,6 +9684,69 @@ variationSettings,weight",
         }
     }
 
+    /// Правило печатается так, как его печатает браузер: значения приводятся
+    /// к своему виду, перезаписанное свойство уходит в конец, сокращение с
+    /// перебитой частью распадается на составляющие, а отдельно написанные
+    /// стороны собираются обратно. Челлендж снимает `cssText` всех правил
+    /// своей таблицы — а это одно и то же на всякой машине. Числа сняты с
+    /// Chrome 151.
+    #[tokio::test]
+    async fn a_rule_prints_the_way_the_browser_prints_it() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<!doctype html><html><body></body></html>")
+            .await
+            .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const st = document.createElement('style');
+            st.textContent = `
+              .a { box-shadow: inset 0 0 0 rgb(34, 139, 73); }
+              .b { outline: 2px solid rgb(0, 81, 195); }
+              .c { grid-area: 1/1; }
+              .d { transform-origin: center; }
+              .e { stroke-dasharray: 0,100,0; }
+              .f { transition: all 0.1s ease-in; }
+              .g { animation: none; }
+              .h { transform: rotate(0) translateY(0) scale(1); }
+              .i { border: solid rgb(196, 77, 14); border-width: 0 4px 4px 0; }
+              .j { margin-top: 1px; margin-right: 2px; margin-bottom: 3px; margin-left: 4px; }
+              .k { padding: 1px; padding-left: 9px; }
+              .l { stroke-width: 1px; fill: red; stroke-width: 6px; }
+              .m { background: red url(x.png); }
+              .n { border: 1px solid red; border-top-color: blue; }
+            `;
+            document.documentElement.appendChild(st);
+            return __ptJSON.stringify([...st.sheet.cssRules].map((r) => r.cssText));
+        })()"#).await;
+
+        let got: Vec<String> = out
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
+            .unwrap_or_default();
+        let want = [
+            ".a { box-shadow: rgb(34, 139, 73) 0px 0px 0px inset; }",
+            ".b { outline: rgb(0, 81, 195) solid 2px; }",
+            ".c { grid-area: 1 / 1; }",
+            ".d { transform-origin: center center; }",
+            ".e { stroke-dasharray: 0, 100, 0; }",
+            ".f { transition: 0.1s ease-in; }",
+            ".g { animation: auto ease 0s 1 normal none running none; }",
+            ".h { transform: rotate(0deg) translateY(0px) scale(1); }",
+            ".i { border-style: solid; border-color: rgb(196, 77, 14); border-image: none; border-width: 0px 4px 4px 0px; }",
+            ".j { margin: 1px 2px 3px 4px; }",
+            ".k { padding: 1px 1px 1px 9px; }",
+            ".l { fill: red; stroke-width: 6px; }",
+            ".m { background: url(\"x.png\") red; }",
+            ".n { border-width: 1px; border-style: solid; border-color: blue red red; border-image: none; }",
+        ];
+        assert_eq!(got.len(), want.len(), "все правила на месте: {got:?}");
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(g, w, "правило {i}");
+        }
+    }
+
     /// Поля соседних блоков схлопываются, а поле первого и последнего ребёнка
     /// уходит наружу через пустой край родителя. Без этого между двумя
     /// абзацами выходило вдвое больше места, чем у браузера, и вся геометрия

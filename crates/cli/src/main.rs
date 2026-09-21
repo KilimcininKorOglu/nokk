@@ -510,6 +510,7 @@ async fn main() -> Result<()> {
 if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = globalThis.__ptD || {})[s.length]) {
   globalThis.__ptD[s.length] = 1;
   for (let q = 0; q < s.length; q += 250) console.error('[кус ' + s.length + ':' + (q / 300) + '] ' + s.slice(q, q + 300));
+  console.error('[хвост ' + s.length + '] куски=' + s.split('|').length + ' последние=' + JSON.stringify(s.split('|').slice(-3).map((x) => x.slice(-40))));
 }
                           }
                           return enc.call(this, x);

@@ -2216,13 +2216,119 @@
       if (state === null && ANIM_STATE.has(low)) { state = low; continue; }
       if (name === null) name = tok;
     }
-    return [dur || '0s', timing || 'ease', delay || '0s', count || '1',
+    // Начальная длительность у браузера — `auto`, а не ноль секунд:
+    // `animation: none` он печатает как `auto ease 0s 1 normal none running none`.
+    return [dur || 'auto', timing || 'ease', delay || '0s', count || '1',
             dir || 'normal', fill || 'none', state || 'running', name || 'none'].join(' ');
   }).join(', ');
+
+  // Как браузер печатает тень: сперва цвет, потом четыре длины с единицами,
+  // и `inset` в конце. Автор пишет как придётся, а в CSSOM выходит всегда так.
+  // Разбить список по запятым верхнего уровня: запятые внутри `rgb(…)` не
+  // делят его.
+  const __cssCommaParts = (v) => {
+    const out = [];
+    let depth = 0, cur = '';
+    for (const c of String(v)) {
+      if (c === '(') depth++;
+      else if (c === ')') depth--;
+      if (c === ',' && depth === 0) { out.push(cur); cur = ''; continue; }
+      cur += c;
+    }
+    out.push(cur);
+    return out;
+  };
+
+  const __cssShadow = (v) => __cssCommaParts(v).map((one) => {
+    const parts = __ptCssParts(one.trim());
+    let colour = null, inset = false;
+    const lens = [];
+    for (const t of parts) {
+      if (/^inset$/i.test(t)) { inset = true; continue; }
+      if (/^[-\d.]/.test(t)) { lens.push(/^[-\d.]+$/.test(t) ? t + 'px' : t); continue; }
+      colour = t;
+    }
+    if (!lens.length) return one.trim();
+    // Число длин — как у автора: `1px 2px` браузер не дополняет размытием.
+    // Слово браузер оставляет словом: `red` в правиле так и печатается, а вот
+    // запись функцией приводится к своему виду — `rgba(0,0,0,.1)` становится
+    // `rgba(0, 0, 0, 0.1)`.
+    const norm = colour && /^(rgba?|hsla?|hwb|color|lab|lch|oklab|oklch)\(/i.test(colour)
+      && globalThis.__pt_cssColour ? globalThis.__pt_cssColour(colour) : colour;
+    const out = [norm || colour || 'currentcolor', ...lens];
+    if (inset) out.push('inset');
+    return out.join(' ');
+  }).join(', ');
+
+  // Обводка: цвет, начертание, толщина — в этом порядке.
+  const __cssOutline = (v) => {
+    const parts = __ptCssParts(v.trim());
+    let colour = null, style = null, width = null;
+    for (const t of parts) {
+      const low = t.toLowerCase();
+      if (CS_BORDER_STYLES.has(low)) { style = low; continue; }
+      if (/^[-\d.]/.test(t) || CS_WIDTH_WORDS[low]) { width = /^[-\d.]+$/.test(t) ? t + 'px' : t; continue; }
+      colour = t;
+    }
+    if (!style && !width) return v;
+    return [colour || 'currentcolor', style || 'none', width || 'medium'].join(' ');
+  };
+
+  // Нули внутри преобразования получают единицы: `rotate(0)` браузер печатает
+  // как `rotate(0deg)`, `translateY(0)` — как `translateY(0px)`.
+  const __cssTransform = (v) => v.replace(/([a-zA-Z]+)\(([^()]*)\)/g, (m, fn, args) => {
+    const low = fn.toLowerCase();
+    const unit = /^(rotate|rotatex|rotatey|rotatez|rotate3d|skew|skewx|skewy)$/.test(low) ? 'deg'
+      : /^(translate|translatex|translatey|translatez|translate3d|perspective)$/.test(low) ? 'px'
+      : null;
+    if (!unit) return m;
+    const out = args.split(',').map((a, i) => {
+      const t = a.trim();
+      if (!/^-?\d+(?:\.\d+)?$/.test(t)) return t;
+      // У `rotate3d` первые три числа — ось, без единиц.
+      if (low === 'rotate3d' && i < 3) return t;
+      if (low === 'translate3d' && i === 2) return t + 'px';
+      return t + unit;
+    });
+    return fn + '(' + out.join(', ') + ')';
+  });
 
   const __cssValue = (prop, value) => {
     let v = __cssZero(__cssHex(String(value).trim().replace(/\s+/g, ' ')));
     if (prop === 'animation') return __cssAnimation(v);
+    if (prop === 'box-shadow' || prop === 'text-shadow') return __cssShadow(v);
+    if (prop === 'outline') return __cssOutline(v);
+    if (prop === 'transform') return __cssTransform(v);
+    // Косая черта в сетке печатается с пробелами по бокам.
+    if (prop === 'grid-area' || prop === 'grid-row' || prop === 'grid-column') {
+      return v.replace(/\s*\/\s*/g, ' / ');
+    }
+    // Одно слово в точке преобразования браузер дополняет вторым.
+    if (prop === 'transform-origin' && /^[a-z%\d.-]+$/i.test(v) && !/\s/.test(v)) {
+      return v + ' center';
+    }
+    // Список через запятую печатается с пробелом после запятой.
+    if (prop === 'stroke-dasharray') return v.replace(/\s*,\s*/g, ', ');
+    // Начальное значение `transition-property` браузер не печатает.
+    if (prop === 'transition') return v.replace(/^all\s+/i, '');
+    // Фон печатается в своём порядке: сперва картинка, цвет последним, а
+    // голый адрес берётся в кавычки.
+    if (prop === 'background') {
+      const parts = __ptCssParts(v);
+      const image = [], rest = [];
+      let colour = null;
+      for (const t of parts) {
+        if (/^url\(/i.test(t)) {
+          image.push(t.replace(/^url\(\s*(['"]?)(.*?)\1\s*\)$/i, (m, q, u) => 'url("' + u + '")'));
+        } else if (/^(linear-gradient|radial-gradient|conic-gradient|image-set|-webkit-)/i.test(t)) image.push(t);
+        else if (__ptIsColour(t)) colour = t;
+        else rest.push(t);
+      }
+      if (!image.length && !colour) return v;
+      return [...image, ...rest, ...(colour ? [colour] : [])].join(' ');
+    }
+    // В сокращении шрифта косая черта отделяется пробелами.
+    if (prop === 'font') return v.replace(/\s*\/\s*/g, ' / ');
     // Список семейств браузер печатает с пробелом после запятой.
     if (prop === 'font-family') return v.replace(/\s*,\s*/g, ', ');
     // Составляющие сокращённой записи, равные начальному значению, браузер не
@@ -2325,7 +2431,12 @@
       const colon = decl.indexOf(':');
       if (colon <= 0) continue;
       const prop = decl.slice(0, colon).trim().toLowerCase();
-      if (prop) map.set(prop, __cssValue(prop, decl.slice(colon + 1)));
+      // Написанное дважды встаёт на второе место, а не остаётся на первом:
+      // браузер при перезаписи убирает свойство и дописывает в конец.
+      if (prop) {
+        map.delete(prop);
+        map.set(prop, __cssValue(prop, decl.slice(colon + 1)));
+      }
     }
     return map;
   }
@@ -2466,15 +2577,81 @@
   };
   /// Пары «имя: значение» на печать: то же, что в объявлении, но с раскрытым
   /// `border`, если раскрыть его пришлось.
+  // Четыре стороны, свёрнутые как у браузера: одно значение, если все равны,
+  // два — если совпадают противоположные, и так далее.
+  const __cssFour = (t, r, b, l) => {
+    if (t === r && r === b && b === l) return t;
+    if (t === b && r === l) return t + ' ' + r;
+    if (r === l) return t + ' ' + r + ' ' + b;
+    return t + ' ' + r + ' ' + b + ' ' + l;
+  };
+
+  // Семейства, которые браузер собирает обратно из длинных имён.
+  const __CSS_BOX_FAMILIES = [
+    ['margin', ['margin-top', 'margin-right', 'margin-bottom', 'margin-left']],
+    ['padding', ['padding-top', 'padding-right', 'padding-bottom', 'padding-left']],
+    ['border-width', ['border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width']],
+    ['border-style', ['border-top-style', 'border-right-style', 'border-bottom-style', 'border-left-style']],
+    ['border-color', ['border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color']],
+  ];
+
+  /// Объявления так, как их печатает браузер. Он держит длинные свойства, а
+  /// сокращение собирает при печати — поэтому `padding: 1px` с отдельным
+  /// `padding-left: 9px` выходит одной записью `padding: 1px 1px 1px 9px`, а
+  /// `border` с перебитой стороной распадается на составляющие. Мы печатали
+  /// написанное автором, и правило расходилось с браузерным.
   const __styleEntries = (m) => {
-    const out = [];
+    // Какие длинные имена написаны отдельно: только из-за них сокращение
+    // разбирают.
+    // Что написано отдельно — с учётом того, что и само написанное бывает
+    // сокращением: `border` разбирают и тогда, когда рядом стоит
+    // `border-width`, а не только `border-top-width`.
+    const written = new Set();
+    for (const k of m.keys()) {
+      written.add(k);
+      for (const n of (CSS_LONGHANDS[k] || [])) written.add(n);
+    }
+    const order = [];
+    const seen = new Map();
+    const put = (k, v) => {
+      if (seen.has(k)) order[seen.get(k)] = null;
+      seen.set(k, order.length);
+      order.push([k, v]);
+    };
     for (const [k, v] of m) {
       if (k === 'border' && __borderAllInitial(v)) {
-        out.push(['border-width', 'medium'], ['border-style', 'none'],
-                 ['border-color', 'currentcolor'], ['border-image', 'none']);
-      } else out.push([k, v]);
+        put('border-width', 'medium'); put('border-style', 'none');
+        put('border-color', 'currentcolor'); put('border-image', 'none');
+        continue;
+      }
+      const list = CSS_LONGHANDS[k];
+      const overridden = list && list.some((n) => {
+        if (!written.has(n)) return false;
+        // Своё собственное разложение переписью не считается.
+        return ![...m.keys()].every((other) => other === k
+          || !(other === n || (CSS_LONGHANDS[other] || []).includes(n)));
+      });
+      const pairs = overridden && typeof __ptExpand === 'function' ? __ptExpand(k, v) : null;
+      if (pairs && pairs.length) {
+        for (const [lk, lv] of pairs) put(lk, lv);
+        if (k === 'border') put('border-image', 'none');
+        continue;
+      }
+      put(k, v);
     }
-    return out;
+    let live = order.filter(Boolean);
+    // Собрать обратно: сокращение встаёт на место первой своей части.
+    for (const [short, parts] of __CSS_BOX_FAMILIES) {
+      const at = parts.map((n) => live.findIndex(([k]) => k === short || k === n));
+      if (at.some((i) => i < 0)) continue;
+      const vals = parts.map((n) => (live.find(([k]) => k === n) || [])[1]);
+      if (vals.some((x) => x == null)) continue;
+      const first = Math.min(...at);
+      const merged = [short, __cssFour(vals[0], vals[1], vals[2], vals[3])];
+      live = live.map((e, i) => (i === first ? merged : (parts.includes(e[0]) ? null : e)))
+        .filter(Boolean);
+    }
+    return live;
   };
 
   /// Значение длинного свойства, написанного сокращением. Браузер хранит
@@ -2631,7 +2808,8 @@
         const k = common(Object.create(__ruleProto('CSSKeyframeRule')), RULE_TYPE.keyframe);
         const decls = __cssDecls(p.body || '');
         return own(k, { keyText: __cssPrelude(p.prelude), style: __cssDeclaration(decls),
-                        cssText: __cssPrelude(p.prelude) + ' { ' + [...decls].map(([a2, b2]) => a2 + ': ' + b2 + ';').join(' ') + ' }' });
+                        cssText: __cssPrelude(p.prelude) + ' { '
+                          + __styleEntries(decls).map(([a2, b2]) => a2 + ': ' + b2 + ';').join(' ') + ' }' });
       });
       const name = prelude.slice(at.length).trim();
       return own(r, { name, length: kids.length, cssRules: __cssRuleList(kids),
@@ -2642,7 +2820,8 @@
       const r = common(Object.create(__ruleProto('CSSFontFaceRule')), RULE_TYPE['font-face']);
       const decls = __cssDecls(parsed.body || '');
       return own(r, { style: __cssDeclaration(decls),
-                      cssText: '@font-face { ' + [...decls].map(([a2, b2]) => a2 + ': ' + b2 + ';').join(' ') + ' }' });
+                      cssText: '@font-face { '
+                        + __styleEntries(decls).map(([a2, b2]) => a2 + ': ' + b2 + ';').join(' ') + ' }' });
     }
     if (at) {
       // `@charset` браузер в перечень правил не кладёт вовсе — он читает его и
@@ -2655,7 +2834,7 @@
     const r = common(Object.create(__ruleProto('CSSStyleRule')), RULE_TYPE.style);
     const decls = __cssDecls(parsed.body || '');
     const sel = __cssSelector(prelude);
-    const body = [...decls].map(([k, v]) => k + ': ' + v + ';').join(' ');
+    const body = __styleEntries(decls).map(([k, v]) => k + ': ' + v + ';').join(' ');
     return own(r, { selectorText: sel, style: __cssDeclaration(decls),
                     cssRules: __cssRuleList([]), insertRule() { return 0; }, deleteRule() {},
                     cssText: sel + ' { ' + (body ? body + ' ' : '') + '}' });
@@ -6130,7 +6309,9 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       // единицами, и `inset` в конце.
       {
         const sh = String(map.get('box-shadow') || '');
-        if (sh && sh !== 'none' && !/^(rgba?|color)\(/.test(sh)) {
+        // Вычисленный стиль печатает все четыре длины, даже если автор написал
+        // две: браузер дописывает размытие и разброс нулями.
+        if (sh && sh !== 'none') {
           const parts = __ptCssParts(sh);
           let colour = null, inset = false;
           const lens = [];
