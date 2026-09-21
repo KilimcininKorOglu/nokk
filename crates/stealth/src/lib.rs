@@ -1564,6 +1564,42 @@ pub fn late_interfaces_script() -> String {
       value: named('FontFace', FontFace), writable: true, enumerable: false, configurable: true,
     });
   } catch (e) {}
+
+  // `DOMParser` и `XMLSerializer`: таблица имён кладёт под этими именами
+  // пустые классы, и вызов бросает. Работу делает слой DOM, здесь — только
+  // объявление поверх таблицы.
+  const late = globalThis.__pt_lateDom;
+  if (late) {
+    const DOMParser = function DOMParser() {};
+    meth(DOMParser.prototype, 'parseFromString', function parseFromString(markup, type) {
+      if (arguments.length < 2) {
+        throw new TypeError("Failed to execute 'parseFromString' on 'DOMParser': " +
+          '2 arguments required, but only ' + arguments.length + ' present.');
+      }
+      const kind = String(type).toLowerCase();
+      if (!/^(text\/html|text\/xml|application\/xml|application\/xhtml\+xml|image\/svg\+xml)$/.test(kind)) {
+        throw new TypeError("Failed to execute 'parseFromString' on 'DOMParser': " +
+          "The provided value '" + type + "' is not a valid enum value of type SupportedType.");
+      }
+      return late.parseDocument(markup, kind);
+    });
+    try { Object.defineProperty(DOMParser.prototype, Symbol.toStringTag, { value: 'DOMParser', configurable: true }); } catch (e) {}
+    const XMLSerializer = function XMLSerializer() {};
+    meth(XMLSerializer.prototype, 'serializeToString', function serializeToString(node) {
+      if (!arguments.length) {
+        throw new TypeError("Failed to execute 'serializeToString' on 'XMLSerializer': " +
+          '1 argument required, but only 0 present.');
+      }
+      return late.serializeXml(node);
+    });
+    try { Object.defineProperty(XMLSerializer.prototype, Symbol.toStringTag, { value: 'XMLSerializer', configurable: true }); } catch (e) {}
+    for (const [name, C] of [['DOMParser', DOMParser], ['XMLSerializer', XMLSerializer]]) {
+      try {
+        Object.defineProperty(globalThis, name,
+          { value: named(name, C), writable: true, enumerable: false, configurable: true });
+      } catch (e) {}
+    }
+  }
 })();"##
         .to_string()
 }
@@ -4464,9 +4500,12 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   tag(PerformanceResourceTiming.prototype, 'PerformanceResourceTiming');
   class PerformanceNavigationTiming extends PerformanceEntry {}
   tag(PerformanceNavigationTiming.prototype, 'PerformanceNavigationTiming');
+  class PerformancePaintTiming extends PerformanceEntry {}
+  tag(PerformancePaintTiming.prototype, 'PerformancePaintTiming');
   globalThis.PerformanceEntry = PerformanceEntry;
   globalThis.PerformanceResourceTiming = PerformanceResourceTiming;
   globalThis.PerformanceNavigationTiming = PerformanceNavigationTiming;
+  globalThis.PerformancePaintTiming = PerformancePaintTiming;
 
   globalThis.__pt_noteResources = (json) => {
     let list;
@@ -4504,6 +4543,18 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
       }
       entries.push(e);
       fresh.push(e);
+      // Отрисовка: у браузера рядом с переходом стоят две записи — первая
+      // краска и первая содержательная, — и страницы их читают. У нас их не
+      // было вовсе, и `getEntriesByType('paint')` возвращал пустоту.
+      if (r.entryType === 'navigation' && !entries.some((x) => x.entryType === 'paint')) {
+        const at = Math.round((start + (Number(r.duration) || 0) * 0.92) * 10) / 10;
+        for (const name of ['first-paint', 'first-contentful-paint']) {
+          const p = new PerformancePaintTiming();
+          Object.assign(p, { name, entryType: 'paint', startTime: at, duration: 0 });
+          entries.push(p);
+          fresh.push(p);
+        }
+      }
     }
     __ptNotify(fresh);
     return entries.length;
@@ -4549,8 +4600,9 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   tag(PerformanceObserver.prototype, 'PerformanceObserver');
   // Порядок и состав — как у Chrome 148.
   PerformanceObserver.supportedEntryTypes = ['element', 'event', 'first-input',
-    'largest-contentful-paint', 'layout-shift', 'long-animation-frame', 'longtask',
-    'mark', 'measure', 'navigation', 'paint', 'resource'];
+    'interaction-contentful-paint', 'largest-contentful-paint', 'layout-shift',
+    'long-animation-frame', 'longtask', 'mark', 'measure', 'navigation', 'paint',
+    'resource', 'soft-navigation', 'visibility-state'];
   globalThis.PerformanceObserver = PerformanceObserver;
   globalThis.PerformanceObserverEntryList = PerformanceObserverEntryList;
 
@@ -5201,8 +5253,17 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   }
   // A deep clone that covers what pages actually pass through it.
   if (!globalThis.structuredClone) {
-    globalThis.structuredClone = function structuredClone(v) {
+    globalThis.structuredClone = function structuredClone(v, opts) {
       const seen = new Map();
+      // Перенос — это отцепление: у браузера исходный буфер после него
+      // нулевой длины, а у нас оставался целым.
+      const moved = [];
+      try {
+        const list = opts && opts.transfer ? Array.from(opts.transfer) : [];
+        for (const t of list) {
+          if (t instanceof ArrayBuffer && typeof t.transfer === 'function') moved.push(t);
+        }
+      } catch (e) {}
       const walk = (x) => {
         if (x === null || typeof x !== 'object') return x;
         if (seen.has(x)) return seen.get(x);
@@ -5217,7 +5278,10 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         for (const k of Object.keys(x)) o[k] = walk(x[k]);
         return o;
       };
-      return walk(v);
+      const out = walk(v);
+      // Отцепляем после копии: браузер делает это же и в том же порядке.
+      for (const b of moved) { try { b.transfer(0); } catch (e) {} }
+      return out;
     };
   }
   if (!globalThis.reportError) globalThis.reportError = function reportError(e) { try { console.error(e); } catch (x) {} };
@@ -5361,6 +5425,22 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         this.signal = init.signal || null;
         Object.defineProperty(this, '__body', { value: init.body === undefined ? null : init.body, enumerable: false });
         this.bodyUsed = false;
+        // Тело само задаёт свой тип, если его не задали явно: строка —
+        // `text/plain;charset=UTF-8`, форма — `multipart/form-data`, blob —
+        // свой. Браузер так и делает, а мы оставляли заголовок пустым.
+        try {
+          const b = this.__body;
+          if (b != null && !this.headers.has('content-type')) {
+            if (typeof b === 'string') this.headers.set('content-type', 'text/plain;charset=UTF-8');
+            else if (globalThis.URLSearchParams && b instanceof URLSearchParams) {
+              this.headers.set('content-type', 'application/x-www-form-urlencoded;charset=UTF-8');
+            } else if (globalThis.FormData && b instanceof FormData) {
+              this.headers.set('content-type', 'multipart/form-data; boundary=----WebKitFormBoundary');
+            } else if (b && typeof b === 'object' && typeof b.type === 'string' && b.type) {
+              this.headers.set('content-type', b.type);
+            }
+          }
+        } catch (e) {}
       }
       clone() { return new globalThis.Request(this); }
       text() { this.bodyUsed = true; return Promise.resolve(this.__body == null ? '' : String(this.__body)); }
@@ -5558,8 +5638,14 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       // Answering `true` to everything would be its own giveaway; a real engine
       // rejects nonsense. This accepts a well-formed declaration and no more.
       supports: (a, b) => {
-        if (b !== undefined) return /^[-a-zA-Z]+$/.test(String(a)) && String(b).length > 0;
-        return /^\s*[-a-zA-Z]+\s*:\s*[^;]+\s*$/.test(String(a));
+        // Имя свойства сверяется со списком движка: браузер отвечает `false`
+        // на выдуманное, а «что угодно с двоеточием» — само по себе улика.
+        // Своё свойство страницы (`--x`) браузер принимает всегда.
+        const known = (n) => (String(n).lastIndexOf('--', 0) === 0
+          || (globalThis.__pt_cssKnown ? __pt_cssKnown(n) : /^[-a-zA-Z]+$/.test(n)));
+        if (b !== undefined) return /^[-a-zA-Z]+$/.test(String(a)) && String(b).length > 0 && known(a);
+        const m = /^\s*(--[-a-zA-Z0-9_]+|[-a-zA-Z]+)\s*:\s*([^;]+?)\s*$/.exec(String(a));
+        return !!m && known(m[1]);
       },
     };
   }
@@ -8885,11 +8971,50 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       0x2c6, 0x2030, 0x160, 0x2039, 0x152, 0x8d, 0x17d, 0x8f, 0x90, 0x2018, 0x2019,
       0x201c, 0x201d, 0x2022, 0x2013, 0x2014, 0x2dc, 0x2122, 0x161, 0x203a, 0x153,
       0x9d, 0x17e, 0x178];
+    // Верхняя половина однобайтовых кодировок — как её задаёт Encoding
+    // Standard. Браузер знает их все, а мы отвечали отказом на любую, кроме
+    // латиницы: `new TextDecoder('windows-1251')` бросал там, где у Chrome
+    // выходит текст.
+    const HIGH = JSON.parse("{\"windows-1250\": \"€�‚�„…†‡�‰Š‹ŚŤŽŹ�‘’“”•–—�™š›śťžź ˇ˘Ł¤Ą¦§¨©Ş«¬­®Ż°±˛ł´µ¶·¸ąş»Ľ˝ľżŔÁÂĂÄĹĆÇČÉĘËĚÍÎĎĐŃŇÓÔŐÖ×ŘŮÚŰÜÝŢßŕáâăäĺćçčéęëěíîďđńňóôőö÷řůúűüýţ˙\", \"windows-1251\": \"ЂЃ‚ѓ„…†‡€‰Љ‹ЊЌЋЏђ‘’“”•–—�™љ›њќћџ ЎўЈ¤Ґ¦§Ё©Є«¬­®Ї°±Ііґµ¶·ё№є»јЅѕїАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюя\", \"windows-1252\": \"€�‚ƒ„…†‡ˆ‰Š‹Œ�Ž��‘’“”•–—˜™š›œ�žŸ ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ\", \"windows-1253\": \"€�‚ƒ„…†‡�‰�‹�����‘’“”•–—�™�›���� ΅Ά£¤¥¦§¨©�«¬­®―°±²³΄µ¶·ΈΉΊ»Ό½ΎΏΐΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡ�ΣΤΥΦΧΨΩΪΫάέήίΰαβγδεζηθικλμνξοπρςστυφχψωϊϋόύώ�\", \"windows-1254\": \"€�‚ƒ„…†‡ˆ‰Š‹Œ����‘’“”•–—˜™š›œ��Ÿ ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏĞÑÒÓÔÕÖ×ØÙÚÛÜİŞßàáâãäåæçèéêëìíîïğñòóôõö÷øùúûüışÿ\", \"windows-1255\": \"€�‚ƒ„…†‡ˆ‰�‹�����‘’“”•–—˜™�›���� ¡¢£₪¥¦§¨©×«¬­®¯°±²³´µ¶·¸¹÷»¼½¾¿ְֱֲֳִֵֶַָֹ�ֻּֽ־ֿ׀ׁׂ׃װױײ׳״�������אבגדהוזחטיךכלםמןנסעףפץצקרשת��‎‏�\", \"windows-1256\": \"€پ‚ƒ„…†‡ˆ‰ٹ‹Œچژڈگ‘’“”•–—ک™ڑ›œ‌‍ں ،¢£¤¥¦§¨©ھ«¬­®¯°±²³´µ¶·¸¹؛»¼½¾؟ہءآأؤإئابةتثجحخدذرزسشصض×طظعغـفقكàلâمنهوçèéêëىيîïًٌٍَôُِ÷ّùْûü‎‏ے\", \"windows-1257\": \"€�‚�„…†‡�‰�‹�¨ˇ¸�‘’“”•–—�™�›�¯˛� �¢£¤�¦§Ø©Ŗ«¬­®Æ°±²³´µ¶·ø¹ŗ»¼½¾æĄĮĀĆÄÅĘĒČÉŹĖĢĶĪĻŠŃŅÓŌÕÖ×ŲŁŚŪÜŻŽßąįāćäåęēčéźėģķīļšńņóōõö÷ųłśūüżž˙\", \"windows-1258\": \"€�‚ƒ„…†‡ˆ‰�‹Œ����‘’“”•–—˜™�›œ��Ÿ ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂĂÄÅÆÇÈÉÊË̀ÍÎÏĐÑ̉ÓÔƠÖ×ØÙÚÛÜỮßàáâăäåæçèéêë́íîïđṇ̃óôơö÷øùúûüư₫ÿ\", \"iso-8859-2\": \" Ą˘Ł¤ĽŚ§¨ŠŞŤŹ­ŽŻ°ą˛ł´ľśˇ¸šşťź˝žżŔÁÂĂÄĹĆÇČÉĘËĚÍÎĎĐŃŇÓÔŐÖ×ŘŮÚŰÜÝŢßŕáâăäĺćçčéęëěíîďđńňóôőö÷řůúűüýţ˙\", \"iso-8859-3\": \" Ħ˘£¤�Ĥ§¨İŞĞĴ­�Ż°ħ²³´µĥ·¸ışğĵ½�żÀÁÂ�ÄĊĈÇÈÉÊËÌÍÎÏ�ÑÒÓÔĠÖ×ĜÙÚÛÜŬŜßàáâ�äċĉçèéêëìíîï�ñòóôġö÷ĝùúûüŭŝ˙\", \"iso-8859-4\": \" ĄĸŖ¤ĨĻ§¨ŠĒĢŦ­Ž¯°ą˛ŗ´ĩļˇ¸šēģŧŊžŋĀÁÂÃÄÅÆĮČÉĘËĖÍÎĪĐŅŌĶÔÕÖ×ØŲÚÛÜŨŪßāáâãäåæįčéęëėíîīđņōķôõö÷øųúûüũū˙\", \"iso-8859-5\": \" ЁЂЃЄЅІЇЈЉЊЋЌ­ЎЏАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюя№ёђѓєѕіїјљњћќ§ўџ\", \"iso-8859-6\": \" ���¤�������،­�������������؛���؟�ءآأؤإئابةتثجحخدذرزسشصضطظعغ�����ـفقكلمنهوىيًٌٍَُِّْ�������������\", \"iso-8859-7\": \" ‘’£€₯¦§¨©ͺ«¬­�―°±²³΄΅Ά·ΈΉΊ»Ό½ΎΏΐΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡ�ΣΤΥΦΧΨΩΪΫάέήίΰαβγδεζηθικλμνξοπρςστυφχψωϊϋόύώ�\", \"iso-8859-8\": \" �¢£¤¥¦§¨©×«¬­®¯°±²³´µ¶·¸¹÷»¼½¾��������������������������������‗אבגדהוזחטיךכלםמןנסעףפץצקרשת��‎‏�\", \"iso-8859-10\": \" ĄĒĢĪĨĶ§ĻĐŠŦŽ­ŪŊ°ąēģīĩķ·ļđšŧž―ūŋĀÁÂÃÄÅÆĮČÉĘËĖÍÎÏÐŅŌÓÔÕÖŨØŲÚÛÜÝÞßāáâãäåæįčéęëėíîïðņōóôõöũøųúûüýþĸ\", \"iso-8859-13\": \" ”¢£¤„¦§Ø©Ŗ«¬­®Æ°±²³“µ¶·ø¹ŗ»¼½¾æĄĮĀĆÄÅĘĒČÉŹĖĢĶĪĻŠŃŅÓŌÕÖ×ŲŁŚŪÜŻŽßąįāćäåęēčéźėģķīļšńņóōõö÷ųłśūüżž’\", \"iso-8859-14\": \" Ḃḃ£ĊċḊ§Ẁ©ẂḋỲ­®ŸḞḟĠġṀṁ¶ṖẁṗẃṠỳẄẅṡÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏŴÑÒÓÔÕÖṪØÙÚÛÜÝŶßàáâãäåæçèéêëìíîïŵñòóôõöṫøùúûüýŷÿ\", \"iso-8859-15\": \" ¡¢£€¥Š§š©ª«¬­®¯°±²³Žµ¶·ž¹º»ŒœŸ¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ\", \"iso-8859-16\": \" ĄąŁ€„Š§š©Ș«Ź­źŻ°±ČłŽ”¶·žčș»ŒœŸżÀÁÂĂÄĆÆÇÈÉÊËÌÍÎÏĐŃÒÓÔŐÖŚŰÙÚÛÜĘȚßàáâăäćæçèéêëìíîïđńòóôőöśűùúûüęțÿ\", \"koi8-r\": \"─│┌┐└┘├┤┬┴┼▀▄█▌▐░▒▓⌠■∙√≈≤≥ ⌡°²·÷═║╒ё╓╔╕╖╗╘╙╚╛╜╝╞╟╠╡Ё╢╣╤╥╦╧╨╩╪╫╬©юабцдефгхийклмнопярстужвьызшэщчъЮАБЦДЕФГХИЙКЛМНОПЯРСТУЖВЬЫЗШЭЩЧЪ\", \"koi8-u\": \"─│┌┐└┘├┤┬┴┼▀▄█▌▐░▒▓⌠■∙√≈≤≥ ⌡°²·÷═║╒ёє╔ії╗╘╙╚╛ґ╝╞╟╠╡ЁЄ╣ІЇ╦╧╨╩╪Ґ╬©юабцдефгхийклмнопярстужвьызшэщчъЮАБЦДЕФГХИЙКЛМНОПЯРСТУЖВЬЫЗШЭЩЧЪ\", \"macintosh\": \"ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø¿¡¬√ƒ≈∆«»… ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄€‹›ﬁﬂ‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ\", \"ibm866\": \"АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмноп░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀рстуфхцчшщъыьэюяЁёЄєЇїЎў°∙·√№¤■ \"}");
     const LABELS = {
-      'utf-8': 'utf-8', 'utf8': 'utf-8', 'unicode-1-1-utf-8': 'utf-8',
+      'utf-8': 'utf-8', 'utf8': 'utf-8', 'unicode-1-1-utf-8': 'utf-8', 'unicode11utf8': 'utf-8',
+      'x-unicode20utf8': 'utf-8', 'unicode20utf8': 'utf-8',
       'latin1': 'windows-1252', 'iso-8859-1': 'windows-1252', 'windows-1252': 'windows-1252',
       'ascii': 'windows-1252', 'us-ascii': 'windows-1252', 'cp1252': 'windows-1252',
-      'utf-16le': 'utf-16le', 'utf-16': 'utf-16le',
+      'iso8859-1': 'windows-1252', 'iso_8859-1': 'windows-1252', 'l1': 'windows-1252',
+      'cp819': 'windows-1252', 'ibm819': 'windows-1252', 'csisolatin1': 'windows-1252',
+      'utf-16le': 'utf-16le', 'utf-16': 'utf-16le', 'ucs-2': 'utf-16le', 'unicode': 'utf-16le',
+      'unicodefeff': 'utf-16le', 'utf-16be': 'utf-16be', 'unicodefffe': 'utf-16be',
+      'windows-1250': 'windows-1250', 'cp1250': 'windows-1250', 'x-cp1250': 'windows-1250',
+      'windows-1251': 'windows-1251', 'cp1251': 'windows-1251', 'x-cp1251': 'windows-1251',
+      'windows-1253': 'windows-1253', 'cp1253': 'windows-1253', 'x-cp1253': 'windows-1253',
+      'windows-1254': 'windows-1254', 'cp1254': 'windows-1254', 'x-cp1254': 'windows-1254',
+      'iso-8859-9': 'windows-1254', 'iso8859-9': 'windows-1254', 'latin5': 'windows-1254',
+      'windows-1255': 'windows-1255', 'cp1255': 'windows-1255', 'x-cp1255': 'windows-1255',
+      'windows-1256': 'windows-1256', 'cp1256': 'windows-1256', 'x-cp1256': 'windows-1256',
+      'windows-1257': 'windows-1257', 'cp1257': 'windows-1257', 'x-cp1257': 'windows-1257',
+      'windows-1258': 'windows-1258', 'cp1258': 'windows-1258', 'x-cp1258': 'windows-1258',
+      'iso-8859-2': 'iso-8859-2', 'iso8859-2': 'iso-8859-2', 'latin2': 'iso-8859-2', 'l2': 'iso-8859-2',
+      'iso-8859-3': 'iso-8859-3', 'iso8859-3': 'iso-8859-3', 'latin3': 'iso-8859-3',
+      'iso-8859-4': 'iso-8859-4', 'iso8859-4': 'iso-8859-4', 'latin4': 'iso-8859-4',
+      'iso-8859-5': 'iso-8859-5', 'iso8859-5': 'iso-8859-5', 'cyrillic': 'iso-8859-5',
+      'iso-8859-6': 'iso-8859-6', 'iso8859-6': 'iso-8859-6', 'arabic': 'iso-8859-6',
+      'iso-8859-7': 'iso-8859-7', 'iso8859-7': 'iso-8859-7', 'greek': 'iso-8859-7',
+      'iso-8859-8': 'iso-8859-8', 'iso8859-8': 'iso-8859-8', 'hebrew': 'iso-8859-8',
+      'iso-8859-8-i': 'iso-8859-8', 'iso-8859-10': 'iso-8859-10', 'iso-8859-13': 'iso-8859-13',
+      'iso-8859-14': 'iso-8859-14', 'iso-8859-15': 'iso-8859-15', 'iso8859-15': 'iso-8859-15',
+      'latin9': 'iso-8859-15', 'iso-8859-16': 'iso-8859-16',
+      'koi8-r': 'koi8-r', 'koi8_r': 'koi8-r', 'koi': 'koi8-r', 'koi8': 'koi8-r',
+      'koi8-u': 'koi8-u', 'koi8-ru': 'koi8-u',
+      'macintosh': 'macintosh', 'mac': 'macintosh', 'x-mac-roman': 'macintosh',
+      'ibm866': 'ibm866', '866': 'ibm866', 'cp866': 'ibm866', 'csibm866': 'ibm866',
+      // Многобайтовые браузер тоже знает; метку принимаем, разбираем как
+      // однобайтовую — страницы, которые ими пользуются, в отпечатке не
+      // встречаются, а отказ на метку виден сразу.
+      'gbk': 'gbk', 'gb18030': 'gb18030', 'gb2312': 'gbk', 'big5': 'big5',
+      'euc-jp': 'euc-jp', 'shift_jis': 'shift_jis', 'sjis': 'shift_jis',
+      'euc-kr': 'euc-kr', 'iso-2022-jp': 'iso-2022-jp', 'replacement': 'replacement',
+      'x-user-defined': 'x-user-defined',
     };
     globalThis.TextDecoder = class TextDecoder {
       constructor(label, opts) {
@@ -8911,6 +9036,18 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           : new Uint8Array(buf);
         const enc = this.__ptEnc;
         let s = '';
+        const high = HIGH[enc];
+        if (high) {
+          for (let i = 0; i < a.length; i++) {
+            const b = a[i];
+            s += b < 0x80 ? String.fromCharCode(b) : high[b - 0x80];
+          }
+          return s;
+        }
+        if (enc === 'utf-16be') {
+          for (let i = 0; i + 1 < a.length; i += 2) s += String.fromCharCode((a[i] << 8) | a[i + 1]);
+          return s;
+        }
         if (enc === 'windows-1252') {
           for (let i = 0; i < a.length; i++) {
             const b = a[i];
@@ -9030,7 +9167,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
   }
   if (!globalThis.FormData) {
-    globalThis.FormData = class FormData { constructor() { this.__ptD = []; } append(k, v) { this.__ptD.push([String(k), v]); } set(k, v) { this.delete(k); this.append(k, v); } get(k) { const e = this.__ptD.find((x) => x[0] === k); return e ? e[1] : null; } getAll(k) { return this.__ptD.filter((x) => x[0] === k).map((x) => x[1]); } has(k) { return this.__ptD.some((x) => x[0] === k); } delete(k) { this.__ptD = this.__ptD.filter((x) => x[0] !== k); } forEach(f) { for (const [k, v] of this.__ptD) f(v, k, this); } entries() { return this.__ptD[Symbol.iterator](); } toString() { return this.__ptD.map(([k, v]) => k + '=' + v).join('&'); } };
+    globalThis.FormData = class FormData { constructor() { this.__ptD = []; } append(k, v) { this.__ptD.push([String(k), v]); } set(k, v) { this.delete(k); this.append(k, v); } get(k) { const e = this.__ptD.find((x) => x[0] === k); return e ? e[1] : null; } getAll(k) { return this.__ptD.filter((x) => x[0] === k).map((x) => x[1]); } has(k) { return this.__ptD.some((x) => x[0] === k); } delete(k) { this.__ptD = this.__ptD.filter((x) => x[0] !== k); } forEach(f) { for (const [k, v] of this.__ptD) f(v, k, this); } keys() { return this.__ptD.map((x) => x[0])[Symbol.iterator](); } values() { return this.__ptD.map((x) => x[1])[Symbol.iterator](); } entries() { return this.__ptD.map((x) => [x[0], x[1]])[Symbol.iterator](); } [Symbol.iterator]() { return this.entries(); } toString() { return this.__ptD.map(([k, v]) => k + '=' + v).join('&'); } };
   }
 
   if (!globalThis.URLSearchParams) {
@@ -9048,6 +9185,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       keys() { return this.__ptD.map((x) => x[0])[Symbol.iterator](); }
       values() { return this.__ptD.map((x) => x[1])[Symbol.iterator](); }
       entries() { return this.__ptD.map((x) => [x[0], x[1]])[Symbol.iterator](); }
+      // Перебор и счёт браузер даёт на самом объекте: `[...params]` и
+      // `params.size` — обычные строки на любой странице, а у нас первая
+      // бросала, второй не было вовсе.
+      [Symbol.iterator]() { return this.entries(); }
+      get size() { return this.__ptD.length; }
+      sort() { this.__ptD.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); }
       toString() { return this.__ptD.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&'); }
     };
   }

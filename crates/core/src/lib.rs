@@ -9504,6 +9504,63 @@ variationSettings,weight",
         assert_eq!(out["silent"], true, "неподключённый узел молчит: {out}");
     }
 
+    /// Места, которые страница трогает мимоходом, а сборщик отпечатков — с
+    /// умыслом. Каждое сверено с Chrome 151 на одной и той же странице:
+    /// `DOMParser` и `XMLSerializer` были пустыми классами из таблицы имён,
+    /// набор полей и строка запроса не перебирались, перенос буфера не
+    /// отцеплял исходный, `CSS.supports` соглашался на выдуманное свойство,
+    /// а `TextDecoder` знал одну латиницу.
+    #[tokio::test]
+    async fn the_odds_and_ends_answer_like_a_browser() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const say = (f) => { try { return f(); } catch (e) { return 'бросок ' + e.name; } };
+            const p = new URLSearchParams('a=1&a=2&b=');
+            const fd = new FormData();
+            fd.append('a', '1'); fd.append('a', '2');
+            const buf = new ArrayBuffer(8);
+            const moved = structuredClone(buf, { transfer: [buf] });
+            const doc = new DOMParser().parseFromString('<p>привет</p>', 'text/html');
+            return __ptJSON.stringify({
+              params: [p.getAll('a'), p.toString(), [...p].length, p.size],
+              form: [[...fd.keys()], [...fd].length],
+              transfer: [moved.byteLength, buf.byteLength],
+              parsed: [doc.body.firstChild.tagName, doc.body.textContent, doc.contentType],
+              xml: new XMLSerializer().serializeToString(document.createElement('div')),
+              xmlVoid: new XMLSerializer().serializeToString(document.createElement('br')),
+              supports: [CSS.supports('display', 'grid'), CSS.supports('display: flex'),
+                         CSS.supports('foo: bar'), CSS.supports('--x: 1')],
+              decoded: new TextDecoder('windows-1251').decode(new Uint8Array([207, 240, 232, 226, 229, 242])),
+              koi: new TextDecoder('koi8-r').decode(new Uint8Array([208, 210, 201, 215, 197, 212])),
+              labels: [new TextDecoder('cp1251').encoding, new TextDecoder('latin1').encoding],
+              badLabel: say(() => { new TextDecoder('вздор'); return 'без броска'; }),
+              requestType: new Request('https://example.com/x', { method: 'POST', body: 'b' })
+                .headers.get('content-type'),
+              entryTypes: PerformanceObserver.supportedEntryTypes.length,
+            });
+        })()"#).await;
+
+        assert_eq!(out["params"], serde_json::json!([["1", "2"], "a=1&a=2&b=", 3, 3]));
+        assert_eq!(out["form"], serde_json::json!([["a", "a"], 2]));
+        assert_eq!(out["transfer"], serde_json::json!([8, 0]), "перенос отцепляет исходный буфер");
+        assert_eq!(out["parsed"], serde_json::json!(["P", "привет", "text/html"]));
+        assert_eq!(out["xml"], "<div xmlns=\"http://www.w3.org/1999/xhtml\"></div>");
+        assert_eq!(out["xmlVoid"], "<br xmlns=\"http://www.w3.org/1999/xhtml\" />");
+        assert_eq!(out["supports"], serde_json::json!([true, true, false, true]));
+        assert_eq!(out["decoded"], "Привет");
+        assert_eq!(out["koi"], "привет");
+        assert_eq!(out["labels"], serde_json::json!(["windows-1251", "windows-1252"]));
+        assert_eq!(out["badLabel"], "бросок RangeError");
+        assert_eq!(out["requestType"], "text/plain;charset=UTF-8");
+        assert_eq!(out["entryTypes"], 15);
+    }
+
     /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`
     /// is the idiom every collector uses, Cloudflare's included — the URL is dead
     /// one line after the worker starts. Reading the blob when the engine got
@@ -9724,7 +9781,11 @@ variationSettings,weight",
             navigation: performance.getEntriesByType('navigation').length,
             resources: performance.getEntriesByType('resource').length,
             named: Object.prototype.toString.call(performance.getEntries()[0]),
-            sized: performance.getEntries().every(e => e.duration >= 0 && e.responseEnd >= e.startTime),
+            // У записи отрисовки нет ни `responseEnd`, ни тела — как и в
+            // браузере; сверяем сроки только там, где они есть.
+            sized: performance.getEntries().every(e => e.duration >= 0
+              && (e.responseEnd === undefined || e.responseEnd >= e.startTime)),
+            paint: performance.getEntriesByType('paint').map(e => e.name).join(','),
         })"#).await;
         assert_eq!(timing["navigation"], 1, "the document is a navigation entry");
         assert!(
@@ -9733,6 +9794,10 @@ variationSettings,weight",
         );
         assert_eq!(timing["named"], "[object PerformanceNavigationTiming]");
         assert_eq!(timing["sized"], true, "with timings that make sense");
+        assert_eq!(
+            timing["paint"], "first-paint,first-contentful-paint",
+            "и две записи отрисовки рядом с переходом, как у браузера: {timing}"
+        );
 
         // ICE gathering takes event-loop turns, as it does in a browser: start it,
         // let the loop run, then read what arrived.

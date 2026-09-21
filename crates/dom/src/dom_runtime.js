@@ -3775,6 +3775,58 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // а `srcdoc` — разобранную разметку; и в обоих случаях скрипты внутри
   // исполняются в этом окне. У нас документ реалма был пуст, поэтому и
   // `contentDocument.body` был null, и класть туда было некуда.
+  // `DOMParser` и `XMLSerializer` — обычные места в сборе отпечатка, и у нас
+  // это были пустые классы из таблицы имён: вызов бросал `TypeError`. Разбор
+  // идёт тем же разбором, что и присваивание `innerHTML`, а запись — тем же
+  // сериализатором, что и `outerHTML`, только с пространством имён на корне,
+  // как это делает браузер.
+  const VOID_XML = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+    'link', 'meta', 'param', 'source', 'track', 'wbr']);
+  globalThis.__pt_lateDom = {
+    parseDocument(markup, type) {
+      const kind = String(type || 'text/html').toLowerCase();
+      const doc = new Document();
+      Object.defineProperty(doc, '__ptContentType', { value: kind, writable: true, configurable: true });
+      const nodes = parseFragment(String(markup == null ? '' : markup));
+      const isHtml = kind === 'text/html';
+      let root = nodes.find((n) => n.nodeType === ELEMENT_NODE && n.localName === 'html');
+      if (!root && isHtml) {
+        root = doc.createElement('html');
+        const head = doc.createElement('head');
+        const body = doc.createElement('body');
+        __ptAdd.call(root, head);
+        __ptAdd.call(root, body);
+        for (const n of nodes) __ptAdd.call(body, n);
+      } else if (!root) {
+        root = nodes.find((n) => n.nodeType === ELEMENT_NODE) || doc.createElement('html');
+      } else if (isHtml) {
+        if (!__tags(root, 'head')[0]) __ptInsert.call(root, doc.createElement('head'), root.firstChild);
+        if (!__tags(root, 'body')[0]) __ptAdd.call(root, doc.createElement('body'));
+      }
+      __ptAdd.call(doc, root);
+      doc.documentElement = root;
+      __walkTree(doc, (n) => { n.ownerDocument = doc; });
+      return doc;
+    },
+    serializeXml(node) {
+      const one = (n, root) => {
+        if (n.nodeType === TEXT_NODE) return esc(String(n.data), false);
+        if (n.nodeType === COMMENT_NODE) return '<!--' + n.data + '-->';
+        if (n.nodeType !== ELEMENT_NODE) {
+          return (n.__ptKids || []).map((c) => one(c, false)).join('');
+        }
+        const tag = n.localName;
+        let attrs = '';
+        if (root) attrs += ' xmlns="http://www.w3.org/1999/xhtml"';
+        for (const { name, value } of n.attributes) attrs += ' ' + name + '="' + esc(String(value), true) + '"';
+        const kids = (n.__ptKids || []).map((c) => one(c, false)).join('');
+        if (!kids && VOID_XML.has(tag)) return '<' + tag + attrs + ' />';
+        return '<' + tag + attrs + '>' + kids + '</' + tag + '>';
+      };
+      return one(node, node && node.nodeType === ELEMENT_NODE);
+    },
+  };
+
   globalThis.__pt_writeDocument = (html) => {
     const nodes = parseFragment(String(html == null ? '' : html));
     let root = nodes.find((n) => n.nodeType === 1 && n.tagName === 'HTML');
@@ -5295,6 +5347,21 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     ['min-inline-size', 'min-width'], ['min-block-size', 'min-height'],
     ['max-inline-size', 'max-width'], ['max-block-size', 'max-height'],
   ];
+
+  // Какие свойства движок знает: `CSS.supports` у браузера отвечает `false`
+  // на выдуманное имя, а у нас отвечал `true` на что угодно с двоеточием.
+  try {
+    const known = new Set(CS_ORDER);
+    for (const name of CSS_PROPS) {
+      const plain = name.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase()).toLowerCase();
+      known.add(plain);
+      if (/^(webkit|moz|ms|o)-/.test(plain)) known.add('-' + plain);
+    }
+    Object.defineProperty(globalThis, '__pt_cssKnown', {
+      value: (name) => known.has(String(name).trim().toLowerCase()),
+      enumerable: false, configurable: true, writable: true,
+    });
+  } catch (e) {}
 
   globalThis.getComputedStyle = (el, pseudo) => {
     const map = new Map();
