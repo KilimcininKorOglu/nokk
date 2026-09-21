@@ -1480,6 +1480,94 @@ const WORKER_SCOPE_ENUMERABLE: &str = r#"["atob", "btoa", "caches", "clearInterv
 /// оборачивают, — видел лишний вызов на каждый офскрин; в браузере его нет
 /// вовсе. Ссылки снимаются последними, поверх всех слоёв, так что внутрь
 /// по-прежнему попадает то же, что получила бы страница.
+/// Интерфейсы, которые должны пережить таблицу имён. Таблица строит по имени
+/// пустой класс — для `FontFace` этого мало: `local("Имя")` это то, чем
+/// страницы перечисляют установленные шрифты, и у браузера обещание
+/// разрешается на существующее имя и отклоняется сетевой ошибкой на чужое.
+/// Кусок идёт последним, после всех слоёв, иначе его затирает та же таблица.
+pub fn late_interfaces_script() -> String {
+    r##"(() => {
+  const native = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
+  const named = (name, f) => {
+    try { Object.defineProperty(f, 'name', { value: name, configurable: true }); } catch (e) {}
+    return native(f);
+  };
+  const meth = (o, n, f) => {
+    try {
+      Object.defineProperty(o, n, { value: named(n, f), writable: true, enumerable: true, configurable: true });
+    } catch (e) {}
+  };
+  const defg = (o, n, get, set) => {
+    try {
+      Object.defineProperty(o, n, {
+        get: named('get ' + n, get),
+        set: set ? named('set ' + n, set) : undefined,
+        enumerable: true, configurable: true,
+      });
+    } catch (e) {}
+  };
+  const DESCRIPTORS = [['style', 'normal'], ['weight', 'normal'], ['stretch', 'normal'],
+    ['unicodeRange', 'U+0-10FFFF'], ['variant', 'normal'], ['featureSettings', 'normal'],
+    ['variationSettings', 'normal'], ['display', 'auto'], ['ascentOverride', 'normal'],
+    ['descentOverride', 'normal'], ['lineGapOverride', 'normal'], ['sizeAdjust', 'normal']];
+  const state = new WeakMap();
+  const netError = () => new (globalThis.DOMException || Error)(
+    'A network error occurred.', 'NetworkError');
+  const FontFace = function FontFace(family, source, descriptors) {
+    if (!new.target) {
+      throw new TypeError("Failed to construct 'FontFace': Please use the 'new' operator, " +
+        'this DOM object constructor cannot be called as a function.');
+    }
+    if (arguments.length < 2) {
+      throw new TypeError("Failed to construct 'FontFace': 2 arguments required, but only " +
+        arguments.length + ' present.');
+    }
+    const own = { family: String(family), source: String(source), status: 'unloaded', promise: null };
+    for (const [k, v] of DESCRIPTORS) {
+      own[k] = descriptors && descriptors[k] !== undefined ? String(descriptors[k]) : v;
+    }
+    state.set(this, own);
+  };
+  const P = FontFace.prototype;
+  const at = (o) => state.get(o) || {};
+  for (const [k] of DESCRIPTORS.concat([['family']])) {
+    defg(P, k, function () { return at(this)[k]; },
+      function (v) { const o = state.get(this); if (o) o[k] = String(v); });
+  }
+  defg(P, 'status', function () { return at(this).status; });
+  const start = (face) => {
+    const o = state.get(face);
+    if (!o) return Promise.reject(new TypeError('Illegal invocation'));
+    if (o.promise) return o.promise;
+    // `local(Имя)` — единственный источник, который разрешается не выходя в
+    // сеть; всё прочее отвечает сетевой ошибкой, как у браузера с недоступным
+    // адресом. Подмены fontconfig не в счёт: браузер ищет по именам самих
+    // файлов, и `Arial` на машине без него не находится.
+    const m = /local\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)/i.exec(o.source || '');
+    const name = m ? String(m[1] || m[2] || m[3] || '').trim() : null;
+    const have = !!(name && typeof globalThis.__pt_localFont === 'function' && __pt_localFont(name));
+    o.status = 'loading';
+    o.promise = have
+      ? Promise.resolve().then(() => { o.status = 'loaded'; return face; })
+      : Promise.resolve().then(() => { o.status = 'error'; throw netError(); });
+    o.promise.catch(() => {});
+    return o.promise;
+  };
+  meth(P, 'load', function load() { return start(this); });
+  defg(P, 'loaded', function () { return start(this); });
+  try { Object.defineProperty(P, Symbol.toStringTag, { value: 'FontFace', configurable: true }); } catch (e) {}
+  try { Object.defineProperty(FontFace, 'length', { value: 2, configurable: true }); } catch (e) {}
+  // Порядок имён на прототипе браузер печатает со `constructor` внутри, по
+  // алфавиту: таблица уже положила его первым, оставляем как есть.
+  try {
+    Object.defineProperty(globalThis, 'FontFace', {
+      value: named('FontFace', FontFace), writable: true, enumerable: false, configurable: true,
+    });
+  } catch (e) {}
+})();"##
+        .to_string()
+}
+
 pub fn late_originals_script() -> String {
     r#"(() => {
   try {
@@ -2781,9 +2869,12 @@ __OPFS__
     const FFS = rebrand(document.fonts, 'FontFaceSet', ET, true);
     if (FFS) {
       const P = FFS.prototype;
-      const empty = new Set();
-      defg(P, 'size', function () { return empty.size; });
-      defg(P, 'status', function () { return 'loaded'; });
+      // Набор настоящий: страница добавляет в него `FontFace` и читает
+      // `size`, перебирает его и ждёт `load`.
+      const faces = new Set();
+      let pending = 0;
+      defg(P, 'size', function () { return faces.size; });
+      defg(P, 'status', function () { return pending > 0 ? 'loading' : 'loaded'; });
       const ready = Promise.resolve(document.fonts);
       defg(P, 'ready', function () { return ready; });
       for (const on of ['onloading', 'onloadingdone', 'onloadingerror']) {
@@ -2797,23 +2888,42 @@ __OPFS__
         }
         return true;
       });
+      // Семейство из сокращения: `12px "Имя", serif` — это «Имя».
+      const familyOf = (font) => {
+        const t = String(font);
+        const m = /(?:\d+(?:\.\d+)?(?:px|pt|em|rem|%)|x?x-(?:small|large)|small|medium|large|larger|smaller)\s+(.+)$/.exec(t);
+        if (!m) return '';
+        const first = m[1].split(',')[0].trim();
+        return first.replace(/^["']|["']$/g, '');
+      };
       meth(P, 'load', function (font) {
         if (!parses(font)) {
           return Promise.reject(new (globalThis.DOMException || Error)("Failed to execute 'load' on 'FontFaceSet': Could not resolve '" + font + "' as a font.", 'SyntaxError'));
         }
-        return Promise.resolve([]);
+        const want = familyOf(font);
+        const mine = [...faces].filter((f) => {
+          try { return String(f.family) === want; } catch (e) { return false; }
+        });
+        pending++;
+        const done = () => { pending = Math.max(0, pending - 1); };
+        return Promise.all(mine.map((f) => {
+          try { return f.load().then(() => f, () => null); } catch (e) { return Promise.resolve(null); }
+        })).then((list) => {
+          setTimeout(done, 0);
+          return list.filter(Boolean);
+        }, (e) => { setTimeout(done, 0); throw e; });
       });
-      meth(P, 'add', function () { return this; });
-      meth(P, 'delete', function () { return false; });
-      meth(P, 'clear', function () {});
-      meth(P, 'has', function () { return false; });
-      meth(P, 'forEach', function (f, t) { empty.forEach(f, t); });
-      meth(P, 'keys', function () { return empty.keys(); });
-      meth(P, 'values', function () { return empty.values(); });
-      meth(P, 'entries', function () { return empty.entries(); });
+      meth(P, 'add', function (face) { if (face) faces.add(face); return this; });
+      meth(P, 'delete', function (face) { return faces.delete(face); });
+      meth(P, 'clear', function () { faces.clear(); });
+      meth(P, 'has', function (face) { return faces.has(face); });
+      meth(P, 'forEach', function (f, t) { faces.forEach(f, t); });
+      meth(P, 'keys', function () { return faces.keys(); });
+      meth(P, 'values', function () { return faces.values(); });
+      meth(P, 'entries', function () { return faces.entries(); });
       try {
         Object.defineProperty(P, Symbol.iterator, {
-          value: fn('[Symbol.iterator]', function () { return empty.values(); }),
+          value: fn('[Symbol.iterator]', function () { return faces.values(); }),
           writable: true, configurable: true,
         });
       } catch (e) {}

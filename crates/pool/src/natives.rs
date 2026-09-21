@@ -55,6 +55,7 @@ pub fn install(scope: &mut v8::PinScope) {
         bind(scope, "__pt_canvasClearRect", canvas_clear_rect);
         bind(scope, "__pt_canvasFillText", canvas_fill_text);
         bind(scope, "__pt_canvasMeasureText", canvas_measure_text);
+        bind(scope, "__pt_localFont", local_font);
         bind(scope, "__pt_canvasFillPath", canvas_fill_path);
         bind(
             scope,
@@ -260,6 +261,17 @@ fn canvas_fill_text(
     let italic = args.get(11).boolean_value(scope);
     crate::canvas::fill_text(id, &text, x, y, size, rgba, &families, bold, italic,
         &arg_f32s(args.get(12)));
+}
+
+/// `__pt_localFont(name)` — есть ли в системе шрифт с таким именем.
+#[cfg(feature = "render")]
+fn local_font(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let name = arg_string(scope, args.get(0));
+    rv.set_bool(crate::canvas::has_local_font(&name));
 }
 
 /// `__pt_canvasMeasureText(text, size)` → advance width in CSS px (a number).

@@ -74,6 +74,20 @@ const FAMILIES: &[(&str, &[&str])] = &[
     ("cantarell", &["Cantarell-Regular.otf"]),
 ];
 
+/// Есть ли в системе шрифт с таким именем — как его ищет `local()` в
+/// `@font-face`. Именно так страница перечисляет установленные шрифты: на
+/// существующее имя `new FontFace(…, 'local("X")').load()` разрешается, на
+/// чужое — отклоняется сетевой ошибкой. Подмены fontconfig здесь не в счёт:
+/// браузер ищет по именам самих файлов, поэтому `Arial` на этой машине не
+/// находится, а `Liberation Sans` находится.
+pub fn has_local_font(name: &str) -> bool {
+    let key = name.trim().to_lowercase();
+    if key.is_empty() {
+        return false;
+    }
+    font_index().contains_key(&key)
+}
+
 /// Основной шрифт браузера: им меряется всё, для чего семейство не нашлось.
 const FALLBACK_FAMILY: &str = "times new roman";
 

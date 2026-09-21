@@ -437,7 +437,11 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
     );
     // И последним — снимок методов, которыми движок пользуется сам: он должен
     // лечь поверх всех слоёв, но раньше любого скрипта страницы.
-    let base = format!("{base}\n{}", nokk_stealth::late_originals_script());
+    let base = format!(
+        "{base}\n{}\n{}",
+        nokk_stealth::late_interfaces_script(),
+        nokk_stealth::late_originals_script()
+    );
     // Diagnostic only, and last so it wraps a finished surface. Reading
     // `__pt_probeLog()` afterwards says what the page asked us and what we said.
     match std::env::var("NOKK_TRACE_PROBES").ok().as_deref() {
@@ -9360,6 +9364,76 @@ opacity: 0.9; flex-flow: column; }",
         assert_eq!(out["strokeLnk"], "0px rgb(102, 51, 153)");
         assert_eq!(out["cursorLnk"], "pointer", "у ссылки свой стиль от браузера");
         assert_eq!(out["decorLnk"], "underline");
+    }
+
+    /// `local("Имя")` в `@font-face` — то, чем страницы перечисляют
+    /// установленные шрифты: обещание разрешается на существующее имя и
+    /// отклоняется сетевой ошибкой на чужое. У нас конструктор `FontFace`
+    /// бросал `TypeError`, и в отчёте челленджа не было целого блока — у
+    /// браузера там список из пяти семейств. Подмены fontconfig не в счёт:
+    /// браузер ищет по именам самих файлов, поэтому `Arial` на этой машине
+    /// не находится, а `Liberation Sans` находится.
+    #[tokio::test]
+    async fn local_fonts_are_found_by_their_own_names() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        ctx.evaluate(r#"(() => {
+            window.__out = { shape: Object.getOwnPropertyNames(FontFace.prototype).sort().join(','),
+                             len: FontFace.length,
+                             tag: Object.prototype.toString.call(new FontFace('x', 'local("DejaVu Sans")')) };
+            window.__out.native = typeof __pt_localFont === 'function';
+            const names = ['DejaVu Sans', 'Liberation Sans', 'Arial', 'Zzz Quux'];
+            const faces = names.map((n) => new FontFace('проба', 'local("' + n + '")'));
+            window.__out.before = faces[0].status;
+            Promise.all(faces.map((f, i) => f.load().then(() => names[i], (e) => e.name)))
+              .then((r) => { window.__out.result = r; window.__out.after = faces.map((f) => f.status); });
+            const set = document.fonts;
+            set.add(faces[0]);
+            window.__out.size = set.size;
+            window.__out.has = set.has(faces[0]);
+            set.delete(faces[0]);
+            window.__out.sizeAfter = set.size;
+        })()"#).await.unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        let out = probe(&ctx, "__ptJSON.stringify(window.__out)").await;
+        assert_eq!(
+            out["shape"],
+            "ascentOverride,constructor,descentOverride,display,family,featureSettings,\
+lineGapOverride,load,loaded,sizeAdjust,status,stretch,style,unicodeRange,variant,\
+variationSettings,weight",
+            "форма интерфейса как у браузера: {out}"
+        );
+        assert_eq!(out["len"], 2);
+        assert_eq!(out["tag"], "[object FontFace]");
+        assert_eq!(out["before"], "unloaded");
+        // Сборка без `render` шрифтов не знает вовсе: там честный отказ на
+        // всё, и проверять нечего, кроме формы.
+        if out["native"] == true {
+            assert_eq!(
+                out["result"],
+                serde_json::json!(["DejaVu Sans", "Liberation Sans", "NetworkError", "NetworkError"]),
+                "установленные находятся, подменённые и выдуманные — нет: {out}"
+            );
+            assert_eq!(
+                out["after"],
+                serde_json::json!(["loaded", "loaded", "error", "error"])
+            );
+        } else {
+            assert_eq!(
+                out["result"],
+                serde_json::json!(["NetworkError", "NetworkError", "NetworkError", "NetworkError"]),
+                "без шрифтов — отказ на всё: {out}"
+            );
+        }
+        assert_eq!(out["size"], 1, "набор настоящий: {out}");
+        assert_eq!(out["has"], true);
+        assert_eq!(out["sizeAfter"], 0);
     }
 
     /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`
