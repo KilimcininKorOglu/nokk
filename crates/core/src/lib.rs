@@ -9677,6 +9677,60 @@ variationSettings,weight",
         }
     }
 
+    /// Гибкий контейнер: дети ложатся в ряд, свободное место делится по
+    /// `flex-grow`, поперёк они выравниваются по правилу контейнера, а
+    /// высота у них — строки из стиля, а не чернил гарнитуры. Виджет почти
+    /// всегда гибкий, и его геометрию сборщик меряет. Числа сняты с Chrome
+    /// 151 на той же разметке.
+    #[tokio::test]
+    async fn a_flex_row_places_its_children_like_a_browser() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><head><style>
+              body { margin: 0; font: 16px/1.4 system-ui, sans-serif; }
+              #w { width: 300px; height: 65px; border: 1px solid #000; padding: 0 12px;
+                   display: flex; align-items: center; }
+              #box { width: 24px; height: 24px; border: 2px solid #000; margin: 4px 8px; }
+              #txt { flex: 1 1 auto; }
+            </style></head><body>
+              <div id=w><div id=box></div><span id=txt>x</span></div>
+            </body></html>"#,
+        )
+        .await
+        .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const r = (id) => { const b = document.getElementById(id).getBoundingClientRect();
+              return [Math.round(b.x * 100) / 100, Math.round(b.y * 100) / 100,
+                      Math.round(b.width * 100) / 100, Math.round(b.height * 100) / 100]; };
+            const cs = getComputedStyle(document.getElementById('txt'));
+            return __ptJSON.stringify({ w: r('w'), box: r('box'), txt: r('txt'),
+              display: cs.display, grow: cs.flexGrow, line: cs.lineHeight });
+        })()"#).await;
+
+        let nums = |key: &str| -> Vec<f64> {
+            out[key]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(nums("w"), vec![0.0, 0.0, 326.0, 67.0], "коробка контейнера: {out}");
+        assert_eq!(
+            nums("box"), vec![21.0, 19.5, 28.0, 28.0],
+            "первый ребёнок стоит по центру поперёк: {out}"
+        );
+        let txt = nums("txt");
+        assert_eq!(txt[0], 57.0, "второй начинается за первым: {out}");
+        assert_eq!(txt[2], 256.0, "и растягивается на всё свободное место: {out}");
+        assert_eq!(txt[3], 22.39, "высота — строка из стиля: {out}");
+        assert_eq!(out["display"], "block", "ребёнок гибкого контейнера блочный");
+        assert_eq!(out["grow"], "1");
+        assert_eq!(out["line"], "22.4px");
+    }
+
     /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`
     /// is the idiom every collector uses, Cloudflare's included — the URL is dead
     /// one line after the worker starts. Reading the blob when the engine got

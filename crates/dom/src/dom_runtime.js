@@ -4862,7 +4862,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     h1: [21.44, 0], h2: [19.92, 0], h3: [18.72, 0], h4: [21.28, 0], h5: [22.18, 0], h6: [24.98, 0],
   };
 
-  function __layoutOne(el, originX, originY, availW, strut) {
+  function __layoutOne(el, originX, originY, availW, strut, forced) {
     // В порядке документа, не после детей: попадание в точку ищется с конца
     // списка, и глубокий элемент должен стоять там позже своего родителя.
     __boxes.push(el);
@@ -4898,7 +4898,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const ovAll = String(cs.get('overflow') || '').toLowerCase();
     const ovX = String(cs.get('overflow-x') || ovAll || 'visible').toLowerCase();
     const ovY = String(cs.get('overflow-y') || ovAll || 'visible').toLowerCase();
-    const inlineish = __INLINEISH.test(display);
+    // Ребёнок гибкого контейнера — блок, каким бы ни был его собственный
+    // `display`: браузер его «блокирует», и высота у него строки, а не чернил.
+    const forcedW = !!(forced && forced.w != null);
+    const inlineish = __INLINEISH.test(display) && !(forced && forced.block);
     const position = String(cs.get('position') || 'static').toLowerCase();
 
     const uam = UA_MARGIN[tag];
@@ -4928,6 +4931,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         : ua.w;
     }
     if (cw == null && !inlineish) cw = Math.max(0, availW - ml - mr - bl - br - pl - pr);
+    // Гибкий родитель назначает ребёнку длину сам — и до того, как тот
+    // разложит своё содержимое, иначе строки обернутся не по той ширине.
+    if (forced && forced.w != null) cw = Math.max(0, forced.w - pl - pr - bl - br);
 
     let boxX = originX + ml, boxY = originY + mt;
     if (position === 'absolute' || position === 'fixed') {
@@ -4946,11 +4952,132 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (cw == null) {
       cw = boxedKids.length ? 0 : __textWidth(__OWN_TEXT(el), fs, family, bold, false);
     }
+    if (forcedW) cw = Math.max(0, forced.w - pl - pr - bl - br);
 
     const fbox = __fontBox(fs, family);
-    const lineH = fbox.line;
+    // Высота строки — из стиля, а не из метрик гарнитуры: `font: 16px/1.4`
+    // делает строку в 22,4 пикселя, и ребёнок гибкого контейнера ровно
+    // такой высоты. Мы брали высоту чернил и отвечали восемнадцатью.
+    let lineH = fbox.line;
+    {
+      let lh = cs.get('line-height');
+      if (lh == null && typeof __inheritedValue === 'function') lh = __inheritedValue(el, 'line-height');
+      const t = lh == null ? '' : String(lh).trim();
+      if (t && t !== 'normal') {
+        lineH = /^[\d.]+$/.test(t) ? parseFloat(t) * fs : (__lengthPx(t, fs, availW) || fbox.line);
+      }
+    }
     const contentX = boxX + bl + pl, contentY = boxY + bt + pt_;
     let y = contentY, widest = 0, deepest = 0;
+    // Гибкий контейнер: дети ложатся в ряд (или в столбец), свободное место
+    // делится по `flex-grow`, нехватка — по `flex-shrink`, а поперёк они по
+    // умолчанию растягиваются. Раньше мы клали их обычным блочным потоком, и
+    // виджет — а он почти всегда гибкий — получал не ту геометрию.
+    const flexish = display === 'flex' || display === 'inline-flex';
+    if (flexish && boxedKids.length) {
+      const dir = String(cs.get('flex-direction') || 'row').toLowerCase();
+      const row = dir.lastIndexOf('column', 0) !== 0;
+      const reverse = /-reverse$/.test(dir);
+      const gapMain = len(row ? 'column-gap' : 'row-gap', cw) || 0;
+      const align = String(cs.get('align-items') || 'normal').toLowerCase();
+      const justify = String(cs.get('justify-content') || 'normal').toLowerCase();
+      const flow = boxedKids.filter((c) => {
+        const p = String(__cascadeFor(c).get('position') || 'static').toLowerCase();
+        return p !== 'absolute' && p !== 'fixed';
+      });
+      // Первый проход — узнать естественные размеры.
+      const items = flow.map((c) => {
+        const ccs = __cascadeFor(c);
+        const cb = __layoutOne(c, contentX, contentY, cw, fbox) || { w: 0, h: 0 };
+        const cfs = __usedFontSize(c);
+        const mw = (__lengthPx(ccs.get('margin-left'), cfs, cw) || 0)
+                 + (__lengthPx(ccs.get('margin-right'), cfs, cw) || 0);
+        const mh = (__lengthPx(ccs.get('margin-top'), cfs, cw) || 0)
+                 + (__lengthPx(ccs.get('margin-bottom'), cfs, cw) || 0);
+        const num = (v, dflt) => { const n = parseFloat(v); return Number.isFinite(n) ? n : dflt; };
+        const basis = String(ccs.get('flex-basis') || 'auto').toLowerCase();
+        const basisPx = basis === 'auto' || basis === 'content'
+          ? null : __lengthPx(basis, cfs, cw);
+        const natural = row ? cb.w : cb.h;
+        return {
+          el: c, box: cb,
+          grow: num(ccs.get('flex-grow'), 0),
+          shrink: num(ccs.get('flex-shrink'), 1),
+          base: basisPx != null ? basisPx : natural,
+          mMain: row ? mw : mh, mCross: row ? mh : mw,
+        };
+      });
+      const inner = row ? cw : (explicitH != null ? explicitH : 0);
+      const gaps = gapMain * Math.max(0, items.length - 1);
+      const used = items.reduce((a, it) => a + it.base + it.mMain, 0) + gaps;
+      let free = inner - used;
+      if (free > 0) {
+        const total = items.reduce((a, it) => a + it.grow, 0);
+        if (total > 0) for (const it of items) it.main = it.base + free * (it.grow / total);
+        else for (const it of items) it.main = it.base;
+      } else if (free < 0) {
+        const total = items.reduce((a, it) => a + it.shrink * it.base, 0);
+        for (const it of items) {
+          it.main = total > 0
+            ? Math.max(0, it.base + free * ((it.shrink * it.base) / total))
+            : it.base;
+        }
+      } else for (const it of items) it.main = it.base;
+      const taken = items.reduce((a, it) => a + it.main + it.mMain, 0) + gaps;
+      const slack = Math.max(0, inner - taken);
+      let lead = 0, between = gapMain;
+      if (justify === 'center') lead = slack / 2;
+      else if (justify === 'flex-end' || justify === 'end' || justify === 'right') lead = slack;
+      else if (justify === 'space-between' && items.length > 1) between += slack / (items.length - 1);
+      else if (justify === 'space-around' && items.length) {
+        lead = slack / items.length / 2; between += slack / items.length;
+      } else if (justify === 'space-evenly' && items.length) {
+        lead = slack / (items.length + 1); between += slack / (items.length + 1);
+      }
+      // Поперечный размер строки: заданная высота контейнера или самый
+      // высокий ребёнок.
+      const crossOuter = items.reduce((a, it) => Math.max(a, (row ? it.box.h : it.box.w) + it.mCross), 0);
+      const lineCross = row
+        ? (explicitH != null ? explicitH : crossOuter)
+        : cw;
+      const order = reverse ? items.slice().reverse() : items;
+      let along = lead;
+      for (const it of order) {
+        const ccs = __cascadeFor(it.el);
+        const self = String(ccs.get('align-self') || 'auto').toLowerCase();
+        const how = self !== 'auto' && self !== 'normal' ? self : align;
+        const cfs = __usedFontSize(it.el);
+        const mLead = row ? (__lengthPx(ccs.get('margin-left'), cfs, cw) || 0)
+                          : (__lengthPx(ccs.get('margin-top'), cfs, cw) || 0);
+        const mCrossLead = row ? (__lengthPx(ccs.get('margin-top'), cfs, cw) || 0)
+                               : (__lengthPx(ccs.get('margin-left'), cfs, cw) || 0);
+        const natCross = row ? it.box.h : it.box.w;
+        const stretch = (how === 'normal' || how === 'stretch')
+          && (row ? explicitH != null || items.length > 0 : true);
+        const crossSize = stretch ? Math.max(0, lineCross - it.mCross) : natCross;
+        let crossPos = mCrossLead;
+        if (!stretch) {
+          if (how === 'center') crossPos = Math.max(0, (lineCross - natCross - it.mCross) / 2) + mCrossLead;
+          else if (how === 'flex-end' || how === 'end') crossPos = Math.max(0, lineCross - natCross - it.mCross) + mCrossLead;
+        }
+        const x = row ? contentX + along + mLead : contentX + crossPos;
+        const yy = row ? contentY + crossPos : contentY + along + mLead;
+        const cb = __layoutOne(it.el, x - mLead, yy - (row ? mCrossLead : mLead), cw, fbox,
+          row ? { w: it.main, h: stretch ? crossSize : null, block: true }
+              : { w: stretch ? crossSize : null, h: it.main, block: true });
+        if (cb) {
+          widest = Math.max(widest, cb.x - contentX + cb.w);
+          deepest = Math.max(deepest, cb.y - contentY + cb.h);
+        }
+        along += it.main + it.mMain + between;
+      }
+      y = contentY + (row ? lineCross : along);
+      // Остальное — как у блока: абсолютные дети кладутся сами по себе.
+      for (const c of boxedKids) {
+        const p = String(__cascadeFor(c).get('position') || 'static').toLowerCase();
+        if (p === 'absolute' || p === 'fixed') __layoutOne(c, contentX, contentY, cw, fbox);
+      }
+    } else
     for (const c of boxedKids) {
       const cb = __layoutOne(c, contentX, y, cw, fbox);
       if (!cb) continue;
@@ -4964,16 +5091,17 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       // следующий блок встаёт на высоту строки ниже.
       y = cb.inline ? cb.lineTop + Math.max(lineH, cb.h) : cb.y + cb.h + (cb.mb || 0);
     }
-    if (inlineish && explicitW == null && boxedKids.length) cw = widest;
+    if (inlineish && explicitW == null && !forcedW && boxedKids.length) cw = widest;
 
     let ch;
     let lines = null;
     const ownText = __OWN_TEXT(el);
     if (ownText && !boxedKids.length) {
-      lines = __wrapLines(ownText, inlineish && explicitW == null ? 0 : cw, fs, family, bold);
-      if (inlineish && explicitW == null && lines.length === 1) cw = lines[0].width;
+      lines = __wrapLines(ownText, inlineish && explicitW == null && !forcedW ? 0 : cw, fs, family, bold);
+      if (inlineish && explicitW == null && !forcedW && lines.length === 1) cw = lines[0].width;
     }
-    if (explicitH != null) ch = explicitH;
+    if (forced && forced.h != null) ch = Math.max(0, forced.h - pt_ - pb - bt - bb);
+    else if (explicitH != null) ch = explicitH;
     else if (attrH != null) ch = attrH;
     else if (boxedKids.length) ch = Math.max(0, y - contentY);
     else if (lines && lines.length) ch = lines.length * lineH;
@@ -4991,7 +5119,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     // Браузер держит длины в шестьдесят четвёртых пикселя, и это видно:
     // ширина строки 72.26171875 у нас против 72.265625 у Chrome — та же
     // величина, округлённая до его шага.
-    const q = (v) => Math.round(v * 64) / 64;
+    // Браузер держит длины в шестьдесят четвёртых пикселя и **отбрасывает**
+    // остаток, а не округляет: высота строки 22,4 становится 22,390625, а не
+    // 22,40625. Разница видна в каждом дробном размере.
+    const q = (v) => Math.floor(v * 64) / 64;
     const box = {
       x: q(boxX), y: q(boxY),
       w: q(cw + pl + pr + bl + br),
