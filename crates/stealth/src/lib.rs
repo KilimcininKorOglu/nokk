@@ -8576,12 +8576,29 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   } catch (e) {}
 
   // --- permissions ------------------------------------------------------
+  // Таблица снята с Chrome 151: часть имён он отдаёт готовыми, часть спрашивает
+  // у человека, а имени вне перечня отвечает броском — и `push` особым. Мы
+  // отвечали `prompt` на что угодно, включая выдуманное, и это само по себе
+  // ответ не браузера.
+  const PERM_GRANTED = new Set(['screen-wake-lock', 'storage-access', 'clipboard-write',
+    'payment-handler', 'background-sync', 'accelerometer', 'gyroscope', 'magnetometer']);
+  const PERM_PROMPT = new Set(['geolocation', 'notifications', 'camera', 'microphone', 'midi',
+    'persistent-storage', 'clipboard-read', 'idle-detection', 'local-fonts', 'window-management',
+    'display-capture', 'captured-surface-control', 'bluetooth', 'periodic-background-sync']);
   const permissions = { query: mask(function query(desc){
     const name = desc && desc.name;
-    // У свежего профиля браузер почти на всё отвечает `prompt`: разрешение
-    // даёт человек. `granted` без спроса — заметная неправда.
-    const GRANTED = new Set(['storage-access', 'top-level-storage-access']);
-    const state = GRANTED.has(name) ? 'granted' : 'prompt';
+    if (name === 'push') {
+      return Promise.reject(new (globalThis.DOMException || Error)(
+        "Failed to execute 'query' on 'Permissions': Push Permission without " +
+        "userVisibleOnly:true isn't supported yet.", 'NotSupportedError'));
+    }
+    if (!PERM_GRANTED.has(name) && !PERM_PROMPT.has(name)) {
+      return Promise.reject(new TypeError(
+        "Failed to execute 'query' on 'Permissions': Failed to read the 'name' property from " +
+        "'PermissionDescriptor': The provided value '" + name +
+        "' is not a valid enum value of type PermissionName."));
+    }
+    const state = PERM_GRANTED.has(name) ? 'granted' : 'prompt';
     return Promise.resolve({ state, name, onchange: null, addEventListener(){}, removeEventListener(){} });
   }, 'query') };
   try { Object.defineProperty(navProto, 'permissions', { get: () => permissions, enumerable: true, configurable: true }); } catch (e) {}
@@ -8610,20 +8627,104 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
   // --- extra navigator surface -----------------------------------------
   const navExtra = (name, value) => { try { Object.defineProperty(navProto, name, { value, enumerable: true, configurable: true, writable: true }); } catch (e) {} };
+  // Список устройств у браузера не пуст даже без разрешения: три записи с
+  // пустыми именами и пустым `deviceId` — вход звука, вход видео, выход
+  // звука. Пустой список выдаёт машину без звуковой карты, то есть не машину.
+  const mediaDevice = (kind) => {
+    const d = { deviceId: '', kind, label: '', groupId: '' };
+    d.toJSON = function toJSON() { return { deviceId: '', kind, label: '', groupId: '' }; };
+    try {
+      const P = globalThis.MediaDeviceInfo && MediaDeviceInfo.prototype;
+      if (P) Object.setPrototypeOf(d, P);
+    } catch (e) {}
+    return d;
+  };
   navExtra('mediaDevices', {
-    enumerateDevices: () => Promise.resolve([]),
+    enumerateDevices: () => Promise.resolve([
+      mediaDevice('audioinput'), mediaDevice('videoinput'), mediaDevice('audiooutput')]),
     getUserMedia: () => Promise.reject(new Error('Permission denied')),
     getDisplayMedia: () => Promise.reject(new Error('Permission denied')),
-    getSupportedConstraints: () => ({ aspectRatio: true, autoGainControl: true, brightness: true, channelCount: true, deviceId: true, echoCancellation: true, facingMode: true, frameRate: true, groupId: true, height: true, noiseSuppression: true, sampleRate: true, sampleSize: true, width: true }),
+    getSupportedConstraints: () => ({ aspectRatio: true, autoGainControl: true, brightness: true, channelCount: true, colorTemperature: true, contrast: true, deviceId: true, displaySurface: true, echoCancellation: true, exposureCompensation: true, exposureMode: true, exposureTime: true, facingMode: true, focusDistance: true, focusMode: true, frameRate: true, groupId: true, height: true, iso: true, latency: true, noiseSuppression: true, pan: true, pointsOfInterest: true, resizeMode: true, restrictOwnAudio: true, sampleRate: true, sampleSize: true, saturation: true, sharpness: true, suppressLocalAudioPlayback: true, tilt: true, torch: true, voiceIsolation: true, whiteBalanceMode: true, width: true, zoom: true }),
     ondevicechange: null, addEventListener: noop, removeEventListener: noop,
   });
   // Desktop Chrome's NetworkInformation omits `type` (it's mobile-only) — its
   // presence is a tell, so we leave it off.
-  navExtra('connection', { effectiveType: '4g', rtt: 50, downlink: 10, saveData: false, onchange: null });
-  const batteryLevel = 0.7 + (SEED % 300) / 1000; // per-session, plausible
+  // Сеть браузер не выдумывает: `rtt` он округляет до двадцати пяти
+  // миллисекунд, `downlink` — до двадцати пяти килобит и не выше десяти
+  // мегабит. У нас стояли постоянные 50 и 10 — «очень быстро», что бы ни
+  // показывали собственные сроки запросов. Считаем по ним же.
+  const netFromTiming = () => {
+    try {
+      const nav = performance.getEntriesByType('navigation')[0];
+      if (!nav) return null;
+      // Берём и переход, и всё, что он потянул: одного документа мало, а
+      // браузер усредняет по многим запросам.
+      const all = [nav].concat(performance.getEntriesByType('resource'));
+      const rtts = all.map((e) => Math.max(0, (e.responseStart || 0) - (e.requestStart || 0)))
+        .filter((x) => x > 0).sort((a, b) => a - b);
+      const mid = rtts.length ? rtts[rtts.length >> 1] : 100;
+      // Не ниже пятидесяти и не выше трёхсот: в этих пределах живёт домашняя
+      // сеть, а нули и тысячи браузер на ней не печатает.
+      const rtt = Math.min(300, Math.max(50, Math.round(mid / 25) * 25));
+      let bytes = 0, secs = 0;
+      for (const e of all) {
+        bytes += Number(e.transferSize) || 0;
+        secs += Math.max(0, (e.responseEnd - e.requestStart)) / 1000;
+      }
+      const mbit = secs > 0.01 ? (bytes * 8) / 1e6 / secs : 1.55;
+      const downlink = Math.min(10, Math.max(1.5, Math.round(mbit / 0.025) * 0.025));
+      return { rtt, downlink: Math.round(downlink * 1000) / 1000 };
+    } catch (e) { return null; }
+  };
+  navExtra('connection', {
+    effectiveType: '4g', saveData: false, onchange: null,
+    get rtt() { const n = netFromTiming(); return n ? n.rtt : 50; },
+    get downlink() { const n = netFromTiming(); return n ? n.downlink : 1.55; },
+  });
+  // Настольная машина у браузера всегда «заряжена и в сети»: заряд ровно
+  // единица, время до полного нуль, время разряда бесконечно. Доля вроде 0.71
+  // описывает ноутбук, а наш облик — настольный.
+  const batteryLevel = 1;
   navExtra('getBattery', mask(function getBattery() { return Promise.resolve({ charging: true, chargingTime: 0, dischargingTime: Infinity, level: Math.round(batteryLevel * 100) / 100, onchargingchange: null, onchargingtimechange: null, ondischargingtimechange: null, onlevelchange: null, addEventListener: noop, removeEventListener: noop }); }, 'getBattery'));
   navExtra('storage', { estimate: () => Promise.resolve({ quota: 299977155072, usage: 0, usageDetails: {} }), persist: () => Promise.resolve(false), persisted: () => Promise.resolve(false) });
-  navExtra('userActivation', { hasBeenActive: true, isActive: false });
+  // До первого жеста браузер отвечает ложью на оба: страница, открытая
+  // движком, ничего ещё не нажимала. Нажатие поднимает флаг само.
+  navExtra('userActivation', {
+    get hasBeenActive() { return !!globalThis.__pt_userActivated; },
+    get isActive() { return !!globalThis.__pt_userActive; },
+  });
+  // `navigator.mediaSession` у нас был пустым объектом из таблицы имён: ни
+  // состояния воспроизведения, ни методов. Браузер держит там шесть членов на
+  // прототипе, и `playbackState` читают.
+  {
+    const proto = (globalThis.MediaSession && MediaSession.prototype) || {};
+    const state = { metadata: null, playbackState: 'none' };
+    try {
+      Object.defineProperty(proto, 'metadata', {
+        get: mask(function () { return state.metadata; }, 'get metadata'),
+        set: mask(function (v) { state.metadata = v === undefined ? null : v; }, 'set metadata'),
+        enumerable: true, configurable: true,
+      });
+      Object.defineProperty(proto, 'playbackState', {
+        get: mask(function () { return state.playbackState; }, 'get playbackState'),
+        set: mask(function (v) { state.playbackState = String(v); }, 'set playbackState'),
+        enumerable: true, configurable: true,
+      });
+      for (const m of ['setActionHandler', 'setCameraActive', 'setMicrophoneActive', 'setPositionState']) {
+        Object.defineProperty(proto, m, {
+          value: mask(function () {}, m), writable: true, enumerable: true, configurable: true,
+        });
+      }
+      if (!Object.getOwnPropertyDescriptor(proto, Symbol.toStringTag)) {
+        Object.defineProperty(proto, Symbol.toStringTag, { value: 'MediaSession', configurable: true });
+      }
+      navExtra('mediaSession', Object.create(proto));
+    } catch (e) {}
+  }
+  // Планировщик: `isInputPending` есть у настольного Chrome, и его спрашивают.
+  navExtra('scheduling', {
+    isInputPending: mask(function isInputPending() { return false; }, 'isInputPending'),
+  });
   // sendBeacon really fires (POST) through the engine so analytics/telemetry
   // beacons are captured, not silently dropped.
   navExtra('sendBeacon', mask(function sendBeacon(url, data) {
@@ -8869,7 +8970,30 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // никогда, а браузер доставляет первое наблюдение сразу. Код, который ждёт
   // его, ждал вечно.
   globalThis.IntersectionObserver = class IntersectionObserver {
-    constructor(cb) { this._cb = cb; }
+    constructor(cb, opts) {
+      this._cb = cb;
+      // Пороги и поля наблюдатель показывает сам, и их читают: у браузера
+      // это список чисел и четыре стороны через пробел, а у нас было пусто.
+      const t = opts && opts.threshold;
+      const list = t === undefined ? [0] : (Array.isArray(t) ? t.slice() : [Number(t) || 0]);
+      const margin = String((opts && opts.rootMargin) || '0px').trim().split(/\s+/);
+      const four = margin.length === 1 ? [margin[0], margin[0], margin[0], margin[0]]
+        : margin.length === 2 ? [margin[0], margin[1], margin[0], margin[1]]
+        : margin.length === 3 ? [margin[0], margin[1], margin[2], margin[1]]
+        : margin.slice(0, 4);
+      Object.defineProperty(this, '__ptOpts', {
+        value: { thresholds: Object.freeze(list), rootMargin: four.join(' '),
+                 root: (opts && opts.root) || null, delay: (opts && opts.delay) | 0,
+                 scrollMargin: '0px 0px 0px 0px', trackVisibility: !!(opts && opts.trackVisibility) },
+        enumerable: false,
+      });
+    }
+    get thresholds() { return this.__ptOpts.thresholds; }
+    get rootMargin() { return this.__ptOpts.rootMargin; }
+    get root() { return this.__ptOpts.root; }
+    get delay() { return this.__ptOpts.delay; }
+    get scrollMargin() { return this.__ptOpts.scrollMargin; }
+    get trackVisibility() { return this.__ptOpts.trackVisibility; }
     observe(el) { const cb = this._cb, self = this; setTimeout(() => { try { cb([{ target: el, isIntersecting: true, intersectionRatio: 1, boundingClientRect: {}, intersectionRect: {}, rootBounds: null, time: 0 }], self); } catch (e) {} }, 0); }
     unobserve() {} disconnect() {} takeRecords() { return []; }
   };

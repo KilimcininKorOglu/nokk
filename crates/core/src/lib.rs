@@ -9561,6 +9561,64 @@ variationSettings,weight",
         assert_eq!(out["entryTypes"], 15);
     }
 
+    /// Второй круг сверки с Chrome 151: разрешения, устройства, наблюдатель
+    /// пересечений, сеанс проигрывания, батарея, сеть. Всё это страница
+    /// читает мимоходом, а сборщик отпечатков — с умыслом: пустой список
+    /// устройств описывает машину без звуковой карты, `prompt` на выдуманное
+    /// имя разрешения — движок без таблицы, а заряд 0,71 — ноутбук там, где
+    /// мы называемся настольной машиной.
+    #[tokio::test]
+    async fn permissions_and_devices_answer_like_a_browser() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        ctx.evaluate(r#"(() => {
+            const out = {};
+            const ask = (n) => navigator.permissions.query({ name: n })
+              .then((s) => s.state, (e) => 'бросок ' + e.name);
+            Promise.all([ask('geolocation'), ask('accelerometer'), ask('push'), ask('вздор'),
+                         navigator.mediaDevices.enumerateDevices(), navigator.getBattery()])
+              .then(([geo, accel, push, bad, devices, battery]) => {
+                out.perms = [geo, accel, push, bad];
+                out.devices = devices.map((d) => d.kind + ':' + d.deviceId + ':' + d.label);
+                out.battery = [battery.charging, battery.level, battery.chargingTime,
+                               battery.dischargingTime === Infinity ? 'вечно' : battery.dischargingTime];
+                const io = new IntersectionObserver(() => {}, { threshold: [0, 0.5], rootMargin: '10px' });
+                out.io = [io.thresholds, io.rootMargin, io.root];
+                out.session = [navigator.mediaSession.playbackState,
+                               typeof navigator.mediaSession.setActionHandler];
+                out.constraints = Object.keys(navigator.mediaDevices.getSupportedConstraints()).length;
+                out.activation = [navigator.userActivation.hasBeenActive, navigator.userActivation.isActive];
+                out.scheduling = typeof navigator.scheduling.isInputPending;
+                window.__nav = out;
+              });
+        })()"#).await.unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        let out = probe(&ctx, "__ptJSON.stringify(window.__nav)").await;
+        assert_eq!(
+            out["perms"],
+            serde_json::json!(["prompt", "granted", "бросок NotSupportedError", "бросок TypeError"]),
+            "таблица разрешений как у браузера: {out}"
+        );
+        assert_eq!(
+            out["devices"],
+            serde_json::json!(["audioinput::", "videoinput::", "audiooutput::"]),
+            "три устройства без имён — как без разрешения у браузера: {out}"
+        );
+        assert_eq!(out["battery"], serde_json::json!([true, 1, 0, "вечно"]));
+        assert_eq!(out["io"], serde_json::json!([[0, 0.5], "10px 10px 10px 10px", null]));
+        assert_eq!(out["session"], serde_json::json!(["none", "function"]));
+        assert_eq!(out["constraints"], 36);
+        assert_eq!(out["activation"], serde_json::json!([false, false]),
+                   "до жеста — ложь на оба: {out}");
+        assert_eq!(out["scheduling"], "function");
+    }
+
     /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`
     /// is the idiom every collector uses, Cloudflare's included — the URL is dead
     /// one line after the worker starts. Reading the blob when the engine got
