@@ -9219,22 +9219,45 @@ opacity: 0.9; flex-flow: column; }",
             wrap(Node.prototype, 'appendChild');
             wrap(Node.prototype, 'insertBefore');
             wrap(Element.prototype, 'setAttribute');
+            wrap(Element.prototype, 'getAttribute');
+            wrap(Element.prototype, 'hasAttribute');
+            wrap(Element.prototype, 'removeAttribute');
+            wrap(Node.prototype, 'removeChild');
             const host = document.body;
             host.innerHTML = '<p class=x>привет <b>мир</b><!--тут--></p>';
             const img = new Image(5, 7);
             const audio = new Audio('/x.mp3');
+            // Отражённые атрибуты, стиль, классы, текст и вставка разметки —
+            // всё это в браузере нативная работа, и крючок её не видит.
+            const div = document.createElement('div');
+            host.insertBefore(div, host.firstChild);
+            div.style.color = 'red';
+            div.classList.add('a');
+            div.textContent = 'привет';
+            div.insertAdjacentHTML('beforeend', '<i>x</i>');
+            img.src = 'https://example.com/x.png';
+            const style = getComputedStyle(div).color;
             return __ptJSON.stringify({
               seen,
-              markup: host.innerHTML,
+              markup: host.querySelector('p').outerHTML,
               img: img.width + 'x' + img.height,
               audio: audio.getAttribute('src'),
+              colour: style,
+              cls: div.className,
+              text: div.innerHTML,
             });
         })()"#).await;
 
+        // `host.insertBefore` и `audio.getAttribute` странице засчитываются —
+        // она сама их и позвала; всё прочее движок обязан делать молча.
+        let seen: Vec<&str> = out["seen"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
         assert_eq!(
-            out["seen"].as_array().map(Vec::len),
-            Some(0),
-            "страница не должна видеть ни одного внутреннего вызова: {out}"
+            seen,
+            vec!["insertBefore", "getAttribute"],
+            "страница не должна видеть внутренних вызовов движка: {out}"
         );
         assert_eq!(
             out["markup"], "<p class=\"x\">привет <b>мир</b><!--тут--></p>",
@@ -9242,6 +9265,89 @@ opacity: 0.9; flex-flow: column; }",
         );
         assert_eq!(out["img"], "5x7");
         assert_eq!(out["audio"], "/x.mp3");
+        assert_eq!(
+            out["colour"], "rgb(255, 0, 0)",
+            "стиль ставится и печатается как у браузера: {out}"
+        );
+        assert_eq!(out["cls"], "a");
+        assert_eq!(out["text"], "привет<i>x</i>");
+    }
+
+    /// Вычисленный стиль челлендж снимает целиком — это самый большой кусок
+    /// его отчёта. У нас он был «почти»: цвет оставался записью автора
+    /// (`red`, `#0f0`, `hsl(...)`), сокращения не раскладывались по длинным
+    /// (`background: blue` не давало `background-color`), а сами сокращения
+    /// лишними именами торчали в перечислении. Числа сняты с Chrome 151.
+    #[tokio::test]
+    async fn a_computed_style_answers_like_a_browser() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><head><style>
+              body { font: 16px/1.4 system-ui, sans-serif; color: #111; }
+              #w { display: flex; border: 1px solid #e0e0e0; border-radius: 4px;
+                   box-shadow: 0 0 5px rgba(0,0,0,0.1); background: rgba(255,255,255,0.9); }
+              #box { border: 2px solid rgb(0, 120, 212); background: blue; margin: 4px 8px;
+                     outline: 1px dotted green; transition: all .2s ease-in-out;
+                     font: italic small-caps bold 14px/1.5 Georgia, serif;
+                     text-decoration: underline dotted red; }
+              a { color: rebeccapurple; }
+            </style></head><body>
+              <div id=w><div id=box></div><a id=lnk href=#>ссылка</a></div>
+            </body></html>"#,
+        )
+        .await
+        .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const cs = (id) => getComputedStyle(document.getElementById(id));
+            const w = cs('w'), box = cs('box'), lnk = cs('lnk');
+            let names = 0, shorthands = 0;
+            for (let i = 0; i < box.length; i++) {
+              names++;
+              if (['font', 'background', 'border', 'margin', 'outline', 'flex', 'gap',
+                   'overflow', 'inset', 'border-radius', 'padding', 'transition',
+                   'list-style', 'place-items', 'grid-area'].includes(box[i])) shorthands++;
+            }
+            return __ptJSON.stringify({
+              names, shorthands,
+              bgW: w.backgroundColor, radiusW: w.borderStartStartRadius, shadowW: w.boxShadow,
+              lineW: w.lineHeight, borderW: w.borderTopColor + '|' + w.borderTopStyle + '|' + w.borderTopWidth,
+              logical: w.borderBlockStartColor,
+              bgBox: box.backgroundColor, sizeBox: box.fontSize, lineBox: box.lineHeight,
+              variantBox: box.fontVariant, styleBox: box.fontStyle,
+              decorBox: box.textDecoration, outlineBox: box.outlineColor + '|' + box.outlineStyle,
+              transBox: box.transitionDuration + '|' + box.transitionTimingFunction,
+              minBox: box.minHeight, displayBox: box.display,
+              caretBox: box.caretColor,
+              colourLnk: lnk.color, cursorLnk: lnk.cursor, decorLnk: lnk.textDecorationLine,
+            });
+        })()"#).await;
+
+        assert_eq!(out["names"], 475, "столько же имён, сколько у браузера: {out}");
+        assert_eq!(out["shorthands"], 0, "сокращений среди них нет");
+        assert_eq!(out["bgW"], "rgba(255, 255, 255, 0.9)");
+        assert_eq!(out["radiusW"], "4px", "логический угол повторяет физический");
+        assert_eq!(out["shadowW"], "rgba(0, 0, 0, 0.1) 0px 0px 5px 0px");
+        assert_eq!(out["lineW"], "22.4px", "множитель печатается в пикселях");
+        assert_eq!(out["borderW"], "rgb(224, 224, 224)|solid|1px");
+        assert_eq!(out["logical"], "rgb(224, 224, 224)");
+        assert_eq!(out["bgBox"], "rgb(0, 0, 255)");
+        assert_eq!(out["sizeBox"], "14px", "кегль из сокращённого `font`");
+        assert_eq!(out["lineBox"], "21px");
+        assert_eq!(out["variantBox"], "small-caps");
+        assert_eq!(out["styleBox"], "italic");
+        assert_eq!(out["decorBox"], "underline dotted rgb(255, 0, 0)");
+        assert_eq!(out["outlineBox"], "rgb(0, 128, 0)|dotted");
+        assert_eq!(out["transBox"], "0.2s|ease-in-out");
+        assert_eq!(out["minBox"], "auto", "ребёнок гибкого контейнера: минимум `auto`");
+        assert_eq!(out["displayBox"], "block");
+        assert_eq!(out["caretBox"], "rgb(17, 17, 17)", "`currentColor` — это цвет элемента");
+        assert_eq!(out["colourLnk"], "rgb(102, 51, 153)");
+        assert_eq!(out["cursorLnk"], "pointer", "у ссылки свой стиль от браузера");
+        assert_eq!(out["decorLnk"], "underline");
     }
 
     /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`

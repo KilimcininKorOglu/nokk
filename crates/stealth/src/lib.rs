@@ -1497,6 +1497,10 @@ pub fn late_originals_script() -> String {
     if (N) { keep.appendChild = N.appendChild; keep.insertBefore = N.insertBefore; }
     const E = globalThis.Element && Element.prototype;
     if (E) keep.setAttribute = E.setAttribute;
+    // Двумерный контекст: `createImageBitmap` у нас рисует через него, и эти
+    // два вызова видел бы всякий, кто обернул рисование.
+    const X = globalThis.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype;
+    if (X) { keep.drawImage = X.drawImage; keep.putImageData = X.putImageData; }
     // Методы GL — целиком: наш WebGPU лежит поверх WebGL и зовёт их десятками,
     // а страница может обернуть любой. Снимок делается один раз, отсюда.
     for (const N of ['WebGLRenderingContext', 'WebGL2RenderingContext']) {
@@ -3798,6 +3802,16 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     const ctx2d = (c) => (globalThis.__pt_privateCtx
       ? globalThis.__pt_privateCtx(c, '2d')
       : (c && c.getContext('2d')));
+    // Рисование — через снимок, снятый до страницы: свой промежуточный холст
+    // движок наполняет молча, как это делает браузер.
+    const draw = (g, args) => {
+      const O = globalThis.__pt_orig;
+      return (O && O.drawImage ? O.drawImage : g.drawImage).apply(g, args);
+    };
+    const put = (g, args) => {
+      const O = globalThis.__pt_orig;
+      return (O && O.putImageData ? O.putImageData : g.putImageData).apply(g, args);
+    };
     // Прототип снимка оформляется один раз: в браузере ни ширина, ни высота не
     // лежат на самом объекте — они читаются с прототипа, и `close` их обнуляет.
     const shape = () => {
@@ -3948,9 +3962,9 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
             // холст, а уже тот переносится с вырезкой и масштабом.
             const tmp = newCanvas(size[0], size[1]);
             const tg = tmp && ctx2d(tmp);
-            if (tg) { tg.putImageData(image, 0, 0); g.drawImage(tmp, sx, sy, sw, sh, 0, 0, ow, oh); }
+            if (tg) { put(tg, [image, 0, 0]); draw(g, [tmp, sx, sy, sw, sh, 0, 0, ow, oh]); }
           } else {
-            g.drawImage(image, sx, sy, sw, sh, 0, 0, ow, oh);
+            draw(g, [image, sx, sy, sw, sh, 0, 0, ow, oh]);
           }
         } catch (e) {}
       }
@@ -5993,6 +6007,43 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     return null;
   };
   const parseColor = (c) => parseColorRaw(c) || [0, 0, 0, 255];
+  // Цвет так, как его печатает `getComputedStyle`: браузер приводит всякую
+  // запись sRGB к `rgb(r, g, b)` (или `rgba(…)` с долей), а записи в своих
+  // пространствах — `lab`, `oklch`, `color()` — оставляет как есть. Доля
+  // берётся из самой записи, а не из округлённого байта: `0.9` у браузера так
+  // и остаётся `0.9`, а не превращается в `0.902`.
+  try {
+    Object.defineProperty(globalThis, '__pt_cssColour', {
+      value: (v) => {
+        const t = String(v == null ? '' : v).trim();
+        const low = t.toLowerCase();
+        if (!low) return null;
+        if (/^(color|lab|lch|oklab|oklch|color-mix|var|calc|attr|light-dark)\(/.test(low)) return null;
+        if (low === 'transparent') return 'rgba(0, 0, 0, 0)';
+        if (low === 'currentcolor') return null;
+        const c = parseColorRaw(low);
+        if (!c) return null;
+        let a = c[3] / 255;
+        const m = /^(?:rgba?|hsla?|hwb)\(([^]*)\)$/.exec(low);
+        if (m) {
+          const body = m[1];
+          const slash = body.lastIndexOf('/');
+          let txt = null;
+          if (slash >= 0) txt = body.slice(slash + 1).trim();
+          else { const parts = body.split(','); if (parts.length === 4) txt = parts[3].trim(); }
+          if (txt != null && txt !== '') {
+            const val = /%$/.test(txt) ? parseFloat(txt) / 100 : parseFloat(txt);
+            if (!Number.isNaN(val)) a = val;
+          }
+        }
+        a = Math.max(0, Math.min(1, a));
+        return a >= 1
+          ? 'rgb(' + c[0] + ', ' + c[1] + ', ' + c[2] + ')'
+          : 'rgba(' + c[0] + ', ' + c[1] + ', ' + c[2] + ', ' + (Math.round(a * 1000) / 1000) + ')';
+      },
+      enumerable: false, configurable: true, writable: true,
+    });
+  } catch (e) {}
   // Запись цвета обратно: браузер отдаёт `#rrggbb`, а полупрозрачный —
   // `rgba(r, g, b, a)`. Мы возвращали строку страницы как есть.
   const serializeColor = (rgba) => {

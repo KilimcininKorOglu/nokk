@@ -130,7 +130,7 @@
     namedItem(n) {
       for (let i = 0; i < this.length; i++) {
         const e = this[i];
-        if (e && (e.id === n || (e.getAttribute && e.getAttribute('name') === n))) return e;
+        if (e && (e.id === n || (e.getAttribute && __ptGetA(e, 'name') === n))) return e;
       }
       return null;
     },
@@ -168,11 +168,11 @@
       for (let i = 0; i < this.length; i++) if (this[i].name === k) return this[i];
       return null; },
     getNamedItemNS(_ns, n) { return this.getNamedItem(n); },
-    setNamedItem(a) { if (a && this.__ptOwner) this.__ptOwner.setAttribute(a.name, a.value); return null; },
+    setNamedItem(a) { if (a && this.__ptOwner) __ptSetA(this.__ptOwner, a.name, a.value); return null; },
     setNamedItemNS(a) { return this.setNamedItem(a); },
     removeNamedItem(n) { const a = this.getNamedItem(n);
       if (!a) throw new Error("Failed to execute 'removeNamedItem' on 'NamedNodeMap': No item with name '" + n + "' was found.");
-      this.__ptOwner.removeAttribute(a.name); return a; },
+      __ptDelA(this.__ptOwner, a.name); return a; },
     removeNamedItemNS(_ns, n) { return this.removeNamedItem(n); },
     [Symbol.iterator]() { let i = 0; const self = this;
       return { next: () => i < self.length ? { value: self[i++], done: false } : { value: undefined, done: true } }; },
@@ -190,27 +190,27 @@
   // а не литерал с методами.
   const __tokenListProto = {
     get [Symbol.toStringTag]() { return 'DOMTokenList'; },
-    get value() { return this.__ptEl.getAttribute('class') || ''; },
-    set value(v) { this.__ptEl.setAttribute('class', String(v)); },
+    get value() { return __ptGetA(this.__ptEl, 'class') || ''; },
+    set value(v) { __ptSetA(this.__ptEl, 'class', String(v)); },
     get length() { return this.__ptTokens().length; },
     item(i) { const t = this.__ptTokens(); return i >= 0 && i < t.length ? t[i] : null; },
     contains(c) { return this.__ptTokens().includes(String(c)); },
     add(...cs) { const t = this.__ptTokens();
       for (const c of cs) if (!t.includes(String(c))) t.push(String(c));
-      this.__ptEl.setAttribute('class', t.join(' ')); },
+      __ptSetA(this.__ptEl, 'class', t.join(' ')); },
     remove(...cs) { const drop = cs.map(String);
-      this.__ptEl.setAttribute('class', this.__ptTokens().filter((c) => !drop.includes(c)).join(' ')); },
+      __ptSetA(this.__ptEl, 'class', this.__ptTokens().filter((c) => !drop.includes(c)).join(' ')); },
     toggle(c, force) { const t = this.__ptTokens(), has = t.includes(String(c));
       if (force === true || (force === undefined && !has)) {
         if (!has) t.push(String(c));
-        this.__ptEl.setAttribute('class', t.join(' '));
+        __ptSetA(this.__ptEl, 'class', t.join(' '));
         return true;
       }
-      this.__ptEl.setAttribute('class', t.filter((x) => x !== String(c)).join(' '));
+      __ptSetA(this.__ptEl, 'class', t.filter((x) => x !== String(c)).join(' '));
       return false; },
     replace(from, to) { const t = this.__ptTokens(), i = t.indexOf(String(from));
       if (i < 0) return false;
-      t[i] = String(to); this.__ptEl.setAttribute('class', t.join(' ')); return true; },
+      t[i] = String(to); __ptSetA(this.__ptEl, 'class', t.join(' ')); return true; },
     supports() { throw new TypeError("Failed to execute 'supports' on 'DOMTokenList': DOMTokenList has no supported tokens."); },
     forEach(fn, thisArg) { this.__ptTokens().forEach((v, i) => fn.call(thisArg, v, i, this)); },
     *entries() { const t = this.__ptTokens(); for (let i = 0; i < t.length; i++) yield [i, t[i]]; },
@@ -226,7 +226,7 @@
       list = Object.create(proto);
       Object.defineProperty(list, '__ptEl', { value: el });
       Object.defineProperty(list, '__ptTokens', {
-        value: () => (el.getAttribute('class') || '').split(/\s+/).filter(Boolean),
+        value: () => (__ptGetA(el, 'class') || '').split(/\s+/).filter(Boolean),
       });
       Object.defineProperty(el, '__ptTokenList', { value: list, enumerable: false, writable: true });
     }
@@ -305,7 +305,7 @@
         for (const c of child.__ptKids.slice()) this.insertBefore(c, ref);
         return child;
       }
-      if (child.parentNode) child.parentNode.removeChild(child);
+      if (child.parentNode) __ptDrop.call(child.parentNode, child);
       const i = (ref === null || ref === undefined) ? -1 : this.__ptKids.indexOf(ref);
       if (i < 0) this.__ptKids.push(child); else this.__ptKids.splice(i, 0, child);
       child.parentNode = this;
@@ -370,7 +370,7 @@
     set textContent(v) {
       if (this.nodeType === 9 || this.nodeType === 10) return;
       this.__ptKids = [];
-      if (v !== '') this.appendChild(new Text(String(v)));
+      if (v !== '') __ptAdd.call(this, new Text(String(v)));
     }
 
     // EventTarget
@@ -601,7 +601,7 @@
       const k = this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE);
       return k.length ? k[k.length - 1] : null;
     }
-    getElementById(id) { return firstMatch(this, (e) => e.getAttribute('id') === String(id)); }
+    getElementById(id) { return firstMatch(this, (e) => __ptGetA(e, 'id') === String(id)); }
     querySelector(sel) {
       __needArgs(arguments.length, 1, 'querySelector', this.constructor && this.constructor.name || 'Element');
       return query(this, __checkSelector(sel, 'querySelector', this.constructor && this.constructor.name || 'Element'))[0] || null;
@@ -664,7 +664,7 @@
       const walk = (n) => {
         for (const c of (n.__ptKids || [])) {
           if (c.nodeType === ELEMENT_NODE) {
-            if (c.__ptLocal === 'style' || (c.__ptLocal === 'link' && /stylesheet/i.test(c.getAttribute('rel') || ''))) {
+            if (c.__ptLocal === 'style' || (c.__ptLocal === 'link' && /stylesheet/i.test(__ptGetA(c, 'rel') || ''))) {
               own.push(c);
             }
             walk(c);
@@ -723,7 +723,7 @@
     const watched = Ctor.observedAttributes;
     if (Array.isArray(watched)) {
       for (const a of watched) {
-        const v = el.getAttribute(a);
+        const v = __ptGetA(el, a);
         if (v !== null) __customCallback(el, 'attributeChangedCallback', [a, null, v, null]);
       }
     }
@@ -818,10 +818,10 @@
     getAttributeNames() { return [...this.__ptAttrs.keys()]; }
     get attributes() { return __namedNodeMap(this); }
 
-    get id() { return this.getAttribute('id') || ''; }
-    set id(v) { this.setAttribute('id', v); }
-    get className() { return this.getAttribute('class') || ''; }
-    set className(v) { this.setAttribute('class', v); }
+    get id() { return __ptGetA(this, 'id') || ''; }
+    set id(v) { __ptSetA(this, 'id', v); }
+    get className() { return __ptGetA(this, 'class') || ''; }
+    set className(v) { __ptSetA(this, 'class', v); }
     get classList() { return __tokenList(this); }
     get dataset() { return makeDataset(this); }
 
@@ -831,7 +831,7 @@
     // widget refused to initialise ("Could not find Turnstile valid script tag").
     get src() { return this.__ptUrlAttr('src'); }
     set src(v) {
-      this.setAttribute('src', v);
+      __ptSetA(this, 'src', v);
       // Картинка идёт в сеть от одного присваивания, без всякого документа:
       // `new Image().src = …` — обычный способ послать GET, и у нас он не
       // посылал ничего. Запрос делает браузер сам, поэтому мимо страничного
@@ -845,7 +845,7 @@
     }
 
     __ptLoadImage() {
-      const raw = this.getAttribute('src');
+      const raw = __ptGetA(this, 'src');
       if (!raw) return;
       let url = raw;
       try { url = new URL(raw, document.baseURI || location.href).href; } catch (e) {}
@@ -879,7 +879,7 @@
     get text() {
       const t = this.tagName;
       if (t === 'SCRIPT' || t === 'TITLE' || t === 'OPTION' || t === 'A') return this.textContent || '';
-      return this.getAttribute('text');
+      return __ptGetA(this, 'text');
     }
     set text(v) {
       this.textContent = String(v);
@@ -888,22 +888,22 @@
     // `srcdoc` — документ, написанный прямо в атрибуте: у него нет адреса, и
     // отражается он как есть. Присвоение после вставки в документ означает
     // новый документ в этом окне, как навигация.
-    get srcdoc() { const v = this.getAttribute('srcdoc'); return v === null ? '' : v; }
+    get srcdoc() { const v = __ptGetA(this, 'srcdoc'); return v === null ? '' : v; }
     set srcdoc(v) {
-      this.setAttribute('srcdoc', v);
+      __ptSetA(this, 'srcdoc', v);
       if (this.__ptLocal !== 'iframe') return;
       try {
         const w = this.__ptRealm || (this.isConnected ? this.__ptRealmWindow() : null);
         if (w && typeof w.__pt_writeDocument === 'function') w.__pt_writeDocument(String(v));
       } catch (e) {}
     }
-    get sandbox() { return this.getAttribute('sandbox') || ''; }
-    set sandbox(v) { this.setAttribute('sandbox', v); }
-    get allow() { return this.getAttribute('allow') || ''; }
-    set allow(v) { this.setAttribute('allow', v); }
+    get sandbox() { return __ptGetA(this, 'sandbox') || ''; }
+    set sandbox(v) { __ptSetA(this, 'sandbox', v); }
+    get allow() { return __ptGetA(this, 'allow') || ''; }
+    set allow(v) { __ptSetA(this, 'allow', v); }
     get href() { return this.__ptUrlAttr('href'); }
     set href(v) {
-      this.setAttribute('href', v);
+      __ptSetA(this, 'href', v);
       // `<link>` — тоже запрос: предзагрузка, стиль, значок. Браузер идёт за
       // ними сам, а мы не ходили ни за одним, и `rel=preload` не отправлял
       // ничего вовсе.
@@ -911,11 +911,11 @@
     }
 
     __ptLoadLink() {
-      const rel = String(this.getAttribute('rel') || '').toLowerCase();
+      const rel = String(__ptGetA(this, 'rel') || '').toLowerCase();
       // Загружаемые виды: остальные (`alternate`, `canonical`, `dns-prefetch`)
       // в браузере запроса не делают.
       if (!/^(stylesheet|preload|prefetch|modulepreload|icon|shortcut icon|apple-touch-icon|manifest|prerender)$/.test(rel)) return;
-      const raw = this.getAttribute('href');
+      const raw = __ptGetA(this, 'href');
       if (!raw) return;
       let url = raw;
       try { url = new URL(raw, document.baseURI || location.href).href; } catch (e) {}
@@ -956,7 +956,7 @@
     __ptLinkURL() {
       const tag = this.__ptLocal;
       if (tag !== 'a' && tag !== 'area') return undefined;
-      const raw = this.getAttribute('href');
+      const raw = __ptGetA(this, 'href');
       if (raw == null) return undefined;
       const base = (globalThis.location && location.href) || 'about:blank';
       try { return new URL(raw, base); } catch (e) { return undefined; }
@@ -964,69 +964,69 @@
     __ptSetLinkPart(part, v) {
       const u = this.__ptLinkURL();
       if (!u) return;
-      try { u[part] = v; this.setAttribute('href', u.href); } catch (e) {}
+      try { u[part] = v; __ptSetA(this, 'href', u.href); } catch (e) {}
     }
     get action() { return this.__ptUrlAttr('action'); }
-    set action(v) { this.setAttribute('action', v); }
+    set action(v) { __ptSetA(this, 'action', v); }
     __ptUrlAttr(n) {
-      const raw = this.getAttribute(n);
+      const raw = __ptGetA(this, n);
       if (raw == null) return '';
       const base = (globalThis.location && location.href) || 'about:blank';
       try { return new URL(raw, base).href; } catch (e) { return raw; }
     }
 
     // Plain string/boolean reflections a page can read back off an element.
-    get rel() { return this.getAttribute('rel') || ''; }
-    set rel(v) { this.setAttribute('rel', v); }
-    get target() { return this.getAttribute('target') || ''; }
-    set target(v) { this.setAttribute('target', v); }
-    get alt() { return this.getAttribute('alt') || ''; }
-    set alt(v) { this.setAttribute('alt', v); }
-    get integrity() { return this.getAttribute('integrity') || ''; }
-    set integrity(v) { this.setAttribute('integrity', v); }
-    get nonce() { return this.getAttribute('nonce') || ''; }
-    set nonce(v) { this.setAttribute('nonce', v); }
-    get crossOrigin() { return this.hasAttribute('crossorigin') ? (this.getAttribute('crossorigin') || 'anonymous') : null; }
-    set crossOrigin(v) { this.setAttribute('crossorigin', v); }
-    get referrerPolicy() { return this.getAttribute('referrerpolicy') || ''; }
-    set referrerPolicy(v) { this.setAttribute('referrerpolicy', v); }
-    get async() { return this.hasAttribute('async'); }
-    set async(v) { v ? this.setAttribute('async', '') : this.removeAttribute('async'); }
-    get defer() { return this.hasAttribute('defer'); }
-    set defer(v) { v ? this.setAttribute('defer', '') : this.removeAttribute('defer'); }
+    get rel() { return __ptGetA(this, 'rel') || ''; }
+    set rel(v) { __ptSetA(this, 'rel', v); }
+    get target() { return __ptGetA(this, 'target') || ''; }
+    set target(v) { __ptSetA(this, 'target', v); }
+    get alt() { return __ptGetA(this, 'alt') || ''; }
+    set alt(v) { __ptSetA(this, 'alt', v); }
+    get integrity() { return __ptGetA(this, 'integrity') || ''; }
+    set integrity(v) { __ptSetA(this, 'integrity', v); }
+    get nonce() { return __ptGetA(this, 'nonce') || ''; }
+    set nonce(v) { __ptSetA(this, 'nonce', v); }
+    get crossOrigin() { return __ptHasA(this, 'crossorigin') ? (__ptGetA(this, 'crossorigin') || 'anonymous') : null; }
+    set crossOrigin(v) { __ptSetA(this, 'crossorigin', v); }
+    get referrerPolicy() { return __ptGetA(this, 'referrerpolicy') || ''; }
+    set referrerPolicy(v) { __ptSetA(this, 'referrerpolicy', v); }
+    get async() { return __ptHasA(this, 'async'); }
+    set async(v) { v ? __ptSetA(this, 'async', '') : __ptDelA(this, 'async'); }
+    get defer() { return __ptHasA(this, 'defer'); }
+    set defer(v) { v ? __ptSetA(this, 'defer', '') : __ptDelA(this, 'defer'); }
     // `'noModule' in script` — как страница спрашивает, умеет ли браузер модули.
     // Без этого свойства мы для любой сборки Vite — браузер из позапрошлой эпохи,
     // и нам присылают legacy-половину.
-    get noModule() { return this.hasAttribute('nomodule'); }
-    set noModule(v) { v ? this.setAttribute('nomodule', '') : this.removeAttribute('nomodule'); }
-    get hreflang() { return this.getAttribute('hreflang') || ''; }
-    set hreflang(v) { this.setAttribute('hreflang', v); }
-    get content() { return this.getAttribute('content') || ''; }
-    set content(v) { this.setAttribute('content', v); }
-    get httpEquiv() { return this.getAttribute('http-equiv') || ''; }
-    set httpEquiv(v) { this.setAttribute('http-equiv', v); }
-    get loading() { return this.getAttribute('loading') || 'auto'; }
-    set loading(v) { this.setAttribute('loading', v); }
-    get maxLength() { const v = parseInt(this.getAttribute('maxlength'), 10); return Number.isFinite(v) ? v : -1; }
-    set maxLength(v) { this.setAttribute('maxlength', String(v)); }
-    get minLength() { const v = parseInt(this.getAttribute('minlength'), 10); return Number.isFinite(v) ? v : -1; }
-    set minLength(v) { this.setAttribute('minlength', String(v)); }
-    get defaultValue() { return this.getAttribute('value') || ''; }
-    set defaultValue(v) { this.setAttribute('value', v); }
+    get noModule() { return __ptHasA(this, 'nomodule'); }
+    set noModule(v) { v ? __ptSetA(this, 'nomodule', '') : __ptDelA(this, 'nomodule'); }
+    get hreflang() { return __ptGetA(this, 'hreflang') || ''; }
+    set hreflang(v) { __ptSetA(this, 'hreflang', v); }
+    get content() { return __ptGetA(this, 'content') || ''; }
+    set content(v) { __ptSetA(this, 'content', v); }
+    get httpEquiv() { return __ptGetA(this, 'http-equiv') || ''; }
+    set httpEquiv(v) { __ptSetA(this, 'http-equiv', v); }
+    get loading() { return __ptGetA(this, 'loading') || 'auto'; }
+    set loading(v) { __ptSetA(this, 'loading', v); }
+    get maxLength() { const v = parseInt(__ptGetA(this, 'maxlength'), 10); return Number.isFinite(v) ? v : -1; }
+    set maxLength(v) { __ptSetA(this, 'maxlength', String(v)); }
+    get minLength() { const v = parseInt(__ptGetA(this, 'minlength'), 10); return Number.isFinite(v) ? v : -1; }
+    set minLength(v) { __ptSetA(this, 'minlength', String(v)); }
+    get defaultValue() { return __ptGetA(this, 'value') || ''; }
+    set defaultValue(v) { __ptSetA(this, 'value', v); }
     // Поля, которые участвуют в проверке формы: у неотключённой кнопки или
     // поля это `true`, и страницы это читают.
     get willValidate() {
-      const t = String(this.getAttribute('type') || '').toLowerCase();
+      const t = String(__ptGetA(this, 'type') || '').toLowerCase();
       if (this.__ptLocal !== 'input' && this.__ptLocal !== 'textarea' && this.__ptLocal !== 'select') return undefined;
-      return !this.hasAttribute('disabled') && !this.hasAttribute('readonly')
+      return !__ptHasA(this, 'disabled') && !__ptHasA(this, 'readonly')
              && t !== 'hidden' && t !== 'button' && t !== 'reset';
     }
     // Список маркеров, а не строка: `rel`, `sandbox`, `relList` в браузере
     // это `DOMTokenList`, и страница читает у них `length` и перебирает.
     get relList() { return makeClassList(this, 'rel'); }
     get sandbox() { return makeClassList(this, 'sandbox'); }
-    get htmlFor() { return this.getAttribute('for') || ''; }
-    set htmlFor(v) { this.setAttribute('for', v); }
+    get htmlFor() { return __ptGetA(this, 'for') || ''; }
+    set htmlFor(v) { __ptSetA(this, 'for', v); }
 
     get children() { return __collection(this.__ptKids.filter(n => n.nodeType === ELEMENT_NODE)); }
     get childElementCount() { return this.children.length; }
@@ -1104,7 +1104,7 @@
     __ptRealmWindow() {
       if (this.__ptLocal !== 'iframe' || !this.isConnected) return null;
       if (this.__ptRealm) return this.__ptRealm;
-      const src = this.getAttribute('src');
+      const src = __ptGetA(this, 'src');
       if (src && src !== 'about:blank') return null;
       if (typeof globalThis.__pt_makeRealm !== 'function') return null;
       const w = globalThis.__pt_makeRealm();
@@ -1118,7 +1118,7 @@
       // Пустое окно — не пустой документ: у браузера там html/head/body, и
       // страница туда пишет. `srcdoc` кладётся тем же путём.
       try {
-        const markup = this.getAttribute('srcdoc');
+        const markup = __ptGetA(this, 'srcdoc');
         if (typeof w.__pt_writeDocument === 'function') w.__pt_writeDocument(markup || '');
       } catch (e) {}
       return w;
@@ -1129,13 +1129,13 @@
     // re-inserted element from running again.
     __ptRunScript() {
       if (this.__ptRan || this.__ptLocal !== 'script') return;
-      const type = String(this.getAttribute('type') || '').toLowerCase().trim();
+      const type = String(__ptGetA(this, 'type') || '').toLowerCase().trim();
       // Anything that is not classic JS — a JSON island, a template, an importmap
       // — is data the page reads itself, not code to run.
       if (type && !/^(text|application)\/(java|ecma)script$|^module$/.test(type)) return;
       // `nomodule` — «это для браузера без модулей». Мы с модулями, значит мимо.
-      if (type !== 'module' && this.hasAttribute('nomodule')) return;
-      const src = this.getAttribute('src');
+      if (type !== 'module' && __ptHasA(this, 'nomodule')) return;
+      const src = __ptGetA(this, 'src');
       // Nothing to run *yet*: an element appended empty starts when its `src`
       // arrives, so the flag must not be set until there is something to do.
       if (!src && !this.textContent) return;
@@ -1175,7 +1175,7 @@
 
     __ptConnectFrame() {
       if (this.__ptFrameId || this.__ptLocal !== 'iframe') return;
-      const src = this.getAttribute('src');
+      const src = __ptGetA(this, 'src');
       // `about:blank` — не адрес, за которым идут в сеть: у браузера это тот же
       // начальный пустой документ, что и у кадра без src, и реалм в нём готов
       // сразу. Отличать их — значит ронять `f.src='about:blank';
@@ -1185,7 +1185,7 @@
       if (blank) {
         // Кадр с `srcdoc` грузится сам, как только попал в документ, — ждать,
         // пока кто-нибудь прочитает `contentWindow`, браузер не заставляет.
-        if (src || this.getAttribute('srcdoc') !== null) { try { this.__ptRealmWindow(); } catch (e) {} }
+        if (src || __ptGetA(this, 'srcdoc') !== null) { try { this.__ptRealmWindow(); } catch (e) {} }
         // Пустой документ тоже загружается: браузер сообщает `load` следующим
         // же оборотом. Мы молчали, и страница, ждущая `iframe.onload`, ждала
         // вечно — а это обычный способ дождаться готового кадра.
@@ -1250,10 +1250,10 @@
           'SyntaxError');
       }
       const nodes = parseFragment(String(html));
-      if (pos === 'beforeend') for (const n of nodes) this.appendChild(n);
-      else if (pos === 'afterbegin') for (const n of nodes.reverse()) this.insertBefore(n, this.firstChild);
-      else if (pos === 'beforebegin') for (const n of nodes) this.parentNode.insertBefore(n, this);
-      else if (pos === 'afterend') for (const n of nodes.reverse()) this.parentNode.insertBefore(n, this.nextSibling);
+      if (pos === 'beforeend') for (const n of nodes) __ptAdd.call(this, n);
+      else if (pos === 'afterbegin') for (const n of nodes.reverse()) __ptInsert.call(this, n, this.firstChild);
+      else if (pos === 'beforebegin') for (const n of nodes) __ptInsert.call(this.parentNode, n, this);
+      else if (pos === 'afterend') for (const n of nodes.reverse()) __ptInsert.call(this.parentNode, n, this.nextSibling);
     }
 
     // Synthetic layout (no real rendering): rendered elements report a non-empty
@@ -1300,7 +1300,7 @@
     }
     // Form-field value (reflects the `value` attribute until edited). Generic so
     // input/textarea typing works; harmless on other elements.
-    get value() { return this.__ptValue !== undefined ? this.__ptValue : (this.getAttribute('value') || ''); }
+    get value() { return this.__ptValue !== undefined ? this.__ptValue : (__ptGetA(this, 'value') || ''); }
     set value(v) { this.__ptValue = String(v); }
     // Common form-field surface, reflected from attributes — drivers gate `fill`
     // and `select` on these (an input with no `type`/`disabled`/`readOnly` fails
@@ -1308,44 +1308,44 @@
     // Неизвестное значение `type` у поля браузер сводит к `text`: страница,
     // которая ставит выдуманный тип и читает его назад, получает `text`.
     get type() {
-      const t = (this.getAttribute('type') || '').toLowerCase();
+      const t = (__ptGetA(this, 'type') || '').toLowerCase();
       if (this.tagName !== 'INPUT') return t;
       const KNOWN = ['button','checkbox','color','date','datetime-local','email','file','hidden',
                      'image','month','number','password','radio','range','reset','search','submit',
                      'tel','text','time','url','week'];
       return KNOWN.indexOf(t) >= 0 ? t : 'text';
     }
-    set type(v) { this.setAttribute('type', v); }
-    get disabled() { return this.hasAttribute('disabled'); }
-    set disabled(v) { if (v) this.setAttribute('disabled', ''); else this.removeAttribute('disabled'); }
-    get readOnly() { return this.hasAttribute('readonly'); }
-    set readOnly(v) { if (v) this.setAttribute('readonly', ''); else this.removeAttribute('readonly'); }
-    get name() { return this.getAttribute('name') || ''; }
-    set name(v) { this.setAttribute('name', v); }
-    get placeholder() { return this.getAttribute('placeholder') || ''; }
+    set type(v) { __ptSetA(this, 'type', v); }
+    get disabled() { return __ptHasA(this, 'disabled'); }
+    set disabled(v) { if (v) __ptSetA(this, 'disabled', ''); else __ptDelA(this, 'disabled'); }
+    get readOnly() { return __ptHasA(this, 'readonly'); }
+    set readOnly(v) { if (v) __ptSetA(this, 'readonly', ''); else __ptDelA(this, 'readonly'); }
+    get name() { return __ptGetA(this, 'name') || ''; }
+    set name(v) { __ptSetA(this, 'name', v); }
+    get placeholder() { return __ptGetA(this, 'placeholder') || ''; }
     // Reflected dimension attributes. Without these, `canvas.width = 200` would
     // create an *own* property on the element (real ones are prototype
     // accessors), which is exactly the tell we hide everywhere else.
     get width() {
-      const v = parseInt(this.getAttribute('width'), 10);
+      const v = parseInt(__ptGetA(this, 'width'), 10);
       if (Number.isFinite(v)) return v;
       if (this.tagName === 'CANVAS') return 300;
       // Без атрибута ширина картинки — её собственная, та, что в файле.
       return this.tagName === 'IMG' ? this.naturalWidth : 0;
     }
     set width(v) {
-      this.setAttribute('width', String(Math.max(0, v | 0)));
+      __ptSetA(this, 'width', String(Math.max(0, v | 0)));
       // Смена размера холста сбрасывает состояние его контекста.
       if (this.__ptCtxResize) this.__ptCtxResize();
     }
     get height() {
-      const v = parseInt(this.getAttribute('height'), 10);
+      const v = parseInt(__ptGetA(this, 'height'), 10);
       if (Number.isFinite(v)) return v;
       if (this.tagName === 'CANVAS') return 150;
       return this.tagName === 'IMG' ? this.naturalHeight : 0;
     }
     set height(v) {
-      this.setAttribute('height', String(Math.max(0, v | 0)));
+      __ptSetA(this, 'height', String(Math.max(0, v | 0)));
       if (this.__ptCtxResize) this.__ptCtxResize();
     }
     // Собственный размер картинки: ноль, пока она не загружена, и настоящий —
@@ -1357,14 +1357,14 @@
       if (this.tagName !== 'IMG' || !this.__ptImgDone || !this.__ptImgAt) return null;
       try { return globalThis.__pt_imageSizeOf ? __pt_imageSizeOf(this.__ptImgAt) : null; } catch (e) { return null; }
     }
-    get checked() { return this.__ptChecked !== undefined ? this.__ptChecked : this.hasAttribute('checked'); }
+    get checked() { return this.__ptChecked !== undefined ? this.__ptChecked : __ptHasA(this, 'checked'); }
     set checked(v) { this.__ptChecked = !!v; }
     get selectionStart() { return String(this.value || '').length; }
     get selectionEnd() { return String(this.value || '').length; }
     select() {}
     setSelectionRange() {}
     setRangeText() {}
-    get isContentEditable() { const v = (this.getAttribute('contenteditable') || '').toLowerCase(); return v === '' || v === 'true'; }
+    get isContentEditable() { const v = (__ptGetA(this, 'contenteditable') || '').toLowerCase(); return v === '' || v === 'true'; }
     click() { this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
 
     __ptShallowClone() {
@@ -1447,12 +1447,12 @@
     // `links` is `<a>`/`<area>` *with an href*, and `anchors` is `<a>` with a name.
     get links() {
       return __collection(__docTags(this, 'a').concat(__docTags(this, 'area'))
-        .filter(e => e.hasAttribute('href')));
+        .filter(e => __ptHasA(e, 'href')));
     }
-    get anchors() { return __collection(__docTags(this, 'a').filter(e => e.hasAttribute('name'))); }
+    get anchors() { return __collection(__docTags(this, 'a').filter(e => __ptHasA(e, 'name'))); }
     get styleSheets() {
       return __styleSheetList(__docTags(this, 'style')
-        .concat(__docTags(this, 'link').filter((e) => /stylesheet/i.test(e.getAttribute('rel') || ''))));
+        .concat(__docTags(this, 'link').filter((e) => /stylesheet/i.test(__ptGetA(e, 'rel') || ''))));
     }
     // Кодировка — объявленная, а не всегда UTF-8: страница без объявления
     // разбирается как windows-1252, и Chrome именно это и сообщает. Отвечать
@@ -1460,10 +1460,10 @@
     get characterSet() {
       if (this.__ptCharset) return this.__ptCharset;
       for (const m of __docTags(this, 'meta')) {
-        const c = m.getAttribute('charset');
+        const c = __ptGetA(m, 'charset');
         if (c) return __normEncoding(c);
-        if (/^content-type$/i.test(m.getAttribute('http-equiv') || '')) {
-          const hit = /charset\s*=\s*"?([\w-]+)/i.exec(m.getAttribute('content') || '');
+        if (/^content-type$/i.test(__ptGetA(m, 'http-equiv') || '')) {
+          const hit = /charset\s*=\s*"?([\w-]+)/i.exec(__ptGetA(m, 'content') || '');
           if (hit) return __normEncoding(hit[1]);
         }
       }
@@ -1981,7 +1981,20 @@
   // не видны никому, а у нас каждая такая мелочь всплывала в чужом крючке.
   const __ptInsert = Node.prototype.insertBefore;
   const __ptAdd = Node.prototype.appendChild;
+  const __ptDrop = Node.prototype.removeChild;
   const __ptSetAttr = Element.prototype.setAttribute;
+  // Чтение и запись атрибутов изнутри движка. Свойства, отражающие атрибут
+  // (`el.src`, `el.id`, `style.color`, `classList`), в браузере не зовут
+  // `getAttribute`/`setAttribute` — это нативная работа, и крючок страницы её
+  // не видит. У нас каждое такое присваивание всплывало чужим вызовом.
+  const __ptAttrGet = Element.prototype.getAttribute;
+  const __ptAttrSet = Element.prototype.setAttribute;
+  const __ptAttrHas = Element.prototype.hasAttribute;
+  const __ptAttrDel = Element.prototype.removeAttribute;
+  const __ptGetA = (el, n) => __ptAttrGet.call(el, n);
+  const __ptSetA = (el, n, v) => __ptAttrSet.call(el, n, v);
+  const __ptHasA = (el, n) => __ptAttrHas.call(el, n);
+  const __ptDelA = (el, n) => __ptAttrDel.call(el, n);
 
   // Холст для собственных нужд движка. Ни `document.createElement`, ни
   // `getContext` со страницы здесь не участвуют: всякий, кто их обернул — а
@@ -2027,8 +2040,8 @@
   // ---- helpers: classList, dataset, style -----------------------------------
   function makeClassList(el, attr) {
     const name = attr || 'class';
-    const get = () => (el.getAttribute(name) || '').split(/\s+/).filter(Boolean);
-    const set = (arr) => el.setAttribute(name, arr.join(' '));
+    const get = () => (__ptGetA(el, name) || '').split(/\s+/).filter(Boolean);
+    const set = (arr) => __ptSetA(el, name, arr.join(' '));
     // Настоящий `DOMTokenList`, а не литерал: он перебирается, индексируется и
     // называет себя. `[...el.classList]` у нас бросал — а это одна из самых
     // ходовых строк на любой странице.
@@ -2058,7 +2071,7 @@
     });
     Object.defineProperty(api, 'length', { get: () => get().length, configurable: true });
     Object.defineProperty(api, 'value', {
-      get: () => get().join(' '), set: (v) => el.setAttribute(name, String(v)), configurable: true,
+      get: () => get().join(' '), set: (v) => __ptSetA(el, name, String(v)), configurable: true,
     });
     // Числовые ключи живые: список читается из атрибута при каждом обращении.
     return new Proxy(api, {
@@ -2601,8 +2614,8 @@
       Object.defineProperty(sheet, 'href', { value: href, enumerable: true, configurable: true });
       Object.defineProperty(sheet, 'type', { value: 'text/css', enumerable: true, configurable: true });
       Object.defineProperty(sheet, 'disabled', { value: false, writable: true, enumerable: true, configurable: true });
-      Object.defineProperty(sheet, 'title', { value: owner.getAttribute('title'), enumerable: true, configurable: true });
-      Object.defineProperty(sheet, 'media', { value: __mediaList(owner.getAttribute('media') || ''), enumerable: true, configurable: true });
+      Object.defineProperty(sheet, 'title', { value: __ptGetA(owner, 'title'), enumerable: true, configurable: true });
+      Object.defineProperty(sheet, 'media', { value: __mediaList(__ptGetA(owner, 'media') || ''), enumerable: true, configurable: true });
       Object.defineProperty(sheet, 'parentStyleSheet', { value: null, enumerable: true, configurable: true });
       Object.defineProperty(sheet, 'ownerRule', { value: null, enumerable: true, configurable: true });
     }
@@ -2630,11 +2643,11 @@
   function makeDataset(el) {
     const target = {};
     for (const k of el.getAttributeNames()) if (k.startsWith('data-'))
-      target[camel(k.slice(5))] = el.getAttribute(k);
+      target[camel(k.slice(5))] = __ptGetA(el, k);
     return new Proxy(target, {
-      get: (t, p) => el.getAttribute('data-' + dash(String(p))) ?? undefined,
-      set: (t, p, v) => { el.setAttribute('data-' + dash(String(p)), v); return true; },
-      has: (t, p) => el.hasAttribute('data-' + dash(String(p))),
+      get: (t, p) => __ptGetA(el, 'data-' + dash(String(p))) ?? undefined,
+      set: (t, p, v) => { __ptSetA(el, 'data-' + dash(String(p)), v); return true; },
+      has: (t, p) => __ptHasA(el, 'data-' + dash(String(p))),
     });
   }
   const camel = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
@@ -2711,7 +2724,7 @@
       },
       function cssText(v) {
         const s = st(this); if (!s) return;
-        if (s.el && s.el.setAttribute) s.el.setAttribute('style', String(v));
+        if (s.el && s.el.setAttribute) __ptSetA(s.el, 'style', String(v));
         __markDirty();
       });
     return proto;
@@ -2720,7 +2733,7 @@
   function makeStyle(el) {
     let cachedText = null, cachedMap = new Map();
     const read = () => {
-      const text = String((el && el.getAttribute && el.getAttribute('style')) || '');
+      const text = String((el && el.getAttribute && __ptGetA(el, 'style')) || '');
       if (text === cachedText) return cachedMap;
       const m = new Map();
       for (const part of text.split(';')) {
@@ -2749,7 +2762,7 @@
       // Точка с запятой в конце обязательна: браузер её ставит.
       const text = __styleEntries(m).map(([k, v]) => `${k}: ${v};`).join(' ');
       cachedText = text; cachedMap = m;
-      if (el && el.setAttribute) el.setAttribute('style', text);
+      if (el && el.setAttribute) __ptSetA(el, 'style', text);
       reindex(__styleNames(m));
       __markDirty();
     };
@@ -2827,10 +2840,10 @@
         const am = /^\s*([\w-]+)\s*(?:([~^$*|]?=)\s*(.*?))?\s*$/.exec(tok.slice(1, -1));
         if (!am) { tests.push(() => false); continue; }
         const name = am[1], op = am[2];
-        if (!op) { tests.push(e => e.hasAttribute(name)); continue; }
+        if (!op) { tests.push(e => __ptHasA(e, name)); continue; }
         const val = (am[3] || '').replace(/^["']|["']$/g, '');
         tests.push(e => {
-          const a = e.getAttribute(name);
+          const a = __ptGetA(e, name);
           if (a == null) return false;
           switch (op) {
             case '=': return a === val;
@@ -3073,7 +3086,7 @@
     if (spec.tag === 'script') {
       Object.defineProperty(el, '__ptRan', { value: true, configurable: true, enumerable: false });
     }
-    for (const [name, value] of spec.attrs) el.setAttribute(name, value);
+    for (const [name, value] of spec.attrs) __ptSetA(el, name, value);
     // Разбор кладёт детей шаблона в его содержимое, а сам элемент оставляет
     // пустым — `t.childNodes.length === 0` и в браузере тоже.
     const into = spec.tag === 'template' ? __templateContent(el) : el;
@@ -3132,7 +3145,7 @@
           const a = this.attributes || [], b = other.attributes || [];
           if (a.length !== b.length) return false;
           for (let i = 0; i < a.length; i++) {
-            if (other.getAttribute(a[i].name) !== a[i].value) return false;
+            if (__ptGetA(other, a[i].name) !== a[i].value) return false;
           }
         }
         const x = this.childNodes, y = other.childNodes;
@@ -3288,7 +3301,7 @@
     if (!proto) continue;
     Object.defineProperty(proto, 'sheet', {
       get() {
-        if (this.__ptLocal === 'link' && !/stylesheet/i.test(this.getAttribute('rel') || '')) return null;
+        if (this.__ptLocal === 'link' && !/stylesheet/i.test(__ptGetA(this, 'rel') || '')) return null;
         if (!this.isConnected) return null;
         return globalThis.__pt_sheetFor ? __pt_sheetFor(this) : null;
       },
@@ -3304,7 +3317,7 @@
     if (proto) {
       Object.defineProperty(proto, 'complete', {
         get() {
-          const src = this.getAttribute('src');
+          const src = __ptGetA(this, 'src');
           if (!src) return true;
           return !!this.__ptImgDone;
         },
@@ -3322,8 +3335,8 @@
         enumerable: true, configurable: true,
       });
       const attr = (name, want) => Object.defineProperty(proto, name, {
-        get() { const v = this.getAttribute(want); return v === null ? (want === 'shadowrootmode' ? '' : false) : (want === 'shadowrootmode' ? v : true); },
-        set(v) { if (want === 'shadowrootmode') this.setAttribute(want, String(v)); else if (v) this.setAttribute(want, ''); else this.removeAttribute(want); },
+        get() { const v = __ptGetA(this, want); return v === null ? (want === 'shadowrootmode' ? '' : false) : (want === 'shadowrootmode' ? v : true); },
+        set(v) { if (want === 'shadowrootmode') __ptSetA(this, want, String(v)); else if (v) __ptSetA(this, want, ''); else __ptDelA(this, want); },
         enumerable: true, configurable: true,
       });
       attr('shadowRootMode', 'shadowrootmode');
@@ -3411,7 +3424,7 @@
       scaleNonUniform() { return svgMatrix(); }, rotateFromVector() { return svgMatrix(); },
     });
     const num = (el, name, dflt) => {
-      const v = parseFloat(el.getAttribute && el.getAttribute(name));
+      const v = parseFloat(el.getAttribute && __ptGetA(el, name));
       return Number.isFinite(v) ? v : (dflt || 0);
     };
 
@@ -3470,7 +3483,7 @@
     };
     const outline = (el) => {
       const t = (el.localName || '').toLowerCase();
-      if (t === 'path') return pathPoints(el.getAttribute('d'));
+      if (t === 'path') return pathPoints(__ptGetA(el, 'd'));
       if (t === 'line') return [[num(el, 'x1'), num(el, 'y1')], [num(el, 'x2'), num(el, 'y2')]];
       if (t === 'rect') { const x = num(el, 'x'), y = num(el, 'y'), w = num(el, 'width'), h = num(el, 'height');
         return [[x, y], [x + w, y], [x + w, y + h], [x, y + h], [x, y]]; }
@@ -3479,7 +3492,7 @@
       if (t === 'ellipse') { const cx = num(el, 'cx'), cy = num(el, 'cy'), rx = num(el, 'rx'), ry = num(el, 'ry');
         return [[cx - rx, cy - ry], [cx + rx, cy + ry]]; }
       if (t === 'polyline' || t === 'polygon') {
-        const nums = String(el.getAttribute('points') || '').match(/-?[\d.]+/g) || [];
+        const nums = String(__ptGetA(el, 'points') || '').match(/-?[\d.]+/g) || [];
         const pts = []; for (let k = 0; k + 1 < nums.length; k += 2) pts.push([+nums[k], +nums[k+1]]);
         return pts;
       }
@@ -3568,7 +3581,7 @@
     }
     const svgEl = P('SVGSVGElement');
     acc(svgEl, 'viewBox', function viewBox() {
-      const n = String(this.getAttribute('viewBox') || '').match(/-?[\d.]+/g) || [];
+      const n = String(__ptGetA(this, 'viewBox') || '').match(/-?[\d.]+/g) || [];
       const r = svgRect(+n[0] || 0, +n[1] || 0, +n[2] || 0, +n[3] || 0);
       return wrap('SVGAnimatedRect', { baseVal: r, animVal: r });
     });
@@ -3652,8 +3665,8 @@
   // `hidden` — отражаемый атрибут HTMLElement: мы его читали внутри себя, но
   // наружу не отдавали вовсе, хотя в браузере он есть у каждого элемента.
   Object.defineProperty(__htmlProto, 'hidden', {
-    get() { return this.hasAttribute('hidden'); },
-    set(v) { if (v) this.setAttribute('hidden', ''); else this.removeAttribute('hidden'); },
+    get() { return __ptHasA(this, 'hidden'); },
+    set(v) { if (v) __ptSetA(this, 'hidden', ''); else __ptDelA(this, 'hidden'); },
     enumerable: true, configurable: true,
   });
 
@@ -4088,8 +4101,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     // атрибутах, а раскладка к моменту вопроса может быть ещё прошлой.
     const px = (v) => { const n = parseFloat(v); return Number.isFinite(n) && n > 0 ? Math.round(n) : 0; };
     let w = 0, h = 0;
-    try { w = px(el.style && el.style.width) || px(el.getAttribute('width')); } catch (e) {}
-    try { h = px(el.style && el.style.height) || px(el.getAttribute('height')); } catch (e) {}
+    try { w = px(el.style && el.style.width) || px(__ptGetA(el, 'width')); } catch (e) {}
+    try { h = px(el.style && el.style.height) || px(__ptGetA(el, 'height')); } catch (e) {}
     // Только заявленный размер: спросить раскладку значит построить её прямо
     // сейчас, посреди загрузки, и заморозить в недостроенном виде — страница
     // потом получала нулевые коробки. Не заявлен — размер по умолчанию, как у
@@ -4421,9 +4434,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const IP = globalThis.HTMLImageElement && globalThis.HTMLImageElement.prototype;
     if (IP) {
       Object.defineProperty(IP, 'src', {
-        get() { return this.__ptUrlAttr ? this.__ptUrlAttr('src') : (this.getAttribute('src') || ''); },
+        get() { return this.__ptUrlAttr ? this.__ptUrlAttr('src') : (__ptGetA(this, 'src') || ''); },
         set(v) {
-          this.setAttribute('src', v);
+          __ptSetA(this, 'src', v);
           if (this.__ptLoadImage) this.__ptLoadImage();
         },
         enumerable: true, configurable: true,
@@ -4552,9 +4565,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   function __isHiddenEl(el) {
     if (__UNRENDERED.has(el.tagName)) return true;
     if (__hiddenBySheet.has(el)) return true;
-    if (el.hasAttribute && el.hasAttribute('hidden')) return true;
+    if (el.hasAttribute && __ptHasA(el, 'hidden')) return true;
     // Скрытое поле формы ничего не занимает — и строки тоже.
-    if (el.tagName === 'INPUT' && /^hidden$/i.test(el.getAttribute('type') || '')) return true;
+    if (el.tagName === 'INPUT' && /^hidden$/i.test(__ptGetA(el, 'type') || '')) return true;
     const s = el.style;
     if (s) {
       const d = String(s.display || '').toLowerCase();
@@ -4657,15 +4670,23 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (ok) won.push(r);
     }
     won.sort((a, b) => (a.spec - b.spec) || (a.order - b.order));
+    // Сокращения раскладываются здесь, а не при выдаче: на каскад смотрят и
+    // раскладка, и использованный кегль, и вычисленный стиль — и каждый из них
+    // раньше не видел, что `font: 14px/1.5 Georgia` задаёт `font-size`.
+    const take = (n, v) => {
+      const pairs = typeof __ptExpand === 'function' ? __ptExpand(n, v) : null;
+      if (pairs) { for (const [k, val] of pairs) out.set(k, val); return; }
+      out.set(n, v);
+    };
     for (const r of won) {
       const d = r.style;
       for (let i = 0; i < d.length; i++) {
         const n = d.item(i);
-        out.set(n, d.getPropertyValue(n));
+        take(n, d.getPropertyValue(n));
       }
     }
     const own = el.style;
-    if (own) for (let i = 0; i < own.length; i++) out.set(own.item(i), own.getPropertyValue(own.item(i)));
+    if (own) for (let i = 0; i < own.length; i++) take(own.item(i), own.getPropertyValue(own.item(i)));
     __styleCache.set(el, out);
     return out;
   }
@@ -4759,7 +4780,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   const UA_FORM_FONT = 13.3333;
   function __uaBox(el, tag) {
     if (tag === 'input') {
-      const t = String((el.getAttribute && el.getAttribute('type')) || 'text').toLowerCase();
+      const t = String((el.getAttribute && __ptGetA(el, 'type')) || 'text').toLowerCase();
       if (t === 'checkbox') return { w: 13, h: 13, p: [0, 0], b: 0, m: [3, 3] };
       if (t === 'radio') return { w: 13, h: 13, p: [0, 0], b: 0, m: [3, 3] };
       if (t === 'range') return { w: 129, h: 16, p: [0, 0], b: 0, m: [2, 2] };
@@ -4844,13 +4865,13 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const explicitW = len('width', availW);
     const explicitH = len('height', availW);
     const frame = tag === 'iframe' || tag === 'img' || tag === 'canvas' || tag === 'video';
-    const attrW = frame && el.getAttribute ? __lengthPx(el.getAttribute('width'), fs, availW) : null;
-    const attrH = frame && el.getAttribute ? __lengthPx(el.getAttribute('height'), fs, availW) : null;
+    const attrW = frame && el.getAttribute ? __lengthPx(__ptGetA(el, 'width'), fs, availW) : null;
+    const attrH = frame && el.getAttribute ? __lengthPx(__ptGetA(el, 'height'), fs, availW) : null;
 
     let cw = explicitW != null ? explicitW : attrW;
     if (cw == null && ua) {
       cw = ua.label
-        ? __textWidth((el.getAttribute && el.getAttribute('value')) || __OWN_TEXT(el) || ua.dflt || '',
+        ? __textWidth((el.getAttribute && __ptGetA(el, 'value')) || __OWN_TEXT(el) || ua.dflt || '',
                       fs, family, bold, false)
         : ua.w;
     }
@@ -4982,8 +5003,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     };
     const st = el.style;
     if (st) { out.w = px(st.width); out.h = px(st.height); }
-    if (out.w == null && el.getAttribute) out.w = px(el.getAttribute('width'));
-    if (out.h == null && el.getAttribute) out.h = px(el.getAttribute('height'));
+    if (out.w == null && el.getAttribute) out.w = px(__ptGetA(el, 'width'));
+    if (out.h == null && el.getAttribute) out.h = px(__ptGetA(el, 'height'));
     return out;
   }
 
@@ -5063,6 +5084,218 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     return null;
   };
 
+  // Сокращённые свойства. В вычисленном стиле браузер их не показывает вовсе
+  // — только длинные, — а значение раскладывает по ним сам. Мы же клали в
+  // ответ и само сокращение (лишнее имя в перечислении), и оставляли длинные
+  // при начальных значениях: `background: blue` не давало `background-color`,
+  // `border: 2px solid red` — ни цвета, ни стиля.
+  const CS_SIDES = ['top', 'right', 'bottom', 'left'];
+  const __ptIsColour = (t) => !!(globalThis.__pt_cssColour && globalThis.__pt_cssColour(t))
+    || /^(currentcolor|transparent)$/i.test(t)
+    || /^(color|lab|lch|oklab|oklch|color-mix|light-dark)\(/i.test(t);
+  const CS_BORDER_STYLES = new Set(['none', 'hidden', 'dotted', 'dashed', 'solid', 'double',
+    'groove', 'ridge', 'inset', 'outset']);
+  const CS_WIDTH_WORDS = { thin: '1px', medium: '3px', thick: '5px' };
+  // Разбиение по пробелам верхнего уровня: `rgba(1, 2, 3, .4) solid 1px` —
+  // три куска, а не семь.
+  const __ptCssParts = (v) => {
+    const out = [];
+    let depth = 0, cur = '';
+    for (const ch of String(v)) {
+      if (ch === '(') depth++;
+      if (ch === ')') depth--;
+      if (/\s/.test(ch) && depth === 0) { if (cur) out.push(cur); cur = ''; continue; }
+      cur += ch;
+    }
+    if (cur) out.push(cur);
+    return out;
+  };
+  const __ptFourWay = (name, value) => {
+    const parts = __ptCssParts(value);
+    if (!parts.length) return [];
+    const pick = [0, 1, 2, 3].map((i) => parts[[0, 0, 0, 0][i] === 0 ? Math.min(i, parts.length - 1) : i]);
+    const order = parts.length === 1 ? [parts[0], parts[0], parts[0], parts[0]]
+      : parts.length === 2 ? [parts[0], parts[1], parts[0], parts[1]]
+      : parts.length === 3 ? [parts[0], parts[1], parts[2], parts[1]]
+      : [parts[0], parts[1], parts[2], parts[3]];
+    void pick;
+    return CS_SIDES.map((side, i) => [name.replace('*', side), order[i]]);
+  };
+  // Возвращает пары «длинное свойство — значение» или null, если это не
+  // сокращение.
+  const __ptExpand = (prop, value) => {
+    const v = String(value).trim();
+    const parts = __ptCssParts(v);
+    const out = [];
+    const borderSide = /^border-(top|right|bottom|left|block-start|block-end|inline-start|inline-end)$/.exec(prop);
+    if (prop === 'border' || borderSide) {
+      const sides = borderSide ? [borderSide[1]] : CS_SIDES;
+      let width = 'medium', style = 'none', colour = 'currentcolor';
+      for (const t of parts) {
+        const low = t.toLowerCase();
+        if (CS_BORDER_STYLES.has(low)) style = low;
+        else if (CS_WIDTH_WORDS[low] || /^[\d.]/.test(low)) width = CS_WIDTH_WORDS[low] || t;
+        else if (__ptIsColour(t)) colour = t;
+      }
+      if (style === 'none' || style === 'hidden') width = '0px';
+      for (const side of sides) {
+        out.push(['border-' + side + '-width', width === 'medium' ? '3px' : width]);
+        out.push(['border-' + side + '-style', style]);
+        out.push(['border-' + side + '-color', colour]);
+      }
+      return out;
+    }
+    if (prop === 'border-width' || prop === 'border-style' || prop === 'border-color') {
+      const kind = prop.slice('border-'.length);
+      return __ptFourWay('border-*-' + kind, v);
+    }
+    if (prop === 'margin' || prop === 'padding') return __ptFourWay(prop + '-*', v);
+    if (prop === 'inset') {
+      const four = __ptFourWay('*', v);
+      return CS_SIDES.map((side, i) => [side, four[i][1]]);
+    }
+    if (prop === 'border-radius') {
+      const corners = ['top-left', 'top-right', 'bottom-right', 'bottom-left'];
+      const round = v.split('/')[0].trim();
+      const p = __ptCssParts(round);
+      const order = p.length === 1 ? [p[0], p[0], p[0], p[0]]
+        : p.length === 2 ? [p[0], p[1], p[0], p[1]]
+        : p.length === 3 ? [p[0], p[1], p[2], p[1]]
+        : [p[0], p[1], p[2], p[3]];
+      return corners.map((c, i) => ['border-' + c + '-radius', order[i]]);
+    }
+    if (prop === 'background') {
+      let colour = null, image = null;
+      for (const t of parts) {
+        if (/^(url|linear-gradient|radial-gradient|conic-gradient|image-set)\(/i.test(t)) image = t;
+        else if (__ptIsColour(t)) colour = t;
+      }
+      if (colour) out.push(['background-color', colour]);
+      if (image) out.push(['background-image', image]);
+      if (!out.length) return [];
+      return out;
+    }
+    if (prop === 'outline') {
+      let width = 'medium', style = 'none', colour = 'currentcolor';
+      for (const t of parts) {
+        const low = t.toLowerCase();
+        if (CS_BORDER_STYLES.has(low) || low === 'auto') style = low;
+        else if (CS_WIDTH_WORDS[low] || /^[\d.]/.test(low)) width = CS_WIDTH_WORDS[low] || t;
+        else if (__ptIsColour(t)) colour = t;
+      }
+      return [['outline-width', width === 'medium' ? '3px' : width],
+              ['outline-style', style], ['outline-color', colour]];
+    }
+    if (prop === 'font') {
+      // `font: italic small-caps bold 14px/1.5 Georgia, serif`
+      const m = /(^|\s)((?:[\d.]+[a-z%]*|smaller|larger|x?x-(?:small|large)|small|medium|large))(?:\s*\/\s*([^\s]+))?\s+(.+)$/i.exec(v);
+      if (!m) return [];
+      const before = v.slice(0, m.index).trim().toLowerCase().split(/\s+/).filter(Boolean);
+      for (const w of before) {
+        if (w === 'italic' || w === 'oblique') out.push(['font-style', w]);
+        else if (w === 'small-caps') out.push(['font-variant-caps', w]);
+        else if (/^(bold|bolder|lighter|[1-9]00)$/.test(w)) out.push(['font-weight', w === 'bold' ? '700' : w]);
+        else if (/^(ultra|extra|semi)?-?(condensed|expanded)$/.test(w)) out.push(['font-stretch', w]);
+      }
+      out.push(['font-size', m[2]]);
+      if (m[3]) out.push(['line-height', m[3]]);
+      out.push(['font-family', m[4].trim()]);
+      return out;
+    }
+    if (prop === 'flex') {
+      const grow = parts[0] || '0', shrink = parts[1] || '1';
+      const basis = parts[2] || (parts.length === 1 && /^[\d.]+$/.test(grow) ? '0%' : 'auto');
+      return [['flex-grow', grow], ['flex-shrink', /^[\d.]+$/.test(shrink) ? shrink : '1'],
+              ['flex-basis', basis]];
+    }
+    if (prop === 'gap') {
+      const row = parts[0] || 'normal';
+      return [['row-gap', row], ['column-gap', parts[1] || row]];
+    }
+    if (prop === 'overflow') {
+      const x = parts[0] || 'visible';
+      return [['overflow-x', x], ['overflow-y', parts[1] || x]];
+    }
+    if (prop === 'place-items' || prop === 'place-content' || prop === 'place-self') {
+      const kind = prop.slice('place-'.length);
+      const a = parts[0] || 'normal';
+      return [['align-' + kind, a], ['justify-' + kind, parts[1] || a]];
+    }
+    if (prop === 'grid-area') {
+      const p = v.split('/').map((x) => x.trim());
+      const names = ['grid-row-start', 'grid-column-start', 'grid-row-end', 'grid-column-end'];
+      return names.map((n, i) => [n, p[i] || 'auto']).filter(([, x]) => x);
+    }
+    if (prop === 'grid-row' || prop === 'grid-column') {
+      const p = v.split('/').map((x) => x.trim());
+      return [[prop + '-start', p[0] || 'auto'], [prop + '-end', p[1] || 'auto']];
+    }
+    if (prop === 'list-style') {
+      for (const t of parts) {
+        const low = t.toLowerCase();
+        if (low === 'inside' || low === 'outside') out.push(['list-style-position', low]);
+        else if (/^(url|linear-gradient|image-set)\(/i.test(t) || low === 'none') out.push(['list-style-image', low === 'none' ? 'none' : t]);
+        else out.push(['list-style-type', t]);
+      }
+      return out;
+    }
+    if (prop === 'transition') {
+      // Первый слой: браузер печатает списки по слоям, а на странице почти
+      // всегда один.
+      const layer = v.split(',')[0].trim();
+      const p = __ptCssParts(layer);
+      const times = p.filter((x) => /^[\d.]+m?s$/i.test(x));
+      const ease = p.find((x) => /^(ease|ease-in|ease-out|ease-in-out|linear|step-start|step-end|cubic-bezier\(|steps\()/i.test(x));
+      const name = p.find((x) => !/^[\d.]+m?s$/i.test(x) && x !== ease);
+      const secs = (t) => (/ms$/i.test(t) ? (parseFloat(t) / 1000) : parseFloat(t)) + 's';
+      return [['transition-property', name || 'all'],
+              ['transition-duration', times[0] ? secs(times[0]) : '0s'],
+              ['transition-timing-function', ease || 'ease'],
+              ['transition-delay', times[1] ? secs(times[1]) : '0s']];
+    }
+    if (prop === 'text-decoration') {
+      for (const t of parts) {
+        const low = t.toLowerCase();
+        if (/^(none|underline|overline|line-through|blink)$/.test(low)) out.push(['text-decoration-line', low]);
+        else if (/^(solid|double|dotted|dashed|wavy)$/.test(low)) out.push(['text-decoration-style', low]);
+        else if (__ptIsColour(t)) out.push(['text-decoration-color', t]);
+        else out.push(['text-decoration-thickness', t]);
+      }
+      return out;
+    }
+    return null;
+  };
+  // Цвет, унаследованный от `color`: у этих свойств начальное значение —
+  // `currentColor`, и браузер печатает в них цвет самого элемента.
+  const CS_CURRENT_COLOUR = ['caret-color', 'column-rule-color', 'row-rule-color', 'outline-color',
+    'text-decoration-color', 'text-emphasis-color', '-webkit-text-fill-color',
+    '-webkit-text-stroke-color', 'border-top-color', 'border-right-color',
+    'border-bottom-color', 'border-left-color', 'border-block-start-color',
+    'border-block-end-color', 'border-inline-start-color', 'border-inline-end-color'];
+  // Логические имена браузер печатает теми же значениями, что и физические.
+  const CS_LOGICAL = [
+    ['border-block-start-color', 'border-top-color'], ['border-block-end-color', 'border-bottom-color'],
+    ['border-inline-start-color', 'border-left-color'], ['border-inline-end-color', 'border-right-color'],
+    ['border-block-start-style', 'border-top-style'], ['border-block-end-style', 'border-bottom-style'],
+    ['border-inline-start-style', 'border-left-style'], ['border-inline-end-style', 'border-right-style'],
+    ['border-block-start-width', 'border-top-width'], ['border-block-end-width', 'border-bottom-width'],
+    ['border-inline-start-width', 'border-left-width'], ['border-inline-end-width', 'border-right-width'],
+    ['margin-block-start', 'margin-top'], ['margin-block-end', 'margin-bottom'],
+    ['margin-inline-start', 'margin-left'], ['margin-inline-end', 'margin-right'],
+    ['padding-block-start', 'padding-top'], ['padding-block-end', 'padding-bottom'],
+    ['padding-inline-start', 'padding-left'], ['padding-inline-end', 'padding-right'],
+    ['inset-block-start', 'top'], ['inset-block-end', 'bottom'],
+    ['inset-inline-start', 'left'], ['inset-inline-end', 'right'],
+    ['inline-size', 'width'], ['block-size', 'height'],
+    ['overflow-block', 'overflow-y'], ['overflow-inline', 'overflow-x'],
+    ['border-start-start-radius', 'border-top-left-radius'],
+    ['border-start-end-radius', 'border-top-right-radius'],
+    ['border-end-start-radius', 'border-bottom-left-radius'],
+    ['border-end-end-radius', 'border-bottom-right-radius'],
+    ['min-inline-size', 'min-width'], ['min-block-size', 'min-height'],
+    ['max-inline-size', 'max-width'], ['max-block-size', 'max-height'],
+  ];
+
   globalThis.getComputedStyle = (el, pseudo) => {
     const map = new Map();
     // У элемента вне отрисованного дерева вычисленного стиля нет: браузер
@@ -5094,25 +5327,114 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       for (const prop of CSS_INHERITED) {
         if (cascade.has(prop)) continue;
         const v = __inheritedValue(el, prop);
-        if (v != null) map.set(prop, v);
+        if (v == null) continue;
+        const pairs = __ptExpand(prop, v);
+        if (pairs) { for (const [k, val] of pairs) if (map.has(k)) map.set(k, val); continue; }
+        if (map.has(prop)) map.set(prop, v);
       }
+      // Только длинные имена: сокращений в вычисленном стиле браузер не
+      // показывает, но раскладывает их значения по длинным сам.
+      const put = (k, raw) => {
+        if (!map.has(k)) return;
+        map.set(k, __resolveLength(String(raw).trim(), k, fs, el));
+      };
+      const written = new Set();
       for (const [n, raw] of cascade) {
         const v = __resolveLength(raw, n, fs, el);
-        map.set(n, v);
-        // Сокращённые свойства браузер раскрывает в длинные, и меряют обычно
-        // именно длинные: `border: 0` — это и `border-top-width: 0px`.
-        const sides = ['top', 'right', 'bottom', 'left'];
-        if (n === 'border' || n === 'border-width') {
-          const w = /^0$|^0px$|^none$/.test(v.trim()) ? '0px' : (v.match(/(\d+(?:\.\d+)?px)/) || [, v])[1];
-          for (const side of sides) map.set('border-' + side + '-width', w);
-          if (/^0$|^none$/.test(v.trim())) for (const side of sides) map.set('border-' + side + '-style', 'none');
-        } else if (n === 'margin' || n === 'padding') {
-          const parts = v.trim().split(/\s+/);
-          const pick = (i) => parts[[0, 1, 2, 3].map((k) => Math.min(k, parts.length - 1))[i]] || '0px';
-          sides.forEach((side, i) => map.set(n + '-' + side, pick(i)));
-        } else if (n === 'font') {
-          const m = /(\d+(?:\.\d+)?)px/.exec(v);
-          if (m) map.set('font-size', m[1] + 'px');
+        const pairs = __ptExpand(n, v);
+        if (pairs) {
+          for (const [k, val] of pairs) { put(k, val); written.add(k); }
+          continue;
+        }
+        put(n, v);
+        written.add(n);
+      }
+      // Цвет по записи браузера: всякая запись sRGB приводится к `rgb(…)`.
+      for (const k of map.keys()) {
+        if (k !== 'color' && !k.endsWith('-color')) continue;
+        const norm = globalThis.__pt_cssColour && globalThis.__pt_cssColour(map.get(k));
+        if (norm) map.set(k, norm);
+      }
+      // `currentColor` — начальное значение у целого ряда свойств: браузер
+      // печатает в них цвет самого элемента.
+      const own = map.get('color');
+      if (own) {
+        for (const k of CS_CURRENT_COLOUR) {
+          if (!map.has(k)) continue;
+          const cur = map.get(k);
+          if (!written.has(k) || /^currentcolor$/i.test(String(cur))) map.set(k, own);
+        }
+      }
+      // Логические имена повторяют физические.
+      for (const [logical, physical] of CS_LOGICAL) {
+        if (map.has(logical) && map.has(physical) && !written.has(logical)) {
+          map.set(logical, map.get(physical));
+        }
+      }
+      // Ребёнок гибкого контейнера: браузер делает его блочным и меняет
+      // начальный минимум на `auto`.
+      try {
+        const parent = el.parentNode;
+        const pd = parent && parent.nodeType === ELEMENT_NODE
+          ? String(__cascadeFor(parent).get('display') || CS_DISPLAY[parent.localName] || '')
+          : '';
+        if (/^(flex|inline-flex|grid|inline-grid)$/.test(pd)) {
+          if (!written.has('display') && /^(inline|inline-block)$/.test(String(map.get('display')))) {
+            map.set('display', 'block');
+          }
+          for (const k of ['min-width', 'min-height', 'min-inline-size', 'min-block-size']) {
+            if (!written.has(k) && map.has(k)) map.set(k, 'auto');
+          }
+        }
+      } catch (e) {}
+      // Тень браузер печатает по-своему: сперва цвет, потом четыре длины с
+      // единицами, и `inset` в конце.
+      {
+        const sh = String(map.get('box-shadow') || '');
+        if (sh && sh !== 'none' && !/^(rgba?|color)\(/.test(sh)) {
+          const parts = __ptCssParts(sh);
+          let colour = null, inset = false;
+          const lens = [];
+          for (const t of parts) {
+            if (/^inset$/i.test(t)) { inset = true; continue; }
+            if (/^[-\d.]/.test(t)) { lens.push(t); continue; }
+            const norm = globalThis.__pt_cssColour && globalThis.__pt_cssColour(t);
+            if (norm) colour = norm;
+          }
+          while (lens.length < 4) lens.push('0px');
+          const px = (x) => (/^[-\d.]+$/.test(x) ? x + 'px' : x);
+          map.set('box-shadow', [colour || map.get('color'), px(lens[0]), px(lens[1]), px(lens[2]), px(lens[3])]
+            .join(' ') + (inset ? ' inset' : ''));
+        }
+      }
+      // Множитель межстрочного браузер печатает уже в пикселях.
+      const lh = String(map.get('line-height') || '');
+      if (/^[\d.]+$/.test(lh)) {
+        const px = parseFloat(lh) * parseFloat(map.get('font-size')) || 0;
+        map.set('line-height', (Math.round(px * 1e4) / 1e4) + 'px');
+      }
+      // Ссылка: у браузера свой стиль по умолчанию, и он виден в вычисленном.
+      if (el.localName === 'a' && __ptHasA(el, 'href')) {
+        if (!written.has('cursor')) map.set('cursor', 'pointer');
+        if (!written.has('text-decoration-line')) map.set('text-decoration-line', 'underline');
+      }
+      // Сокращения, которые браузер всё же печатает, собираются из длинных.
+      {
+        const line = map.get('text-decoration-line');
+        if (map.has('text-decoration')) {
+          let td = line || 'none';
+          const st = map.get('text-decoration-style');
+          if (st && st !== 'solid') td += ' ' + st;
+          const col = map.get('text-decoration-color');
+          if (col && col !== own && written.has('text-decoration-color')) td += ' ' + col;
+          map.set('text-decoration', td);
+        }
+        if (map.has('-webkit-text-decorations-in-effect')) {
+          map.set('-webkit-text-decorations-in-effect', line && line !== 'none' ? line : 'none');
+        }
+        if (map.has('font-variant')) {
+          const caps = map.get('font-variant-caps');
+          map.set('font-variant', caps && caps !== 'normal' ? caps : 'normal');
         }
       }
       if (el) map.set('font-size', __usedFontSize(el) + 'px');
@@ -5506,8 +5828,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     for (let e = el; e && e.nodeType === ELEMENT_NODE; e = e.parentNode) {
       const t = e.tagName;
       if (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT' || t === 'BUTTON') return e;
-      if (t === 'A' && e.hasAttribute('href')) return e;
-      if (e.hasAttribute('tabindex')) return e;
+      if (t === 'A' && __ptHasA(e, 'href')) return e;
+      if (__ptHasA(e, 'tabindex')) return e;
       if (e.isContentEditable) return e;
     }
     return null;
@@ -5568,8 +5890,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       for (const n of (root.__ptKids || [])) {
         if (n.nodeType !== ELEMENT_NODE) continue;
         if (!__isHiddenEl(n)) {
-          const role = (n.getAttribute && n.getAttribute('role')) || '';
-          const type = (n.getAttribute && n.getAttribute('type')) || '';
+          const role = (n.getAttribute && __ptGetA(n, 'role')) || '';
+          const type = (n.getAttribute && __ptGetA(n, 'type')) || '';
           const control = (n.tagName === 'INPUT' && /^(checkbox|radio|submit|button)$/i.test(type))
             || n.tagName === 'BUTTON'
             || role === 'checkbox' || role === 'button' || role === 'switch';
@@ -5591,7 +5913,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
                           x: r.x + Math.min(r.width, 24) / 2,
                           y: r.y + Math.min(r.height, 24) / 2,
                           at: Math.round(r.y),
-                          label: (n.getAttribute && n.getAttribute('aria-label')) || '' });
+                          label: (n.getAttribute && __ptGetA(n, 'aria-label')) || '' });
             }
           }
           if (n.__ptShadow) scan(n.__ptShadow, true);
@@ -5623,7 +5945,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   function __labelFor(el) {
     for (let e = el; e && e.nodeType === ELEMENT_NODE; e = e.parentNode) {
       if (e.tagName !== 'LABEL') continue;
-      const id = e.getAttribute && e.getAttribute('for');
+      const id = e.getAttribute && __ptGetA(e, 'for');
       if (id) {
         const root = e.getRootNode ? e.getRootNode() : (globalThis.document || null);
         const found = root && root.getElementById ? root.getElementById(id)
@@ -5669,12 +5991,12 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         const toggle = (c) => {
           // Нажатие на чекбокс/радио переключает его до того, как всплывёт
           // click, — обработчик читает уже новое состояние.
-          c.checked = String(c.getAttribute('type')).toLowerCase() === 'radio' ? true : !c.checked;
+          c.checked = String(__ptGetA(c, 'type')).toLowerCase() === 'radio' ? true : !c.checked;
           c.dispatchEvent(__ptTrust(new Event('input', { bubbles: true })));
           c.dispatchEvent(__ptTrust(new Event('change', { bubbles: true })));
         };
         const isBox = (n) => n && n.tagName === 'INPUT'
-          && /^(checkbox|radio)$/i.test(n.getAttribute('type') || '');
+          && /^(checkbox|radio)$/i.test(__ptGetA(n, 'type') || '');
         if (isBox(el)) toggle(el);
         send(new MouseEvent('click', base));
         // Нажатие на подпись — это нажатие на её поле. Виджет прячет свой
