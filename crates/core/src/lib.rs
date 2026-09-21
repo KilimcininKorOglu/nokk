@@ -1337,7 +1337,13 @@ impl BrowserContext {
             self.log_console("page", &queues);
             // How long until the page's next timer, straight from the same queue
             // the driver just pumped: -1 for "nothing pending".
-            let next_timer_ms = queues["timers"].as_i64().unwrap_or(-1);
+            // Часы очереди теперь дробные, и «через 49.9 мс» приходит числом
+            // с запятой: `as_i64` на нём отдавал пустоту, то есть «таймеров
+            // нет», и загрузка переставала их дожидаться.
+            let next_timer_ms = queues["timers"]
+                .as_f64()
+                .map(|v| if v < 0.0 { -1 } else { v.ceil() as i64 })
+                .unwrap_or(-1);
             self.note_next_timer(next_timer_ms);
 
             // 3. Sockets: apply what the page asked for, then hand it whatever the
@@ -1780,8 +1786,14 @@ impl BrowserContext {
     async fn settle(&self, how_long: std::time::Duration) {
         let until = std::time::Instant::now() + how_long;
         while std::time::Instant::now() < until {
-            let _ = self.run_event_loop().await;
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            // Пока страница работает, между прокачками спим миллисекунду, а не
+            // пять: браузерный таймер на 1 мс срабатывает через 1 мс, а у нас
+            // получалось три, и вложенные — пять вместо четырёх. Эти доли
+            // читают: частота кадров и зажим вложенных таймеров — обычная
+            // проба на движок.
+            let worked = self.run_event_loop().await.unwrap_or(0);
+            let nap = if worked > 0 { 500 } else { 5_000 };
+            tokio::time::sleep(std::time::Duration::from_micros(nap)).await;
         }
     }
 
@@ -9617,6 +9629,52 @@ variationSettings,weight",
         assert_eq!(out["activation"], serde_json::json!([false, false]),
                    "до жеста — ложь на оба: {out}");
         assert_eq!(out["scheduling"], "function");
+    }
+
+    /// Частота кадров — обычная проба на движок: отметку времени браузер
+    /// кладёт на сетку развёртки и округляет до десятой доли миллисекунды,
+    /// отчего соседние отличаются то на 16,6, то на 16,7. У нас кадр был
+    /// «таймером на шестнадцать миллисекунд» с дрожанием и полной точностью
+    /// — и отбивал ровные 16,667, чего у развёртки не бывает.
+    #[tokio::test]
+    async fn frames_land_on_the_refresh_grid() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        ctx.evaluate(r#"(() => {
+            const stamps = [];
+            const step = (t) => { stamps.push(t); if (stamps.length < 8) requestAnimationFrame(step); };
+            requestAnimationFrame(step);
+            window.__stamps = stamps;
+        })()"#).await.unwrap();
+        for _ in 0..4 {
+            ctx.run_event_loop().await.unwrap();
+        }
+
+        let out = probe(&ctx, r#"(() => {
+            const s = window.__stamps;
+            const d = [];
+            for (let i = 1; i < s.length; i++) d.push(Math.round((s[i] - s[i - 1]) * 1000) / 1000);
+            return __ptJSON.stringify({ count: s.length, deltas: d,
+              tenths: s.every((x) => Math.abs(x * 10 - Math.round(x * 10)) < 1e-9) });
+        })()"#).await;
+
+        assert!(
+            out["count"].as_u64().unwrap_or(0) >= 5,
+            "кадры приходят один за другим: {out}"
+        );
+        assert_eq!(out["tenths"], true, "отметка округлена до десятой доли: {out}");
+        for d in out["deltas"].as_array().cloned().unwrap_or_default() {
+            let v = d.as_f64().unwrap_or_default();
+            assert!(
+                (v - 16.6).abs() < 0.06 || (v - 16.7).abs() < 0.06,
+                "соседние отметки отстоят на 16,6 или 16,7: {v} ({out})"
+            );
+        }
     }
 
     /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`

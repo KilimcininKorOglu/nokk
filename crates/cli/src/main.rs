@@ -232,7 +232,10 @@ async fn eval_and_print(ctx: &BrowserContext, js: &str) -> Result<()> {
         if ready || Instant::now() > deadline {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Миллисекунда, а не десять: на десяти кадры анимации ложатся на
+        // чужую сетку, и `requestAnimationFrame` отбивает то двенадцать
+        // миллисекунд, то двадцать четыре вместо ровных 16,7.
+        tokio::time::sleep(Duration::from_micros(500)).await;
     }
     let out = ctx
         .evaluate(
@@ -1779,7 +1782,7 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                             let until = Instant::now() + Duration::from_millis(1_500);
                             while Instant::now() < until {
                                 let _ = ctx.run_event_loop().await;
-                                tokio::time::sleep(Duration::from_millis(5)).await;
+                                tokio::time::sleep(Duration::from_millis(1)).await;
                             }
                         }
                     }
@@ -1823,7 +1826,13 @@ if (s.length > 15000 && s.length < 16000 && !(globalThis.__ptD = globalThis.__pt
                 // шагов по таймеру, и четверть секунды на каждом растягивала
                 // четыре секунды работы в одиннадцать — ровно за его порог.
                 let idle = worked == 0;
-                tokio::time::sleep(Duration::from_millis(if idle { 25 } else { 5 })).await;
+                // Работающей странице — миллисекунда между прокачками: на пяти
+                // таймеры опаздывают, и это видно по частоте кадров.
+                if idle {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                } else {
+                    tokio::time::sleep(Duration::from_micros(500)).await;
+                }
             }
         }
 

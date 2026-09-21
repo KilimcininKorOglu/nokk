@@ -1065,7 +1065,19 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   let seq = 1;
   let virt = 0; // fast mode only: the clock that jumps to each due time
   const q = new Map(); // id -> {fn, delay, interval, due, cancelled, id, depth}
-  const clock = () => (FAST ? virt : Date.now());
+  // Часы очереди — высокого разрешения: `Date.now()` меряет целыми
+  // миллисекундами, и таймер на четыре миллисекунды срабатывал где угодно
+  // между четырьмя и пятью, а сетка кадров ложилась на целые доли. У
+  // браузера и то, и другое считается по монотонным часам.
+  // Один масштаб на всю жизнь очереди: `performance` появляется позже нас, и
+  // если до него считать абсолютными миллисекундами, а после — от начала
+  // страницы, все заведённые раньше таймеры окажутся в далёком будущем.
+  const T0 = Date.now();
+  const hi = () => {
+    const p = globalThis.performance;
+    return p && typeof p.now === 'function' ? p.now() : Date.now() - T0;
+  };
+  const clock = () => (FAST ? virt : hi());
 
   // Chrome clamps a timer nested deeper than five levels to 4 ms. Without the
   // clamp a `setTimeout(f, 0)` chain spins the driver at CPU speed — which is
@@ -1104,19 +1116,53 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   // завели два таймера. Мы отдавали общий номер — разница видна одной строкой.
   let rafSeq = 0;
   const rafIds = new Map();
+  // Кадр — не «таймер на шестнадцать миллисекунд», а узел сетки развёртки:
+  // у браузера соседние отметки отстоят ровно на 16,7 мс, сколько бы он ни
+  // был занят, а у нас выходило 17,3 с дрожанием — и это первое, что меряет
+  // всякий, кто считает частоту кадров. Начало сетки — запуск страницы,
+  // поэтому первый кадр приходит через случайную долю периода, как в
+  // браузере, а не всегда через полный.
+  const FRAME_MS = 1000 / 60;
+  const frameOrigin = clock();
+  let frameSlot = null;
   globalThis.requestAnimationFrame = (fn) => {
+    if (typeof fn !== 'function') {
+      throw new TypeError("Failed to execute 'requestAnimationFrame' on 'Window': " +
+        "parameter 1 is not of type 'Function'.");
+    }
     const rid = ++rafSeq;
-    rafIds.set(rid, add(() => {
-      rafIds.delete(rid);
-      fn(globalThis.performance ? globalThis.performance.now() : clock());
-    }, 16, false, []));
+    const now = clock();
+    let at = frameOrigin + Math.ceil((now - frameOrigin) / FRAME_MS) * FRAME_MS;
+    if (at - now < 0.5) at += FRAME_MS;
+    if (!frameSlot || frameSlot.at !== at) {
+      const slot = { at, list: [] };
+      frameSlot = slot;
+      add(() => {
+        if (frameSlot === slot) frameSlot = null;
+        // Отметка времени у всех обработчиков одного кадра одна и та же —
+        // время самого кадра, а не момент вызова.
+        // Отметку кадра браузер округляет до десятой доли миллисекунды —
+        // отсюда его 16,6 и 16,7 вперемежку. Ровные 16,667 выдают счётчик,
+        // а не развёртку.
+        const stamp = Math.round(slot.at * 10) / 10;
+        for (const [id, cb] of slot.list.splice(0)) {
+          rafIds.delete(id);
+          try { cb(stamp); } catch (e) {
+            try { if (globalThis.__pt_reportError) __pt_reportError(e, 'requestAnimationFrame'); } catch (x) {}
+          }
+        }
+      }, Math.max(0, at - now), false, []);
+    }
+    frameSlot.list.push([rid, fn]);
+    rafIds.set(rid, frameSlot);
     return rid;
   };
   globalThis.cancelAnimationFrame = (rid) => {
-    const tid = rafIds.get(rid);
-    if (tid === undefined) return;
+    const slot = rafIds.get(rid);
+    if (!slot) return;
     rafIds.delete(rid);
-    globalThis.clearTimeout(tid);
+    const i = slot.list.findIndex((x) => x[0] === rid);
+    if (i >= 0) slot.list.splice(i, 1);
   };
   // No browser has `setImmediate`/`clearImmediate` — they are Node's, and we were
   // the ones putting them on the page. An extra global is as much a tell as a
