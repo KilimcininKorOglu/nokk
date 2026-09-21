@@ -9731,6 +9731,53 @@ variationSettings,weight",
         assert_eq!(out["line"], "22.4px");
     }
 
+    /// Внешняя таблица стилей — это правила, а не просто запрос: тело у нас
+    /// выбрасывалось, и на настоящей странице `document.styleSheets[i]
+    /// .cssRules` был пуст (у Chrome их там три тысячи), а каскад не видел
+    /// ни одного правила из внешнего файла. Заодно `window.length` — счёт
+    /// живых кадров, и его спрашивают о странице первым делом.
+    #[tokio::test]
+    async fn an_external_stylesheet_brings_its_rules() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><head>
+               <link rel="stylesheet" href="data:text/css,p%7Bcolor%3A%20rgb(1%2C%202%2C%203)%7D">
+               </head><body><p id=p>текст</p></body></html>"#,
+        )
+        .await
+        .unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const sheet = document.styleSheets[0];
+            const f = document.createElement('iframe');
+            f.src = 'about:blank';
+            document.body.appendChild(f);
+            return __ptJSON.stringify({
+              sheets: document.styleSheets.length,
+              rules: sheet ? sheet.cssRules.length : -1,
+              href: sheet ? String(sheet.href).slice(0, 14) : '',
+              first: sheet && sheet.cssRules[0] ? sheet.cssRules[0].selectorText : '',
+              applied: getComputedStyle(document.getElementById('p')).color,
+              frames: window.length,
+              windowed: typeof window[0],
+            });
+        })()"#).await;
+
+        assert_eq!(out["sheets"], 1, "таблица одна: {out}");
+        assert!(
+            out["rules"].as_i64().unwrap_or(0) >= 1,
+            "и правила из неё разобраны: {out}"
+        );
+        assert_eq!(out["first"], "p", "селектор читается: {out}");
+        assert_eq!(out["applied"], "rgb(1, 2, 3)", "и правило действует на элемент: {out}");
+        assert_eq!(out["frames"], 1, "кадр посчитан: {out}");
+        assert_eq!(out["windowed"], "object", "и доступен по номеру: {out}");
+    }
+
     /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`
     /// is the idiom every collector uses, Cloudflare's included — the URL is dead
     /// one line after the worker starts. Reading the blob when the engine got

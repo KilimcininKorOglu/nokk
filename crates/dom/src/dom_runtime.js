@@ -921,12 +921,46 @@
       try { url = new URL(raw, document.baseURI || location.href).href; } catch (e) {}
       if (this.__ptLinkAt === url) return;
       Object.defineProperty(this, '__ptLinkAt', { value: url, configurable: true, enumerable: false });
-      if (url.slice(0, 5) === 'data:' || url.slice(0, 5) === 'blob:' || typeof globalThis.__pt_subresource !== 'function') return;
+      // Таблица стилей, записанная прямо в адрес, — тоже таблица: браузер её
+      // разбирает, не выходя в сеть.
+      if (url.slice(0, 5) === 'data:') {
+        if (rel === 'stylesheet') {
+          try {
+            const comma = url.indexOf(',');
+            const head = url.slice(5, comma);
+            const raw = url.slice(comma + 1);
+            const text = /;base64$/i.test(head) ? atob(raw) : decodeURIComponent(raw);
+            Object.defineProperty(this, '__ptSheetText',
+              { value: text, writable: true, enumerable: false, configurable: true });
+            __markDirty();
+          } catch (e) {}
+        }
+        if (this.__ptFireLoad) __pt_soon(() => this.__ptFireLoad(true));
+        return;
+      }
+      if (url.slice(0, 5) === 'blob:' || typeof globalThis.__pt_subresource !== 'function') return;
       // Всё, что пришло через `<link>`, браузер называет `link` в перечне
       // ресурсов — и предзагрузку, и значок, и таблицу стилей.
       const kind = rel === 'stylesheet' ? 'stylesheet' : 'link';
       __pt_subresource(url, kind).then(
-        () => { if (this.__ptFireLoad) this.__ptFireLoad(true); },
+        (res) => {
+          // Внешняя таблица стилей — это правила, а не просто запрос: у нас
+          // её тело выбрасывалось, и `document.styleSheets[i].cssRules` был
+          // пуст на любой настоящей странице (у Chrome их там три тысячи), а
+          // каскад не видел ни одного правила из внешнего файла.
+          const wanted = rel === 'stylesheet';
+          const take = (text) => {
+            if (wanted && typeof text === 'string') {
+              Object.defineProperty(this, '__ptSheetText',
+                { value: text, writable: true, enumerable: false, configurable: true });
+              __markDirty();
+            }
+            if (this.__ptFireLoad) this.__ptFireLoad(true);
+          };
+          if (wanted && res && typeof res.text === 'function') {
+            res.text().then(take, () => take(null));
+          } else take(null);
+        },
         () => { if (this.__ptFireLoad) this.__ptFireLoad(false); },
       );
     }
@@ -2604,7 +2638,9 @@
   globalThis.__pt_sheetFor = (owner) => __sheetFor(owner);
   function __sheetFor(owner) {
     const proto = __link('CSSStyleSheet', __sheetProto);
-    const text = owner.__ptLocal === 'style' ? String(owner.textContent || '') : '';
+    const text = owner.__ptLocal === 'style'
+      ? String(owner.textContent || '')
+      : String(owner.__ptSheetText || '');
     let sheet = owner.__ptSheet;
     if (!sheet) {
       sheet = Object.create(proto);
@@ -3827,6 +3863,45 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     },
   };
 
+  // `window.length` и `window.frames[i]` — счёт живых кадров. У нас там
+  // стоял ноль при любом числе рамок, а это первое, что спрашивают о
+  // странице: у браузера длина равна числу кадров, а по номеру лежит их
+  // окно. Пересчитывается по дереву, чтобы не разъезжаться со вставками.
+  {
+    const frameEls = () => {
+      const out = [];
+      const doc = globalThis.document;
+      if (!doc || !doc.documentElement) return out;
+      __walkTree(doc.documentElement, (n) => {
+        if (n.nodeType === ELEMENT_NODE && (n.__ptLocal === 'iframe' || n.__ptLocal === 'frame')) out.push(n);
+      });
+      return out;
+    };
+    const windowOf = (el) => {
+      try { return el.contentWindow || null; } catch (e) { return null; }
+    };
+    try {
+      Object.defineProperty(globalThis, 'length', {
+        get: () => frameEls().length,
+        enumerable: true, configurable: true,
+      });
+    } catch (e) {}
+    // Номерные свойства окна: браузер держит их столько, сколько кадров.
+    // Отдаём их через ловушку на чтение — перечисление и `length` уже есть.
+    globalThis.__pt_frameAt = (i) => {
+      const els = frameEls();
+      return i >= 0 && i < els.length ? windowOf(els[i]) : undefined;
+    };
+    for (let i = 0; i < 16; i++) {
+      try {
+        Object.defineProperty(globalThis, String(i), {
+          get: () => globalThis.__pt_frameAt(i),
+          enumerable: false, configurable: true,
+        });
+      } catch (e) {}
+    }
+  }
+
   globalThis.__pt_writeDocument = (html) => {
     const nodes = parseFragment(String(html == null ? '' : html));
     let root = nodes.find((n) => n.nodeType === 1 && n.tagName === 'HTML');
@@ -4690,7 +4765,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const sheetsOf = (node, root) => {
       for (const n of (node.__ptKids || [])) {
         if (n.nodeType !== ELEMENT_NODE) continue;
-        if (n.tagName === 'STYLE' && n.sheet) take(root, n.sheet.cssRules);
+        if ((n.tagName === 'STYLE' || (n.tagName === 'LINK' && n.__ptSheetText)) && n.sheet) {
+          take(root, n.sheet.cssRules);
+        }
         if (n.__ptShadow) sheetsOf(n.__ptShadow, n.__ptShadow);
         sheetsOf(n, root);
       }
