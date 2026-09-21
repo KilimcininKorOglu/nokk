@@ -2249,6 +2249,16 @@
 
   // Разбор: пролог до `{` или `;`, затем тело со счётом вложенности. Строки и
   // комментарии не считаются — иначе `content: "}"` рвёт правило пополам.
+  // Экранирована ли кавычка: считать надо идущие подряд обратные косые, а не
+  // одну. `content:"\\"` — это строка из одной косой, и кавычка после неё
+  // закрывающая; мы считали её экранированной и теряли весь остаток файла
+  // (на chess.com — семьсот шестьдесят правил из тысячи).
+  const __cssEscaped = (text, i) => {
+    let n = 0;
+    while (i - 1 - n >= 0 && text[i - 1 - n] === '\\') n++;
+    return (n & 1) === 1;
+  };
+
   function __cssParse(text) {
     const out = [];
     const n = text.length;
@@ -2261,7 +2271,7 @@
       let depth = 0, q = null;
       while (i < n) {
         const c = text[i];
-        if (q) { if (c === q && text[i - 1] !== '\\') q = null; i++; continue; }
+        if (q) { if (c === q && !__cssEscaped(text, i)) q = null; i++; continue; }
         if (c === '"' || c === "'") { q = c; i++; continue; }
         if (c === '(') depth++;
         else if (c === ')') depth--;
@@ -2277,7 +2287,7 @@
       q = null;
       while (i < n && d > 0) {
         const c = text[i];
-        if (q) { if (c === q && text[i - 1] !== '\\') q = null; i++; continue; }
+        if (q) { if (c === q && !__cssEscaped(text, i)) q = null; i++; continue; }
         if (c === '"' || c === "'") { q = c; i++; continue; }
         if (c === '{') d++;
         else if (c === '}') d--;
@@ -2297,7 +2307,7 @@
       let depth = 0, q = null;
       while (i < n) {
         const c = body[i];
-        if (q) { if (c === q && body[i - 1] !== '\\') q = null; i++; continue; }
+        if (q) { if (c === q && !__cssEscaped(body, i)) q = null; i++; continue; }
         if (c === '"' || c === "'") { q = c; i++; continue; }
         if (c === '(') depth++;
         else if (c === ')') depth--;
@@ -2570,7 +2580,7 @@
       const name = at === '@media' ? 'CSSMediaRule' : 'CSSSupportsRule';
       const r = common(Object.create(__ruleProto(name)), at === '@media' ? RULE_TYPE.media : RULE_TYPE.supports);
       const cond = __cssPrelude(prelude.slice(at.length).trim());
-      const kids = __cssParse(parsed.body || '').map((p) => __makeRule(p, sheet, r));
+      const kids = __cssParse(parsed.body || '').map((p) => __makeRule(p, sheet, r)).filter(Boolean);
       own(r, { cssRules: __cssRuleList(kids), conditionText: cond });
       if (at === '@media') own(r, { media: __mediaList(cond) });
       return own(r, { cssText: __cssGroup(at + ' ' + cond, kids, false) });
@@ -2595,6 +2605,10 @@
                       cssText: '@font-face { ' + [...decls].map(([a2, b2]) => a2 + ': ' + b2 + ';').join(' ') + ' }' });
     }
     if (at) {
+      // `@charset` браузер в перечень правил не кладёт вовсе — он читает его и
+      // забывает. У нас он торчал лишней записью в каждой таблице, которая с
+      // него начинается.
+      if (/^@charset\b/i.test(prelude)) return null;
       const r = common(Object.create(__ruleProto('CSSRule')), RULE_TYPE.charset);
       return own(r, { cssText: prelude + (parsed.statement ? ';' : ' { }') });
     }
@@ -2627,7 +2641,7 @@
     addRule(sel, decl, index) { return this.insertRule(sel + ' { ' + (decl || '') + ' }', index), -1; },
     removeRule(index) { this.deleteRule(index); },
     replaceSync(text) {
-      const rules = __cssParse(String(text)).map((p) => __makeRule(p, this, null));
+      const rules = __cssParse(String(text)).map((p) => __makeRule(p, this, null)).filter(Boolean);
       Object.defineProperty(this, 'cssRules', { value: __cssRuleList(rules), enumerable: true, configurable: true });
     },
     replace(text) { this.replaceSync(text); return Promise.resolve(this); },
@@ -2657,7 +2671,7 @@
     }
     if (sheet.__ptText !== text) {
       Object.defineProperty(sheet, '__ptText', { value: text, writable: true, enumerable: false, configurable: true });
-      const rules = __cssParse(text).map((p) => __makeRule(p, sheet, null));
+      const rules = __cssParse(text).map((p) => __makeRule(p, sheet, null)).filter(Boolean);
       Object.defineProperty(sheet, 'cssRules', { value: __cssRuleList(rules), enumerable: true, configurable: true });
     }
     return sheet;

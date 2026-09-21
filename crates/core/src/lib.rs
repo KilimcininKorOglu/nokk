@@ -9753,6 +9753,11 @@ variationSettings,weight",
 
         let out = probe(&ctx, r#"(() => {
             const sheet = document.styleSheets[0];
+            // Строка, кончающаяся экранированной косой, раньше съедала весь
+            // остаток файла: кавычка после неё считалась экранированной.
+            const tricky = document.createElement('style');
+            tricky.textContent = '@charset "utf-8"; a:before{content:"\\\\"} b{color:red} i{color:blue}';
+            document.head.appendChild(tricky);
             const f = document.createElement('iframe');
             f.src = 'about:blank';
             document.body.appendChild(f);
@@ -9764,15 +9769,19 @@ variationSettings,weight",
               applied: getComputedStyle(document.getElementById('p')).color,
               frames: window.length,
               windowed: typeof window[0],
+              escaped: (() => { let n = 0; for (const r of tricky.sheet.cssRules) if (r.selectorText === 'b' || r.selectorText === 'i') n++; return n; })(),
+              charset: (() => { let n = 0; for (const r of tricky.sheet.cssRules) if (r.type === 1) n++; return tricky.sheet.cssRules.length - n; })(),
             });
         })()"#).await;
 
-        assert_eq!(out["sheets"], 1, "таблица одна: {out}");
+        assert_eq!(out["sheets"], 2, "внешняя таблица и добавленная: {out}");
         assert!(
             out["rules"].as_i64().unwrap_or(0) >= 1,
             "и правила из неё разобраны: {out}"
         );
         assert_eq!(out["first"], "p", "селектор читается: {out}");
+        assert_eq!(out["escaped"], 2, "строка с экранированной косой не рвёт разбор: {out}");
+        assert_eq!(out["charset"], 0, "а `@charset` в перечень правил не попадает: {out}");
         assert_eq!(out["applied"], "rgb(1, 2, 3)", "и правило действует на элемент: {out}");
         assert_eq!(out["frames"], 1, "кадр посчитан: {out}");
         assert_eq!(out["windowed"], "object", "и доступен по номеру: {out}");
