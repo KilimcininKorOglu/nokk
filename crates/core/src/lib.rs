@@ -430,7 +430,10 @@ fn emulation_os_for(profile: &StealthProfile) -> nokk_net::EmulationOs {
 /// defined, so everything real has to exist before it looks.
 fn build_bootstrap(profile: &StealthProfile) -> String {
     let base = format!(
-        "{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}",
+        // Первой строкой — запись изнутри: ею пользуются все слои, а свойства
+        // только для чтения появляются лишь в последнем.
+        nokk_stealth::write_helper_script(),
         nokk_stealth::bootstrap_script(profile),
         nokk_dom::runtime_js(),
         nokk_stealth::fingerprint_script(profile),
@@ -7216,6 +7219,70 @@ mod tests {
             "пробелы по краям в рамку не идут"
         );
         assert_eq!(box_of("empty"), vec![0.0, 0.0, 0.0, 0.0], "у пустого текста рамки нет");
+    }
+
+    // Вид описания у члена интерфейса читается одной строкой, и обход графа у
+    // челленджа читает его именно так. У браузера свойство интерфейса — это
+    // акцессор (у доступных на запись есть и установщик), метод — перечислимое
+    // значение, а константа не переписывается и не удаляется. Сверено с
+    // Chrome 151 обходом всех девятисот пятидесяти интерфейсов; здесь — по
+    // одному образцу на каждый вид.
+    #[tokio::test]
+    async fn an_interface_member_is_described_the_way_a_browser_describes_it() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+        let out = probe(
+            &ctx,
+            r#"(() => {
+                const kind = (o, n) => {
+                    const d = Object.getOwnPropertyDescriptor(o, n);
+                    if (!d) return 'нет';
+                    return (d.get || d.set)
+                        ? 'a' + (d.get ? 'g' : '') + (d.set ? 's' : '')
+                            + (d.enumerable ? 'e' : '') + (d.configurable ? 'c' : '')
+                        : 'v' + (typeof d.value)[0] + (d.writable ? 'w' : '')
+                            + (d.enumerable ? 'e' : '') + (d.configurable ? 'c' : '');
+                };
+                return __ptJSON.stringify({
+                    namespaceURI: kind(Element.prototype, 'namespaceURI'),
+                    title: kind(HTMLElement.prototype, 'title'),
+                    ownerDocument: kind(Node.prototype, 'ownerDocument'),
+                    appendChild: kind(Node.prototype, 'appendChild'),
+                    elementNode: kind(Node.prototype, 'ELEMENT_NODE'),
+                    geolocation: kind(Navigator.prototype, 'geolocation'),
+                    body: kind(Document.prototype, 'body'),
+                    svgPx: kind(SVGLength.prototype, 'SVG_LENGTHTYPE_PX'),
+                    svgPxValue: SVGLength.SVG_LENGTHTYPE_PX,
+                    // Запись изнутри всё ещё работает: страница поля не пишет,
+                    // а движок пишет.
+                    lifecycle: (() => {
+                        const d = document.createElement('i');
+                        document.body.appendChild(d);
+                        return [document.readyState, d.parentNode.nodeName,
+                                d.ownerDocument === document, d.nodeType];
+                    })(),
+                });
+            })()"#,
+        )
+        .await;
+        assert_eq!(out["namespaceURI"], "agec", "только чтение: {out}");
+        assert_eq!(out["title"], "agsec", "и чтение, и запись: {out}");
+        assert_eq!(out["ownerDocument"], "agec", "{out}");
+        assert_eq!(out["appendChild"], "vfwec", "метод — значение: {out}");
+        assert_eq!(out["elementNode"], "vne", "константу не переписать: {out}");
+        assert_eq!(out["geolocation"], "agec", "{out}");
+        assert_eq!(out["body"], "agsec", "{out}");
+        assert_eq!(out["svgPx"], "vne", "{out}");
+        assert_eq!(out["svgPxValue"], 5, "константа — число, а не пустота: {out}");
+        assert_eq!(
+            out["lifecycle"],
+            serde_json::json!(["complete", "BODY", true, 1]),
+            "движку запись изнутри по-прежнему доступна: {out}"
+        );
     }
 
     // A filled arc (the classic canvas-fingerprint shape) must rasterize to a real

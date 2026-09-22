@@ -476,6 +476,37 @@ pub fn apply_geo(profile: &StealthProfile, timezone: &str, country_code: &str) -
 /// The scripts are intentionally small and composed at runtime from the profile
 /// so a single source of truth (the [`StealthProfile`]) drives every spoofed
 /// value.
+/// Запись изнутри. У браузера половина свойств интерфейса только читается —
+/// страница их не пишет, а движок пишет, и делает это через `__pt_write`: если
+/// установщик с этого имени сняли (см. [`IFACE_KINDS`]), он найдётся в
+/// хранилище, а если ничего не снимали, выйдет обычное присваивание. Ставится
+/// первой строкой каждого скрипта: зовут его и те слои, что идут раньше
+/// самого прохода.
+/// Отдаётся отдельным скриптом и ставится первым: см. [`PT_WRITE_HELPER`].
+pub fn write_helper_script() -> String {
+    PT_WRITE_HELPER.to_string()
+}
+
+const PT_WRITE_HELPER: &str = r#"(() => {
+  if (globalThis.__pt_write) return;
+  const writers = new WeakMap();
+  globalThis.__pt_writers = writers;
+  globalThis.__pt_write = (obj, name, value) => {
+    if (!obj) return;
+    for (let p = obj; p; p = Object.getPrototypeOf(p)) {
+      const w = writers.get(p);
+      if (w && w[name]) { w[name].call(obj, value); return; }
+      const d = Object.getOwnPropertyDescriptor(p, name);
+      if (d) {
+        if (d.set) { d.set.call(obj, value); return; }
+        if (!d.get) { try { obj[name] = value; } catch (e) {} return; }
+      }
+    }
+    try { obj[name] = value; } catch (e) {}
+  };
+})();
+"#;
+
 pub fn injection_script(profile: &StealthProfile) -> String {
     let languages = json_string_array(&profile.languages);
     // Note: values are embedded via `json_escape` to stay valid JS strings.
@@ -705,8 +736,8 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   });
   win.navigator = Object.create(NavigatorProto);
 
-  win.window = win; win.self = win; win.top = win; win.parent = win; win.frames = win;
-  win.length = 0; win.name = ""; win.closed = false;
+  win.window = win; win.self = win; __pt_write(win, 'top', win); win.parent = win; win.frames = win;
+  __pt_write(win, 'length', 0); win.name = ""; win.closed = false;
 
   // --- screen -----------------------------------------------------------
   const ScreenProto = defClass("Screen");
@@ -1695,7 +1726,8 @@ pub fn late_originals_script() -> String {
 
 pub fn worker_scope_script(name: &str, url: &str) -> String {
     format!(
-        r##"(() => {{
+        r##"{helper}
+(() => {{
   const NAME = {name};
   const URL_ = {url};
   // Форма снята с настоящего воркера Chrome 148, уровень за уровнем: у самой
@@ -1878,7 +1910,7 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
     try {{ ev = new MessageEvent('message', {{ data, origin: '', lastEventId: '', source: null, ports: [] }}); }} catch (e) {{
       ev = {{ type: 'message', data, origin: '', lastEventId: '', source: null, ports: [] }};
     }}
-    try {{ ev.target = globalThis; ev.currentTarget = globalThis; }} catch (e) {{}}
+    try {{ __pt_write(ev, 'target', globalThis); __pt_write(ev, 'currentTarget', globalThis); }} catch (e) {{}}
     // Событие доставляет движок, а движок здесь — браузер: оно доверенное.
     // Сборщик Cloudflare исполняет присланное задание только под условием
     // `e.isTrusted && '' === e.origin && null === e.source`, и без первого
@@ -1910,6 +1942,7 @@ __OPFS__
     }}
   }} catch (e) {{}}
 }})();"##,
+        helper = PT_WRITE_HELPER,
         name = quoted(name),
         url = quoted(url),
     )
@@ -1929,6 +1962,85 @@ __OPFS__
 /// разница видна ему первым же действием.
 const WINDOW_ENUMERABLE: &str = r#"["alert", "atob", "blur", "btoa", "caches", "cancelAnimationFrame", "cancelIdleCallback", "captureEvents", "chrome", "clearInterval", "clearTimeout", "clientInformation", "close", "closed", "confirm", "cookieStore", "crashReport", "createImageBitmap", "credentialless", "crossOriginIsolated", "crypto", "customElements", "devicePixelRatio", "document", "documentPictureInPicture", "event", "external", "fence", "fetch", "fetchLater", "find", "focus", "frameElement", "frames", "getComputedStyle", "getScreenDetails", "getSelection", "history", "indexedDB", "innerHeight", "innerWidth", "isSecureContext", "launchQueue", "length", "localStorage", "location", "locationbar", "matchMedia", "menubar", "moveBy", "moveTo", "name", "navigation", "navigator", "onabort", "onafterprint", "onanimationcancel", "onanimationend", "onanimationiteration", "onanimationstart", "onappinstalled", "onauxclick", "onbeforeinput", "onbeforeinstallprompt", "onbeforematch", "onbeforeprint", "onbeforetoggle", "onbeforeunload", "onbeforexrselect", "onblur", "oncancel", "oncanplay", "oncanplaythrough", "onchange", "onclick", "onclose", "oncommand", "oncontentvisibilityautostatechange", "oncontextlost", "oncontextmenu", "oncontextrestored", "oncuechange", "ondblclick", "ondevicemotion", "ondeviceorientation", "ondeviceorientationabsolute", "ondrag", "ondragend", "ondragenter", "ondragleave", "ondragover", "ondragstart", "ondrop", "ondurationchange", "onemptied", "onended", "onerror", "onfocus", "onformdata", "ongamepadconnected", "ongamepaddisconnected", "ongotpointercapture", "onhashchange", "oninput", "oninvalid", "onkeydown", "onkeypress", "onkeyup", "onlanguagechange", "onload", "onloadeddata", "onloadedmetadata", "onloadstart", "onlostpointercapture", "onmessage", "onmessageerror", "onmousedown", "onmouseenter", "onmouseleave", "onmousemove", "onmouseout", "onmouseover", "onmouseup", "onmousewheel", "onoffline", "ononline", "onpagehide", "onpagereveal", "onpageshow", "onpageswap", "onpause", "onplay", "onplaying", "onpointercancel", "onpointerdown", "onpointerenter", "onpointerleave", "onpointermove", "onpointerout", "onpointerover", "onpointerrawupdate", "onpointerup", "onpopstate", "onprogress", "onratechange", "onrejectionhandled", "onreset", "onresize", "onscroll", "onscrollend", "onscrollsnapchange", "onscrollsnapchanging", "onsearch", "onsecuritypolicyviolation", "onseeked", "onseeking", "onselect", "onselectionchange", "onselectstart", "onslotchange", "onstalled", "onstorage", "onsubmit", "onsuspend", "ontimeupdate", "ontoggle", "ontransitioncancel", "ontransitionend", "ontransitionrun", "ontransitionstart", "onunhandledrejection", "onunload", "onvolumechange", "onwaiting", "onwebkitanimationend", "onwebkitanimationiteration", "onwebkitanimationstart", "onwebkittransitionend", "onwheel", "open", "opener", "origin", "originAgentCluster", "outerHeight", "outerWidth", "pageXOffset", "pageYOffset", "parent", "performance", "personalbar", "postMessage", "print", "prompt", "queryLocalFonts", "queueMicrotask", "releaseEvents", "reportError", "requestAnimationFrame", "requestIdleCallback", "resizeBy", "resizeTo", "scheduler", "screen", "screenLeft", "screenTop", "screenX", "screenY", "scroll", "scrollBy", "scrollTo", "scrollX", "scrollY", "scrollbars", "self", "sessionStorage", "setInterval", "setTimeout", "sharedStorage", "showDirectoryPicker", "showOpenFilePicker", "showSaveFilePicker", "speechSynthesis", "status", "statusbar", "stop", "structuredClone", "styleMedia", "toolbar", "top", "trustedTypes", "viewport", "visualViewport", "webkitCancelAnimationFrame", "webkitRequestAnimationFrame", "webkitRequestFileSystem", "webkitResolveLocalFileSystemURL", "window"]"#;
 
+/// Какого вида описание у каждого члена прототипа — снято с Chrome 151 обходом
+/// всех девятисот пятидесяти интерфейсов. Имена у нас уже совпадали, а вид —
+/// нет: у браузера свойство интерфейса это акцессор (`agec` — только чтение,
+/// `agsec` — и запись), метод — перечислимое значение (`vfwec`), а константа
+/// вроде `Node.ELEMENT_NODE` не переписывается и не удаляется (`vne`). У нас
+/// заглушки лежали значениями, часть методов была неперечислима, а у
+/// свойств только для чтения стоял установщик. Читается это одной строкой —
+/// `Object.getOwnPropertyDescriptor(Element.prototype, 'namespaceURI').get` — и
+/// обход графа у челленджа читает описания именно так.
+const IFACE_KINDS: &str = r#"{"Image":{"agsec":["alt","crossOrigin","height","loading","name","referrerPolicy","width"],"agec":["naturalHeight","naturalWidth"]},"webkitRTCPeerConnection":{"agec":["canTrickleIceCandidates","connectionState","currentLocalDescription","currentRemoteDescription","iceConnectionState","iceGatheringState","localDescription","pendingLocalDescription","pendingRemoteDescription","remoteDescription","sctp","signalingState"],"vfwec":["addIceCandidate","close","createAnswer","createDataChannel","createOffer","getConfiguration","getReceivers","getSenders","getStats","getTransceivers","restartIce","setConfiguration","setLocalDescription","setRemoteDescription"]},"WebSocket":{"vfwec":["close","send"]},"WebGLRenderingContext":{"agec":["canvas","drawingBufferFormat","drawingBufferHeight","drawingBufferWidth"]},"WebGL2RenderingContext":{"agec":["canvas","drawingBufferFormat","drawingBufferHeight","drawingBufferWidth"]},"VisualViewport":{"agsec":["onresize","onscroll","onscrollend"]},"URLSearchParams":{"agec":["size"],"vfwec":["append","delete","entries","forEach","get","getAll","has","keys","set","sort","toString","values"]},"URL":{"agec":["origin","searchParams"],"agsec":["hash","host","hostname","href","password","pathname","port","protocol","search","username"],"vfwec":["toJSON","toString"]},"UIEvent":{"agec":["detail","view","which"]},"TextMetrics":{"agec":["actualBoundingBoxAscent","actualBoundingBoxDescent","actualBoundingBoxLeft","actualBoundingBoxRight","alphabeticBaseline","fontBoundingBoxAscent","fontBoundingBoxDescent","hangingBaseline","ideographicBaseline","width"]},"TextEncoder":{"agec":["encoding"],"vfwec":["encode","encodeInto"]},"TextDecoder":{"agec":["encoding","fatal","ignoreBOM"],"vfwec":["decode"]},"ShadowRoot":{"agsec":["fullscreenElement","onslotchange"],"agec":["activeElement","clonable","customElementRegistry","delegatesFocus","pictureInPictureElement","pointerLockElement","serializable","slotAssignment"]},"Selection":{"agec":["anchorNode","anchorOffset","baseNode","baseOffset","direction","extentNode","extentOffset","focusNode","focusOffset","isCollapsed","rangeCount","type"],"vfwec":["addRange","collapse","collapseToEnd","collapseToStart","containsNode","deleteFromDocument","empty","extend","getComposedRanges","getRangeAt","modify","removeAllRanges","removeRange","selectAllChildren","setBaseAndExtent","setPosition","toString"]},"Screen":{"agsec":["onchange"]},"SVGTransformList":{"agec":["length","numberOfItems"]},"SVGStringList":{"agec":["length","numberOfItems"]},"SVGSVGElement":{"agsec":["currentScale","zoomAndPan"],"agec":["currentTranslate","preserveAspectRatio"],"vne":["SVG_ZOOMANDPAN_DISABLE","SVG_ZOOMANDPAN_MAGNIFY","SVG_ZOOMANDPAN_UNKNOWN"]},"SVGRect":{"agsec":["height","width","x","y"]},"SVGPointList":{"agec":["length","numberOfItems"]},"SVGPoint":{"agsec":["x","y"]},"SVGMatrix":{"agsec":["a","b","c","d","e","f"]},"SVGLength":{"agec":["unitType"],"agsec":["value","valueAsString","valueInSpecifiedUnits"],"vne":["SVG_LENGTHTYPE_CM","SVG_LENGTHTYPE_EMS","SVG_LENGTHTYPE_EXS","SVG_LENGTHTYPE_IN","SVG_LENGTHTYPE_MM","SVG_LENGTHTYPE_NUMBER","SVG_LENGTHTYPE_PC","SVG_LENGTHTYPE_PERCENTAGE","SVG_LENGTHTYPE_PT","SVG_LENGTHTYPE_PX","SVG_LENGTHTYPE_UNKNOWN"]},"SVGGraphicsElement":{"agec":["farthestViewportElement","nearestViewportElement","requiredExtensions","systemLanguage","transform"]},"SVGElement":{"agec":["attributeStyleMap","dataset","ownerSVGElement","viewportElement"],"agsec":["autofocus","nonce","onabort","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","onauxclick","onbeforeinput","onbeforematch","onbeforetoggle","onbeforexrselect","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncopy","oncuechange","oncut","ondblclick","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","ongotpointercapture","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onload","onloadeddata","onloadedmetadata","onloadstart","onlostpointercapture","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onpaste","onpause","onplay","onplaying","onpointercancel","onpointerdown","onpointerenter","onpointerleave","onpointermove","onpointerout","onpointerover","onpointerrawupdate","onpointerup","onprogress","onratechange","onreset","onresize","onscroll","onscrollend","onscrollsnapchange","onscrollsnapchanging","onsecuritypolicyviolation","onseeked","onseeking","onselect","onselectionchange","onselectstart","onslotchange","onstalled","onsubmit","onsuspend","ontimeupdate","ontoggle","ontransitioncancel","ontransitionend","ontransitionrun","ontransitionstart","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkittransitionend","onwheel","style","tabIndex"],"vfwec":["blur","focus"]},"SVGAnimatedTransformList":{"agec":["animVal","baseVal"]},"SVGAnimatedString":{"agsec":["baseVal"],"agec":["animVal"]},"SVGAnimatedRect":{"agec":["animVal","baseVal"]},"SVGAnimatedLength":{"agec":["animVal","baseVal"]},"RTCPeerConnection":{"agec":["canTrickleIceCandidates","connectionState","currentLocalDescription","currentRemoteDescription","iceConnectionState","iceGatheringState","localDescription","pendingLocalDescription","pendingRemoteDescription","remoteDescription","sctp","signalingState"],"vfwec":["addIceCandidate","close","createAnswer","createDataChannel","createOffer","getConfiguration","getReceivers","getSenders","getStats","getTransceivers","restartIce","setConfiguration","setLocalDescription","setRemoteDescription"]},"PointerEvent":{"agec":["altitudeAngle","azimuthAngle","height","isPrimary","pointerId","pointerType","pressure","tangentialPressure","tiltX","tiltY","twist","width"]},"PerformanceTiming":{"vfwec":["toJSON"]},"PerformanceObserverEntryList":{"vfwec":["getEntries","getEntriesByName","getEntriesByType"]},"PerformanceObserver":{"vfwec":["disconnect","observe","takeRecords"]},"PerformanceNavigation":{"vne":["TYPE_BACK_FORWARD","TYPE_NAVIGATE","TYPE_RELOAD","TYPE_RESERVED"],"vfwec":["toJSON"]},"PerformanceEntry":{"vfwec":["toJSON"]},"Performance":{"agsec":["onresourcetimingbufferfull"],"vfwec":["clearMarks","clearMeasures","clearResourceTimings","getEntries","getEntriesByName","getEntriesByType","mark","measure","now","setResourceTimingBufferSize","toJSON"],"agec":["eventCounts","interactionCount"]},"OffscreenCanvas":{"agsec":["height","width"],"vfwec":["convertToBlob","getContext","transferToImageBitmap"]},"OfflineAudioContext":{"agsec":["oncomplete"],"agec":["length"],"vfwec":["resume","startRendering","suspend"]},"NodeList":{"agec":["length"]},"Node":{"agec":["childNodes","nodeType","ownerDocument","parentNode"],"vne":["ATTRIBUTE_NODE","CDATA_SECTION_NODE","COMMENT_NODE","DOCUMENT_FRAGMENT_NODE","DOCUMENT_NODE","DOCUMENT_POSITION_CONTAINED_BY","DOCUMENT_POSITION_CONTAINS","DOCUMENT_POSITION_DISCONNECTED","DOCUMENT_POSITION_FOLLOWING","DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC","DOCUMENT_POSITION_PRECEDING","DOCUMENT_TYPE_NODE","ELEMENT_NODE","ENTITY_NODE","ENTITY_REFERENCE_NODE","NOTATION_NODE","PROCESSING_INSTRUCTION_NODE","TEXT_NODE"]},"NetworkInformation":{"agsec":["onchange"]},"Navigator":{"agec":["clipboard","connection","credentials","deprecatedRunAdAuctionEnforcesKAnonymity","devicePosture","geolocation","gpu","hid","ink","keyboard","locks","login","managed","mediaCapabilities","mediaDevices","mediaSession","presentation","protectedAudience","scheduling","serial","serviceWorker","storage","storageBuckets","usb","userActivation","virtualKeyboard","wakeLock","webkitPersistentStorage","webkitTemporaryStorage","windowControlsOverlay","xr"]},"NamedNodeMap":{"agec":["length"]},"MouseEvent":{"agec":["altKey","button","buttons","clientX","clientY","ctrlKey","layerX","layerY","metaKey","movementX","movementY","offsetX","offsetY","pageX","pageY","relatedTarget","screenX","screenY","shiftKey","x","y"]},"MessageEvent":{"agec":["data","lastEventId","origin","ports","source"]},"MediaQueryList":{"agec":["matches","media"]},"KeyboardEvent":{"agec":["altKey","charCode","code","ctrlKey","key","keyCode","location","metaKey","repeat","shiftKey"]},"IntersectionObserver":{"agec":["delay","root","rootMargin","scrollMargin","thresholds","trackVisibility"],"vfwec":["disconnect","observe","takeRecords","unobserve"]},"InputEvent":{"agec":["data","inputType","isComposing"]},"History":{"agsec":["scrollRestoration"]},"HTMLVideoElement":{"agsec":["height","width"]},"HTMLUListElement":{"agsec":["type"]},"HTMLTitleElement":{"agsec":["text"]},"HTMLTextAreaElement":{"agsec":["defaultValue","disabled","maxLength","minLength","name","placeholder","readOnly","selectionEnd","selectionStart","value"],"agec":["type","willValidate"],"vfwec":["select","setRangeText","setSelectionRange"]},"HTMLTableElement":{"agsec":["width"]},"HTMLStyleElement":{"agsec":["disabled","type"]},"HTMLSelectElement":{"agsec":["disabled","name","value"],"agec":["type","willValidate"]},"HTMLScriptElement":{"agsec":["async","crossOrigin","defer","htmlFor","integrity","noModule","referrerPolicy","src","text","type"]},"HTMLOptionElement":{"agsec":["disabled","text","value"]},"HTMLMetaElement":{"agsec":["content","httpEquiv","name"]},"HTMLLinkElement":{"agsec":["crossOrigin","disabled","href","hreflang","integrity","referrerPolicy","rel","relList","target","type"]},"HTMLLabelElement":{"agsec":["htmlFor"]},"HTMLLIElement":{"agsec":["type","value"]},"HTMLInputElement":{"agsec":["alt","checked","defaultValue","disabled","height","maxLength","minLength","name","placeholder","readOnly","selectionEnd","selectionStart","src","type","value","width"],"agec":["willValidate"],"vfwec":["select","setRangeText","setSelectionRange"]},"HTMLImageElement":{"agsec":["alt","crossOrigin","height","loading","name","referrerPolicy","width"],"agec":["naturalHeight","naturalWidth"]},"HTMLIFrameElement":{"agsec":["allow","height","loading","name","referrerPolicy","sandbox","src","srcdoc","width"],"agec":["contentDocument","contentWindow"]},"HTMLFormElement":{"agsec":["action","name","rel","relList","target"]},"HTMLElement":{"agsec":["accessKey","autocapitalize","autofocus","contentEditable","dir","draggable","editContext","enterKeyHint","inert","inputMode","lang","onabort","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","onauxclick","onbeforeinput","onbeforematch","onbeforetoggle","onbeforexrselect","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncopy","oncuechange","oncut","ondblclick","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","ongotpointercapture","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onload","onloadeddata","onloadedmetadata","onloadstart","onlostpointercapture","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onpaste","onpause","onplay","onplaying","onpointercancel","onpointerdown","onpointerenter","onpointerleave","onpointermove","onpointerout","onpointerover","onpointerrawupdate","onpointerup","onprogress","onratechange","onreset","onresize","onscroll","onscrollend","onscrollsnapchange","onscrollsnapchanging","onsecuritypolicyviolation","onseeked","onseeking","onselect","onselectionchange","onselectstart","onslotchange","onstalled","onsubmit","onsuspend","ontimeupdate","ontoggle","ontransitioncancel","ontransitionend","ontransitionrun","ontransitionstart","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkittransitionend","onwheel","outerText","popover","spellcheck","style","tabIndex","title","translate","virtualKeyboardPolicy","writingSuggestions"],"agec":["attributeStyleMap"]},"HTMLCanvasElement":{"agsec":["height","width"]},"HTMLButtonElement":{"agsec":["disabled","name","type","value"],"agec":["willValidate"]},"HTMLBodyElement":{"agsec":["text"]},"HTMLAnchorElement":{"agsec":["hash","host","hostname","href","hreflang","name","password","pathname","port","protocol","referrerPolicy","rel","relList","search","target","text","type","username"],"agec":["origin"]},"FormData":{"vfwec":["append","delete","entries","forEach","get","getAll","has","keys","set","values"]},"FocusEvent":{"agec":["relatedTarget"]},"FileReader":{"vfwec":["abort","readAsArrayBuffer","readAsBinaryString","readAsDataURL","readAsText"]},"Event":{"agec":["bubbles","cancelable","composed","currentTarget","defaultPrevented","eventPhase","target","timeStamp","type"]},"Element":{"agec":["activeViewTransition","assignedSlot","currentCSSZoom","customElementRegistry","namespaceURI","prefix"],"agsec":["ariaActiveDescendantElement","ariaAtomic","ariaAutoComplete","ariaBrailleLabel","ariaBrailleRoleDescription","ariaBusy","ariaChecked","ariaColCount","ariaColIndex","ariaColIndexText","ariaColSpan","ariaControlsElements","ariaCurrent","ariaDescribedByElements","ariaDescription","ariaDetailsElements","ariaDisabled","ariaErrorMessageElements","ariaExpanded","ariaFlowToElements","ariaHasPopup","ariaHidden","ariaInvalid","ariaKeyShortcuts","ariaLabel","ariaLabelledByElements","ariaLevel","ariaLive","ariaModal","ariaMultiLine","ariaMultiSelectable","ariaOrientation","ariaPlaceholder","ariaPosInSet","ariaPressed","ariaReadOnly","ariaRelevant","ariaRequired","ariaRoleDescription","ariaRowCount","ariaRowIndex","ariaRowIndexText","ariaRowSpan","ariaSelected","ariaSetSize","ariaSort","ariaValueMax","ariaValueMin","ariaValueNow","ariaValueText","classList","elementTiming","onbeforecopy","onbeforecut","onbeforepaste","onfullscreenchange","onfullscreenerror","onsearch","onwebkitfullscreenchange","onwebkitfullscreenerror","outerHTML","part","role","scrollLeft","scrollTop","slot"]},"Document":{"agec":["activeElement","activeViewTransition","all","applets","childElementCount","children","currentScript","customElementRegistry","defaultView","documentElement","featurePolicy","firstElementChild","fonts","fragmentDirective","implementation","lastElementChild","pictureInPictureElement","pictureInPictureEnabled","pointerLockElement","prerendering","readyState","referrer","rootElement","scrollingElement","timeline","wasDiscarded","webkitCurrentFullScreenElement","webkitFullscreenElement","webkitFullscreenEnabled","webkitHidden","webkitIsFullScreen","xmlEncoding"],"agsec":["body","fullscreen","fullscreenElement","fullscreenEnabled","onabort","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","onauxclick","onbeforecopy","onbeforecut","onbeforeinput","onbeforematch","onbeforepaste","onbeforetoggle","onbeforexrselect","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncopy","oncuechange","oncut","ondblclick","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","onfreeze","onfullscreenchange","onfullscreenerror","ongotpointercapture","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onload","onloadeddata","onloadedmetadata","onloadstart","onlostpointercapture","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onpaste","onpause","onplay","onplaying","onpointercancel","onpointerdown","onpointerenter","onpointerleave","onpointerlockchange","onpointerlockerror","onpointermove","onpointerout","onpointerover","onpointerrawupdate","onpointerup","onprerenderingchange","onprogress","onratechange","onreadystatechange","onreset","onresize","onresume","onscroll","onscrollend","onscrollsnapchange","onscrollsnapchanging","onsearch","onsecuritypolicyviolation","onseeked","onseeking","onselect","onselectionchange","onselectstart","onslotchange","onstalled","onsubmit","onsuspend","ontimeupdate","ontoggle","ontransitioncancel","ontransitionend","ontransitionrun","ontransitionstart","onvisibilitychange","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkitfullscreenchange","onwebkitfullscreenerror","onwebkittransitionend","onwheel","xmlStandalone","xmlVersion"]},"DOMTokenList":{"agec":["length"],"agsec":["value"]},"DOMRectReadOnly":{"agec":["bottom","height","left","right","top","width","x","y"],"vfwec":["toJSON"]},"DOMRect":{"agsec":["height","width","x","y"]},"CustomEvent":{"agec":["detail"]},"CustomElementRegistry":{"vfwec":["define","get","getName","upgrade","whenDefined"]},"Crypto":{"vfwec":["getRandomValues","randomUUID"]},"CanvasRenderingContext2D":{"agec":["canvas"]},"CanvasPattern":{"vfwec":["setTransform"]},"CanvasGradient":{"vfwec":["addColorStop"]},"CSSStyleDeclaration":{"agsec":["cssFloat","cssText"],"agec":["length","parentRule"]},"Blob":{"agec":["size","type"],"vfwec":["arrayBuffer","bytes","slice","text"]},"BaseAudioContext":{"agec":["audioWorklet","currentTime","destination","listener","sampleRate","state"],"agsec":["onstatechange"],"vfwec":["createAnalyser","createBiquadFilter","createBuffer","createBufferSource","createConvolver","createDelay","createDynamicsCompressor","createGain","createOscillator","createPanner","createPeriodicWave","createScriptProcessor","createStereoPanner","createWaveShaper","decodeAudioData"]},"AudioContext":{"agec":["baseLatency","outputLatency","playbackStats","sinkId"],"agsec":["onerror","onsinkchange"],"vfwec":["close","resume","suspend"]},"AnalyserNode":{"agec":["frequencyBinCount"]},"GPUDevice":{"agsec":["label"]},"SubtleCrypto":{"vfwec":["decrypt","deriveBits","deriveKey","digest","encrypt","exportKey","generateKey","importKey","sign","verify"]},"SharedWorker":{"agec":["port"],"agsec":["onerror"]},"SpeechSynthesis":{"agsec":["onvoiceschanged"]}}"#;
+
+/// Приводит описания к снятым: заводить ничего не заводит, только исправляет
+/// вид у того, что уже есть. Идёт последним — после заглушек, подъёмов и
+/// переносов, иначе поправленное перепишут заново.
+const IFACE_KINDS_TEMPLATE: &str = r#"(() => {
+  const K = __IFACE_KINDS__;
+  const nat = globalThis.__pt_native || ((f) => f);
+  const named = (f, n) => {
+    try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {}
+    return f;
+  };
+  // Чтение и запись у заглушки-акцессора: значение живёт при самом объекте,
+  // как у браузера, а не общее на весь прототип.
+  const pair = (name, dflt) => {
+    const slots = new WeakMap();
+    return [
+      nat(named(function () { const s = slots.get(this); return s ? s.v : dflt; }, 'get ' + name)),
+      nat(named(function (v) {
+        let s = slots.get(this);
+        if (!s) { s = {}; try { slots.set(this, s); } catch (e) { return; } }
+        s.v = v;
+      }, 'set ' + name)),
+    ];
+  };
+  // Убранный установщик движку всё-таки нужен: сам браузер эти поля пишет
+  // изнутри, страница — нет. Хранилище заведено раньше (им пользуются и
+  // конструкторы), здесь оно только пополняется.
+  const writers = globalThis.__pt_writers;
+  for (const iface of Object.keys(K)) {
+    let P;
+    try { const C = globalThis[iface]; P = C && C.prototype; } catch (e) { continue; }
+    if (!P || typeof P !== 'object') continue;
+    const groups = K[iface];
+    for (const kind of Object.keys(groups)) {
+      const wantE = kind.indexOf('e') >= 0, wantC = kind.indexOf('c') >= 0;
+      for (const name of groups[kind]) {
+        let d;
+        try { d = Object.getOwnPropertyDescriptor(P, name); } catch (e) { continue; }
+        if (!d || !d.configurable) continue;
+        try {
+          if (kind.charCodeAt(0) === 97) {
+            const wantSet = kind.charAt(2) === 's';
+            let get = d.get, set = d.set;
+            if (!get || (wantSet && !set)) {
+              const made = pair(name, d.get ? undefined : d.value);
+              if (!get) { get = made[0]; set = made[1]; }
+              else if (wantSet && !set) set = made[1];
+            }
+            if (!wantSet && set && writers) {
+              let w = writers.get(P);
+              if (!w) { w = Object.create(null); writers.set(P, w); }
+              w[name] = set;
+            }
+            Object.defineProperty(P, name, {
+              get, set: wantSet ? set : undefined, enumerable: wantE, configurable: wantC,
+            });
+          } else {
+            let value = d.value;
+            if (d.get) { try { value = d.get.call(P); } catch (e) { value = undefined; } }
+            Object.defineProperty(P, name, {
+              value, writable: kind.indexOf('w') >= 0, enumerable: wantE, configurable: wantC,
+            });
+          }
+        } catch (e) {}
+      }
+    }
+  }
+})();"#;
+
 pub fn web_surface_script() -> String {
     format!(
         "{WEB_SURFACE_TEMPLATE}\n{}\n{}\n{}",
@@ -1941,8 +2053,8 @@ pub fn web_surface_script() -> String {
             .replace("__IFACE_STATICS__", IFACE_STATICS)
             .replace("__IFACE_PROTO_MOVES__", IFACE_PROTO_MOVES)
             .replace("__IFACE_CHAIN__", IFACE_CHAIN)
-            .replace("__IFACE_LIFT__", IFACE_LIFT)
-    )
+            .replace("__IFACE_LIFT__", IFACE_LIFT),
+    ) + "\n" + &IFACE_KINDS_TEMPLATE.replace("__IFACE_KINDS__", IFACE_KINDS)
 }
 
 /// Приводит перечислимость собственных свойств окна к браузерной. Идёт
@@ -2011,18 +2123,59 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
     const loc = globalThis.location;
     const lproto = loc && Object.getPrototypeOf(loc);
     if (loc && lproto && lproto !== Object.prototype) {
+      // Список происхождений предков — настоящий DOMStringList, а не пустой
+      // объект: у страницы верхнего уровня он нулевой длины, но со своим
+      // прототипом, `item` и `contains`. Готовится до переноса: перенесённые
+      // члены неподделываемы, и переопределить их уже нельзя.
+      let ancestors = null;
+      try {
+        const DSL = typeof globalThis.DOMStringList === 'function' ? globalThis.DOMStringList : null;
+        if (DSL) {
+          const P = DSL.prototype;
+          const nat = globalThis.__pt_native || ((f) => f);
+          if (!Object.prototype.hasOwnProperty.call(P, 'length')) {
+            Object.defineProperty(P, 'length', {
+              get: nat(function length() { return 0; }), enumerable: true, configurable: true,
+            });
+            for (const [m, f] of [['contains', function contains() { return false; }],
+                                  ['item', function item() { return null; }]]) {
+              Object.defineProperty(P, m, { value: nat(f), writable: true, enumerable: true, configurable: true });
+            }
+            // `constructor` у браузера идёт последним — то есть заведён после
+            // членов; перечисление прототипа это показывает.
+            const ctor = Object.getOwnPropertyDescriptor(P, 'constructor');
+            if (ctor && ctor.configurable) { delete P.constructor; Object.defineProperty(P, 'constructor', ctor); }
+            try { Object.defineProperty(P, Symbol.toStringTag, { value: 'DOMStringList', configurable: true }); }
+            catch (e2) {}
+          }
+          ancestors = Object.create(P);
+        }
+      } catch (e) {}
       for (const name of Object.getOwnPropertyNames(lproto)) {
         if (name === 'constructor') continue;
-        const d = Object.getOwnPropertyDescriptor(lproto, name);
+        let d = Object.getOwnPropertyDescriptor(lproto, name);
         if (!d) continue;
+        if (name === 'ancestorOrigins' && ancestors) {
+          d = { get: (globalThis.__pt_native || ((f) => f))(
+                  function ancestorOrigins() { return ancestors; }), enumerable: true, configurable: true };
+        }
         try {
           // `valueOf` у браузера неперечислим, остальные пятнадцать — да.
-          Object.defineProperty(loc, name, Object.assign({}, d, {
+          const own = Object.assign({}, d, {
             enumerable: name !== 'valueOf', configurable: false,
-          }));
+          });
+          // Члены Location браузер держит неподделываемыми: ни переписать
+          // методом своё, ни переопределить. У нас они были перезаписываемы,
+          // а это видно первым же чтением описания.
+          if ('writable' in own) own.writable = false;
+          // `origin` только читается: присваивание у браузера молча ничего не
+          // делает, а у нас уводило страницу.
+          if (name === 'origin') delete own.set;
+          Object.defineProperty(loc, name, own);
           delete lproto[name];
         } catch (e) {}
       }
+
     }
   } catch (e) {}
 
@@ -2347,7 +2500,7 @@ const OPFS_TEMPLATE: &str = r##"  // ── Origin Private File System ───
       if (end > file.data.length) {
         const grown = new Uint8Array(end);
         grown.set(file.data);
-        file.data = grown;
+        __pt_write(file, 'data', grown);
       }
       file.data.set(data, start);
       return data.length;
@@ -2485,7 +2638,7 @@ const OPFS_TEMPLATE: &str = r##"  // ── Origin Private File System ───
     });
     put(FileH, 'createWritable', function createWritable(opts) {
       const n = node(this);
-      if (!(opts && opts.keepExistingData)) n.data = new Uint8Array(0);
+      if (!(opts && opts.keepExistingData)) __pt_write(n, 'data', new Uint8Array(0));
       const stream = Object.create(Writable ? Writable.prototype : Object.prototype);
       STATE.set(stream, { file: n, at: 0 });
       return Promise.resolve(stream);
@@ -2497,7 +2650,7 @@ const OPFS_TEMPLATE: &str = r##"  // ── Origin Private File System ───
         const st = node(this);
         if (chunk && typeof chunk === 'object' && chunk.type) {
           if (chunk.type === 'seek') { st.at = chunk.position | 0; return Promise.resolve(undefined); }
-          if (chunk.type === 'truncate') { st.file.data = st.file.data.slice(0, chunk.size | 0); return Promise.resolve(undefined); }
+          if (chunk.type === 'truncate') { __pt_write(st.file, 'data', st.file.data.slice(0, chunk.size | 0)); return Promise.resolve(undefined); }
           chunk = chunk.data;
         }
         st.at += putAt(st.file, bytesOf(chunk), st.at);
@@ -2506,7 +2659,7 @@ const OPFS_TEMPLATE: &str = r##"  // ── Origin Private File System ───
       put(Writable, 'seek', function seek(pos) { node(this).at = pos | 0; return Promise.resolve(undefined); });
       put(Writable, 'truncate', function truncate(size) {
         const st = node(this);
-        st.file.data = st.file.data.slice(0, size | 0);
+        __pt_write(st.file, 'data', st.file.data.slice(0, size | 0));
         return Promise.resolve(undefined);
       });
       put(Writable, 'close', function close() { return Promise.resolve(undefined); });
@@ -2540,7 +2693,7 @@ const OPFS_TEMPLATE: &str = r##"  // ── Origin Private File System ───
         return n;
       });
       put(Sync, 'getSize', function getSize() { return node(this).file.data.length; });
-      put(Sync, 'truncate', function truncate(size) { const st = node(this); st.file.data = st.file.data.slice(0, size | 0); });
+      put(Sync, 'truncate', function truncate(size) { const st = node(this); __pt_write(st.file, 'data', st.file.data.slice(0, size | 0)); });
       put(Sync, 'flush', function flush() {
         const st = node(this);
         if (!st.fd) return;
@@ -3988,7 +4141,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       if (globalThis.__pt_privateCanvas) return globalThis.__pt_privateCanvas(w, h);
       if (!D || !D.createElement) return null;
       const el = D.createElement('canvas');
-      el.width = w; el.height = h;
+      __pt_write(el, 'width', w); __pt_write(el, 'height', h);
       return el;
     };
     const ctx2d = (c) => (globalThis.__pt_privateCtx
@@ -4638,7 +4791,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
       }
     }
     disconnect() {
-      this.__ptOn = false; this.__ptQueue.length = 0;
+      this.__ptOn = false; __pt_write(this.__ptQueue, 'length', 0);
       const i = observers.indexOf(this); if (i >= 0) observers.splice(i, 1);
     }
     takeRecords() { return this.__ptQueue.splice(0); }
@@ -4695,7 +4848,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
     }
     clearMarks() {}
     clearMeasures() {}
-    clearResourceTimings() { entries.length = 0; }
+    clearResourceTimings() { __pt_write(entries, 'length', 0); }
     setResourceTimingBufferSize() {}
     // Слушателей объявляет `EventTarget`, от которого `Performance` наследует, —
     // одна пустышка здесь давала три лишних имени на прототипе против браузера.
@@ -4735,7 +4888,7 @@ const CRYPTO_TEMPLATE: &str = r#"(() => {
     const o = { name: nameOf(a) };
     if (a && typeof a === 'object') {
       if (a.hash) o.hash = { name: hashOf(a) };
-      if (a.length != null) o.length = a.length;
+      if (a.length != null) __pt_write(o, 'length', a.length);
     }
     return o;
   };
@@ -5151,7 +5304,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     };
     // Порядок важен: `readystatechange` доходит и до свойства-обработчика, и до
     // слушателей, — ради этого класс и существует.
-    const setState = (self, n) => { self.__ptX.readyState = n; fire(self, 'readystatechange'); };
+    const setState = (self, n) => { __pt_write(self.__ptX, 'readyState', n); fire(self, 'readystatechange'); };
 
     meth('open', function (method, url) {
       const b = this.__ptX;
@@ -5173,7 +5326,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     });
     meth('abort', function () {
       const b = this.__ptX;
-      b.aborted = true; b.readyState = 4; b.status = 0;
+      b.aborted = true; __pt_write(b, 'readyState', 4); b.status = 0;
       fire(this, 'abort'); fire(this, 'loadend');
     });
     meth('send', function (body) {
@@ -5466,11 +5619,11 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         this.url = String(input && input.url !== undefined ? input.url : input);
         this.method = String(init.method || (input && input.method) || 'GET').toUpperCase();
         this.headers = new globalThis.Headers(init.headers || (input && input.headers));
-        this.credentials = init.credentials || 'same-origin';
+        __pt_write(this, 'credentials', init.credentials || 'same-origin');
         this.mode = init.mode || 'cors';
         this.cache = init.cache || 'default';
         this.redirect = init.redirect || 'follow';
-        this.referrer = init.referrer === undefined ? 'about:client' : String(init.referrer);
+        __pt_write(this, 'referrer', init.referrer === undefined ? 'about:client' : String(init.referrer));
         this.signal = init.signal || null;
         Object.defineProperty(this, '__body', { value: init.body === undefined ? null : init.body, enumerable: false });
         this.bodyUsed = false;
@@ -5506,12 +5659,12 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         this.headers = new globalThis.Headers(init.headers);
         this.ok = this.status >= 200 && this.status < 300;
         this.redirected = false;
-        this.type = 'default';
+        __pt_write(this, 'type', 'default');
         this.url = '';
         this.bodyUsed = false;
         Object.defineProperty(this, '__body', { value: body == null ? '' : body, enumerable: false });
       }
-      static error() { const r = new globalThis.Response(null, { status: 0 }); r.type = 'error'; return r; }
+      static error() { const r = new globalThis.Response(null, { status: 0 }); __pt_write(r, 'type', 'error'); return r; }
       static json(data, init) { return new globalThis.Response(__ptJSON.stringify(data), init); }
       clone() { return new globalThis.Response(this.__body, { status: this.status, statusText: this.statusText, headers: this.headers }); }
       text() { this.bodyUsed = true; return Promise.resolve(String(this.__body)); }
@@ -5710,11 +5863,11 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       queueMicrotask(() => {
         try {
           run(r);
-          r.readyState = 'done';
+          __pt_write(r, 'readyState', 'done');
           const ev = { type: 'success', target: r, currentTarget: r };
           if (typeof r.onsuccess === 'function') r.onsuccess(ev);
         } catch (e) {
-          r.error = e; r.readyState = 'done';
+          r.error = e; __pt_write(r, 'readyState', 'done');
           const ev = { type: 'error', target: r, currentTarget: r };
           if (typeof r.onerror === 'function') r.onerror(ev);
         }
@@ -5763,7 +5916,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
           addEventListener(t, fn) { this['on' + t] = fn; }, removeEventListener() {}, dispatchEvent() { return true; } };
         queueMicrotask(() => {
           r.result = db;
-          r.readyState = 'done';
+          __pt_write(r, 'readyState', 'done');
           if (wanted > entry.version) {
             const old = entry.version;
             entry.version = wanted;
@@ -5816,7 +5969,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   globalThis.__pt_wsOpen = (id, protocol) => {
     const sock = wsLive.get(id); if (!sock) return;
     const st = wsState.get(sock);
-    st.readyState = 1; st.protocol = String(protocol || '');
+    __pt_write(st, 'readyState', 1); st.protocol = String(protocol || '');
     wsFire(sock, 'open', { type: 'open' });
   };
   globalThis.__pt_wsMessage = (id, data, isBinary) => {
@@ -5888,7 +6041,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     close(code, reason) {
       const st = wsState.get(this);
       if (st.readyState === 2 || st.readyState === 3) return;
-      st.readyState = 2;
+      __pt_write(st, 'readyState', 2);
       wsOps.push({ op: 'close', id: st.id, code: code == null ? 1000 : (code | 0), reason: reason == null ? '' : String(reason) });
     }
     addEventListener(type, fn) {
@@ -6705,7 +6858,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       if (w === lastW && h === lastH) return;
       lastW = w; lastH = h;
       M = [1, 0, 0, 1, 0, 0];
-      mStack.length = 0;
+      __pt_write(mStack, 'length', 0);
       verbs = []; sub = false; cx = 0; cy = 0;
       bx0 = by0 = bx1 = by1 = 0;
       uniform = null;
@@ -7958,7 +8111,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         } catch (e) {}
         return dst && dst.connect ? dst : undefined;
       },
-      disconnect() { state.__ptOut.length = 0; },
+      disconnect() { __pt_write(state.__ptOut, 'length', 0); },
       start() {}, stop() {},
       addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
     }, extra || {});
@@ -8323,14 +8476,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // Частота живого контекста у Chrome — та, что у звуковой карты, и это
       // 48 кГц, а не 44,1. Задержка вывода — размер буфера, делённый на неё.
       // И контекст без действия пользователя браузер держит остановленным.
-      this.sampleRate = 48000; this.currentTime = 0; this.state = 'suspended';
+      __pt_write(this, 'sampleRate', 48000); __pt_write(this, 'currentTime', 0); __pt_write(this, 'state', 'suspended');
       this.__ptNodes = []; this.__ptEdges = [];
       // У приёмника нет выхода, и число каналов у него задано явно, а не
       // «сколько придёт»: снято с Chrome 151.
-      this.destination = makeNode(this, 'destination',
-        { maxChannelCount: 2, numberOfOutputs: 0, channelCountMode: 'explicit' });
-      this.listener = { positionX: audioParam(0), positionY: audioParam(0), positionZ: audioParam(0), setPosition() {}, setOrientation() {} };
-      this.audioWorklet = { addModule() { return Promise.resolve(); } };
+      __pt_write(this, 'destination', makeNode(this, 'destination',
+        { maxChannelCount: 2, numberOfOutputs: 0, channelCountMode: 'explicit' }));
+      __pt_write(this, 'listener', { positionX: audioParam(0), positionY: audioParam(0), positionZ: audioParam(0), setPosition() {}, setOrientation() {} });
+      __pt_write(this, 'audioWorklet', { addModule() { return Promise.resolve(); } });
       this.onstatechange = null;
     }
     createOscillator() {
@@ -8379,9 +8532,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       } return bufferOf(new Float32Array(len), ch, len, rate || this.sampleRate); }
     createPeriodicWave() { return {}; }
     decodeAudioData(_d, cb) { const b = this.createBuffer(2, this.sampleRate, this.sampleRate); if (typeof cb === 'function') cb(b); return Promise.resolve(b); }
-    resume() { this.state = 'running'; return Promise.resolve(); }
-    suspend() { this.state = 'suspended'; return Promise.resolve(); }
-    close() { this.state = 'closed'; return Promise.resolve(); }
+    resume() { __pt_write(this, 'state', 'running'); return Promise.resolve(); }
+    suspend() { __pt_write(this, 'state', 'suspended'); return Promise.resolve(); }
+    close() { __pt_write(this, 'state', 'closed'); return Promise.resolve(); }
     addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
     // Граф считается обходом от приёмника, а не подменяется синтезом.
     // Раньше здесь всегда рисовался осциллятор со сжимателем, чем бы страница
@@ -8693,8 +8846,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // карты, а выходную он на этой машине не знает и говорит ноль. Их
       // отсутствие само по себе примета — у офлайнового контекста их нет, у
       // живого есть.
-      this.baseLatency = 512 / this.sampleRate;
-      this.outputLatency = 0;
+      __pt_write(this, 'baseLatency', 512 / this.sampleRate);
+      __pt_write(this, 'outputLatency', 0);
     }
   }, 'AudioContext'), 'AudioContext');
   // `close`/`resume`/`suspend` браузер объявляет на самих контекстах, а не на
@@ -8717,8 +8870,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   globalThis.OfflineAudioContext = audioTag(mask(class OfflineAudioContext extends BaseAudioContext {
     constructor(ch, len, rate) {
       super();
-      if (ch && typeof ch === 'object') { this.__ptChans = ch.numberOfChannels || 1; this.length = ch.length || 44100; if (ch.sampleRate) this.sampleRate = ch.sampleRate; }
-      else { this.__ptChans = ch || 1; this.length = len || 44100; if (rate) this.sampleRate = rate; }
+      if (ch && typeof ch === 'object') { this.__ptChans = ch.numberOfChannels || 1; __pt_write(this, 'length', ch.length || 44100); if (ch.sampleRate) __pt_write(this, 'sampleRate', ch.sampleRate); }
+      else { this.__ptChans = ch || 1; __pt_write(this, 'length', len || 44100); if (rate) __pt_write(this, 'sampleRate', rate); }
       this.oncomplete = null;
     }
     startRendering() {
@@ -8977,14 +9130,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         },
         enumerable: false,
       });
-      this.localDescription = null;
-      this.remoteDescription = null;
-      this.currentLocalDescription = null;
-      this.pendingLocalDescription = null;
-      this.iceGatheringState = 'new';
-      this.iceConnectionState = 'new';
-      this.connectionState = 'new';
-      this.signalingState = 'stable';
+      __pt_write(this, 'localDescription', null);
+      __pt_write(this, 'remoteDescription', null);
+      __pt_write(this, 'currentLocalDescription', null);
+      __pt_write(this, 'pendingLocalDescription', null);
+      __pt_write(this, 'iceGatheringState', 'new');
+      __pt_write(this, 'iceConnectionState', 'new');
+      __pt_write(this, 'connectionState', 'new');
+      __pt_write(this, 'signalingState', 'stable');
       this.onicecandidate = null;
       this.onicegatheringstatechange = null;
       this.oniceconnectionstatechange = null;
@@ -9018,7 +9171,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       const channel = Object.assign(new EventTarget(), {
         label: String(label == null ? '' : label), ordered: !(opts && opts.ordered === false),
         readyState: 'connecting', bufferedAmount: 0, id: null, protocol: (opts && opts.protocol) || '',
-        send() {}, close() { this.readyState = 'closed'; },
+        send() {}, close() { __pt_write(this, 'readyState', 'closed'); },
       });
       // Канал обязан называть себя каналом: `Object.prototype.toString` по
       // нему — обычная проверка, и `[object Object]` выдаёт нас с головой.
@@ -9037,20 +9190,20 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     }
     async setLocalDescription(desc) {
       const value = desc || { type: 'offer', sdp: this.__ptSdp('offer') };
-      this.localDescription = value;
-      this.currentLocalDescription = value;
-      this.signalingState = value.type === 'offer' ? 'have-local-offer' : 'stable';
+      __pt_write(this, 'localDescription', value);
+      __pt_write(this, 'currentLocalDescription', value);
+      __pt_write(this, 'signalingState', value.type === 'offer' ? 'have-local-offer' : 'stable');
       this.__ptGather();
     }
     async setRemoteDescription(desc) {
-      this.remoteDescription = desc || null;
-      this.signalingState = 'stable';
+      __pt_write(this, 'remoteDescription', desc || null);
+      __pt_write(this, 'signalingState', 'stable');
     }
     __ptGather() {
       const st = this.__pt;
       if (st.gathered || st.closed) return;
       st.gathered = true;
-      this.iceGatheringState = 'gathering';
+      __pt_write(this, 'iceGatheringState', 'gathering');
       this.__ptFire('icegatheringstatechange');
       const st_ = st, self = this;
       // Сбор идёт не мгновенно: браузеру нужен цикл событий, и код, который
@@ -9072,7 +9225,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         });
         setTimeout(() => {
           if (st_.closed) return;
-          self.iceGatheringState = 'complete';
+          __pt_write(self, 'iceGatheringState', 'complete');
           self.__ptFire('icecandidate', { candidate: null });
           self.__ptFire('icegatheringstatechange');
         }, 30);
@@ -9088,9 +9241,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     restartIce() {}
     close() {
       this.__pt.closed = true;
-      this.signalingState = 'closed';
-      this.iceConnectionState = 'closed';
-      this.connectionState = 'closed';
+      __pt_write(this, 'signalingState', 'closed');
+      __pt_write(this, 'iceConnectionState', 'closed');
+      __pt_write(this, 'connectionState', 'closed');
     }
   }, 'RTCPeerConnection');
 
@@ -9255,8 +9408,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // остальным, и `[object Object]` там — готовая примета.
     const MQL = globalThis.MediaQueryList;
     const proto = MQL && MQL.prototype ? MQL.prototype : Object.prototype;
-    return Object.assign(Object.create(proto), {
-      matches, media: query, onchange: null,
+    // `matches` и `media` у браузера только читаются — кладём их через запись
+    // изнутри, иначе `Object.assign` падает о собственный же интерфейс.
+    const mql = Object.create(proto);
+    __pt_write(mql, 'matches', matches);
+    __pt_write(mql, 'media', query);
+    return Object.assign(mql, {
+      onchange: null,
       addListener: (f) => { if (f) listeners.push(f); },
       removeListener: (f) => { const i = listeners.indexOf(f); if (i >= 0) listeners.splice(i, 1); },
       addEventListener: (t, f) => { if (t === 'change' && f) listeners.push(f); },
@@ -9464,25 +9622,25 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   if (!globalThis.FileReader) {
     globalThis.FileReader = class FileReader {
       constructor() {
-        this.readyState = 0; this.result = null; this.error = null;
+        __pt_write(this, 'readyState', 0); this.result = null; this.error = null;
         this.onload = null; this.onloadend = null; this.onerror = null; this.onprogress = null;
         Object.defineProperty(this, '__ls', { value: {}, enumerable: false });
       }
       addEventListener(t, fn) { (this.__ls[t] = this.__ls[t] || []).push(fn); }
       removeEventListener(t, fn) { const l = this.__ls[t]; if (!l) return; const i = l.indexOf(fn); if (i >= 0) l.splice(i, 1); }
       dispatchEvent() { return true; }
-      abort() { this.readyState = 2; }
+      abort() { __pt_write(this, 'readyState', 2); }
       __ptFire(type) {
         const ev = { type, target: this, currentTarget: this, isTrusted: true };
         try { if (typeof this['on' + type] === 'function') this['on' + type](ev); } catch (e) {}
         for (const fn of (this.__ls[type] || []).slice()) { try { fn.call(this, ev); } catch (e) {} }
       }
       __ptRead(blob, make) {
-        this.readyState = 1;
+        __pt_write(this, 'readyState', 1);
         Promise.resolve(blob && blob.text ? blob.text() : String(blob)).then((t) => {
-          this.result = make(t); this.readyState = 2;
+          this.result = make(t); __pt_write(this, 'readyState', 2);
           this.__ptFire('load'); this.__ptFire('loadend');
-        }, (e) => { this.error = e; this.readyState = 2; this.__ptFire('error'); this.__ptFire('loadend'); });
+        }, (e) => { this.error = e; __pt_write(this, 'readyState', 2); this.__ptFire('error'); this.__ptFire('loadend'); });
       }
       readAsText(b) { this.__ptRead(b, (t) => t); }
       readAsDataURL(b) { this.__ptRead(b, (t) => 'data:' + ((b && b.type) || 'application/octet-stream') + ';base64,' + btoa(t)); }
@@ -9620,7 +9778,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           // не приходила.
           st.scheme = scheme;
           st.username = b.username; st.password = b.password;
-          st.host = b.host; st.port = b.port;
+          st.host = b.host; __pt_write(st, 'port', b.port);
           st.opaque = false;
           let rest = s;
           const hi = rest.indexOf('#'); st.fragment = hi >= 0 ? rest.slice(hi) : '';
@@ -9645,7 +9803,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         if (hi >= 0) s = s.slice(0, hi);
         const qi = s.indexOf('?'); const q = qi >= 0 ? s.slice(qi) : '';
         if (qi >= 0) s = s.slice(0, qi);
-        st.host = ''; st.port = ''; st.username = ''; st.password = '';
+        st.host = ''; __pt_write(st, 'port', ''); st.username = ''; st.password = '';
         st.path = s; st.query = q; st.fragment = frag;
         return true;
       }
@@ -9672,7 +9830,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         if (ci >= 0) { hostPart = auth.slice(0, ci); portPart = auth.slice(ci + 1); }
       }
       st.host = hostPart.startsWith('[') ? hostPart.toLowerCase() : encHost(hostPart.toLowerCase());
-      st.port = portPart === SPECIAL[scheme] ? '' : portPart;
+      __pt_write(st, 'port', portPart === SPECIAL[scheme] ? '' : portPart);
       const hi = rest.indexOf('#'); st.fragment = hi >= 0 ? rest.slice(hi) : '';
       if (hi >= 0) rest = rest.slice(0, hi);
       const qi = rest.indexOf('?'); st.query = qi >= 0 ? rest.slice(qi) : '';
@@ -9709,12 +9867,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       get hostname() { return URL_STATE.get(this).host; }
       set hostname(v) { const st = URL_STATE.get(this); if (!st.opaque) st.host = encHost(String(v).toLowerCase()); }
       get port() { return URL_STATE.get(this).port; }
-      set port(v) { const st = URL_STATE.get(this); const t = String(v).replace(/[^0-9]/g, ''); st.port = t === SPECIAL[st.scheme] ? '' : t; }
+      set port(v) { const st = URL_STATE.get(this); const t = String(v).replace(/[^0-9]/g, ''); __pt_write(st, 'port', t === SPECIAL[st.scheme] ? '' : t); }
       get host() { const st = URL_STATE.get(this); return st.host + (st.port ? ':' + st.port : ''); }
       set host(v) {
         const st = URL_STATE.get(this); const t = String(v);
         const ci = t.startsWith('[') ? t.indexOf(']') + 1 : t.lastIndexOf(':');
-        if (ci > 0 && t[ci] === ':') { this.hostname = t.slice(0, ci); this.port = t.slice(ci + 1); }
+        if (ci > 0 && t[ci] === ':') { this.hostname = t.slice(0, ci); __pt_write(this, 'port', t.slice(ci + 1)); }
         else this.hostname = t;
       }
       get pathname() { return URL_STATE.get(this).path; }
@@ -10183,5 +10341,33 @@ mod tests {
         let script = injection_script(&profile);
         // The quote must be escaped, not left to terminate the JS string.
         assert!(script.contains(r#"evil\" + alert(1) + \""#));
+    }
+}
+
+#[cfg(test)]
+mod dump_scripts {
+    /// Скрипты слоёв — текстом на диск, когда задан `NOKK_DUMP_DIR`. Нужен он
+    /// для одного: проверить синтаксис тем же `node --check`, каким проверяется
+    /// `dom_runtime.js`. Внутри строк Rust опечатка видна только так — движок
+    /// на неё отвечает одним `SyntaxError` без места.
+    #[test]
+    fn dump_scripts() {
+        let dir = std::env::var("NOKK_DUMP_DIR").unwrap_or_default();
+        if dir.is_empty() {
+            return;
+        }
+        let prof = super::StealthProfile::default();
+        for (name, body) in [
+            ("write_helper", super::write_helper_script()),
+            ("web_surface", super::web_surface_script()),
+            ("injection", super::injection_script(&prof)),
+            ("bootstrap", super::bootstrap_script(&prof)),
+            ("fingerprint", super::fingerprint_script(&prof)),
+            ("late_interfaces", super::late_interfaces_script()),
+            ("late_originals", super::late_originals_script()),
+            ("worker_scope", super::worker_scope_script("w", "https://example.com/w.js")),
+        ] {
+            std::fs::write(format!("{dir}/dump_{name}.js"), body).unwrap();
+        }
     }
 }
