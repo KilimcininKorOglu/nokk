@@ -4180,14 +4180,28 @@ mod tests {
                   computedFirst: cs[0],
                   computedDashed: cs['background-color'],
                   sameProto: Object.getPrototypeOf(cs) === Object.getPrototypeOf(st),
+                  // Описание свойства у браузера — значение, а не акцессор.
+                  inlineDesc: (() => { const d = Object.getOwnPropertyDescriptor(st, 'color');
+                    return [typeof d.get, d.value, !!d.writable, !!d.enumerable, !!d.configurable]; })(),
+                  computedDesc: (() => { const d = Object.getOwnPropertyDescriptor(cs, 'backgroundColor');
+                    return [typeof d.get, d.value]; })(),
+                  // А девять `-epub-` — имена без описания: в списке есть, `in`
+                  // отвечает «нет», читается `undefined`.
+                  epub: [names.includes('epubWordBreak'),
+                         Object.getOwnPropertyDescriptor(st, 'epubWordBreak') === undefined,
+                         'epubWordBreak' in st, String(st.epubWordBreak),
+                         cs.getPropertyValue('-epub-word-break')],
+                  epubAt: [names.indexOf('epubCaptionSide'), names[names.indexOf('epubCaptionSide') - 1]],
                 })
               })()"#,
         )
         .await;
 
                 // Два объявления — значит два числовых свойства поверх семисот сорока
-        // пяти имён. Порядок браузера: индексы впереди.
-        assert_eq!(out["inlineOwn"], 738, "{out}");
+        // пяти имён. Девять из них — с приставкой `-epub-`: в списке собственных
+        // они есть, а описания у них нет, как у браузера. Порядок браузера:
+        // индексы впереди.
+        assert_eq!(out["inlineOwn"], 747, "{out}");
         assert_eq!(
             out["firstThree"],
             serde_json::json!(["0", "1", "accentColor"]),
@@ -4199,12 +4213,33 @@ mod tests {
         assert_eq!(out["background"], "blue", "{out}");
         assert_eq!(out["inlineLength"], 2, "{out}");
         assert_eq!(out["cssText"], "color: red; background-color: blue;", "{out}");
-        // Вычисленный стиль: 475 свойств по индексам плюс те же имена.
+        // Вычисленный стиль: 475 свойств по индексам плюс те же имена, включая
+        // девять `-epub-`.
         assert_eq!(out["computedLength"], 475, "{out}");
-        assert_eq!(out["computedOwn"], 1211, "{out}");
+        assert_eq!(out["computedOwn"], 1220, "{out}");
         assert_eq!(out["computedFirst"], "accent-color", "{out}");
         assert!(out["computedDashed"].is_string(), "дефисное имя читается: {out}");
         assert_eq!(out["sameProto"], true, "оба объявления одного интерфейса: {out}");
+        assert_eq!(
+            out["inlineDesc"],
+            serde_json::json!(["undefined", "red", true, true, true]),
+            "свойство отдаётся значением, а не акцессором: {out}"
+        );
+        assert_eq!(
+            out["computedDesc"],
+            serde_json::json!(["undefined", "rgb(0, 0, 255)"]),
+            "у вычисленного — тоже значением, и уже разобранным: {out}"
+        );
+        assert_eq!(
+            out["epub"],
+            serde_json::json!([true, true, false, "undefined", "normal"]),
+            "имя есть, описания нет: {out}"
+        );
+        assert_eq!(
+            out["epubAt"],
+            serde_json::json!([195, "emptyCells"]),
+            "и стоит там же, где у браузера: {out}"
+        );
     }
 
     /// Картинка — это запрос. `new Image().src = …` — обычный способ послать

@@ -2630,13 +2630,33 @@
   /// разложенное: после `style.border = '1px solid'` он отвечает `1px` на
   /// `style.borderTopWidth`, а мы держали только саму запись и отвечали
   /// пустотой — вместе с ней пропадала и рамка из раскладки.
+  // Обратный указатель: в каких сокращениях встречается это длинное
+  // свойство. Без него поиск шёл перебором всей карты — у вычисленного стиля
+  // это четыре с половиной сотни записей на каждое спрошенное имя, и перебор
+  // стиля целиком стоил лишних две с половиной миллисекунды.
+  let __SHORTS_OF = null;
+  const __shortsOf = (key) => {
+    if (!__SHORTS_OF) {
+      __SHORTS_OF = Object.create(null);
+      for (const short of Object.keys(CSS_LONGHANDS)) {
+        for (const long of CSS_LONGHANDS[short]) {
+          (__SHORTS_OF[long] || (__SHORTS_OF[long] = [])).push(short);
+        }
+      }
+    }
+    return __SHORTS_OF[key];
+  };
+
   const __longhandFrom = (m, key) => {
-    for (const [short, value] of m) {
-      const list = CSS_LONGHANDS[short];
-      if (!list || !list.includes(key)) continue;
-      const pairs = typeof __ptExpand === 'function' ? __ptExpand(short, value) : null;
-      if (!pairs) continue;
-      for (const [k, v] of pairs) if (k === key) return v;
+    const shorts = __shortsOf(key);
+    if (shorts) {
+      for (const short of shorts) {
+        const value = m.get(short);
+        if (value == null) continue;
+        const pairs = typeof __ptExpand === 'function' ? __ptExpand(short, value) : null;
+        if (!pairs) continue;
+        for (const [k, v] of pairs) if (k === key) return v;
+      }
     }
     // И наоборот: сокращение, собранное из длинных. `border: 1px solid`
     // отвечает `solid` на `borderStyle`, потому что все четыре стороны
@@ -2941,7 +2961,10 @@
       const m = s.computed ? s.map : s.read();
       // Имена с приставкой поставщика спрашивают и с дефисом впереди, а
       // длинное свойство может быть записано сокращением: `border-top-width`
-      // отвечает из `border`.
+      // отвечает из `border`. А `-epub-…` — просто другое имя: у вычисленного
+      // стиля `-epub-word-break` отвечает тем же, чем `word-break`.
+      const alias = s.computed ? EPUB_ALIAS[k] : null;
+      if (alias) return m.get(alias) || __longhandFrom(m, alias) || '';
       return m.get(k) || (k.charCodeAt(0) === 45 ? m.get(k.slice(1)) || '' : '')
         || __longhandFrom(m, k);
     });
@@ -2995,6 +3018,83 @@
     return proto;
   };
 
+  // Описания семисот с лишним свойств CSS строятся один раз на всех: они
+  // ходят за своим объявлением через `this`, и потому одинаковы. Объявление
+  // у каждого элемента своё, и когда каждое строило себе семьсот
+  // акцессоров заново, одно только чтение `el.style` стоило полмиллисекунды —
+  // страница, которая трогает стиль у тысячи узлов, теряла на этом полсекунды.
+  // Девять имён с приставкой -epub-: браузер показывает их в списке
+  // собственных свойств объявления, но описания у них нет, `in` отвечает
+  // «нет», а чтение даёт `undefined`. Так выглядит перехватчик V8 изнутри, и
+  // повторить это можно только ловушками: если завести свойства всерьёз,
+  // разойдутся и `in`, и описание.
+  const EPUB_NAMES = ['epubCaptionSide', 'epubTextCombine', 'epubTextEmphasis',
+    'epubTextEmphasisColor', 'epubTextEmphasisStyle', 'epubTextOrientation',
+    'epubTextTransform', 'epubWordBreak', 'epubWritingMode'];
+  const EPUB_SET = new Set(EPUB_NAMES);
+  // Чем каждое из них отвечает на `getPropertyValue('-epub-…')` у вычисленного
+  // стиля: это другие имена для обычных свойств.
+  const EPUB_ALIAS = {
+    '-epub-caption-side': 'caption-side', '-epub-text-combine': 'text-combine-upright',
+    '-epub-text-emphasis': 'text-emphasis', '-epub-text-emphasis-color': 'text-emphasis-color',
+    '-epub-text-emphasis-style': 'text-emphasis-style', '-epub-text-orientation': 'text-orientation',
+    '-epub-text-transform': 'text-transform', '-epub-word-break': 'word-break',
+    '-epub-writing-mode': 'writing-mode',
+  };
+  // Имена вставляются туда же, где они у браузера, — следом за `emptyCells`.
+  const __withEpub = (keys) => {
+    const at = keys.indexOf('emptyCells');
+    if (at < 0) return keys;
+    return keys.slice(0, at + 1).concat(EPUB_NAMES, keys.slice(at + 1));
+  };
+  // Свойства объявления браузер отдаёт значениями, а не акцессорами: в
+  // описании `color` лежит `value: "red"`, и ни `get`, ни `set` там нет. У нас
+  // они были акцессорами — первое, что видно тому, кто читает описания.
+  // Имена свойств CSS — множеством: описание у них одинаковой формы, и
+  // спрашивают их тысячами (перебор объявления — тысяча двести имён), так что
+  // разбираться, чьё это имя, надо за один поиск, а не через `Reflect`.
+  let __CSS_PROP_SET = null;
+  const __cssPropSet = () => (__CSS_PROP_SET || (__CSS_PROP_SET = new Set(CSS_PROPS)));
+  const __declTraps = (valueOf) => ({
+    ownKeys: (t) => __withEpub(Reflect.ownKeys(t)),
+    getOwnPropertyDescriptor: (t, p) => {
+      if (typeof p === 'string') {
+        if (EPUB_SET.has(p)) return undefined;
+        if (__cssPropSet().has(p)) {
+          return { value: valueOf(t, p), writable: true, enumerable: true, configurable: true };
+        }
+      }
+      return Reflect.getOwnPropertyDescriptor(t, p);
+    },
+  });
+
+  let __STYLE_DESCS = null;
+  const __styleDescs = () => {
+    if (__STYLE_DESCS) return __STYLE_DESCS;
+    const d = {};
+    for (const name of CSS_PROPS) {
+      const key = dash(name);
+      d[name] = {
+        get() {
+          const s = __cssReaders.get(this);
+          if (!s) return '';
+          const m = s.computed ? s.map : s.read();
+          return m.get(key) || __longhandFrom(m, key);
+        },
+        set(v) {
+          const s = __cssReaders.get(this);
+          if (!s || s.computed) return;
+          const m = s.read();
+          if (v === '' || v == null) m.delete(key); else m.set(key, __cssValue(key, v));
+          s.write(m);
+        },
+        enumerable: true, configurable: true,
+      };
+    }
+    __STYLE_DESCS = d;
+    return d;
+  };
+
   function makeStyle(el) {
     let cachedText = null, cachedMap = new Map();
     const read = () => {
@@ -3035,23 +3135,13 @@
     // свойствами объявления идут имена свойств CSS, все семьсот три и в том же
     // порядке. У нас собственными были методы, а имён не было вовсе — и всякий,
     // кто перечисляет стиль (а его перечисляют), видел это сразу.
-    const target = Object.create(__inlineStyleProto());
+    const target = Object.create(__inlineStyleProto(), __styleDescs());
     __cssReaders.set(target, { read, write, el });
     reindex(__styleNames(read()));
-    for (const name of CSS_PROPS) {
-      const key = dash(name);
-      Object.defineProperty(target, name, {
-        get() { const m = read(); return m.get(key) || __longhandFrom(m, key); },
-        set(v) {
-          const m = read();
-          if (v === '' || v == null) m.delete(key); else m.set(key, __cssValue(key, v));
-          write(m);
-        },
-        enumerable: true, configurable: true,
-      });
-    }
     return new Proxy(target, {
+      ...__declTraps((t, p) => { const m = read(), k = dash(p); return m.get(k) || __longhandFrom(m, k); }),
       get: (t, p) => {
+        if (typeof p === 'string' && EPUB_SET.has(p)) return undefined;
         if (typeof p === 'string' && !(p in t)) {
           const m = read(), k = dash(p);
           return m.get(k) || __longhandFrom(m, k);
@@ -6743,13 +6833,20 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       const keys = /^(webkit|moz|ms|o)-/.test(plain)
         ? ['-' + plain, plain, plain.replace(/^(webkit|moz|ms|o)-/, '')]
         : [plain];
-      own(name, {
-        get: () => { for (const k of keys) { const v = map.get(k); if (v) return v; } return ''; },
-        enumerable: true, configurable: true,
-      });
+      // Значением, а не акцессором: у браузера в описании свойства лежит
+      // `value`, и `get` там нет вовсе. Вычисленный стиль всё равно снят на
+      // один миг — меняться его значениям уже не от чего.
+      let v = '';
+      for (const k of keys) { const got = map.get(k); if (got) { v = got; break; } }
+      own(name, { value: v, writable: true, enumerable: true, configurable: true });
     }
+    const dashOf = (p) => String(p).replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
     return new Proxy(decl, {
+      // Только список имён: описания у свойств уже такие, как надо, а лишняя
+      // ловушка стоила бы полторы миллисекунды на каждый перебор стиля.
+      ownKeys: (t) => __withEpub(Reflect.ownKeys(t)),
       get: (t, p) => {
+        if (typeof p === 'string' && EPUB_SET.has(p)) return undefined;
         if (typeof p === 'string' && !(p in t)) return map.get(p.toLowerCase()) || '';
         const v = t[p];
         return typeof v === 'function' ? v.bind(t) : v;
