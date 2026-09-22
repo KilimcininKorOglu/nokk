@@ -3790,17 +3790,36 @@
     };
 
     def(graphics, 'getBBox', function getBBox() {
+      // Рамку спрашивают у разложенного дерева: без этого правила таблиц
+      // ещё не собраны, и текст меряется не той гарнитурой.
+      __relayout();
       const t = (this.localName || '').toLowerCase();
       if (t === 'text' || t === 'tspan') {
         // Рамка текста: ширина — измеренная и округлённая вверх до
         // шестьдесят четвёртой пикселя, подъём и высота — из метрик гарнитуры.
         // Проверено на трёх кеглях.
-        const cs = getComputedStyle(this);
-        const fs = parseFloat(cs.fontSize) || 16;
-        const fam = cs.fontFamily || 'sans-serif';
-        const w = Math.ceil(__textWidth(this.textContent || '', fs, fam, false, false) * 64) / 64;
+        // Кегль и гарнитура берутся из каскада, а не из вычисленного стиля:
+        // тот строит все четыре с лишним сотни свойств, и рамка одного
+        // `<text>` обходилась в восьмую долю секунды.
+        const fs = __usedFontSize(this) || 16;
+        let famRaw = __cascadeFor(this).get('font-family');
+        if (famRaw == null) famRaw = __inheritedValue(this, 'font-family');
+        const fam = String(famRaw || '').trim() || 'sans-serif';
+        // Рамка — объединение двух: коробки чернил и коробки раскладки.
+        // Вправо берётся дальняя из них (у «W» чернила вылезают за ширину
+        // знака), влево — только если чернила уходят левее начала («jjj» у
+        // Arial начинается на пиксель левее). Проверено на пяти сочетаниях
+        // гарнитуры с кеглем.
+        const txt = __svgText(this);
+        // Текста нет — и рамки нет: браузер отдаёт нули, а не полоску высотой
+        // в строку.
+        if (!txt) return svgRect(0, 0, 0, 0);
+        const m = __textMetrics(txt, fs, fam, false, false);
+        const adv = Math.ceil((m[0] || 0) * 64) / 64;
+        const over = Math.max(m[1] || 0, 0);
+        const w = over + Math.max(m[2] || 0, adv);
         const fb = __fontBox(fs, fam);
-        return svgRect(num(this, 'x'), -fb.asc, w, fb.asc + fb.desc);
+        return svgRect(num(this, 'x') - over, num(this, 'y') - fb.asc, w, fb.asc + fb.desc);
       }
       const kids = [...(this.__ptKids || [])].filter((k) => k.nodeType === ELEMENT_NODE);
       if (!outline(this).length && kids.length) {
@@ -3840,7 +3859,18 @@
     });
     def(geometry, 'isPointInStroke', function isPointInStroke(pt) { return this.isPointInFill(pt); });
     acc(geometry, 'pathLength', function pathLength() { return animLength(() => num(this, 'pathLength')); });
-    def(textContent, 'getComputedTextLength', function getComputedTextLength() { return this.getBBox().width; });
+    // Длина строки — это её ширина при раскладке, а не рамка: у рамки бывают
+    // чернила шире знака, и тогда числа расходятся.
+    def(textContent, 'getComputedTextLength', function getComputedTextLength() {
+      __relayout();
+      const fs = __usedFontSize(this) || 16;
+      let famRaw = __cascadeFor(this).get('font-family');
+      if (famRaw == null) famRaw = __inheritedValue(this, 'font-family');
+      const fam = String(famRaw || '').trim() || 'sans-serif';
+      const txt = __svgText(this);
+      if (!txt) return 0;
+      return Math.ceil(__textWidth(txt, fs, fam, false, false) * 64) / 64;
+    });
     def(textContent, 'getNumberOfChars', function getNumberOfChars() { return String(this.textContent || '').length; });
 
     // Геометрические атрибуты — не строки, а `SVGAnimatedLength`.
@@ -5055,6 +5085,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   let __rules = [];                       // {root, sel, spec, order, style}
   let __foreignRules = new WeakMap();     // документ → его правила
   let __styleCache = new WeakMap();
+  // Кегль и наследуемое значение считаются обходом предков, а спрашивают их
+  // у каждого узла по нескольку раз за проход: на три сотни узлов выходило
+  // под полторы тысячи обходов. Живут эти ответы ровно столько же, сколько
+  // каскад, — до следующей сборки правил.
+  let __passFont = new WeakMap();
+  let __passInherit = new WeakMap();
   let __hiddenBySheet = new WeakSet();
   let __noneBySheet = new WeakSet();
 
@@ -5109,6 +5145,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   function __collectHidden() {
     __rules = [];
     __styleCache = new WeakMap();
+    __passFont = new WeakMap();
+    __passInherit = new WeakMap();
     __hiddenBySheet = new WeakSet();
     __noneBySheet = new WeakSet();
     __foreignRules = new WeakMap();
@@ -5242,12 +5280,37 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   }
   const __normalLine = (fs, family) => __fontBox(fs, family).line;
 
-  function __textWidth(text, fs, family, bold, italic) {
+  // Мерить строку дорого: раскладка HarfBuzz'ом с подбором шрифта по знакам.
+  // А раскладка страницы меряет одно и то же снова и снова — каждая правка
+  // дерева пересчитывает все коробки, и пять сотен узлов дают пять сотен
+  // замеров тех же слов. Ответ зависит только от строки и шрифта, поэтому
+  // держим его при себе; при переполнении — начинаем сначала, чтобы карта
+  // не росла на странице, которая печатает уникальный текст.
+  const __widths = new Map();
+  // Пробелы в SVG схлопываются: перевод строки выброшен, табуляция — пробел,
+  // подряд идущие сжаты в один, по краям срезаны. `<text>  ii  </text>` меряется
+  // как «ii», а не как строка с отступами.
+  const __svgText = (el) => String((el && el.textContent) || '')
+    .replace(/[\r\n]/g, '').replace(/\t/g, ' ').replace(/ +/g, ' ').trim();
+
+  function __textMetrics(text, fs, family, bold, italic) {
+    const t = String(text);
+    const key = fs + '|' + (family || 'sans-serif') + '|' + (bold ? 1 : 0) + (italic ? 1 : 0) + '|' + t;
+    const hit = __widths.get(key);
+    if (hit !== undefined) return hit;
+    let m = null;
     if (typeof __pt_canvasMeasureText === 'function') {
-      try { return __pt_canvasMeasureText(String(text), fs, family || 'sans-serif', !!bold, !!italic)[0] || 0; }
+      try { m = __pt_canvasMeasureText(t, fs, family || 'sans-serif', !!bold, !!italic); }
       catch (e) {}
     }
-    return String(text).length * fs * 0.5;
+    if (!m) m = [t.length * fs * 0.5, 0, t.length * fs * 0.5, fs * 0.9, fs * 0.2, fs * 0.9, fs * 0.2, fs * 1.15];
+    if (__widths.size > 20000) __widths.clear();
+    __widths.set(key, m);
+    return m;
+  }
+
+  function __textWidth(text, fs, family, bold, italic) {
+    return __textMetrics(text, fs, family, bold, italic)[0] || 0;
   }
 
   // Перенос по словам. Абзац в браузере занимает столько строк, сколько
@@ -6028,11 +6091,21 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   ]);
   /// Значение наследуемого свойства: ближайший предок, который его назвал.
   const __inheritedValue = (el, prop) => {
+    let own = el && el.nodeType === ELEMENT_NODE ? __passInherit.get(el) : null;
+    if (own) {
+      const hit = own.get(prop);
+      if (hit !== undefined) return hit;
+    }
+    let out = null;
     for (let e = el && el.parentNode; e && e.nodeType === ELEMENT_NODE; e = e.parentNode) {
       const raw = __cascadeFor(e).get(prop);
-      if (raw != null) return __resolveLength(raw, prop, __usedFontSize(e), e);
+      if (raw != null) { out = __resolveLength(raw, prop, __usedFontSize(e), e); break; }
     }
-    return null;
+    if (el && el.nodeType === ELEMENT_NODE) {
+      if (!own) { own = new Map(); __passInherit.set(el, own); }
+      own.set(prop, out);
+    }
+    return out;
   };
 
   // Сокращённые свойства. В вычисленном стиле браузер их не показывает вовсе
@@ -6686,6 +6759,17 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
 
   /// Кегль, действующий на элементе: он наследуется, а `em` считается от него.
   function __usedFontSize(el) {
+    if (el && el.nodeType === ELEMENT_NODE) {
+      const hit = __passFont.get(el);
+      if (hit !== undefined) return hit;
+      const v = __usedFontSizeRaw(el);
+      __passFont.set(el, v);
+      return v;
+    }
+    return __usedFontSizeRaw(el);
+  }
+
+  function __usedFontSizeRaw(el) {
     let size = 16;
     const chain = [];
     for (let e = el; e && e.nodeType === ELEMENT_NODE; e = e.parentNode) chain.push(e);

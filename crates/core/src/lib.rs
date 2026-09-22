@@ -7109,6 +7109,80 @@ mod tests {
         );
     }
 
+    // Рамка SVG-текста — отдельный измерительный тракт, и им тоже снимают
+    // отпечаток. Числа сняты с Chrome 151 на этой машине: рамка объединяет
+    // коробку чернил с коробкой раскладки (вправо берётся дальняя, влево —
+    // только вылет чернил), высота — из метрик шрифта, начало отсчитывается от
+    // атрибутов `x` и `y`. Пробелы по краям в счёт не идут, у пустого текста
+    // рамки нет вовсе.
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn an_svg_text_box_is_the_one_a_browser_measures() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<html><body></body></html>",
+        )
+        .await
+        .unwrap();
+        let probe = r#"(() => {
+            const NS = 'http://www.w3.org/2000/svg';
+            const svg = document.createElementNS(NS, 'svg');
+            document.body.appendChild(svg);
+            const mk = (fs, fam, txt) => {
+                const t = document.createElementNS(NS, 'text');
+                t.setAttribute('x', '10'); t.setAttribute('y', '50');
+                t.setAttribute('font-size', fs); t.setAttribute('font-family', fam);
+                t.textContent = txt; svg.appendChild(t); return t;
+            };
+            const r = (t) => { const b = t.getBBox();
+                return [+b.x.toFixed(3), +b.y.toFixed(3), +b.width.toFixed(3), +b.height.toFixed(3)]; };
+            const jjj = mk('16px', 'Arial', 'jjj');
+            const mono = mk('24px', 'monospace', 'mmmmmmmmmmlli');
+            const spaced = mk('20px', 'Arial', '  ii  ');
+            const tight = mk('20px', 'Arial', 'ii');
+            const empty = mk('16px', 'Arial', '');
+            return __ptJSON.stringify({
+                jjj: r(jjj), mono: r(mono), spaced: r(spaced), tight: r(tight), empty: r(empty),
+                length: +mono.getComputedTextLength().toFixed(3),
+            });
+        })()"#;
+        let out = match ctx.evaluate(probe).await.unwrap() {
+            Value::String(s) => s,
+            v => panic!("expected string, got {v:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let box_of = |k: &str| -> Vec<f64> {
+            v[k].as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_f64().unwrap())
+                .collect()
+        };
+        // Чернила «jjj» уходят на пиксель левее начала — рамка едет за ними, а
+        // ширина этот вылет вбирает.
+        assert_eq!(box_of("jjj"), vec![9.0, 36.0, 11.672, 17.0], "рамка «jjj»");
+        // Моноширинный: чернила уже раскладки, и вправо берётся раскладка.
+        assert_eq!(
+            box_of("mono"),
+            vec![10.0, 24.0, 187.203, 33.0],
+            "рамка моноширинной строки"
+        );
+        assert_eq!(
+            v["length"].as_f64().unwrap(),
+            187.203,
+            "длина строки — ширина раскладки"
+        );
+        assert_eq!(
+            box_of("spaced"),
+            box_of("tight"),
+            "пробелы по краям в рамку не идут"
+        );
+        assert_eq!(box_of("empty"), vec![0.0, 0.0, 0.0, 0.0], "у пустого текста рамки нет");
+    }
+
     // A filled arc (the classic canvas-fingerprint shape) must rasterize to a real
     // disc of pixels via native paths — not the deterministic bbox stamp.
     #[cfg(feature = "render")]
