@@ -210,6 +210,16 @@ pub fn profile_for_major(major: u32) -> wreq_util::Profile {
     }
 }
 
+/// Подписи, которые Chrome 151 объявляет в `signature_algorithms`, в его
+/// порядке: три постквантовых впереди, дальше обычные восемь. Имена — как их
+/// понимает BoringSSL; `mldsa*` знает только наш вендоренный.
+const CHROME_SIGALGS: &str = concat!(
+    "mldsa44:mldsa65:mldsa87:",
+    "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:",
+    "ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:",
+    "rsa_pss_rsae_sha512:rsa_pkcs1_sha512",
+);
+
 /// Client configuration.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -440,6 +450,16 @@ impl FingerprintClient {
         // собрала страница, видно с первого запроса. Переписываем только
         // номер версии и список марок, всё остальное — от набора.
         retag_chrome_version(&mut emulation.headers, config.chrome_major);
+        // Постквантовые подписи. Chrome 151 объявляет их первыми тремя в
+        // `signature_algorithms` (ML-DSA-44/65/87, кодовые точки 0904/0905/0906),
+        // а набор `wreq-util` — нет, и третий кусок JA4 из-за этого не совпадал
+        // ни с одним настоящим браузером. Знает эти имена наш BoringSSL: см.
+        // `vendor/btls-sys/PATCHES.md`. Выбрать такую подпись сервер не может —
+        // рукопожатие с ней просто не состоится, — но её объявление у Chrome
+        // есть, а значит должно быть и у нас.
+        if let Some(tls) = emulation.tls_options.as_mut() {
+            tls.sigalgs_list = Some(CHROME_SIGALGS.into());
+        }
         let mut builder = wreq::Client::builder().emulation(emulation);
         // Named session or not, the jar is ours: a named one is shared (and
         // serializable) across contexts of the same identity, an anonymous one is

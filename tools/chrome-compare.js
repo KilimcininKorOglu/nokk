@@ -61,7 +61,7 @@ const HOOK = `(() => {
       // Тело первого POST — то, что уходит до программы; разница с движком
       // видна только текстом.
       try {
-        if (/\/cdn-cgi\/challenge-platform\//.test(this.__u || '') && b && b.length > 1000
+        if (/\\/cdn-cgi\\/challenge-platform\\//.test(this.__u || '') && b && b.length > 1000
             && b.length < 20000 && !globalThis.__ptFirstBody) {
           globalThis.__ptFirstBody = 1;
           const s0 = String(b);
@@ -97,6 +97,17 @@ const HOOK = `(() => {
           const n = globalThis.__ptJoinN++;
           let host = '?';
           try { host = location.host.slice(0, 12); } catch (e) {}
+          // Тело первого POST собирается такой же склейкой; длины кусков по
+          // порядку показывают, какой из них у движка короче.
+          if (out.length > 3000 && out.length < 6000 && String(sep) === ''
+              && this.length > 1 && !globalThis.__ptFirstParts) {
+            globalThis.__ptFirstParts = 1;
+            try {
+              const lens = Array.prototype.map.call(this, (x) => String(x == null ? '' : x).length);
+              console.log('[первые куски] всего=' + out.length + ' n=' + lens.length +
+                    ' длины=' + lens.join(','));
+            } catch (e) {}
+          }
           // Из чего склеен отчёт: сколько кусков и какой длины. Сравнение
           // поэлементно показывает, какое именно поле у кого короче.
           if (out.length > 50000 && String(sep) === '' && this.length !== out.length && !globalThis.__ptPartsDone) {
@@ -577,8 +588,15 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[cs\]|^\[ПЕРВЫЙ |^\[svg\]|^\[хвост |^\[parts|^\[звук |^\[json |^\[btoa |^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
+      if (/^\[(send|hook|hookerr|blob|worker|count|бросок|время|первые)\]|^\[[jPC]\d* |^\[cs\]|^\[ПЕРВЫЙ |^\[svg\]|^\[хвост |^\[parts|^\[звук |^\[json |^\[btoa |^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
         lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
+    }
+    // Крючок мог и не встать: у внедрения ошибка видна только так, а без неё
+    // лента выходит пустой и молчит о причине.
+    if (m.method === 'Runtime.exceptionThrown') {
+      const d = m.params.exceptionDetails || {};
+      lines.push('[крючок упал] ' + (d.text || '') + ' ' +
+        ((d.exception && (d.exception.description || d.exception.value)) || '').slice(0, 200));
     }
     if (m.method === 'Target.attachedToTarget') {
       const s = m.params.sessionId;
@@ -586,6 +604,10 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
       send('Runtime.enable', {}, s);
       send('Page.enable', {}, s);
       send('Page.addScriptToEvaluateOnNewDocument', { source: HOOK }, s);
+      // Крючок и в уже готовый документ: кадр виджета приезжает своей целью, и
+      // к моменту привязки его документ бывает создан — тогда «на новый
+      // документ» опаздывает, и лента выходит пустой.
+      send('Runtime.evaluate', { expression: HOOK, includeCommandLineAPI: false }, s);
       send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, s);
       send('Runtime.runIfWaitingForDebugger', {}, s);
     }

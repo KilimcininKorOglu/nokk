@@ -1186,6 +1186,18 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           }
                           let host = '?';
                           try { host = location.host.slice(0, 12); } catch (e) {}
+                          // Тело первого POST собирается такой же склейкой, и у нас
+                          // оно на полсотни знаков короче хромовского. Длины кусков
+                          // по порядку показывают, какой именно кусок короче.
+                          if (out.length > 3000 && out.length < 6000 && String(sep) === ''
+                              && this.length > 1 && !globalThis.__ptFirstParts) {
+                            globalThis.__ptFirstParts = 1;
+                            try {
+                              const lens = Array.prototype.map.call(this, (x) => String(x == null ? '' : x).length);
+                              console.error('[первые куски] всего=' + out.length + ' n=' + lens.length +
+                                    ' длины=' + lens.join(','));
+                            } catch (e) {}
+                          }
                           // Из чего склеен отчёт: длины кусков по порядку.
                           if (out.length > 50000 && String(sep) === '' && this.length !== out.length && !globalThis.__ptPartsDone) {
             globalThis.__ptPartsDone = 1;
