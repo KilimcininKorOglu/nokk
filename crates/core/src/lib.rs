@@ -650,6 +650,7 @@ impl Engine {
             workers: std::sync::Mutex::new(HashMap::new()),
             bootstrap,
             frame_init_scripts: std::sync::Mutex::new(Vec::new()),
+            worker_init_scripts: std::sync::Mutex::new(Vec::new()),
             init_scripts: std::sync::Mutex::new(Vec::new()),
             next_timer_at: std::sync::Mutex::new(None),
             session,
@@ -792,6 +793,10 @@ pub struct BrowserContext {
     /// what `Page.addScriptToEvaluateOnNewDocument` means in Chrome — it applies
     /// to the whole frame tree, not just the top document.
     frame_init_scripts: std::sync::Mutex<Vec<String>>,
+    /// То же — для воркеров. У воркера свой реалм и свои прототипы, и крючок,
+    /// поставленный странице, там не виден: сборка тела, которую воркер делает
+    /// у себя, из страницы не просматривается вовсе.
+    worker_init_scripts: std::sync::Mutex<Vec<String>>,
     /// The same, for this page's own document. "On new document" means *before*
     /// the document's own scripts — that is the whole point of the API, and what
     /// every stealth patch and instrumentation hook depends on. Running them after
@@ -1560,6 +1565,17 @@ impl BrowserContext {
         }
     }
 
+    /// Register a script to run in every worker this page starts, right after
+    /// the worker's own stealth scope and before its script. Same bound as the
+    /// frame list.
+    pub fn add_worker_init_script(&self, src: String) {
+        if let Ok(mut v) = self.worker_init_scripts.lock() {
+            if v.len() < 32 {
+                v.push(src);
+            }
+        }
+    }
+
     /// Run `src` in this page on every future navigation, before the document's
     /// own scripts. The caller keeps the list; the load applies it.
     pub fn add_init_script(&self, src: String) {
@@ -2004,6 +2020,19 @@ impl BrowserContext {
                     let _ = self
                         .eval_at(place, child, &nokk_stealth::worker_scope_script(name, &url))
                         .await;
+                    // Крючки наблюдателя — следом за областью: воркер стартует
+                    // со своим реалмом, и всё, что поставлено странице, здесь
+                    // не действует.
+                    let winit = self
+                        .worker_init_scripts
+                        .lock()
+                        .map(|v| v.clone())
+                        .unwrap_or_default();
+                    for src in winit {
+                        if let Err(e) = self.eval_at(place, child, &src).await {
+                            tracing::debug!(error = %e, "worker init script threw");
+                        }
+                    }
                     if let Ok(mut w) = self.workers.lock() {
                         w.insert(
                             key,

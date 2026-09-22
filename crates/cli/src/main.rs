@@ -929,6 +929,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                 let (lo, hi) = window.split_once('-').unwrap_or(("15000", "16000"));
                 let probe = probe.replace("__DUMPLO__", lo.trim()).replace("__DUMPHI__", hi.trim());
                 c.add_frame_init_script(probe.clone());
+                c.add_worker_init_script(probe.clone());
                 c.add_init_script(probe);
             }
             // Исходник чужой программы. Её строят `new Function`, и это
@@ -1094,6 +1095,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     &std::env::var("NOKK_VM_MIN").unwrap_or_else(|_| "20000".into()),
                 );
                 c.add_frame_init_script(probe.clone());
+                c.add_worker_init_script(probe.clone());
                 c.add_init_script(probe);
             }
             // Наблюдение за крючками челленджа: программа, пришедшая с сервера,
@@ -1152,8 +1154,66 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     // Их сериализация не идёт через JSON — но строка где-то
                     // собирается: из массива, конкатенацией или из кодов.
                     let seen = 0, dumped = 0;
+                    // Тело первого POST у Chrome собирается склейкой массива, а у
+                    // нас такой склейки нет вовсе — значит собирают иначе. Ставим
+                    // ещё три заметки: коды знаков, склейка типизированного
+                    // массива и base64. Печатают только строки нужного размера.
+                    // Заметки ставятся «нативными»: у подменённой функции виден и
+                    // исходник, и другая длина, а челлендж их читает — под грубой
+                    // подменой он просто не начинается.
+                    const асНатив = (f, src) => {
+                      try {
+                        Object.defineProperty(f, 'name', { value: src.name, configurable: true });
+                        Object.defineProperty(f, 'length', { value: src.length, configurable: true });
+                      } catch (e) {}
+                      return globalThis.__pt_native ? __pt_native(f) : f;
+                    };
+                    try {
+                      const FCC = String.fromCharCode;
+                      String.fromCharCode = асНатив(function (...a) {
+                        const out = FCC.apply(this, a);
+                        try {
+                          if (out.length > 1000 && out.length < 9000
+                              && (globalThis.__ptFccN = (globalThis.__ptFccN || 0) + 1) < 12) {
+                            console.error('[коды ' + out.length + '] доводов=' + a.length +
+                                  ' ' + out.slice(0, 120));
+                          }
+                        } catch (e) {}
+                        return out;
+                      }, FCC);
+                    } catch (e) {}
+                    try {
+                      const TA = Object.getPrototypeOf(Int8Array.prototype);
+                      const TJ = TA.join;
+                      TA.join = асНатив(function (sep) {
+                        const out = TJ.apply(this, arguments);
+                        try {
+                          if (typeof out === 'string' && out.length > 1000
+                              && (globalThis.__ptTaN = (globalThis.__ptTaN || 0) + 1) < 12) {
+                            console.error('[склейка чисел ' + out.length + '] n=' + this.length +
+                                  ' ' + out.slice(0, 100));
+                          }
+                        } catch (e) {}
+                        return out;
+                      }, TJ);
+                    } catch (e) {}
+                    try {
+                      const B = globalThis.btoa;
+                      if (typeof B === 'function') {
+                        globalThis.btoa = асНатив(function (x) {
+                          const src = String(x == null ? '' : x);
+                          try {
+                            if (src.length > 1000 && src.length < 9000
+                                && (globalThis.__ptBtoaN = (globalThis.__ptBtoaN || 0) + 1) < 12) {
+                              console.error('[base64 ' + src.length + '] ' + src.slice(0, 120));
+                            }
+                          } catch (e) {}
+                          return B.call(this, x);
+                        }, B);
+                      }
+                    } catch (e) {}
                     const J = Array.prototype.join;
-                    Array.prototype.join = function (sep) {
+                    Array.prototype.join = асНатив(function (sep) {
                       const out = J.apply(this, arguments);
                       if (typeof out === 'string' && out.length > 1500 && seen++ < 3) {
                         try { console.error('[join ' + out.length + '] ' + out.slice(0, 700)); } catch (e) {}
@@ -1186,6 +1246,15 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           }
                           let host = '?';
                           try { host = location.host.slice(0, 12); } catch (e) {}
+                          // Ряд склеек: та же лента, что печатает chrome-compare
+                          // ([j n хост длина разделитель]), — по ней видно, чем и в
+                          // каком порядке собирали, и какой склейки у нас нет.
+                          if (n < 40) {
+                            try {
+                              console.error('[j ' + n + ' ' + host + ' ' + out.length + ' ' +
+                                    JSON.stringify(String(sep === undefined ? ',' : sep)).slice(0, 12) + ']');
+                            } catch (e) {}
+                          }
                           // Тело первого POST собирается такой же склейкой, и у нас
                           // оно на полсотни знаков короче хромовского. Длины кусков
                           // по порядку показывают, какой именно кусок короче.
@@ -1228,7 +1297,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                         } catch (e) {}
                       }
                       return out;
-                    };
+                    }, J);
                     const FCC = String.fromCharCode;
                     let fccBuf = 0;
                     String.fromCharCode = function () { fccBuf += arguments.length; return FCC.apply(this, arguments); };
@@ -1904,6 +1973,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     if std::env::var("NOKK_HANG_UNREACHABLE").is_ok() { "true" } else { "false" },
                 );
                 c.add_frame_init_script(hook.clone());
+                c.add_worker_init_script(hook.clone());
                 c.add_init_script(hook);
             }
             c.navigate(url).await?;
