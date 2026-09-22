@@ -417,6 +417,7 @@ async fn main() -> Result<()> {
             if std::env::var("NOKK_TRACE_BEACON").is_ok() {
                 let probe = r#"(() => {
                   globalThis.__ptEncMin = __ENCMIN__;
+                  globalThis.__ptLight = __LIGHT__;
                   try {
                     const S = XMLHttpRequest.prototype.send;
                     const O = XMLHttpRequest.prototype.open;
@@ -489,7 +490,11 @@ async fn main() -> Result<()> {
                       } catch (e) {}
                     };
                     const count = (obj, label, names) => {
-                      if (!obj) return;
+                      // `NOKK_TRACE_BEACON=light` — только лента запросов, без
+                      // подмены членов: счётчики меряют и себя, и на сборе это
+                      // видно секундами. Сколько сбор занимает на самом деле,
+                      // видно только лёгким прогоном.
+                      if (globalThis.__ptLight || !obj) return;
                       for (const n of names) {
                         const f = obj[n];
                         if (typeof f !== 'function') continue;
@@ -908,6 +913,10 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                 // Порог, ниже которого куски отчёта в лог не идут: мелочь
                 // топит вывод, но иногда именно короткий кусок и отличается
                 // (список шрифтов у Chrome — 71 знак).
+                let probe = probe.replace(
+                    "__LIGHT__",
+                    if std::env::var("NOKK_TRACE_BEACON").as_deref() == Ok("light") { "1" } else { "0" },
+                );
                 let probe = probe.replace(
                     "__ENCMIN__",
                     &std::env::var("NOKK_ENC_MIN").unwrap_or_else(|_| "30".into()),

@@ -47,6 +47,16 @@ const get = (p) => new Promise((res, rej) => { const t = (n) => http.get({host:'
         // отличие в заголовках видно сразу по коду ответа.
         const kind = /\/fo\//.test(q.url) && q.method === 'POST' ? 'первого POST'
           : /\/pat\//.test(q.url) ? 'запроса /pat/' : null;
+        // Тело первого POST — с `BODY=1`. Оно уходит до программы, и по нему
+        // челлендж решает, какую программу дать; сравнивать его надо знак в
+        // знак с тем, что печатает движок ([ПЕРВЫЙ] в его тапе).
+        if (process.env.BODY && kind === 'первого POST' && q.postData && !globalThis.__bodyShown) {
+          globalThis.__bodyShown = 1;
+          const b = String(q.postData);
+          for (let i = 0; i < b.length; i += 250) {
+            console.log('[ПЕРВЫЙ ' + b.length + ':' + (i / 250) + '] ' + b.slice(i, i + 250));
+          }
+        }
         if (kind && !globalThis['__hdr' + kind]) {
           globalThis['__hdr' + kind] = 1;
           console.log('— заголовки ' + kind + ':');

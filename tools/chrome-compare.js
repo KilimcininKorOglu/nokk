@@ -40,6 +40,19 @@ const get = (path) => new Promise((res, rej) => {
 const HOOK = `(() => {
   globalThis.__JMIN = ${+(process.env.JMIN || 2000)};
   const tag = () => { try { return location.host + location.pathname.slice(0, 24); } catch (e) { return '?'; } };
+  // Что челлендж роняет по пути: часть бросков у него нарочная (он читает
+  // собственный стек), и отличить нарочные от настоящих можно только
+  // сравнив ленты браузера и движка. Тот же крючок стоит в движке —
+  // NOKK_TRACE_BEACON, метка [бросок].
+  const t0 = Date.now();
+  addEventListener('error', (e) => {
+    try { console.log('[бросок] ' + (Date.now() - t0) + 'мс ' + String(e.message || '') + ' @ ' +
+      String(e.filename || '').slice(-58) + ':' + e.lineno); } catch (x) {}
+  });
+  addEventListener('unhandledrejection', (e) => {
+    try { console.log('[бросок] ' + (Date.now() - t0) + 'мс отклонено: ' +
+      String((e.reason && (e.reason.stack || e.reason.message)) || e.reason).slice(0, 150)); } catch (x) {}
+  });
   try {
     const S = XMLHttpRequest.prototype.send, O = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (m, u) { this.__u = String(u); return O.apply(this, arguments); };
