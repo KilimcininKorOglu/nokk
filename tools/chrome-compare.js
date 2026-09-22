@@ -228,8 +228,8 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
               const show = (v) => (v && typeof v === 'object'
                 ? '{' + ['x', 'y', 'width', 'height'].map((k) => k + '=' + (v[k] === undefined ? '?' : v[k])).join(',') + '}'
                 : String(v));
-              console.log('[svg] ' + name + '(' + a.join(',') + ') текст=' +
-                JSON.stringify(String(this.textContent || '').slice(0, 12)) + ' -> ' + show(r));
+              console.log('[svg] ' + name + '(' + a.join(',') + ') шрифт=' + (() => { try { const cs = getComputedStyle(this); return cs.fontSize + '/' + cs.fontFamily.slice(0, 20); } catch (e) { return '?'; } })() + ' текст=' +
+                JSON.stringify(String(this.textContent || '').slice(0, 70)) + ' -> ' + show(r));
             }
           } catch (e) {}
           return r;
@@ -245,8 +245,8 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
           const r = bb.apply(this, a);
           try {
             if ((globalThis.__ptBBoxN = (globalThis.__ptBBoxN || 0) + 1) <= 40) {
-              console.log('[svg] getBBox текст=' +
-                JSON.stringify(String(this.textContent || '').slice(0, 12)) +
+              console.log('[svg] getBBox шрифт=' + (() => { try { const cs = getComputedStyle(this); return cs.fontSize + '/' + cs.fontFamily.slice(0, 20); } catch (e) { return '?'; } })() + ' текст=' +
+                JSON.stringify(String(this.textContent || '').slice(0, 70)) +
                 ' -> {' + [r.x, r.y, r.width, r.height].join(',') + '}');
             }
           } catch (e) {}

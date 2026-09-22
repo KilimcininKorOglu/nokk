@@ -571,8 +571,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                               const show = (v) => (v && typeof v === 'object'
                                 ? '{' + ['x', 'y', 'width', 'height'].map((k) => k + '=' + (v[k] === undefined ? '?' : v[k])).join(',') + '}'
                                 : String(v));
-                              console.error('[svg] ' + name + '(' + a.join(',') + ') текст=' +
-                                JSON.stringify(String(this.textContent || '').slice(0, 12)) + ' -> ' + show(r));
+                              console.error('[svg] ' + name + '(' + a.join(',') + ') шрифт=' + (() => { try { const cs = getComputedStyle(this); return cs.fontSize + '/' + cs.fontFamily.slice(0, 20); } catch (e) { return '?'; } })() + ' текст=' +
+                                JSON.stringify(String(this.textContent || '').slice(0, 70)) + ' -> ' + show(r));
                             }
                           } catch (e) {}
                           return r;
@@ -588,8 +588,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           const r = bb.apply(this, a);
                           try {
                             if ((globalThis.__ptBBoxN = (globalThis.__ptBBoxN || 0) + 1) <= 40) {
-                              console.error('[svg] getBBox текст=' +
-                                JSON.stringify(String(this.textContent || '').slice(0, 12)) +
+                              console.error('[svg] getBBox шрифт=' + (() => { try { const cs = getComputedStyle(this); return cs.fontSize + '/' + cs.fontFamily.slice(0, 20); } catch (e) { return '?'; } })() + ' текст=' +
+                                JSON.stringify(String(this.textContent || '').slice(0, 70)) +
                                 ' -> {' + [r.x, r.y, r.width, r.height].join(',') + '}');
                             }
                           } catch (e) {}

@@ -2293,6 +2293,19 @@
     return fn + '(' + out.join(', ') + ')';
   });
 
+  /// Список семейств так, как его печатает браузер: имя с пробелами берётся
+  /// в двойные кавычки, одинарные переводятся в двойные, остальное как есть.
+  const __cssFamilies = (v) => __cssCommaParts(v).map((one) => {
+    const t = one.trim();
+    if (!t) return t;
+    const q = t[0];
+    if (q === '"' || q === "'") {
+      const inner = t.slice(1, t.length - (t[t.length - 1] === q ? 1 : 0));
+      return '"' + inner + '"';
+    }
+    return /\s/.test(t) ? '"' + t + '"' : t;
+  }).join(', ');
+
   const __cssValue = (prop, value) => {
     let v = __cssZero(__cssHex(String(value).trim().replace(/\s+/g, ' ')));
     if (prop === 'animation') return __cssAnimation(v);
@@ -2327,10 +2340,19 @@
       if (!image.length && !colour) return v;
       return [...image, ...rest, ...(colour ? [colour] : [])].join(' ');
     }
-    // В сокращении шрифта косая черта отделяется пробелами.
-    if (prop === 'font') return v.replace(/\s*\/\s*/g, ' / ');
-    // Список семейств браузер печатает с пробелом после запятой.
-    if (prop === 'font-family') return v.replace(/\s*,\s*/g, ', ');
+    // В сокращении шрифта косая черта отделяется пробелами, а список
+    // семейств печатается по тем же правилам, что и отдельное свойство.
+    if (prop === 'font') {
+      const spaced = v.replace(/\s*\/\s*/g, ' / ');
+      const at = spaced.search(/(?:^|\s)(?:[\d.]+[a-z%]*|smaller|larger|x?x-(?:small|large)|small|medium|large)(?:\s*\/\s*\S+)?\s+/);
+      if (at < 0) return spaced;
+      const m = /(?:^|\s)(?:[\d.]+[a-z%]*|smaller|larger|x?x-(?:small|large)|small|medium|large)(?:\s*\/\s*\S+)?\s+/.exec(spaced);
+      const head = spaced.slice(0, m.index + m[0].length);
+      return head + __cssFamilies(spaced.slice(m.index + m[0].length));
+    }
+    // Список семейств: пробел после запятой, а имя из нескольких слов — в
+    // двойных кавычках, как печатает браузер. Одинарные он переводит в двойные.
+    if (prop === 'font-family') return __cssFamilies(v);
     // Составляющие сокращённой записи, равные начальному значению, браузер не
     // печатает: `flex-flow: column nowrap` возвращается как `column`.
     if (prop === 'flex-flow') v = v.replace(/\s+nowrap$/, '');
@@ -3660,6 +3682,10 @@
     }
     globalThis.__pt_svgProto = (tag) => svgProto.get((SVG_CHAIN[tag] || [])[0]) ||
                                         svgProto.get('SVGElement') || null;
+    // По имени интерфейса, а не тега: измерительные члены должны лечь на
+    // `SVGTextContentElement`, а не на общий `SVGElement`, — страница ходит по
+    // цепочке прототипов и видит, у кого что лежит.
+    globalThis.__pt_svgIface = (name) => svgProto.get(name) || null;
   }
 
 
@@ -3669,7 +3695,8 @@
   // отдельный измерительный тракт, и им тоже снимают отпечаток: текст меряют
   // не только холстом, но и рамкой `<text>`.
   {
-    const P = (n) => (globalThis.__pt_svgProto ? __pt_svgProto(n) : null);
+    const P = (n) => (globalThis.__pt_svgIface && __pt_svgIface(n))
+      || (globalThis.__pt_svgProto ? __pt_svgProto(n) : null);
     const wrap = (name, val) => {
       const C = globalThis[name];
       const o = C && C.prototype ? Object.create(C.prototype) : {};
@@ -3978,6 +4005,21 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         try { Object.defineProperty(proto, name, d); } catch (e) {}
       }
       try { delete Element.prototype[name]; } catch (e) {}
+    }
+    // Часть членов браузер кладёт и в SVG — они приходят из общей примеси.
+    // Без них у SVG-узла не было ни объявления стиля, ни каскада: `<text
+    // font-size="150">` мерился шестнадцатью пикселями, а `style.fontSize`
+    // не доходил до атрибута.
+    const svgRoot = globalThis.SVGElement && SVGElement.prototype;
+    if (svgRoot) {
+      for (const name of ['style', 'dataset', 'attributeStyleMap', 'nonce',
+                          'tabIndex', 'autofocus', 'focus', 'blur']) {
+        if (Object.getOwnPropertyDescriptor(svgRoot, name)) continue;
+        const d = Object.getOwnPropertyDescriptor(__htmlProto, name);
+        if (d) {
+          try { Object.defineProperty(svgRoot, name, d); } catch (e) {}
+        }
+      }
     }
   }
 
@@ -5086,11 +5128,40 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   /// Объявления, дошедшие до элемента: сначала таблицы по весу, потом его
   /// собственный атрибут `style`.
+  /// Свойства, которые в SVG пишут атрибутами. Список Chrome 151.
+  const SVG_PRESENTATION = ['alignment-baseline', 'baseline-shift', 'clip-path', 'clip-rule',
+    'color', 'color-interpolation', 'color-interpolation-filters', 'cursor', 'direction',
+    'display', 'dominant-baseline', 'fill', 'fill-opacity', 'fill-rule', 'filter',
+    'flood-color', 'flood-opacity', 'font-family', 'font-size', 'font-size-adjust',
+    'font-stretch', 'font-style', 'font-variant', 'font-weight', 'image-rendering',
+    'letter-spacing', 'lighting-color', 'marker-end', 'marker-mid', 'marker-start', 'mask',
+    'mask-type', 'opacity', 'overflow', 'paint-order', 'pointer-events', 'shape-rendering',
+    'stop-color', 'stop-opacity', 'stroke', 'stroke-dasharray', 'stroke-dashoffset',
+    'stroke-linecap', 'stroke-linejoin', 'stroke-miterlimit', 'stroke-opacity',
+    'stroke-width', 'text-anchor', 'text-decoration', 'text-overflow', 'text-rendering',
+    'transform-origin', 'unicode-bidi', 'vector-effect', 'visibility', 'white-space',
+    'word-spacing', 'writing-mode'];
+  const SVG_LENGTH_ATTRS = new Set(['font-size', 'letter-spacing', 'word-spacing',
+    'stroke-width', 'stroke-dashoffset', 'baseline-shift']);
+
   function __cascadeFor(el) {
     if (!el || el.nodeType !== ELEMENT_NODE) return new Map();
     const hit = __styleCache.get(el);
     if (hit) return hit;
     const out = new Map();
+    // В SVG свойства пишут атрибутами, и браузер считает их объявлениями
+    // самого низкого веса: `<text font-size="150">` меряется полутора сотнями
+    // пикселей, а не шестнадцатью.
+    if (el.__ptNS === 'http://www.w3.org/2000/svg' && el.hasAttribute) {
+      for (const name of SVG_PRESENTATION) {
+        const raw = __ptGetA(el, name);
+        if (raw == null) continue;
+        const v = String(raw).trim();
+        // Голое число в SVG — это пользовательские единицы, то есть пиксели.
+        const norm = SVG_LENGTH_ATTRS.has(name) && /^-?[\d.]+$/.test(v) ? v + 'px' : v;
+        out.set(name, norm);
+      }
+    }
     const won = [];
     for (const r of __rulesFor(el.ownerDocument)) {
       let ok = false;
