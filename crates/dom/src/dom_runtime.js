@@ -781,12 +781,22 @@
       this.__ptTag = String(tag).toUpperCase();
       this.__ptLocal = String(tag).toLowerCase();
       this.__ptAttrs = new Map();
-      this.__ptStyle = makeStyle(this);
     }
     get nodeName() { return this.tagName; }
     get tagName() { return this.__ptTag; }
     get localName() { return this.__ptLocal; }
-    get style() { return this.__ptStyle; }
+    // Объявление стиля строится при первом обращении, а не при создании
+    // узла: у него семьсот собственных свойств, и на страницу с тысячей
+    // элементов это полсекунды на пустом месте. Браузер создаёт узел за
+    // полмикросекунды, у нас выходило полмиллисекунды.
+    get style() {
+      if (!this.__ptStyle) {
+        Object.defineProperty(this, '__ptStyle', {
+          value: makeStyle(this), writable: true, enumerable: false, configurable: true,
+        });
+      }
+      return this.__ptStyle;
+    }
 
     // Attributes
     getAttribute(n) { const v = this.__ptAttrs.get(n.toLowerCase()); return v === undefined ? null : v; }
@@ -2477,71 +2487,11 @@
   // идут имена свойств CSS — все семьсот три, в порядке браузера. У нас было
   // наоборот: методы собственными, имён не было вовсе, и перечисление стиля
   // выглядело как что угодно, только не как браузер.
-  const __shapeStyleProto = (proto) => {
-    if (proto.__ptStyleShaped) return proto;
-    try { Object.defineProperty(proto, '__ptStyleShaped', { value: true }); } catch (e) {}
-    const dash = (p) => String(p).replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
-    // Прототип объявления один на всех: у правила, у атрибута `style` и у
-    // вычисленного стиля. Кто настраивал его последним, тот раньше и затирал
-    // чужие `length`, `item` и `getPropertyValue` — вычисленный стиль отвечал
-    // нулевой длиной, потому что искал себя не в том хранилище. Теперь каждый
-    // член сперва смотрит, чей перед ним объект.
-    const other = (o) => __cssReaders.get(o);
-    const mapOf = (o) => {
-      const m = __cssMaps.get(o);
-      if (m) return m;
-      const s = other(o);
-      if (s) return s.computed ? s.map : s.read();
-      return new Map();
-    };
-    const namesOf = (o) => {
-      const s = other(o);
-      if (s) return s.computed ? s.names : __styleNames(s.read());
-      return [...mapOf(o).keys()];
-    };
-    const def = (name, value) => {
-      try { Object.defineProperty(proto, name, { value, writable: true, enumerable: true, configurable: true }); } catch (e) {}
-    };
-    const acc = (name, get) => {
-      try { Object.defineProperty(proto, name, { get, enumerable: true, configurable: true }); } catch (e) {}
-    };
-    // Порядок объявления виден снаружи: `for…in` по стилю отдаёт сперва имена
-    // свойств CSS, а следом эти девять — в том порядке, в каком их завели. У
-    // Chrome он именно такой, и перечисление стиля челлендж делает целиком.
-    // У вычисленного стиля `cssText` пуст — это не декларация автора.
-    acc('cssText', function cssText() {
-      const st = __cssReaders.get(this);
-      if (st && st.computed) return '';
-      return [...mapOf(this)].map(([k, v]) => k + ': ' + v + ';').join(' ');
-    });
-    acc('length', function length() { return namesOf(this).length; });
-    acc('parentRule', function parentRule() { return null; });
-    acc('cssFloat', function cssFloat() { return mapOf(this).get('float') || ''; });
-    def('getPropertyPriority', function getPropertyPriority() { return ''; });
-    def('getPropertyValue', function getPropertyValue(p) {
-      const m = mapOf(this), k = String(p).toLowerCase();
-      // Имена с приставкой поставщика спрашивают и с дефисом впереди:
-      // `-webkit-logical-width` — то же свойство, что у нас без него.
-      return m.get(k) || (k.charCodeAt(0) === 45 ? m.get(k.slice(1)) || '' : '')
-        || __longhandFrom(m, k);
-    });
-    def('item', function item(i) { return namesOf(this)[i] || ''; });
-    def('removeProperty', function removeProperty(p) {
-      const k = dash(String(p)).toLowerCase(), m = mapOf(this), had = m.get(k) || '';
-      m.delete(k); return had;
-    });
-    def('setProperty', function setProperty(p, v) {
-      const k = dash(String(p)).toLowerCase();
-      mapOf(this).set(k, __cssValue(k, v));
-    });
-    try {
-      Object.defineProperty(proto, Symbol.iterator, {
-        value: function* () { for (const k of mapOf(this).keys()) yield k; },
-        writable: true, configurable: true,
-      });
-    } catch (e) {}
-    return proto;
-  };
+  // Построитель у объявления один — `__inlineStyleProto`. Раньше их было два,
+  // и прототип у правила, атрибута и вычисленного стиля общий: чей построитель
+  // успевал позже, того и члены, а половина работы первого пропадала. Отсюда
+  // и брались нулевая длина у правила, и `item` с именами не из того набора.
+  const __shapeStyleProto = () => __inlineStyleProto();
 
   // Во что браузер разворачивает сокращённые записи. `style.length` считает
   // длинные свойства, а не написанные: у `border: none` их семнадцать, у
@@ -2965,7 +2915,20 @@
     const proto = __styleProto();
     if (proto.__ptInlineShaped) return proto;
     try { Object.defineProperty(proto, '__ptInlineShaped', { value: true }); } catch (e) {}
-    const st = (o) => __cssReaders.get(o);
+    // Объявление бывает двух видов: инлайновое (за ним атрибут элемента) и
+    // правило таблицы (за ним карта разобранных объявлений). Члены у них
+    // общие — они лежат на одном прототипе, — поэтому здесь понимаются оба.
+    // Пока понимался один, порядок сборки решал: если первым успевало
+    // правило, у инлайнового пропадали чтения, а если первым инлайновое —
+    // у правила выходила нулевая длина, и каскад не брал ни одного
+    // объявления.
+    const st = (o) => {
+      const own = __cssReaders.get(o);
+      if (own) return own;
+      const map = __cssMaps.get(o);
+      if (!map) return null;
+      return { read: () => map, write: () => {}, computed: false, map, el: null };
+    };
     const def = (name, value) => {
       try { Object.defineProperty(proto, name, { value, writable: true, enumerable: true, configurable: true }); } catch (e) {}
     };
@@ -2976,7 +2939,11 @@
       const s = st(this); if (!s) return '';
       const k = String(p).toLowerCase();
       const m = s.computed ? s.map : s.read();
-      return m.get(k) || (k.charCodeAt(0) === 45 ? m.get(k.slice(1)) || '' : '');
+      // Имена с приставкой поставщика спрашивают и с дефисом впереди, а
+      // длинное свойство может быть записано сокращением: `border-top-width`
+      // отвечает из `border`.
+      return m.get(k) || (k.charCodeAt(0) === 45 ? m.get(k.slice(1)) || '' : '')
+        || __longhandFrom(m, k);
     });
     def('getPropertyPriority', function getPropertyPriority() { return ''; });
     def('setProperty', function setProperty(p, v) {
@@ -3019,6 +2986,12 @@
         if (s.el && s.el.setAttribute) __ptSetA(s.el, 'style', String(v));
         __markDirty();
       });
+    try {
+      Object.defineProperty(proto, Symbol.iterator, {
+        value: function* () { const s = st(this); if (!s) return; for (const k of (s.computed ? s.names : __styleNames(s.read()))) yield k; },
+        writable: true, configurable: true,
+      });
+    } catch (e) {}
     return proto;
   };
 
@@ -4075,6 +4048,39 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   };
   __pt_fillShapes();
 
+
+  // Доступ к своим кукам в стороннем кадре. Виджет Turnstile его просит, и
+  // браузер после этого помечает запросы кадра отдельным заголовком; у нас
+  // вызов возвращал пустоту, `.then` падал с TypeError, и виджет шёл другой
+  // дорогой.
+  try {
+    const D = Document.prototype;
+    const def = (name, fn) => {
+      try {
+        Object.defineProperty(D, name, {
+          value: globalThis.__pt_native ? __pt_native(fn) : fn,
+          writable: true, enumerable: true, configurable: true,
+        });
+      } catch (e) {}
+    };
+    def('requestStorageAccess', function requestStorageAccess(types) {
+      globalThis.__ptStorageAccess = true;
+      if (types && typeof types === 'object') {
+        const handle = {};
+        for (const k of Object.keys(types)) if (types[k]) handle[k] = true;
+        return Promise.resolve(handle);
+      }
+      return Promise.resolve(undefined);
+    });
+    def('hasStorageAccess', function hasStorageAccess() { return Promise.resolve(true); });
+    def('hasUnpartitionedCookieAccess', function hasUnpartitionedCookieAccess() {
+      return Promise.resolve(true);
+    });
+    def('requestStorageAccessFor', function requestStorageAccessFor() {
+      globalThis.__ptStorageAccess = true;
+      return Promise.resolve(undefined);
+    });
+  } catch (e) {}
 
   globalThis.ShadowRoot = ShadowRoot;
   globalThis.Text = Text;
@@ -6256,7 +6262,18 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     });
   } catch (e) {}
 
+  // Вычисленный стиль дорог: тысяча двести свойств, каскад, наследование и
+  // раскладка. Страница спрашивает его десятками раз подряд, и между
+  // вопросами ничего не меняется — держим готовый ответ до первой правки
+  // дерева.
+  const __computedCache = new WeakMap();
+
   globalThis.getComputedStyle = (el, pseudo) => {
+    if (el && !pseudo && el.nodeType === ELEMENT_NODE) {
+      __relayout();
+      const hit = __computedCache.get(el);
+      if (hit && hit.at === __layoutBuilt) return hit.style;
+    }
     const map = new Map();
     // У элемента вне отрисованного дерева вычисленного стиля нет: браузер
     // отдаёт пустую строку на каждое свойство и `length` ноль. Мы отвечали
@@ -6454,7 +6471,11 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     // `length` и в нумерованные имена не попадают, как и в браузере.
     const names = [...map.keys()];
     __addShorthands(map);
-    return __makeComputed(map, names);
+    const made = __makeComputed(map, names);
+    if (el && !pseudo && el.nodeType === ELEMENT_NODE) {
+      try { __computedCache.set(el, { at: __layoutBuilt, style: made }); } catch (e) {}
+    }
+    return made;
   };
 
   /// Объявление вычисленного стиля. `names` пуст, когда элемент не отрисован:
