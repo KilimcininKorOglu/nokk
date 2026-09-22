@@ -121,6 +121,44 @@ impl EmulationOs {
 /// набору, какой знает `wreq-util` — см. [`profile_for_major`].
 pub const DEFAULT_CHROME_MAJOR: u32 = 151;
 
+/// Переписать номер версии Chrome в заголовках набора: `user-agent` и список
+/// марок `sec-ch-ua` должны говорить то же, что `navigator.userAgent` и
+/// `navigator.userAgentData.brands` на стороне JS.
+fn retag_chrome_version(headers: &mut wreq::header::HeaderMap, major: u32) {
+    use wreq::header::{HeaderValue, HeaderName};
+    if let Some(ua) = headers.get(wreq::header::USER_AGENT).cloned() {
+        if let Ok(text) = ua.to_str() {
+            // `Chrome/<n>.0.0.0` → `Chrome/<major>.0.0.0`, остальное не трогаем.
+            let mut out = String::with_capacity(text.len());
+            let mut rest = text;
+            while let Some(at) = rest.find("Chrome/") {
+                out.push_str(&rest[..at + "Chrome/".len()]);
+                rest = &rest[at + "Chrome/".len()..];
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                out.push_str(&major.to_string());
+                rest = &rest[digits.len()..];
+            }
+            out.push_str(rest);
+            if let Ok(v) = HeaderValue::from_str(&out) {
+                headers.insert(wreq::header::USER_AGENT, v);
+            }
+        }
+    }
+    // Список марок — тот же, что отдаёт `userAgentData.brands`: GREASE-марка
+    // впереди, затем Chrome и Chromium одной версии.
+    let brands = format!(
+        "\"Not=A?Brand\";v=\"99\", \"Google Chrome\";v=\"{major}\", \"Chromium\";v=\"{major}\""
+    );
+    if let (Ok(name), Ok(value)) = (
+        HeaderName::from_bytes(b"sec-ch-ua"),
+        HeaderValue::from_str(&brands),
+    ) {
+        if headers.contains_key(&name) {
+            headers.insert(name, value);
+        }
+    }
+}
+
 /// Map a Chrome major version to the matching wreq TLS/HTTP emulation profile.
 ///
 /// Covers the modern range wreq-util ships (roughly Chrome 120–149); an
@@ -223,6 +261,11 @@ pub struct Request {
     /// reloads *itself*, and a reload that claims a human gesture is one no
     /// browser sends. Meaningless for anything but a navigation.
     pub user_activated: bool,
+    /// Запрос идёт из кадра, чей источник не совпадает с источником страницы.
+    /// Браузер добавляет в таком кадре `sec-fetch-storage-access`, и челлендж
+    /// Cloudflare живёт ровно в таком кадре: все три его запроса этот
+    /// заголовок несут, а первый POST — тот самый, по которому решают.
+    pub third_party: bool,
 }
 
 /// The destination a request is for, in the sense `Sec-Fetch-Dest` means it.
@@ -391,6 +434,12 @@ impl FingerprintClient {
                 true,
             ));
         }
+        // Версия в заголовках — та, которую показывает JS. Набор рукопожатия у
+        // `wreq-util` доходит до Chrome 149, и его заголовки говорят «149», а
+        // наш `navigator` — «151»: несоответствие между заголовком и тем, что
+        // собрала страница, видно с первого запроса. Переписываем только
+        // номер версии и список марок, всё остальное — от набора.
+        retag_chrome_version(&mut emulation.headers, config.chrome_major);
         let mut builder = wreq::Client::builder().emulation(emulation);
         // Named session or not, the jar is ours: a named one is shared (and
         // serializable) across contexts of the same identity, an anonymous one is
@@ -424,6 +473,18 @@ impl FingerprintClient {
     }
 }
 
+
+/// Источник адреса — схема, узел и порт, как их пишет браузер в `Origin`.
+fn origin_of(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://").map(|r| ("https", r))
+        .or_else(|| url.strip_prefix("http://").map(|r| ("http", r)))?;
+    let (scheme, tail) = rest;
+    let host = tail.split(['/', '?', '#']).next()?;
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{host}"))
+}
 
 /// Whether `referer` and `url` are the same origin — the difference between
 /// `sec-fetch-site: same-origin` and `cross-site`.
@@ -497,13 +558,43 @@ impl HttpClient for FingerprintClient {
         if plain_http {
             rb = rb.header("connection", "keep-alive");
         }
+        // Источник: браузер шлёт его у всякого запроса не-GET и у всякого
+        // междоменного. Без него запрос от страницы не отличить от запроса
+        // из программы — и у Cloudflare это первое, на что он смотрит.
+        let wants_origin = req.method != "GET" && req.method != "HEAD" || !same_origin;
+        let page_origin = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("referer"))
+            .and_then(|(_, r)| origin_of(r));
+        let mut sent_origin = false;
+        if wants_origin && req.kind != RequestKind::Document {
+            if let Some(o) = page_origin.as_deref() {
+                rb = rb.header("origin", o);
+                sent_origin = true;
+            }
+        }
         let mut order = wreq::header::OrigHeaderMap::new();
         if plain_http {
             order.insert("host");
             order.insert("connection");
         }
-        for name in ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"] {
-            order.insert(name);
+        // Подсказки о браузере идут в разном порядке у перехода и у запроса
+        // из страницы: у перехода — `sec-ch-ua`, `-mobile`, `-platform`, у
+        // запроса — `-platform`, `user-agent`, `sec-ch-ua`, `content-type`,
+        // `-mobile`. Снято с Chrome 151.
+        let subresource = req.kind != RequestKind::Document;
+        if subresource {
+            order.insert("content-length");
+            order.insert("sec-ch-ua-platform");
+            order.insert("user-agent");
+            order.insert("sec-ch-ua");
+            order.insert("content-type");
+            order.insert("sec-ch-ua-mobile");
+        } else {
+            for name in ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"] {
+                order.insert(name);
+            }
         }
         let claims_user = req.kind == RequestKind::Document && req.user_activated;
         if req.kind == RequestKind::Document {
@@ -517,14 +608,30 @@ impl HttpClient for FingerprintClient {
                 rb = rb.header("sec-fetch-user", "?1");
             }
         }
-        for name in ["user-agent", "accept", "sec-fetch-site", "sec-fetch-mode"] {
+        if !subresource {
+            order.insert("user-agent");
+        }
+        order.insert("accept");
+        if sent_origin {
+            order.insert("origin");
+        }
+        // Доступ к своим кукам в чужом кадре: браузер говорит о нём отдельным
+        // заголовком, и только в стороннем кадре — на своей же странице его нет.
+        let storage_access = req.third_party && same_origin && req.kind != RequestKind::Document;
+        if storage_access {
+            rb = rb.header("sec-fetch-storage-access", "active");
+        }
+        for name in ["sec-fetch-site", "sec-fetch-mode"] {
             order.insert(name);
         }
         if claims_user {
             order.insert("sec-fetch-user");
         }
+        order.insert("sec-fetch-dest");
+        if storage_access {
+            order.insert("sec-fetch-storage-access");
+        }
         for name in [
-            "sec-fetch-dest",
             "referer",
             "accept-encoding",
             "accept-language",
@@ -657,6 +764,7 @@ mod tests {
             headers: BTreeMap::new(),
             body: None,
             kind: RequestKind::default(),
+            third_party: false,
             user_activated: true,
         }
     }

@@ -43,11 +43,26 @@ const get = (p) => new Promise((res, rej) => { const t = (n) => http.get({host:'
       if (/challenge-platform/.test(q.url)) {
         const n = q.postData ? q.postData.length : (q.postDataEntries ? -1 : 0);
         sent.push([m.params.timestamp, q.method, n, q.url.replace(/^https:\/\//, '').slice(0, 62), m.params.requestId]);
-        if (/\/fo\//.test(q.url) && q.method === 'POST' && !globalThis.__hdrShown) {
-          globalThis.__hdrShown = 1;
-          console.log('— заголовки первого POST:');
+        // Заголовки показываются и у `/pat/`: там разговор о жетоне, и
+        // отличие в заголовках видно сразу по коду ответа.
+        const kind = /\/fo\//.test(q.url) && q.method === 'POST' ? 'первого POST'
+          : /\/pat\//.test(q.url) ? 'запроса /pat/' : null;
+        if (kind && !globalThis['__hdr' + kind]) {
+          globalThis['__hdr' + kind] = 1;
+          console.log('— заголовки ' + kind + ':');
           for (const k of Object.keys(q.headers)) console.log('   ' + k + ': ' + String(q.headers[k]).slice(0, 90));
         }
+      }
+    }
+    // Полный набор заголовков виден только в дополнении: сам запрос в CDP
+    // показывает лишь то, что поставил скрипт.
+    if (m.method === 'Network.requestWillBeSentExtraInfo') {
+      const u = urls.get(m.params.requestId) || '';
+      const sa = m.params.headers['sec-fetch-storage-access'];
+      const st = m.params.headers['sec-fetch-site'];
+      if ((globalThis.__extraN = (globalThis.__extraN || 0) + 1) <= 40) {
+        console.log('[хранилище] ' + (sa || '—') + ' | site=' + (st || '—') + ' | '
+          + u.replace(/^https?:\/\//, '').slice(0, 58));
       }
     }
     if (m.method === 'Network.loadingFinished') {

@@ -288,6 +288,7 @@ impl EngineInner {
             headers,
             body: None,
             kind: nokk_net::RequestKind::Xhr,
+            third_party: false,
             user_activated: false,
         };
         match client.send(req).await {
@@ -728,6 +729,7 @@ impl Engine {
             body: None,
             kind: nokk_net::RequestKind::Document,
             // A one-shot fetch is someone asking for an address, like typing one.
+            third_party: false,
             user_activated: true,
         };
         match self.inner.client.send(req).await {
@@ -3111,6 +3113,9 @@ impl BrowserContext {
             headers,
             body,
             kind: nokk_net::RequestKind::Xhr,
+            // Кадр сказал, что ему дали доступ к своим кукам: с этого момента
+            // браузер помечает его запросы `sec-fetch-storage-access`.
+            third_party: r["storageAccess"].as_bool().unwrap_or(false),
             user_activated: false,
         };
 
@@ -3286,6 +3291,7 @@ impl BrowserContext {
                 _ => nokk_net::RequestKind::Subresource,
             },
             // A navigation nobody's page asked for is one a person asked for.
+            third_party: false,
             user_activated: resource_type == "document" && referrer.is_none(),
         };
         match self.client.send(req).await {

@@ -4923,6 +4923,9 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       method: (opts.method || 'GET').toUpperCase(),
       headers: headerObj(opts.headers),
       body: opts.body != null ? String(opts.body) : null,
+      // Кадр, которому дали доступ к своим кукам, помечает этим свои
+      // запросы: браузер добавляет к ним отдельный заголовок.
+      storageAccess: !!globalThis.__ptStorageAccess,
     };
     return new Promise((resolve, reject) => {
       pending.set(id, { resolve, reject, url: req.url });
