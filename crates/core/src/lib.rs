@@ -8273,9 +8273,11 @@ mod tests {
         }
         assert_eq!(out["fetch"], "function", "what a worker does have, it has");
         assert_eq!(out["json"], "function", "the language comes along");
-        // Measured against Chrome 148, level by level: the shape of the realm is
-        // the first thing a collector inside a worker enumerates.
-        assert_eq!(out["own"], 334, "own names on the scope: {out}");
+        // Measured against Chrome 151, level by level: the shape of the realm is
+        // the first thing a collector inside a worker enumerates. Имён 335 —
+        // `FontFaceSet` в их числе: у браузера `self.fonts` это интерфейс, а не
+        // безымянный объект.
+        assert_eq!(out["own"], 335, "own names on the scope: {out}");
         assert_eq!(out["keys"], 12, "and twelve of them enumerable");
         assert_eq!(out["scope"], 30, "WorkerGlobalScope carries the rest");
         // Chrome carries 23; a context with no network reports one fewer (no

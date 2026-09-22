@@ -400,8 +400,7 @@
       // `window.event` — событие, которое обрабатывается прямо сейчас. Старое,
       // но живое свойство: у нас оно было `undefined` всегда, а в Chrome внутри
       // обработчика там лежит само событие.
-      const outerEvent = globalThis.event;
-      try { globalThis.event = event; } catch (e) {}
+      const снимок = __ptTakeEvent(event);
       // Build the ancestor path for capture/bubble.
       const path = []; for (let n = this; n; n = n.parentNode) path.push(n);
       // Capture phase (root -> target), then bubble (target -> root).
@@ -432,7 +431,7 @@
       if (!onFirst) callOn();
       if (event.bubbles) for (let i = 1; i < path.length; i++) { if (event.__ptStop) break; __ptEvSet(event, 'eventPhase', 3); fire(path[i]); }
       // Возвращаем `window.event` как было: вне обработки его нет.
-      try { globalThis.event = outerEvent; } catch (e) {}
+      __ptDropEvent(снимок);
       return !event.defaultPrevented;
     }
   }
@@ -551,6 +550,26 @@
   // Событие движок метит сам: цель, текущую цель и стадию у браузера читают,
   // но не пишут, и установщиков у них нет. Свои события держат это в `__ptE`,
   // а пришедшие с другого этажа — собственным свойством.
+  // `window.event` — событие, которое обрабатывается прямо сейчас. У воркера
+  // такого имени нет вовсе, и восстановление «как было» не должно его
+  // заводить: присваивание `undefined` создаёт собственное свойство, и в
+  // воркере появлялось лишнее имя, которого у браузера там нет.
+  // Признак окна — не `document` (движок строит его и в воркере, просто
+  // прячет), а `importScripts`: он есть только у воркера.
+  const __ptEventSlot = () => typeof importScripts === 'undefined';
+  const __ptTakeEvent = (ev) => {
+    const было = Object.prototype.hasOwnProperty.call(globalThis, 'event');
+    const прежнее = было ? globalThis.event : undefined;
+    if (__ptEventSlot()) { try { globalThis.event = ev; } catch (e) {} }
+    return { было, прежнее };
+  };
+  const __ptDropEvent = (снимок) => {
+    try {
+      if (снимок.было) globalThis.event = снимок.прежнее;
+      else delete globalThis.event;
+    } catch (e) {}
+  };
+
   const __ptEvSet = (ev, key, value) => {
     if (!ev) return;
     if (ev.__ptE) { ev.__ptE[key] = value; return; }
@@ -1857,13 +1876,12 @@
     const ev = __ptTrust(new MessageEvent('message', { data, origin: '', source: null }));
     try { __ptEvSet(ev, 'target', W.worker); __ptEvSet(ev, 'currentTarget', W.worker); } catch (e) {}
     // Внутри обработчика `window.event` — это событие, снаружи ничего.
-    const outer = globalThis.event;
-    try { globalThis.event = ev; } catch (e) {}
+    const снимок = __ptTakeEvent(ev);
     try {
       try { if (typeof W.onmessage === 'function') W.onmessage.call(W.worker, ev); } catch (e) {}
       for (const h of (W.listeners.message || [])) { try { h.call(W.worker, ev); } catch (e) {} }
     } finally {
-      try { globalThis.event = outer; } catch (e) {}
+      __ptDropEvent(снимок);
     }
   };
   globalThis.__pt_workerFailed = (id, message) => {
