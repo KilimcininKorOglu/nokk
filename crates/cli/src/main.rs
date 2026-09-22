@@ -430,11 +430,29 @@ async fn main() -> Result<()> {
                         // высыпать счётчики.
                         if (/\/fo\//.test(this.__ptU || '') && b && b.length > 50000) {
                           try { globalThis.__ptDumpCounts && __ptDumpCounts(); } catch (e) {}
+                          try {
+                            const T = globalThis.__ptTime || {};
+                            const rows = Object.keys(T).map((k) => [k, T[k]]).sort((x, y) => y[1] - x[1]).slice(0, 14);
+                            for (const [k, v] of rows) {
+                              console.error('[время] ' + Math.round(v) + 'мс — ' + k);
+                            }
+                          } catch (e) {}
                         }
                         // Оракул по размерам: какая программа пришла в ответ на
                         // первый POST и чем ответили на отчёт. Расшифрованная
                         // длина, а не сжатая, — сравнивать с Chrome через
                         // `tools/netwatch.js`.
+                        // Тело первого POST — то, что уходит до программы. У нас оно
+                        // на полсотни знаков короче хромовского, и разница видна только
+                        // текстом.
+                        if (/\/cdn-cgi\/challenge-platform\//.test(this.__ptU || '') && b && b.length > 1000
+                            && b.length < 20000 && !globalThis.__ptFirstBody) {
+                          globalThis.__ptFirstBody = 1;
+                          const s0 = String(b);
+                          for (let q = 0; q < s0.length; q += 250) {
+                            console.error('[ПЕРВЫЙ ' + s0.length + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
+                          }
+                        }
                         if (/\/cdn-cgi\/challenge-platform\//.test(this.__ptU || '')) {
                           const url = this.__ptU, t0 = Math.round(performance.now());
                           const sent = (b && b.length) || 0;
@@ -479,7 +497,16 @@ async fn main() -> Result<()> {
                           Object.defineProperty(obj, n, {
                             value: function (...a) {
                               bump(label + '.' + n);
+                              const t0 = performance.now();
                               const r = f.apply(this, a);
+                              // Сколько времени ушло на каждый вызов: челлендж
+                              // меряет себя сам, и медленный ответ виден ему
+                              // не хуже неправильного.
+                              try {
+                                const key = label + '.' + n;
+                                const T = (globalThis.__ptTime = globalThis.__ptTime || {});
+                                T[key] = (T[key] || 0) + (performance.now() - t0);
+                              } catch (e) {}
                               grew(label + '.' + n, r);
                               return r;
                             },
@@ -597,6 +624,44 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                         };
                         V.__ptSaid = 1;
                         Object.defineProperty(G, 'getBBox', { value: V, writable: true, configurable: true });
+                      }
+                    } catch (e) {}
+                    // Что страница склеивает в JSON и что кодирует в base64:
+                    // начальная посылка собирается именно так, и её содержимое
+                    // видно только здесь.
+                    try {
+                      const J = JSON.stringify;
+                      if (!J.__ptSaid) {
+                        const V = function stringify(...a) {
+                          const r = J.apply(this, a);
+                          try {
+                            if (typeof r === 'string' && r.length > 300
+                                && (globalThis.__ptJsonN = (globalThis.__ptJsonN || 0) + 1) <= 6) {
+                              for (let q = 0; q < Math.min(r.length, 4000); q += 250) {
+                                console.error('[json ' + r.length + ':' + (q / 250) + '] ' + r.slice(q, q + 250));
+                              }
+                            }
+                          } catch (e) {}
+                          return r;
+                        };
+                        V.__ptSaid = 1;
+                        JSON.stringify = globalThis.__pt_native ? __pt_native(V) : V;
+                      }
+                      const B = globalThis.btoa;
+                      if (B && !B.__ptSaid) {
+                        const V = function btoa(x) {
+                          const s0 = String(x);
+                          try {
+                            if (s0.length > 300 && (globalThis.__ptBtoaN = (globalThis.__ptBtoaN || 0) + 1) <= 4) {
+                              for (let q = 0; q < Math.min(s0.length, 4000); q += 250) {
+                                console.error('[btoa ' + s0.length + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
+                              }
+                            }
+                          } catch (e) {}
+                          return B.call(this, x);
+                        };
+                        V.__ptSaid = 1;
+                        globalThis.btoa = globalThis.__pt_native ? __pt_native(V) : V;
                       }
                     } catch (e) {}
                     count(globalThis.OfflineAudioContext && OfflineAudioContext.prototype, 'audio',
@@ -803,7 +868,22 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     } catch (e) {}
                     count(globalThis.Worker && Worker.prototype, 'worker', ['postMessage', 'terminate']);
                     count(globalThis.Navigator && Navigator.prototype, 'nav', ['getGamepads']);
-                    count(globalThis, 'win', ['atob', 'btoa', 'matchMedia', 'getComputedStyle']);
+                    count(globalThis, 'win', ['atob', 'btoa', 'matchMedia', 'getComputedStyle',
+                                              'setTimeout', 'requestAnimationFrame', 'queueMicrotask']);
+                    // Что ещё может быть медленным: измерения, разметка, картинки.
+                    count(globalThis.Document && Document.prototype, 'd',
+                          ['createElement', 'createElementNS', 'querySelector', 'querySelectorAll', 'getElementById']);
+                    count(globalThis.Element && Element.prototype, 'el',
+                          ['getBoundingClientRect', 'getClientRects', 'querySelector', 'querySelectorAll',
+                           'setAttribute', 'getAttribute', 'attachShadow', 'closest', 'matches']);
+                    count(globalThis.Node && Node.prototype, 'node', ['appendChild', 'insertBefore', 'removeChild', 'cloneNode']);
+                    count(globalThis.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype, 'ctx2d',
+                          ['measureText', 'fillText', 'strokeText', 'getImageData', 'putImageData', 'drawImage',
+                           'fill', 'stroke', 'createRadialGradient', 'createLinearGradient']);
+                    count(globalThis.SVGTextContentElement && SVGTextContentElement.prototype, 'svgText',
+                          ['getComputedTextLength', 'getNumberOfChars', 'getSubStringLength']);
+                    count(globalThis.SVGGraphicsElement && SVGGraphicsElement.prototype, 'svg', ['getBBox']);
+                    count(globalThis.FontFaceSet && FontFaceSet.prototype, 'fonts', ['check', 'load']);
                     count(globalThis.RTCPeerConnection && RTCPeerConnection.prototype, 'rtc', ['getStats']);
                     // Выгрузка в момент отправки отчёта, а не по таймеру: кадр
                     // виджета к сроку успевает исчезнуть, и счётчики пропадали

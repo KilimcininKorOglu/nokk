@@ -45,6 +45,18 @@ const HOOK = `(() => {
     XMLHttpRequest.prototype.open = function (m, u) { this.__u = String(u); return O.apply(this, arguments); };
     XMLHttpRequest.prototype.send = function (b) {
       console.log('[send] ' + tag() + ' bytes=' + ((b && b.length) || 0) + ' url=' + String(this.__u || '').slice(-40));
+      // Тело первого POST — то, что уходит до программы; разница с движком
+      // видна только текстом.
+      try {
+        if (/\/cdn-cgi\/challenge-platform\//.test(this.__u || '') && b && b.length > 1000
+            && b.length < 20000 && !globalThis.__ptFirstBody) {
+          globalThis.__ptFirstBody = 1;
+          const s0 = String(b);
+          for (let q = 0; q < s0.length; q += 250) {
+            console.log('[ПЕРВЫЙ ' + s0.length + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
+          }
+        }
+      } catch (e) {}
       return S.apply(this, arguments);
     };
   } catch (e) {}
@@ -254,6 +266,44 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
         };
         V.__ptSaid = 1;
         Object.defineProperty(G, 'getBBox', { value: V, writable: true, configurable: true });
+      }
+    } catch (e) {}
+    // Что страница склеивает в JSON и что кодирует в base64:
+    // начальная посылка собирается именно так, и её содержимое
+    // видно только здесь.
+    try {
+      const J = JSON.stringify;
+      if (!J.__ptSaid) {
+        const V = function stringify(...a) {
+          const r = J.apply(this, a);
+          try {
+            if (typeof r === 'string' && r.length > 300
+                && (globalThis.__ptJsonN = (globalThis.__ptJsonN || 0) + 1) <= 6) {
+              for (let q = 0; q < Math.min(r.length, 4000); q += 250) {
+                console.log('[json ' + r.length + ':' + (q / 250) + '] ' + r.slice(q, q + 250));
+              }
+            }
+          } catch (e) {}
+          return r;
+        };
+        V.__ptSaid = 1;
+        JSON.stringify = V;
+      }
+      const B = globalThis.btoa;
+      if (B && !B.__ptSaid) {
+        const V = function btoa(x) {
+          const s0 = String(x);
+          try {
+            if (s0.length > 300 && (globalThis.__ptBtoaN = (globalThis.__ptBtoaN || 0) + 1) <= 4) {
+              for (let q = 0; q < Math.min(s0.length, 4000); q += 250) {
+                console.log('[btoa ' + s0.length + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
+              }
+            }
+          } catch (e) {}
+          return B.call(this, x);
+        };
+        V.__ptSaid = 1;
+        globalThis.btoa = V;
       }
     } catch (e) {}
     const C2 = globalThis.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype;
@@ -514,7 +564,7 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[cs\]|^\[svg\]|^\[хвост |^\[parts|^\[звук |^\[json |^\[btoa |^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
+      if (/^\[(send|hook|hookerr|blob|worker|count)\]|^\[[jPC]\d* |^\[cs\]|^\[ПЕРВЫЙ |^\[svg\]|^\[хвост |^\[parts|^\[звук |^\[json |^\[btoa |^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
         lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
     }
     if (m.method === 'Target.attachedToTarget') {
