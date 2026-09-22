@@ -1677,9 +1677,157 @@ pub fn late_interfaces_script() -> String {
       } catch (e) {}
     }
   }
+
+  // Пять имён, которых у нас не было на окне вовсе, — а обход графа у
+  // челленджа читает окно целиком. Формы сняты с Chrome 151: порядок членов,
+  // вид описаний и предок у каждого свой.
+  {
+    const событие = (P, k) => {
+      let store = null;
+      try {
+        Object.defineProperty(P, k, {
+          get: named('get ' + k, function () { return store; }),
+          set: named('set ' + k, function (v) { store = v; }),
+          enumerable: true, configurable: true,
+        });
+      } catch (e) {}
+    };
+    const чтение = (P, k, v) => {
+      try {
+        Object.defineProperty(P, k, {
+          get: named('get ' + k, function () { return typeof v === 'function' ? v.call(this) : v; }),
+          enumerable: true, configurable: true,
+        });
+      } catch (e) {}
+    };
+    const конец = (P, C) => {
+      // `constructor` у браузера идёт последним: он заводится после членов.
+      try { delete P.constructor; } catch (e) {}
+      try {
+        Object.defineProperty(P, 'constructor', { value: C, writable: true, configurable: true });
+      } catch (e) {}
+    };
+    const интерфейс = (имя, предок) => {
+      const C = named(имя, (function () {
+        'use strict';
+        return function () { throw new TypeError('Illegal constructor'); };
+      })());
+      const P = Object.create(предок || Object.prototype);
+      try { Object.defineProperty(P, Symbol.toStringTag, { value: имя, configurable: true }); } catch (e) {}
+      try { Object.defineProperty(C, 'prototype', { value: P, writable: false, configurable: false }); } catch (e) {}
+      try { Object.defineProperty(C, 'length', { value: 0, configurable: true }); } catch (e) {}
+      return [C, P];
+    };
+    const опубликовать = (имя, C) => {
+      try {
+        Object.defineProperty(globalThis, имя, {
+          value: C, writable: true, enumerable: false, configurable: true,
+        });
+      } catch (e) {}
+    };
+
+    // `FontFaceSet` у браузера на окне есть, и `document.fonts` — его
+    // ��кземпляр. У нас интерфейс был, а имени на окне не было; заодно
+    // приводим порядок членов и вид описаний к браузерным.
+    try {
+      const fonts = globalThis.document && document.fonts;
+      const P = fonts ? Object.getPrototypeOf(fonts) : null;
+      if (P && typeof globalThis.FontFaceSet !== 'function') {
+        const C = P.constructor && P.constructor.name === 'FontFaceSet'
+          ? P.constructor
+          : named('FontFaceSet', (function () { 'use strict'; return function () { throw new TypeError('Illegal constructor'); }; })());
+        try { Object.defineProperty(C, 'prototype', { value: P, writable: false, configurable: false }); } catch (e) {}
+        try { Object.defineProperty(C, 'length', { value: 0, configurable: true }); } catch (e) {}
+        // Порядок у браузера: обработчики, чтения, методы, `constructor`.
+        const прежние = {};
+        for (const k of Object.getOwnPropertyNames(P)) {
+          прежние[k] = Object.getOwnPropertyDescriptor(P, k);
+          if (k !== 'constructor') { try { delete P[k]; } catch (e) {} }
+        }
+        for (const k of ['onloading', 'onloadingdone', 'onloadingerror']) событие(P, k);
+        for (const k of ['ready', 'status', 'size']) {
+          const d = прежние[k];
+          if (d && d.get) {
+            try { Object.defineProperty(P, k, { get: d.get, enumerable: true, configurable: true }); } catch (e) {}
+          } else {
+            чтение(P, k, k === 'ready' ? function () { return Promise.resolve(this); }
+                       : k === 'status' ? 'loaded' : 0);
+          }
+        }
+        for (const k of ['check', 'load', 'add', 'clear', 'delete', 'entries', 'forEach', 'has', 'keys', 'values']) {
+          const d = прежние[k];
+          if (d && typeof d.value === 'function') {
+            try { Object.defineProperty(P, k, { value: d.value, writable: true, enumerable: true, configurable: true }); }
+            catch (e) {}
+          } else {
+            meth(P, k, function () { return undefined; });
+          }
+        }
+        конец(P, C);
+        опубликовать('FontFaceSet', C);
+      }
+    } catch (e) {}
+
+    // Остальные четыре имени интерфейсами и остаются: страница их читает
+    // обходом, но объектов этих классов ей не достаётся.
+    const таблица = [
+      ['CSSPseudoElement', null, [['type', 'г'], ['element', 'г'], ['parent', 'г'], ['pseudo', 'м']]],
+      ['HTMLUserMediaElement', 'HTMLElement', [['error', 'г'], ['onstream', 'с'], ['oncancel', 'с'],
+        ['onerror', 'с'], ['stream', 'г'], ['setConstraints', 'м']]],
+      ['InteractionContentfulPaint', 'PerformanceEntry', [['largestContentfulPaint', 'г'],
+        ['interactionId', 'г'], ['toJSON', 'м'], ['paintTime', 'г'], ['presentationTime', 'г']]],
+      ['PerformanceSoftNavigation', 'PerformanceEntry', [['navigationType', 'г'], ['interactionId', 'г'],
+        ['getLargestInteractionContentfulPaint', 'м'], ['paintTime', 'г'], ['presentationTime', 'г']]],
+    ];
+    for (const [имя, предокИмя, члены] of таблица) {
+      if (typeof globalThis[имя] === 'function') continue;
+      let предок = Object.prototype;
+      try {
+        const B = предокИмя ? globalThis[предокИмя] : null;
+        if (B && B.prototype) предок = B.prototype;
+      } catch (e) {}
+      const [C, P] = интерфейс(имя, предок);
+      for (const [k, вид] of члены) {
+        if (вид === 'с') событие(P, k);
+        else if (вид === 'г') чтение(P, k, null);
+        else meth(P, k, function () { return undefined; });
+      }
+      конец(P, C);
+      опубликовать(имя, C);
+    }
+  }
+
 })();"##
         .to_string()
 }
+
+/// Порядок собственных имён окна, снятый с Chrome 151: всё, что идёт после
+/// `console` — то есть после встроенных имён самого движка, которые V8 кладёт
+/// сам и в том же порядке. Обход графа у челленджа перечисляет окно целиком, а
+/// перечисление отдаёт имена в порядке заведения: у нас первые шесть десятков
+/// сходились, а дальше шло своё. Порядок — такая же примета, как состав.
+const WINDOW_ORDER: &str = r#"["Option","Image","Audio","webkitURL","webkitRTCPeerConnection","webkitMediaStream","WebKitMutationObserver","WebKitCSSMatrix","XPathResult","XPathExpression","XPathEvaluator","XMLSerializer","XMLHttpRequestUpload","XMLHttpRequestEventTarget","XMLHttpRequest","XMLDocument","WritableStreamDefaultWriter","WritableStreamDefaultController","WritableStream","Worker","WindowControlsOverlayGeometryChangeEvent","WindowControlsOverlay","Window","WheelEvent","WebSocket","WebGLVertexArrayObject","WebGLUniformLocation","WebGLTransformFeedback","WebGLTexture","WebGLSync","WebGLShaderPrecisionFormat","WebGLShader","WebGLSampler","WebGLRenderingContext","WebGLRenderbuffer","WebGLQuery","WebGLProgram","WebGLObject","WebGLFramebuffer","WebGLContextEvent","WebGLBuffer","WebGLActiveInfo","WebGL2RenderingContext","WaveShaperNode","VisualViewport","VisibilityStateEntry","VirtualKeyboardGeometryChangeEvent","ViewTransitionTypeSet","ViewTransition","ViewTimeline","VideoPlaybackQuality","VideoFrame","VideoColorSpace","ValidityState","VTTCue","UserActivation","URLSearchParams","URLPattern","URL","UIEvent","TrustedTypePolicyFactory","TrustedTypePolicy","TrustedScriptURL","TrustedScript","TrustedHTML","TreeWalker","TransitionEvent","TransformStreamDefaultController","TransformStream","TrackEvent","TouchList","TouchEvent","Touch","ToggleEvent","TimeRanges","TextUpdateEvent","TextTrackList","TextTrackCueList","TextTrackCue","TextTrack","TextMetrics","TextFormatUpdateEvent","TextFormat","TextEvent","TextEncoderStream","TextEncoder","TextDecoderStream","TextDecoder","Text","TaskSignal","TaskPriorityChangeEvent","TaskController","TaskAttributionTiming","SyncManager","Subscriber","SubmitEvent","StyleSheetList","StyleSheet","StylePropertyMapReadOnly","StylePropertyMap","StorageEvent","Storage","StereoPannerNode","StaticRange","SourceBufferList","SourceBuffer","ShadowRoot","Selection","SecurityPolicyViolationEvent","ScrollTimeline","ScriptProcessorNode","ScreenOrientation","Screen","Scheduling","Scheduler","SVGViewElement","SVGUseElement","SVGUnitTypes","SVGTransformList","SVGTransform","SVGTitleElement","SVGTextPositioningElement","SVGTextPathElement","SVGTextElement","SVGTextContentElement","SVGTSpanElement","SVGSymbolElement","SVGSwitchElement","SVGStyleElement","SVGStringList","SVGStopElement","SVGSetElement","SVGScriptElement","SVGSVGElement","SVGRectElement","SVGRect","SVGRadialGradientElement","SVGPreserveAspectRatio","SVGPolylineElement","SVGPolygonElement","SVGPointList","SVGPoint","SVGPatternElement","SVGPathElement","SVGNumberList","SVGNumber","SVGMetadataElement","SVGMatrix","SVGMaskElement","SVGMarkerElement","SVGMPathElement","SVGLinearGradientElement","SVGLineElement","SVGLengthList","SVGLength","SVGImageElement","SVGGraphicsElement","SVGGradientElement","SVGGeometryElement","SVGGElement","SVGForeignObjectElement","SVGFilterElement","SVGFETurbulenceElement","SVGFETileElement","SVGFESpotLightElement","SVGFESpecularLightingElement","SVGFEPointLightElement","SVGFEOffsetElement","SVGFEMorphologyElement","SVGFEMergeNodeElement","SVGFEMergeElement","SVGFEImageElement","SVGFEGaussianBlurElement","SVGFEFuncRElement","SVGFEFuncGElement","SVGFEFuncBElement","SVGFEFuncAElement","SVGFEFloodElement","SVGFEDropShadowElement","SVGFEDistantLightElement","SVGFEDisplacementMapElement","SVGFEDiffuseLightingElement","SVGFEConvolveMatrixElement","SVGFECompositeElement","SVGFEComponentTransferElement","SVGFEColorMatrixElement","SVGFEBlendElement","SVGEllipseElement","SVGElement","SVGDescElement","SVGDefsElement","SVGComponentTransferFunctionElement","SVGClipPathElement","SVGCircleElement","SVGAnimationElement","SVGAnimatedTransformList","SVGAnimatedString","SVGAnimatedRect","SVGAnimatedPreserveAspectRatio","SVGAnimatedNumberList","SVGAnimatedNumber","SVGAnimatedLengthList","SVGAnimatedLength","SVGAnimatedInteger","SVGAnimatedEnumeration","SVGAnimatedBoolean","SVGAnimatedAngle","SVGAnimateTransformElement","SVGAnimateMotionElement","SVGAnimateElement","SVGAngle","SVGAElement","Response","ResizeObserverSize","ResizeObserverEntry","ResizeObserver","Request","ReportingObserver","ReportBody","ReadableStreamDefaultReader","ReadableStreamDefaultController","ReadableStreamBYOBRequest","ReadableStreamBYOBReader","ReadableStream","ReadableByteStreamController","Range","RadioNodeList","RTCTrackEvent","RTCStatsReport","RTCSessionDescription","RTCSctpTransport","RTCRtpTransceiver","RTCRtpSender","RTCRtpReceiver","RTCPeerConnectionIceEvent","RTCPeerConnectionIceErrorEvent","RTCPeerConnection","RTCIceTransport","RTCIceCandidate","RTCErrorEvent","RTCError","RTCEncodedVideoFrame","RTCEncodedAudioFrame","RTCDtlsTransport","RTCDataChannelEvent","RTCDTMFToneChangeEvent","RTCDTMFSender","RTCCertificate","PromiseRejectionEvent","ProgressEvent","ProcessingInstruction","PopStateEvent","PointerEvent","PluginArray","Plugin","PictureInPictureWindow","PictureInPictureEvent","Permissions","PermissionStatus","PeriodicWave","PerformanceTiming","PerformanceServerTiming","PerformanceScriptTiming","PerformanceResourceTiming","PerformancePaintTiming","PerformanceObserverEntryList","PerformanceObserver","PerformanceNavigationTiming","PerformanceNavigation","PerformanceMeasure","PerformanceMark","PerformanceLongTaskTiming","PerformanceLongAnimationFrameTiming","PerformanceEventTiming","PerformanceEntry","PerformanceElementTiming","Performance","Path2D","PannerNode","PageTransitionEvent","OverconstrainedError","OscillatorNode","OffscreenCanvasRenderingContext2D","OffscreenCanvas","OfflineAudioContext","OfflineAudioCompletionEvent","Observable","NodeList","NodeIterator","NodeFilter","Node","NetworkInformation","NavigatorUAData","Navigator","NavigationTransition","NavigationPrecommitController","NavigationHistoryEntry","NavigationDestination","NavigationCurrentEntryChangeEvent","NavigationActivation","Navigation","NavigateEvent","NamedNodeMap","MutationRecord","MutationObserver","MouseEvent","MimeTypeArray","MimeType","MessagePort","MessageEvent","MessageChannel","MediaStreamTrackVideoStats","MediaStreamTrackProcessor","MediaStreamTrackGenerator","MediaStreamTrackEvent","MediaStreamTrackAudioStats","MediaStreamTrack","MediaStreamEvent","MediaStreamAudioSourceNode","MediaStreamAudioDestinationNode","MediaStream","MediaSourceHandle","MediaSource","MediaRecorder","MediaQueryListEvent","MediaQueryList","MediaList","MediaError","MediaEncryptedEvent","MediaElementAudioSourceNode","MediaCapabilities","MathMLElement","Location","LayoutShiftAttribution","LayoutShift","LargestContentfulPaint","KeyframeEffect","KeyboardEvent","IntersectionObserverEntry","IntersectionObserver","InterestEvent","InputEvent","InputDeviceInfo","InputDeviceCapabilities","Ink","ImageData","ImageBitmapRenderingContext","ImageBitmap","IdleDeadline","IIRFilterNode","IDBVersionChangeEvent","IDBTransaction","IDBRequest","IDBRecord","IDBOpenDBRequest","IDBObjectStore","IDBKeyRange","IDBIndex","IDBFactory","IDBDatabase","IDBCursorWithValue","IDBCursor","History","HighlightRegistry","Highlight","Headers","HashChangeEvent","HTMLVideoElement","HTMLUnknownElement","HTMLUListElement","HTMLTrackElement","HTMLTitleElement","HTMLTimeElement","HTMLTextAreaElement","HTMLTemplateElement","HTMLTableSectionElement","HTMLTableRowElement","HTMLTableElement","HTMLTableColElement","HTMLTableCellElement","HTMLTableCaptionElement","HTMLStyleElement","HTMLSpanElement","HTMLSourceElement","HTMLSlotElement","HTMLSelectedContentElement","HTMLSelectElement","HTMLScriptElement","HTMLQuoteElement","HTMLProgressElement","HTMLPreElement","HTMLPictureElement","HTMLParamElement","HTMLParagraphElement","HTMLOutputElement","HTMLOptionsCollection","HTMLOptionElement","HTMLOptGroupElement","HTMLObjectElement","HTMLOListElement","HTMLModElement","HTMLMeterElement","HTMLMetaElement","HTMLMenuElement","HTMLMediaElement","HTMLMarqueeElement","HTMLMapElement","HTMLLinkElement","HTMLLegendElement","HTMLLabelElement","HTMLLIElement","HTMLInputElement","HTMLImageElement","HTMLIFrameElement","HTMLHtmlElement","HTMLHeadingElement","HTMLHeadElement","HTMLHRElement","HTMLFrameSetElement","HTMLFrameElement","HTMLFormElement","HTMLFormControlsCollection","HTMLFontElement","HTMLFieldSetElement","HTMLEmbedElement","HTMLElement","HTMLDocument","HTMLDivElement","HTMLDirectoryElement","HTMLDialogElement","HTMLDetailsElement","HTMLDataListElement","HTMLDataElement","HTMLDListElement","HTMLCollection","HTMLCanvasElement","HTMLButtonElement","HTMLBodyElement","HTMLBaseElement","HTMLBRElement","HTMLAudioElement","HTMLAreaElement","HTMLAnchorElement","HTMLAllCollection","GeolocationPositionError","GeolocationPosition","GeolocationCoordinates","Geolocation","GamepadHapticActuator","GamepadEvent","GamepadButton","Gamepad","GainNode","FormDataEvent","FormData","FontFaceSetLoadEvent","FontFaceSet","FontFace","FocusEvent","FileReader","FileList","File","FeaturePolicy","External","EventTarget","EventSource","EventCounts","Event","ErrorEvent","EncodedVideoChunk","EncodedAudioChunk","ElementInternals","Element","EditContext","DynamicsCompressorNode","DragEvent","DocumentType","DocumentTimeline","DocumentFragment","Document","DelegatedInkTrailPresenter","DelayNode","DecompressionStream","DataTransferItemList","DataTransferItem","DataTransfer","DOMTokenList","DOMStringMap","DOMStringList","DOMRectReadOnly","DOMRectList","DOMRect","DOMQuad","DOMPointReadOnly","DOMPoint","DOMParser","DOMMatrixReadOnly","DOMMatrix","DOMImplementation","DOMException","DOMError","CustomStateSet","CustomEvent","CustomElementRegistry","Crypto","CountQueuingStrategy","ConvolverNode","ContentVisibilityAutoStateChangeEvent","ConstantSourceNode","CompressionStream","CompositionEvent","Comment","CommandEvent","CloseWatcher","CloseEvent","ClipboardEvent","CharacterData","CharacterBoundsUpdateEvent","ChannelSplitterNode","ChannelMergerNode","CaretPosition","CanvasRenderingContext2D","CanvasPattern","CanvasGradient","CanvasCaptureMediaStreamTrack","CSSViewTransitionRule","CSSVariableReferenceValue","CSSUnparsedValue","CSSUnitValue","CSSTranslate","CSSTransition","CSSTransformValue","CSSTransformComponent","CSSSupportsRule","CSSStyleValue","CSSStyleSheet","CSSStyleRule","CSSStyleDeclaration","CSSStartingStyleRule","CSSSkewY","CSSSkewX","CSSSkew","CSSScopeRule","CSSScale","CSSRuleList","CSSRule","CSSRotate","CSSPropertyRule","CSSPositionValue","CSSPositionTryRule","CSSPositionTryDescriptors","CSSPerspective","CSSPageRule","CSSNumericValue","CSSNumericArray","CSSNestedDeclarations","CSSNamespaceRule","CSSMediaRule","CSSMatrixComponent","CSSMathValue","CSSMathSum","CSSMathProduct","CSSMathNegate","CSSMathMin","CSSMathMax","CSSMathInvert","CSSMathClamp","CSSMarginRule","CSSLayerStatementRule","CSSLayerBlockRule","CSSKeywordValue","CSSKeyframesRule","CSSKeyframeRule","CSSImportRule","CSSImageValue","CSSGroupingRule","CSSFontPaletteValuesRule","CSSFontFaceRule","CSSCounterStyleRule","CSSContainerRule","CSSConditionRule","CSSAnimation","CSS","CSPViolationReportBody","CDATASection","ByteLengthQueuingStrategy","BrowserCaptureMediaStreamTrack","BroadcastChannel","BlobEvent","Blob","BiquadFilterNode","BeforeUnloadEvent","BeforeInstallPromptEvent","BaseAudioContext","BarProp","AudioWorkletNode","AudioSinkInfo","AudioScheduledSourceNode","AudioProcessingEvent","AudioParamMap","AudioParam","AudioNode","AudioListener","AudioDestinationNode","AudioData","AudioContext","AudioBufferSourceNode","AudioBuffer","Attr","AnimationTimeline","AnimationPlaybackEvent","AnimationEvent","AnimationEffect","Animation","AnalyserNode","AbstractRange","AbortSignal","AbortController","window","self","document","name","location","customElements","history","navigation","locationbar","menubar","personalbar","scrollbars","statusbar","toolbar","status","closed","frames","length","top","opener","parent","frameElement","navigator","origin","external","screen","innerWidth","innerHeight","scrollX","pageXOffset","scrollY","pageYOffset","visualViewport","screenX","screenY","outerWidth","outerHeight","devicePixelRatio","event","clientInformation","offscreenBuffering","screenLeft","screenTop","styleMedia","onsearch","onappinstalled","onbeforeinstallprompt","onabort","onbeforeinput","onbeforematch","onbeforetoggle","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncuechange","ondblclick","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onload","onloadeddata","onloadedmetadata","onloadstart","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onpause","onplay","onplaying","onprogress","onratechange","onreset","onresize","onscroll","onscrollend","onsecuritypolicyviolation","onseeked","onseeking","onselect","onslotchange","onstalled","onsubmit","onsuspend","ontimeupdate","ontoggle","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkittransitionend","onwheel","onauxclick","ongotpointercapture","onlostpointercapture","onpointerdown","onpointermove","onpointerup","onpointercancel","onpointerover","onpointerout","onpointerenter","onpointerleave","onselectstart","onselectionchange","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","ontransitionrun","ontransitionstart","ontransitionend","ontransitioncancel","onbeforexrselect","onafterprint","onbeforeprint","onbeforeunload","onhashchange","onlanguagechange","onmessage","onmessageerror","onoffline","ononline","onpagehide","onpageshow","onpopstate","onrejectionhandled","onstorage","onunhandledrejection","onunload","isSecureContext","crossOriginIsolated","scheduler","performance","trustedTypes","crypto","indexedDB","localStorage","sessionStorage","alert","atob","blur","btoa","cancelAnimationFrame","cancelIdleCallback","captureEvents","clearInterval","clearTimeout","close","confirm","createImageBitmap","fetch","find","focus","getComputedStyle","getSelection","matchMedia","moveBy","moveTo","open","postMessage","print","prompt","queueMicrotask","releaseEvents","reportError","requestAnimationFrame","requestIdleCallback","resizeBy","resizeTo","scroll","scrollBy","scrollTo","setInterval","setTimeout","stop","structuredClone","webkitCancelAnimationFrame","webkitRequestAnimationFrame","Temporal","SuppressedError","DisposableStack","AsyncDisposableStack","Float16Array","chrome","WebAssembly","crashReport","cookieStore","ondevicemotion","ondeviceorientation","ondeviceorientationabsolute","onpointerrawupdate","caches","documentPictureInPicture","sharedStorage","AbsoluteOrientationSensor","Accelerometer","AudioDecoder","AudioEncoder","AudioWorklet","BatteryManager","Cache","CacheStorage","Clipboard","ClipboardChangeEvent","ClipboardItem","CookieChangeEvent","CookieStore","CookieStoreManager","CreateMonitor","Credential","CredentialsContainer","CryptoKey","DeviceMotionEvent","DeviceMotionEventAcceleration","DeviceMotionEventRotationRate","DeviceOrientationEvent","FederatedCredential","GPU","GPUAdapter","GPUAdapterInfo","GPUBindGroup","GPUBindGroupLayout","GPUBuffer","GPUBufferUsage","GPUCanvasContext","GPUColorWrite","GPUCommandBuffer","GPUCommandEncoder","GPUCompilationInfo","GPUCompilationMessage","GPUComputePassEncoder","GPUComputePipeline","GPUDevice","GPUDeviceLostInfo","GPUError","GPUExternalTexture","GPUInternalError","GPUMapMode","GPUOutOfMemoryError","GPUPipelineError","GPUPipelineLayout","GPUQuerySet","GPUQueue","GPURenderBundle","GPURenderBundleEncoder","GPURenderPassEncoder","GPURenderPipeline","GPUSampler","GPUShaderModule","GPUShaderStage","GPUSupportedFeatures","GPUSupportedLimits","GPUTexture","GPUTextureUsage","GPUTextureView","GPUUncapturedErrorEvent","GPUValidationError","GravitySensor","Gyroscope","IdleDetector","ImageCapture","ImageDecoder","ImageTrack","ImageTrackList","Keyboard","KeyboardLayoutMap","LinearAccelerationSensor","MIDIAccess","MIDIConnectionEvent","MIDIInput","MIDIInputMap","MIDIMessageEvent","MIDIOutput","MIDIOutputMap","MIDIPort","MediaDeviceInfo","MediaDevices","MediaKeyMessageEvent","MediaKeySession","MediaKeyStatusMap","MediaKeySystemAccess","MediaKeys","NavigationPreloadManager","NavigatorManagedData","OrientationSensor","PasswordCredential","ProtectedAudience","RelativeOrientationSensor","ScreenDetailed","ScreenDetails","Sensor","SensorErrorEvent","ServiceWorkerRegistration","StorageManager","SubtleCrypto","VideoDecoder","VideoEncoder","VirtualKeyboard","WGSLLanguageFeatures","WebTransport","WebTransportBidirectionalStream","WebTransportDatagramDuplexStream","WebTransportError","Worklet","XRDOMOverlayState","XRLayer","XRWebGLBinding","AudioPlaybackStats","AuthenticatorAssertionResponse","AuthenticatorAttestationResponse","AuthenticatorResponse","PublicKeyCredential","CaptureController","CrashReportContext","DevicePosture","DigitalCredential","DocumentPictureInPicture","FetchLaterResult","FileSystemDirectoryHandle","FileSystemFileHandle","FileSystemHandle","FileSystemWritableFileStream","FileSystemObserver","FontData","FragmentDirective","HID","HIDConnectionEvent","HIDDevice","HIDInputReportEvent","IdentityCredential","IdentityCredentialError","IdentityProvider","NavigatorLogin","LanguageDetector","LanguageModel","Lock","LockManager","ServiceWorker","ServiceWorkerContainer","NotRestoredReasonDetails","NotRestoredReasons","OTPCredential","PaymentAddress","PaymentRequest","PaymentRequestUpdateEvent","PaymentResponse","PaymentManager","PaymentMethodChangeEvent","Presentation","PresentationAvailability","PresentationConnection","PresentationConnectionAvailableEvent","PresentationConnectionCloseEvent","PresentationConnectionList","PresentationReceiver","PresentationRequest","PressureObserver","PressureRecord","Serial","SerialPort","SpeechRecognitionPhrase","StorageBucket","StorageBucketManager","Summarizer","Translator","USB","USBAlternateInterface","USBConfiguration","USBConnectionEvent","USBDevice","USBEndpoint","USBInTransferResult","USBInterface","USBIsochronousInTransferPacket","USBIsochronousInTransferResult","USBIsochronousOutTransferPacket","USBIsochronousOutTransferResult","USBOutTransferResult","WakeLock","WakeLockSentinel","XRAnchor","XRAnchorSet","XRBoundedReferenceSpace","XRCPUDepthInformation","XRCamera","XRDepthInformation","XRFrame","XRHand","XRHitTestResult","XRHitTestSource","XRInputSource","XRInputSourceArray","XRInputSourceEvent","XRInputSourcesChangeEvent","XRJointPose","XRJointSpace","XRLightEstimate","XRLightProbe","XRPose","XRRay","XRReferenceSpace","XRReferenceSpaceEvent","XRRenderState","XRRigidTransform","XRSession","XRSessionEvent","XRSpace","XRSystem","XRTransientInputHitTestResult","XRTransientInputHitTestSource","XRView","XRViewerPose","XRViewport","XRWebGLDepthInformation","XRWebGLLayer","XRCompositionLayer","XRProjectionLayer","XRCubeLayer","XRCylinderLayer","XREquirectLayer","XRLayerEvent","XRQuadLayer","XRSubImage","XRWebGLSubImage","XRPlane","XRPlaneSet","XRVisibilityMaskChangeEvent","fetchLater","getScreenDetails","queryLocalFonts","showDirectoryPicker","showOpenFilePicker","showSaveFilePicker","originAgentCluster","viewport","onpageswap","onpagereveal","credentialless","fence","launchQueue","speechSynthesis","onscrollsnapchange","onscrollsnapchanging","ongamepadconnected","ongamepaddisconnected","AnimationTrigger","BackgroundFetchManager","BackgroundFetchRecord","BackgroundFetchRegistration","CSSFontFeatureValuesRule","CSSFunctionDeclarations","CSSFunctionDescriptors","CSSFunctionRule","CSSPseudoElement","ChapterInformation","CropTarget","DocumentPictureInPictureEvent","Fence","FencedFrameConfig","HTMLFencedFrameElement","HTMLGeolocationElement","HTMLUserMediaElement","IntegrityViolationReportBody","InteractionContentfulPaint","PerformanceSoftNavigation","LaunchParams","LaunchQueue","MediaMetadata","MediaSession","Notification","Origin","PageRevealEvent","PageSwapEvent","PerformanceTimingConfidence","PeriodicSyncManager","Profiler","PushManager","PushSubscription","PushSubscriptionOptions","QuotaExceededError","RTCDataChannel","RTCRtpScriptTransform","RemotePlayback","RestrictionTarget","Sanitizer","SharedStorage","SharedStorageWorklet","SharedStorageAppendMethod","SharedStorageClearMethod","SharedStorageDeleteMethod","SharedStorageModifierMethod","SharedStorageSetMethod","SharedWorker","SnapEvent","SpeechGrammar","SpeechGrammarList","SpeechRecognition","SpeechRecognitionErrorEvent","SpeechRecognitionEvent","SpeechSynthesis","SpeechSynthesisErrorEvent","SpeechSynthesisEvent","SpeechSynthesisUtterance","SpeechSynthesisVoice","TimelineTrigger","TimelineTriggerRange","TimelineTriggerRangeList","Viewport","WebSocketError","WebSocketStream","XSLTProcessor","webkitSpeechGrammar","webkitSpeechGrammarList","webkitSpeechRecognition","webkitSpeechRecognitionError","webkitSpeechRecognitionEvent","webkitRequestFileSystem","webkitResolveLocalFileSystemURL"]"#;
+
+/// Переставляет имена окна в браузерный порядок: собственное свойство,
+/// заведённое заново, встаёт в конец, поэтому один проход по списку
+/// выстраивает весь хвост. Идёт последним — после всех слоёв, иначе порядок
+/// снова разъедется.
+pub fn window_order_script() -> String {
+    WINDOW_ORDER_TEMPLATE.replace("__WINDOW_ORDER__", WINDOW_ORDER)
+}
+
+const WINDOW_ORDER_TEMPLATE: &str = r#"(() => {
+  const ORDER = __WINDOW_ORDER__;
+  for (const name of ORDER) {
+    let d;
+    try { d = Object.getOwnPropertyDescriptor(globalThis, name); } catch (e) { continue; }
+    if (!d || !d.configurable) continue;
+    try {
+      delete globalThis[name];
+      Object.defineProperty(globalThis, name, d);
+    } catch (e) {}
+  }
+})();"#;
 
 pub fn late_originals_script() -> String {
     r#"(() => {
@@ -2527,13 +2675,16 @@ const CLONE_TEMPLATE: &str = r##"  // ── Структурное клонир
       return v;
     };
 
-    globalThis.__pt_cloneEncode = (v) => __ptJSON.stringify(encodeValue(v, new Map()));
-    globalThis.__pt_cloneRevive = (v) => reviveValue(v, []);
-    globalThis.__pt_cloneDecode = (text) => {
-      let parsed = null;
-      try { parsed = __ptJSON.parse(text); } catch (e) { return null; }
-      return reviveValue(parsed, []);
-    };
+    Object.defineProperty(globalThis, '__pt_cloneEncode', { value: (v) => __ptJSON.stringify(encodeValue(v, new Map())), writable: true, configurable: true });
+    Object.defineProperty(globalThis, '__pt_cloneRevive', { value: (v) => reviveValue(v, []), writable: true, configurable: true });
+    Object.defineProperty(globalThis, '__pt_cloneDecode', {
+      value: (text) => {
+        let parsed = null;
+        try { parsed = __ptJSON.parse(text); } catch (e) { return null; }
+        return reviveValue(parsed, []);
+      },
+      writable: true, configurable: true,
+    });
   })();
 "##;
 
@@ -3673,7 +3824,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       try { Object.defineProperty(ctor, 'length', { value: 2, configurable: true }); } catch (e) {}
       try { Object.defineProperty(P0, 'constructor', { value: ctor, writable: true, configurable: true }); } catch (e) {}
       globalThis.ImageData = globalThis.__pt_native ? __pt_native(ctor) : ctor;
-      globalThis.__pt_imageDataReal = true;
+      Object.defineProperty(globalThis, '__pt_imageDataReal', { value: true, writable: true, configurable: true });
     }
   } catch (e) {}
 
@@ -3683,7 +3834,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
   try {
     const RO = globalThis.DOMMatrixReadOnly, MM = globalThis.DOMMatrix;
     if (MM && MM.prototype && !globalThis.__pt_matrixReal) {
-      globalThis.__pt_matrixReal = true;
+      Object.defineProperty(globalThis, '__pt_matrixReal', { value: true, writable: true, configurable: true });
       const ST = new WeakMap();
       const ident = () => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
       const stateOf = (o) => { let v = ST.get(o); if (!v) { v = { m: ident(), d2: true }; ST.set(o, v); } return v; };
@@ -4258,7 +4409,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       Object.defineProperty(b, '__ptImageBitmap', { value: { surf, w: w | 0, h: h | 0, closed: false } });
       return b;
     };
-    globalThis.__pt_makeBitmap = makeBitmap;
+    Object.defineProperty(globalThis, '__pt_makeBitmap', { value: makeBitmap, writable: true, configurable: true });
 
     // Снимок из `Blob`: размер читается из заголовка самой картинки, а
     // рисуется она через data-ссылку — тем же путём, что и `<img>`.
@@ -4434,7 +4585,14 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
   // Слои, оформляющие свои прототипы позже нас (аудиоузлы — при создании
   // первого узла), проверяют «не занято ли имя» и уступали бы нашему. Метим
   // объявленное здесь, чтобы такая проверка считала место свободным.
-  const stubs = globalThis.__pt_stubMembers || (globalThis.__pt_stubMembers = new WeakSet());
+  const stubs = globalThis.__pt_stubMembers || (() => {
+    const w = new WeakSet();
+    // Служебное имя движка не должно попадать в перечисление окна: обычное
+    // присваивание кладёт перечислимое свойство, и `for…in` у страницы
+    // показывал наши имена наравне со своими.
+    Object.defineProperty(globalThis, '__pt_stubMembers', { value: w, writable: true, configurable: true });
+    return w;
+  })();
   const named = (f, n) => {
     try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {}
     try { stubs.add(f); } catch (e) {}

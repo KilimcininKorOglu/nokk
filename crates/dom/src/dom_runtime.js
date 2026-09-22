@@ -4323,20 +4323,30 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         enumerable: true, configurable: true,
       });
     } catch (e) {}
-    // Номерные свойства окна: браузер держит их столько, сколько кадров.
-    // Отдаём их через ловушку на чтение — перечисление и `length` уже есть.
+    // Номерные свойства окна: браузер держит ровно столько, сколько кадров,
+    // и держит их значениями — не переписываемыми, перечислимыми. У нас
+    // стояло шестнадцать акцессоров всегда, и страница без единого кадра
+    // показывала шестнадцать номеров, которых у браузера нет.
     globalThis.__pt_frameAt = (i) => {
       const els = frameEls();
       return i >= 0 && i < els.length ? windowOf(els[i]) : undefined;
     };
-    for (let i = 0; i < 16; i++) {
-      try {
-        Object.defineProperty(globalThis, String(i), {
-          get: () => globalThis.__pt_frameAt(i),
-          enumerable: false, configurable: true,
-        });
-      } catch (e) {}
-    }
+    let __slots = 0;
+    const __syncSlots = () => {
+      const n = frameEls().length;
+      for (let i = 0; i < n; i++) {
+        try {
+          Object.defineProperty(globalThis, String(i), {
+            value: globalThis.__pt_frameAt(i),
+            writable: false, enumerable: true, configurable: true,
+          });
+        } catch (e) {}
+      }
+      for (let i = n; i < __slots; i++) { try { delete globalThis[String(i)]; } catch (e) {} }
+      __slots = n;
+    };
+    globalThis.__pt_syncFrameSlots = __syncSlots;
+    __syncSlots();
   }
 
   globalThis.__pt_writeDocument = (html) => {
@@ -4551,7 +4561,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   let __mouseDownEl = null;
   let __hoverEl = null; // element the pointer is currently over
 
-  function __markDirty() { __layoutSeq++; }
+  function __markDirty() {
+    __layoutSeq++;
+    // Номерные свойства окна ходят за кадрами: их ровно столько, сколько
+    // рамок в дереве, и правка дерева их меняет.
+    if (globalThis.__pt_syncFrameSlots) { try { __pt_syncFrameSlots(); } catch (e) {} }
+  }
 
   // --- MutationObserver ---------------------------------------------------
   // A stub that never fires is worse than none: a page waiting on a mutation

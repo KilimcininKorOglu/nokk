@@ -442,9 +442,12 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
     // И последним — снимок методов, которыми движок пользуется сам: он должен
     // лечь поверх всех слоёв, но раньше любого скрипта страницы.
     let base = format!(
-        "{base}\n{}\n{}",
+        "{base}\n{}\n{}\n{}",
         nokk_stealth::late_interfaces_script(),
-        nokk_stealth::late_originals_script()
+        nokk_stealth::late_originals_script(),
+        // Порядок имён окна — последним: перечисление отдаёт их в порядке
+        // заведения, и всякий слой, заводящий своё имя, этот порядок сдвигает.
+        nokk_stealth::window_order_script(),
     );
     // Diagnostic only, and last so it wraps a finished surface. Reading
     // `__pt_probeLog()` afterwards says what the page asked us and what we said.
@@ -8919,7 +8922,9 @@ mod tests {
         assert_eq!(out["unknown"], true, "a fallback is always there, so any family checks out");
         assert_eq!(out["bad"], "SyntaxError");
         assert_eq!(out["iterable"], 0);
-        assert_eq!(out["global"], "undefined");
+        // Имя на окне у браузера есть: `FontFaceSet` лежит рядом с
+        // `FontFaceSetLoadEvent`, и `document.fonts` — его экземпляр.
+        assert_eq!(out["global"], "function");
         assert_eq!(out["locks"], "[object LockManager]");
         assert_eq!(out["lockMembers"], serde_json::json!(["query", "request"]));
     }

@@ -350,7 +350,16 @@ impl Isolate {
             // Крючок динамического импорта видит только область; чтобы он знал,
             // в каком контексте спросили, контекст носит свой номер под
             // `__pt`-именем — такие имена перечисление не показывает.
-            let _ = run_script(scope, &format!("globalThis.__pt_ctxIndex = {index};"));
+            // Заводится невидимым: обычное присваивание кладёт на окно
+            // перечислимое свойство, и `for…in` у страницы показывал наше
+            // служебное имя наравне со своими.
+            let _ = run_script(
+                scope,
+                &format!(
+                    "Object.defineProperty(globalThis, '__pt_ctxIndex', \
+                     {{ value: {index}, writable: true, configurable: true }});"
+                ),
+            );
             global
         };
         self.contexts.push(Some(global));
