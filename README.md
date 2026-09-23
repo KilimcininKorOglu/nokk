@@ -218,7 +218,9 @@ Verified end-to-end against a plain Cloudflare interstitial
 
 A clearance expires, and a page that still shows the gate otherwise looks like an
 ordinary load. `--fail-on-challenge` makes that a question a script can ask: nokk says
-why the gate is still up and exits with code 3, which is the cue to re-harvest.
+why the gate is still up and exits with code 3, which is the cue to re-harvest. (Don't
+trust the cookie's own `expires` — it reads a year out, while Cloudflare decides validity
+on its side, against the IP and the TLS fingerprint too.)
 
 See [examples/cf-harvester](examples/cf-harvester/) for a scriptable harvester (Python +
 `nodriver`, auto-clicks a managed widget) and the

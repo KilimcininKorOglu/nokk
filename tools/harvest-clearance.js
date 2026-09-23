@@ -91,9 +91,15 @@ const конец = (код) => {
   for (const c of куки) банка[c.name] = c.value;
   fs.writeFileSync(ФАЙЛ, JSON.stringify({ cookies: банка, domain: хост, url: URL_ }, null, 1));
   const имена = куки.map((c) => c.name).join(', ');
+  // Срок в самой куке — год, и верить ему нельзя: годность решает сторона
+  // Cloudflare, а она смотрит ещё на адрес и на отпечаток. Печатаем как есть,
+  // но живой замок или нет — отвечает движок (`--fail-on-challenge`).
+  const срокЗамка = замок && замок.expires > 0
+    ? `, в куке до ${new Date(замок.expires * 1000).toISOString().replace('T', ' ').slice(0, 19)}`
+    : '';
   process.stdout.write(
     `кук с ${корень}: ${куки.length} (${имена})\n`
-    + (замок ? `cf_clearance: ${замок.value.slice(0, 32)}… → ${ФАЙЛ}\n`
+    + (замок ? `cf_clearance: ${замок.value.slice(0, 32)}…${срокЗамка} → ${ФАЙЛ}\n`
              : `cf_clearance не появился за ${СРОК / 1000} с — в файле только остальные куки\n`),
     () => конец(замок ? 0 : 1),
   );
