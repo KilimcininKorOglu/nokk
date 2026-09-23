@@ -570,6 +570,20 @@
     } catch (e) {}
   };
 
+  // Событие фокуса: у браузера это `FocusEvent` со вторым участником и с
+  // доверием — его шлёт он сам, даже когда фокус попросили из скрипта.
+  const __ptFocusEvent = (type, related, bubbles) => {
+    const C = globalThis.FocusEvent || globalThis.Event;
+    let ev;
+    try { ev = new C(type, { bubbles: !!bubbles, cancelable: false, relatedTarget: related || null }); }
+    catch (e) { ev = new Event(type, { bubbles: !!bubbles }); }
+    if (!('relatedTarget' in ev)) {
+      try { Object.defineProperty(ev, 'relatedTarget', { value: related || null, enumerable: true, configurable: true }); }
+      catch (e) {}
+    }
+    return __ptTrust(ev);
+  };
+
   const __ptEvSet = (ev, key, value) => {
     if (!ev) return;
     if (ev.__ptE) { ev.__ptE[key] = value; return; }
@@ -1364,16 +1378,28 @@
       const doc = this.ownerDocument || globalThis.document;
       if (!doc || doc.activeElement === this) return;
       const prev = doc.activeElement;
-      if (prev && prev !== doc.body && prev.dispatchEvent) prev.dispatchEvent(new Event('blur'));
+      // Порядок у браузера такой: `blur` и `focusout` на прежнем, потом `focus`
+      // и `focusin` на новом; у каждого — второй участник в `relatedTarget`.
+      // Событие шлёт сам браузер, поэтому `isTrusted` у него истина, даже когда
+      // фокус попросили из скрипта. У нас были два события из четырёх, без
+      // `relatedTarget` и недоверенные — а это читают.
+      if (prev && prev !== doc.body && prev.dispatchEvent) {
+        prev.dispatchEvent(__ptFocusEvent('blur', this));
+        prev.dispatchEvent(__ptFocusEvent('focusout', this, true));
+      }
       doc.__ptActive = this;
-      this.dispatchEvent(new Event('focus'));
-      this.dispatchEvent(new Event('focusin', { bubbles: true }));
+      // Тело — это «фокуса ни на ком»: у браузера в `relatedTarget` тогда
+      // пусто, а не сам `<body>`.
+      const откуда = prev && prev !== doc.body ? prev : null;
+      this.dispatchEvent(__ptFocusEvent('focus', откуда));
+      this.dispatchEvent(__ptFocusEvent('focusin', откуда, true));
     }
     blur() {
       const doc = this.ownerDocument || globalThis.document;
       if (!doc || doc.activeElement !== this) return;
       doc.__ptActive = doc.body || null;
-      this.dispatchEvent(new Event('blur'));
+      this.dispatchEvent(__ptFocusEvent('blur', null));
+      this.dispatchEvent(__ptFocusEvent('focusout', null, true));
     }
     // Form-field value (reflects the `value` attribute until edited). Generic so
     // input/textarea typing works; harmless on other elements.

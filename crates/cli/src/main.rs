@@ -1241,15 +1241,25 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                             : (o && o.localName) || (o && o.constructor && o.constructor.name) || '?';
                         } catch (e) { return '?'; }
                       };
+                      const ВВОД0 = /^(pointer|mouse|touch|key|wheel|scroll|focus|blur|visibilitychange|selectionchange|devicemotion|deviceorientation)/;
                       ET.addEventListener = асНатив(function (type, fn, opts) {
-                        if (__ptЧужой() && (globalThis.__ptПодписки = (globalThis.__ptПодписки || 0) + 1) < 60) {
-                          console.error('[слушает] ' + кто(this) + ' ' + String(type));
+                        if ((__ptЧужой() || ВВОД0.test(String(type)))
+                            && (globalThis.__ptПодписки = (globalThis.__ptПодписки || 0) + 1) < 80) {
+                          console.error('[слушает] ' + (__ptЧужой() ? 'кадр ' : 'страница ')
+                                + кто(this) + ' ' + String(type));
                         }
                         return AL.apply(this, arguments);
                       }, AL);
+                      // Сводку о вводе собирает страница (api.js) и пересылает в
+                      // кадр сообщением; поэтому ввод смотрим и на странице —
+                      // но только его, иначе лента тонет.
+                      const ВВОД = /^(pointer|mouse|touch|key|wheel|scroll|focus|blur|visibilitychange|selectionchange|devicemotion|deviceorientation)/;
                       ET.dispatchEvent = асНатив(function (ev) {
-                        if (__ptЧужой() && (globalThis.__ptСобытий = (globalThis.__ptСобытий || 0) + 1) < 80) {
-                          console.error('[событие] ' + кто(this) + ' ' + String(ev && ev.type)
+                        const тип = String((ev && ev.type) || '');
+                        const свой = __ptЧужой();
+                        if ((свой || ВВОД.test(тип))
+                            && (globalThis.__ptСобытий = (globalThis.__ptСобытий || 0) + 1) < 120) {
+                          console.error('[событие] ' + (свой ? 'кадр ' : 'страница ') + кто(this) + ' ' + тип
                                 + ' доверено=' + !!(ev && ev.isTrusted));
                         }
                         return DE.apply(this, arguments);

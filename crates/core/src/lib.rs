@@ -7280,6 +7280,49 @@ mod tests {
         assert_eq!(box_of("empty"), vec![0.0, 0.0, 0.0, 0.0], "у пустого текста рамки нет");
     }
 
+    /// Фокус у браузера — четыре события, а не два: `blur` и `focusout` на
+    /// прежнем, `focus` и `focusin` на новом, у каждого второй участник в
+    /// `relatedTarget`. Шлёт их сам браузер, поэтому они доверены, даже когда
+    /// фокус попросили из скрипта. Тело — это «ни на ком»: в `relatedTarget`
+    /// тогда пусто.
+    #[tokio::test]
+    async fn focus_moves_the_way_a_browser_moves_it() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><body><input id=a><input id=b><script>
+              globalThis.__лог = [];
+              for (const t of ['focus', 'blur', 'focusin', 'focusout']) {
+                for (const id of ['a', 'b']) {
+                  document.getElementById(id).addEventListener(t, (e) => {
+                    __лог.push([id, t, e.isTrusted, e.relatedTarget ? e.relatedTarget.id : null,
+                                Object.prototype.toString.call(e), e.bubbles]);
+                  });
+                }
+              }
+              document.getElementById('a').focus();
+              document.getElementById('b').focus();
+            </script></body></html>"#,
+        )
+        .await
+        .unwrap();
+        let out = probe(&ctx, "__ptJSON.stringify(globalThis.__лог)").await;
+        assert_eq!(
+            out,
+            serde_json::json!([
+                ["a", "focus", true, null, "[object FocusEvent]", false],
+                ["a", "focusin", true, null, "[object FocusEvent]", true],
+                ["a", "blur", true, "b", "[object FocusEvent]", false],
+                ["a", "focusout", true, "b", "[object FocusEvent]", true],
+                ["b", "focus", true, "a", "[object FocusEvent]", false],
+                ["b", "focusin", true, "a", "[object FocusEvent]", true],
+            ]),
+            "порядок, доверие и второй участник"
+        );
+    }
+
     /// События жизненного цикла приходят от движка, а движок здесь — браузер:
     /// у настоящих `isTrusted` истина, и читают это первой же строкой. Плюс те
     /// два, которых у нас не было вовсе: `readystatechange` на каждом шаге
