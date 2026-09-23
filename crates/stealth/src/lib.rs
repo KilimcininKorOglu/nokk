@@ -1323,7 +1323,13 @@ const TRACER_TEMPLATE: &str = r##"(() => {
   globalThis.__pt_probeTail = (n) => __ptJSON.stringify(tail.slice(-(n || 60)));
   // Метка в самой ленте: без неё непонятно, где начинается и где обрывается
   // чужая программа, а сравнивать надо именно её отрезок.
-  globalThis.__pt_probeMark = (text) => { note('== ' + text, ''); };
+  globalThis.__pt_probeMark = (text) => {
+    note('== ' + text, '');
+    // Снимок хвоста на метке: лента головы к этому времени переполнена, а
+    // нужен как раз отрезок перед событием — что прочитали последним, прежде
+    // чем отправить.
+    try { globalThis.__pt_atMark = __ptJSON.stringify(tail.slice(-400)); } catch (e) {}
+  };
   globalThis.__pt_probeHead = (n) => __ptJSON.stringify(head.slice(0, n || 40000));
 
   const native = globalThis.__pt_native || ((f) => f);
@@ -9371,9 +9377,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     }
     __ptFire(type, extra) {
       const ev = Object.assign({ type, target: this, currentTarget: this, isTrusted: true }, extra || {});
-      const on = this['on' + type];
-      if (typeof on === 'function') { try { on.call(this, ev); } catch (e) {} }
-      try { this.dispatchEvent(ev); } catch (e) {}
+      // Одна доставка, а не две: `dispatchEvent` сам зовёт и слушателей, и
+      // `on<событие>`. Пока звали обоих, каждый кандидат приходил дважды, и
+      // состояние сбора менялось дважды — у браузера так не бывает, а тот,
+      // кто считает кандидатов, считает именно события.
+      try { this.dispatchEvent(ev); } catch (e) {
+        const on = this['on' + type];
+        if (typeof on === 'function') { try { on.call(this, ev); } catch (e2) {} }
+      }
     }
     __ptSdp(kind) {
       const st = this.__pt;
@@ -9388,6 +9399,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         + 'a=ice-options:trickle\r\na=fingerprint:sha-256 ' + st.print + '\r\n'
         + 'a=setup:' + (kind === 'offer' ? 'actpass' : 'active') + '\r\n'
         + 'a=mid:' + mid[0] + '\r\na=sctp-port:5000\r\na=max-message-size:262144\r\n';
+      // Предложение у браузера кончается переводом строки — он уже есть выше;
+      // отдельной строкой это отмечено, чтобы правка не съела его случайно.
     }
     createDataChannel(label, opts) {
       const st = this.__pt;
@@ -9434,19 +9447,47 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // ждёт кандидата в обработчике, обязан успеть подписаться.
       setTimeout(() => {
         if (st_.closed) return;
-        const foundation = String(Math.floor(Math.random() * 4000000000));
-        const port = 50000 + Math.floor(Math.random() * 15000);
-        const line = 'candidate:' + foundation + ' 1 udp 2113937151 ' + st_.mdns + ' ' + port
-          + ' typ host generation 0 ufrag ' + st_.ufrag + ' network-cost 999';
-        self.__ptFire('icecandidate', {
-          candidate: {
-            candidate: line, sdpMid: (st_.mids[0] || '0'), sdpMLineIndex: 0,
-            foundation, component: 'rtp', protocol: 'udp', priority: 2113937151,
-            address: st_.mdns, port, type: 'host', usernameFragment: st_.ufrag,
-            relatedAddress: null, relatedPort: null, tcpType: null,
-            toJSON() { return { candidate: line, sdpMid: this.sdpMid, sdpMLineIndex: 0, usernameFragment: this.usernameFragment }; },
-          },
-        });
+        // Кандидатов у браузера два: хост по IPv4 и хост по IPv6. У каждого своё
+        // имя `.local` (mDNS прячет настоящий адрес), свой порт, своя основа и
+        // свой вес — 2113937151 у первого, 2113939711 у второго. Мы слали один
+        // и тот же дважды, и это видно всякому, кто их считает.
+        const uuid = () => {
+          const h = (n) => Array.from({ length: n }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('');
+          return h(8) + '-' + h(4) + '-4' + h(3) + '-' + '89ab'[Math.floor(Math.random() * 4)] + h(3) + '-' + h(12);
+        };
+        const пара = [
+          { prio: 2113937151, mdns: st_.mdns },
+          { prio: 2113939711, mdns: uuid() + '.local' },
+        ];
+        for (const { prio, mdns } of пара) {
+          const foundation = String(Math.floor(Math.random() * 4000000000));
+          const port = 40000 + Math.floor(Math.random() * 20000);
+          const line = 'candidate:' + foundation + ' 1 udp ' + prio + ' ' + mdns + ' ' + port
+            + ' typ host generation 0 ufrag ' + st_.ufrag + ' network-cost 999';
+          // Собранный кандидат браузер вписывает и в само предложение — сразу
+          // за строкой `c=`, и без `ufrag`, в отличие от события. У нас
+          // `localDescription` оставался без кандидатов вовсе.
+          try {
+            const вSdp = 'a=candidate:' + foundation + ' 1 udp ' + prio + ' ' + mdns + ' ' + port
+              + ' typ host generation 0 network-cost 999';
+            const было = self.localDescription;
+            if (было && typeof было.sdp === 'string') {
+              const sdp = было.sdp.replace('a=ice-ufrag:', вSdp + '\r\na=ice-ufrag:');
+              const стало = { type: было.type, sdp, toJSON() { return { type: this.type, sdp: this.sdp }; } };
+              __pt_write(self, 'localDescription', стало);
+              __pt_write(self, 'currentLocalDescription', стало);
+            }
+          } catch (e) {}
+          self.__ptFire('icecandidate', {
+            candidate: {
+              candidate: line, sdpMid: (st_.mids[0] || '0'), sdpMLineIndex: 0,
+              foundation, component: 'rtp', protocol: 'udp', priority: prio,
+              address: mdns, port, type: 'host', usernameFragment: st_.ufrag,
+              relatedAddress: null, relatedPort: null, tcpType: null,
+              toJSON() { return { candidate: line, sdpMid: this.sdpMid, sdpMLineIndex: 0, usernameFragment: this.usernameFragment }; },
+            },
+          });
+        }
         setTimeout(() => {
           if (st_.closed) return;
           __pt_write(self, 'iceGatheringState', 'complete');

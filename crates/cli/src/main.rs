@@ -453,6 +453,13 @@ async fn main() -> Result<()> {
                         // Тело первого POST — то, что уходит до программы. У нас оно
                         // на полсотни знаков короче хромовского, и разница видна только
                         // текстом.
+                        // Метка в ленте наблюдателя: всё, что прочитано до неё, и
+                        // есть то, из чего собрано тело первого POST.
+                        if (/\/cdn-cgi\/challenge-platform\//.test(this.__ptU || '') && b && b.length > 1000
+                            && !globalThis.__ptMarked) {
+                          globalThis.__ptMarked = 1;
+                          try { globalThis.__pt_probeMark && __pt_probeMark('первый POST ' + b.length); } catch (e) {}
+                        }
                         if (/\/cdn-cgi\/challenge-platform\//.test(this.__ptU || '') && b && b.length > 1000
                             && b.length < 20000 && !globalThis.__ptFirstBody) {
                           globalThis.__ptFirstBody = 1;
@@ -2216,6 +2223,32 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                             for row in rows {
                                 eprintln!("#   {:>6}ms {} -> {}", row[0].as_i64().unwrap_or(0),
                                           row[1].as_str().unwrap_or(""), row[2].as_str().unwrap_or(""));
+                            }
+                        }
+                    }
+                }
+            }
+            // Снимок ленты на метке: что читали последним перед отправкой.
+            for slot in ctx.frame_list().iter().map(|f| Some(f.id)).chain(std::iter::once(None)) {
+                let expr = "globalThis.__pt_atMark || ''";
+                let out = match slot {
+                    None => ctx.evaluate(expr).await,
+                    Some(id) => ctx.evaluate_in_frame(id, expr).await,
+                };
+                if let Ok(serde_json::Value::String(text)) = out {
+                    if let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
+                        if !rows.is_empty() {
+                            let label = slot
+                                .map(|i| format!("frame {i}"))
+                                .unwrap_or_else(|| "page".to_string());
+                            eprintln!("# mark {label}: {} rows", rows.len());
+                            for row in rows {
+                                eprintln!(
+                                    "#М {:>6}ms {} -> {}",
+                                    row[0].as_i64().unwrap_or(0),
+                                    row[1].as_str().unwrap_or(""),
+                                    row[2].as_str().unwrap_or("")
+                                );
                             }
                         }
                     }
