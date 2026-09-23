@@ -7280,6 +7280,42 @@ mod tests {
         assert_eq!(box_of("empty"), vec![0.0, 0.0, 0.0, 0.0], "у пустого текста рамки нет");
     }
 
+    /// События жизненного цикла приходят от движка, а движок здесь — браузер:
+    /// у настоящих `isTrusted` истина, и читают это первой же строкой. Плюс те
+    /// два, которых у нас не было вовсе: `readystatechange` на каждом шаге
+    /// готовности и `pageshow` следом за `load`.
+    #[tokio::test]
+    async fn the_lifecycle_events_are_trusted_like_a_browsers() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><body><script>
+              globalThis.__итог = {};
+              document.addEventListener('readystatechange', (e) => {
+                __итог['готовность:' + document.readyState] = e.isTrusted;
+              });
+              document.addEventListener('DOMContentLoaded', (e) => { __итог.dcl = e.isTrusted; });
+              window.addEventListener('DOMContentLoaded', (e) => { __итог.dclОкно = e.isTrusted; });
+              window.addEventListener('load', (e) => { __итог.load = e.isTrusted; });
+              document.addEventListener('load', (e) => { __итог.loadДокумент = e.isTrusted; });
+              window.addEventListener('pageshow', (e) => {
+                __итог.pageshow = e.isTrusted; __итог.persisted = e.persisted;
+              });
+            </script></body></html>"#,
+        )
+        .await
+        .unwrap();
+        let out = probe(&ctx, "__ptJSON.stringify(globalThis.__итог)").await;
+        for key in ["dcl", "dclОкно", "load", "loadДокумент", "pageshow"] {
+            assert_eq!(out[key], true, "{key} должно быть доверенным: {out}");
+        }
+        assert_eq!(out["готовность:interactive"], true, "{out}");
+        assert_eq!(out["готовность:complete"], true, "{out}");
+        assert_eq!(out["persisted"], false, "обычная загрузка, не возврат: {out}");
+    }
+
     // Вид описания у члена интерфейса читается одной строкой, и обход графа у
     // челленджа читает его именно так. У браузера свойство интерфейса — это
     // акцессор (у доступных на запись есть и установщик), метод — перечислимое

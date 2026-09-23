@@ -4425,8 +4425,16 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   // Called after all page scripts have run: fire DOMContentLoaded then load.
   globalThis.__pt_finishLoad = () => {
-    document.__ptReady = 'interactive';
-    const dcl = new Event('DOMContentLoaded', { bubbles: true });
+    // Смена готовности видна страницам: `readystatechange` браузер шлёт на
+    // каждом шаге, и слушают его наравне с `DOMContentLoaded`.
+    const готовность = (v) => {
+      document.__ptReady = v;
+      try { document.dispatchEvent(__ptTrust(new Event('readystatechange'))); } catch (e) {}
+    };
+    готовность('interactive');
+    // События жизненного цикла приходят от движка, а движок здесь — браузер:
+    // у настоящего `e.isTrusted` истина, и это читают первой же строкой.
+    const dcl = __ptTrust(new Event('DOMContentLoaded', { bubbles: true }));
     document.dispatchEvent(dcl);
     // Событие всплывает с документа на окно, и слушают его чаще именно там:
     // `window.addEventListener('DOMContentLoaded', …)` — так api.js Turnstile
@@ -4438,11 +4446,20 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         globalThis.dispatchEvent(dcl);
       }
     } catch (e) {}
-    document.__ptReady = 'complete';
-    const load = new Event('load');
+    готовность('complete');
+    const load = __ptTrust(new Event('load'));
     globalThis.dispatchEvent && globalThis.dispatchEvent(load);
     // `load` в браузере доходит и до документа, и до тела.
-    try { document.dispatchEvent(new Event('load')); } catch (e) {}
+    try { document.dispatchEvent(__ptTrust(new Event('load'))); } catch (e) {}
+    // `pageshow` идёт следом за `load` — с `persisted: false` у обычной
+    // загрузки. Его слушают те, кто отличает переход «назад» от свежей
+    // загрузки; у нас его не было вовсе.
+    try {
+      const ps = __ptTrust(new Event('pageshow'));
+      try { Object.defineProperty(ps, 'persisted', { value: false, enumerable: true, configurable: true }); }
+      catch (e) {}
+      globalThis.dispatchEvent && globalThis.dispatchEvent(ps);
+    } catch (e) {}
   };
 
   // window is an EventTarget too.

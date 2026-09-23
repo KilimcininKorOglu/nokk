@@ -1226,6 +1226,56 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                         }, B);
                       }
                     } catch (e) {}
+                    // Какие события челлендж слушает и какие до него доходят.
+                    // Он держит их список и отправляет сводкой; у Chrome к
+                    // первой отправке этот список пуст, у нас — нет, и тогда
+                    // видно, что движок сам что-то присылает.
+                    try {
+                      const ET = EventTarget.prototype;
+                      const AL = ET.addEventListener;
+                      const DE = ET.dispatchEvent;
+                      const кто = (o) => {
+                        try {
+                          return o === globalThis ? 'окно'
+                            : (o && o.nodeType === 9) ? 'документ'
+                            : (o && o.localName) || (o && o.constructor && o.constructor.name) || '?';
+                        } catch (e) { return '?'; }
+                      };
+                      ET.addEventListener = асНатив(function (type, fn, opts) {
+                        if (__ptЧужой() && (globalThis.__ptПодписки = (globalThis.__ptПодписки || 0) + 1) < 60) {
+                          console.error('[слушает] ' + кто(this) + ' ' + String(type));
+                        }
+                        return AL.apply(this, arguments);
+                      }, AL);
+                      ET.dispatchEvent = асНатив(function (ev) {
+                        if (__ptЧужой() && (globalThis.__ptСобытий = (globalThis.__ptСобытий || 0) + 1) < 80) {
+                          console.error('[событие] ' + кто(this) + ' ' + String(ev && ev.type)
+                                + ' доверено=' + !!(ev && ev.isTrusted));
+                        }
+                        return DE.apply(this, arguments);
+                      }, DE);
+                    } catch (e) {}
+
+                    // Откуда челлендж зовёт `isFinite` перед первой отправкой: у
+                    // Chrome этих вызовов нет вовсе, у нас три десятка — значит
+                    // его код идёт другой веткой, и стек покажет какой.
+                    try {
+                      const IF = globalThis.isFinite;
+                      let счёт = 0;
+                      globalThis.isFinite = асНатив(function (x) {
+                        if (__ptЧужой() && счёт < 6) {
+                          счёт++;
+                          let стек = '';
+                          try {
+                            стек = String(new Error().stack || '').split('\n').slice(1, 5)
+                              .map((l) => l.trim()).join(' | ');
+                          } catch (e) {}
+                          console.error('[конечно ' + счёт + '] ' + x + ' ← ' + стек.slice(0, 260));
+                        }
+                        return IF.call(this, x);
+                      }, IF);
+                    } catch (e) {}
+
                     // Открытый текст первого POST. Он не проходит ни через
                     // `TextEncoder`, ни через `JSON.stringify` — его сжимают, а
                     // сжатие читает строку по знакам. Заметка стоит на самом

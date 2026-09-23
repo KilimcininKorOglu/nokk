@@ -64,6 +64,15 @@ const HOOK = `(() => {
         if (/\\/cdn-cgi\\/challenge-platform\\//.test(this.__u || '') && b && b.length > 1000
             && b.length < 20000 && !globalThis.__ptFirstBody) {
           globalThis.__ptFirstBody = 1;
+          // Вектор чисел, собранный к этому мигу: дальше он продолжится уже
+          // сбором отчёта, а сравнивать надо то, что ушло первым.
+          try {
+            const ряд = globalThis.__ptЧисла || [];
+            const s1 = JSON.stringify(ряд);
+            for (let q = 0; q < s1.length; q += 250) {
+              console.log('[числа ' + ряд.length + ':' + (q / 250) + '] ' + s1.slice(q, q + 250));
+            }
+          } catch (e) {}
           const s0 = String(b);
           for (let q = 0; q < s0.length; q += 250) {
             console.log('[ПЕРВЫЙ ' + s0.length + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
@@ -87,6 +96,44 @@ const HOOK = `(() => {
   // Отчёт целиком — то же, что печатает NOKK_DUMP_REPORT=1 у нас. Их
   // сериализация идёт через склейку массива, поэтому здесь виден текст до
   // сжатия и шифрования.
+  // Числа, которые челлендж проверяет перед отправкой. Он прогоняет весь
+  // собранный вектор через isFinite, и это единственное место, где значения
+  // видны по одному — тело уже шифр. Тот же ряд движок печатает своим
+  // наблюдателем (NOKK_TRACE_PROBES), и вектора сравниваются напрямую.
+  try {
+    const чужой = () => { try { return /challenges\\.cloudflare/.test(location.host); } catch (e) { return false; } };
+    const IF = globalThis.isFinite;
+    const ряд = [];
+    globalThis.__ptЧисла = ряд;
+    const нат = (f, src) => {
+      try {
+        Object.defineProperty(f, 'name', { value: src.name, configurable: true });
+        Object.defineProperty(f, 'length', { value: src.length, configurable: true });
+      } catch (e) {}
+      return f;
+    };
+    globalThis.isFinite = нат(function (x) {
+      if (чужой() && ряд.length < 4000) ряд.push(typeof x === 'number' ? x : String(x).slice(0, 20));
+      return IF.call(this, x);
+    }, IF);
+    if (чужой()) console.log('[числа] крючок стоит');
+    // Ряд печатается, когда уходит первый POST: дальше он продолжается уже
+    // другим — сбором отчёта.
+    const S = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = нат(function (b) {
+      try {
+        if (чужой() && b && b.length > 1000 && b.length < 20000 && !globalThis.__ptЧислаВыданы) {
+          globalThis.__ptЧислаВыданы = 1;
+          const s0 = JSON.stringify(ряд);
+          for (let q = 0; q < s0.length; q += 250) {
+            console.log('[числа ' + ряд.length + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
+          }
+        }
+      } catch (e) {}
+      return S.apply(this, arguments);
+    }, S);
+  } catch (e) {}
+
   // Открытый текст, который читают знак за знаком: сжатие и разбор стека идут
   // именно так. Заметка на самом горячем месте языка, поэтому проверка
   // короткая — только нулевой знак и только в кадре челленджа.
@@ -618,7 +665,7 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker|count|бросок|время|первые|исходник)\]|^\[[jPC]\d* |^\[cs\]|^\[ПЕРВЫЙ |^\[svg\]|^\[хвост |^\[parts|^\[звук |^\[json |^\[btoa |^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
+      if (/^\[(send|hook|hookerr|blob|worker|count|бросок|время|первые|исходник|числа)\]|^\[[jPC]\d* |^\[cs\]|^\[ПЕРВЫЙ |^\[svg\]|^\[хвост |^\[parts|^\[звук |^\[json |^\[btoa |^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
         lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
     }
     // Крючок мог и не встать: у внедрения ошибка видна только так, а без неё
