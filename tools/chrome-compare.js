@@ -87,6 +87,36 @@ const HOOK = `(() => {
   // Отчёт целиком — то же, что печатает NOKK_DUMP_REPORT=1 у нас. Их
   // сериализация идёт через склейку массива, поэтому здесь виден текст до
   // сжатия и шифрования.
+  // Открытый текст, который читают знак за знаком: сжатие и разбор стека идут
+  // именно так. Заметка на самом горячем месте языка, поэтому проверка
+  // короткая — только нулевой знак и только в кадре челленджа.
+  try {
+    const чужой = () => { try { return /challenges\\.cloudflare/.test(location.host); } catch (e) { return false; } };
+    const CCA = String.prototype.charCodeAt;
+    const видели = Object.create(null);
+    const нат = (f, src) => {
+      try {
+        Object.defineProperty(f, 'name', { value: src.name, configurable: true });
+        Object.defineProperty(f, 'length', { value: src.length, configurable: true });
+      } catch (e) {}
+      return f;
+    };
+    String.prototype.charCodeAt = нат(function (i) {
+      if (i === 0 && this.length > 300 && this.length < 40000 && чужой()) {
+        const n = this.length;
+        if (!видели[n] && Object.keys(видели).length < 30) {
+          видели[n] = 1;
+          const s0 = String(this);
+          console.log('[исходник ' + n + '] ' + Math.round(performance.now()) + 'мс');
+          for (let q = 0; q < s0.length; q += 250) {
+            console.log('[исходник ' + n + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
+          }
+        }
+      }
+      return CCA.call(this, i);
+    }, CCA);
+  } catch (e) {}
+
   try {
     const J = Array.prototype.join;
     Array.prototype.join = function (sep) {
@@ -588,7 +618,7 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker|count|бросок|время|первые)\]|^\[[jPC]\d* |^\[cs\]|^\[ПЕРВЫЙ |^\[svg\]|^\[хвост |^\[parts|^\[звук |^\[json |^\[btoa |^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
+      if (/^\[(send|hook|hookerr|blob|worker|count|бросок|время|первые|исходник)\]|^\[[jPC]\d* |^\[cs\]|^\[ПЕРВЫЙ |^\[svg\]|^\[хвост |^\[parts|^\[звук |^\[json |^\[btoa |^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
         lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
     }
     // Крючок мог и не встать: у внедрения ошибка видна только так, а без неё

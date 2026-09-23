@@ -1051,6 +1051,29 @@ impl BrowserContext {
         self.eval_at(self.worker, index, source).await
     }
 
+    /// Выполнить скрипт страницы, назвав его своим адресом. Имя уходит в
+    /// `ScriptOrigin`: его видно и в кадрах самого скрипта, и там, где движок
+    /// называет родителя вложенного `eval`/`new Function` — `//# sourceURL`
+    /// второго не даёт, и вместо адреса выходило `unknown source`.
+    async fn eval_named_in(
+        &self,
+        index: usize,
+        source: &str,
+        name: &str,
+    ) -> Result<Value, EngineError> {
+        let source = source.to_string();
+        let name = name.to_string();
+        let out = self
+            .engine
+            .pool
+            .dispatch(self.worker, move |iso| {
+                iso.eval_named(index, &source, Some(name.as_str()))
+            })
+            .await?
+            .map_err(EngineError::Js)?;
+        Ok(Value::String(out))
+    }
+
     /// То же, но в контексте на другом потоке пула. Номера контекстов свои у
     /// каждого изолята, поэтому воркер, живущий не с нами, адресуется только
     /// парой «поток + номер»; [`Self::eval_in`] — этот же вызов для потока
@@ -1168,16 +1191,20 @@ impl BrowserContext {
             }
             // Which script it was, for the log below: an anonymous "a script
             // threw" says nothing on a page that runs forty of them.
-            let mut whose = String::from("inline");
+            // Имя скрипта — его адрес: у внешнего свой, у встроенного адрес
+            // страницы, как у браузера.
+            let mut whose = if base_url.is_empty() {
+                String::from("inline")
+            } else {
+                base_url.to_string()
+            };
             let code = match script {
                 // Встроенный скрипт — тоже скрипт с адресом: в браузере кадры
                 // стека внутри него названы адресом документа, а не пустотой.
                 // Без имени каждый такой кадр читается как `<anonymous>` —
                 // видно всякому, кто разбирает `new Error().stack`, а его
                 // разбирают.
-                nokk_dom::Script::Inline(code) if !base_url.is_empty() => {
-                    format!("{code}\n//# sourceURL={base_url}")
-                }
+                nokk_dom::Script::Inline(code) if !base_url.is_empty() => code.clone(),
                 nokk_dom::Script::Inline(code) => code.clone(),
                 nokk_dom::Script::External(src) => match resolve_url(base_url, src) {
                     Some(abs) => {
@@ -1194,7 +1221,7 @@ impl BrowserContext {
                             // читают, и форма стека — часть отпечатка.
                             Ok((_, code)) => {
                                 whose = abs.clone();
-                                format!("{code}\n//# sourceURL={abs}")
+                                code
                             }
                             Err(e) => {
                                 tracing::warn!(url = %abs, error = %e, "external script fetch failed");
@@ -1215,7 +1242,7 @@ impl BrowserContext {
             let _ = self
                 .eval_in(index, &format!("__pt_beginScript({idx})"))
                 .await;
-            if let Err(e) = self.eval_in(index, &code).await {
+            if let Err(e) = self.eval_named_in(index, &code, &whose).await {
                 // For an inline script the address is the page's, so name it by
                 // its opening instead — enough to find it in the document.
                 let head: String = code.chars().filter(|c| !c.is_control()).take(70).collect();

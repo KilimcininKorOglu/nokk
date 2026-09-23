@@ -379,12 +379,24 @@ impl Isolate {
     /// A thrown exception (or a force-termination after [`Self::EVAL_TIMEOUT`]) is
     /// returned as `Err` with its message; the isolate stays reusable afterward.
     pub fn eval(&mut self, index: usize, source: &str) -> Result<String, String> {
+        self.eval_named(index, source, None)
+    }
+
+    /// То же, но скрипт назван своим адресом — как называет свои браузер.
+    /// Имя уходит в `ScriptOrigin`, а не в `//# sourceURL`: первое видно и
+    /// родителю вложенного `eval`, второе — нет.
+    pub fn eval_named(
+        &mut self,
+        index: usize,
+        source: &str,
+        name: Option<&str>,
+    ) -> Result<String, String> {
         let global = self.context(index)?;
         let watchdog = TerminateWatchdog::arm(&mut self.isolate);
 
         let result = {
             v8::scope_with_context!(scope, &mut self.isolate, &global);
-            run_script(scope, source)
+            run_script_named(scope, source, name)
         };
 
         // Disarm and clear any pending termination so the next eval on this
@@ -901,12 +913,46 @@ fn resolve_module<'a>(
 /// Compile and run `source` in the current context, returning its result as a
 /// string, or the exception message on failure.
 fn run_script(scope: &mut v8::PinScope, source: &str) -> Result<String, String> {
+    run_script_named(scope, source, None)
+}
+
+/// То же, но скрипт назван своим адресом. Имя видно не только в кадрах
+/// стека самого скрипта (для этого хватало бы `//# sourceURL`), но и там, где
+/// движок называет *родителя*: у `new Function` и `eval` браузер пишет
+/// `eval at <anonymous> (https://…:2:12)`, а безымянный скрипт даёт
+/// `unknown source`. Стек читают — и эту разницу видно.
+fn run_script_named(
+    scope: &mut v8::PinScope,
+    source: &str,
+    name: Option<&str>,
+) -> Result<String, String> {
     v8::tc_scope!(scope, scope);
 
     let Some(code) = v8::String::new(scope, source) else {
         return Err("script source too large for V8".to_string());
     };
-    let Some(script) = v8::Script::compile(scope, code, None) else {
+    let origin = match name {
+        Some(url) => {
+            let Some(n) = v8::String::new(scope, url) else {
+                return Err("script name too large for V8".to_string());
+            };
+            Some(v8::ScriptOrigin::new(
+                scope,
+                n.into(),
+                0,
+                0,
+                false,
+                0,
+                None,
+                false,
+                false,
+                false, // is_module
+                None,
+            ))
+        }
+        None => None,
+    };
+    let Some(script) = v8::Script::compile(scope, code, origin.as_ref()) else {
         return Err(exception_message(scope));
     };
     let Some(value) = script.run(scope) else {

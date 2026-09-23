@@ -1212,6 +1212,35 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                         }, B);
                       }
                     } catch (e) {}
+                    // Открытый текст первого POST. Он не проходит ни через
+                    // `TextEncoder`, ни через `JSON.stringify` — его сжимают, а
+                    // сжатие читает строку по знакам. Заметка стоит на самом
+                    // горячем месте языка, поэтому проверка короткая: только
+                    // нулевой знак и только у длинных строк.
+                    // Заметка нужна только в кадре челленджа: страница сама
+                    // читает строки знак за знаком тысячами, и её ленту смотреть
+                    // незачем.
+                    const __ptЧужой = () => {
+                      try { return /challenges\.cloudflare/.test(location.host); } catch (e) { return false; }
+                    };
+                    try {
+                      const CCA = String.prototype.charCodeAt;
+                      const видели = Object.create(null);
+                      String.prototype.charCodeAt = асНатив(function (i) {
+                        if (i === 0 && this.length > 300 && this.length < 40000) {
+                          const n = this.length;
+                          if (!видели[n] && Object.keys(видели).length < 30 && __ptЧужой()) {
+                            видели[n] = 1;
+                            const s0 = String(this);
+                            console.error('[исходник ' + n + '] ' + Math.round(performance.now()) + 'мс');
+                            for (let q = 0; q < s0.length; q += 250) {
+                              console.error('[исходник ' + n + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
+                            }
+                          }
+                        }
+                        return CCA.call(this, i);
+                      }, CCA);
+                    } catch (e) {}
                     const J = Array.prototype.join;
                     Array.prototype.join = асНатив(function (sep) {
                       const out = J.apply(this, arguments);
