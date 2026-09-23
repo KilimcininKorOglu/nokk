@@ -216,6 +216,10 @@ Verified end-to-end against a plain Cloudflare interstitial
 (`scrapingcourse.com/cloudflare-challenge`): without the cookie nokk gets
 `Just a moment...`; with it, the page itself — the same document the real browser sees.
 
+A clearance expires, and a page that still shows the gate otherwise looks like an
+ordinary load. `--fail-on-challenge` makes that a question a script can ask: nokk says
+why the gate is still up and exits with code 3, which is the cue to re-harvest.
+
 See [examples/cf-harvester](examples/cf-harvester/) for a scriptable harvester (Python +
 `nodriver`, auto-clicks a managed widget) and the
 [research write-up](examples/cf-harvester/docs/RESEARCH.md) on why this hybrid — real

@@ -127,6 +127,13 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     retries: u32,
 
+    /// For `--load`: exit with code 3 if the page still shows a Cloudflare
+    /// challenge at the end. Turns "is my `cf_clearance` still good?" into a
+    /// question a script can ask — a dead or mismatched clearance otherwise
+    /// looks like an ordinary load of a "Just a moment…" page.
+    #[arg(long)]
+    fail_on_challenge: bool,
+
     /// For `--load`: after loading, print every network request the page made
     /// (document + scripts + fetch/XHR) as `[type] METHOD url → status (N bytes)`.
     #[arg(long)]
@@ -2404,9 +2411,26 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
             return Ok(());
         }
 
+        // Застава на выходе — это ответ на вопрос «замок ещё жив?», и молча
+        // отдавать страницу «Just a moment…» нечестно: снаружи она выглядит как
+        // обычная загрузка.
+        let final_title = ctx.evaluate("document.title").await.unwrap_or_default();
+        let still_challenged =
+            matches!(&final_title, serde_json::Value::String(s) if s.contains("Just a moment"));
+        if still_challenged {
+            if cli.import_cookies.is_some() {
+                eprintln!(
+                    "застава на месте: замок не принят — протух, снят под другой версией \
+                     Chrome или с другого адреса"
+                );
+            } else {
+                eprintln!("застава на месте: замка у нас нет (см. --import-cookies)");
+            }
+        }
+
         if cli.eval.is_none() {
             // Default summary: title + a count of elements in the built DOM.
-            let title = ctx.evaluate("document.title").await.unwrap_or_default();
+            let title = final_title.clone();
             let count = ctx
                 .evaluate("document.querySelectorAll('*').length")
                 .await
@@ -2414,6 +2438,9 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
             println!("loaded {url}");
             println!("title: {title}");
             println!("elements: {count}");
+        }
+        if still_challenged && cli.fail_on_challenge {
+            std::process::exit(3);
         }
         return Ok(());
     }
