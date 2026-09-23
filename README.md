@@ -198,17 +198,28 @@ closes. Distinct session names are fully isolated. Without `--session-store`, se
 in-memory only. From the Rust API this is `Engine::new_context_with_session(name, proxy)`.
 
 **Reusing a Cloudflare `cf_clearance`.** An interactive/managed Turnstile can't be solved by
-a no-render engine, but a clearance solved once in a real browser can be *replayed*: match
-its Chrome version (`--chrome-version <N>`) and exit IP, import the cookies, and navigate.
+a no-render engine, but a clearance solved once in a real browser can be *replayed*. The
+cookie is bound to the exit IP **and to the TLS fingerprint of the browser that earned it**,
+so the two have to match: nokk emulates Chrome 151 and its JA4 is byte-identical to the real
+browser's, which is what makes the handoff work.
 
 ```bash
-nokk --load https://gated.example/ --chrome-version 148 \
-     --session cf --import-cookies cf_clearance.json      # → 200, past the gate
+# 1. earn it in a real browser (visible window; nothing is injected into the page)
+node tools/harvest-clearance.js https://gated.example/ 40 cf_clearance.json
+
+# 2. hand it to nokk
+nokk --load https://gated.example/ \
+     --session-store ./sessions --session cf --import-cookies cf_clearance.json
 ```
 
-See [examples/cf-harvester](examples/cf-harvester/) for a real-browser harvester that
-produces `cf_clearance.json`, and the [research write-up](examples/cf-harvester/docs/RESEARCH.md)
-on why this hybrid (real browser solves, nokk replays at scale) is the honest approach.
+Verified end-to-end against a plain Cloudflare interstitial
+(`scrapingcourse.com/cloudflare-challenge`): without the cookie nokk gets
+`Just a moment...`; with it, the page itself — the same document the real browser sees.
+
+See [examples/cf-harvester](examples/cf-harvester/) for a scriptable harvester (Python +
+`nodriver`, auto-clicks a managed widget) and the
+[research write-up](examples/cf-harvester/docs/RESEARCH.md) on why this hybrid — real
+browser solves, nokk replays at scale — is the honest approach.
 
 ### Rotating fingerprints across contexts
 

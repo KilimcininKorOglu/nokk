@@ -64,13 +64,19 @@ the same Chrome version and exit from the same IP:
 
 ```bash
 nokk --load https://www.example-protected.com/ \
-     --chrome-version 148 \
-     --session cf --import-cookies cf_clearance.json
+     --session-store ./sessions --session cf --import-cookies cf_clearance.json
 # → [document] GET … → 200   (past the Turnstile gate)
 ```
 
-Set `--chrome-version` to the major in the harvested `user_agent`. `cf_clearance`
-also has a short TTL, so re-harvest when it expires.
+nokk emulates current-stable Chrome (151 today) and its JA4 matches the real browser
+byte for byte, so a cookie harvested with the local Chrome replays as-is. If the
+harvester ran a *different* major than nokk emulates, pass `--chrome-version <major>`
+from the harvested `user_agent` — the clearance is bound to the TLS fingerprint, not
+just the cookie. It also has a short TTL, so re-harvest when it expires.
+
+There is a dependency-free variant of this harvester in the repo root:
+`node tools/harvest-clearance.js <url> [seconds] [file]` — it drives the local Chrome
+over CDP (no Python, no `nodriver`) and waits until the cookie actually appears.
 
 ## License
 
