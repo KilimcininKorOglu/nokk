@@ -1273,12 +1273,13 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       const IF = globalThis.isFinite;
                       let счёт = 0;
                       globalThis.isFinite = асНатив(function (x) {
-                        if (__ptЧужой() && счёт < 6) {
+                        if (__ptЧужой() && счёт < 40) {
                           счёт++;
                           let стек = '';
                           try {
-                            стек = String(new Error().stack || '').split('\n').slice(1, 5)
-                              .map((l) => l.trim()).join(' | ');
+                            стек = String(new Error().stack || '').split('\n').slice(1, 3)
+                              .map((l) => l.trim().replace(/^at /, '').replace(/https?:[^)]*normal\?lang=auto/, ''))
+                              .join(' | ');
                           } catch (e) {}
                           console.error('[конечно ' + счёт + '] ' + x + ' ← ' + стек.slice(0, 260));
                         }
