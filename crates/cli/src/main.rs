@@ -960,7 +960,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                 let window = std::env::var("NOKK_DUMP_ENC").unwrap_or_else(|_| "15000-16000".into());
                 let (lo, hi) = window.split_once('-').unwrap_or(("15000", "16000"));
                 let probe = probe.replace("__DUMPLO__", lo.trim()).replace("__DUMPHI__", hi.trim());
-                c.add_frame_init_script(probe.clone());
+                c.add_frame_init_script(spread_to_realms(&probe, "beacon"));
                 c.add_worker_init_script(probe.clone());
                 c.add_init_script(probe);
             }
@@ -1133,6 +1133,60 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
             // Наблюдение за крючками челленджа: программа, пришедшая с сервера,
             // зовёт виджет через его же таблицу колбэков, и увидеть, какие из
             // них она позвала, — единственный способ прочитать её решение.
+            // Лента полей первого POST — и ничего больше. Полная трассировка
+            // в кадре и его свежем реалме останавливает виджет: POST не уходит
+            // вовсе. Здесь три крючка, все с родным видом: `charCodeAt` (так
+            // сериализатор читает каждое поле и значение), `open` и `send`.
+            if std::env::var("NOKK_TRACE_FIELDS").is_ok() {
+                let probe = r#"(() => {
+                  const nat = (f, src) => {
+                    try {
+                      Object.defineProperty(f, 'name', { value: src.name, configurable: true });
+                      Object.defineProperty(f, 'length', { value: src.length, configurable: true });
+                    } catch (e) {}
+                    return globalThis.__pt_native ? __pt_native(f) : f;
+                  };
+                  const cf = () => {
+                    if (globalThis.__ptВРеалме) return true;
+                    try { return /challenges\.cloudflare/.test(location.host); } catch (e) { return false; }
+                  };
+                  try {
+                    const P = XMLHttpRequest.prototype, XO = P.open, XS = P.send;
+                    P.open = nat(function open(m, u) {
+                      try {
+                        if (cf() && /challenge-platform/.test(String(u)) && !globalThis.__ptСобрано) globalThis.__ptСериализуем = 1;
+                      } catch (e) {}
+                      return XO.apply(this, arguments);
+                    }, XO);
+                    P.send = nat(function send(b) {
+                      try {
+                        if (globalThis.__ptСериализуем && b && b.length > 1000 && b.length < 20000 && !globalThis.__ptСобрано) {
+                          globalThis.__ptСобрано = 1;
+                          globalThis.__ptСериализуем = 0;
+                          const ряд = globalThis.__ptСтроки || [];
+                          const s1 = JSON.stringify(ряд);
+                          console.error('[поля] всего=' + ряд.length + ' тело=' + b.length);
+                          for (let q = 0; q < s1.length; q += 250) {
+                            console.error('[поля ' + ряд.length + ':' + (q / 250) + '] ' + s1.slice(q, q + 250));
+                          }
+                        }
+                      } catch (e) {}
+                      return XS.apply(this, arguments);
+                    }, XS);
+                  } catch (e) {}
+                  try {
+                    const CCA = String.prototype.charCodeAt;
+                    String.prototype.charCodeAt = nat(function charCodeAt(i) {
+                      if (i === 0 && globalThis.__ptСериализуем && this.length < 120) {
+                        const ряд = globalThis.__ptСтроки || (globalThis.__ptСтроки = []);
+                        if (ряд.length < 600) ряд.push(String(this));
+                      }
+                      return CCA.call(this, i);
+                    }, CCA);
+                  } catch (e) {}
+                })();"#;
+                c.add_frame_init_script(spread_to_realms(probe, "fields"));
+            }
             if std::env::var("NOKK_TRACE_HOOKS").is_ok() {
                 let hook = r#"(() => {
                   try { console.error('[hook] installed'); } catch (e) {}
@@ -1438,6 +1492,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     // читает строки знак за знаком тысячами, и её ленту смотреть
                     // незачем.
                     const __ptЧужой = () => {
+                      if (globalThis.__ptВРеалме) return true;
                       try { return /challenges\.cloudflare/.test(location.host); } catch (e) { return false; }
                     };
                     try {
@@ -2226,7 +2281,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     "__HANG__",
                     if std::env::var("NOKK_HANG_UNREACHABLE").is_ok() { "true" } else { "false" },
                 );
-                c.add_frame_init_script(hook.clone());
+                c.add_frame_init_script(spread_to_realms(&hook, "hooks"));
                 c.add_worker_init_script(hook.clone());
                 c.add_init_script(hook);
             }
@@ -2769,4 +2824,38 @@ mod tests {
         let v = serde_json::json!({ "a": 1 });
         assert_eq!(render(&v), "{\"a\":1}");
     }
+}
+
+/// Пробник трассировки — ещё и во всякий свежий реалм. Виджет Turnstile
+/// сериализует и отправляет через пустой кадр за `contentWindow`, а пробники
+/// кадра туда не попадают: реалм строится из бутстрапа. Флаги окна
+/// сериализации реалм делит с родителем. Только для трассировки.
+fn spread_to_realms(probe: &str, key: &str) -> String {
+    let body = serde_json::to_string(probe).unwrap_or_default();
+    format!(
+        r#"{probe}
+;(() => {{
+  const RM = globalThis.__pt_makeRealm;
+  if (typeof RM !== 'function' || globalThis['__ptSpread_{key}']) return;
+  globalThis['__ptSpread_{key}'] = 1;
+  const родитель = globalThis;
+  globalThis.__pt_makeRealm = function __pt_makeRealm() {{
+    const g = RM.apply(this, arguments);
+    try {{
+      if (g && typeof g.eval === 'function' && !g['__ptSpread_{key}']) {{
+        for (const k of ['__ptСериализуем', '__ptСобрано', '__ptСтроки', '__ptFirstBody', '__ptMarked']) {{
+          if (Object.getOwnPropertyDescriptor(g, k)) continue;
+          Object.defineProperty(g, k, {{ get() {{ return родитель[k]; }}, set(v) {{ родитель[k] = v; }}, configurable: true }});
+        }}
+        g.__ptВРеалме = 1;
+        // Консоль реалма пишет в сток, который движок не читает; пробнику
+        // отдаём консоль родителя — лексически, не трогая окно реалма.
+        Object.defineProperty(g, '__ptParentConsole', {{ value: родитель.console, configurable: true }});
+        g.eval('(function (console) {{' + {body} + '\n}})(globalThis.__ptParentConsole)');
+      }}
+    }} catch (e) {{ try {{ console.error('[реалм] пробник не встал: ' + e); }} catch (x) {{}} }}
+    return g;
+  }};
+}})();"#
+    )
 }
