@@ -1244,6 +1244,26 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                         }, B);
                       }
                     } catch (e) {}
+                    // Что видит api.js, когда ищет свою запись Resource Timing.
+                    try {
+                      const P = globalThis.Performance && Performance.prototype;
+                      const G = P && P.getEntriesByType;
+                      if (G) P.getEntriesByType = асНатив(function (t) {
+                        const r = G.apply(this, arguments);
+                        try {
+                          if (String(t) === 'resource' && !__ptЧужой()
+                              && (globalThis.__ptРесЗапр = (globalThis.__ptРесЗапр || 0) + 1) < 6) {
+                            const cs = document.currentScript;
+                            const cf = r.filter((e) => /challenges\.cloudflare/.test(e.name));
+                            console.error('[ресурсы] всего=' + r.length + ' cf=' + cf.length
+                                  + ' текущий=' + (cs ? String(cs.src || '(встроенный)').slice(-60) : 'нет')
+                                  + ' имена=' + cf.map((e) => String(e.name).slice(-50) + (e instanceof PerformanceResourceTiming ? '' : '(не PRT)')).join(','));
+                          }
+                        } catch (e) {}
+                        return r;
+                      }, G);
+                    } catch (e) {}
+
                     // Что приходит кадру письмами: часть тела первого POST
                     // виджет получает от страницы (api.js) — и у Chrome в этом
                     // месте есть поля, которых у нас нет.
@@ -1264,7 +1284,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                                 if (s1.length <= 220) {
                                   console.error('[письмо] ' + String(ev && ev.origin).slice(0, 30) + ' ' + s1);
                                 } else {
-                                  for (let q = 0; q < Math.min(s1.length, 3000); q += 220) {
+                                  for (let q = 0; q < Math.min(s1.length, 8000); q += 220) {
                                     console.error('[письмо ' + s1.length + ':' + (q / 220) + '] ' + s1.slice(q, q + 220));
                                   }
                                 }

@@ -121,6 +121,43 @@ const HOOK = `(() => {
   // Отчёт целиком — то же, что печатает NOKK_DUMP_REPORT=1 у нас. Их
   // сериализация идёт через склейку массива, поэтому здесь виден текст до
   // сжатия и шифрования.
+  // Письма от страницы к кадру виджета: часть тела первого POST виджет
+  // получает так (extraParams — стек, времена шагов, слепок страницы). Тот же
+  // крючок стоит в движке, метка [письмо].
+  try {
+    const чужой0 = () => { try { return /challenges\\.cloudflare/.test(location.host); } catch (e) { return false; } };
+    const AL = EventTarget.prototype.addEventListener;
+    const нат0 = (f, src) => {
+      try {
+        Object.defineProperty(f, 'name', { value: src.name, configurable: true });
+        Object.defineProperty(f, 'length', { value: src.length, configurable: true });
+      } catch (e) {}
+      return f;
+    };
+    EventTarget.prototype.addEventListener = нат0(function (type, fn, opts) {
+      if (чужой0() && String(type) === 'message' && typeof fn === 'function') {
+        const свой = function (ev) {
+          try {
+            if ((globalThis.__ptПисем = (globalThis.__ptПисем || 0) + 1) < 25) {
+              const d = ev && ev.data;
+              let t;
+              if (typeof d === 'string') t = d;
+              else { try { t = JSON.stringify(d); } catch (e) { t = String(d); } }
+              t = String(t);
+              if (t.length <= 220) console.log('[письмо] ' + t);
+              else for (let q = 0; q < Math.min(t.length, 4000); q += 220) {
+                console.log('[письмо ' + t.length + ':' + (q / 220) + '] ' + t.slice(q, q + 220));
+              }
+            }
+          } catch (e) {}
+          return fn.apply(this, arguments);
+        };
+        return AL.call(this, type, свой, opts);
+      }
+      return AL.apply(this, arguments);
+    }, AL);
+  } catch (e) {}
+
   // Числа, которые челлендж проверяет перед отправкой. Он прогоняет весь
   // собранный вектор через isFinite, и это единственное место, где значения
   // видны по одному — тело уже шифр. Тот же ряд движок печатает своим
@@ -695,7 +732,7 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker|count|бросок|время|первые|исходник|числа)\]|^\[[jPC]\d* |^\[cs\]|^\[строки |^\[числа |^\[исходник |^\[ПЕРВЫЙ |^\[svg\]|^\[хвост |^\[parts|^\[звук |^\[json |^\[btoa |^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
+      if (/^\[(send|hook|hookerr|blob|worker|count|бросок|время|первые|исходник|числа|письмо)\]|^\[[jPC]\d* |^\[cs\]|^\[строки |^\[письмо |^\[числа |^\[исходник |^\[ПЕРВЫЙ |^\[svg\]|^\[хвост |^\[parts|^\[звук |^\[json |^\[btoa |^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
         lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
     }
     // Крючок мог и не встать: у внедрения ошибка видна только так, а без неё

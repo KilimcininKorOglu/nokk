@@ -4765,8 +4765,21 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   globalThis.__pt_drainScriptQueue = () => __scriptOps.splice(0);
 
+  // Пока исполняется скрипт, вставленный страницей, `document.currentScript` —
+  // он сам, как у встроенного в разметку. У нас там было пусто, и api.js
+  // Turnstile не находил собственный адрес, а с ним — свою запись Resource
+  // Timing: у браузера она уходит виджету целиком, у нас не уходила вовсе.
+  // У модуля `currentScript` пуст и у браузера — его не ставим.
+  globalThis.__pt_scriptStart = (id) => {
+    const el = __scriptEls.get(id);
+    if (el) document.__ptCurScript = el;
+  };
+
   globalThis.__pt_scriptDone = (id, ok) => {
     const el = __scriptEls.get(id);
+    // Скрипт отработал — `currentScript` снова пуст, и `onload` его уже не
+    // видит, как и у браузера.
+    if (el && document.__ptCurScript === el) document.__ptCurScript = null;
     if (!el) return;
     __scriptEls.delete(id);
     const ev = { type: ok ? 'load' : 'error', target: el, currentTarget: el, isTrusted: true };

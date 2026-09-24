@@ -4933,6 +4933,20 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   globalThis.PerformanceNavigationTiming = PerformanceNavigationTiming;
   globalThis.PerformancePaintTiming = PerformancePaintTiming;
 
+  // Номер навигации: у браузера он один на все записи документа.
+  const NAV_ID = 1000 + Math.floor(Math.random() * 9000);
+  // «Сокращённый» MIME, как его пишет Resource Timing: у любого JavaScript —
+  // `text/javascript`, у JSON — `application/json`, у SVG и XML — свои, у
+  // прочих поддерживаемых — сама суть без параметров, у незнакомых — пусто.
+  const __ptMinimizeMime = (raw) => {
+    const t = String(raw || '').split(';')[0].trim().toLowerCase();
+    if (!t) return '';
+    if (/^(application|text)\/(x-)?(java|ecma)script$|^text\/(jscript|livescript|x-javascript1\.\d)$|^text\/javascript1\.\d$/.test(t)) return 'text/javascript';
+    if (t === 'application/json' || t === 'text/json' || /\+json$/.test(t)) return 'application/json';
+    if (t === 'image/svg+xml') return 'image/svg+xml';
+    if (t === 'text/xml' || t === 'application/xml' || /\+xml$/.test(t)) return 'application/xml';
+    return t;
+  };
   globalThis.__pt_noteResources = (json) => {
     let list;
     const fresh = [];
@@ -4942,21 +4956,30 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
       const e = new Ctor();
       const start = Number(r.start) || 0;
       const end = start + (Number(r.duration) || 0);
+      // Поля — в том порядке, в каком их отдаёт браузер (`toJSON` идёт по
+      // собственным именам): его запись api.js Turnstile пересылает виджету
+      // целиком, и она уходит в тело первого POST. Недостающих полей у нас
+      // было семь, `contentType` не «сокращался», порядок был свой.
+      const rs = start + (Number(r.duration) || 0) * 0.8;
       Object.assign(e, {
         name: String(r.name || ''), entryType: r.entryType || 'resource',
         startTime: start, duration: Number(r.duration) || 0,
+        navigationId: NAV_ID,
         initiatorType: r.initiatorType || 'other', deliveryType: '',
         nextHopProtocol: r.protocol || 'h2', renderBlockingStatus: 'non-blocking',
-        workerStart: 0, redirectStart: 0, redirectEnd: 0,
+        contentType: __ptMinimizeMime(r.contentType), contentEncoding: String(r.encoding || ''),
+        workerStart: 0, workerRouterEvaluationStart: 0, workerCacheLookupStart: 0,
+        workerMatchedSourceType: '', workerFinalSourceType: '',
+        redirectStart: 0, redirectEnd: 0,
         fetchStart: start, domainLookupStart: start, domainLookupEnd: start,
         connectStart: start, secureConnectionStart: start, connectEnd: start,
-        requestStart: start, responseStart: start + (Number(r.duration) || 0) * 0.8,
-        firstInterimResponseStart: 0, responseEnd: end,
+        requestStart: start, responseStart: rs,
+        firstInterimResponseStart: 0, finalResponseHeadersStart: rs, responseEnd: end,
         transferSize: Number(r.size) || 0,
         encodedBodySize: Math.max(0, (Number(r.size) || 0) - 300),
         decodedBodySize: Number(r.decoded) || Math.max(0, (Number(r.size) || 0) - 300),
         responseStatus: Number(r.status) || 200,
-        serverTiming: [], contentType: r.contentType || '',
+        serverTiming: [],
       });
       if (r.entryType === 'navigation') {
         Object.assign(e, {

@@ -337,6 +337,10 @@ pub struct Response {
     /// Сколько заняло само обращение, в миллисекундах. У браузера у каждого
     /// ресурса своя длительность; у нас всем подряд ставилось двенадцать.
     pub elapsed_ms: f64,
+    /// `content-encoding` ответа (`br`, `gzip`…), пустая — без сжатия. Заголовок
+    /// после распаковки снимается, а значение браузер показывает в записи
+    /// Resource Timing (`contentEncoding`).
+    pub content_encoding: String,
     /// Final URL after any redirects were followed — the origin the body
     /// actually came from. Callers use it as the document base URL.
     pub url: String,
@@ -797,6 +801,7 @@ impl HttpClient for FingerprintClient {
             .map(|s| s.trim().to_ascii_lowercase())
             .unwrap_or_default();
         let body = decode_body(&encoding, raw);
+        let content_encoding = encoding.clone();
         headers.remove("content-encoding");
         headers.remove("content-length");
         Ok(Response {
@@ -806,6 +811,7 @@ impl HttpClient for FingerprintClient {
             body,
             encoded_len,
             elapsed_ms,
+            content_encoding,
         })
     }
 }

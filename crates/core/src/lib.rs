@@ -948,6 +948,8 @@ pub struct NetworkRecord {
     /// скрипта это втрое меньше распакованной длины, и сторона, отдавшая файл,
     /// знает точное число.
     pub encoded_len: usize,
+    /// Чем было сжато тело по проводу (`br`, `gzip`), пусто — ничем.
+    pub content_encoding: String,
     /// Контекст, который запросил: страница или один из её кадров. Времена
     /// ресурсов раздаются по нему — у кадра в браузере своя лента, и пустая
     /// лента там заметна не меньше, чем пустая у страницы.
@@ -1244,6 +1246,12 @@ impl BrowserContext {
                 | nokk_dom::Script::ExternalModule(_)
                 | nokk_dom::Script::Skipped => continue,
             };
+            // Запись о скрипте должна быть видна, пока он исполняется: у
+            // браузера ответ пришёл раньше, чем скрипт начал. api.js Turnstile
+            // ищет свою запись первой же строкой и отдаёт её виджету; у нас
+            // записи раздавались только после всех скриптов, и лента была
+            // пуста.
+            self.flush_resource_timings(index).await;
             let _ = self
                 .eval_in(index, &format!("__pt_beginScript({idx})"))
                 .await;
@@ -1759,6 +1767,7 @@ impl BrowserContext {
                         "duration": r.duration_ms,
                         "size": r.encoded_len + 300,
                         "decoded": r.body.len(),
+                    "encoding": r.content_encoding,
                         "status": r.status,
                         "protocol": "h2",
                         "contentType": r.headers.get("content-type").cloned().unwrap_or_default(),
@@ -1812,6 +1821,7 @@ impl BrowserContext {
                     "duration": r.duration_ms,
                     "size": r.encoded_len + 300,
                     "decoded": r.body.len(),
+                    "encoding": r.content_encoding,
                     "status": r.status,
                     "protocol": "h2",
                     "contentType": r.headers.get("content-type").cloned().unwrap_or_default(),
@@ -2796,8 +2806,12 @@ impl BrowserContext {
                         let _ = self.eval_in(index, &done(true)).await;
                         continue;
                     }
-                    let code = format!("{code}\n//# sourceURL={url}");
-                    if let Err(e) = self.eval_in(index, &code).await {
+                    // Классический скрипт: пока он идёт, `currentScript` —
+                    // он сам; имя — его адрес в `ScriptOrigin`, а не комментарий.
+                    let _ = self
+                        .eval_in(index, &format!("__pt_scriptStart({id});"))
+                        .await;
+                    if let Err(e) = self.eval_named_in(index, &code, &url).await {
                         tracing::debug!(url = %url, error = %e, "inserted script threw");
                     }
                     let _ = self.eval_in(index, &done(true)).await;
@@ -3200,6 +3214,7 @@ impl BrowserContext {
                     &sent,
                     resp.encoded_len,
                     Some(resp.elapsed_ms),
+                    &resp.content_encoding,
                 );
                 let headers_js =
                     serde_json::to_string(&resp.headers).unwrap_or_else(|_| "{}".into());
@@ -3376,6 +3391,7 @@ impl BrowserContext {
                     &[],
                     resp.encoded_len,
                     Some(resp.elapsed_ms),
+                    &resp.content_encoding,
                 );
                 let final_url = if resp.url.is_empty() {
                     url.to_string()
@@ -3419,6 +3435,7 @@ impl BrowserContext {
             &[],
             body.len(),
             None,
+            "",
         )
     }
 
@@ -3440,6 +3457,7 @@ impl BrowserContext {
         request_body: &[u8],
         encoded_len: usize,
         measured_ms: Option<f64>,
+        content_encoding: &str,
     ) {
         let now = self.started.elapsed().as_secs_f64() * 1000.0;
         // Замеренное время обращения, а не одно и то же число на всех: у
@@ -3463,6 +3481,7 @@ impl BrowserContext {
             started_ms: started_ms.max(0.0),
             duration_ms: duration_ms.max(0.0),
             encoded_len,
+            content_encoding: content_encoding.to_string(),
             context,
         };
         if let Ok(mut log) = self.requests.lock() {
@@ -7294,6 +7313,74 @@ mod tests {
             "пробелы по краям в рамку не идут"
         );
         assert_eq!(box_of("empty"), vec![0.0, 0.0, 0.0, 0.0], "у пустого текста рамки нет");
+    }
+
+    /// Скрипт, вставленный страницей, видит себя так же, как видит браузерный:
+    /// `document.currentScript` — он сам, а его запись Resource Timing уже на
+    /// месте, пока он исполняется. api.js Turnstile ищет её первой же строкой
+    /// и пересылает виджету целиком; у нас не было ни того, ни другого, и тело
+    /// первого POST выходило на шесть полей короче браузерного.
+    #[tokio::test]
+    async fn an_inserted_script_sees_itself_and_its_timing() {
+        let _serial = serial().await;
+        const PAGE: &str = r#"<html><body><script>
+            const s = document.createElement('script'); s.src = '/self.js';
+            s.onload = () => { globalThis.__после = document.currentScript === null; };
+            document.head.appendChild(s);
+          </script></body></html>"#;
+        const JS: &str = "(function () {
+            var cs = document.currentScript;
+            var all = performance.getEntriesByType('resource');
+            var mine = all.filter(function (e) { return cs && e.name.indexOf(cs.src) >= 0; });
+            globalThis.__сам = {
+              cs: !!cs, inst: mine.length ? mine[0] instanceof PerformanceResourceTiming : false,
+              found: mine.length, keys: mine.length ? Object.keys(mine[0].toJSON()).slice(0, 8) : [],
+              type: mine.length ? mine[0].contentType : null,
+            };
+          })();";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let (ct, body) = if req.starts_with("GET /self.js") {
+                        ("application/javascript; charset=UTF-8", JS)
+                    } else {
+                        ("text/html", PAGE)
+                    };
+                    let out = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(out.as_bytes()).await;
+                });
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&format!("http://{addr}/")).await.unwrap();
+        ctx.run_event_loop().await.unwrap();
+        let out = probe(&ctx, "__ptJSON.stringify({ сам: globalThis.__сам, после: globalThis.__после })").await;
+        assert_eq!(out["сам"]["cs"], true, "currentScript — сам скрипт: {out}");
+        assert_eq!(out["сам"]["found"], 1, "запись о себе видна во время исполнения: {out}");
+        assert_eq!(out["сам"]["inst"], true, "{out}");
+        assert_eq!(
+            out["сам"]["keys"],
+            serde_json::json!(["name", "entryType", "startTime", "duration", "navigationId",
+                               "initiatorType", "deliveryType", "nextHopProtocol"]),
+            "поля в браузерном порядке: {out}"
+        );
+        assert_eq!(out["сам"]["type"], "text/javascript", "MIME сокращён, как у браузера: {out}");
+        assert_eq!(out["после"], true, "после исполнения currentScript снова пуст: {out}");
     }
 
     /// Фокус у браузера — четыре события, а не два: `blur` и `focusout` на
