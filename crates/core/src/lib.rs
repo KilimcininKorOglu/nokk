@@ -7315,6 +7315,37 @@ mod tests {
         assert_eq!(box_of("empty"), vec![0.0, 0.0, 0.0, 0.0], "у пустого текста рамки нет");
     }
 
+    /// Список селекторов через запятую отдаёт элементы в порядке документа, а
+    /// не сгруппированными по селекторам. api.js Turnstile описывает форму
+    /// именно так (`querySelectorAll("input, select, textarea, button")`), и у
+    /// нас кнопки уезжали в конец — виджету уходила чужая форма.
+    #[tokio::test]
+    async fn a_selector_list_answers_in_document_order() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<html><body><form><button id=b1></button><input id=i1><select id=s1></select>\
+             <div><input id=i2><div><textarea id=t1></textarea></div></div><button id=b2></button>\
+             </form></body></html>",
+        )
+        .await
+        .unwrap();
+        let out = probe(
+            &ctx,
+            "__ptJSON.stringify({
+               all: [...document.querySelectorAll('input, select, textarea, button')].map(e => e.id),
+               two: [...document.querySelectorAll('button, input')].map(e => e.id),
+               nested: [...document.querySelectorAll('div textarea, form > button')].map(e => e.id),
+             })",
+        )
+        .await;
+        assert_eq!(out["all"], serde_json::json!(["b1", "i1", "s1", "i2", "t1", "b2"]), "{out}");
+        assert_eq!(out["two"], serde_json::json!(["b1", "i1", "i2", "b2"]), "{out}");
+        assert_eq!(out["nested"], serde_json::json!(["b1", "t1", "b2"]), "{out}");
+    }
+
     /// Скрипт, вставленный страницей, видит себя так же, как видит браузерный:
     /// `document.currentScript` — он сам, а его запись Resource Timing уже на
     /// месте, пока он исполняется. api.js Turnstile ищет её первой же строкой

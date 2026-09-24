@@ -3394,6 +3394,18 @@
       }
       for (const el of current) if (el !== root && !seen.has(el)) { seen.add(el); results.push(el); }
     }
+    // Порядок — документа, а не селекторов: `querySelectorAll('input, button')`
+    // у браузера отдаёт элементы так, как они стоят в дереве. У нас сначала шли
+    // все поля, потом все кнопки — и api.js Turnstile, описывающий форму этим
+    // запросом, отправлял виджету чужую форму.
+    if (results.length > 1) {
+      const ordered = [];
+      walk(root, (e) => { if (seen.has(e)) ordered.push(e); });
+      if (ordered.length === results.length) {
+        ordered.item = (i) => ordered[i] || null;
+        return ordered;
+      }
+    }
     results.item = (i) => results[i] || null;
     return results;
   }
