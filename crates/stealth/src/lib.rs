@@ -4960,7 +4960,11 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
       // собственным именам): его запись api.js Turnstile пересылает виджету
       // целиком, и она уходит в тело первого POST. Недостающих полей у нас
       // было семь, `contentType` не «сокращался», порядок был свой.
-      const rs = start + (Number(r.duration) || 0) * 0.8;
+      // Перенаправление: запись начинается с первого запроса, а выборка —
+      // с конца последнего перенаправления.
+      const hop = r.redirect != null && Number(r.redirect) > 0 ? Math.min(Number(r.redirect), Number(r.duration) || 0) : 0;
+      const fs = start + hop;
+      const rs = fs + ((Number(r.duration) || 0) - hop) * 0.8;
       Object.assign(e, {
         name: String(r.name || ''), entryType: r.entryType || 'resource',
         startTime: start, duration: Number(r.duration) || 0,
@@ -4970,10 +4974,10 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
         contentType: __ptMinimizeMime(r.contentType), contentEncoding: String(r.encoding || ''),
         workerStart: 0, workerRouterEvaluationStart: 0, workerCacheLookupStart: 0,
         workerMatchedSourceType: '', workerFinalSourceType: '',
-        redirectStart: 0, redirectEnd: 0,
-        fetchStart: start, domainLookupStart: start, domainLookupEnd: start,
-        connectStart: start, secureConnectionStart: start, connectEnd: start,
-        requestStart: start, responseStart: rs,
+        redirectStart: hop ? start : 0, redirectEnd: hop ? fs : 0,
+        fetchStart: fs, domainLookupStart: fs, domainLookupEnd: fs,
+        connectStart: fs, secureConnectionStart: fs, connectEnd: fs,
+        requestStart: fs, responseStart: rs,
         firstInterimResponseStart: 0, finalResponseHeadersStart: rs, responseEnd: end,
         transferSize: Number(r.size) || 0,
         encodedBodySize: Math.max(0, (Number(r.size) || 0) - 300),

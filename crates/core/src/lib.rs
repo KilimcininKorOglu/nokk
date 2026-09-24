@@ -950,6 +950,9 @@ pub struct NetworkRecord {
     pub encoded_len: usize,
     /// Чем было сжато тело по проводу (`br`, `gzip`), пусто — ничем.
     pub content_encoding: String,
+    /// Через сколько миллисекунд от начала запроса закончилось последнее
+    /// перенаправление; `None` — их не было.
+    pub redirect_ms: Option<f64>,
     /// Контекст, который запросил: страница или один из её кадров. Времена
     /// ресурсов раздаются по нему — у кадра в браузере своя лента, и пустая
     /// лента там заметна не меньше, чем пустая у страницы.
@@ -1293,14 +1296,14 @@ impl BrowserContext {
     /// and holding a CDP command hostage to it would be worse than returning and
     /// letting the server's periodic pump carry the page forward.
     pub async fn run_event_loop(&self) -> Result<u32, EngineError> {
-        self.run_event_loop_waiting(IDLE_WAIT_BUDGET).await
+        self.run_event_loop_waiting(IDLE_WAIT_BUDGET, false).await
     }
 
     /// [`Self::run_event_loop`] with a longer patience for timers, used while a
     /// document is loading: work deferred by a few hundred milliseconds is still
     /// part of the load, and a caller that just navigated is waiting anyway.
     async fn run_event_loop_for_load(&self) -> Result<u32, EngineError> {
-        self.run_event_loop_waiting(LOAD_WAIT_BUDGET).await
+        self.run_event_loop_waiting(LOAD_WAIT_BUDGET, false).await
     }
 
     /// The loop both of the above run. `idle_wait` is the *total* time it may
@@ -1309,6 +1312,7 @@ impl BrowserContext {
     async fn run_event_loop_waiting(
         &self,
         idle_wait: std::time::Duration,
+        until_sheets: bool,
     ) -> Result<u32, EngineError> {
         const TIMER_CAP: u32 = 10_000;
         const MAX_FETCHES: usize = 200;
@@ -1452,12 +1456,18 @@ impl BrowserContext {
 
             // 5. Perform each fetch off the isolate thread, then settle its
             //    Promise back on the worker.
-            for r in reqs {
-                if fetches_done >= MAX_FETCHES {
-                    break;
-                }
-                fetches_done += 1;
-                let settle = self.perform_fetch(index, &base, &r).await;
+            // Запросы раунда идут разом, как у браузера: он не ждёт шрифта,
+            // чтобы попросить таблицу стилей. У нас они шли по одному, по
+            // полсотни миллисекунд каждый, и страница с десятком ссылок в
+            // заголовке теряла на этом полсекунды до первого скрипта.
+            let room = MAX_FETCHES.saturating_sub(fetches_done);
+            let batch: Vec<Value> = reqs.into_iter().take(room).collect();
+            fetches_done += batch.len();
+            let settles = futures_util::future::join_all(
+                batch.iter().map(|r| self.perform_fetch(index, &base, r)),
+            )
+            .await;
+            for settle in settles {
                 self.engine
                     .pool
                     .dispatch(self.worker, move |iso| iso.eval(index, &settle))
@@ -1496,6 +1506,21 @@ impl BrowserContext {
                 frames_ran = self.pump_frames().await?;
                 tracing::debug!(target: "nokk::pace", gap_ms = gap,
                     pump_ms = t.elapsed().as_millis() as u64, frames_ran, "круг кадров");
+            }
+
+            // Ждали только таблиц из разметки — пришли, и хватит: дальше
+            // исполняется следующий скрипт, а не всё, что успела завести
+            // страница.
+            if until_sheets {
+                let left = self
+                    .eval_in(index, "globalThis.__ptBlockingSheets | 0")
+                    .await
+                    .ok()
+                    .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    .unwrap_or(0);
+                if left == 0 {
+                    break;
+                }
             }
 
             if busy || frames_ran > 0 || !frame_ops.is_empty() {
@@ -1823,6 +1848,7 @@ impl BrowserContext {
                     "size": r.encoded_len + 300,
                     "decoded": r.body.len(),
                     "encoding": r.content_encoding,
+                    "redirect": r.redirect_ms,
                     "status": r.status,
                     "protocol": "h2",
                     "contentType": r.headers.get("content-type").cloned().unwrap_or_default(),
@@ -2635,44 +2661,60 @@ impl BrowserContext {
         seen.insert(url.to_string());
         let mut pending = vec![(url.to_string(), source)];
 
-        while let Some((at, code)) = pending.pop() {
-            let (i, u, c) = (index, at.clone(), code);
-            let requests = self
-                .engine
-                .pool
-                .dispatch(self.worker, move |iso| iso.module_requests(i, &u, &c))
-                .await?
-                .map_err(EngineError::Js)?;
-
-            for spec in requests {
-                // A bare specifier ("react") needs an import map to mean anything;
-                // a bundled page never has one, and guessing would be worse.
-                let Some(target) = resolve_url(&at, &spec) else {
-                    continue;
-                };
-                let (i, from, sp, to) = (index, at.clone(), spec.clone(), target.clone());
-                self.engine
-                    .pool
-                    .dispatch(self.worker, move |iso| iso.link_module(i, &from, &sp, &to))
-                    .await?;
-                if seen.contains(&target) || seen.len() >= MAX_MODULES {
-                    continue;
-                }
-                seen.insert(target.clone());
-                // Уже собранный модуль второй раз не тянем: у браузера на реалм
-                // одна карта модулей, и адрес в ней один, сколько бы кусков его
-                // ни импортировало.
-                let (i, u) = (index, target.clone());
-                if self
+        // Волнами: разобрать всё, что уже пришло, собрать новые адреса и
+        // забрать их разом. Браузер тянет граф параллельно; мы — по одному
+        // файлу, и у chess.com (сотня модулей) api.js Turnstile начинал
+        // грузиться на четвёртой-восьмой секунде вместо половины первой. Эта
+        // цифра уходит виджету в письме (`apiJsResourceTiming.startTime`).
+        while !pending.is_empty() {
+            let wave = std::mem::take(&mut pending);
+            let mut to_fetch: Vec<String> = Vec::new();
+            for (at, code) in wave {
+                let (i, u, c) = (index, at.clone(), code);
+                let requests = self
                     .engine
                     .pool
-                    .dispatch(self.worker, move |iso| iso.has_module(i, &u))
-                    .await
-                    .unwrap_or(false)
-                {
-                    continue;
+                    .dispatch(self.worker, move |iso| iso.module_requests(i, &u, &c))
+                    .await?
+                    .map_err(EngineError::Js)?;
+
+                for spec in requests {
+                    // A bare specifier ("react") needs an import map to mean anything;
+                    // a bundled page never has one, and guessing would be worse.
+                    let Some(target) = resolve_url(&at, &spec) else {
+                        continue;
+                    };
+                    let (i, from, sp, to) = (index, at.clone(), spec.clone(), target.clone());
+                    self.engine
+                        .pool
+                        .dispatch(self.worker, move |iso| iso.link_module(i, &from, &sp, &to))
+                        .await?;
+                    if seen.contains(&target) || seen.len() >= MAX_MODULES {
+                        continue;
+                    }
+                    seen.insert(target.clone());
+                    // Уже собранный модуль второй раз не тянем: у браузера на реалм
+                    // одна карта модулей, и адрес в ней один, сколько бы кусков его
+                    // ни импортировало.
+                    let (i, u) = (index, target.clone());
+                    if self
+                        .engine
+                        .pool
+                        .dispatch(self.worker, move |iso| iso.has_module(i, &u))
+                        .await
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    to_fetch.push(target);
                 }
-                match self.fetch_text_in(index, &target, "script", None).await {
+            }
+            let got = futures_util::future::join_all(
+                to_fetch.iter().map(|t| self.fetch_text_in(index, t, "script", None)),
+            )
+            .await;
+            for (target, res) in to_fetch.into_iter().zip(got) {
+                match res {
                     Ok((_, code)) => pending.push((target, code)),
                     Err(e) => tracing::debug!(url = %target, error = %e, "import failed to load"),
                 }
@@ -2872,7 +2914,7 @@ impl BrowserContext {
                 return;
             }
             // Цикл может сам загрузить документ, а тот — снова ждать таблиц.
-            if Box::pin(self.run_event_loop_waiting(std::time::Duration::ZERO)).await.is_err() {
+            if Box::pin(self.run_event_loop_waiting(std::time::Duration::ZERO, true)).await.is_err() {
                 return;
             }
         }
@@ -3238,6 +3280,7 @@ impl BrowserContext {
                     resp.encoded_len,
                     Some(resp.elapsed_ms),
                     &resp.content_encoding,
+                    resp.redirect_ms,
                 );
                 let headers_js =
                     serde_json::to_string(&resp.headers).unwrap_or_else(|_| "{}".into());
@@ -3415,6 +3458,7 @@ impl BrowserContext {
                     resp.encoded_len,
                     Some(resp.elapsed_ms),
                     &resp.content_encoding,
+                    resp.redirect_ms,
                 );
                 let final_url = if resp.url.is_empty() {
                     url.to_string()
@@ -3459,6 +3503,7 @@ impl BrowserContext {
             body.len(),
             None,
             "",
+            None,
         )
     }
 
@@ -3481,6 +3526,7 @@ impl BrowserContext {
         encoded_len: usize,
         measured_ms: Option<f64>,
         content_encoding: &str,
+        redirect_ms: Option<f64>,
     ) {
         let now = self.started.elapsed().as_secs_f64() * 1000.0;
         // Замеренное время обращения, а не одно и то же число на всех: у
@@ -3505,6 +3551,7 @@ impl BrowserContext {
             duration_ms: duration_ms.max(0.0),
             encoded_len,
             content_encoding: content_encoding.to_string(),
+            redirect_ms,
             context,
         };
         if let Ok(mut log) = self.requests.lock() {

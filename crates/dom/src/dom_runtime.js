@@ -2912,8 +2912,22 @@
     const decls = __cssDecls(parsed.body || '');
     const sel = __cssSelector(prelude);
     const body = __styleEntries(decls).map(([k, v]) => k + ': ' + v + ';').join(' ');
-    return own(r, { selectorText: sel, style: __cssDeclaration(decls),
-                    cssRules: __cssRuleList([]), insertRule() { return 0; }, deleteRule() {},
+    own(r, { selectorText: sel });
+    // Объявление правила — семьсот свойств на объекте — строится, только
+    // когда его попросят. Строить его на каждое из тысяч правил стоило
+    // восьмисот миллисекунд на таблицу: страница с двумя крупными таблицами
+    // запускала первый скрипт на две секунды позже браузера. Каскаду оно не
+    // нужно — он читает карту объявлений напрямую.
+    Object.defineProperty(r, 'style', {
+      get() {
+        const d = __cssDeclaration(decls);
+        Object.defineProperty(this, 'style', { value: d, enumerable: true, configurable: true });
+        return d;
+      },
+      enumerable: true, configurable: true,
+    });
+    Object.defineProperty(r, '__ptDecls', { value: decls, enumerable: false, configurable: true });
+    return own(r, { cssRules: __cssRuleList([]), insertRule() { return 0; }, deleteRule() {},
                     cssText: sel + ' { ' + (body ? body + ' ' : '') + '}' });
   }
 
@@ -5704,7 +5718,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         for (const one of __selSplit(r.selectorText)) {
           const sel = one.trim();
           if (!sel) continue;
-          out.push({ root, sel, spec: __specificity(sel), order: state.order++, style: r.style });
+          out.push({ root, sel, spec: __specificity(sel), order: state.order++, rule: r });
         }
       }
     };
@@ -5728,6 +5742,79 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // страницы туда не достают, и браузер отвечает умолчаниями: чёрным цветом и
   // шестнадцатью пикселями. Мы отвечали цветом и кеглем страницы, и весь
   // перечисленный стиль расходился с браузерным — челлендж снимает его целиком.
+  /// Ключ правила — по самому правому составному: id, класс или тег. Каскад
+  /// спрашивает только правила со «своими» ключами, как браузер: сверять
+  /// каждое из трёх тысяч правил chess.com с каждым элементом стоило по сотне
+  /// миллисекунд на всякую перераскладку.
+  function __ruleKey(sel) {
+    let depth = 0, q = null, start = 0;
+    for (let i = 0; i < sel.length; i++) {
+      const c = sel[i];
+      if (c === '\\') { i++; continue; }
+      if (q) { if (c === q) q = null; continue; }
+      if (c === '"' || c === "'") q = c;
+      else if (c === '(' || c === '[') depth++;
+      else if (c === ')' || c === ']') depth--;
+      else if (depth === 0 && (c === ' ' || c === '>' || c === '+' || c === '~' || c === '\t' || c === '\n')) start = i + 1;
+    }
+    const comp = sel.slice(start);
+    let flat = '';
+    depth = 0;
+    for (const c of comp) {
+      if (c === '(' || c === '[') { depth++; continue; }
+      if (c === ')' || c === ']') { depth--; continue; }
+      if (depth === 0) flat += c;
+    }
+    if (flat.indexOf('\\') >= 0) return null;
+    let m = /#([\w-]+)/.exec(flat);
+    if (m) return 'i' + m[1];
+    m = /\.([\w-]+)/.exec(flat);
+    if (m) return 'c' + m[1];
+    m = /^([a-zA-Z][\w-]*)/.exec(flat);
+    if (m) return 't' + m[1].toLowerCase();
+    return null;
+  }
+  const __ruleIndexes = new WeakMap();
+  function __ruleIndex(rules) {
+    let ix = __ruleIndexes.get(rules);
+    if (ix && ix.n === rules.length) return ix;
+    ix = { n: rules.length, keyed: new Map(), any: [] };
+    for (const r of rules) {
+      const k = __ruleKey(r.sel);
+      if (k == null) { ix.any.push(r); continue; }
+      let list = ix.keyed.get(k);
+      if (!list) ix.keyed.set(k, (list = []));
+      list.push(r);
+    }
+    __ruleIndexes.set(rules, ix);
+    return ix;
+  }
+  /// Правила, которые могут подойти элементу.
+  function __candidateRules(el) {
+    const ix = __ruleIndex(__rulesFor(el.ownerDocument));
+    const out = ix.any.slice();
+    const add = (k) => { const l = ix.keyed.get(k); if (l) for (const r of l) out.push(r); };
+    add('t' + String(el.localName || '').toLowerCase());
+    const id = __ptGetA(el, 'id');
+    if (id) add('i' + id);
+    const cls = __ptGetA(el, 'class');
+    if (cls) {
+      const seen = new Set();
+      for (const c of cls.split(/[\t\n\f\r ]+/)) if (c && !seen.has(c)) { seen.add(c); add('c' + c); }
+    }
+    return out;
+  }
+
+  /// Карта объявлений правила как написано.
+  function __ruleMap(rr) {
+    const rule = rr.rule;
+    if (!rule) return null;
+    if (rule.__ptDecls) return rule.__ptDecls;
+    const d = rule.style;
+    const raw = d && __declRaw.get(d);
+    return raw ? raw() : null;
+  }
+
   function __rulesFor(doc) {
     if (!doc || doc === globalThis.document) return __rules;
     let hit = __foreignRules.get(doc);
@@ -5752,10 +5839,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     // Спрятанное собирается тем же проходом: скрытие — просто одно из
     // объявлений, и отдельного правила для него больше не нужно.
     for (const r of __rules) {
-      const d = r.style;
+      const d = __ruleMap(r);
       if (!d) continue;
-      const disp = String(d.getPropertyValue('display') || '').toLowerCase();
-      const vis = String(d.getPropertyValue('visibility') || '').toLowerCase();
+      const disp = String(d.get('display') || '').toLowerCase();
+      const vis = String(d.get('visibility') || '').toLowerCase();
       if (disp !== 'none' && vis !== 'hidden' && vis !== 'collapse') continue;
       try {
         for (const el of query(r.root, r.sel)) {
@@ -5803,7 +5890,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       }
     }
     const won = [];
-    for (const r of __rulesFor(el.ownerDocument)) {
+    for (const r of __candidateRules(el)) {
       let ok = false;
       try { ok = matchesSelector(el, r.sel); } catch (e) {}
       if (ok) won.push(r);
@@ -5835,7 +5922,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         note(n, d.getPropertyValue(n));
       }
     };
-    for (const r of won) noteAll(r.style);
+    for (const r of won) {
+      const m = __ruleMap(r);
+      if (m) for (const [n, v] of m) note(n, String(v));
+    }
     const own = el.style;
     if (own) noteAll(own);
     const vars = __customsFor(el, mine);

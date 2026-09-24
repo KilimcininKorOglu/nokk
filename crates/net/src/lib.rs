@@ -341,6 +341,11 @@ pub struct Response {
     /// после распаковки снимается, а значение браузер показывает в записи
     /// Resource Timing (`contentEncoding`).
     pub content_encoding: String,
+    /// Через сколько миллисекунд от начала пришёл ответ последнего
+    /// перенаправления; `None` — перенаправлений не было. Браузер показывает
+    /// это в Resource Timing (`redirectStart`/`redirectEnd`), и api.js
+    /// Turnstile, который всегда приходит через 302, отдаёт эту запись виджету.
+    pub redirect_ms: Option<f64>,
     /// Final URL after any redirects were followed — the origin the body
     /// actually came from. Callers use it as the document base URL.
     pub url: String,
@@ -753,6 +758,19 @@ impl HttpClient for FingerprintClient {
             tracing::trace!(url = %req.url, method = %req.method, page_headers = %sent.join(" | "), "request");
         }
         let started = std::time::Instant::now();
+        // Своя политика перенаправлений на запрос — только чтобы засечь, когда
+        // пришёл ответ последнего из них. Правило то же: не больше десяти.
+        let hop_at: Arc<std::sync::Mutex<Option<std::time::Instant>>> = Arc::default();
+        {
+            let hop_at = hop_at.clone();
+            let limit = wreq::redirect::Policy::limited(10);
+            rb = rb.redirect(wreq::redirect::Policy::custom(move |attempt| {
+                if let Ok(mut t) = hop_at.lock() {
+                    *t = Some(std::time::Instant::now());
+                }
+                limit.redirect(attempt)
+            }));
+        }
         let resp = rb.send().await.map_err(|e| {
             if e.is_timeout() {
                 NetError::Timeout
@@ -802,6 +820,11 @@ impl HttpClient for FingerprintClient {
             .unwrap_or_default();
         let body = decode_body(&encoding, raw);
         let content_encoding = encoding.clone();
+        let redirect_ms = hop_at
+            .lock()
+            .ok()
+            .and_then(|t| *t)
+            .map(|t| t.duration_since(started).as_secs_f64() * 1000.0);
         headers.remove("content-encoding");
         headers.remove("content-length");
         Ok(Response {
@@ -812,6 +835,7 @@ impl HttpClient for FingerprintClient {
             encoded_len,
             elapsed_ms,
             content_encoding,
+            redirect_ms,
         })
     }
 }
