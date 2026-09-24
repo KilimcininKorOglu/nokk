@@ -997,6 +997,19 @@
       // Всё, что пришло через `<link>`, браузер называет `link` в перечне
       // ресурсов — и предзагрузку, и значок, и таблицу стилей.
       const kind = rel === 'stylesheet' ? 'stylesheet' : 'link';
+      // Таблица из разметки задерживает скрипты, что идут за ней: браузер не
+      // исполнит их, пока её не разберёт. У нас скрипты шли сразу, и всё, что
+      // они мерили при запуске, мерилось по голой странице — api.js Turnstile
+      // отдавал виджету место обёртки у правого края окна вместо центра.
+      const blocking = rel === 'stylesheet' && !document.__ptCurScript
+        && this.ownerDocument === document && document.__ptReady === 'loading';
+      if (blocking) globalThis.__ptBlockingSheets = (globalThis.__ptBlockingSheets | 0) + 1;
+      let released = false;
+      const release = () => {
+        if (!blocking || released) return;
+        released = true;
+        globalThis.__ptBlockingSheets = Math.max(0, (globalThis.__ptBlockingSheets | 0) - 1);
+      };
       __pt_subresource(url, kind).then(
         (res) => {
           // Внешняя таблица стилей — это правила, а не просто запрос: у нас
@@ -1010,13 +1023,14 @@
                 { value: text, writable: true, enumerable: false, configurable: true });
               __markDirty();
             }
+            release();
             if (this.__ptFireLoad) this.__ptFireLoad(true);
           };
           if (wanted && res && typeof res.text === 'function') {
             res.text().then(take, () => take(null));
           } else take(null);
         },
-        () => { if (this.__ptFireLoad) this.__ptFireLoad(false); },
+        () => { release(); if (this.__ptFireLoad) this.__ptFireLoad(false); },
       );
     }
 
@@ -6291,6 +6305,74 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   const UA_MONO = new Set(['pre', 'code', 'kbd', 'samp', 'tt', 'textarea', 'xmp', 'plaintext', 'listing']);
 
   // Строчный ли это уровень: такие дети ложатся в одну строку, а не столбиком.
+  /// Два поля, схлопнутые в одно: наибольшее положительное плюс наименьшее
+  /// отрицательное.
+  const __collapseM = (a, b) => Math.max(0, a, b) + Math.min(0, a, b);
+
+  /// Ширина по содержимому (max-content), рамка включительно: сколько
+  /// займёт элемент, если ему ничего не навязывать. Нужна ребёнку гибкого
+  /// ряда: его основа — эта ширина, а не вся строка. Мы давали всю строку,
+  /// и пустой `div`, который api.js Turnstile вставляет в центрованный ряд,
+  /// у нас стоял у правого края — а его место уходит виджету в письме.
+  function __maxContentW(el, depth) {
+    depth = depth || 0;
+    if (depth > 40 || !el || el.nodeType !== ELEMENT_NODE || __isUnboxed(el)) return 0;
+    const cs = __cascadeFor(el);
+    const fs = __usedFontSize(el);
+    const tag = (el.localName || '').toLowerCase();
+    const len = (n) => __lengthPx(cs.get(n), fs, null);
+    const bbox = /^border-box$/i.test(String(cs.get('box-sizing') || '').trim());
+    const pad = (len('padding-left') || 0) + (len('padding-right') || 0)
+      + (len('border-left-width') || 0) + (len('border-right-width') || 0);
+    const clamp = (w) => {
+      const hi = len('max-width'), lo = len('min-width');
+      if (hi != null && w > (bbox ? hi : hi + pad)) w = bbox ? hi : hi + pad;
+      if (lo != null && w < (bbox ? lo : lo + pad)) w = bbox ? lo : lo + pad;
+      return w;
+    };
+    const w = len('width');
+    if (w != null) return clamp(bbox ? w : w + pad);
+    const ua = __uaBox(el, tag);
+    if (ua && ua.w != null) return clamp(ua.w + pad);
+    let familyRaw = cs.get('font-family');
+    if (familyRaw == null) familyRaw = __inheritedValue(el, 'font-family');
+    const family = String(familyRaw || '').trim() || 'sans-serif';
+    const weight = cs.get('font-weight') || __inheritedValue(el, 'font-weight') || (UA_BOLD.has(tag) ? '700' : '');
+    const bold = /(^|\s)(bold|[5-9]00)(\s|$)/i.test(String(weight));
+    const text = __OWN_TEXT(el);
+    let inner = text ? __textWidth(text, fs, family, bold, false) : 0;
+    const kids = [];
+    for (const c of (el.__ptKids || [])) {
+      if (c.nodeType !== ELEMENT_NODE || __isUnboxed(c)) continue;
+      const p = String(__cascadeFor(c).get('position') || 'static').toLowerCase();
+      if (p !== 'absolute' && p !== 'fixed') kids.push(c);
+    }
+    const display = String(cs.get('display') || CS_DISPLAY[tag] || 'block').toLowerCase();
+    const outer = (c) => {
+      const ccs = __cascadeFor(c), cfs = __usedFontSize(c);
+      return __maxContentW(c, depth + 1) + (__lengthPx(ccs.get('margin-left'), cfs, null) || 0)
+        + (__lengthPx(ccs.get('margin-right'), cfs, null) || 0);
+    };
+    const gap = (n) => { const v = cs.get(n); return v == null || /normal/i.test(String(v)) ? 0 : (__lengthPx(v, fs, null) || 0); };
+    if (/flex$/.test(display) && !/^column/.test(String(cs.get('flex-direction') || 'row'))) {
+      inner += kids.reduce((a, c) => a + outer(c), 0) + gap('column-gap') * Math.max(0, kids.length - 1);
+    } else if (/grid$/.test(display)) {
+      const n = Math.max(1, __gridTracks(cs.get('grid-template-columns'), 0, 0, fs).length);
+      const cols = new Array(n).fill(0);
+      kids.forEach((c, i) => { cols[i % n] = Math.max(cols[i % n], outer(c)); });
+      inner += cols.reduce((a, x) => a + x, 0) + gap('column-gap') * (n - 1);
+    } else {
+      // Строчные — в одну строку, блочные — каждый своей.
+      let line = inner, widest = 0;
+      for (const c of kids) {
+        if (__isInlineLevel(c)) line += outer(c);
+        else { widest = Math.max(widest, line, outer(c)); line = 0; }
+      }
+      inner = Math.max(widest, line);
+    }
+    return clamp(inner + pad);
+  }
+
   function __isInlineLevel(el) {
     const tag = (el.localName || '').toLowerCase();
     const d = String(__cascadeFor(el).get('display') || CS_DISPLAY[tag] || 'block').toLowerCase();
@@ -6550,7 +6632,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const contentX = boxX + bl + pl;
     let contentY = boxY + bt + pt_;
     // Поля детей, убежавшие наружу через пустой край родителя.
-    let escapedTop = 0, escapedBottom = 0;
+    let escapedTop = 0, escapedBottom = 0, hasEscapedTop = false;
     let y = contentY, widest = 0, deepest = 0;
     // Гибкий контейнер: дети ложатся в ряд (или в столбец), свободное место
     // делится по `flex-grow`, нехватка — по `flex-shrink`, а поперёк они по
@@ -6699,7 +6781,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         const basis = String(ccs.get('flex-basis') || 'auto').toLowerCase();
         const basisPx = basis === 'auto' || basis === 'content'
           ? null : __lengthPx(basis, cfs, cw);
-        const natural = row ? cb.w : cb.h;
+        // Основа в ряду — ширина по содержимому, если ширина не задана.
+        const autoW = ccs.get('width') == null || /^auto$/i.test(String(ccs.get('width')).trim());
+        const natural = row ? (autoW ? Math.min(cb.w, __maxContentW(c)) : cb.w) : cb.h;
         return {
           el: c, box: cb,
           grow: num(ccs.get('flex-grow'), 0),
@@ -6824,9 +6908,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
           // Наружу — только у первого в потоке и только через пустой край.
           // У соседей поля схлопываются в большее из двух: коробка встала на
           // своё поле, и добрать надо лишь разницу.
+          // Отрицательные поля тоже схлопываются: итог — наибольшее
+          // положительное плюс наименьшее отрицательное. Мы их отбрасывали,
+          // и `margin-top: -15px` у chess.com не поднимал блок ни на пиксель.
           const escapes = firstFlow && !bt && !pt_;
-          const shift = escapes ? -cmt : Math.max(0, carry - cmt);
-          if (escapes) escapedTop = Math.max(escapedTop, cmt);
+          const shift = escapes ? -cmt : __collapseM(carry, cmt) - cmt;
+          if (escapes) { escapedTop = cmt; hasEscapedTop = true; }
           if (shift) __ptShiftBox(c, cb.x, cb.y + shift);
           widest = Math.max(widest, cb.x - contentX + cb.w);
           deepest = Math.max(deepest, cb.y - contentY + cb.h);
@@ -6856,15 +6943,16 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     // Убежавшее поле становится полем самого родителя: блок с абзацем внутри
     // стоит у браузера на шестнадцать пикселей ниже, чем встал бы без этого,
     // а дети внутри — там же, где были.
-    if (escapedTop > mt) {
-      const delta = escapedTop - mt;
+    const collapsedTop = hasEscapedTop ? __collapseM(mt, escapedTop) : mt;
+    if (collapsedTop !== mt) {
+      const delta = collapsedTop - mt;
       for (const c of boxedKids) {
         if (c.__ptBox) __ptShiftBox(c, c.__ptBox.x, c.__ptBox.y + delta);
       }
       boxY += delta; contentY += delta; y += delta;
-      mt = escapedTop;
+      mt = collapsedTop;
     }
-    if (escapedBottom > mb) mb = escapedBottom;
+    if (escapedBottom) mb = __collapseM(mb, escapedBottom);
     if (inlineish && explicitW == null && !forcedW && boxedKids.length) cw = widest;
 
     let ch;

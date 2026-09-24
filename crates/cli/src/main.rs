@@ -1264,6 +1264,33 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       }, G);
                     } catch (e) {}
 
+                    // Где стоит обёртка виджета в тот миг, когда api.js её
+                    // меряет (поле `wp` письма): цепочка предков и число таблиц.
+                    try {
+                      const E = globalThis.Element && Element.prototype;
+                      const R = E && E.getBoundingClientRect;
+                      if (R) E.getBoundingClientRect = асНатив(function () {
+                        const r = R.apply(this, arguments);
+                        try {
+                          if (!__ptЧужой() && this.closest && this.closest('#turnstile-login-form')
+                              && (globalThis.__ptМест = (globalThis.__ptМест || 0) + 1) < 4) {
+                            const цеп = [];
+                            for (let e = this; e && e.nodeType === 1 && цеп.length < 9; e = e.parentElement) {
+                              const q = R.call(e);
+                              цеп.push(e.tagName.toLowerCase() + '.' + String(e.className || '').split(' ')[0]
+                                + ' ' + q.left + ',' + q.top + ' ' + q.width + 'x' + q.height);
+                            }
+                            console.error('[место] таблиц=' + document.styleSheets.length + ' | ' + цеп.join(' < '));
+                            console.error('[место] ' + [...document.styleSheets].map((t) => {
+                              let n = '?'; try { n = t.cssRules.length; } catch (e) { n = 'x'; }
+                              return String(t.href || (t.ownerNode && t.ownerNode.tagName) || '').slice(-40) + '=' + n;
+                            }).join(' '));
+                          }
+                        } catch (e) {}
+                        return r;
+                      }, R);
+                    } catch (e) {}
+
                     // Что приходит кадру письмами: часть тела первого POST
                     // виджет получает от страницы (api.js) — и у Chrome в этом
                     // месте есть поля, которых у нас нет.

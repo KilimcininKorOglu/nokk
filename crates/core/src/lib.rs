@@ -1162,6 +1162,7 @@ impl BrowserContext {
             // а модуль уходит из этого цикла раньше, чем доходит до конца.
             if index == self.index {
                 self.frames_take_a_turn().await;
+                self.wait_for_blocking_sheets(index).await;
             }
             // `<script nomodule>` is addressed to a browser without modules. We
             // have them, so we are not the audience — and a site that ships both
@@ -2855,6 +2856,28 @@ impl BrowserContext {
     /// длинных последовательностей главного документа: пока страница по
     /// очереди качает и исполняет свои скрипты, виджет в кадре иначе стоит
     /// целыми секундами — у браузера он живёт в своём процессе и не ждёт.
+    /// Дождаться таблиц стилей из разметки, прежде чем исполнять следующий
+    /// скрипт, — как браузер. Ожидание не простой: страница живёт, её
+    /// таймеры идут, а запросы за таблицами обслуживаются тем же циклом.
+    async fn wait_for_blocking_sheets(&self, index: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let pending = self
+                .eval_in(index, "globalThis.__ptBlockingSheets | 0")
+                .await
+                .ok()
+                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                .unwrap_or(0);
+            if pending == 0 || std::time::Instant::now() >= deadline {
+                return;
+            }
+            // Цикл может сам загрузить документ, а тот — снова ждать таблиц.
+            if Box::pin(self.run_event_loop_waiting(std::time::Duration::ZERO)).await.is_err() {
+                return;
+            }
+        }
+    }
+
     async fn frames_take_a_turn(&self) {
         if !self.has_frames() {
             return;
