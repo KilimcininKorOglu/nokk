@@ -4858,7 +4858,8 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   };
 
   // Plausible, correctly ordered navigation milestones anchored at the origin.
-  const T = (d) => ORIGIN + d;
+  // Поля `performance.timing` — целые миллисекунды эпохи, как у браузера.
+  const T = (d) => Math.round(ORIGIN + d);
   const TIMING = {
     navigationStart: T(0), unloadEventStart: 0, unloadEventEnd: 0,
     redirectStart: 0, redirectEnd: 0,
@@ -4948,6 +4949,35 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
     if (t === 'text/xml' || t === 'application/xml' || /\+xml$/.test(t)) return 'application/xml';
     return t;
   };
+  // Отметки документа (domInteractive, DOMContentLoaded, load) — в тот миг,
+  // когда событие случилось; до того в записи нули, как у браузера.
+  const NAV_MARKS = {};
+  let NAV_ENTRY = null;
+  const __ptSyncTimingMarks = () => {
+    const at = (v) => (v ? Math.round(ORIGIN + v) : 0);
+    const m = NAV_MARKS;
+    Object.assign(TIMING, {
+      domInteractive: at(m.interactive), domContentLoadedEventStart: at(m.dclStart),
+      domContentLoadedEventEnd: at(m.dclEnd), domComplete: at(m.complete),
+      loadEventStart: at(m.loadStart), loadEventEnd: at(m.loadEnd),
+    });
+  };
+  Object.defineProperty(globalThis, '__pt_markNav', {
+    value: (name) => {
+      if (NAV_MARKS[name]) return;
+      NAV_MARKS[name] = nowMs();
+      const e = NAV_ENTRY;
+      if (e) {
+        const field = { interactive: 'domInteractive', dclStart: 'domContentLoadedEventStart',
+          dclEnd: 'domContentLoadedEventEnd', complete: 'domComplete',
+          loadStart: 'loadEventStart', loadEnd: 'loadEventEnd' }[name];
+        if (field) __pt_write(e, field, NAV_MARKS[name]);
+        if (name === 'loadEnd') __pt_write(e, 'duration', NAV_MARKS[name]);
+      }
+      __ptSyncTimingMarks();
+    },
+    enumerable: false, configurable: true,
+  });
   globalThis.__pt_noteResources = (json) => {
     let list;
     const fresh = [];
@@ -4964,8 +4994,16 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
       // Перенаправление: запись начинается с первого запроса, а выборка —
       // с конца последнего перенаправления.
       const hop = r.redirect != null && Number(r.redirect) > 0 ? Math.min(Number(r.redirect), Number(r.duration) || 0) : 0;
-      const fs = start + hop;
-      const rs = fs + ((Number(r.duration) || 0) - hop) * 0.8;
+      const isNav = r.entryType === 'navigation';
+      const net = Math.max(0, (Number(r.duration) || 0) - hop);
+      // У навигации выборка начинается не в нуле, а соединение, запрос и
+      // первый байт идут своими шагами: у кадра виджета в Chrome это
+      // 56 → 58…147 → 147 → 204 → 242. У нас все они стояли в одной точке.
+      const fs = start + hop + (isNav ? Math.min(net * 0.02, 5) : 0);
+      const span = Math.max(0, end - fs);
+      const cEnd = isNav && span > 120 ? fs + span * 0.45 : fs;
+      const rq = isNav ? cEnd + (span > 120 ? 0.3 : 0) : fs;
+      const rs = isNav ? fs + span * 0.78 : fs + net * 0.8;
       Object.assign(e, {
         name: String(r.name || ''), entryType: r.entryType || 'resource',
         startTime: start, duration: Number(r.duration) || 0,
@@ -4977,8 +5015,8 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
         workerMatchedSourceType: '', workerFinalSourceType: '',
         redirectStart: hop ? start : 0, redirectEnd: hop ? fs : 0,
         fetchStart: fs, domainLookupStart: fs, domainLookupEnd: fs,
-        connectStart: fs, secureConnectionStart: fs, connectEnd: fs,
-        requestStart: fs, responseStart: rs,
+        connectStart: cEnd > fs ? fs + 1.5 : fs, secureConnectionStart: cEnd > fs ? fs + 1.5 : fs, connectEnd: cEnd,
+        requestStart: rq, responseStart: rs,
         firstInterimResponseStart: 0, finalResponseHeadersStart: rs, responseEnd: end,
         transferSize: Number(r.size) || 0,
         encodedBodySize: Math.max(0, (Number(r.size) || 0) - 300),
@@ -4987,13 +5025,30 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
         serverTiming: [],
       });
       if (r.entryType === 'navigation') {
+        // Отметки документа — нули, пока событие не случилось, как у браузера;
+        // их ставит __pt_markNav. Длительность навигации — до конца `load`.
+        const m = NAV_MARKS;
         Object.assign(e, {
-          unloadEventStart: 0, unloadEventEnd: 0, domInteractive: end,
-          domContentLoadedEventStart: end, domContentLoadedEventEnd: end,
-          domComplete: end, loadEventStart: end, loadEventEnd: end,
+          unloadEventStart: 0, unloadEventEnd: 0, domInteractive: m.interactive || 0,
+          domContentLoadedEventStart: m.dclStart || 0, domContentLoadedEventEnd: m.dclEnd || 0,
+          domComplete: m.complete || 0, loadEventStart: m.loadStart || 0, loadEventEnd: m.loadEnd || 0,
           type: 'navigate', redirectCount: 0, activationStart: 0, criticalCHRestart: 0,
           notRestoredReasons: null,
         });
+      }
+      if (r.entryType === 'navigation') {
+        __pt_write(e, 'duration', NAV_MARKS.loadEnd || 0);
+        NAV_ENTRY = e;
+        // `performance.timing` — те же отметки, в миллисекундах эпохи.
+        const at = (v) => (v ? Math.round(ORIGIN + v) : 0);
+        Object.assign(TIMING, {
+          fetchStart: at(e.fetchStart), domainLookupStart: at(e.domainLookupStart),
+          domainLookupEnd: at(e.domainLookupEnd), connectStart: at(e.connectStart),
+          secureConnectionStart: at(e.secureConnectionStart), connectEnd: at(e.connectEnd),
+          requestStart: at(e.requestStart), responseStart: at(e.responseStart),
+          responseEnd: at(e.responseEnd), domLoading: at(e.responseStart),
+        });
+        __ptSyncTimingMarks();
       }
       entries.push(e);
       fresh.push(e);
@@ -5118,12 +5173,26 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   {
     const offsets = {};
     for (const k of Object.keys(TIMING)) offsets[k] = TIMING[k] ? TIMING[k] - ORIGIN : 0;
+    // Начало часов документа — начало его навигации. Контекст кадра строится
+    // уже после того, как документ скачан, и без сдвига навигация кадра
+    // начиналась с готового ответа: её длительность выходила втрое короче
+    // хромовской, а виджет Turnstile кладёт её в тело первого POST.
+    Object.defineProperty(globalThis, '__pt_shiftOrigin', {
+      value: (ms) => {
+        const d = Math.max(0, Number(ms) || 0);
+        ORIGIN -= d;
+        HR_BASE -= d;
+        for (const k of Object.keys(offsets)) TIMING[k] = offsets[k] || k === 'navigationStart' ? Math.round(ORIGIN + offsets[k]) : 0;
+        PERF_BAG.timeOrigin = ORIGIN;
+      },
+      enumerable: false, configurable: true,
+    });
     Object.defineProperty(globalThis, '__pt_resetClock', {
       value: () => {
         ORIGIN = originNow();
         HR_BASE = typeof hr === 'function' ? hr() : 0;
         last = 0;
-        for (const k of Object.keys(offsets)) TIMING[k] = offsets[k] || k === 'navigationStart' ? ORIGIN + offsets[k] : 0;
+        for (const k of Object.keys(offsets)) TIMING[k] = offsets[k] || k === 'navigationStart' ? Math.round(ORIGIN + offsets[k]) : 0;
         PERF_BAG.timeOrigin = ORIGIN;
       },
       enumerable: false, configurable: true,

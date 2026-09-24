@@ -2603,6 +2603,7 @@ impl BrowserContext {
                             .pool
                             .dispatch_detached(self.frame_worker, move |iso| iso.prewarm_realms(&boot, 2));
                     }
+                    let nav_started = std::time::Instant::now();
                     let Ok((_, html)) = self.fetch_text(&url, "document").await else {
                         let _ = self.evaluate(&format!("__pt_frameFailed({id})")).await;
                         continue;
@@ -2637,6 +2638,12 @@ impl BrowserContext {
                             Some(std::sync::Arc::new(self.engine.pool.register_context(place))),
                         )
                     };
+                    // Часы кадра идут от начала его навигации, а не от постройки
+                    // контекста: документ к этому мигу уже пришёл.
+                    let ago = nav_started.elapsed().as_secs_f64() * 1000.0;
+                    let _ = self
+                        .eval_in(index, &format!("globalThis.__pt_shiftOrigin && __pt_shiftOrigin({ago:.3});"))
+                        .await;
                     // Teach the child who it is before anything runs in it: its own
                     // frame id (so its `postMessage` can be routed back) and that it
                     // is not the top-level window.
@@ -6082,7 +6089,9 @@ mod tests {
               ordered: (t => t.loadEventEnd >= t.domComplete && t.domComplete >= t.domInteractive
                         && t.domInteractive >= t.responseEnd && t.responseEnd >= t.requestStart
                         && t.requestStart >= t.navigationStart)(performance.timing),
-              navigationStartAtOrigin: performance.timing.navigationStart === performance.timeOrigin,
+              // У Chrome navigationStart — целые миллисекунды, timeOrigin — дробные.
+              navigationStartAtOrigin: Number.isInteger(performance.timing.navigationStart)
+                && Math.abs(performance.timing.navigationStart - performance.timeOrigin) < 1,
               navType: performance.navigation.type,
               heapLimit: performance.memory.jsHeapSizeLimit,
               entriesIsArray: Array.isArray(performance.getEntries()),

@@ -4885,8 +4885,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // Called after all page scripts have run: fire DOMContentLoaded then load.
   // Разбор кончился: дальше идут отложенные скрипты, и видят они уже
   // `interactive`, как в браузере.
+  // Отметки навигации (domInteractive, DOMContentLoaded, load) — в тот
+  // миг, когда событие и правда случилось. Мы ставили их все равными концу
+  // ответа, и длительность навигации кадра выходила в два-три раза короче
+  // хромовской: у браузера туда входит разбор документа и его скрипты.
+  const __ptMark = (n) => { try { globalThis.__pt_markNav && __pt_markNav(n); } catch (e) {} };
   globalThis.__pt_parseDone = () => {
     if (document.__ptReady !== 'loading') return;
+    __ptMark('interactive');
     document.__ptReady = 'interactive';
     try { document.dispatchEvent(__ptTrust(new Event('readystatechange'))); } catch (e) {}
   };
@@ -4898,7 +4904,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       try { document.dispatchEvent(__ptTrust(new Event('readystatechange'))); } catch (e) {}
     };
     // Разбор мог кончиться раньше — перед отложенными скриптами.
-    if (document.__ptReady === 'loading') готовность('interactive');
+    if (document.__ptReady === 'loading') { __ptMark('interactive'); готовность('interactive'); }
+    __ptMark('dclStart');
     // События жизненного цикла приходят от движка, а движок здесь — браузер:
     // у настоящего `e.isTrusted` истина, и это читают первой же строкой.
     const dcl = __ptTrust(new Event('DOMContentLoaded', { bubbles: true }));
@@ -4913,11 +4920,15 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         globalThis.dispatchEvent(dcl);
       }
     } catch (e) {}
+    __ptMark('dclEnd');
+    __ptMark('complete');
     готовность('complete');
+    __ptMark('loadStart');
     const load = __ptTrust(new Event('load'));
     globalThis.dispatchEvent && globalThis.dispatchEvent(load);
     // `load` в браузере доходит и до документа, и до тела.
     try { document.dispatchEvent(__ptTrust(new Event('load'))); } catch (e) {}
+    __ptMark('loadEnd');
     // `pageshow` идёт следом за `load` — с `persisted: false` у обычной
     // загрузки. Его слушают те, кто отличает переход «назад» от свежей
     // загрузки; у нас его не было вовсе.
