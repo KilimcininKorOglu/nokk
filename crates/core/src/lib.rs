@@ -635,9 +635,13 @@ impl Engine {
             .await?
             .map_err(EngineError::Js)?;
         tracing::debug!(?worker, index, "context created");
+        // Поток для будущих кадров чужого происхождения выбирается сразу.
+        let frame_worker = self.inner.pool.pick_worker_except(worker);
         Ok(BrowserContext {
+            frame_worker,
             frame_pump_count: std::sync::atomic::AtomicUsize::new(0),
             last_frame_turn: std::sync::Mutex::new(std::time::Instant::now()),
+            frames_live: std::sync::atomic::AtomicBool::new(false),
             engine: self.inner.clone(),
             client,
             worker,
@@ -818,6 +822,11 @@ pub struct BrowserContext {
     /// Когда кадры получали ход в последний раз — чтобы давать его и во
     /// время долгих последовательностей вроде загрузки скриптов страницы.
     last_frame_turn: std::sync::Mutex<std::time::Instant>,
+    /// Поток для кадров чужого происхождения (см. `apply_frame_ops`).
+    frame_worker: nokk_pool::WorkerId,
+    /// Кадры сейчас крутятся, пока страница ждёт сеть: второй раз изнутри
+    /// того же пульса их не трогаем.
+    frames_live: std::sync::atomic::AtomicBool,
 
 }
 
@@ -843,6 +852,8 @@ struct FrameState {
     /// applied yet when the frame is first connected — so it is re-checked as
     /// the page settles, the way a browser resizes a frame that changed.
     viewport: (f64, f64),
+    /// Кадр на своём потоке держит его занятым, пока жив.
+    _load: Option<std::sync::Arc<nokk_pool::ContextLoadGuard>>,
 }
 
 /// A live worker: its own V8 context on an isolate thread of its own, and the URL
@@ -908,9 +919,10 @@ impl Drop for BrowserContext {
             indices.extend(workers.values().map(|s| s.index));
         }
         for index in indices {
+            let (w, raw) = self.route(index);
             self.engine
                 .pool
-                .dispatch_detached(self.worker, move |iso| iso.dispose_context(index));
+                .dispatch_detached(w, move |iso| iso.dispose_context(raw));
         }
     }
 }
@@ -1058,7 +1070,19 @@ impl BrowserContext {
     /// page's own context is [`Self::index`], so `eval_in(self.index, …)` is
     /// exactly [`Self::evaluate`].
     async fn eval_in(&self, index: usize, source: &str) -> Result<Value, EngineError> {
-        self.eval_at(self.worker, index, source).await
+        let (worker, raw) = self.route(index);
+        self.eval_at(worker, raw, source).await
+    }
+
+    /// Поток и номер контекста в его изоляте. Страница и кадры её
+    /// происхождения живут на потоке страницы; кадр чужого происхождения —
+    /// на своём, как в браузере с изоляцией сайтов.
+    fn route(&self, index: usize) -> (nokk_pool::WorkerId, usize) {
+        if index & OWN_THREAD != 0 {
+            (nokk_pool::WorkerId((index >> 32) & 0xFFFF), index & 0xFFFF_FFFF)
+        } else {
+            (self.worker, index)
+        }
     }
 
     /// Выполнить скрипт страницы, назвав его своим адресом. Имя уходит в
@@ -1073,10 +1097,11 @@ impl BrowserContext {
     ) -> Result<Value, EngineError> {
         let source = source.to_string();
         let name = name.to_string();
+        let (worker, index) = self.route(index);
         let out = self
             .engine
             .pool
-            .dispatch(self.worker, move |iso| {
+            .dispatch(worker, move |iso| {
                 iso.eval_named(index, &source, Some(name.as_str()))
             })
             .await?
@@ -1212,7 +1237,7 @@ impl BrowserContext {
                     self.run_module(index, base_url, code.clone()).await
                 } else {
                     match resolve_url(base_url, code) {
-                        Some(abs) => match self.fetch_text(&abs, "script").await {
+                        Some(abs) => match self.with_frames_live(self.fetch_text(&abs, "script")).await {
                             Ok((_, source)) => self.run_module(index, &abs, source).await,
                             Err(e) => Err(EngineError::Js(e.to_string())),
                         },
@@ -1250,7 +1275,7 @@ impl BrowserContext {
                             self.record("GET", &abs, "script", 0, &[]);
                             continue;
                         }
-                        match self.fetch_text(&abs, "script").await {
+                        match self.with_frames_live(self.fetch_text(&abs, "script")).await {
                             // `sourceURL` — не отладочная мелочь: без него каждый
                             // кадр стека выглядит как `<anonymous>`, тогда как в
                             // браузере там адрес скрипта. `new Error().stack`
@@ -1284,7 +1309,12 @@ impl BrowserContext {
             let _ = self
                 .eval_in(index, &format!("__pt_beginScript({idx})"))
                 .await;
-            if let Err(e) = self.eval_named_in(index, &code, &whose).await {
+            let ran = if index == self.index {
+                self.with_frames_live(self.eval_named_in(index, &code, &whose)).await
+            } else {
+                self.eval_named_in(index, &code, &whose).await
+            };
+            if let Err(e) = ran {
                 // For an inline script the address is the page's, so name it by
                 // its opening instead — enough to find it in the document.
                 let head: String = code.chars().filter(|c| !c.is_control()).take(70).collect();
@@ -1397,7 +1427,9 @@ impl BrowserContext {
                 // contexts frequently (fairness), rather than held for seconds.
                 iso.run_event_loop(index, remaining, std::time::Duration::from_millis(250))
             });
-            let (page, workers) = tokio::join!(page_slice, self.pump_workers());
+            let (page, workers) = self
+                .with_frames_live(async { tokio::join!(page_slice, self.pump_workers()) })
+                .await;
             let ran = page?.map_err(EngineError::Js)?;
             let pumped_workers = workers?;
             total_timers += ran;
@@ -1488,14 +1520,16 @@ impl BrowserContext {
             let room = MAX_FETCHES.saturating_sub(fetches_done);
             let batch: Vec<Value> = reqs.into_iter().take(room).collect();
             fetches_done += batch.len();
-            let settles = futures_util::future::join_all(
-                batch.iter().map(|r| self.perform_fetch(index, &base, r)),
-            )
-            .await;
+            let settles = self
+                .with_frames_live(futures_util::future::join_all(
+                    batch.iter().map(|r| self.perform_fetch(index, &base, r)),
+                ))
+                .await;
             for settle in settles {
+                let (w, raw) = self.route(index);
                 self.engine
                     .pool
-                    .dispatch(self.worker, move |iso| iso.eval(index, &settle))
+                    .dispatch(w, move |iso| iso.eval(raw, &settle))
                     .await?
                     .map_err(EngineError::Js)?;
                 // Между загрузками кадрам дают ход. Страница вроде chess.com
@@ -1585,6 +1619,10 @@ impl BrowserContext {
                 }
             }
 
+            // Простой страницы — добрать запас пустых реалмов на её потоке.
+            if std::env::var_os("NOKK_NO_SPARE_REALMS").is_none() {
+                self.engine.pool.dispatch_detached(self.worker, |iso| iso.top_up_realms(3, 1));
+            }
             // Idle — but an open socket means "not finished", only "nothing right
             // now". Wait briefly for a frame rather than spinning, and still return
             // promptly: continuous delivery is the caller's job (the CDP server
@@ -2529,18 +2567,50 @@ impl BrowserContext {
                     if self.frames.lock().map(|f| f.len()).unwrap_or(0) >= MAX_FRAMES {
                         continue;
                     }
+                    // Запас пустых реалмов на потоке кадров строится, пока документ
+                    // кадра идёт по сети: программе челленджа они нужны сразу.
+                    if origin_of(&url) != origin_of(base)
+                        && std::env::var_os("NOKK_FRAMES_SHARED").is_none()
+                        && std::env::var_os("NOKK_NO_SPARE_REALMS").is_none()
+                    {
+                        let boot = self.bootstrap.clone();
+                        self.engine
+                            .pool
+                            .dispatch_detached(self.frame_worker, move |iso| iso.prewarm_realms(&boot, 2));
+                    }
                     let Ok((_, html)) = self.fetch_text(&url, "document").await else {
                         let _ = self.evaluate(&format!("__pt_frameFailed({id})")).await;
                         continue;
                     };
                     let boot = self.bootstrap.clone();
-                    let Ok(Ok(index)) = self
+                    // Кадр чужого происхождения — на своём потоке: в браузере он
+                    // в своём процессе и считает, пока страница занята. На общем
+                    // потоке виджет Turnstile ждал, пока страница догрузит сотню
+                    // своих кусков, и его собственные часы показывали отрезки в
+                    // три-пять раз длиннее хромовских — а они уходят в тело
+                    // первого POST. Кадр своего происхождения остаётся со
+                    // страницей.
+                    let cross = origin_of(&url) != origin_of(base);
+                    let place = if cross && std::env::var_os("NOKK_FRAMES_SHARED").is_none() {
+                        self.frame_worker
+                    } else {
+                        self.worker
+                    };
+                    let Ok(Ok(raw_index)) = self
                         .engine
                         .pool
-                        .dispatch(self.worker, move |iso| iso.create_context(&boot))
+                        .dispatch(place, move |iso| iso.create_context(&boot))
                         .await
                     else {
                         continue;
+                    };
+                    let (index, load) = if place == self.worker {
+                        (raw_index, None)
+                    } else {
+                        (
+                            own_thread_index(place, raw_index),
+                            Some(std::sync::Arc::new(self.engine.pool.register_context(place))),
+                        )
                     };
                     // Teach the child who it is before anything runs in it: its own
                     // frame id (so its `postMessage` can be routed back) and that it
@@ -2593,6 +2663,7 @@ impl BrowserContext {
                                 url: url.clone(),
                                 origin: origin.clone(),
                                 viewport: (fw, fh),
+                                _load: load,
                             },
                         );
                     }
@@ -2612,10 +2683,11 @@ impl BrowserContext {
                         // A removed frame is a document that ended: its workers
                         // end with it, exactly as they do when the page navigates.
                         self.terminate_workers_of(Some(idx)).await;
+                        let (w, raw) = self.route(idx);
                         let _ = self
                             .engine
                             .pool
-                            .dispatch(self.worker, move |iso| iso.dispose_context(idx))
+                            .dispatch(w, move |iso| iso.dispose_context(raw))
                             .await;
                     }
                 }
@@ -2695,11 +2767,12 @@ impl BrowserContext {
             let wave = std::mem::take(&mut pending);
             let mut to_fetch: Vec<String> = Vec::new();
             for (at, code) in wave {
-                let (i, u, c) = (index, at.clone(), code);
+                let (mw, i) = self.route(index);
+                let (u, c) = (at.clone(), code);
                 let requests = self
                     .engine
                     .pool
-                    .dispatch(self.worker, move |iso| iso.module_requests(i, &u, &c))
+                    .dispatch(mw, move |iso| iso.module_requests(i, &u, &c))
                     .await?
                     .map_err(EngineError::Js)?;
 
@@ -2709,10 +2782,10 @@ impl BrowserContext {
                     let Some(target) = resolve_url(&at, &spec) else {
                         continue;
                     };
-                    let (i, from, sp, to) = (index, at.clone(), spec.clone(), target.clone());
+                    let (from, sp, to) = (at.clone(), spec.clone(), target.clone());
                     self.engine
                         .pool
-                        .dispatch(self.worker, move |iso| iso.link_module(i, &from, &sp, &to))
+                        .dispatch(mw, move |iso| iso.link_module(i, &from, &sp, &to))
                         .await?;
                     if seen.contains(&target) || seen.len() >= MAX_MODULES {
                         continue;
@@ -2721,11 +2794,11 @@ impl BrowserContext {
                     // Уже собранный модуль второй раз не тянем: у браузера на реалм
                     // одна карта модулей, и адрес в ней один, сколько бы кусков его
                     // ни импортировало.
-                    let (i, u) = (index, target.clone());
+                    let u = target.clone();
                     if self
                         .engine
                         .pool
-                        .dispatch(self.worker, move |iso| iso.has_module(i, &u))
+                        .dispatch(mw, move |iso| iso.has_module(i, &u))
                         .await
                         .unwrap_or(false)
                     {
@@ -2734,10 +2807,11 @@ impl BrowserContext {
                     to_fetch.push(target);
                 }
             }
-            let got = futures_util::future::join_all(
-                to_fetch.iter().map(|t| self.fetch_text_in(index, t, "script", None)),
-            )
-            .await;
+            let got = self
+                .with_frames_live(futures_util::future::join_all(
+                    to_fetch.iter().map(|t| self.fetch_text_in(index, t, "script", None)),
+                ))
+                .await;
             for (target, res) in to_fetch.into_iter().zip(got) {
                 match res {
                     Ok((_, code)) => pending.push((target, code)),
@@ -2746,12 +2820,15 @@ impl BrowserContext {
             }
         }
 
-        let (i, u) = (index, url.to_string());
-        self.engine
+        let (mw, i) = self.route(index);
+        let u = url.to_string();
+        let run = self
+            .engine
             .pool
-            .dispatch(self.worker, move |iso| iso.eval_module(i, &u))
-            .await?
-            .map_err(EngineError::Js)
+            .dispatch(mw, move |iso| iso.eval_module(i, &u));
+        let run = async move { run.await };
+        let out = if index == self.index { self.with_frames_live(run).await } else { run.await };
+        out?.map_err(EngineError::Js)
     }
 
     /// Serve the `import()` calls the isolate is waiting on.
@@ -2762,7 +2839,7 @@ impl BrowserContext {
     /// catches the rejection, fires `vite:preloadError`, and a page listening for
     /// it reloads itself forever.
     async fn serve_dynamic_imports(&self) -> usize {
-        let asked = match self
+        let mut asked = match self
             .engine
             .pool
             .dispatch(self.worker, move |iso| iso.drain_dynamic_imports())
@@ -2771,6 +2848,23 @@ impl BrowserContext {
             Ok(v) => v,
             Err(_) => return 0,
         };
+        // Кадры на своих потоках — со своих изолятов, и только свои.
+        let away: Vec<usize> = self
+            .frames
+            .lock()
+            .map(|f| f.values().map(|s| s.index).filter(|i| i & OWN_THREAD != 0).collect())
+            .unwrap_or_default();
+        for index in away {
+            let (w, raw) = self.route(index);
+            if let Ok(more) = self
+                .engine
+                .pool
+                .dispatch(w, move |iso| iso.drain_dynamic_imports_for(&[raw]))
+                .await
+            {
+                asked.extend(more.into_iter().map(|(id, _, r, sp)| (id, index, r, sp)));
+            }
+        }
         let mut served = 0;
         for (id, index, referrer, specifier) in asked {
             // The referrer is the address the module was compiled under, so a
@@ -2779,7 +2873,7 @@ impl BrowserContext {
                 None => Err(format!(
                     "Failed to resolve module specifier '{specifier}'"
                 )),
-                Some(target) => match self.fetch_text_in(index, &target, "script", None).await {
+                Some(target) => match self.with_frames_live(self.fetch_text_in(index, &target, "script", None)).await {
                     Err(e) => Err(format!("Failed to fetch dynamically imported module: {e}")),
                     Ok((final_url, code)) => match self.run_module(index, &final_url, code).await {
                         Err(e) => Err(e.to_string()),
@@ -2789,13 +2883,14 @@ impl BrowserContext {
             };
             let settle = outcome.as_ref().map(|u| u.as_str()).map_err(Clone::clone);
             let owned: Result<String, String> = settle.map(str::to_string);
+            let (w, raw) = self.route(index);
             let _ = self
                 .engine
                 .pool
-                .dispatch(self.worker, move |iso| {
+                .dispatch(w, move |iso| {
                     iso.settle_dynamic_import(
                         id,
-                        index,
+                        raw,
                         owned.as_ref().map(String::as_str).map_err(Clone::clone),
                     )
                 })
@@ -2945,6 +3040,34 @@ impl BrowserContext {
         }
     }
 
+    /// Дождаться `fut`, не останавливая кадры. Кадр чужого происхождения в
+    /// браузере живёт в своём процессе и считает, пока страница тянет свои
+    /// куски; у нас он стоял всё это время. Виджет Turnstile меряет свои этапы
+    /// часами (`Date.now`), и два его отрезка выходили у нас в три-пять раз
+    /// длиннее хромовских — ровно на время, пока страница грузила сотню
+    /// файлов, а кадр ждал хода. Эти числа уходят в тело первого POST.
+    async fn with_frames_live<F: std::future::Future>(&self, fut: F) -> F::Output {
+        use std::sync::atomic::Ordering;
+        if !self.has_frames()
+            || std::env::var_os("NOKK_FRAMES_WAIT").is_some()
+            || self.frames_live.swap(true, Ordering::AcqRel)
+        {
+            return fut.await;
+        }
+        let mut fut = std::pin::pin!(fut);
+        let out = loop {
+            tokio::select! {
+                biased;
+                out = &mut fut => break out,
+                _ = tokio::time::sleep(FRAME_PUMP_EVERY) => {
+                    let _ = Box::pin(self.pump_frames()).await;
+                }
+            }
+        };
+        self.frames_live.store(false, Ordering::Release);
+        out
+    }
+
     async fn frames_take_a_turn(&self) {
         if !self.has_frames() {
             return;
@@ -2986,12 +3109,19 @@ impl BrowserContext {
             let ran = self
                 .engine
                 .pool
-                .dispatch(self.worker, move |iso| {
-                    iso.run_event_loop(index, 200, std::time::Duration::from_millis(50))
+                .dispatch(self.route(index).0, {
+                    let raw = self.route(index).1;
+                    move |iso| iso.run_event_loop(raw, 200, std::time::Duration::from_millis(50))
                 })
                 .await?
                 .unwrap_or(0);
             work += ran as usize;
+            // Кадр простаивает — самое время добрать запас пустых реалмов на
+            // его потоке: следующий вставленный им кадр получит готовый.
+            if ran == 0 && index & OWN_THREAD != 0 && std::env::var_os("NOKK_NO_SPARE_REALMS").is_none() {
+                let (w, _) = self.route(index);
+                self.engine.pool.dispatch_detached(w, |iso| iso.top_up_realms(5, 1));
+            }
             tracing::debug!(target: "nokk::pace", frame = id, ran, slice_ms = t_slice.elapsed().as_millis() as u64, "срез кадра");
             let qjson = self.eval_in(index, DRAIN_IO).await?;
             let queues: Value = match qjson {
@@ -3233,9 +3363,10 @@ impl BrowserContext {
             }
         }
         if n > 0 {
+            let (w, index) = self.route(index);
             self.engine
                 .pool
-                .dispatch(self.worker, move |iso| iso.eval(index, &script))
+                .dispatch(w, move |iso| iso.eval(index, &script))
                 .await?
                 .map_err(EngineError::Js)?;
         }
@@ -3640,6 +3771,16 @@ const LOAD_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_millis(1
 // 55 мс — ответь». Двадцать миллисекунд задержки на доставку превращали
 // честные 55 в 79, и виджет гонял эту пробу заново, пока не выходил срок.
 const FRAME_PUMP_EVERY: std::time::Duration = std::time::Duration::from_millis(4);
+
+/// Номер контекста кадра, живущего на своём потоке пула. Номера контекстов у
+/// каждого изолята свои, поэтому такой кадр адресуется парой «поток + номер»,
+/// упакованной в одно число с меткой: всё, что принимает `index`, работает с
+/// ним как прежде, а [`BrowserContext::route`] разворачивает его в пару.
+const OWN_THREAD: usize = 1usize << 48;
+
+fn own_thread_index(worker: nokk_pool::WorkerId, raw: usize) -> usize {
+    OWN_THREAD | ((worker.0 & 0xFFFF) << 32) | (raw & 0xFFFF_FFFF)
+}
 
 fn json_num(v: u32) -> Value {
     Value::Number(serde_json::Number::from(v))

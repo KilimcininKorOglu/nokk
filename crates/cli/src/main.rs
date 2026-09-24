@@ -1166,6 +1166,11 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           const ряд = globalThis.__ptСтроки || [];
                           const s1 = JSON.stringify(ряд);
                           console.error('[поля] всего=' + ряд.length + ' тело=' + b.length);
+                          try {
+                            const Ж = globalThis.__ptЧтения || [];
+                            const s2 = JSON.stringify(Ж.slice(-200));
+                            for (let q = 0; q < s2.length; q += 250) console.error('[чтения ' + q / 250 + '] ' + s2.slice(q, q + 250));
+                          } catch (e) {}
                           for (let q = 0; q < s1.length; q += 250) {
                             console.error('[поля ' + ряд.length + ':' + (q / 250) + '] ' + s1.slice(q, q + 250));
                           }
@@ -1174,6 +1179,56 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       return XS.apply(this, arguments);
                     }, XS);
                   } catch (e) {}
+                  // Журнал чтений времени (NOKK_TRACE_READS): что кадр читал из
+                  // часов перед тем, как собрать тело.
+                  if (__READS__ && cf) {
+                    const журнал = (what, v) => {
+                      try {
+                        if (!cf()) return;
+                        const Ж = globalThis.__ptЧтения || (globalThis.__ptЧтения = []);
+                        let где = '';
+                        try { где = String(new Error().stack).split('\n').slice(3, 5).map((x) => x.trim().replace(/^at /, '').replace(/\(?https?:\/\/[^)]*?(:\d+:\d+)\)?/, '$1')).join(' < '); } catch (e) {}
+                        Ж.push([what, typeof v === 'number' ? Math.round(v * 10) / 10 : String(v).slice(0, 30), где]);
+                        if (Ж.length > 400) Ж.splice(0, 100);
+                      } catch (e) {}
+                    };
+                    try {
+                      // Медленные вставки и замеры геометрии: что именно стоит.
+                      const медленно = (label, f) => nat(function () {
+                        const t0 = performance.now();
+                        const r = f.apply(this, arguments);
+                        const dt = performance.now() - t0;
+                        if (dt > 3 && cf()) {
+                          const a = arguments[0];
+                          журнал('медленно ' + label, Math.round(dt) + ' ' + ((a && a.nodeName) || (this && this.nodeName) || ''));
+                        }
+                        return r;
+                      }, f);
+                      const NP = Node.prototype;
+                      for (const k of ['appendChild', 'insertBefore', 'removeChild', 'replaceChild']) NP[k] = медленно(k, NP[k]);
+                      if (globalThis.SVGGraphicsElement) SVGGraphicsElement.prototype.getBBox = медленно('getBBox', SVGGraphicsElement.prototype.getBBox);
+                      Element.prototype.getBoundingClientRect = медленно('rect', Element.prototype.getBoundingClientRect);
+                      globalThis.getComputedStyle = медленно('gcs', globalThis.getComputedStyle);
+                    } catch (e) {}
+                    try {
+                      const PN = Performance.prototype.now;
+                      Performance.prototype.now = nat(function now() { const v = PN.call(this); журнал('now', v); return v; }, PN);
+                      const DN = Date.now;
+                      Date.now = nat(function now() { const v = DN(); журнал('Date.now', v % 100000); return v; }, DN);
+                      for (const [proto, label] of [[globalThis.PerformanceTiming && PerformanceTiming.prototype, 'timing'],
+                                                    [globalThis.PerformanceNavigationTiming && PerformanceNavigationTiming.prototype, 'nav'],
+                                                    [globalThis.PerformanceResourceTiming && PerformanceResourceTiming.prototype, 'res'],
+                                                    [globalThis.Performance && Performance.prototype, 'perf']]) {
+                        if (!proto) continue;
+                        for (const k of Object.getOwnPropertyNames(proto)) {
+                          const d = Object.getOwnPropertyDescriptor(proto, k);
+                          if (!d || !d.get || k === 'constructor') continue;
+                          const g = d.get;
+                          Object.defineProperty(proto, k, { get: nat(function () { const v = g.call(this); if (typeof v === 'number') журнал(label + '.' + k, label === 'timing' ? v % 100000 : v); return v; }, g), set: d.set, enumerable: d.enumerable, configurable: true });
+                        }
+                      }
+                    } catch (e) {}
+                  }
                   try {
                     const CCA = String.prototype.charCodeAt;
                     String.prototype.charCodeAt = nat(function charCodeAt(i) {
@@ -1185,7 +1240,11 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     }, CCA);
                   } catch (e) {}
                 })();"#;
-                c.add_frame_init_script(spread_to_realms(probe, "fields"));
+                let probe = probe.replace(
+                    "__READS__",
+                    if std::env::var("NOKK_TRACE_READS").is_ok() { "true" } else { "false" },
+                );
+                c.add_frame_init_script(spread_to_realms(&probe, "fields"));
             }
             if std::env::var("NOKK_TRACE_HOOKS").is_ok() {
                 let hook = r#"(() => {

@@ -31,6 +31,14 @@ type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 /// second window from it without handing the source to the page.
 pub struct RealmBootstrap(pub String);
 
+/// Запас заранее построенных реалмов. Построить реалм — это новый контекст и
+/// весь бутстрап, 50–90 мс; в браузере пустой кадр появляется за миллисекунду.
+/// Программа челленджа вставляет такие кадры по нескольку раз и меряет себя
+/// часами, так что каждая постройка на месте удлиняла её этапы втрое против
+/// Chrome. Запас наполняется заранее, а выдаётся мгновенно.
+#[derive(Default)]
+pub struct SpareRealms(pub Vec<v8::Global<v8::Context>>);
+
 /// Install every native binding on the current context's global object.
 pub fn install(scope: &mut v8::PinScope) {
     bind(scope, "__pt_makeRealm", make_realm);
@@ -46,6 +54,7 @@ pub fn install(scope: &mut v8::PinScope) {
     bind(scope, "__pt_waveTable", wave_table);
     bind(scope, "__pt_waveTableCustom", wave_table_custom);
     bind(scope, "__pt_compress", compress);
+    bind(scope, "__pt_atob", atob_native);
     bind(scope, "__pt_heapStats", heap_stats);
 
     // Optional real 2D rasterization (the `render` feature). Their presence is the
@@ -1445,6 +1454,55 @@ fn compress(
     set_floats(scope, &mut rv, &all);
 }
 
+/// `__pt_atob(s)` — «прощающее» base64-декодирование по стандарту HTML:
+/// пробелы ASCII выбрасываются, до двух `=` в конце допускаются, лишние биты
+/// в хвосте не мешают. Ответ — строка по байту на знак, или `null`, если вход
+/// не base64 (обёртка тогда бросает браузерную ошибку). На JS это был
+/// посимвольный цикл: программа челленджа расшифровывает так мегабайт и
+/// тратила на трёх вызовах восемьдесят миллисекунд, у браузера — единицы.
+fn atob_native(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    use base64::Engine as _;
+    let Some(text) = args.get(0).to_string(scope) else {
+        rv.set_null();
+        return;
+    };
+    let raw = text.to_rust_string_lossy(scope);
+    let mut body: Vec<u8> = raw
+        .bytes()
+        .filter(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\x0c' | b'\r'))
+        .collect();
+    if body.len() % 4 == 0 {
+        for _ in 0..2 {
+            if body.last() == Some(&b'=') {
+                body.pop();
+            }
+        }
+    }
+    if body.len() % 4 == 1
+        || body.iter().any(|b| !(b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/'))
+    {
+        rv.set_null();
+        return;
+    }
+    let engine = base64::engine::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        base64::engine::GeneralPurposeConfig::new()
+            .with_decode_padding_mode(base64::engine::DecodePaddingMode::RequireNone)
+            .with_decode_allow_trailing_bits(true),
+    );
+    match engine.decode(&body) {
+        Ok(bytes) => match v8::String::new_from_one_byte(scope, &bytes, v8::NewStringType::Normal) {
+            Some(out) => rv.set(out.into()),
+            None => rv.set_null(),
+        },
+        Err(_) => rv.set_null(),
+    }
+}
+
 /// Число из довода — без оглядки на то, собрана ли отрисовка.
 fn arg_f32_any(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> f32 {
     value.number_value(scope).unwrap_or(0.0) as f32
@@ -1492,7 +1550,30 @@ fn make_realm(
             return;
         }
     };
-    tracing::debug!(target: "nokk::realm", "a page asked for a fresh realm");
+    // Спрос на реалмы отмечается самим запасом: где он есть, его подпитывают.
+    if scope.get_slot::<SpareRealms>().is_none() {
+        scope.set_slot(SpareRealms::default());
+    }
+    let spare = scope.get_slot_mut::<SpareRealms>().and_then(|s| s.0.pop());
+    tracing::debug!(target: "nokk::realm", from_spare = spare.is_some(), "a page asked for a fresh realm");
+    if let Some(ready) = spare {
+        let context = v8::Local::new(scope, &ready);
+        let token = scope.get_current_context().get_security_token(scope);
+        context.set_security_token(token);
+        let global = context.global(scope);
+        {
+            let inner = &mut v8::ContextScope::new(scope, context);
+            v8::tc_scope!(inner, inner);
+            // Часы нового окна начинаются в миг выдачи, а не постройки.
+            if let Some(src) = v8::String::new(inner, "globalThis.__pt_resetClock && __pt_resetClock()") {
+                if let Some(script) = v8::Script::compile(inner, src, None) {
+                    let _ = script.run(inner);
+                }
+            }
+        }
+        rv.set(global.into());
+        return;
+    }
     let context = v8::Context::new(scope, v8::ContextOptions::default());
     // Same origin, in V8's own terms: without a shared security token every
     // property read across the boundary answers "no access", which is exactly

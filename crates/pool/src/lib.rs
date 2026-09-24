@@ -165,6 +165,18 @@ impl IsolatePool {
 
     /// Pick the least-loaded worker for a *new* context. The returned id must be
     /// remembered and reused for every subsequent job touching that context.
+    /// Наименее занятый поток, кроме `avoid`, — для кадра чужого
+    /// происхождения, который должен считать параллельно со своей страницей.
+    /// Если поток один, выбора нет.
+    pub fn pick_worker_except(&self, avoid: WorkerId) -> WorkerId {
+        self.workers
+            .iter()
+            .filter(|w| w.id != avoid)
+            .min_by_key(|w| w.load.load(Ordering::Relaxed))
+            .map(|w| w.id)
+            .unwrap_or(avoid)
+    }
+
     pub fn pick_worker(&self) -> WorkerId {
         self.workers
             .iter()

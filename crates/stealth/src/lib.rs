@@ -4822,12 +4822,13 @@ const STACK_TEMPLATE: &str = r##"(() => {
 const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   // У браузера начало отсчёта тоже не целое: оно снято с тех же часов, что и
   // `now()`, и несёт доли миллисекунды.
-  const ORIGIN = (() => {
+  const originNow = () => {
     const ms = Date.now();
     const hr0 = typeof globalThis.__pt_hrtime === 'function' ? globalThis.__pt_hrtime() : 0;
     const frac = Math.floor((hr0 - Math.floor(hr0)) * 10) / 10;
     return Math.floor((ms + frac) * 16777216) / 16777216;
-  })();
+  };
+  let ORIGIN = originNow();
 
   // DOMHighResTimeStamp: 0.1 ms granularity (Chrome coarsens it against timing
   // attacks) and never decreasing. Derived from the same clock as `Date.now()`,
@@ -4839,7 +4840,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   // замеров подряд и минимальная положительная разница. У браузера 0.1 мс, у
   // нас не было ни одного продвижения на пяти тысячах.
   const hr = globalThis.__pt_hrtime;
-  const HR_BASE = typeof hr === 'function' ? hr() : 0;
+  let HR_BASE = typeof hr === 'function' ? hr() : 0;
   let last = 0;
   const nowMs = () => {
     const raw = typeof hr === 'function' ? hr() - HR_BASE : Math.max(0, Date.now() - ORIGIN);
@@ -5110,7 +5111,24 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
       return { timeOrigin: ORIGIN, timing: timing.toJSON(), navigation: navigation.toJSON() };
     }
   }
-  onProto(Performance.prototype, { timeOrigin: ORIGIN, timing, navigation, memory });
+  const PERF_BAG = { timeOrigin: ORIGIN, timing, navigation, memory };
+  onProto(Performance.prototype, PERF_BAG);
+  // Запасной реалм строится заранее, а выдаётся, когда страница вставит
+  // пустой кадр: его часы должны начаться в миг выдачи, как у нового окна.
+  {
+    const offsets = {};
+    for (const k of Object.keys(TIMING)) offsets[k] = TIMING[k] ? TIMING[k] - ORIGIN : 0;
+    Object.defineProperty(globalThis, '__pt_resetClock', {
+      value: () => {
+        ORIGIN = originNow();
+        HR_BASE = typeof hr === 'function' ? hr() : 0;
+        last = 0;
+        for (const k of Object.keys(offsets)) TIMING[k] = offsets[k] || k === 'navigationStart' ? ORIGIN + offsets[k] : 0;
+        PERF_BAG.timeOrigin = ORIGIN;
+      },
+      enumerable: false, configurable: true,
+    });
+  }
   tag(Performance.prototype, 'Performance');
 
   globalThis.Performance = Performance;
@@ -5678,7 +5696,15 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   // functional break and something a probe can list in one line.
   const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   if (!globalThis.atob) {
+    const NATIVE_ATOB = globalThis.__pt_atob;
     globalThis.atob = function atob(input) {
+      if (typeof NATIVE_ATOB === 'function') {
+        const out = NATIVE_ATOB(String(input));
+        if (out === null) {
+          throw new (globalThis.DOMException || Error)("Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.", 'InvalidCharacterError');
+        }
+        return out;
+      }
       const s = String(input).replace(/[ \t\n\f\r]/g, '');
       const body = s.replace(/=+$/, '');
       if (body.length % 4 === 1 || /[^A-Za-z0-9+/]/.test(body)) {

@@ -326,6 +326,67 @@ impl Isolate {
     /// Create a fresh context, run `bootstrap` in it (the stealth environment:
     /// `navigator`/`window`/`screen`…), and return its index. If the bootstrap
     /// script throws, the context is discarded and the error is returned.
+    /// Наполнить запас реалмов до `n` — см. [`crate::natives::SpareRealms`].
+    /// Зовётся, пока страница ещё ничего не мерит: при создании контекста.
+    /// Добрать запас до `n`, построив не больше `step` реалмов за раз, — для
+    /// подпитки в простое, чтобы не держать поток долго.
+    pub fn top_up_realms(&mut self, n: usize, step: usize) {
+        // Подпитываем только там, где реалмы уже просили: странице без пустых
+        // кадров запас ни к чему.
+        let Some(have) = self
+            .isolate
+            .get_slot::<crate::natives::SpareRealms>()
+            .map(|s| s.0.len())
+        else {
+            return;
+        };
+        let Some(boot) = self
+            .isolate
+            .get_slot::<crate::natives::RealmBootstrap>()
+            .map(|b| b.0.clone())
+        else {
+            return;
+        };
+        if have < n {
+            self.prewarm_realms(&boot, (have + step).min(n));
+        }
+    }
+
+    pub fn prewarm_realms(&mut self, bootstrap: &str, n: usize) {
+        if self.isolate.get_slot::<crate::natives::RealmBootstrap>().is_none() {
+            self.isolate
+                .set_slot(crate::natives::RealmBootstrap(bootstrap.to_string()));
+        }
+        let boot = bootstrap.to_string();
+        loop {
+            let have = self
+                .isolate
+                .get_slot::<crate::natives::SpareRealms>()
+                .map(|s| s.0.len())
+                .unwrap_or(0);
+            if have >= n {
+                break;
+            }
+            let ready = {
+                v8::scope!(scope, &mut self.isolate);
+                let context = v8::Context::new(scope, v8::ContextOptions::default());
+                let global = v8::Global::new(scope, context);
+                let scope = &mut v8::ContextScope::new(scope, context);
+                crate::natives::install(scope);
+                if run_script(scope, &boot).is_err() {
+                    return;
+                }
+                global
+            };
+            if self.isolate.get_slot::<crate::natives::SpareRealms>().is_none() {
+                self.isolate.set_slot(crate::natives::SpareRealms::default());
+            }
+            if let Some(s) = self.isolate.get_slot_mut::<crate::natives::SpareRealms>() {
+                s.0.push(ready);
+            }
+        }
+    }
+
     pub fn create_context(&mut self, bootstrap: &str) -> Result<usize, String> {
         let index = self.contexts.len();
         // Keep the bootstrap on the isolate so a *realm* can be built from it
@@ -472,6 +533,19 @@ impl Isolate {
     }
 
     /// What `import()` calls are waiting to be loaded, taken off the queue.
+    /// То же, но только для перечисленных контекстов: остальные остаются в
+    /// очереди. На одном потоке живут контексты разных страниц, и кадр,
+    /// вынесенный на чужой поток, не должен забирать их `import()`.
+    pub fn drain_dynamic_imports_for(&mut self, indices: &[usize]) -> Vec<(u32, usize, String, String)> {
+        let Some(d) = self.isolate.get_slot_mut::<DynamicImports>() else {
+            return Vec::new();
+        };
+        let (mine, rest): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut d.queue).into_iter().partition(|e| indices.contains(&e.1));
+        d.queue = rest;
+        mine
+    }
+
     pub fn drain_dynamic_imports(&mut self) -> Vec<(u32, usize, String, String)> {
         self.isolate
             .get_slot_mut::<DynamicImports>()
