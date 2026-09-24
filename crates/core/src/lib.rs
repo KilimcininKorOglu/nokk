@@ -1204,6 +1204,31 @@ impl BrowserContext {
             .chain(std::iter::once(None))
             .chain(later.map(Some))
             .collect();
+        // Сканер предзагрузки: браузер находит внешние скрипты документа ещё
+        // при разборе и просит их все разом, а исполняет по своему порядку. Мы
+        // просили каждый, только когда до него доходила очередь, и сотня
+        // файлов chess.com шла цепочкой: между запуском api.js и отрисовкой
+        // виджета проходила секунда против двухсот-трёхсот миллисекунд у
+        // Chrome, и это число уходит в тело первого POST.
+        let mut preload: HashMap<String, Preloaded> = HashMap::new();
+        if index == self.index && std::env::var_os("NOKK_NO_PRELOAD").is_none() {
+            for script in &page.scripts {
+                let (nokk_dom::Script::External(src) | nokk_dom::Script::ExternalModule(src)) = script else {
+                    continue;
+                };
+                let Some(abs) = resolve_url(base_url, src) else { continue };
+                if preload.contains_key(&abs)
+                    || (self.engine.block_trackers && nokk_net::is_blocked_url(&abs))
+                {
+                    continue;
+                }
+                let req = self.get_request(&abs, "script", None);
+                let client = self.client.clone();
+                let started = std::time::Instant::now();
+                let handle = tokio::spawn(async move { client.send(req).await });
+                preload.insert(abs, (started, handle));
+            }
+        }
         for step in plan {
             let Some(idx) = step else {
                 let _ = self.eval_in(index, "__pt_parseDone()").await;
@@ -1237,7 +1262,7 @@ impl BrowserContext {
                     self.run_module(index, base_url, code.clone()).await
                 } else {
                     match resolve_url(base_url, code) {
-                        Some(abs) => match self.with_frames_live(self.fetch_text(&abs, "script")).await {
+                        Some(abs) => match self.with_frames_live(self.take_preloaded(preload.remove(&abs), &abs)).await {
                             Ok((_, source)) => self.run_module(index, &abs, source).await,
                             Err(e) => Err(EngineError::Js(e.to_string())),
                         },
@@ -1275,7 +1300,7 @@ impl BrowserContext {
                             self.record("GET", &abs, "script", 0, &[]);
                             continue;
                         }
-                        match self.with_frames_live(self.fetch_text(&abs, "script")).await {
+                        match self.with_frames_live(self.take_preloaded(preload.remove(&abs), &abs)).await {
                             // `sourceURL` — не отладочная мелочь: без него каждый
                             // кадр стека выглядит как `<anonymous>`, тогда как в
                             // браузере там адрес скрипта. `new Error().stack`
@@ -3562,6 +3587,31 @@ impl BrowserContext {
         resource_type: &str,
         referrer: Option<&str>,
     ) -> Result<(String, String), EngineError> {
+        let req = self.get_request(url, resource_type, referrer);
+        let started = std::time::Instant::now();
+        let sent = self.client.send(req).await;
+        self.finish_text(context, url, resource_type, started, sent)
+    }
+
+    /// Скрипт, запрошенный сканером предзагрузки, — или, если его не
+    /// просили заранее, запрошенный сейчас.
+    async fn take_preloaded(
+        &self,
+        pre: Option<Preloaded>,
+        url: &str,
+    ) -> Result<(String, String), EngineError> {
+        match pre {
+            Some((started, handle)) => match handle.await {
+                Ok(sent) => self.finish_text(self.index, url, "script", started, sent),
+                Err(_) => self.fetch_text(url, "script").await,
+            },
+            None => self.fetch_text(url, "script").await,
+        }
+    }
+
+    /// Запрос `GET`, каким его шлёт документ: заголовки отпечатка, реферер,
+    /// назначение.
+    fn get_request(&self, url: &str, resource_type: &str, referrer: Option<&str>) -> Request {
         let mut headers = std::collections::BTreeMap::new();
         headers.insert(
             "User-Agent".to_string(),
@@ -3585,7 +3635,7 @@ impl BrowserContext {
         if let Some(r) = from {
             headers.insert("Referer".to_string(), r);
         }
-        let req = Request {
+        Request {
             method: "GET".into(),
             url: url.to_string(),
             headers,
@@ -3599,9 +3649,26 @@ impl BrowserContext {
             // A navigation nobody's page asked for is one a person asked for.
             third_party: false,
             user_activated: resource_type == "document" && referrer.is_none(),
-        };
-        match self.client.send(req).await {
+        }
+    }
+
+    /// Записать пришедший ответ (или отказ) и отдать текст. `started` —
+    /// когда запрос ушёл: для заранее отправленного скрипта это миг сканера
+    /// предзагрузки, а не миг, когда до него дошла очередь.
+    fn finish_text(
+        &self,
+        context: usize,
+        url: &str,
+        resource_type: &str,
+        started: std::time::Instant,
+        sent: Result<nokk_net::Response, NetError>,
+    ) -> Result<(String, String), EngineError> {
+        match sent {
             Ok(resp) => {
+                // Длительность — от ухода запроса до конца ответа, как у браузера;
+                // запись ставится в ленту по мигу ухода.
+                let measured = resp.elapsed_ms;
+                let lag = started.elapsed().as_secs_f64() * 1000.0 - measured;
                 self.record_full(
                     context,
                     "GET",
@@ -3612,10 +3679,13 @@ impl BrowserContext {
                     resp.headers.clone(),
                     &[],
                     resp.encoded_len,
-                    Some(resp.elapsed_ms),
+                    Some(measured),
                     &resp.content_encoding,
                     resp.redirect_ms,
                 );
+                if lag > 1.0 {
+                    self.shift_last_record(context, url, lag);
+                }
                 let final_url = if resp.url.is_empty() {
                     url.to_string()
                 } else {
@@ -3628,6 +3698,16 @@ impl BrowserContext {
                 // Log the failed attempt (status 0) before surfacing the error.
                 self.record_in(context, "GET", url, resource_type, 0, &[]);
                 Err(EngineError::Net(e))
+            }
+        }
+    }
+
+    /// Сдвинуть начало последней записи об `url` назад на `lag` мс: ответ
+    /// пришёл раньше, чем его взяли.
+    fn shift_last_record(&self, context: usize, url: &str, lag: f64) {
+        if let Ok(mut log) = self.requests.lock() {
+            if let Some(r) = log.iter_mut().rev().find(|r| r.context == context && r.url == url) {
+                r.started_ms = (r.started_ms - lag).max(0.0);
             }
         }
     }
@@ -3771,6 +3851,12 @@ const LOAD_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_millis(1
 // 55 мс — ответь». Двадцать миллисекунд задержки на доставку превращали
 // честные 55 в 79, и виджет гонял эту пробу заново, пока не выходил срок.
 const FRAME_PUMP_EVERY: std::time::Duration = std::time::Duration::from_millis(4);
+
+/// Скрипт, запрошенный заранее: миг запроса и задача, которая его ждёт.
+type Preloaded = (
+    std::time::Instant,
+    tokio::task::JoinHandle<Result<nokk_net::Response, NetError>>,
+);
 
 /// Номер контекста кадра, живущего на своём потоке пула. Номера контекстов у
 /// каждого изолята свои, поэтому такой кадр адресуется парой «поток + номер»,
