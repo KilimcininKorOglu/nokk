@@ -1149,12 +1149,12 @@
     closest(sel) {
       __needArgs(arguments.length, 1, 'closest', 'Element');
       __checkSelector(sel, 'closest', 'Element');
-      for (let e = this; e; e = e.parentNode) if (e.nodeType === ELEMENT_NODE && matchesSelector(e, sel)) return e;
+      for (let e = this; e; e = e.parentNode) if (e.nodeType === ELEMENT_NODE && matchesSelector(e, sel, this)) return e;
       return null;
     }
     matches(sel) {
       __needArgs(arguments.length, 1, 'matches', 'Element');
-      return matchesSelector(this, __checkSelector(sel, 'matches', 'Element'));
+      return matchesSelector(this, __checkSelector(sel, 'matches', 'Element'), this);
     }
 
     // Serialization
@@ -1688,12 +1688,12 @@
     querySelector(s) {
       __needArgs(arguments.length, 1, 'querySelector', 'Document');
       __checkSelector(s, 'querySelector', 'Document');
-      return this.documentElement ? query(this.documentElement, s)[0] || null : null;
+      return query(this, s)[0] || null;
     }
     querySelectorAll(s) {
       __needArgs(arguments.length, 1, 'querySelectorAll', 'Document');
       __checkSelector(s, 'querySelectorAll', 'Document');
-      return __staticNodeList(this.documentElement ? query(this.documentElement, s) : []);
+      return __staticNodeList(query(this, s));
     }
 
     // document.write inserts parsed markup at the position of the script that
@@ -2372,7 +2372,16 @@
     return /\s/.test(t) ? '"' + t + '"' : t;
   }).join(', ');
 
+  // Имя свойства: встроенные — без регистра, собственные (`--*`) — с ним.
+  // Мы приводили к строчным и те и другие, и `var(--Wide)` на chess.com не
+  // находил объявленного `--Wide`: вся раскладка формы входа съезжала.
+  const __cssKey = (p) => {
+    const s = String(p).trim();
+    return s.charCodeAt(0) === 45 && s.charCodeAt(1) === 45 ? s : s.toLowerCase();
+  };
   const __cssValue = (prop, value) => {
+    // Значение собственного свойства браузер хранит как написано.
+    if (prop.charCodeAt(0) === 45 && prop.charCodeAt(1) === 45) return String(value).trim();
     let v = __cssZero(__cssHex(String(value).trim().replace(/\s+/g, ' ')));
     if (prop === 'animation') return __cssAnimation(v);
     if (prop === 'box-shadow' || prop === 'text-shadow') return __cssShadow(v);
@@ -2518,7 +2527,7 @@
       if (!decl) continue;
       const colon = decl.indexOf(':');
       if (colon <= 0) continue;
-      const prop = decl.slice(0, colon).trim().toLowerCase();
+      const prop = __cssKey(decl.slice(0, colon));
       // Написанное дважды встаёт на второе место, а не остаётся на первом:
       // браузер при перезаписи убирает свойство и дописывает в конец.
       if (prop) {
@@ -2539,6 +2548,10 @@
   const CSS_PROPS = ["accentColor","additiveSymbols","alignContent","alignItems","alignSelf","alignmentBaseline","all","anchorName","anchorScope","animation","animationComposition","animationDelay","animationDirection","animationDuration","animationFillMode","animationIterationCount","animationName","animationPlayState","animationRange","animationRangeEnd","animationRangeStart","animationTimeline","animationTimingFunction","animationTrigger","appRegion","appearance","ascentOverride","aspectRatio","backdropFilter","backfaceVisibility","background","backgroundAttachment","backgroundBlendMode","backgroundClip","backgroundColor","backgroundImage","backgroundOrigin","backgroundPosition","backgroundPositionX","backgroundPositionY","backgroundRepeat","backgroundSize","basePalette","baselineShift","baselineSource","blockSize","border","borderBlock","borderBlockColor","borderBlockEnd","borderBlockEndColor","borderBlockEndStyle","borderBlockEndWidth","borderBlockStart","borderBlockStartColor","borderBlockStartStyle","borderBlockStartWidth","borderBlockStyle","borderBlockWidth","borderBottom","borderBottomColor","borderBottomLeftRadius","borderBottomRightRadius","borderBottomStyle","borderBottomWidth","borderCollapse","borderColor","borderEndEndRadius","borderEndStartRadius","borderImage","borderImageOutset","borderImageRepeat","borderImageSlice","borderImageSource","borderImageWidth","borderInline","borderInlineColor","borderInlineEnd","borderInlineEndColor","borderInlineEndStyle","borderInlineEndWidth","borderInlineStart","borderInlineStartColor","borderInlineStartStyle","borderInlineStartWidth","borderInlineStyle","borderInlineWidth","borderLeft","borderLeftColor","borderLeftStyle","borderLeftWidth","borderRadius","borderRight","borderRightColor","borderRightStyle","borderRightWidth","borderShape","borderSpacing","borderStartEndRadius","borderStartStartRadius","borderStyle","borderTop","borderTopColor","borderTopLeftRadius","borderTopRightRadius","borderTopStyle","borderTopWidth","borderWidth","bottom","boxDecorationBreak","boxShadow","boxSizing","breakAfter","breakBefore","breakInside","bufferedRendering","captionSide","caretAnimation","caretColor","caretShape","clear","clip","clipPath","clipRule","color","colorInterpolation","colorInterpolationFilters","colorRendering","colorScheme","columnCount","columnFill","columnGap","columnHeight","columnRule","columnRuleBreak","columnRuleColor","columnRuleInset","columnRuleInsetCap","columnRuleInsetCapEnd","columnRuleInsetCapStart","columnRuleInsetEnd","columnRuleInsetJunction","columnRuleInsetJunctionEnd","columnRuleInsetJunctionStart","columnRuleInsetStart","columnRuleStyle","columnRuleVisibilityItems","columnRuleWidth","columnSpan","columnWidth","columnWrap","columns","contain","containIntrinsicBlockSize","containIntrinsicHeight","containIntrinsicInlineSize","containIntrinsicSize","containIntrinsicWidth","container","containerName","containerType","content","contentVisibility","cornerBlockEndShape","cornerBlockStartShape","cornerBottomLeftShape","cornerBottomRightShape","cornerBottomShape","cornerEndEndShape","cornerEndStartShape","cornerInlineEndShape","cornerInlineStartShape","cornerLeftShape","cornerRightShape","cornerShape","cornerStartEndShape","cornerStartStartShape","cornerTopLeftShape","cornerTopRightShape","cornerTopShape","counterIncrement","counterReset","counterSet","cursor","cx","cy","d","descentOverride","direction","display","dominantBaseline","dynamicRangeLimit","emptyCells","fallback","fieldSizing","fill","fillOpacity","fillRule","filter","flex","flexBasis","flexDirection","flexFlow","flexGrow","flexLineCount","flexShrink","flexWrap","float","floodColor","floodOpacity","font","fontDisplay","fontFamily","fontFeatureSettings","fontKerning","fontLanguageOverride","fontOpticalSizing","fontPalette","fontSize","fontSizeAdjust","fontStretch","fontStyle","fontSynthesis","fontSynthesisSmallCaps","fontSynthesisStyle","fontSynthesisWeight","fontVariant","fontVariantAlternates","fontVariantCaps","fontVariantEastAsian","fontVariantEmoji","fontVariantLigatures","fontVariantNumeric","fontVariantPosition","fontVariationSettings","fontWeight","forcedColorAdjust","gap","grid","gridArea","gridAutoColumns","gridAutoFlow","gridAutoRows","gridColumn","gridColumnEnd","gridColumnGap","gridColumnStart","gridGap","gridRow","gridRowEnd","gridRowGap","gridRowStart","gridTemplate","gridTemplateAreas","gridTemplateColumns","gridTemplateRows","height","hyphenateCharacter","hyphenateLimitChars","hyphens","imageOrientation","imageRendering","inherits","initialLetter","initialValue","inlineSize","inset","insetBlock","insetBlockEnd","insetBlockStart","insetInline","insetInlineEnd","insetInlineStart","interactivity","interestDelay","interestDelayEnd","interestDelayStart","interpolateSize","isolation","justifyContent","justifyItems","justifySelf","left","letterSpacing","lightingColor","lineBreak","lineGapOverride","lineHeight","listStyle","listStyleImage","listStylePosition","listStyleType","margin","marginBlock","marginBlockEnd","marginBlockStart","marginBottom","marginInline","marginInlineEnd","marginInlineStart","marginLeft","marginRight","marginTop","marker","markerEnd","markerMid","markerStart","mask","maskClip","maskComposite","maskImage","maskMode","maskOrigin","maskPosition","maskRepeat","maskSize","maskType","mathDepth","mathShift","mathStyle","maxBlockSize","maxHeight","maxInlineSize","maxWidth","minBlockSize","minHeight","minInlineSize","minWidth","mixBlendMode","navigation","negative","objectFit","objectPosition","objectViewBox","offset","offsetAnchor","offsetDistance","offsetPath","offsetPosition","offsetRotate","opacity","order","orphans","outline","outlineColor","outlineOffset","outlineStyle","outlineWidth","overflow","overflowAnchor","overflowBlock","overflowClipMargin","overflowInline","overflowWrap","overflowX","overflowY","overlay","overrideColors","overscrollBehavior","overscrollBehaviorBlock","overscrollBehaviorInline","overscrollBehaviorX","overscrollBehaviorY","pad","padding","paddingBlock","paddingBlockEnd","paddingBlockStart","paddingBottom","paddingInline","paddingInlineEnd","paddingInlineStart","paddingLeft","paddingRight","paddingTop","page","pageBreakAfter","pageBreakBefore","pageBreakInside","pageMarginSafety","pageOrientation","paintOrder","perspective","perspectiveOrigin","placeContent","placeItems","placeSelf","pointerEvents","position","positionAnchor","positionArea","positionTry","positionTryFallbacks","positionTryOrder","positionVisibility","prefix","printColorAdjust","quotes","r","range","readingFlow","readingOrder","resize","result","right","rotate","rowGap","rowRule","rowRuleBreak","rowRuleColor","rowRuleInset","rowRuleInsetCap","rowRuleInsetCapEnd","rowRuleInsetCapStart","rowRuleInsetEnd","rowRuleInsetJunction","rowRuleInsetJunctionEnd","rowRuleInsetJunctionStart","rowRuleInsetStart","rowRuleStyle","rowRuleVisibilityItems","rowRuleWidth","rubyAlign","rubyOverhang","rubyPosition","rule","ruleBreak","ruleColor","ruleInset","ruleInsetCap","ruleInsetEnd","ruleInsetJunction","ruleInsetStart","ruleOverlap","ruleStyle","ruleVisibilityItems","ruleWidth","rx","ry","scale","scrollBehavior","scrollInitialTarget","scrollMargin","scrollMarginBlock","scrollMarginBlockEnd","scrollMarginBlockStart","scrollMarginBottom","scrollMarginInline","scrollMarginInlineEnd","scrollMarginInlineStart","scrollMarginLeft","scrollMarginRight","scrollMarginTop","scrollMarkerGroup","scrollPadding","scrollPaddingBlock","scrollPaddingBlockEnd","scrollPaddingBlockStart","scrollPaddingBottom","scrollPaddingInline","scrollPaddingInlineEnd","scrollPaddingInlineStart","scrollPaddingLeft","scrollPaddingRight","scrollPaddingTop","scrollSnapAlign","scrollSnapStop","scrollSnapType","scrollTargetGroup","scrollTimeline","scrollTimelineAxis","scrollTimelineName","scrollbarColor","scrollbarGutter","scrollbarWidth","shapeImageThreshold","shapeMargin","shapeOutside","shapeRendering","size","sizeAdjust","speak","speakAs","src","stopColor","stopOpacity","stroke","strokeDasharray","strokeDashoffset","strokeLinecap","strokeLinejoin","strokeMiterlimit","strokeOpacity","strokeWidth","suffix","symbols","syntax","system","tabSize","tableLayout","textAlign","textAlignLast","textAnchor","textAutospace","textBox","textBoxEdge","textBoxTrim","textCombineUpright","textDecoration","textDecorationColor","textDecorationLine","textDecorationSkipInk","textDecorationStyle","textDecorationThickness","textEmphasis","textEmphasisColor","textEmphasisPosition","textEmphasisStyle","textFit","textIndent","textJustify","textOrientation","textOverflow","textRendering","textShadow","textSizeAdjust","textSpacingTrim","textTransform","textUnderlineOffset","textUnderlinePosition","textWrap","textWrapMode","textWrapStyle","timelineScope","timelineTrigger","timelineTriggerActivationRange","timelineTriggerActivationRangeEnd","timelineTriggerActivationRangeStart","timelineTriggerActiveRange","timelineTriggerActiveRangeEnd","timelineTriggerActiveRangeStart","timelineTriggerName","timelineTriggerSource","top","touchAction","transform","transformBox","transformOrigin","transformStyle","transition","transitionBehavior","transitionDelay","transitionDuration","transitionProperty","transitionTimingFunction","translate","triggerScope","types","unicodeBidi","unicodeRange","userSelect","vectorEffect","verticalAlign","viewTimeline","viewTimelineAxis","viewTimelineInset","viewTimelineName","viewTransitionClass","viewTransitionGroup","viewTransitionName","viewTransitionScope","visibility","webkitAlignContent","webkitAlignItems","webkitAlignSelf","webkitAnimation","webkitAnimationDelay","webkitAnimationDirection","webkitAnimationDuration","webkitAnimationFillMode","webkitAnimationIterationCount","webkitAnimationName","webkitAnimationPlayState","webkitAnimationTimingFunction","webkitAppRegion","webkitAppearance","webkitBackfaceVisibility","webkitBackgroundClip","webkitBackgroundOrigin","webkitBackgroundSize","webkitBorderAfter","webkitBorderAfterColor","webkitBorderAfterStyle","webkitBorderAfterWidth","webkitBorderBefore","webkitBorderBeforeColor","webkitBorderBeforeStyle","webkitBorderBeforeWidth","webkitBorderBottomLeftRadius","webkitBorderBottomRightRadius","webkitBorderEnd","webkitBorderEndColor","webkitBorderEndStyle","webkitBorderEndWidth","webkitBorderHorizontalSpacing","webkitBorderImage","webkitBorderRadius","webkitBorderStart","webkitBorderStartColor","webkitBorderStartStyle","webkitBorderStartWidth","webkitBorderTopLeftRadius","webkitBorderTopRightRadius","webkitBorderVerticalSpacing","webkitBoxAlign","webkitBoxDecorationBreak","webkitBoxDirection","webkitBoxFlex","webkitBoxOrdinalGroup","webkitBoxOrient","webkitBoxPack","webkitBoxReflect","webkitBoxShadow","webkitBoxSizing","webkitClipPath","webkitColumnBreakAfter","webkitColumnBreakBefore","webkitColumnBreakInside","webkitColumnCount","webkitColumnGap","webkitColumnRule","webkitColumnRuleColor","webkitColumnRuleStyle","webkitColumnRuleWidth","webkitColumnSpan","webkitColumnWidth","webkitColumns","webkitFilter","webkitFlex","webkitFlexBasis","webkitFlexDirection","webkitFlexFlow","webkitFlexGrow","webkitFlexShrink","webkitFlexWrap","webkitFontFeatureSettings","webkitFontSmoothing","webkitHyphenateCharacter","webkitJustifyContent","webkitLineBreak","webkitLineClamp","webkitLocale","webkitLogicalHeight","webkitLogicalWidth","webkitMarginAfter","webkitMarginBefore","webkitMarginEnd","webkitMarginStart","webkitMask","webkitMaskBoxImage","webkitMaskBoxImageOutset","webkitMaskBoxImageRepeat","webkitMaskBoxImageSlice","webkitMaskBoxImageSource","webkitMaskBoxImageWidth","webkitMaskClip","webkitMaskComposite","webkitMaskImage","webkitMaskOrigin","webkitMaskPosition","webkitMaskPositionX","webkitMaskPositionY","webkitMaskRepeat","webkitMaskSize","webkitMaxLogicalHeight","webkitMaxLogicalWidth","webkitMinLogicalHeight","webkitMinLogicalWidth","webkitOpacity","webkitOrder","webkitPaddingAfter","webkitPaddingBefore","webkitPaddingEnd","webkitPaddingStart","webkitPerspective","webkitPerspectiveOrigin","webkitPerspectiveOriginX","webkitPerspectiveOriginY","webkitPrintColorAdjust","webkitRtlOrdering","webkitRubyPosition","webkitShapeImageThreshold","webkitShapeMargin","webkitShapeOutside","webkitTapHighlightColor","webkitTextCombine","webkitTextDecorationsInEffect","webkitTextEmphasis","webkitTextEmphasisColor","webkitTextEmphasisPosition","webkitTextEmphasisStyle","webkitTextFillColor","webkitTextOrientation","webkitTextSecurity","webkitTextSizeAdjust","webkitTextStroke","webkitTextStrokeColor","webkitTextStrokeWidth","webkitTransform","webkitTransformOrigin","webkitTransformOriginX","webkitTransformOriginY","webkitTransformOriginZ","webkitTransformStyle","webkitTransition","webkitTransitionDelay","webkitTransitionDuration","webkitTransitionProperty","webkitTransitionTimingFunction","webkitUserDrag","webkitUserModify","webkitUserSelect","webkitWritingMode","whiteSpace","whiteSpaceCollapse","widows","width","willChange","wordBreak","wordSpacing","wordWrap","writingMode","x","y","zIndex","zoom"];
 
   const __cssMaps = new WeakMap();
+  // Объявление → его карта как написано: сокращения — сокращениями. Каскаду
+  // она нужна, чтобы `padding: var(--p)` раскладывался после подстановки,
+  // а не до неё.
+  const __declRaw = new WeakMap();
   // Методы и `length` живут на прототипе, а собственными свойствами объявления
   // идут имена свойств CSS — все семьсот три, в порядке браузера. У нас было
   // наоборот: методы собственными, имён не было вовсе, и перечисление стиля
@@ -2752,7 +2765,7 @@
         enumerable: true, configurable: true,
       });
     }
-    return new Proxy(target, {
+    const px = new Proxy(target, {
       get: (t, p) => {
         if (typeof p === 'string' && !(p in t)) return map.get(dash(p).toLowerCase()) || '';
         const v = t[p];
@@ -2767,6 +2780,8 @@
         t[p] = v; return true;
       },
     });
+    __declRaw.set(px, () => map);
+    return px;
   }
 
   const __ruleListProto = {
@@ -3013,7 +3028,7 @@
     };
     def('getPropertyValue', function getPropertyValue(p) {
       const s = st(this); if (!s) return '';
-      const k = String(p).toLowerCase();
+      const k = __cssKey(p);
       const m = s.computed ? s.map : s.read();
       // Имена с приставкой поставщика спрашивают и с дефисом впереди, а
       // длинное свойство может быть записано сокращением: `border-top-width`
@@ -3028,7 +3043,7 @@
     def('setProperty', function setProperty(p, v) {
       const s = st(this); if (!s) return;
       if (s.computed) throw new TypeError('Cannot modify computed style');
-      const m = s.read(), k = String(p).toLowerCase();
+      const m = s.read(), k = __cssKey(p);
       // Пустое значение свойство удаляет, а не оставляет пустым. Мы писали
       // `opacity: ` без значения — строки, которой браузер не производит; кадр
       // виджета читает свой `style` десятками тысяч раз и видел именно её.
@@ -3038,7 +3053,7 @@
     def('removeProperty', function removeProperty(p) {
       const s = st(this); if (!s) return '';
       if (s.computed) throw new TypeError('Cannot modify computed style');
-      const m = s.read(), k = String(p).toLowerCase(), had = m.get(k) || '';
+      const m = s.read(), k = __cssKey(p), had = m.get(k) || '';
       m.delete(k); s.write(m); return had;
     });
     def('item', function item(i) {
@@ -3160,7 +3175,7 @@
       for (const part of text.split(';')) {
         const i = part.indexOf(':');
         if (i < 0) continue;
-        const k = part.slice(0, i).trim().toLowerCase();
+        const k = __cssKey(part.slice(0, i));
         const v = part.slice(i + 1).trim();
         if (k) m.set(k, v);
       }
@@ -3194,7 +3209,7 @@
     const target = Object.create(__inlineStyleProto(), __styleDescs());
     __cssReaders.set(target, { read, write, el });
     reindex(__styleNames(read()));
-    return new Proxy(target, {
+    const px = new Proxy(target, {
       ...__declTraps((t, p) => { const m = read(), k = dash(p); return m.get(k) || __longhandFrom(m, k); }),
       get: (t, p) => {
         if (typeof p === 'string' && EPUB_SET.has(p)) return undefined;
@@ -3214,6 +3229,8 @@
         write(m); return true;
       },
     });
+    __declRaw.set(px, read);
+    return px;
   }
 
   // ---- tree walking ---------------------------------------------------------
@@ -3240,70 +3257,452 @@
   }
 
   // ---- selector engine ------------------------------------------------------
-  // Compound selector -> predicate. Combinators handled in query().
-  function parseCompound(part) {
-    const tests = [];
-    const re = /([#.]?[\w-]+|\[[^\]]+\]|\*)/g; let m;
-    while ((m = re.exec(part))) {
-      const tok = m[1];
-      if (tok === '*') continue;
-      else if (tok[0] === '#') tests.push(e => e.id === tok.slice(1));
-      else if (tok[0] === '.') tests.push(e => e.classList.contains(tok.slice(1)));
-      else if (tok[0] === '[') {
-        // [name] / [name=v] / [name^=v] [name$=v] [name*=v] [name~=v] [name|=v]
-        const am = /^\s*([\w-]+)\s*(?:([~^$*|]?=)\s*(.*?))?\s*$/.exec(tok.slice(1, -1));
-        if (!am) { tests.push(() => false); continue; }
-        const name = am[1], op = am[2];
-        if (!op) { tests.push(e => __ptHasA(e, name)); continue; }
-        const val = (am[3] || '').replace(/^["']|["']$/g, '');
-        tests.push(e => {
-          const a = __ptGetA(e, name);
-          if (a == null) return false;
-          switch (op) {
-            case '=': return a === val;
-            case '^=': return val !== '' && a.slice(0, val.length) === val;
-            case '$=': return val !== '' && a.slice(-val.length) === val;
-            case '*=': return val !== '' && a.indexOf(val) >= 0;
-            case '~=': return val !== '' && a.split(/\s+/).indexOf(val) >= 0;
-            case '|=': return a === val || a.slice(0, val.length + 1) === val + '-';
-            default: return false;
+  // Разбор селектора целиком: простые, составные, все четыре комбинатора и
+  // псевдоклассы. Прежний движок знал только теги, классы, `#id`, атрибуты и
+  // два комбинатора, а псевдокласс читал как имя тега: `:root` искал элемент
+  // `<root>`. На chess.com все переменные стоят в `:root { … }` — и ни одна
+  // не доходила до страницы, а с ними вся раскладка формы входа.
+  const __selCache = new Map();
+  const __SEL_NEVER = () => false;
+
+  /// Список селекторов → части верхнего уровня (запятые внутри скобок,
+  /// квадратных скобок и кавычек не делят).
+  function __selSplit(s) {
+    const out = [];
+    let depth = 0, q = null, start = 0;
+    s = String(s);
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c === '\\') { i++; continue; }
+      if (q) { if (c === q) q = null; continue; }
+      if (c === '"' || c === "'") q = c;
+      else if (c === '(' || c === '[') depth++;
+      else if (c === ')' || c === ']') depth--;
+      else if (c === ',' && depth === 0) { out.push(s.slice(start, i)); start = i + 1; }
+    }
+    out.push(s.slice(start));
+    return out.map((x) => x.trim());
+  }
+
+  function __selParse(src) {
+    let i = 0;
+    const s = String(src);
+    const ws = () => { const a = i; while (i < s.length && /\s/.test(s[i])) i++; return i > a; };
+    const identStart = (c) => c != null && (/[A-Za-z_ -￿-]/.test(c) || c === '\\');
+    const ident = () => {
+      let out = '';
+      while (i < s.length) {
+        const c = s[i];
+        if (c === '\\') {
+          const hex = /^[0-9a-fA-F]{1,6}\s?/.exec(s.slice(i + 1, i + 8));
+          if (hex) { out += String.fromCodePoint(parseInt(hex[0], 16) || 0xfffd); i += 1 + hex[0].length; }
+          else { out += s[i + 1] || ''; i += 2; }
+        } else if (/[\w -￿-]/.test(c)) { out += c; i++; }
+        else break;
+      }
+      return out;
+    };
+    const fail = () => { throw new SyntaxError('selector'); };
+    // Содержимое скобок как строка, с учётом вложенности и кавычек.
+    const paren = () => {
+      if (s[i] !== '(') fail();
+      let depth = 1, q = null; const a = ++i;
+      for (; i < s.length; i++) {
+        const c = s[i];
+        if (c === '\\') { i++; continue; }
+        if (q) { if (c === q) q = null; continue; }
+        if (c === '"' || c === "'") q = c;
+        else if (c === '(') depth++;
+        else if (c === ')' && --depth === 0) break;
+      }
+      if (depth) fail();
+      return s.slice(a, i++);
+    };
+    const compound = () => {
+      const tests = [];
+      const spec = [0, 0, 0];
+      let any = false;
+      for (;;) {
+        const c = s[i];
+        if (c === '*') {
+          i++; any = true;
+          if (s[i] === '|') { i++; if (s[i] === '*') i++; else { const n = ident().toLowerCase(); spec[2]++; tests.push((e) => e.localName === n); } }
+          continue;
+        }
+        if (c === '|') { i++; continue; }
+        if (identStart(c)) {
+          if (any || tests.length) break;
+          let n = ident();
+          if (s[i] === '|' && s[i + 1] !== '=') { i++; if (s[i] === '*') { i++; any = true; continue; } n = ident(); }
+          const low = n.toLowerCase();
+          spec[2]++; any = true;
+          tests.push((e) => e.localName === low || (e.__ptNS && e.__ptNS !== 'http://www.w3.org/1999/xhtml' && e.localName === n));
+          continue;
+        }
+        if (c === '#') { i++; const n = ident(); if (!n) fail(); spec[0]++; tests.push((e) => e.id === n); any = true; continue; }
+        if (c === '.') {
+          i++; const n = ident(); if (!n) fail(); spec[1]++;
+          tests.push((e) => { const v = __ptGetA(e, 'class'); return v != null && (' ' + v.replace(/[\t\n\f\r ]+/g, ' ') + ' ').indexOf(' ' + n + ' ') >= 0; });
+          any = true; continue;
+        }
+        if (c === '[') {
+          i++; ws();
+          let name = ident();
+          if (s[i] === '|' && s[i + 1] !== '=') { i++; name = ident(); }
+          ws();
+          let op = null, val = '', flag = '';
+          if (s[i] === ']') i++;
+          else {
+            const m = /^([~^$*|]?=)/.exec(s.slice(i));
+            if (!m) fail();
+            op = m[1]; i += op.length; ws();
+            if (s[i] === '"' || s[i] === "'") {
+              const q = s[i++]; let v = '';
+              while (i < s.length && s[i] !== q) { if (s[i] === '\\') { v += s[i + 1] || ''; i += 2; } else v += s[i++]; }
+              i++; val = v;
+            } else val = ident();
+            ws();
+            if (/[isIS]/.test(s[i] || '') && !/[\w-]/.test(s[i + 1] || '')) { flag = s[i].toLowerCase(); i++; ws(); }
+            if (s[i] !== ']') fail();
+            i++;
           }
-        });
-      } else tests.push(e => e.localName === tok.toLowerCase());
-    }
-    return (e) => tests.every(t => t(e));
+          spec[1]++; any = true;
+          const nm = name.toLowerCase();
+          const ci = flag === 'i';
+          const want = ci ? val.toLowerCase() : val;
+          tests.push((e) => {
+            let a = __ptGetA(e, nm);
+            if (a == null && nm !== name) a = __ptGetA(e, name);
+            if (a == null) return false;
+            if (!op) return true;
+            if (ci) a = a.toLowerCase();
+            switch (op) {
+              case '=': return a === want;
+              case '^=': return want !== '' && a.startsWith(want);
+              case '$=': return want !== '' && a.endsWith(want);
+              case '*=': return want !== '' && a.indexOf(want) >= 0;
+              case '~=': return want !== '' && !/\s/.test(want) && a.split(/[\t\n\f\r ]+/).indexOf(want) >= 0;
+              case '|=': return a === want || a.startsWith(want + '-');
+            }
+            return false;
+          });
+          continue;
+        }
+        if (c === ':' && s[i + 1] === ':') {
+          // Псевдоэлемент: элемент им не бывает.
+          i += 2; ident(); if (s[i] === '(') paren();
+          spec[2]++; any = true; tests.push(__SEL_NEVER);
+          continue;
+        }
+        if (c === ':') {
+          i++;
+          const name = ident().toLowerCase();
+          if (!name) fail();
+          // Старые псевдоэлементы с одним двоеточием.
+          if (/^(before|after|first-line|first-letter)$/.test(name)) { spec[2]++; any = true; tests.push(__SEL_NEVER); continue; }
+          const arg = s[i] === '(' ? paren() : null;
+          const r = __selPseudo(name, arg);
+          spec[0] += r.spec[0]; spec[1] += r.spec[1]; spec[2] += r.spec[2];
+          tests.push(r.test); any = true;
+          continue;
+        }
+        if (c === '&') { i++; any = true; spec[1]++; tests.push((e, ctx) => !!(ctx && ctx.scope) && e === ctx.scope); continue; }
+        break;
+      }
+      if (!any) fail();
+      const n = tests.length;
+      const test = n === 0 ? () => true : n === 1 ? tests[0]
+        : (e, ctx) => { for (let k = 0; k < n; k++) if (!tests[k](e, ctx)) return false; return true; };
+      return { test, spec };
+    };
+    // Сложный селектор; `relative` — для `:has()`, где он может начинаться с
+    // комбинатора.
+    const complex = (relative) => {
+      const comps = [], combs = [];
+      const spec = [0, 0, 0];
+      ws();
+      let lead = null;
+      if (relative && /[>+~]/.test(s[i] || '')) { lead = s[i++]; ws(); }
+      for (;;) {
+        const c = compound();
+        comps.push(c.test);
+        spec[0] += c.spec[0]; spec[1] += c.spec[1]; spec[2] += c.spec[2];
+        const had = ws();
+        if (i >= s.length) break;
+        const ch = s[i];
+        if (ch === '>' || ch === '+' || ch === '~') { i++; ws(); combs.push(ch); continue; }
+        if (ch === ',' || ch === ')') break;
+        if (had) { combs.push(' '); continue; }
+        fail();
+      }
+      return { comps, combs, spec, lead };
+    };
+    const list = (relative) => {
+      const out = [];
+      for (;;) {
+        out.push(complex(relative));
+        ws();
+        if (s[i] === ',') { i++; continue; }
+        break;
+      }
+      if (i < s.length) fail();
+      return out;
+    };
+    return list(false);
   }
-  // Parse one selector branch (no commas) into compound predicates plus the
-  // combinators between them, e.g. `nav > ul a` -> compounds [nav, ul, a],
-  // combinators ['child', 'descendant'] (combinators[k] links compound k -> k+1).
-  function parseComplex(sel) {
-    const steps = sel.trim().replace(/\s*>\s*/g, ' > ').split(/\s+/).filter(Boolean);
-    const compounds = [], combinators = [];
-    let comb = 'descendant';
-    for (const s of steps) {
-      if (s === '>') { comb = 'child'; continue; }
-      if (compounds.length) combinators.push(comb);
-      compounds.push(parseCompound(s));
-      comb = 'descendant';
+
+  const __parentEl = (e) => { const p = e.parentNode; return p && p.nodeType === ELEMENT_NODE ? p : null; };
+  const __prevEl = (e) => { let p = e.previousSibling; while (p && p.nodeType !== ELEMENT_NODE) p = p.previousSibling; return p; };
+  const __nextEl = (e) => { let p = e.nextSibling; while (p && p.nodeType !== ELEMENT_NODE) p = p.nextSibling; return p; };
+
+  function __selMatchComplex(el, cx, idx, ctx) {
+    if (!cx.comps[idx](el, ctx)) return false;
+    if (idx === 0) {
+      if (!cx.lead && !cx.anchored) return true;
+      // `:has(> a)`: слева — сам якорь.
+      const a = ctx.hasAnchor;
+      const comb = cx.lead || ' ';
+      if (comb === '>') return __parentEl(el) === a;
+      if (comb === ' ') { for (let p = __parentEl(el); p; p = __parentEl(p)) if (p === a) return true; return false; }
+      if (comb === '+') return __prevEl(el) === a;
+      for (let p = __prevEl(el); p; p = __prevEl(p)) if (p === a) return true;
+      return false;
     }
-    return { compounds, combinators };
-  }
-  // Match `el` against compounds[idx] then walk left through the combinators,
-  // verifying an ancestor (descendant) or parent (child) for each earlier
-  // compound. Descendant combinators backtrack over all ancestors.
-  function matchesSteps(el, compounds, combinators, idx) {
-    if (!compounds[idx](el)) return false;
-    if (idx === 0) return true;
-    const comb = combinators[idx - 1];
-    if (comb === 'child') {
-      const p = el.parentNode;
-      return !!p && p.nodeType === ELEMENT_NODE && matchesSteps(p, compounds, combinators, idx - 1);
+    const comb = cx.combs[idx - 1];
+    if (comb === '>') { const p = __parentEl(el); return !!p && __selMatchComplex(p, cx, idx - 1, ctx); }
+    if (comb === ' ') {
+      for (let p = __parentEl(el); p; p = __parentEl(p)) if (__selMatchComplex(p, cx, idx - 1, ctx)) return true;
+      return false;
     }
-    for (let p = el.parentNode; p && p.nodeType === ELEMENT_NODE; p = p.parentNode) {
-      if (matchesSteps(p, compounds, combinators, idx - 1)) return true;
-    }
+    if (comb === '+') { const p = __prevEl(el); return !!p && __selMatchComplex(p, cx, idx - 1, ctx); }
+    for (let p = __prevEl(el); p; p = __prevEl(p)) if (__selMatchComplex(p, cx, idx - 1, ctx)) return true;
     return false;
   }
+
+  function __selCompiled(sel) {
+    const key = String(sel);
+    let hit = __selCache.get(key);
+    if (hit !== undefined) return hit;
+    try { hit = __selParse(key); } catch (e) { hit = null; }
+    if (__selCache.size > 5000) __selCache.clear();
+    __selCache.set(key, hit);
+    return hit;
+  }
+  const __selAny = (list, e, ctx) => {
+    for (const cx of list) if (__selMatchComplex(e, cx, cx.comps.length - 1, ctx)) return true;
+    return false;
+  };
+  const __maxSpec = (list) => list.reduce((m, cx) => {
+    const a = cx.spec, b = m;
+    return (a[0] - b[0] || a[1] - b[1] || a[2] - b[2]) > 0 ? a : b;
+  }, [0, 0, 0]);
+  // Список внутри `:is()`/`:where()` прощающий: непонятная часть просто
+  // выпадает, а не губит всё.
+  const __selForgiving = (arg) => {
+    const out = [];
+    for (const part of __selSplit(arg)) {
+      if (!part) continue;
+      const c = __selCompiled(part);
+      if (c) out.push(...c);
+    }
+    return out;
+  };
+  // An+B из `:nth-child()`.
+  function __nthParse(t) {
+    t = t.trim().toLowerCase().replace(/\s+/g, '');
+    if (t === 'odd') return [2, 1];
+    if (t === 'even') return [2, 0];
+    let m = /^([+-]?\d*)n([+-]\d+)?$/.exec(t);
+    if (m) {
+      const a = m[1] === '' || m[1] === '+' ? 1 : m[1] === '-' ? -1 : parseInt(m[1], 10);
+      return [a, m[2] ? parseInt(m[2], 10) : 0];
+    }
+    if ((m = /^[+-]?\d+$/.exec(t))) return [0, parseInt(t, 10)];
+    return null;
+  }
+  const __nthOk = (ab, pos) => {
+    const [a, b] = ab;
+    if (a === 0) return pos === b;
+    const n = (pos - b) / a;
+    return Number.isInteger(n) && n >= 0;
+  };
+  const __FORM_CTL = new Set(['button', 'input', 'select', 'textarea', 'optgroup', 'option', 'fieldset']);
+  const __TEXTISH = /^(text|search|url|tel|email|password|date|month|week|time|datetime-local|number)$/;
+  const __inputType = (e) => String(__ptGetA(e, 'type') || 'text').toLowerCase();
+  const __isDisabled = (e) => {
+    if (!__FORM_CTL.has(e.localName)) return false;
+    if (__ptHasA(e, 'disabled')) return true;
+    for (let p = __parentEl(e); p; p = __parentEl(p)) {
+      if (p.localName === 'fieldset' && __ptHasA(p, 'disabled')) {
+        // Кроме того, что лежит в первой легенде.
+        const legend = [...p.children].find((k) => k.localName === 'legend');
+        if (!(legend && legend.contains(e))) return true;
+      }
+    }
+    return false;
+  };
+  const __valueOf = (e) => { try { return String(e.value == null ? '' : e.value); } catch (x) { return ''; } };
+  const __isInvalid = (e) => {
+    const t = e.localName;
+    if (t === 'form' || t === 'fieldset') {
+      let bad = false;
+      walk(e, (k) => { if (!bad && __isInvalid(k)) bad = true; });
+      return bad;
+    }
+    if (!(t === 'input' || t === 'select' || t === 'textarea') || __isDisabled(e)) return false;
+    if (t === 'input' && /^(hidden|submit|reset|button|image)$/.test(__inputType(e))) return false;
+    if (__ptHasA(e, 'required')) {
+      if (t === 'input' && /^(checkbox|radio)$/.test(__inputType(e))) return !e.checked;
+      if (__valueOf(e) === '') return true;
+    }
+    return false;
+  };
+
+  function __selPseudo(name, arg) {
+    const B = [0, 1, 0];
+    const doc = () => globalThis.document;
+    const sib = (e, dir, same) => {
+      let n = 1;
+      for (let p = dir < 0 ? __prevEl(e) : __nextEl(e); p; p = dir < 0 ? __prevEl(p) : __nextEl(p)) {
+        if (!same || p.localName === e.localName) n++;
+      }
+      return n;
+    };
+    switch (name) {
+      case 'root': return { spec: B, test: (e) => !!e.ownerDocument && e === e.ownerDocument.documentElement };
+      case 'scope': return { spec: B, test: (e, ctx) => (ctx && ctx.scope && ctx.scope.nodeType === ELEMENT_NODE ? e === ctx.scope : !!e.ownerDocument && e === e.ownerDocument.documentElement) };
+      case 'is': case 'matches': case '-webkit-any': case 'where': {
+        const list = __selForgiving(arg || '');
+        return { spec: name === 'where' ? [0, 0, 0] : __maxSpec(list),
+          test: (e, ctx) => __selAny(list, e, ctx) };
+      }
+      case 'not': {
+        const list = __selCompiled(arg || '');
+        if (!list) throw new SyntaxError('selector');
+        return { spec: __maxSpec(list), test: (e, ctx) => !__selAny(list, e, ctx) };
+      }
+      case 'has': {
+        const parts = __selSplit(arg || '');
+        const rel = [];
+        for (const p of parts) {
+          let one;
+          try { one = __selParseRelative(p); } catch (x) { one = null; }
+          if (one) rel.push(one);
+        }
+        if (!rel.length) throw new SyntaxError('selector');
+        return {
+          spec: __maxSpec(rel),
+          test: (e) => {
+            for (const cx of rel) {
+              const ctx = { hasAnchor: e };
+              const lead = cx.lead || ' ';
+              const scope = lead === '+' || lead === '~' ? __parentEl(e) : e;
+              if (!scope) continue;
+              let found = false;
+              walk(scope, (k) => { if (!found && __selMatchComplex(k, cx, cx.comps.length - 1, ctx)) found = true; });
+              if (found) return true;
+            }
+            return false;
+          },
+        };
+      }
+      case 'first-child': return { spec: B, test: (e) => !__prevEl(e) && !!e.parentNode };
+      case 'last-child': return { spec: B, test: (e) => !__nextEl(e) && !!e.parentNode };
+      case 'only-child': return { spec: B, test: (e) => !__prevEl(e) && !__nextEl(e) && !!e.parentNode };
+      case 'first-of-type': return { spec: B, test: (e) => sib(e, -1, true) === 1 };
+      case 'last-of-type': return { spec: B, test: (e) => sib(e, 1, true) === 1 };
+      case 'only-of-type': return { spec: B, test: (e) => sib(e, -1, true) === 1 && sib(e, 1, true) === 1 };
+      case 'nth-child': case 'nth-last-child': case 'nth-of-type': case 'nth-last-of-type': {
+        let expr = String(arg || ''), of = null;
+        const m = /^(.*?)\s+of\s+(.*)$/i.exec(expr);
+        if (m && /child/.test(name)) { expr = m[1]; of = __selCompiled(m[2]); if (!of) throw new SyntaxError('selector'); }
+        const ab = __nthParse(expr);
+        if (!ab) throw new SyntaxError('selector');
+        const last = /last/.test(name), type = /type/.test(name);
+        const spec = of ? [B[0] + __maxSpec(of)[0], B[1] + __maxSpec(of)[1], __maxSpec(of)[2]] : B;
+        return {
+          spec,
+          test: (e, ctx) => {
+            if (!e.parentNode) return false;
+            if (of && !__selAny(of, e, ctx)) return false;
+            let n = 1;
+            for (let p = last ? __nextEl(e) : __prevEl(e); p; p = last ? __nextEl(p) : __prevEl(p)) {
+              if (type ? p.localName === e.localName : !of || __selAny(of, p, ctx)) n++;
+            }
+            return __nthOk(ab, n);
+          },
+        };
+      }
+      case 'empty': return { spec: B, test: (e) => !(e.__ptKids || []).some((k) => k.nodeType === ELEMENT_NODE || ((k.nodeType === TEXT_NODE || k.nodeType === 4) && k.data !== '')) };
+      case 'checked': return { spec: B, test: (e) => (e.localName === 'input' && /^(checkbox|radio)$/.test(__inputType(e)) && !!e.checked) || (e.localName === 'option' && !!e.selected) };
+      case 'indeterminate': return { spec: B, test: (e) => e.localName === 'input' && __inputType(e) === 'checkbox' && !!e.indeterminate };
+      case 'default': return { spec: B, test: (e) => (e.localName === 'input' && /^(checkbox|radio)$/.test(__inputType(e)) && __ptHasA(e, 'checked')) || (e.localName === 'option' && __ptHasA(e, 'selected')) };
+      case 'disabled': return { spec: B, test: (e) => __isDisabled(e) };
+      case 'enabled': return { spec: B, test: (e) => __FORM_CTL.has(e.localName) && !__isDisabled(e) };
+      case 'required': return { spec: B, test: (e) => /^(input|select|textarea)$/.test(e.localName) && __ptHasA(e, 'required') };
+      case 'optional': return { spec: B, test: (e) => /^(input|select|textarea)$/.test(e.localName) && !__ptHasA(e, 'required') };
+      case 'read-write': case 'read-only': {
+        const rw = (e) => {
+          if (e.localName === 'textarea') return !__ptHasA(e, 'readonly') && !__isDisabled(e);
+          if (e.localName === 'input') return __TEXTISH.test(__inputType(e)) && !__ptHasA(e, 'readonly') && !__isDisabled(e);
+          for (let p = e; p; p = __parentEl(p)) {
+            const v = __ptGetA(p, 'contenteditable');
+            if (v != null) return v !== 'false';
+          }
+          return false;
+        };
+        return { spec: B, test: name === 'read-write' ? rw : (e) => !rw(e) };
+      }
+      case 'placeholder-shown': return { spec: B, test: (e) => (e.localName === 'input' || e.localName === 'textarea') && __ptHasA(e, 'placeholder') && __valueOf(e) === '' };
+      case 'valid': return { spec: B, test: (e) => /^(input|select|textarea|form|fieldset)$/.test(e.localName) && !__isInvalid(e) };
+      case 'invalid': return { spec: B, test: (e) => __isInvalid(e) };
+      case 'link': case 'any-link': case '-webkit-any-link': return { spec: B, test: (e) => (e.localName === 'a' || e.localName === 'area') && __ptHasA(e, 'href') };
+      case 'focus': return { spec: B, test: (e) => { const d = e.ownerDocument; return !!d && d.__ptActive === e; } };
+      case 'focus-within': return { spec: B, test: (e) => { const d = e.ownerDocument; const a = d && d.__ptActive; return !!a && (a === e || e.contains(a)); } };
+      case 'target': return { spec: B, test: (e) => { try { const h = decodeURIComponent(String(globalThis.location && globalThis.location.hash || '').slice(1)); return !!h && e.id === h; } catch (x) { return false; } } };
+      case 'lang': {
+        const want = String(arg || '').trim().replace(/^["']|["']$/g, '').toLowerCase();
+        return { spec: B, test: (e) => {
+          for (let p = e; p; p = __parentEl(p)) {
+            const v = __ptGetA(p, 'lang');
+            if (v != null) { const l = v.toLowerCase(); return l === want || l.startsWith(want + '-'); }
+          }
+          return false;
+        } };
+      }
+      case 'dir': {
+        const want = String(arg || '').trim().toLowerCase();
+        return { spec: B, test: (e) => {
+          for (let p = e; p; p = __parentEl(p)) {
+            const v = String(__ptGetA(p, 'dir') || '').toLowerCase();
+            if (v === 'ltr' || v === 'rtl') return v === want;
+          }
+          return want === 'ltr';
+        } };
+      }
+      case 'open': return { spec: B, test: (e) => (e.localName === 'details' || e.localName === 'dialog') && __ptHasA(e, 'open') };
+      case 'defined': return { spec: B, test: (e) => e.localName.indexOf('-') < 0 || !!(globalThis.customElements && globalThis.customElements.get && globalThis.customElements.get(e.localName)) };
+      case 'host': case 'host-context': case 'state':
+        return { spec: B, test: __SEL_NEVER };
+    }
+    // Всё прочее — состояния, которых у нас не бывает (`:hover`,
+    // `:active`, `:visited`, `:autofill`, `:fullscreen`, `:modal`…), и
+    // приставочные имена. Совпадения нет, но и ошибки тоже.
+    return { spec: B, test: __SEL_NEVER };
+  }
+  function __selParseRelative(src) {
+    // Относительный селектор: тот же разбор, но с комбинатором впереди и
+    // привязкой к якорю слева.
+    const t = String(src).trim();
+    const lead = /^[>+~]/.test(t) ? t[0] : null;
+    const body = lead ? t.slice(1) : t;
+    const parsed = __selParse(body);
+    if (parsed.length !== 1) throw new SyntaxError('selector');
+    const cx = parsed[0];
+    cx.lead = lead; cx.anchored = true;
+    return cx;
+  }
+
   // Селектор, который браузер разобрать не может, — это отказ, а не пустой
   // ответ: `document.querySelector('<<<')` бросает SyntaxError с точным текстом.
   // У нас же он что-то находил — движок молча пропускал непонятное, и `<<<`
@@ -3312,7 +3711,7 @@
     const s = String(sel);
     if (!s.trim()) return false;
     // Части через запятую проверяются по отдельности, как в браузере.
-    for (const part of s.split(',')) {
+    for (const part of __selSplit(s)) {
       const t = part.trim();
       if (!t) return false;
       if (/[<>~+]$/.test(t) || /^[>~+]/.test(t)) return false;
@@ -3364,47 +3763,20 @@
       "Failed to execute '" + method + "' on 'Node': " + what, 'NotFoundError');
   };
 
-  function matchesSelector(el, selector) {
+  function matchesSelector(el, selector, scope) {
     if (!el || el.nodeType !== ELEMENT_NODE) return false;
-    return selector.split(',').some(sel => {
-      const { compounds, combinators } = parseComplex(sel);
-      return compounds.length > 0 && matchesSteps(el, compounds, combinators, compounds.length - 1);
-    });
+    const list = __selCompiled(selector);
+    return !!list && __selAny(list, el, { scope: scope || null });
   }
+  // Ответ — в порядке документа: `querySelectorAll('input, button')` у
+  // браузера отдаёт элементы так, как они стоят в дереве (api.js Turnstile
+  // описывает форму именно этим запросом).
   function query(root, selector) {
-    const seen = new Set(); const results = [];
-    for (const sel of selector.split(',')) {
-      // Tokenize into (combinator, compound) steps.
-      const raw = sel.trim().replace(/\s*>\s*/g, ' > ');
-      const steps = raw.split(/\s+/).filter(Boolean);
-      let current = [root];
-      for (let i = 0; i < steps.length; i++) {
-        let combinator = 'descendant';
-        if (steps[i] === '>') { combinator = 'child'; i++; }
-        const pred = parseCompound(steps[i]);
-        const next = [];
-        for (const ctx of current) {
-          if (combinator === 'child') {
-            for (const c of (ctx.children || [])) if (pred(c)) next.push(c);
-          } else {
-            walk(ctx, e => { if (pred(e)) next.push(e); });
-          }
-        }
-        current = next;
-      }
-      for (const el of current) if (el !== root && !seen.has(el)) { seen.add(el); results.push(el); }
-    }
-    // Порядок — документа, а не селекторов: `querySelectorAll('input, button')`
-    // у браузера отдаёт элементы так, как они стоят в дереве. У нас сначала шли
-    // все поля, потом все кнопки — и api.js Turnstile, описывающий форму этим
-    // запросом, отправлял виджету чужую форму.
-    if (results.length > 1) {
-      const ordered = [];
-      walk(root, (e) => { if (seen.has(e)) ordered.push(e); });
-      if (ordered.length === results.length) {
-        ordered.item = (i) => ordered[i] || null;
-        return ordered;
-      }
+    const results = [];
+    const list = __selCompiled(selector);
+    if (list) {
+      const ctx = { scope: root };
+      walk(root, (e) => { if (__selAny(list, e, ctx)) results.push(e); });
     }
     results.item = (i) => results[i] || null;
     return results;
@@ -5260,6 +5632,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // объявления накладываются в порядке возрастания веса.
   const __SPEC_ATTR = /\[[^\]]*\]/g;
   function __specificity(sel) {
+    const list = __selCompiled(sel);
+    if (list && list.length === 1) {
+      const [a, b, c] = list[0].spec;
+      return a * 10000 + b * 100 + c;
+    }
     const s = String(sel).replace(__SPEC_ATTR, '[]');
     const ids = (s.match(/#[\w-]+/g) || []).length;
     const cls = (s.match(/\.[\w-]+|\[\]|:(?!:)[a-zA-Z-]+/g) || []).length;
@@ -5294,6 +5671,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // каскад, — до следующей сборки правил.
   let __passFont = new WeakMap();
   let __passInherit = new WeakMap();
+  let __passCustom = new WeakMap();
   let __hiddenBySheet = new WeakSet();
   let __noneBySheet = new WeakSet();
 
@@ -5309,7 +5687,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
           continue;
         }
         if (r.type !== 1 || !r.selectorText) continue;
-        for (const one of String(r.selectorText).split(',')) {
+        for (const one of __selSplit(r.selectorText)) {
           const sel = one.trim();
           if (!sel) continue;
           out.push({ root, sel, spec: __specificity(sel), order: state.order++, style: r.style });
@@ -5350,6 +5728,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __styleCache = new WeakMap();
     __passFont = new WeakMap();
     __passInherit = new WeakMap();
+    __passCustom = new WeakMap();
     __hiddenBySheet = new WeakSet();
     __noneBySheet = new WeakSet();
     __foreignRules = new WeakMap();
@@ -5424,17 +5803,121 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (pairs) { for (const [k, val] of pairs) out.set(k, val); return; }
       out.set(n, v);
     };
-    for (const r of won) {
-      const d = r.style;
+    // Собственные свойства (`--*`) и подстановка `var()`. Раньше `var()`
+    // доходил до раскладки как есть, и всякая длина, записанная через
+    // переменную, не значила ничего — а современные таблицы так пишут почти
+    // всё.
+    const decls = [];
+    const mine = new Map();
+    const note = (n, v) => {
+      if (n.charCodeAt(0) === 45 && n.charCodeAt(1) === 45) mine.set(n, v);
+      else decls.push([n, v]);
+    };
+    const noteAll = (d) => {
+      const raw = __declRaw.get(d);
+      if (raw) { for (const [n, v] of raw()) note(n, String(v)); return; }
       for (let i = 0; i < d.length; i++) {
         const n = d.item(i);
-        take(n, d.getPropertyValue(n));
+        note(n, d.getPropertyValue(n));
       }
-    }
+    };
+    for (const r of won) noteAll(r.style);
     const own = el.style;
-    if (own) for (let i = 0; i < own.length; i++) take(own.item(i), own.getPropertyValue(own.item(i)));
+    if (own) noteAll(own);
+    const vars = __customsFor(el, mine);
+    // `inherit` — значение родителя, как оно у него в каскаде; `initial` и
+    // `unset` — как будто не писали. Мы брали слово буквально, и
+    // `* { box-sizing: inherit }` оставлял всю страницу без `border-box`.
+    const parentOf = () => {
+      const p = el.parentNode;
+      return p && p.nodeType === ELEMENT_NODE ? __cascadeFor(p) : null;
+    };
+    for (let k = 0; k < decls.length; k++) {
+      const v = String(decls[k][1]).trim().toLowerCase();
+      if (v === 'initial' || v === 'unset' || v === 'revert' || v === 'revert-layer') { decls[k][1] = null; continue; }
+      if (v !== 'inherit') continue;
+      const pc = parentOf();
+      const got = pc ? pc.get(decls[k][0]) : undefined;
+      decls[k][1] = got != null ? got : null;
+    }
+    for (const [n, v] of decls) {
+      if (v == null) { out.delete(n); continue; }
+      if (v.indexOf('var(') < 0) { take(n, v); continue; }
+      // Не нашедшая значения подстановка делает объявление недействительным:
+      // свойство ведёт себя так, будто его не писали.
+      const sub = __ptSubstVars(v, vars);
+      if (sub != null) take(n, sub);
+    }
     __styleCache.set(el, out);
     return out;
+  }
+
+  /// Собственные свойства элемента: свои поверх унаследованных. Держатся
+  /// цепочкой прототипов, а не копией — у корня их сотни, а узлов тысячи.
+  function __customsFor(el, mine) {
+    const hit = __passCustom.get(el);
+    if (hit) return hit;
+    const parent = el.parentNode && el.parentNode.nodeType === ELEMENT_NODE ? el.parentNode
+      : (el.parentNode && el.parentNode.host) || null;
+    let base = null;
+    if (parent) { __cascadeFor(parent); base = __passCustom.get(parent) || null; }
+    if (!mine || !mine.size) {
+      const same = base || Object.create(null);
+      __passCustom.set(el, same);
+      return same;
+    }
+    const out = Object.create(base);
+    for (const [n, v] of mine) out[n] = v;
+    // Свои значения сами могут ссылаться на переменные — и на свои, и на
+    // унаследованные. Круг делает значение недействительным.
+    for (const n of mine.keys()) {
+      const v = out[n];
+      if (typeof v !== 'string' || v.indexOf('var(') < 0) continue;
+      const sub = __ptSubstVars(v, out, new Set([n]));
+      if (sub == null) out[n] = undefined; else out[n] = sub;
+    }
+    __passCustom.set(el, out);
+    return out;
+  }
+
+  /// Подставить `var(--имя[, запас])`. Возвращает null, если подстановка
+  /// не удалась и запаса нет.
+  function __ptSubstVars(v, vars, busy) {
+    let out = '', i = 0, bad = false;
+    while (i < v.length) {
+      const at = v.indexOf('var(', i);
+      if (at < 0) { out += v.slice(i); break; }
+      // `var(` внутри имени (`--my-var(`) не бывает, но `somevar(` бывает.
+      if (at > 0 && /[\w-]/.test(v[at - 1])) { out += v.slice(i, at + 4); i = at + 4; continue; }
+      out += v.slice(i, at);
+      let depth = 1, j = at + 4, comma = -1;
+      for (; j < v.length && depth; j++) {
+        const c = v[j];
+        if (c === '(') depth++;
+        else if (c === ')') { if (--depth === 0) break; }
+        else if (c === ',' && depth === 1 && comma < 0) comma = j;
+      }
+      const name = v.slice(at + 4, comma < 0 ? j : comma).trim();
+      const fallback = comma < 0 ? null : v.slice(comma + 1, j).trim();
+      let val = null;
+      if (!(busy && busy.has(name))) {
+        const raw = vars ? vars[name] : undefined;
+        if (typeof raw === 'string') {
+          if (raw.indexOf('var(') < 0) val = raw;
+          else {
+            const b = new Set(busy || []); b.add(name);
+            val = __ptSubstVars(raw, vars, b);
+          }
+        }
+      }
+      if (val == null && fallback != null) {
+        val = fallback.indexOf('var(') < 0 ? fallback : __ptSubstVars(fallback, vars, busy);
+      }
+      if (val == null) { bad = true; break; }
+      out += val;
+      i = j + 1;
+    }
+    return bad ? null : out.trim();
   }
 
   // Раскладка. Была строчная модель: каждый лист занимал двадцать пикселей, а
@@ -5447,24 +5930,203 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   const __BLOCKISH = /^(block|flow-root|list-item|table|flex|grid|table-cell|table-row|table-caption)$/;
   const __INLINEISH = /^(inline|inline-block|inline-flex|inline-grid|inline-table)$/;
 
+  /// Дорожки сетки: `[{px}|{fr}|{auto}]`. Понимает длины, доли, `auto`,
+  /// `minmax()`, `repeat()` (и с `auto-fill`/`auto-fit`), имена линий
+  /// пропускает. Пусто — одна дорожка `auto`.
+  function __gridTracks(raw, avail, gap, fs, rows) {
+    const v = raw == null ? 'none' : String(raw).trim();
+    if (!v || /^(none|auto|subgrid|masonry)$/i.test(v)) return rows ? [] : [{ auto: true }];
+    const split = (t) => {
+      const out = []; let depth = 0, cur = '';
+      for (const ch of t) {
+        if (ch === '(' || ch === '[') depth++;
+        if (ch === ')' || ch === ']') depth--;
+        if (/\s/.test(ch) && depth === 0) { if (cur) out.push(cur); cur = ''; continue; }
+        cur += ch;
+      }
+      if (cur) out.push(cur);
+      return out.filter((x) => x[0] !== '[');
+    };
+    const one = (t) => {
+      const low = t.toLowerCase();
+      let m;
+      if ((m = /^(-?[\d.]+)fr$/.exec(low))) return { fr: parseFloat(m[1]) };
+      if (/^(auto|min-content|max-content)$/.test(low) || /^fit-content\(/.test(low)) return { auto: true };
+      if ((m = /^minmax\((.*)\)$/.exec(low))) {
+        const [a, b] = __selSplit(m[1]);
+        const hi = one(b || 'auto');
+        if (hi.fr) return { fr: hi.fr };
+        if (hi.px != null) {
+          const lo = one(a || '0');
+          return { px: lo.px != null ? Math.max(lo.px, hi.px) : hi.px };
+        }
+        const lo = one(a || 'auto');
+        return lo.px != null ? { px: lo.px, grow: true } : { auto: true };
+      }
+      const px = __lengthPx(t, fs, avail);
+      return px != null ? { px } : { auto: true };
+    };
+    const out = [];
+    for (const t of split(v)) {
+      const m = /^repeat\(\s*([^,]+?)\s*,(.*)\)$/i.exec(t);
+      if (!m) { out.push(one(t)); continue; }
+      const list = split(m[2].trim()).map(one);
+      let count = parseInt(m[1], 10);
+      if (!Number.isFinite(count)) {
+        // auto-fill / auto-fit: сколько поместится по наименьшему размеру.
+        const size = list.reduce((a, d) => a + (d.px || 0), 0) + gap * list.length;
+        count = size > 0 ? Math.max(1, Math.floor((avail + gap) / size)) : 1;
+      }
+      for (let r = 0; r < Math.min(count, 1000); r++) for (const d of list) out.push(Object.assign({}, d));
+    }
+    // `minmax(200px, auto)` растёт как `auto`.
+    for (const d of out) if (d.grow) { delete d.grow; }
+    return out.length ? out : (rows ? [] : [{ auto: true }]);
+  }
+
+  /// Кегль корня: от него считается `rem`. Мы брали шестнадцать, а
+  /// страницы часто пишут `html { font-size: 62.5% }` и дальше всё в `rem`.
+  function __rootFontSize() {
+    const doc = globalThis.document;
+    const root = doc && doc.documentElement;
+    return root ? __usedFontSize(root) : 16;
+  }
+
+  /// Одно число с единицей — в пиксели. `base` — от чего проценты; без него
+  /// проценты не считаются.
+  function __unitPx(x, u, fs, base) {
+    switch (u) {
+      case 'px': case '': return x;
+      case 'em': return x * fs;
+      case 'rem': return x * __rootFontSize();
+      case 'pt': return x * 4 / 3;
+      case 'pc': return x * 16;
+      case 'in': return x * 96;
+      case 'cm': return x * 96 / 2.54;
+      case 'mm': return x * 96 / 25.4;
+      case 'q': return x * 96 / 101.6;
+      case 'ex': return x * fs / 2;
+      case 'ch': return x * fs / 2;
+      case '%': return base == null ? null : x / 100 * base;
+    }
+    // Доли окна, и новые (`dvh`, `svh`, `lvh`) тоже: без панелей и
+    // клавиатуры все три равны обычной.
+    const m = /^[dsl]?(vh|vw|vmin|vmax|vi|vb)$/.exec(u);
+    if (m) {
+      const k = m[1];
+      const vb = k === 'vh' || k === 'vb' ? LAYOUT.H : k === 'vw' || k === 'vi' ? LAYOUT.W
+        : k === 'vmin' ? Math.min(LAYOUT.W, LAYOUT.H) : Math.max(LAYOUT.W, LAYOUT.H);
+      return x / 100 * vb;
+    }
+    return null;
+  }
+
+  /// Выражение `calc()`, `min()`, `max()`, `clamp()` — в пиксели, или null.
+  /// Раньше любое из них значило «не задано», и блок с
+  /// `width: min(100%, 40rem)` растягивался на всё окно.
+  function __ptCalcPx(v, fs, base) {
+    const toks = [];
+    const re = /\s*(?:([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)([a-z%]*)|([a-z-]+)\(|([()*/,+-]))/iy;
+    let pos = 0;
+    while (pos < v.length) {
+      re.lastIndex = pos;
+      const m = re.exec(v);
+      if (!m) { if (/^\s*$/.test(v.slice(pos))) break; return null; }
+      pos = re.lastIndex;
+      if (m[1] != null) {
+        // `a -1px` — это вычитание, а не число со знаком, если перед ним
+        // стоит операнд.
+        const prev = toks[toks.length - 1];
+        if (/^[+-]/.test(m[1]) && prev && (prev.t === 'n' || prev.t === ')')) {
+          toks.push({ t: m[1][0] });
+          toks.push({ t: 'n', x: parseFloat(m[1].slice(1)), u: m[2].toLowerCase() });
+        } else toks.push({ t: 'n', x: parseFloat(m[1]), u: m[2].toLowerCase() });
+      } else if (m[3] != null) toks.push({ t: 'f', f: m[3].toLowerCase() });
+      else toks.push({ t: m[4] });
+    }
+    let i = 0, fail = false;
+    const peek = () => toks[i] || { t: 'end' };
+    // Значение — пара: пиксели и признак «голое число», чтобы `2 * 10px`
+    // и `10px / 2` считались, а `10px * 10px` — нет.
+    const expr = () => {
+      let a = term();
+      while (!fail && (peek().t === '+' || peek().t === '-')) {
+        const op = toks[i++].t, b = term();
+        if (fail) break;
+        a = { x: op === '+' ? a.x + b.x : a.x - b.x, num: a.num && b.num };
+      }
+      return a;
+    };
+    const term = () => {
+      let a = factor();
+      while (!fail && (peek().t === '*' || peek().t === '/')) {
+        const op = toks[i++].t, b = factor();
+        if (fail) break;
+        if (op === '*') a = { x: a.x * b.x, num: a.num && b.num };
+        else { if (!b.num || b.x === 0) { fail = true; break; } a = { x: a.x / b.x, num: a.num }; }
+      }
+      return a;
+    };
+    const args = () => {
+      const out = [expr()];
+      while (!fail && peek().t === ',') { i++; out.push(expr()); }
+      if (peek().t !== ')') fail = true; else i++;
+      return out;
+    };
+    const factor = () => {
+      const t = toks[i++];
+      if (!t) { fail = true; return { x: 0 }; }
+      if (t.t === 'n') {
+        if (t.u === '') return { x: t.x, num: true };
+        const px = __unitPx(t.x, t.u, fs, base);
+        if (px == null) fail = true;
+        return { x: px || 0, num: false };
+      }
+      if (t.t === '(') {
+        const a = expr();
+        if (peek().t !== ')') fail = true; else i++;
+        return a;
+      }
+      if (t.t === '-') { const a = factor(); return { x: -a.x, num: a.num }; }
+      if (t.t === 'f') {
+        const xs = args();
+        if (fail) return { x: 0 };
+        const num = xs.every((a) => a.num);
+        switch (t.f) {
+          case 'calc': case '-webkit-calc':
+            if (xs.length !== 1) fail = true;
+            return xs[0];
+          case 'min': return { x: Math.min(...xs.map((a) => a.x)), num };
+          case 'max': return { x: Math.max(...xs.map((a) => a.x)), num };
+          case 'clamp':
+            if (xs.length !== 3) { fail = true; return { x: 0 }; }
+            return { x: Math.max(xs[0].x, Math.min(xs[1].x, xs[2].x)), num };
+        }
+      }
+      fail = true;
+      return { x: 0 };
+    };
+    const r = expr();
+    if (fail || i !== toks.length || !isFinite(r.x)) return null;
+    return r.x;
+  }
+
+  const __CALC_FN = /(?:^|[^\w-])(?:-webkit-)?(?:calc|min|max|clamp)\(/i;
+
   function __lengthPx(raw, fs, base) {
     if (raw == null) return null;
     const v = String(raw).trim();
     let m;
-    if ((m = /^(-?[\d.]+)px$/.exec(v))) return parseFloat(m[1]);
-    if ((m = /^(-?[\d.]+)$/.exec(v))) return parseFloat(m[1]);
-    if ((m = /^(-?[\d.]+)(em|rem)$/.exec(v))) return parseFloat(m[1]) * (m[2] === 'rem' ? 16 : fs);
-    if ((m = /^(-?[\d.]+)pt$/.exec(v))) return parseFloat(m[1]) * 4 / 3;
-    // Доли окна. Без них `width: 60vw` ничего не значило, блок занимал всю
-    // строку, а вместе с ним уезжала и вся геометрия страницы.
-    if ((m = /^(-?[\d.]+)(vh|vw|vmin|vmax)$/.exec(v))) {
-      const u = m[2];
-      const vb = u === 'vh' ? LAYOUT.H : u === 'vw' ? LAYOUT.W
-        : u === 'vmin' ? Math.min(LAYOUT.W, LAYOUT.H) : Math.max(LAYOUT.W, LAYOUT.H);
-      return Math.round(parseFloat(m[1]) / 100 * vb * 64) / 64;
+    if ((m = /^(-?(?:\d+\.?\d*|\.\d+))([a-z%]*)$/i.exec(v))) {
+      const u = m[2].toLowerCase();
+      const px = __unitPx(parseFloat(m[1]), u, fs, base);
+      if (px == null) return null;
+      // Доли окна и проценты браузер держит с точностью в 1/64 пикселя.
+      return u === '%' || /v/.test(u) ? Math.round(px * 64) / 64 : px;
     }
-    if ((m = /^(-?[\d.]+)%$/.exec(v))) {
-      return base == null ? null : Math.round(parseFloat(m[1]) / 100 * base * 64) / 64;
+    if (__CALC_FN.test(v)) {
+      const px = __ptCalcPx(v, fs, base);
+      return px == null ? null : Math.round(px * 64) / 64;
     }
     return null;
   }
@@ -5796,8 +6458,20 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (!setM[0] && !setM[2] && ua.m) { mt = ua.m[0]; mb = ua.m[0]; }
       if (!setM[3] && !setM[1] && ua.m) { ml = ua.m[1]; mr = ua.m[1]; }
     }
-    const explicitW = len('width', availW);
-    const explicitH = len('height', availW);
+    // `box-sizing: border-box` — размер назван вместе с полями и рамкой. Мы
+    // его не знали, и почти любая современная страница (`* { box-sizing:
+    // border-box }`) выходила у нас шире и выше, чем у браузера.
+    const bbox = /^border-box$/i.test(String(cs.get('box-sizing') || '').trim());
+    const inW = (v) => (v == null ? null : bbox ? Math.max(0, v - pl - pr - bl - br) : v);
+    const inH = (v) => (v == null ? null : bbox ? Math.max(0, v - pt_ - pb - bt - bb) : v);
+    // Проценты высоты — от заданной высоты родителя; у корня это окно. Мы
+    // считали их от ширины, и `height: 100%` давало высоту в ширину окна.
+    const up = el.parentNode;
+    const baseH = up && up.nodeType === ELEMENT_NODE
+      ? (up.__ptDefH != null ? up.__ptDefH : null) : LAYOUT.H;
+    const explicitW = inW(len('width', availW));
+    const explicitH = inH(len('height', baseH));
+    el.__ptDefH = explicitH;
     const frame = tag === 'iframe' || tag === 'img' || tag === 'canvas' || tag === 'video';
     const attrW = frame && el.getAttribute ? __lengthPx(__ptGetA(el, 'width'), fs, availW) : null;
     const attrH = frame && el.getAttribute ? __lengthPx(__ptGetA(el, 'height'), fs, availW) : null;
@@ -5813,8 +6487,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     // Пределы ширины: без них колонка с `max-width` растягивалась во всё
     // окно, а вместе с ней уезжала и вся геометрия под ней.
     if (cw != null) {
-      const maxW = len('max-width', availW);
-      const minW = len('min-width', availW);
+      const maxW = inW(len('max-width', availW));
+      const minW = inW(len('min-width', availW));
       if (maxW != null && cw > maxW) cw = maxW;
       if (minW != null && cw < minW) cw = minW;
     }
@@ -5883,7 +6557,125 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     // умолчанию растягиваются. Раньше мы клали их обычным блочным потоком, и
     // виджет — а он почти всегда гибкий — получал не ту геометрию.
     const flexish = display === 'flex' || display === 'inline-flex';
-    if (flexish && boxedKids.length) {
+    // Сетка: дети по ячейкам, строки высотой в самого высокого, промежутки
+    // `gap`, растяжение по ячейке. Раньше сетка раскладывалась обычным
+    // блочным потоком — без промежутков и без растяжения, и форма входа
+    // chess.com (сетка с `gap: 16px`) выходила на полсотни пикселей ниже.
+    const gridish = display === 'grid' || display === 'inline-grid';
+    if (gridish && boxedKids.length) {
+      const gapLen = (n) => {
+        const v = cs.get(n);
+        if (v == null || /^normal$/i.test(String(v).trim())) return 0;
+        return __lengthPx(v, fs, cw) || 0;
+      };
+      const colGap = gapLen('column-gap'), rowGap = gapLen('row-gap');
+      const flow = boxedKids.filter((c) => {
+        const p = String(__cascadeFor(c).get('position') || 'static').toLowerCase();
+        return p !== 'absolute' && p !== 'fixed';
+      });
+      const cols = __gridTracks(cs.get('grid-template-columns'), cw, colGap, fs);
+      const n = cols.length;
+      const marg = (c, a, b) => {
+        const ccs = __cascadeFor(c), cfs = __usedFontSize(c);
+        return (__lengthPx(ccs.get(a), cfs, cw) || 0) + (__lengthPx(ccs.get(b), cfs, cw) || 0);
+      };
+      // Ширины колонок: заданные — как есть, доли — от остатка, `auto` —
+      // по содержимому, а остаток без долей делится между `auto` поровну.
+      const widths = cols.map((t) => (t.px != null ? t.px : 0));
+      const frTotal = cols.reduce((a, t) => a + (t.fr || 0), 0);
+      const autos = [];
+      cols.forEach((t, k) => { if (t.auto) autos.push(k); });
+      if (autos.length && frTotal) {
+        flow.forEach((c, i) => {
+          const k = i % n;
+          if (!cols[k].auto) return;
+          const b = __layoutOne(c, contentX, contentY, cw, fbox) || { w: 0 };
+          widths[k] = Math.max(widths[k], b.w + marg(c, 'margin-left', 'margin-right'));
+        });
+      }
+      const usedW = widths.reduce((a, w) => a + w, 0) + colGap * Math.max(0, n - 1);
+      let freeW = Math.max(0, cw - usedW);
+      if (frTotal) cols.forEach((t, k) => { if (t.fr) widths[k] = freeW * t.fr / frTotal; });
+      else if (autos.length) { for (const k of autos) widths[k] += freeW / autos.length; freeW = 0; }
+      const totalW = widths.reduce((a, w) => a + w, 0) + colGap * Math.max(0, n - 1);
+      const jc = String(cs.get('justify-content') || 'normal').toLowerCase();
+      const slackW = Math.max(0, cw - totalW);
+      const leadX = jc === 'center' ? slackW / 2 : (jc === 'end' || jc === 'flex-end' || jc === 'right') ? slackW : 0;
+      const colX = [];
+      { let x = contentX + leadX; for (let k = 0; k < n; k++) { colX.push(x); x += widths[k] + colGap; } }
+      const rowsT = __gridTracks(cs.get('grid-template-rows'), explicitH != null ? explicitH : 0, rowGap, fs, true);
+      const ji = String(cs.get('justify-items') || 'normal').toLowerCase();
+      const ai = String(cs.get('align-items') || 'normal').toLowerCase();
+      const selfOf = (c, prop, dflt) => {
+        const v = String(__cascadeFor(c).get(prop) || 'auto').toLowerCase();
+        return v === 'auto' ? dflt : v;
+      };
+      const stretchy = (v) => v === 'normal' || v === 'stretch' || v === 'legacy';
+      // Первый проход — высоты строк.
+      const nRows = Math.ceil(flow.length / n);
+      const rowH = new Array(nRows).fill(0);
+      flow.forEach((c, i) => {
+        const k = i % n, r = (i / n) | 0;
+        const ccs = __cascadeFor(c);
+        const js = selfOf(c, 'justify-self', ji);
+        const fixedW = ccs.get('width') != null && !/^auto$/i.test(String(ccs.get('width')).trim());
+        const mx = marg(c, 'margin-left', 'margin-right');
+        const b = __layoutOne(c, colX[k], contentY, widths[k], fbox,
+          stretchy(js) && !fixedW ? { w: Math.max(0, widths[k] - mx), block: true } : { block: true }) || { h: 0 };
+        rowH[r] = Math.max(rowH[r], b.h + marg(c, 'margin-top', 'margin-bottom'));
+      });
+      for (let r = 0; r < nRows; r++) {
+        const t = rowsT[r];
+        if (t && t.px != null) rowH[r] = t.px;
+      }
+      const totalH = rowH.reduce((a, h) => a + h, 0) + rowGap * Math.max(0, nRows - 1);
+      const ac = String(cs.get('align-content') || 'normal').toLowerCase();
+      const boxH = explicitH != null ? explicitH : null;
+      const slackH = boxH != null ? Math.max(0, boxH - totalH) : 0;
+      const leadY = ac === 'center' ? slackH / 2 : (ac === 'end' || ac === 'flex-end') ? slackH : 0;
+      // Второй проход — окончательные места.
+      const rowY = [];
+      { let yy = contentY + leadY; for (let r = 0; r < nRows; r++) { rowY.push(yy); yy += rowH[r] + rowGap; } }
+      flow.forEach((c, i) => {
+        const k = i % n, r = (i / n) | 0;
+        const ccs = __cascadeFor(c);
+        const js = selfOf(c, 'justify-self', ji), as = selfOf(c, 'align-self', ai);
+        const fixedW = ccs.get('width') != null && !/^auto$/i.test(String(ccs.get('width')).trim());
+        const fixedH = ccs.get('height') != null && !/^auto$/i.test(String(ccs.get('height')).trim());
+        const mx = marg(c, 'margin-left', 'margin-right'), my = marg(c, 'margin-top', 'margin-bottom');
+        const sw = stretchy(js) && !fixedW, sh = stretchy(as) && !fixedH;
+        let x = colX[k], yy = rowY[r];
+        if (!sw || !sh) {
+          const probe = __layoutOne(c, x, yy, widths[k], fbox,
+            { w: sw ? Math.max(0, widths[k] - mx) : null, h: null, block: true }) || { w: 0, h: 0 };
+          if (!sw) {
+            const free = widths[k] - probe.w - mx;
+            if (js === 'center') x += free / 2;
+            else if (js === 'end' || js === 'flex-end' || js === 'right' || js === 'self-end') x += free;
+          }
+          if (!sh) {
+            const free = rowH[r] - probe.h - my;
+            if (as === 'center') yy += free / 2;
+            else if (as === 'end' || as === 'flex-end' || as === 'self-end') yy += free;
+          }
+        }
+        const cb = __layoutOne(c, x, yy, widths[k], fbox, {
+          w: sw ? Math.max(0, widths[k] - mx) : null,
+          h: sh ? Math.max(0, rowH[r] - my) : null,
+          block: true,
+        });
+        if (cb) {
+          widest = Math.max(widest, cb.x - contentX + cb.w);
+          deepest = Math.max(deepest, cb.y - contentY + cb.h);
+        }
+      });
+      y = contentY + Math.max(totalH, 0);
+      if (inlineish && !forcedW && explicitW == null) cw = Math.min(cw || totalW, totalW) || totalW;
+      for (const c of boxedKids) {
+        const p = String(__cascadeFor(c).get('position') || 'static').toLowerCase();
+        if (p === 'absolute' || p === 'fixed') __layoutOne(c, contentX, contentY, cw, fbox);
+      }
+    } else if (flexish && boxedKids.length) {
       const dir = String(cs.get('flex-direction') || 'row').toLowerCase();
       const row = dir.lastIndexOf('column', 0) !== 0;
       const reverse = /-reverse$/.test(dir);
@@ -5916,9 +6708,21 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
           mMain: row ? mw : mh, mCross: row ? mh : mw,
         };
       });
-      const inner = row ? cw : (explicitH != null ? explicitH : 0);
       const gaps = gapMain * Math.max(0, items.length - 1);
       const used = items.reduce((a, it) => a + it.base + it.mMain, 0) + gaps;
+      // Столбец без заданной высоты высок как его содержимое, но не ниже
+      // `min-height` и не выше `max-height`. Мы брали ноль, и нехватка
+      // сжимала всех детей в ничто.
+      let inner = cw;
+      if (!row) {
+        if (explicitH != null) inner = explicitH;
+        else {
+          const lo = inH(len('min-height', baseH)), hi = inH(len('max-height', baseH));
+          inner = used;
+          if (hi != null && inner > hi) inner = hi;
+          if (lo != null && inner < lo) inner = lo;
+        }
+      }
       let free = inner - used;
       if (free > 0) {
         const total = items.reduce((a, it) => a + it.grow, 0);
@@ -5980,7 +6784,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         }
         along += it.main + it.mMain + between;
       }
-      y = contentY + (row ? lineCross : along);
+      // Промежуток ставится между детьми, а не после последнего.
+      y = contentY + (row ? lineCross : Math.max(0, along - (order.length ? between : 0)));
       // Остальное — как у блока: абсолютные дети кладутся сами по себе.
       for (const c of boxedKids) {
         const p = String(__cascadeFor(c).get('position') || 'static').toLowerCase();
@@ -6086,6 +6891,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       ch = fbox.asc + fbox.desc;
     }
     if (ua && explicitH == null && attrH == null) ch = ua.h;
+    {
+      const maxH = inH(len('max-height', baseH));
+      const minH = inH(len('min-height', baseH));
+      if (maxH != null && ch > maxH) ch = maxH;
+      if (minH != null && ch < minH) ch = minH;
+    }
 
     // Браузер держит длины в шестьдесят четвёртых пикселя, и это видно:
     // ширина строки 72.26171875 у нас против 72.265625 у Chrome — та же
@@ -6736,8 +7547,11 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
             const r = Math.round(v * 1e4) / 1e4;
             return (Number.isInteger(r) ? r : parseFloat(r.toFixed(4))) + 'px';
           };
-          map.set('width', q(b.cw)); map.set('height', q(b.ch));
-          map.set('inline-size', q(b.cw)); map.set('block-size', q(b.ch));
+          // При `border-box` — вместе с полями и рамкой, как и названо в CSS.
+          const outer = map.get('box-sizing') === 'border-box';
+          const w = outer ? b.w : b.cw, h = outer ? b.h : b.ch;
+          map.set('width', q(w)); map.set('height', q(h));
+          map.set('inline-size', q(w)); map.set('block-size', q(h));
           map.set('perspective-origin', q(b.w / 2) + ' ' + q(b.h / 2));
           map.set('transform-origin', q(b.w / 2) + ' ' + q(b.h / 2));
         }
@@ -6745,8 +7559,36 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     } catch (e) {}
     // Перечисляются только длинные свойства: сокращения читаются, но в
     // `length` и в нумерованные имена не попадают, как и в браузере.
+    // Ребёнок гибкого контейнера и сетки, а ещё вынутый из потока
+    // (`absolute`, `fixed`, `float`) и корень — блочные, как бы их ни
+    // объявили: браузер печатает `grid` там, где написано `inline-grid`.
+    if (el && el.nodeType === ELEMENT_NODE) {
+      const BLOCKIFY = { inline: 'block', 'inline-block': 'block', 'inline-flex': 'flex', 'inline-grid': 'grid', 'inline-table': 'table', 'inline-flow-root': 'flow-root', 'list-item': null };
+      const d = map.get('display');
+      const to = BLOCKIFY[d];
+      if (to) {
+        let why = el.ownerDocument && el === el.ownerDocument.documentElement;
+        const pos = map.get('position');
+        if (pos === 'absolute' || pos === 'fixed') why = true;
+        if (map.get('float') && map.get('float') !== 'none') why = true;
+        let p = el.parentNode;
+        while (!why && p && p.nodeType === ELEMENT_NODE) {
+          const pd = String(__cascadeFor(p).get('display') || CS_DISPLAY[p.localName] || '').trim().toLowerCase();
+          if (pd === 'contents') { p = p.parentNode; continue; }
+          if (/^(inline-)?(flex|grid)$/.test(pd)) why = true;
+          break;
+        }
+        if (why) map.set('display', to);
+      }
+    }
     const names = [...map.keys()];
     __addShorthands(map);
+    // Собственные свойства читаются `getPropertyValue('--имя')`, но в
+    // перечислении не стоят.
+    if (el && el.nodeType === ELEMENT_NODE) {
+      const vars = __passCustom.get(el);
+      if (vars) for (const k in vars) if (typeof vars[k] === 'string') map.set(k, vars[k]);
+    }
     const made = __makeComputed(map, names);
     if (el && !pseudo && el.nodeType === ELEMENT_NODE) {
       try { __computedCache.set(el, { at: __layoutBuilt, style: made }); } catch (e) {}
@@ -6979,6 +7821,11 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     return __usedFontSizeRaw(el);
   }
 
+  const FONT_KEYWORDS = {
+    'xx-small': 9, 'x-small': 10, small: 13, medium: 16, large: 18,
+    'x-large': 24, 'xx-large': 32, 'xxx-large': 48,
+  };
+
   function __usedFontSizeRaw(el) {
     let size = 16;
     const chain = [];
@@ -7005,12 +7852,16 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         if (f) size *= f;
         continue;
       }
-      const v = String(raw).trim();
-      let m;
-      if ((m = /^(-?[\d.]+)px$/.exec(v))) size = parseFloat(m[1]);
-      else if ((m = /^(-?[\d.]+)(?:em|rem)$/.exec(v))) size = parseFloat(m[1]) * size;
-      else if ((m = /^(-?[\d.]+)%$/.exec(v))) size = parseFloat(m[1]) / 100 * size;
-      else if ((m = /^(-?[\d.]+)pt$/.exec(v))) size = parseFloat(m[1]) * 4 / 3;
+      let v = String(raw).trim().toLowerCase();
+      // `rem` у самого корня значит начальный кегль, а не свой же.
+      const e = chain[i];
+      if (e.ownerDocument && e === e.ownerDocument.documentElement) v = v.replace(/(\d)rem\b/g, '$1em');
+      if (FONT_KEYWORDS[v]) { size = FONT_KEYWORDS[v]; continue; }
+      if (v === 'smaller') { size /= 1.2; continue; }
+      if (v === 'larger') { size *= 1.2; continue; }
+      // `em` и проценты — от кегля родителя, `calc()` и `clamp()` тоже.
+      const px = __lengthPx(v, size, size);
+      if (px != null && px >= 0) size = px;
     }
     return Math.round(size * 1e4) / 1e4;
   }
@@ -7019,13 +7870,17 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   /// ширины родителя, всё прочее как есть.
   const __LENGTH_PROPS = /^(width|height|min-|max-|margin|padding|border-.*-width|top|right|bottom|left|inset|gap|font-size|line-height|text-indent|letter-spacing|word-spacing|outline-width|border-spacing|column-gap|row-gap)/;
   function __resolveLength(raw, prop, fontSize, el) {
-    const v = String(raw);
-    if (!__LENGTH_PROPS.test(prop) || !/[\d.](?:em|rem|pt|%|vh|vw|vmin|vmax)/.test(v)) return v;
-    return v.replace(/(-?[\d.]+)(em|rem|pt|vmin|vmax|vh|vw|%)/g, (m, n, unit) => {
+    let v = String(raw);
+    if (!__LENGTH_PROPS.test(prop)) return v;
+    // Выражения браузер печатает готовым числом, если всё в них известно.
+    if (__CALC_FN.test(v)) v = __ptCalcOut(v, fontSize, el);
+    if (!/[\d.](?:em|rem|pt|%|[dsl]?v(?:h|w|min|max))/.test(v)) return v;
+    return v.replace(/(-?[\d.]+)(em|rem|pt|[dsl]?vmin|[dsl]?vmax|[dsl]?vh|[dsl]?vw|%)(?![\w-])/g, (m, n, unit) => {
       const x = parseFloat(n);
       if (unit === 'pt') return (x * 4 / 3) + 'px';
       if (unit === 'em') return (x * fontSize) + 'px';
-      if (unit === 'rem') return (x * 16) + 'px';
+      if (unit === 'rem') return (x * __rootFontSize()) + 'px';
+      if (unit.length > 2 && /^[dsl]v/.test(unit)) unit = unit.slice(1);
       // Доли окна браузер тоже печатает пикселями: `margin: 15vh auto` в
       // вычисленном стиле выходит числом, а не записью автора.
       if (unit === 'vh' || unit === 'vw' || unit === 'vmin' || unit === 'vmax') {
@@ -7037,6 +7892,30 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       const base = __containingWidth(el);
       return base != null ? (Math.round(x / 100 * base * 64) / 64) + 'px' : m;
     });
+  }
+
+  /// Каждое `calc()`/`min()`/`max()`/`clamp()` верхнего уровня — в пиксели,
+  /// если хватает данных; иначе остаётся как написано.
+  function __ptCalcOut(v, fontSize, el) {
+    let out = '', i = 0;
+    const re = /(?:-webkit-)?(?:calc|min|max|clamp)\(/gi;
+    for (;;) {
+      re.lastIndex = i;
+      const m = re.exec(v);
+      if (!m) { out += v.slice(i); break; }
+      if (m.index > 0 && /[\w-]/.test(v[m.index - 1])) { out += v.slice(i, re.lastIndex); i = re.lastIndex; continue; }
+      let depth = 1, j = re.lastIndex;
+      for (; j < v.length && depth; j++) {
+        if (v[j] === '(') depth++;
+        else if (v[j] === ')') depth--;
+      }
+      const part = v.slice(m.index, j);
+      const needsBase = part.indexOf('%') >= 0;
+      const px = __ptCalcPx(part, fontSize, needsBase ? __containingWidth(el) : null);
+      out += v.slice(i, m.index) + (px == null ? part : (Math.round(px * 64) / 64) + 'px');
+      i = j;
+    }
+    return out;
   }
 
   /// Ширина содержимого блока, в котором лежит элемент.

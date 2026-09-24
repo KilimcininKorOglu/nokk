@@ -7346,6 +7346,105 @@ mod tests {
         assert_eq!(out["nested"], serde_json::json!(["b1", "t1", "b2"]), "{out}");
     }
 
+    /// Псевдоклассы и все четыре комбинатора. Прежний движок читал `:root`
+    /// как имя тега, и переменные из `:root { … }` не доходили ни до одного
+    /// элемента.
+    #[tokio::test]
+    async fn selectors_know_pseudo_classes_and_siblings() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<html><body><ul><li id=a class=x></li><li id=b></li><li id=c class=x></li></ul>\
+             <input id=d required><input id=e disabled value=v><p id=f></p></body></html>",
+        )
+        .await
+        .unwrap();
+        let out = probe(
+            &ctx,
+            "__ptJSON.stringify({
+               root: document.documentElement.matches(':root'),
+               html: document.querySelectorAll('html').length,
+               first: [...document.querySelectorAll('li:first-child, li:last-child')].map(e => e.id),
+               nth: [...document.querySelectorAll('li:nth-child(2n+1)')].map(e => e.id),
+               not: [...document.querySelectorAll('li:not(.x)')].map(e => e.id),
+               sib: [...document.querySelectorAll('#a + li, #a ~ .x')].map(e => e.id),
+               is: [...document.querySelectorAll(':is(ul, p) > :where(#b), p:empty')].map(e => e.id),
+               has: [...document.querySelectorAll('ul:has(> .x)')].length,
+               form: [...document.querySelectorAll('input:invalid, input:disabled')].map(e => e.id),
+               scope: document.querySelector('ul').querySelectorAll(':scope > li').length,
+             })",
+        )
+        .await;
+        assert_eq!(out["root"], true, "{out}");
+        assert_eq!(out["html"], 1, "{out}");
+        assert_eq!(out["first"], serde_json::json!(["a", "c"]), "{out}");
+        assert_eq!(out["nth"], serde_json::json!(["a", "c"]), "{out}");
+        assert_eq!(out["not"], serde_json::json!(["b"]), "{out}");
+        assert_eq!(out["sib"], serde_json::json!(["b", "c"]), "{out}");
+        assert_eq!(out["is"], serde_json::json!(["b", "f"]), "{out}");
+        assert_eq!(out["has"], 1, "{out}");
+        assert_eq!(out["form"], serde_json::json!(["d", "e"]), "{out}");
+        assert_eq!(out["scope"], 3, "{out}");
+    }
+
+    /// Значения современного CSS: `var()` с запасом, собственные свойства с
+    /// регистром, `calc()`/`min()`/`clamp()`, `dvh`, `rem` от корня,
+    /// `box-sizing: inherit` и сетка с `gap`. Числа — из Chrome 151 на той же
+    /// разметке (окно 1920×942).
+    #[tokio::test]
+    async fn modern_css_values_resolve_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<html><head><style>
+               :root { --space-16: 1.6rem; box-sizing: border-box; }
+               *, :before, :after { box-sizing: inherit; }
+               html { font-size: 62.5%; }
+               body { margin: 0; }
+               #a { width: var(--W, 40rem); }
+               #b { --Wide: 34rem; width: var(--Wide, 40rem); }
+               #c { min-height: 100dvh; height: 10px; }
+               #d { padding-left: clamp(1.2rem, 3vw, 2rem); }
+               #e { width: min(50%, 300px); }
+               #g { --x: 7px; margin-left: var(--x); }
+               #h { width: 200px; padding: 0 20px; }
+               #grid { display: grid; gap: var(--space-16); width: 320px; }
+               #grid > div { height: 40px; }
+             </style></head><body><div id=a></div><div id=b></div><div id=c></div><div id=d></div>\
+             <div id=e></div><div id=g></div><div id=h></div>\
+             <form id=grid><div></div><div></div><div></div></form></body></html>",
+        )
+        .await
+        .unwrap();
+        let out = probe(
+            &ctx,
+            "(() => { const q = (id) => document.getElementById(id);
+               const cs = (id, p) => getComputedStyle(q(id))[p];
+               const w = (id) => q(id).getBoundingClientRect().width;
+               const g = q('grid');
+               return __ptJSON.stringify({
+                 a: [cs('a', 'width'), w('a')], b: [w('b'), getComputedStyle(q('b')).getPropertyValue('--Wide')],
+                 c: q('c').getBoundingClientRect().height, d: cs('d', 'paddingLeft'), e: w('e'),
+                 g: cs('g', 'marginLeft'), h: [w('h'), cs('h', 'width')],
+                 grid: [g.getBoundingClientRect().height, cs('grid', 'rowGap'),
+                        g.children[2].getBoundingClientRect().top - g.getBoundingClientRect().top],
+               }); })()",
+        )
+        .await;
+        assert_eq!(out["a"], serde_json::json!(["400px", 400]), "{out}");
+        assert_eq!(out["b"], serde_json::json!([340, "34rem"]), "{out}");
+        assert_eq!(out["c"], 942, "{out}");
+        assert_eq!(out["d"], "20px", "{out}");
+        assert_eq!(out["e"], 300, "{out}");
+        assert_eq!(out["g"], "7px", "{out}");
+        assert_eq!(out["h"], serde_json::json!([200, "200px"]), "{out}");
+        assert_eq!(out["grid"], serde_json::json!([152, "16px", 112]), "{out}");
+    }
+
     /// Скрипт, вставленный страницей, видит себя так же, как видит браузерный:
     /// `document.currentScript` — он сам, а его запись Resource Timing уже на
     /// месте, пока он исполняется. api.js Turnstile ищет её первой же строкой
