@@ -55,7 +55,17 @@ const HOOK = `(() => {
   });
   try {
     const S = XMLHttpRequest.prototype.send, O = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function (m, u) { this.__u = String(u); return O.apply(this, arguments); };
+    XMLHttpRequest.prototype.open = function (m, u) {
+      this.__u = String(u);
+      // Окно сериализации: тело собирается между открытием запроса и
+      // отправкой; вне этого окна лента строк показывает не тело.
+      try {
+        if (/\\/cdn-cgi\\/challenge-platform\\//.test(this.__u) && !globalThis.__ptСобрано) {
+          globalThis.__ptСериализуем = 1;
+        }
+      } catch (e) {}
+      return O.apply(this, arguments);
+    };
     XMLHttpRequest.prototype.send = function (b) {
       console.log('[send] ' + tag() + ' bytes=' + ((b && b.length) || 0) + ' url=' + String(this.__u || '').slice(-40));
       // Тело первого POST — то, что уходит до программы; разница с движком
@@ -65,9 +75,24 @@ const HOOK = `(() => {
             && b.length < 20000 && !globalThis.__ptFirstBody) {
           globalThis.__ptFirstBody = 1;
           // Вектор чисел, собранный к этому мигу: дальше он продолжится уже
-          // сбором отчёта, а сравнивать надо то, что ушло первым.
+          // сбором отчёта, а сравнивать надо то, что ушло первым. Если он
+          // пуст — надо знать, наш ли крючок ещё стоит: пустота и снятый
+          // крючок выглядят одинаково.
+          globalThis.__ptСобрано = 1;
+          globalThis.__ptСериализуем = 0;
+          try {
+            const стр = globalThis.__ptСтроки || [];
+            const s2 = JSON.stringify(стр);
+            console.log('[строки] всего=' + стр.length);
+            for (let q = 0; q < s2.length; q += 250) {
+              console.log('[строки ' + стр.length + ':' + (q / 250) + '] ' + s2.slice(q, q + 250));
+            }
+          } catch (e) {}
           try {
             const ряд = globalThis.__ptЧисла || [];
+            console.log('[числа] всего=' + ряд.length
+                  + ' крючок=' + (globalThis.isFinite && globalThis.isFinite.__ptНаш ? 'наш' : 'чужой')
+                  + ' имя=' + (globalThis.isFinite && globalThis.isFinite.name));
             const s1 = JSON.stringify(ряд);
             for (let q = 0; q < s1.length; q += 250) {
               console.log('[числа ' + ряд.length + ':' + (q / 250) + '] ' + s1.slice(q, q + 250));
@@ -116,6 +141,7 @@ const HOOK = `(() => {
       if (чужой() && ряд.length < 4000) ряд.push(typeof x === 'number' ? x : String(x).slice(0, 20));
       return IF.call(this, x);
     }, IF);
+    try { globalThis.isFinite.__ptНаш = true; } catch (e) {}
     if (чужой()) console.log('[числа] крючок стоит');
     // Ряд печатается, когда уходит первый POST: дальше он продолжается уже
     // другим — сбором отчёта.
@@ -149,6 +175,10 @@ const HOOK = `(() => {
       return f;
     };
     String.prototype.charCodeAt = нат(function (i) {
+      if (i === 0 && this.length > 0 && this.length < 120 && globalThis.__ptСериализуем && чужой()) {
+        const ряд = globalThis.__ptСтроки || (globalThis.__ptСтроки = []);
+        if (ряд.length < 400) ряд.push(String(this));
+      }
       if (i === 0 && this.length > 300 && this.length < 40000 && чужой()) {
         const n = this.length;
         if (!видели[n] && Object.keys(видели).length < 30) {
@@ -665,7 +695,7 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker|count|бросок|время|первые|исходник|числа)\]|^\[[jPC]\d* |^\[cs\]|^\[ПЕРВЫЙ |^\[svg\]|^\[хвост |^\[parts|^\[звук |^\[json |^\[btoa |^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
+      if (/^\[(send|hook|hookerr|blob|worker|count|бросок|время|первые|исходник|числа)\]|^\[[jPC]\d* |^\[cs\]|^\[строки |^\[числа |^\[исходник |^\[ПЕРВЫЙ |^\[svg\]|^\[хвост |^\[parts|^\[звук |^\[json |^\[btoa |^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
         lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
     }
     // Крючок мог и не встать: у внедрения ошибка видна только так, а без неё

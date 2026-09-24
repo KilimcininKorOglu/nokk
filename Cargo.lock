@@ -1395,7 +1395,9 @@ dependencies = [
 name = "nokk-net"
 version = "0.0.0"
 dependencies = [
+ "brotli",
  "cookie_store",
+ "flate2",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1404,6 +1406,7 @@ dependencies = [
  "url",
  "wreq",
  "wreq-util",
+ "zstd",
 ]
 
 [[package]]

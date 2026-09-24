@@ -430,6 +430,14 @@ async fn main() -> Result<()> {
                     const O = XMLHttpRequest.prototype.open;
                     XMLHttpRequest.prototype.open = function (m, u) {
                       this.__ptU = String(u);
+                      // Окно сериализации: тело собирается между открытием
+                      // запроса и отправкой, и только в это время лента строк
+                      // показывает поля тела, а не разбор стилей самим движком.
+                      try {
+                        if (/\/cdn-cgi\/challenge-platform\//.test(this.__ptU) && !globalThis.__ptСобрано) {
+                          globalThis.__ptСериализуем = 1;
+                        }
+                      } catch (e) {}
                       return O.apply(this, arguments);
                     };
                     XMLHttpRequest.prototype.send = function (b) {
@@ -463,6 +471,16 @@ async fn main() -> Result<()> {
                         if (/\/cdn-cgi\/challenge-platform\//.test(this.__ptU || '') && b && b.length > 1000
                             && b.length < 20000 && !globalThis.__ptFirstBody) {
                           globalThis.__ptFirstBody = 1;
+                          globalThis.__ptСобрано = 1;
+                          globalThis.__ptСериализуем = 0;
+                          try {
+                            const ряд = globalThis.__ptСтроки || [];
+                            const s1 = JSON.stringify(ряд);
+                            console.error('[строки] всего=' + ряд.length);
+                            for (let q = 0; q < s1.length; q += 250) {
+                              console.error('[строки ' + ряд.length + ':' + (q / 250) + '] ' + s1.slice(q, q + 250));
+                            }
+                          } catch (e) {}
                           const s0 = String(b);
                           for (let q = 0; q < s0.length; q += 250) {
                             console.error('[ПЕРВЫЙ ' + s0.length + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
@@ -1226,6 +1244,78 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                         }, B);
                       }
                     } catch (e) {}
+                    // Что приходит кадру письмами: часть тела первого POST
+                    // виджет получает от страницы (api.js) — и у Chrome в этом
+                    // месте есть поля, которых у нас нет.
+                    try {
+                      const AL2 = EventTarget.prototype.addEventListener;
+                      EventTarget.prototype.addEventListener = асНатив(function (type, fn, opts) {
+                        if (__ptЧужой() && String(type) === 'message' && typeof fn === 'function') {
+                          const свой = function (ev) {
+                            try {
+                              if ((globalThis.__ptПисем = (globalThis.__ptПисем || 0) + 1) < 25) {
+                                const d = ev && ev.data;
+                                const t = typeof d === 'string' ? d : (() => {
+                                  try { return JSON.stringify(d); } catch (e) { return String(d); }
+                                })();
+                                // Длинные письма печатаются кусками: в них и лежит
+                                // то, чего не хватает телу первого POST.
+                                const s1 = String(t);
+                                if (s1.length <= 220) {
+                                  console.error('[письмо] ' + String(ev && ev.origin).slice(0, 30) + ' ' + s1);
+                                } else {
+                                  for (let q = 0; q < Math.min(s1.length, 3000); q += 220) {
+                                    console.error('[письмо ' + s1.length + ':' + (q / 220) + '] ' + s1.slice(q, q + 220));
+                                  }
+                                }
+                              }
+                            } catch (e) {}
+                            return fn.apply(this, arguments);
+                          };
+                          return AL2.call(this, type, свой, opts);
+                        }
+                        return AL2.apply(this, arguments);
+                      }, AL2);
+                    } catch (e) {}
+
+                    // Где челлендж берёт нетронутые встроенные функции: он строит
+                    // себе кадр-песочницу и читает у него `contentWindow`. Если
+                    // окна не дают (или дают не то), код идёт другой веткой — и
+                    // тело собирается в другом реалме, чем у браузера.
+                    try {
+                      const D = Document.prototype.createElement;
+                      Document.prototype.createElement = асНатив(function (tag) {
+                        const el = D.apply(this, arguments);
+                        try {
+                          if (__ptЧужой() && /^iframe$/i.test(String(tag))
+                              && (globalThis.__ptРамок = (globalThis.__ptРамок || 0) + 1) < 12) {
+                            console.error('[песочница] создан кадр #' + globalThis.__ptРамок);
+                          }
+                        } catch (e) {}
+                        return el;
+                      }, D);
+                      const IF = globalThis.HTMLIFrameElement;
+                      const d = IF && Object.getOwnPropertyDescriptor(IF.prototype, 'contentWindow');
+                      if (d && d.get) {
+                        Object.defineProperty(IF.prototype, 'contentWindow', {
+                          get: асНатив(function () {
+                            const w = d.get.call(this);
+                            try {
+                              if (__ptЧужой()
+                                  && (globalThis.__ptОкон = (globalThis.__ptОкон || 0) + 1) < 12) {
+                                console.error('[песочница] contentWindow → ' + (w ? 'окно' : String(w))
+                                      + ' src=' + String(this.getAttribute('src') || '-').slice(0, 30)
+                                      + ' sandbox=' + String(this.getAttribute('sandbox') || '-').slice(0, 30)
+                                      + ' в дереве=' + !!this.isConnected);
+                              }
+                            } catch (e) {}
+                            return w;
+                          }, d.get),
+                          set: d.set, enumerable: d.enumerable, configurable: d.configurable,
+                        });
+                      }
+                    } catch (e) {}
+
                     // Какие события челлендж слушает и какие до него доходят.
                     // Он держит их список и отправляет сводкой; у Chrome к
                     // первой отправке этот список пуст, у нас — нет, и тогда
@@ -1302,9 +1392,17 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       const CCA = String.prototype.charCodeAt;
                       const видели = Object.create(null);
                       String.prototype.charCodeAt = асНатив(function (i) {
-                        if (i === 0 && this.length > 300 && this.length < 40000) {
+                        if (i === 0 && this.length > 0 && this.length < 40000 && __ptЧужой()) {
                           const n = this.length;
-                          if (!видели[n] && Object.keys(видели).length < 30 && __ptЧужой()) {
+                          // Короткие строки — это имена полей и значения самого
+                          // тела: сериализатор читает их знак за знаком так же,
+                          // как числа. Порядок важнее содержимого, поэтому ведём
+                          // ряд, а не список.
+                          if (n < 120) {
+                            if (!globalThis.__ptСериализуем) return CCA.call(this, i);
+                            const ряд = globalThis.__ptСтроки || (globalThis.__ptСтроки = []);
+                            if (ряд.length < 400) ряд.push(String(this));
+                          } else if (!видели[n] && Object.keys(видели).length < 30) {
                             видели[n] = 1;
                             const s0 = String(this);
                             console.error('[исходник ' + n + '] ' + Math.round(performance.now()) + 'мс');

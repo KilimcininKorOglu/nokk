@@ -943,6 +943,11 @@ pub struct NetworkRecord {
     /// page that reports no timings is a page that never loaded anything.
     pub started_ms: f64,
     pub duration_ms: f64,
+    /// Сколько байт тела пришло по проводу — до распаковки. Из него строится
+    /// `encodedBodySize` (а `transferSize` — он же плюс заголовки): у сжатого
+    /// скрипта это втрое меньше распакованной длины, и сторона, отдавшая файл,
+    /// знает точное число.
+    pub encoded_len: usize,
     /// Контекст, который запросил: страница или один из её кадров. Времена
     /// ресурсов раздаются по нему — у кадра в браузере своя лента, и пустая
     /// лента там заметна не меньше, чем пустая у страницы.
@@ -1752,7 +1757,7 @@ impl BrowserContext {
                         "initiatorType": "navigation",
                         "start": 0.0,
                         "duration": r.duration_ms,
-                        "size": r.body.len() + 300,
+                        "size": r.encoded_len + 300,
                         "decoded": r.body.len(),
                         "status": r.status,
                         "protocol": "h2",
@@ -1805,7 +1810,7 @@ impl BrowserContext {
                     // через сто миллисекунд после собственного начала времён.
                     "start": if top_document { 0.0 } else { r.started_ms },
                     "duration": r.duration_ms,
-                    "size": r.body.len() + 300,
+                    "size": r.encoded_len + 300,
                     "decoded": r.body.len(),
                     "status": r.status,
                     "protocol": "h2",
@@ -3193,6 +3198,8 @@ impl BrowserContext {
                     &resp.body,
                     resp.headers.clone(),
                     &sent,
+                    resp.encoded_len,
+                    Some(resp.elapsed_ms),
                 );
                 let headers_js =
                     serde_json::to_string(&resp.headers).unwrap_or_else(|_| "{}".into());
@@ -3367,6 +3374,8 @@ impl BrowserContext {
                     &resp.body,
                     resp.headers.clone(),
                     &[],
+                    resp.encoded_len,
+                    Some(resp.elapsed_ms),
                 );
                 let final_url = if resp.url.is_empty() {
                     url.to_string()
@@ -3408,6 +3417,8 @@ impl BrowserContext {
             body,
             std::collections::BTreeMap::new(),
             &[],
+            body.len(),
+            None,
         )
     }
 
@@ -3427,11 +3438,15 @@ impl BrowserContext {
         body: &[u8],
         headers: std::collections::BTreeMap<String, String>,
         request_body: &[u8],
+        encoded_len: usize,
+        measured_ms: Option<f64>,
     ) {
         let now = self.started.elapsed().as_secs_f64() * 1000.0;
-        // Without a measured duration, say what a fast local hop looks like
-        // rather than zero: a resource that took no time at all is not one.
-        let duration_ms = 12.0;
+        // Замеренное время обращения, а не одно и то же число на всех: у
+        // браузера у каждого ресурса своя длительность, и страницы их читают.
+        // Без замера (запрос не состоялся) остаётся прежняя оценка быстрого
+        // локального хода: ресурс, взявший ноль времени, — не ресурс.
+        let duration_ms = measured_ms.unwrap_or(12.0);
         let started_ms = now - duration_ms;
         let rec = NetworkRecord {
             request_id: format!(
@@ -3447,6 +3462,7 @@ impl BrowserContext {
             request_body: request_body.to_vec(),
             started_ms: started_ms.max(0.0),
             duration_ms: duration_ms.max(0.0),
+            encoded_len,
             context,
         };
         if let Ok(mut log) = self.requests.lock() {

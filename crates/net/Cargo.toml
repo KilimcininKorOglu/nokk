@@ -26,3 +26,12 @@ wreq-util = { workspace = true }
 # there is a single `cookie` crate in the graph and `RawCookie` types match.
 cookie_store = "0.21"
 url = "2"
+
+# Распаковка тела своими руками. Без неё клиент распаковывает сам и стирает
+# `content-length` с `content-encoding`, а вместе с ними — размер, который
+# ушёл по проводу. Браузер его знает и показывает страницам
+# (`transferSize`, `encodedBodySize`), и сторона, отдавшая файл, знает тоже:
+# несовпадение там видно сразу. Версии — те же, что уже в дереве через wreq.
+brotli = "8"
+flate2 = "1"
+zstd = "0.13"

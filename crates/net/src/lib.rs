@@ -329,9 +329,61 @@ pub struct Response {
     pub status: u16,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
+    /// Сколько байт тела пришло по проводу — до распаковки. Браузер показывает
+    /// это число страницам (`encodedBodySize`, а `transferSize` — оно же плюс
+    /// заголовки), и сторона, отдавшая файл, знает его точно. Мы отдавали
+    /// распакованную длину: у сжатого скрипта расхождение втрое.
+    pub encoded_len: usize,
+    /// Сколько заняло само обращение, в миллисекундах. У браузера у каждого
+    /// ресурса своя длительность; у нас всем подряд ставилось двенадцать.
+    pub elapsed_ms: f64,
     /// Final URL after any redirects were followed — the origin the body
     /// actually came from. Callers use it as the document base URL.
     pub url: String,
+}
+
+
+/// Распаковать тело по `content-encoding`. Неизвестная или пустая кодировка —
+/// тело как есть; сломанный поток — тоже как есть: ронять загрузку страницы
+/// из-за этого браузер не стал бы.
+fn decode_body(encoding: &str, raw: Vec<u8>) -> Vec<u8> {
+    use std::io::Read;
+    if raw.is_empty() {
+        return raw;
+    }
+    let out: Option<Vec<u8>> = match encoding {
+        "br" => {
+            let mut out = Vec::new();
+            brotli::Decompressor::new(raw.as_slice(), 4096)
+                .read_to_end(&mut out)
+                .ok()
+                .map(|_| out)
+        }
+        "gzip" | "x-gzip" => {
+            let mut out = Vec::new();
+            flate2::read::MultiGzDecoder::new(raw.as_slice())
+                .read_to_end(&mut out)
+                .ok()
+                .map(|_| out)
+        }
+        "deflate" => {
+            let mut out = Vec::new();
+            flate2::read::ZlibDecoder::new(raw.as_slice())
+                .read_to_end(&mut out)
+                .ok()
+                .map(|_| out)
+                .or_else(|| {
+                    let mut plain = Vec::new();
+                    flate2::read::DeflateDecoder::new(raw.as_slice())
+                        .read_to_end(&mut plain)
+                        .ok()
+                        .map(|_| plain)
+                })
+        }
+        "zstd" => zstd::stream::decode_all(raw.as_slice()).ok(),
+        _ => None,
+    };
+    out.unwrap_or(raw)
 }
 
 /// The engine talks to the network exclusively through this trait, so the TLS
@@ -461,6 +513,11 @@ impl FingerprintClient {
             tls.sigalgs_list = Some(CHROME_SIGALGS.into());
         }
         let mut builder = wreq::Client::builder().emulation(emulation);
+        // Распаковываем сами: клиент, делающий это за нас, стирает
+        // `content-encoding` и `content-length`, а с ними — размер, ушедший по
+        // проводу. Заголовок `accept-encoding` ставит профиль эмуляции, так что
+        // на вид запроса это не влияет.
+        builder = builder.gzip(false).brotli(false).zstd(false).deflate(false);
         // Named session or not, the jar is ours: a named one is shared (and
         // serializable) across contexts of the same identity, an anonymous one is
         // private to this client. Either way its contents stay readable.
@@ -691,6 +748,7 @@ impl HttpClient for FingerprintClient {
                 .collect();
             tracing::trace!(url = %req.url, method = %req.method, page_headers = %sent.join(" | "), "request");
         }
+        let started = std::time::Instant::now();
         let resp = rb.send().await.map_err(|e| {
             if e.is_timeout() {
                 NetError::Timeout
@@ -724,16 +782,30 @@ impl HttpClient for FingerprintClient {
                 headers.insert(k.to_string(), s.to_string());
             }
         }
-        let body = resp
+        let raw = resp
             .bytes()
             .await
             .map_err(|e| NetError::Connect(e.to_string()))?
             .to_vec();
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let encoded_len = raw.len();
+        // Распаковка наша, а не клиентская: только так остаётся известен
+        // размер, ушедший по проводу. Заголовки о сжатии после этого убираем —
+        // браузер странице их тоже не показывает.
+        let encoding = headers
+            .get("content-encoding")
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let body = decode_body(&encoding, raw);
+        headers.remove("content-encoding");
+        headers.remove("content-length");
         Ok(Response {
             status,
             url,
             headers,
             body,
+            encoded_len,
+            elapsed_ms,
         })
     }
 }
