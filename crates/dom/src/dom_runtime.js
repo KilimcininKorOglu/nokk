@@ -701,21 +701,7 @@
     // Список таблиц стилей — не массив: у браузера это `StyleSheetList`, и
     // `Array.isArray(sr.styleSheets)` там ложно. Мы отдавали литерал массива, а
     // виджет живёт как раз в теневом корне и читает его оттуда.
-    get styleSheets() {
-      const own = [];
-      const walk = (n) => {
-        for (const c of (n.__ptKids || [])) {
-          if (c.nodeType === ELEMENT_NODE) {
-            if (c.__ptLocal === 'style' || (c.__ptLocal === 'link' && /stylesheet/i.test(__ptGetA(c, 'rel') || ''))) {
-              own.push(c);
-            }
-            walk(c);
-          }
-        }
-      };
-      walk(this);
-      return __styleSheetList(own);
-    }
+    get styleSheets() { return __styleSheetList(__sheetOwners(this)); }
     get adoptedStyleSheets() { return this.__ptAdopted || (this.__ptAdopted = []); }
     set adoptedStyleSheets(v) { this.__ptAdopted = v; }
     getElementById(id) { return firstMatch(this, e => e.id === id); }
@@ -1570,10 +1556,7 @@
         .filter(e => __ptHasA(e, 'href')));
     }
     get anchors() { return __collection(__docTags(this, 'a').filter(e => __ptHasA(e, 'name'))); }
-    get styleSheets() {
-      return __styleSheetList(__docTags(this, 'style')
-        .concat(__docTags(this, 'link').filter((e) => /stylesheet/i.test(__ptGetA(e, 'rel') || ''))));
-    }
+    get styleSheets() { return __styleSheetList(__sheetOwners(this)); }
     // Кодировка — объявленная, а не всегда UTF-8: страница без объявления
     // разбирается как windows-1252, и Chrome именно это и сообщает. Отвечать
     // «UTF-8» на документ, который ничего не объявил, — заметная разница.
@@ -3275,6 +3258,32 @@
     const out = []; walk(root, e => { if (pred(e)) out.push(e); });
     out.item = (i) => out[i] || null; return out;
   }
+  /// Есть ли у элемента таблица. У `<link>` — только со словом `stylesheet`
+  /// в `rel` и с непустым `href`: chess.com держит в разметке
+  /// `<link rel="stylesheet" data-href=…>` про запас, и у браузера такой
+  /// ссылки в `document.styleSheets` нет, а у нас она была — и счёт таблиц,
+  /// который api.js Turnstile отправляет виджету, выходил на одну больше.
+  function __ptHasSheet(e) {
+    if (e.__ptLocal === 'style') return true;
+    if (e.__ptLocal !== 'link') return false;
+    const rel = String(__ptGetA(e, 'rel') || '').toLowerCase().split(/[\t\n\f\r ]+/);
+    if (rel.indexOf('stylesheet') < 0 || rel.indexOf('alternate') >= 0) return false;
+    return !!String(__ptGetA(e, 'href') || '').trim();
+  }
+  /// Владельцы таблиц в порядке документа.
+  function __sheetOwners(root) {
+    const own = [];
+    const visit = (n) => {
+      for (const c of (n.__ptKids || [])) {
+        if (c.nodeType !== ELEMENT_NODE) continue;
+        if (__ptHasSheet(c)) own.push(c);
+        visit(c);
+      }
+    };
+    visit(root);
+    return own;
+  }
+
   function firstMatch(root, pred) {
     let found = null; walk(root, e => { if (!found && pred(e)) found = e; }); return found;
   }
@@ -4132,7 +4141,7 @@
     if (!proto) continue;
     Object.defineProperty(proto, 'sheet', {
       get() {
-        if (this.__ptLocal === 'link' && !/stylesheet/i.test(__ptGetA(this, 'rel') || '')) return null;
+        if (this.__ptLocal === 'link' && !__ptHasSheet(this)) return null;
         if (!this.isConnected) return null;
         return globalThis.__pt_sheetFor ? __pt_sheetFor(this) : null;
       },
@@ -4865,6 +4874,13 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   globalThis.__pt_endScript = () => { document.__ptCurScript = null; };
 
   // Called after all page scripts have run: fire DOMContentLoaded then load.
+  // Разбор кончился: дальше идут отложенные скрипты, и видят они уже
+  // `interactive`, как в браузере.
+  globalThis.__pt_parseDone = () => {
+    if (document.__ptReady !== 'loading') return;
+    document.__ptReady = 'interactive';
+    try { document.dispatchEvent(__ptTrust(new Event('readystatechange'))); } catch (e) {}
+  };
   globalThis.__pt_finishLoad = () => {
     // Смена готовности видна страницам: `readystatechange` браузер шлёт на
     // каждом шаге, и слушают его наравне с `DOMContentLoaded`.
@@ -4872,7 +4888,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       document.__ptReady = v;
       try { document.dispatchEvent(__ptTrust(new Event('readystatechange'))); } catch (e) {}
     };
-    готовность('interactive');
+    // Разбор мог кончиться раньше — перед отложенными скриптами.
+    if (document.__ptReady === 'loading') готовность('interactive');
     // События жизненного цикла приходят от движка, а движок здесь — браузер:
     // у настоящего `e.isTrusted` истина, и это читают первой же строкой.
     const dcl = __ptTrust(new Event('DOMContentLoaded', { bubbles: true }));

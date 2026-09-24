@@ -1159,7 +1159,32 @@ impl BrowserContext {
         // document-order script list the DOM runtime built, so `__pt_beginScript`
         // can point `document.currentScript` at the running node (document.write
         // positioning); `__pt_endScript` clears it afterward.
-        for (idx, script) in page.scripts.iter().enumerate() {
+        // Сначала всё, что исполняется по ходу разбора; потом «по готовности»
+        // (`async`: запрос у них короткий, отложенным же ещё тянуть граф
+        // модулей), потом отложенные по порядку документа. Между ними — конец
+        // разбора: `readyState` становится `interactive`.
+        let mode_of = |i: usize| {
+            page.script_modes
+                .get(i)
+                .copied()
+                .unwrap_or(nokk_dom::ScriptMode::Blocking)
+        };
+        let n = page.scripts.len();
+        let blocking = (0..n).filter(|&i| mode_of(i) == nokk_dom::ScriptMode::Blocking);
+        let later = (0..n)
+            .filter(|&i| mode_of(i) == nokk_dom::ScriptMode::Async)
+            .chain((0..n).filter(|&i| mode_of(i) == nokk_dom::ScriptMode::Defer));
+        let plan: Vec<Option<usize>> = blocking
+            .map(Some)
+            .chain(std::iter::once(None))
+            .chain(later.map(Some))
+            .collect();
+        for step in plan {
+            let Some(idx) = step else {
+                let _ = self.eval_in(index, "__pt_parseDone()").await;
+                continue;
+            };
+            let script = &page.scripts[idx];
             // Ход кадрам перед каждым скриптом документа, каким бы он ни был.
             // Страница вроде chess.com грузит их десятками — и модулями тоже,
             // а модуль уходит из этого цикла раньше, чем доходит до конца.

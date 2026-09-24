@@ -1280,7 +1280,12 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                               цеп.push(e.tagName.toLowerCase() + '.' + String(e.className || '').split(' ')[0]
                                 + ' ' + q.left + ',' + q.top + ' ' + q.width + 'x' + q.height);
                             }
-                            console.error('[место] таблиц=' + document.styleSheets.length + ' | ' + цеп.join(' < '));
+                            console.error('[место] таблиц=' + document.styleSheets.length + ' готовность=' + document.readyState
+                              + ' t=' + Math.round(performance.now()) + ' | ' + цеп.join(' < '));
+                            console.error('[место] стек ' + String(new Error().stack).split('\n').slice(2, 9).map((x) => x.trim().replace(/https?:\/\/[^ ]*\//, '')).join(' / '));
+                            console.error('[место] скрипты ' + [...document.getElementsByTagName('script')].map((x) =>
+                              x.src ? x.src.replace(/^https:\/\/[^/]+/, '').slice(0, 60)
+                                    : 'inline:' + x.textContent.trim().slice(0, 30).replace(/\s+/g, ' ')).join(' | '));
                             console.error('[место] ' + [...document.styleSheets].map((t) => {
                               let n = '?'; try { n = t.cssRules.length; } catch (e) { n = 'x'; }
                               return String(t.href || (t.ownerNode && t.ownerNode.tagName) || '').slice(-40) + '=' + n;

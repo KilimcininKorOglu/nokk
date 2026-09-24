@@ -37,6 +37,21 @@ pub enum Script {
     Skipped,
 }
 
+/// Когда скрипт исполняется. Браузер исполняет обычный скрипт по ходу
+/// разбора, `defer` и модули — после разбора по порядку, `async` — как только
+/// придёт. Мы исполняли всё по ходу разбора, и страница, мерившая себя из
+/// отложенного модуля, видела документ до `DOMContentLoaded`, которого у
+/// браузера в этот миг уже нет.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptMode {
+    /// По ходу разбора.
+    Blocking,
+    /// После разбора, по порядку документа.
+    Defer,
+    /// По готовности, без порядка.
+    Async,
+}
+
 /// The result of parsing an HTML document.
 #[derive(Debug, Clone)]
 pub struct ParsedPage {
@@ -45,6 +60,8 @@ pub struct ParsedPage {
     pub root: Value,
     /// Scripts to execute, in document order.
     pub scripts: Vec<Script>,
+    /// Когда исполнять каждый из [`Self::scripts`] — индекс в индекс.
+    pub script_modes: Vec<ScriptMode>,
     /// The document's `<!DOCTYPE …>`, if it had one: name, public id, system id.
     /// A page without one is in quirks mode and its `document.doctype` is null —
     /// both of which a fingerprint reads, so the difference has to survive the
@@ -73,6 +90,7 @@ pub fn parse(html: &str) -> ParsedPage {
         .unwrap_or_else(|_| RcDom::default());
 
     let mut scripts = Vec::new();
+    let mut script_modes = Vec::new();
     // The document's children are the doctype and the root <html> element.
     let doctype = dom.document.children.borrow().iter().find_map(|c| match &c.data {
         NodeData::Doctype {
@@ -92,18 +110,19 @@ pub fn parse(html: &str) -> ParsedPage {
         .borrow()
         .iter()
         .find(|c| matches!(c.data, NodeData::Element { .. }))
-        .map(|html| serialize(html, &mut scripts))
+        .map(|html| serialize(html, &mut scripts, &mut script_modes))
         .unwrap_or(Value::Null);
 
     ParsedPage {
         root,
         scripts,
+        script_modes,
         doctype,
     }
 }
 
 /// Serialize one node to JSON, recording any scripts encountered.
-fn serialize(node: &Handle, scripts: &mut Vec<Script>) -> Value {
+fn serialize(node: &Handle, scripts: &mut Vec<Script>, modes: &mut Vec<ScriptMode>) -> Value {
     match &node.data {
         NodeData::Element {
             name,
@@ -130,6 +149,21 @@ fn serialize(node: &Handle, scripts: &mut Vec<Script>) -> Value {
                     .map(|t| t.trim().eq_ignore_ascii_case("module"))
                     .unwrap_or(false);
                 let nomodule = attrs.borrow().iter().any(|a| &*a.name.local == "nomodule");
+                let has = |name: &str| attrs.borrow().iter().any(|a| &*a.name.local == name);
+                let has_src = attr("src").map(|s| !s.is_empty()).unwrap_or(false);
+                // `async` и `defer` у обычного скрипта значат что-то только при
+                // `src`; модуль отложен всегда, а `async` делает его «по
+                // готовности».
+                let mode = if module {
+                    if has("async") { ScriptMode::Async } else { ScriptMode::Defer }
+                } else if has_src && has("async") {
+                    ScriptMode::Async
+                } else if has_src && has("defer") {
+                    ScriptMode::Defer
+                } else {
+                    ScriptMode::Blocking
+                };
+                let before = scripts.len();
                 // A `<script>` whose type is not JavaScript is a data block, not
                 // code: an import map, structured data, a template, a pile of
                 // JSON the page reads back out of `textContent`. A browser never
@@ -166,6 +200,9 @@ fn serialize(node: &Handle, scripts: &mut Vec<Script>) -> Value {
                         }
                     }
                 }
+                for _ in before..scripts.len() {
+                    modes.push(mode);
+                }
             }
 
             // `<template>` держит разобранное содержимое отдельно от детей —
@@ -182,7 +219,7 @@ fn serialize(node: &Handle, scripts: &mut Vec<Script>) -> Value {
                 .children
                 .borrow()
                 .iter()
-                .map(|c| serialize(c, scripts))
+                .map(|c| serialize(c, scripts, modes))
                 .filter(|v| !v.is_null())
                 .collect();
 
