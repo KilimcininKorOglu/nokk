@@ -100,9 +100,18 @@
     if (!I || !I.prototype) return proto;
     if (proto.__ptLinked) return I.prototype;
     proto.__ptLinked = true;
+    // Связывание идёт уже после натурализации бутстрапа — перенесённые члены
+    // маскируем сами, иначе `HTMLCollection.prototype.item` показывал исходник.
+    const nat = globalThis.__pt_native || ((f) => f);
+    const named = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return nat(f); };
     for (const k of Reflect.ownKeys(proto)) {
       if (k === '__ptLinked') continue;
-      Object.defineProperty(I.prototype, k, Object.getOwnPropertyDescriptor(proto, k));
+      const d = Object.getOwnPropertyDescriptor(proto, k);
+      const label = typeof k === 'symbol' ? '[' + (k.description || '') + ']' : k;
+      if (typeof d.value === 'function') d.value = named(d.value, label);
+      if (typeof d.get === 'function') d.get = named(d.get, 'get ' + label);
+      if (typeof d.set === 'function') d.set = named(d.set, 'set ' + label);
+      Object.defineProperty(I.prototype, k, d);
     }
     Object.setPrototypeOf(proto, I.prototype);
     for (const k of Reflect.ownKeys(proto)) {
@@ -689,7 +698,9 @@
       host.__ptKids = [];
       for (const n of parseFragment(String(html))) __ptAdd.call(host, n);
     }
-    get children() { return this.__ptKids.filter(n => n.nodeType === ELEMENT_NODE); }
+    // Коллекция, а не массив: `document.children` у браузера — HTMLCollection,
+    // и `Object.prototype.toString` на нём отвечает именно так.
+    get children() { return __collection(this.__ptKids.filter(n => n.nodeType === ELEMENT_NODE)); }
     get firstElementChild() { return this.children[0] || null; }
     get lastElementChild() { const c = this.children; return c[c.length - 1] || null; }
     get childElementCount() { return this.children.length; }
@@ -1520,6 +1531,16 @@
     get visibilityState() { return 'visible'; }
     get hidden() { return false; }
     get documentElement() { return this.__ptDocEl; }
+    // ParentNode у документа — своё, а не наследованное: у браузера
+    // `children` лежит на `Document.prototype`, и без него поверхность
+    // ставила заглушку, отвечавшую пустым объектом вместо коллекции.
+    get children() { return __collection(this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE)); }
+    get childElementCount() { return this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE).length; }
+    get firstElementChild() { return this.__ptKids.find((n) => n.nodeType === ELEMENT_NODE) || null; }
+    get lastElementChild() {
+      const k = this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE);
+      return k.length ? k[k.length - 1] : null;
+    }
     set documentElement(v) { this.__ptDocEl = v; }
     get readyState() { return this.__ptReady; }
     set readyState(v) { this.__ptReady = v; }

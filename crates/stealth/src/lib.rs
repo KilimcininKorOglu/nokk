@@ -1568,6 +1568,106 @@ const WORKER_SCOPE_ENUMERABLE: &str = r#"["atob", "btoa", "caches", "clearInterv
 /// страницы перечисляют установленные шрифты, и у браузера обещание
 /// разрешается на существующее имя и отклоняется сетевой ошибкой на чужое.
 /// Кусок идёт последним, после всех слоёв, иначе его затирает та же таблица.
+/// Итоговая натурализация: каждый член каждого интерфейса выглядит родным.
+/// Слои выше маскируют то, что заводят сами (`mask`/`maskProto`), но многое
+/// проходит мимо — классы на JS, аксессоры, статика, алиасы: сверка по всем
+/// интерфейсам давала 648 неродных членов из 5711. Челлендж ловит даже одну
+/// аккуратно замаскированную обёртку в настоящем Chrome — по нашему обходу
+/// он не может не найти сотни. Проходит после всех слоёв, но до снимка
+/// методов движка.
+pub fn naturalize_script() -> String {
+    // `NOKK_NATURALIZE_SKIP=<regex>` — интерфейсы, которые не трогать: для
+    // бисекции, когда что-то после натурализации ломается.
+    let skip = std::env::var("NOKK_NATURALIZE_SKIP")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("new RegExp({})", quoted(&s)))
+        .unwrap_or_else(|| "null".to_string());
+    NATURALIZE_TEMPLATE.replace("__SKIP__", &skip)
+}
+
+const NATURALIZE_TEMPLATE: &str = r#"(() => {
+  const N = globalThis.__pt_native;
+  if (typeof N !== 'function') return;
+  const SKIP = __SKIP__;
+  const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+  const desc = (o, k) => { try { return Object.getOwnPropertyDescriptor(o, k); } catch (e) { return undefined; } };
+  const def = (o, k, d) => { try { Object.defineProperty(o, k, d); return true; } catch (e) { return false; } };
+  const keyName = (k) => (typeof k === 'symbol' ? '[' + (k.description || '') + ']' : String(k));
+  // Конструктор (или его алиас вроде webkitURL) прототип носит по праву;
+  // метод — нет. Отличаем по составу прототипа и по имени.
+  const ctorLike = (f, key) => {
+    if (typeof key === 'string' && /^[A-Z]/.test(key)) return true;
+    const p = f.prototype;
+    if (!p) return false;
+    try {
+      const names = Object.getOwnPropertyNames(p);
+      return names.length > 1 || (names.length === 1 && names[0] !== 'constructor');
+    } catch (e) { return true; }
+  };
+  const asMethod = (fn, key) => {
+    const name = keyName(key);
+    const holder = { [name](...args) { return fn.apply(this, args); } };
+    const m = holder[name];
+    def(m, 'length', { value: fn.length, configurable: true });
+    def(m, 'name', { value: typeof key === 'symbol' ? name : key, configurable: true });
+    return m;
+  };
+  const fix = (owner, key) => {
+    const d = desc(owner, key);
+    if (!d) return;
+    if (typeof d.value === 'function') {
+      let f = d.value;
+      if (key !== 'constructor' && !ctorLike(f, key)) {
+        if (hasOwn(f, 'prototype') && d.configurable) {
+          const orig = f;
+          f = asMethod(f, key);
+          def(owner, key, Object.assign({}, d, { value: f }));
+          // Заглушка поверхности остаётся заглушкой: слои, которые ставят
+          // настоящие члены поверх заглушек (звук), узнают их по этому набору.
+          try { const S = globalThis.__pt_stubMembers; if (S && S.has(orig)) S.add(f); } catch (e) {}
+        } else if (typeof key === 'string' && f.name !== key) {
+          def(f, 'name', { value: key, configurable: true });
+        }
+      }
+      N(f);
+    }
+    for (const [kind, f] of [['get ', d.get], ['set ', d.set]]) {
+      if (typeof f !== 'function') continue;
+      const want = kind + keyName(key);
+      if (f.name !== want) def(f, 'name', { value: want, configurable: true });
+      N(f);
+    }
+  };
+  const keysOf = (o) => { try { return Object.getOwnPropertyNames(o).concat(Object.getOwnPropertySymbols(o)); } catch (e) { return []; } };
+  const doneProto = new WeakSet();
+  const walkProto = (proto) => {
+    if (!proto || typeof proto !== 'object' || doneProto.has(proto)) return;
+    doneProto.add(proto);
+    for (const k of keysOf(proto)) fix(proto, k);
+  };
+  for (const name of Object.getOwnPropertyNames(globalThis)) {
+    if (name.slice(0, 4) === '__pt') continue;
+    if (SKIP && SKIP.test(name)) continue;
+    const d = desc(globalThis, name);
+    if (!d) continue;
+    let C;
+    try { C = d.value; } catch (e) { continue; }
+    if (typeof C !== 'function') { if (d.get || d.set) fix(globalThis, name); continue; }
+    fix(globalThis, name);
+    for (const k of keysOf(C)) if (k !== 'length' && k !== 'name' && k !== 'prototype' && k !== 'arguments' && k !== 'caller') fix(C, k);
+    walkProto(C.prototype);
+  }
+  // Объекты-синглтоны: их методы лежат на своих прототипах, до которых
+  // обход по конструкторам не всегда доходит.
+  for (const name of ['navigator', 'document', 'performance', 'screen', 'history', 'location', 'localStorage', 'sessionStorage', 'crypto', 'speechSynthesis', 'visualViewport', 'scheduler']) {
+    let o; try { o = globalThis[name]; } catch (e) { continue; }
+    if (!o || typeof o !== 'object') continue;
+    let p = Object.getPrototypeOf(o);
+    for (let i = 0; i < 4 && p && p !== Object.prototype; i++) { walkProto(p); p = Object.getPrototypeOf(p); }
+  }
+})();"#;
+
 pub fn late_interfaces_script() -> String {
     r##"(() => {
   const native = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
