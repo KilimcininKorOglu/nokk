@@ -1654,7 +1654,13 @@
     }
 
     createElement(tag) {
-      const C = __customs.get(String(tag).toLowerCase());
+      // Имя тега — по правилам XML: `1x` и `a b` браузер отвергает словами
+      // InvalidCharacterError, а мы строили элемент с любым именем.
+      const raw = String(tag);
+      if (!/^[A-Za-z_:\u00C0-\u{10FFFF}][A-Za-z0-9_:.\-\u00B7\u00C0-\u{10FFFF}]*$/u.test(raw)) {
+        throw new (globalThis.DOMException || Error)("Failed to execute 'createElement' on 'Document': The tag name provided ('" + raw + "') is not a valid name.", 'InvalidCharacterError');
+      }
+      const C = __customs.get(raw.toLowerCase());
       if (globalThis.__pt_setPendingTag) __pt_setPendingTag(tag);
       const e = C ? new C() : new Element(tag);
       if (C) Object.defineProperty(e, '__ptUpgraded', { value: true, configurable: true, enumerable: false });

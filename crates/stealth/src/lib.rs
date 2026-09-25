@@ -1586,6 +1586,8 @@ pub fn naturalize_script() -> String {
     NATURALIZE_TEMPLATE
         .replace("__SKIP__", &skip)
         .replace("__BRAND_EXCEPTIONS__", BRAND_EXCEPTIONS)
+        .replace("__CTOR_TABLE__", CTOR_TABLE)
+        .replace("__METHOD_LENGTHS__", METHOD_LENGTHS)
         .replace("__BRAND_TRACE__", if std::env::var_os("NOKK_TRACE_BRAND").is_some() { "true" } else { "false" })
 }
 
@@ -1593,6 +1595,13 @@ pub fn naturalize_script() -> String {
 /// invocation» (снято `scratchpad/brandsweep.js`, 404 записи: обещания,
 /// итераторы, `toJSON`…). Все остальные бренд проверяют.
 const BRAND_EXCEPTIONS: &str = include_str!("brand_exceptions.json");
+/// Конструкторы интерфейсов Chrome 151: длина, что бывает на `new X()` без
+/// доводов (`illegal`, `args:N`, `ok`) и на вызов без `new` (`illegal`,
+/// `nonew`). Снято `scratchpad/ctorsweep.js`.
+const CTOR_TABLE: &str = include_str!("ctor_table.json");
+/// Длины методов на прототипах интерфейсов Chrome 151 (`Iface.method` →
+/// число обязательных доводов); у нас 262 из 1115 были не те.
+const METHOD_LENGTHS: &str = include_str!("method_lengths.json");
 
 const NATURALIZE_TEMPLATE: &str = r#"(() => {
   'use strict';
@@ -1658,14 +1667,23 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
   // Метод заново: строгий (чтение `.caller` бросает), без `.prototype`, с
   // проверкой бренда, если она положена. `guard` — конструктор интерфейса или
   // null, когда владелец не прототип интерфейса.
+  const LENGTHS = __METHOD_LENGTHS__;
+  const fewArgs = (what, need, got) => new TypeError('Failed to execute \'' + what.slice(what.indexOf('.') + 1) + '\' on \'' + what.slice(0, what.indexOf('.')) + '\': ' + need + ' argument' + (need === 1 ? '' : 's') + ' required, but only ' + got + ' present.');
   const asMethod = (fn, key, guard) => {
     const name = keyName(key);
     const P = guard && guard.prototype;
+    const label = guard ? guard.name + '.' + name : name;
+    // Число обязательных доводов — хромовское; недостача бросает, как там.
+    const need = guard && Object.prototype.hasOwnProperty.call(LENGTHS, label) ? LENGTHS[label] : fn.length;
     const holder = guard
-      ? { [name]() { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); return fn.apply(asThis(P, this), arguments); } }
+      ? { [name]() {
+          if (!ownerOk(guard, P, this)) throw illegal(label, this);
+          if (arguments.length < need) throw fewArgs(label, need, arguments.length);
+          return fn.apply(asThis(P, this), arguments);
+        } }
       : { [name]() { return fn.apply(this, arguments); } };
     const m = holder[name];
-    def(m, 'length', { value: fn.length, configurable: true });
+    def(m, 'length', { value: need, configurable: true });
     def(m, 'name', { value: typeof key === 'symbol' ? name : key, configurable: true });
     return m;
   };
@@ -1691,7 +1709,8 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     if (typeof d.value === 'function') {
       let f = d.value;
       if (key !== 'constructor' && !ctorLike(f, key)) {
-        const needs = hasOwn(f, 'prototype') || !isStrict(f) || wantGuard;
+        const needs = hasOwn(f, 'prototype') || !isStrict(f) || wantGuard
+          || (guard && Object.prototype.hasOwnProperty.call(LENGTHS, label) && LENGTHS[label] !== f.length);
         if (needs && d.configurable) {
           const orig = f;
           f = asMethod(f, key, wantGuard ? guard : null);
@@ -1734,6 +1753,45 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array', 'Float16Array',
     'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array', 'Intl', 'Reflect', 'JSON',
     'Math', 'Atomics', 'WebAssembly', 'globalThis']);
+  // Конструктор интерфейса ведёт себя как у браузера: вызов без `new` —
+  // отказ, `new` у абстрактного — «Illegal constructor», у остальных —
+  // проверка числа доводов. Снаружи стоит фасад с прототипом и статикой
+  // настоящего класса; движок внутри держит сам класс. У нас `new Node()`
+  // строил узел, а `Event()` без `new` — событие: 719 и 648 таких случаев.
+  const CT = __CTOR_TABLE__;
+  const facade = (name, C, d) => {
+    const row = CT[name];
+    // Пространство имён без прототипа (NodeFilter) — не конструктор; фасад
+    // ему ни к чему.
+    if (!row || row.n === 'notctor' || !C.prototype) return;
+    const F = function () {
+      if (new.target === undefined) {
+        throw new TypeError(row.c === 'illegal' ? 'Illegal constructor'
+          : 'Failed to construct \'' + name + '\': Please use the \'new\' operator, this DOM object constructor cannot be called as a function.');
+      }
+      // Наследник (`class X extends HTMLElement` через `super()`) строится
+      // всегда: отказ и счёт доводов — только у самого интерфейса.
+      const own = new.target === F;
+      if (own && row.n === 'illegal') throw new TypeError('Failed to construct \'' + name + '\': Illegal constructor');
+      const m = own ? /^args:(\d+)$/.exec(row.n) : null;
+      if (m && arguments.length < +m[1]) {
+        throw new TypeError('Failed to construct \'' + name + '\': ' + m[1] + ' argument' + (m[1] === '1' ? '' : 's') + ' required, but only ' + arguments.length + ' present.');
+      }
+      return Reflect.construct(C, arguments, new.target === F ? C : new.target);
+    };
+    def(F, 'name', { value: name, configurable: true });
+    def(F, 'length', { value: row.l, configurable: true });
+    def(F, 'prototype', { value: C.prototype, writable: false, enumerable: false, configurable: false });
+    for (const k of keysOf(C)) {
+      if (k === 'length' || k === 'name' || k === 'prototype' || k === 'arguments' || k === 'caller') continue;
+      const sd = desc(C, k);
+      if (sd) def(F, k, sd);
+    }
+    const cd = desc(C.prototype, 'constructor');
+    if (cd && cd.configurable) def(C.prototype, 'constructor', Object.assign({}, cd, { value: F }));
+    N(F);
+    def(globalThis, name, Object.assign({}, d, { value: F }));
+  };
   const keysOf = (o) => { try { return Object.getOwnPropertyNames(o).concat(Object.getOwnPropertySymbols(o)); } catch (e) { return []; } };
   const doneProto = new WeakSet();
   const walkProto = (proto, guard) => {
@@ -1755,6 +1813,7 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     // Promise…) — родные V8, их не трогаем.
     const platform = /^[A-Z]/.test(name) && !BUILTIN.has(name) && C.prototype !== Object.prototype;
     walkProto(C.prototype, platform ? C : null);
+    if (platform && d.configurable) facade(name, C, d);
   }
   // Объекты-синглтоны: их методы лежат на своих прототипах, до которых
   // обход по конструкторам не всегда доходит.
@@ -4999,7 +5058,18 @@ const STACK_TEMPLATE: &str = r##"(() => {
     // месте движка встала чужая программа. Наружу такой стек показывать
     // нельзя, поэтому только по отдельной переменной окружения.
     if (!__STACK_RAW__) {
-      try { keep = Array.prototype.filter.call(sites, (f) => !ours(f)); } catch (e) {}
+      try {
+        // Встроенное V8 (`String`, `Array.join`), которое позвал наш кадр, —
+        // это внутренность родной функции: у браузера преобразование довода
+        // идёт в C++ и кадра не оставляет. Такой кадр прячется вместе с
+        // нашим; встроенное, позванное самой страницей, остаётся.
+        const mine = Array.prototype.map.call(sites, (f) => ours(f));
+        const builtin = (f) => { try { return f.getLineNumber() == null && !f.getFileName() && !f.isEval(); } catch (e) { return false; } };
+        // Снаружи внутрь: цепочка встроенных над нашим кадром прячется целиком.
+        const hidden = new Array(sites.length);
+        for (let i = sites.length - 1; i >= 0; i--) hidden[i] = mine[i] || (builtin(sites[i]) && !!hidden[i + 1]);
+        keep = Array.prototype.filter.call(sites, (f, i) => !hidden[i]);
+      } catch (e) {}
     }
     try {
       const mine = Error.prepareStackTrace;
@@ -5010,7 +5080,11 @@ const STACK_TEMPLATE: &str = r##"(() => {
       const n = err == null ? undefined : err.name;
       const m = err == null ? undefined : err.message;
       const name = n === undefined ? 'Error' : String(n);
-      const msg = m === undefined || m === null || m === '' ? '' : String(m);
+      let msg = m === undefined || m === null || m === '' ? '' : String(m);
+      // У браузера `TypeError` от привязки в заголовке стека идёт без
+      // «Failed to execute 'x' on 'Y': » — приставка остаётся только в
+      // `message`. Мы печатали её и в стеке.
+      if (name === 'TypeError') msg = msg.replace(/^Failed to (?:execute '[^']*' on '[^']*'|construct '[^']*'): /, '');
       head = !name ? msg : (!msg ? name : name + ': ' + msg);
     } catch (e) {}
     let out = head;
@@ -5942,6 +6016,9 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         return new Uint8Array(out);
       }
       encodeInto(input, target) {
+        if (!(target instanceof Uint8Array)) {
+          throw new TypeError("Failed to execute 'encodeInto' on 'TextEncoder': parameter 2 is not of type 'Uint8Array'.");
+        }
         const s = input === undefined ? '' : String(input);
         const bytes = this.encode(s);
         // Пишем только целые символы: браузер не оставляет в буфере половину.
@@ -6042,16 +6119,17 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   }
   if (!globalThis.reportError) globalThis.reportError = function reportError(e) { try { console.error(e); } catch (x) {} };
   if (!globalThis.AbortController) {
-    globalThis.AbortSignal = globalThis.AbortSignal || class AbortSignal {
+    // Класс держим сами: снаружи фасад, у которого `new AbortSignal()` — отказ.
+    const __AbortSignal = globalThis.AbortSignal = globalThis.AbortSignal || class AbortSignal {
       constructor() { this.aborted = false; this.reason = undefined; this.onabort = null; this._ls = []; }
       addEventListener(t, fn) { if (t === 'abort' && typeof fn === 'function') this._ls.push(fn); }
       removeEventListener(t, fn) { const i = this._ls.indexOf(fn); if (i >= 0) this._ls.splice(i, 1); }
       dispatchEvent() { return true; }
       throwIfAborted() { if (this.aborted) throw this.reason; }
-      static abort(reason) { const s = new globalThis.AbortSignal(); s.aborted = true; s.reason = reason; return s; }
+      static abort(reason) { const s = new __AbortSignal(); s.aborted = true; s.reason = reason; return s; }
     };
     globalThis.AbortController = class AbortController {
-      constructor() { this.signal = new globalThis.AbortSignal(); }
+      constructor() { this.signal = new __AbortSignal(); }
       abort(reason) {
         const s = this.signal;
         if (s.aborted) return;
@@ -6069,11 +6147,17 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   // quietest possible way: a widget that opens a `MessageChannel` to talk to its
   // embedder, or constructs a `Request`, simply stops — no error, no output.
   if (!globalThis.DOMException) {
+    // Собственное свойство у исключения одно — `stack`; `message` и `name`
+    // читаются с прототипа, как в браузере (у нас они были собственными, и
+    // `getOwnPropertyNames` это показывал).
+    const __dx = new WeakMap();
     globalThis.DOMException = class DOMException extends Error {
       constructor(message, name) {
-        super(message === undefined ? '' : String(message));
-        this.name = name === undefined ? 'Error' : String(name);
+        super();
+        __dx.set(this, { message: message === undefined ? '' : String(message), name: name === undefined ? 'Error' : String(name) });
       }
+      get message() { const st = __dx.get(this); return st ? st.message : ''; }
+      get name() { const st = __dx.get(this); return st ? st.name : 'Error'; }
       get code() {
         const codes = { IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
           InvalidCharacterError: 5, NotFoundError: 8, NotSupportedError: 9, InvalidStateError: 11,
@@ -6088,7 +6172,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     // A pair of ports, each delivering to the other. Messages arrive in a
     // microtask (never synchronously), and a port that has not been `start`ed
     // queues them — both of which real code depends on.
-    globalThis.MessagePort = class MessagePort {
+    const __MessagePort = globalThis.MessagePort = class MessagePort {
       constructor() {
         Object.defineProperty(this, '__pt', {
           value: { peer: null, started: false, queue: [], onmessage: null, listeners: [] },
@@ -6132,7 +6216,9 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     };
     globalThis.MessageChannel = class MessageChannel {
       constructor() {
-        const a = new globalThis.MessagePort(), b = new globalThis.MessagePort();
+        // Класс, а не имя окна: снаружи стоит фасад, у которого `new MessagePort()`
+        // — «Illegal constructor», как в браузере.
+        const a = new __MessagePort(), b = new __MessagePort();
         a.__pt.peer = b; b.__pt.peer = a;
         Object.defineProperty(this, 'port1', { value: a, enumerable: true });
         Object.defineProperty(this, 'port2', { value: b, enumerable: true });
