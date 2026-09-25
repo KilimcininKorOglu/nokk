@@ -2027,9 +2027,13 @@
       // отдавал null, и сборщик, который снимает там отпечаток холста, молча
       // оставался ни с чем.
       if (!c) {
+        // Холст-подставка наследует прототип элемента: методы холста
+        // проверяют бренд, и чужой объект они отвергают, как и в браузере.
         const proto = globalThis.__pt_canvasProto;
-        c = { localName: 'canvas', width: width | 0, height: height | 0 };
-        if (proto) { c.getContext = proto.getContext; c.toDataURL = proto.toDataURL; }
+        c = Object.create(proto || null);
+        Object.defineProperty(c, 'localName', { value: 'canvas', writable: true, configurable: true });
+        Object.defineProperty(c, 'width', { value: width | 0, writable: true, configurable: true });
+        Object.defineProperty(c, 'height', { value: height | 0, writable: true, configurable: true });
       }
       c.width = width | 0; c.height = height | 0;
       Object.defineProperty(this, '__ptO', { value: { c, w: width | 0, h: height | 0 } });
@@ -2141,9 +2145,12 @@
         ? orig.createElement.call(globalThis.document, 'canvas')
         : globalThis.document.createElement('canvas');
     } else {
+      // Подставка наследует прототип элемента: его методы проверяют бренд.
       const proto = globalThis.__pt_canvasProto;
-      c = { localName: 'canvas', width: w | 0, height: h | 0 };
-      if (proto) { c.getContext = proto.getContext; c.toDataURL = proto.toDataURL; }
+      c = Object.create(proto || null);
+      Object.defineProperty(c, 'localName', { value: 'canvas', writable: true, configurable: true });
+      Object.defineProperty(c, 'width', { value: w | 0, writable: true, configurable: true });
+      Object.defineProperty(c, 'height', { value: h | 0, writable: true, configurable: true });
     }
     if (c) { c.width = w | 0; c.height = h | 0; }
     return c;

@@ -1583,13 +1583,63 @@ pub fn naturalize_script() -> String {
         .filter(|s| !s.is_empty())
         .map(|s| format!("new RegExp({})", quoted(&s)))
         .unwrap_or_else(|| "null".to_string());
-    NATURALIZE_TEMPLATE.replace("__SKIP__", &skip)
+    NATURALIZE_TEMPLATE
+        .replace("__SKIP__", &skip)
+        .replace("__BRAND_EXCEPTIONS__", BRAND_EXCEPTIONS)
+        .replace("__BRAND_TRACE__", if std::env::var_os("NOKK_TRACE_BRAND").is_some() { "true" } else { "false" })
 }
 
+/// Члены, которые Chrome 151 вызывает с чужим `this` без «Illegal
+/// invocation» (снято `scratchpad/brandsweep.js`, 404 записи: обещания,
+/// итераторы, `toJSON`…). Все остальные бренд проверяют.
+const BRAND_EXCEPTIONS: &str = include_str!("brand_exceptions.json");
+
 const NATURALIZE_TEMPLATE: &str = r#"(() => {
+  'use strict';
   const N = globalThis.__pt_native;
   if (typeof N !== 'function') return;
   const SKIP = __SKIP__;
+  // Бренд. Член интерфейса, вызванный с чужим `this`, у браузера бросает
+  // `TypeError: Illegal invocation` — 7850 членов из 8254 — и на чтении
+  // `.caller` бросает каждый. У нас не бросал ни один: отвечал `undefined`,
+  // объектом или внутренней ошибкой движка с его же именами. Так ловится
+  // любая обёртка на JS — и, значит, весь наш DOM. Свой объект — тот, в чьей
+  // цепочке прототипов есть прототип интерфейса или конструктор с его
+  // именем (объект другого реалма тоже свой).
+  const EXC = new Set(__BRAND_EXCEPTIONS__);
+  const TRACE = __BRAND_TRACE__;
+  const illegal = (label, t) => {
+    if (TRACE) {
+      try {
+        let who = ''; try { who = t === null ? 'null' : typeof t !== 'object' && typeof t !== 'function' ? typeof t : (Object.prototype.toString.call(t) + ' ' + Object.getOwnPropertyNames(t).slice(0, 5).join(',')); } catch (e) {}
+        const st = String(new Error().stack || '').split('\n').slice(2, 6).map((x) => x.trim()).join(' < ');
+        console.error('[бренд] ' + label + ' this=' + who + ' | ' + st);
+      } catch (e) {}
+    }
+    return new TypeError('Illegal invocation');
+  };
+  const chainHas = (t, name) => {
+    let p = t;
+    for (let i = 0; i < 12 && p; i++) {
+      try {
+        const c = Object.getOwnPropertyDescriptor(p, 'constructor');
+        if (c && typeof c.value === 'function' && c.value.name === name) return true;
+        p = Object.getPrototypeOf(p);
+      } catch (e) { return false; }
+    }
+    return false;
+  };
+  // Голый вызов члена окна (`addEventListener('load', …)`, `postMessage(…)`)
+  // приходит со строгим `this === undefined`; у браузера для членов
+  // глобального объекта это и есть окно.
+  const ownerOk = (C, P, t) => {
+    if (t === undefined || t === null) return P.isPrototypeOf(globalThis);
+    if (typeof t !== 'object' && typeof t !== 'function') return false;
+    if (P.isPrototypeOf(t)) return true;
+    if (t === globalThis) return true;
+    return chainHas(t, C.name);
+  };
+  const asThis = (P, t) => ((t === undefined || t === null) && P.isPrototypeOf(globalThis) ? globalThis : t);
   const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
   const desc = (o, k) => { try { return Object.getOwnPropertyDescriptor(o, k); } catch (e) { return undefined; } };
   const def = (o, k, d) => { try { Object.defineProperty(o, k, d); return true; } catch (e) { return false; } };
@@ -1605,46 +1655,91 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
       return names.length > 1 || (names.length === 1 && names[0] !== 'constructor');
     } catch (e) { return true; }
   };
-  const asMethod = (fn, key) => {
+  // Метод заново: строгий (чтение `.caller` бросает), без `.prototype`, с
+  // проверкой бренда, если она положена. `guard` — конструктор интерфейса или
+  // null, когда владелец не прототип интерфейса.
+  const asMethod = (fn, key, guard) => {
     const name = keyName(key);
-    const holder = { [name](...args) { return fn.apply(this, args); } };
+    const P = guard && guard.prototype;
+    const holder = guard
+      ? { [name]() { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); return fn.apply(asThis(P, this), arguments); } }
+      : { [name]() { return fn.apply(this, arguments); } };
     const m = holder[name];
     def(m, 'length', { value: fn.length, configurable: true });
     def(m, 'name', { value: typeof key === 'symbol' ? name : key, configurable: true });
     return m;
   };
-  const fix = (owner, key) => {
+  const asAccessor = (fn, key, kind, guard) => {
+    const P = guard && guard.prototype;
+    const g = kind === 'get '
+      ? (guard ? function () { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + keyName(key) + '#get', this); return fn.call(asThis(P, this)); }
+               : function () { return fn.call(this); })
+      : (guard ? function (v) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + keyName(key) + '#set', this); return fn.call(asThis(P, this), v); }
+               : function (v) { return fn.call(this, v); });
+    def(g, 'name', { value: kind + keyName(key), configurable: true });
+    def(g, 'length', { value: kind === 'get ' ? 0 : 1, configurable: true });
+    return g;
+  };
+  // Строгая ли функция: у строгой (и у родной) чтение `.caller` бросает.
+  const isStrict = (f) => { try { void f.caller; return false; } catch (e) { return true; } };
+  const stubs = () => { try { return globalThis.__pt_stubMembers || null; } catch (e) { return null; } };
+  const fix = (owner, key, guard) => {
     const d = desc(owner, key);
     if (!d) return;
+    const label = (guard ? guard.name : '') + '.' + keyName(key);
+    const wantGuard = guard && !EXC.has(label);
     if (typeof d.value === 'function') {
       let f = d.value;
       if (key !== 'constructor' && !ctorLike(f, key)) {
-        if (hasOwn(f, 'prototype') && d.configurable) {
+        const needs = hasOwn(f, 'prototype') || !isStrict(f) || wantGuard;
+        if (needs && d.configurable) {
           const orig = f;
-          f = asMethod(f, key);
+          f = asMethod(f, key, wantGuard ? guard : null);
           def(owner, key, Object.assign({}, d, { value: f }));
           // Заглушка поверхности остаётся заглушкой: слои, которые ставят
           // настоящие члены поверх заглушек (звук), узнают их по этому набору.
-          try { const S = globalThis.__pt_stubMembers; if (S && S.has(orig)) S.add(f); } catch (e) {}
+          const S = stubs(); if (S && S.has(orig)) S.add(f);
         } else if (typeof key === 'string' && f.name !== key) {
           def(f, 'name', { value: key, configurable: true });
         }
       }
       N(f);
     }
-    for (const [kind, f] of [['get ', d.get], ['set ', d.set]]) {
-      if (typeof f !== 'function') continue;
-      const want = kind + keyName(key);
-      if (f.name !== want) def(f, 'name', { value: want, configurable: true });
-      N(f);
+    if (d.get || d.set) {
+      let get = d.get, set = d.set, changed = false;
+      for (const kind of ['get ', 'set ']) {
+        const f = kind === 'get ' ? get : set;
+        if (typeof f !== 'function') continue;
+        const wantG = guard && !EXC.has(label + '#' + kind.trim());
+        if ((wantG || !isStrict(f)) && d.configurable) {
+          const w = asAccessor(f, key, kind, wantG ? guard : null);
+          const S = stubs(); if (S && S.has(f)) S.add(w);
+          if (kind === 'get ') get = w; else set = w;
+          changed = true;
+          N(w);
+        } else {
+          const want = kind + keyName(key);
+          if (f.name !== want) def(f, 'name', { value: want, configurable: true });
+          N(f);
+        }
+      }
+      if (changed) def(owner, key, { get, set, enumerable: d.enumerable, configurable: d.configurable });
     }
   };
+  const BUILTIN = new Set(['Object', 'Function', 'Array', 'String', 'Number', 'Boolean', 'Symbol', 'Error',
+    'RegExp', 'Date', 'Promise', 'Map', 'Set', 'WeakMap', 'WeakSet', 'ArrayBuffer', 'SharedArrayBuffer',
+    'DataView', 'Proxy', 'BigInt', 'Iterator', 'FinalizationRegistry', 'WeakRef', 'AsyncDisposableStack',
+    'DisposableStack', 'Temporal', 'AggregateError', 'EvalError', 'RangeError', 'ReferenceError',
+    'SyntaxError', 'TypeError', 'URIError', 'SuppressedError', 'Int8Array', 'Uint8Array',
+    'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array', 'Float16Array',
+    'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array', 'Intl', 'Reflect', 'JSON',
+    'Math', 'Atomics', 'WebAssembly', 'globalThis']);
   const keysOf = (o) => { try { return Object.getOwnPropertyNames(o).concat(Object.getOwnPropertySymbols(o)); } catch (e) { return []; } };
   const doneProto = new WeakSet();
-  const walkProto = (proto) => {
+  const walkProto = (proto, guard) => {
     if (!proto || typeof proto !== 'object' || doneProto.has(proto)) return;
     doneProto.add(proto);
-    for (const k of keysOf(proto)) fix(proto, k);
+    for (const k of keysOf(proto)) fix(proto, k, guard);
   };
   for (const name of Object.getOwnPropertyNames(globalThis)) {
     if (name.slice(0, 4) === '__pt') continue;
@@ -1654,9 +1749,12 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     let C;
     try { C = d.value; } catch (e) { continue; }
     if (typeof C !== 'function') { if (d.get || d.set) fix(globalThis, name); continue; }
-    fix(globalThis, name);
-    for (const k of keysOf(C)) if (k !== 'length' && k !== 'name' && k !== 'prototype' && k !== 'arguments' && k !== 'caller') fix(C, k);
-    walkProto(C.prototype);
+    fix(globalThis, name, null);
+    for (const k of keysOf(C)) if (k !== 'length' && k !== 'name' && k !== 'prototype' && k !== 'arguments' && k !== 'caller') fix(C, k, null);
+    // Бренд проверяют члены интерфейсов платформы; встроенные языка (Array,
+    // Promise…) — родные V8, их не трогаем.
+    const platform = /^[A-Z]/.test(name) && !BUILTIN.has(name) && C.prototype !== Object.prototype;
+    walkProto(C.prototype, platform ? C : null);
   }
   // Объекты-синглтоны: их методы лежат на своих прототипах, до которых
   // обход по конструкторам не всегда доходит.
@@ -1664,7 +1762,11 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     let o; try { o = globalThis[name]; } catch (e) { continue; }
     if (!o || typeof o !== 'object') continue;
     let p = Object.getPrototypeOf(o);
-    for (let i = 0; i < 4 && p && p !== Object.prototype; i++) { walkProto(p); p = Object.getPrototypeOf(p); }
+    for (let i = 0; i < 4 && p && p !== Object.prototype; i++) {
+      const c = desc(p, 'constructor');
+      walkProto(p, c && typeof c.value === 'function' && c.value.prototype === p ? c.value : null);
+      p = Object.getPrototypeOf(p);
+    }
   }
 })();"#;
 
