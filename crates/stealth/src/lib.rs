@@ -7375,6 +7375,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       },
       // Real glyphs. `y` is the alphabetic baseline, matching canvas semantics.
       text(t, x, y, size, rgba, fam, b, i, sh) { sync(); __pt_canvasFillText(id, String(t), x, y, size, rgba[0], rgba[1], rgba[2], rgba[3], fam || '', !!b, !!i, new Float32Array(sh || [])); },
+      textOps(t, x, y, M, size, fam, b, i, stroke, lw, rgba, grad, sh, mode, align, baseline) { sync(); return __pt_canvasTextOps(id, String(t), x, y, new Float32Array(M), size, fam || '', !!b, !!i, !!stroke, lw, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(grad || []), new Float32Array(sh || []), mode | 0, align | 0, baseline | 0); },
       width(t, size, fam, b, i) { return __pt_canvasMeasureText(String(t), size, fam || '', !!b, !!i); },
       // Real vector paths: JS tessellates curves/arcs to a move/line/close verb
       // stream, tiny-skia fills or strokes it.
@@ -7829,8 +7830,18 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       const m = /(?:\d+(?:\.\d+)?)(?:px|pt|em|%)\s*(?:\/\s*\S+\s*)?(.*)$/.exec(t);
       return (m ? m[1] : t).trim();
     };
-    const drawText = function (t, x, y, rgba) {
+    const drawText = function (t, x, y, rgba, stroke, style) {
       const size = fontSize(this.font);
+      // Текст как у Chrome: раскладка Blink, глифы Skia/Fontations, тень по
+      // глифам. Штрих движок пока рисует прежним путём (false).
+      if (S.native && S.textOps) {
+        const a = this.textAlign, b = this.textBaseline;
+        const ai = a === 'center' ? 1 : (a === 'right' || a === 'end') ? 2 : 0;
+        const bi = (b === 'top' || b === 'hanging') ? 1 : b === 'middle' ? 2 : (b === 'bottom' || b === 'ideographic') ? 3 : 0;
+        const g = gradOf(style);
+        if (S.textOps(t, +x || 0, +y || 0, M, size, fontFamily(this.font), fontBold(this.font), fontItalic(this.font),
+            !!stroke, Math.max(0, +this.lineWidth || 1), g ? [0, 0, 0, 255] : rgba, g ? encodeGrad(g) : [], shadowOf(this), modeOf(this), ai, bi)) return;
+      }
       const w = this.measureText(t).width;
       let ox = +x || 0, oy = +y || 0;
       const a = this.textAlign;                 // shift origin for align/baseline
@@ -7960,8 +7971,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         stamp(X, Y, W2, lw); stamp(X, Y + H2 - lw, W2, lw);
         stamp(X, Y, lw, H2); stamp(X + W2 - lw, Y, lw, H2);
       },
-      fillText(t, x, y) { note('fillText|' + [t, x, y, this.font, this.fillStyle, this.textAlign, this.textBaseline]); drawText.call(this, t, +x || 0, +y || 0, parseColor(this.fillStyle)); },
-      strokeText(t, x, y) { note('strokeText|' + [t, x, y, this.font, this.strokeStyle]); drawText.call(this, t, +x || 0, +y || 0, parseColor(this.strokeStyle)); },
+      fillText(t, x, y) { note('fillText|' + [t, x, y, this.font, this.fillStyle, this.textAlign, this.textBaseline]); drawText.call(this, t, +x || 0, +y || 0, parseColor(this.fillStyle), false, this.fillStyle); },
+      strokeText(t, x, y) { note('strokeText|' + [t, x, y, this.font, this.strokeStyle]); drawText.call(this, t, +x || 0, +y || 0, parseColor(this.strokeStyle), true, this.strokeStyle); },
 
       beginPath() { note('beginPath'); bx0 = by0 = bx1 = by1 = 0; verbs = []; ops = []; sub = false; },
       closePath() { note('closePath'); closeV(); ops.push(4); },

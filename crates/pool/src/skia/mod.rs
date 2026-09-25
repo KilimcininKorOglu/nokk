@@ -16,6 +16,7 @@ pub mod gradient;
 pub mod hair;
 pub mod path;
 pub mod pipeline;
+pub mod text;
 
 use blit::{BlendMode, Blitter, SolidBlitter, SolidPaint, Surface};
 use geometry::{nearly_equal, IRect, Matrix, Point, Rect};
@@ -210,36 +211,49 @@ fn hairline_coverage(line_width: f32, ctm: &Matrix) -> Option<f32> {
     }
 }
 
+/// Блиттер слоя под краску: сплошной цвет — старые блиттеры SkARGB32,
+/// градиент — конвейер растра.
+struct LayerBlitter<'a> {
+    solid: Option<SolidBlitter<'a>>,
+    pipe: Option<PipelineBlitter<'a>>,
+}
+
+impl<'a> LayerBlitter<'a> {
+    fn new(data: &'a mut [u8], w: u32, h: u32, paint: &PaintKind, alpha: u8, mode: BlendMode, layer: &Layer) -> Option<LayerBlitter<'a>> {
+        let alpha_f = alpha as f32 * (1.0 / 255.0);
+        match paint {
+            PaintKind::Solid(rgba) => {
+                let mut color = [rgba[0], rgba[1], rgba[2], alpha];
+                if let Some(f) = layer.filter {
+                    color = shadow_solid_color(color, f);
+                }
+                let surf = Surface { data, width: w as i32, height: h as i32 };
+                Some(LayerBlitter { solid: Some(SolidBlitter::new(surf, &SolidPaint { rgba: color, mode })), pipe: None })
+            }
+            PaintKind::Gradient(desc) => {
+                let shader = gradient::make_shader(desc)?;
+                let filter = layer.filter.map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, c[3] as f32 / 255.0]);
+                let stages = gradient::color_stages(&shader, &layer.ctm, alpha_f, filter, true)?;
+                let is_opaque = shader.is_opaque && alpha == 255 && filter.is_none();
+                Some(LayerBlitter { solid: None, pipe: Some(PipelineBlitter::new(data, w as i32, h as i32, stages, mode, is_opaque)) })
+            }
+        }
+    }
+    fn get(&mut self) -> &mut dyn Blitter {
+        match (&mut self.solid, &mut self.pipe) {
+            (Some(b), _) => b,
+            (_, Some(b)) => b,
+            _ => unreachable!(),
+        }
+    }
+}
+
 /// Один слой: краска → блиттер → (маска + размытие |) растр.
 #[allow(clippy::too_many_arguments)]
 fn draw_layer(data: &mut [u8], w: u32, h: u32, dev: &Path, style: Style, paint: &PaintKind, alpha: u8, mode: BlendMode, layer: &Layer) -> bool {
     let clip = IRect::from_ltrb(0, 0, w as i32, h as i32);
-    let alpha_f = alpha as f32 * (1.0 / 255.0);
-    // Блиттер под краску.
-    let mut solid: Option<SolidBlitter> = None;
-    let mut pipe: Option<PipelineBlitter> = None;
-    match paint {
-        PaintKind::Solid(rgba) => {
-            let mut color = [rgba[0], rgba[1], rgba[2], alpha];
-            if let Some(f) = layer.filter {
-                color = shadow_solid_color(color, f);
-            }
-            let surf = Surface { data, width: w as i32, height: h as i32 };
-            solid = Some(SolidBlitter::new(surf, &SolidPaint { rgba: color, mode }));
-        }
-        PaintKind::Gradient(desc) => {
-            let Some(shader) = gradient::make_shader(desc) else { return true };
-            let filter = layer.filter.map(|c| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, c[3] as f32 / 255.0]);
-            let Some(stages) = gradient::color_stages(&shader, &layer.ctm, alpha_f, filter, true) else { return true };
-            let is_opaque = shader.is_opaque && alpha == 255 && filter.is_none();
-            pipe = Some(PipelineBlitter::new(data, w as i32, h as i32, stages, mode, is_opaque));
-        }
-    }
-    let blitter: &mut dyn Blitter = match (&mut solid, &mut pipe) {
-        (Some(b), _) => b,
-        (_, Some(b)) => b,
-        _ => return true,
-    };
+    let Some(mut lb) = LayerBlitter::new(data, w, h, paint, alpha, mode, layer) else { return true };
+    let blitter: &mut dyn Blitter = lb.get();
     if let Some(sigma) = layer.sigma {
         if !blur::has_no_blur(sigma) {
             let Some(bounds) = blur::compute_mask_bounds(&dev.bounds(), &clip, sigma) else { return true };
@@ -414,6 +428,83 @@ pub fn fill_ops(data: &mut [u8], w: u32, h: u32, ops: &[f32], ctm: [f32; 6], eve
 pub fn stroke_ops(data: &mut [u8], w: u32, h: u32, ops: &[f32], ctm: [f32; 6], line_width: f32, paint: &PaintKind, shadow: Option<Shadow>, mode: u32) -> bool {
     let Some(path) = path_for_ops(ops, false, false) else { return true };
     draw_with_layers(data, w, h, &path, &ctm_of(ctm), Some(line_width), None, paint, shadow, blend_mode_from_index(mode))
+}
+
+/// Текст холста (`fillText`): слои как у путей, глифы как у Skia поверх
+/// Fontations (см. `text.rs`). `align`: 0 start/left, 1 center, 2 right/end;
+/// `baseline`: 0 alphabetic, 1 top/hanging, 2 middle, 3 bottom/ideographic.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_text(data: &mut [u8], w: u32, h: u32, fonts: &[&'static [u8]], glyphs: &[text::ShapedGlyph], width: f32, x: f32, y: f32, ctm: [f32; 6], eff: f32, align: u32, baseline: u32, paint: &PaintKind, shadow: Option<Shadow>, mode: u32) -> bool {
+    if !x.is_finite() || !y.is_finite() || glyphs.is_empty() || fonts.is_empty() {
+        return true;
+    }
+    let mode = blend_mode_from_index(mode);
+    let Some(first) = glyphs.first() else { return true };
+    let Ok(font) = skrifa::FontRef::new(fonts[first.font]) else { return true };
+    let m = ctm_of(ctm);
+    let post = Matrix { sx: m.sx, kx: m.kx, ky: m.ky, sy: m.sy, tx: 0.0, ty: 0.0 };
+    // Скейлер на каждый шрифт цепочки, что встретился в строке.
+    let font_refs: Vec<Option<skrifa::FontRef>> = fonts.iter().map(|b| skrifa::FontRef::new(b).ok()).collect();
+    let scalers: Vec<Option<text::Scaler>> = fonts
+        .iter()
+        .zip(font_refs.iter())
+        .map(|(b, f)| f.as_ref().and_then(|f| text::Scaler::new(b, f, eff, &post)))
+        .collect();
+    // Расположение как в DrawTextInternal: выравнивание по ширине, базовая
+    // линия — по метрикам шрифта (alphabetic = 0).
+    let mut loc = Point::new(x, y);
+    match align {
+        1 => loc.x -= width / 2.0,
+        2 => loc.x -= width,
+        _ => {}
+    }
+    if baseline != 0 {
+        use skrifa::MetadataProvider;
+        let met = font.metrics(skrifa::prelude::Size::new(eff), skrifa::prelude::LocationRef::default());
+        let (asc, desc) = (met.ascent.round(), (-met.descent).round());
+        loc.y += match baseline {
+            1 => asc,
+            2 => (asc - desc) / 2.0,
+            3 => -desc,
+            _ => 0.0,
+        };
+    }
+    let (ax, ay) = text::axis_alignment(&post);
+    let clip = IRect::from_ltrb(0, 0, w as i32, h as i32);
+    let lum = match paint {
+        PaintKind::Solid(c) => text::luminance_byte([c[0], c[1], c[2]]),
+        PaintKind::Gradient(_) => 128,
+    };
+    let mut layers: Vec<Layer> = Vec::new();
+    if let Some(sh) = shadow {
+        let mut lm = m;
+        lm.post_translate(sh.dx, sh.dy);
+        let sigma = (sh.blur * 0.5) as f64;
+        layers.push(Layer { ctm: lm, sigma: if sigma > 0.0 { Some(sigma) } else { None }, filter: Some(sh.color) });
+    }
+    layers.push(Layer { ctm: m, sigma: None, filter: None });
+    for layer in &layers {
+        let Some(mut lb) = LayerBlitter::new(data, w, h, paint, 255, mode, layer) else { continue };
+        let blitter = lb.get();
+        let pos_m = text::pre_translate(&layer.ctm, loc.x, loc.y);
+        for g in glyphs {
+            let Some(scaler) = scalers.get(g.font).and_then(|s| s.as_ref()) else { continue };
+            let Some(dp) = text::device_position(&pos_m, g.x, ax, ay) else { continue };
+            let Some(mut mask) = scaler.fill_mask(g.gid, dp.sub_x, dp.sub_y) else { continue };
+            match layer.sigma {
+                Some(sigma) => {
+                    // Маска-фильтр в контексте скейлера: без гамма-таблицы.
+                    let Some(blurred) = text::blur_mask(&mask, sigma) else { continue };
+                    text::blit_glyph(blitter, &blurred, dp.x, dp.y, &clip);
+                }
+                None => {
+                    text::apply_gamma(&mut mask, lum);
+                    text::blit_glyph(blitter, &mask, dp.x, dp.y, &clip);
+                }
+            }
+        }
+    }
+    true
 }
 
 fn rect_touches(r: &Rect, c: &IRect) -> bool {

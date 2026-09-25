@@ -39,6 +39,7 @@ ab_glyph = { version = "0.2", optional = true }
 # Раскладка строки — тот же HarfBuzz, которым раскладывает браузер: без него
 # ширина надписи не сходится на лигатурах («ffi») и на кернинге пар («AV»).
 rustybuzz = { version = "0.20", optional = true }
+skrifa = "=0.43.2"
 
 # Headless GL stack for the optional `webgl` feature. `khronos-egl` in `dynamic`
 # mode loads libEGL at runtime (no build-time GL needed); `glow` is the GL API.

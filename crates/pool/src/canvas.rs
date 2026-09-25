@@ -494,6 +494,87 @@ fn shape(chain: &[&'static FontVec], text: &str, size_px: f32) -> (Vec<Shaped>, 
     (out, caret)
 }
 
+/// Раскладка как у Blink (см. `skia::text`): те же слова и та же цепочка
+/// шрифтов, что у `shape`, но ширины — Skia (кегль до сотых, усечение до
+/// 26.6), кернинг — HarfBuzz в 16.16. `fonts` — байты шрифтов по индексу
+/// глифа.
+fn shape_blink(chain: &[&'static FontVec], text: &str, eff: f32) -> (Vec<crate::skia::text::ShapedGlyph>, f32, Vec<&'static [u8]>) {
+    use crate::skia::text::{em_mult, to_hb_position, ShapedGlyph};
+    let mut out: Vec<ShapedGlyph> = Vec::new();
+    let mut fonts: Vec<&'static [u8]> = Vec::new();
+    let mut font_index = |f: &'static FontVec| -> usize {
+        let b = f.as_slice();
+        if let Some(i) = fonts.iter().position(|x| std::ptr::eq(x.as_ptr(), b.as_ptr())) {
+            i
+        } else {
+            fonts.push(b);
+            fonts.len() - 1
+        }
+    };
+    // Позиция в 16.16 (InlineLayoutUnit у Blink).
+    let mut total: i64 = 0;
+    let mut run_it = |out: &mut Vec<ShapedGlyph>, font: &'static FontVec, run: &str| {
+        let fi = font_index(font);
+        let Some(face) = shaper(font) else {
+            return;
+        };
+        let Ok(fref) = skrifa::FontRef::new(font.as_slice()) else { return };
+        use skrifa::MetadataProvider;
+        let metrics = fref.glyph_metrics(skrifa::prelude::Size::new(eff), skrifa::prelude::LocationRef::default());
+        let upem = face.units_per_em() as i64;
+        if upem <= 0 {
+            return;
+        }
+        let x_scale = to_hb_position(eff) as i64;
+        let x_mult = (if x_scale < 0 { -((-x_scale) << 16) } else { x_scale << 16 }) / upem;
+        let mut buf = rustybuzz::UnicodeBuffer::new();
+        buf.push_str(run);
+        buf.guess_segment_properties();
+        let laid = rustybuzz::shape(face, &[], buf);
+        let (infos, pos) = (laid.glyph_infos(), laid.glyph_positions());
+        for (info, p) in infos.iter().zip(pos.iter()) {
+            let gid = info.glyph_id as u16;
+            let tid = ttf_parser::GlyphId(gid);
+            // Ширина от Skia; у картиночного знака — по выбранной полосе.
+            let hb_adv = match raster_advance(face, tid, eff) {
+                Some(w) => (w * 65536.0).floor() as i32,
+                None => to_hb_position(metrics.advance_width(skrifa::GlyphId::from(gid)).unwrap_or(0.0)),
+            };
+            let hmtx = face.glyph_hor_advance(tid).unwrap_or(0) as i32;
+            let kern = p.x_advance - hmtx;
+            let x_advance = hb_adv.wrapping_add(if kern != 0 { em_mult(kern, x_mult) } else { 0 });
+            let x_offset = if p.x_offset != 0 { em_mult(p.x_offset, x_mult) } else { 0 };
+            out.push(ShapedGlyph { gid, font: fi, x: (total + x_offset as i64) as f32 / 65536.0 });
+            total += x_advance as i64;
+        }
+    };
+    let mut run = String::new();
+    let mut run_font: Option<&'static FontVec> = None;
+    for ch in text.chars() {
+        let cf = if clings_to_previous(ch) {
+            run_font.unwrap_or_else(|| face_for(chain, ch))
+        } else {
+            face_for(chain, ch)
+        };
+        let breaks = ch == ' ' || run_font.is_some_and(|f| !std::ptr::eq(f, cf));
+        if breaks && !run.is_empty() {
+            run_it(&mut out, run_font.unwrap_or(chain[0]), &run);
+            run.clear();
+        }
+        run.push(ch);
+        run_font = Some(cf);
+        if ch == ' ' {
+            run_it(&mut out, cf, &run);
+            run.clear();
+            run_font = None;
+        }
+    }
+    if !run.is_empty() {
+        run_it(&mut out, run_font.unwrap_or(chain[0]), &run);
+    }
+    (out, total as f32 / 65536.0, fonts)
+}
+
 /// Шрифт, которым рисуется этот знак: первый в цепочке, где он есть.
 fn face_for(chain: &[&'static FontVec], ch: char) -> &'static FontVec {
     for f in chain {
@@ -1363,6 +1444,36 @@ pub fn fill_text(
     });
 }
 
+/// `fillText`/`strokeText` как у Chrome: false — этот вызов движок ещё не
+/// умеет (штрих), рисовать прежним путём.
+#[allow(clippy::too_many_arguments)]
+pub fn text_ops(id: u32, text: &str, x: f32, y: f32, ctm: [f32; 6], size: f32, families: &str, bold: bool, italic: bool, stroke: bool, _line_width: f32, rgba: [u8; 4], grad: &[f32], sh: &[f32], mode: u32, align: u32, baseline: u32) -> bool {
+    if stroke {
+        return false;
+    }
+    let chain = resolve_chain(families, bold, italic);
+    if chain.is_empty() || text.is_empty() {
+        return true;
+    }
+    let eff = crate::skia::text::effective_size(size);
+    if !(eff > 0.0) {
+        return true;
+    }
+    let (glyphs, width, fonts) = shape_blink(&chain, text, eff);
+    let paint = match crate::skia::gradient::GradientDesc::parse(grad) {
+        Some(desc) if !grad.is_empty() => crate::skia::PaintKind::Gradient(desc),
+        _ => crate::skia::PaintKind::Solid(rgba),
+    };
+    CANVASES.with(|c| {
+        if let Some(pm) = c.borrow_mut().get_mut(&id) {
+            let (w, h) = (pm.width(), pm.height());
+            let shadow = crate::skia::Shadow::parse(sh);
+            crate::skia::draw_text(pm.data_mut(), w, h, &fonts, &glyphs, width, x, y, ctm, eff, align, baseline, &paint, shadow, mode);
+        }
+    });
+    true
+}
+
 /// `measureText(text).width` for the bundled font at `size_px`.
 pub fn measure_text(
     text: &str,
@@ -1387,7 +1498,9 @@ pub fn measure_text(
     // источника, а не один.
     let (mut ink_l, mut ink_r) = (f64::MAX, f64::MIN);
     let (mut ink_t, mut ink_b) = (f64::MAX, f64::MIN);
-    let (glyphs, width) = shape(&chain, text, size_px);
+    let (glyphs, _old_width) = shape(&chain, text, size_px);
+    // Ширина — по раскладке Blink (кегль до сотых, ширины Skia, кернинг HarfBuzz).
+    let width = shape_blink(&chain, text, crate::skia::text::effective_size(size_px)).1 as f64;
     for g in &glyphs {
         // Знак берётся из первого семейства цепочки, где он есть, — как в
         // браузере. Кегль при подмене считается по метрикам того шрифта.

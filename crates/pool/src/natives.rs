@@ -72,6 +72,7 @@ pub fn install(scope: &mut v8::PinScope) {
         bind(scope, "__pt_canvasFillOps", canvas_fill_ops);
         bind(scope, "__pt_canvasFillOpsGradient", canvas_fill_ops_gradient);
         bind(scope, "__pt_canvasStrokeOps", canvas_stroke_ops);
+        bind(scope, "__pt_canvasTextOps", canvas_text_ops);
         bind(
             scope,
             "__pt_canvasFillPathGradient",
@@ -276,6 +277,43 @@ fn canvas_fill_text(
     let italic = args.get(11).boolean_value(scope);
     crate::canvas::fill_text(id, &text, x, y, size, rgba, &families, bold, italic,
         &arg_f32s(args.get(12)));
+}
+
+/// `__pt_canvasTextOps(id, text, x, y, ctmF32, size, families, bold, italic,
+/// stroke, lineWidth, r, g, b, a, gradF32, shF32, mode, align, baseline)` → bool.
+#[cfg(feature = "render")]
+fn canvas_text_ops(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let text = arg_string(scope, args.get(1));
+    let (x, y) = (arg_f32(scope, args.get(2)), arg_f32(scope, args.get(3)));
+    let m = arg_f32s(args.get(4));
+    let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+    if m.len() >= 6 {
+        ctm.copy_from_slice(&m[..6]);
+    }
+    let size = arg_f32(scope, args.get(5));
+    let families = arg_string(scope, args.get(6));
+    let bold = args.get(7).boolean_value(scope);
+    let italic = args.get(8).boolean_value(scope);
+    let stroke = args.get(9).boolean_value(scope);
+    let lw = arg_f32(scope, args.get(10));
+    let rgba = [
+        arg_usize(scope, args.get(11)) as u8,
+        arg_usize(scope, args.get(12)) as u8,
+        arg_usize(scope, args.get(13)) as u8,
+        arg_usize(scope, args.get(14)) as u8,
+    ];
+    let grad = arg_f32s(args.get(15));
+    let sh = arg_f32s(args.get(16));
+    let mode = arg_usize(scope, args.get(17)) as u32;
+    let align = arg_usize(scope, args.get(18)) as u32;
+    let baseline = arg_usize(scope, args.get(19)) as u32;
+    let ok = crate::canvas::text_ops(id, &text, x, y, ctm, size, &families, bold, italic, stroke, lw, rgba, &grad, &sh, mode, align, baseline);
+    rv.set_bool(ok);
 }
 
 /// `__pt_localFont(name)` — есть ли в системе шрифт с таким именем.
