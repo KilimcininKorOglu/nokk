@@ -1584,7 +1584,15 @@ const WORKER_SCOPE_ENUMERABLE: &str = r#"["atob", "btoa", "caches", "clearInterv
 /// заглушки (аксессор с ячейкой, метод-пустышка хромовской длины,
 /// константа со значением). Лишнее снимается, порядок — хромовский.
 pub fn proto_shape_script() -> String {
+    // `NOKK_PROTO_SHAPE_SKIP=<regex>` — интерфейсы, форму которых не трогать
+    // (для бисекции).
+    let skip = std::env::var("NOKK_PROTO_SHAPE_SKIP")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("new RegExp({})", quoted(&s)))
+        .unwrap_or_else(|| "null".to_string());
     PROTO_SHAPE_TEMPLATE
+        .replace("__SHAPE_SKIP__", &skip)
         .replace("__SHAPE__", PROTO_SHAPE)
         .replace("__BRAND_TRACE__", if std::env::var_os("NOKK_TRACE_BRAND").is_some() { "true" } else { "false" })
 }
@@ -1593,7 +1601,10 @@ const PROTO_SHAPE: &str = include_str!("proto_shape.json");
 
 const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
   'use strict';
-  const T = __SHAPE__;
+  const T0 = __SHAPE__;
+  const SKIP = __SHAPE_SKIP__;
+  const T = {};
+  for (const k of Object.keys(T0)) if (!SKIP || !SKIP.test(k)) T[k] = T0[k];
   const TRACE = __BRAND_TRACE__;
   const desc = (o, k) => { try { return Object.getOwnPropertyDescriptor(o, k); } catch (e) { return undefined; } };
   const def = (o, k, d) => { try { Object.defineProperty(o, k, d); return true; } catch (e) { return false; } };
@@ -1686,6 +1697,21 @@ const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
     }
     for (const [k, d] of built) { if (!desc(P, k)) def(P, k, d); }
     for (const [k, d] of extra) { if (!desc(P, k)) def(P, k, d); }
+  }
+  // Двойники: у офскринного контекста те же члены, что у контекста холста,
+  // и настоящие они должны быть с самого начала — программа челленджа
+  // снимает методы с прототипа заранее и зовёт их потом на контексте, а
+  // заглушка отдавала undefined, и блоки холстов из отчёта выпадали.
+  for (const [to, from] of [['OffscreenCanvasRenderingContext2D', 'CanvasRenderingContext2D']]) {
+    const P = protoOf(to), S = protoOf(from);
+    if (!P || !S) continue;
+    for (const k of Object.getOwnPropertyNames(P)) {
+      if (k === 'constructor') continue;
+      const d = desc(P, k), sd = desc(S, k);
+      if (!d || !sd || !d.configurable) continue;
+      const isStub = stubs && ((d.value && stubs.has(d.value)) || (d.get && stubs.has(d.get)));
+      if (isStub) def(P, k, Object.assign({}, sd, { enumerable: d.enumerable, configurable: d.configurable }));
+    }
   }
 })();"#;
 

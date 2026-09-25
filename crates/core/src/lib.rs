@@ -446,7 +446,8 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
     let base = format!(
         "{base}\n{}\n{}\n{}\n{}\n{}",
         nokk_stealth::late_interfaces_script(),
-        nokk_stealth::proto_shape_script(),
+        // `NOKK_NO_PROTO_SHAPE=1` — без слоя формы, для бисекции.
+        if std::env::var_os("NOKK_NO_PROTO_SHAPE").is_some() { String::new() } else { nokk_stealth::proto_shape_script() },
         nokk_stealth::naturalize_script(),
         nokk_stealth::late_originals_script(),
         // Порядок имён окна — последним: перечисление отдаёт их в порядке

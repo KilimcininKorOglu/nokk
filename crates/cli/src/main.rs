@@ -573,7 +573,7 @@ async fn main() -> Result<()> {
                             console.error('[enc ' + (en++) + '] ' + Math.round(performance.now()) + 'мс ' + (() => { try { return location.host.slice(0, 18) + ' '; } catch (e) { return '? '; } })() + s.length + ' | ненулевых=' + (() => { let n = 0, sum = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { n++; sum = (sum * 31 + c) >>> 0; } } return n + ' сумма=' + sum; })() + (s.length < 2000 || s.length > 14000 ? ' текст: ' + s.slice(0, 400).replace(/[^\x20-\x7e]/g, '.') : ' коды: ') + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
 if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = globalThis.__ptD || {})[s.length]) {
   globalThis.__ptD[s.length] = 1;
-  for (let q = 0; q < s.length; q += 250) console.error('[кус ' + s.length + ':' + (q / 300) + '] ' + s.slice(q, q + 300));
+  for (let q = 0; q < s.length; q += 60) console.error('[кус ' + s.length + ':' + (q / 60) + '] ' + Array.from(s.slice(q, q + 60)).map((c) => c.charCodeAt(0)).join(','));
   console.error('[хвост ' + s.length + '] куски=' + s.split('|').length + ' последние=' + JSON.stringify(s.split('|').slice(-3).map((x) => x.slice(-40))));
 }
                           }
