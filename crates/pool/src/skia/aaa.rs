@@ -1402,9 +1402,15 @@ pub fn anti_fill_path(path: &Path, clip: &IRect, blitter: &mut dyn Blitter) {
         return;
     }
     let Some(_clipped) = ir.intersect(clip) else { return };
-    // Область обрезки — окно холста; SkScanClipper заворачивает блиттер в
-    // SkRectClipBlitter, у нас пиксельный блиттер сам не пишет вне окна.
-    aaa_fill_path_entry(path, blitter, &ir, clip);
+    // SkScanClipper: если границы пути выходят за окно по горизонтали,
+    // блиттер заворачивается в SkRectClipBlitter — и это меняет арифметику
+    // (blitAntiH2/V2 идут через blitAntiH с пробегами).
+    if !clip.contains(&ir) && (clip.left > ir.left || clip.right < ir.right) {
+        let mut wrapped = super::blit::RectClipBlitter::new(blitter, *clip);
+        aaa_fill_path_entry(path, &mut wrapped, &ir, clip);
+    } else {
+        aaa_fill_path_entry(path, blitter, &ir, clip);
+    }
 }
 
 fn safe_round_out(r: &super::geometry::Rect) -> IRect {

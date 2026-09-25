@@ -91,6 +91,16 @@ impl Matrix {
     pub fn is_translate_only(&self) -> bool {
         self.is_scale_translate() && self.sx == 1.0 && self.sy == 1.0
     }
+    /// `SkMatrix::rectStaysRect()` по `computeTypeMask`: сравнение битов,
+    /// так что −0 считается ненулём.
+    pub fn rect_stays_rect(&self) -> bool {
+        let nz = |v: f32| v.to_bits() != 0;
+        if nz(self.kx) || nz(self.ky) {
+            !nz(self.sx) && !nz(self.sy) && nz(self.kx) && nz(self.ky)
+        } else {
+            nz(self.sx) && nz(self.sy)
+        }
+    }
     /// `setSinCos(sin, cos)`.
     pub fn sin_cos(s: f32, c: f32) -> Matrix {
         Matrix { sx: c, kx: -s, tx: 0.0, ky: s, sy: c, ty: 0.0 }
@@ -802,4 +812,215 @@ pub fn degrees_to_radians(d: f32) -> f32 {
 #[inline]
 pub fn nearly_equal(a: f32, b: f32) -> bool {
     (a - b).abs() <= SCALAR_NEARLY_ZERO
+}
+
+// ── Матрица: обращение, PolyToPoly, масштаб (SkMatrix.cpp) ────────────────
+
+impl Matrix {
+    pub fn translate(dx: f32, dy: f32) -> Matrix {
+        Matrix { sx: 1.0, kx: 0.0, tx: dx, ky: 0.0, sy: 1.0, ty: dy }
+    }
+    /// `SkMatrix::ScaleTranslate`.
+    pub fn scale_translate(sx: f32, sy: f32, tx: f32, ty: f32) -> Matrix {
+        Matrix { sx, kx: 0.0, tx, ky: 0.0, sy, ty }
+    }
+    /// `postScale(sx, sy)` = setConcat(scale, self).
+    pub fn post_scale(&mut self, sx: f32, sy: f32) {
+        if sx == 1.0 && sy == 1.0 {
+            return;
+        }
+        *self = Matrix::concat(&Matrix::scale(sx, sy), self);
+    }
+    fn is_scale_mask(&self) -> bool {
+        self.sx != 1.0 || self.sy != 1.0
+    }
+    fn is_translate_mask(&self) -> bool {
+        self.tx != 0.0 || self.ty != 0.0
+    }
+    fn is_affine_mask(&self) -> bool {
+        self.kx != 0.0 || self.ky != 0.0
+    }
+    /// `SkMatrix::invert()` без перспективы: путь для scale/translate и общий
+    /// через double.
+    pub fn invert(&self) -> Option<Matrix> {
+        if !self.is_scale_mask() && !self.is_translate_mask() && !self.is_affine_mask() {
+            return Some(*self);
+        }
+        if !self.is_affine_mask() {
+            if self.is_scale_mask() {
+                let inv_sx = 1.0 / self.sx;
+                let inv_sy = 1.0 / self.sy;
+                if !inv_sx.is_finite() || !inv_sy.is_finite() {
+                    return None;
+                }
+                let inv_tx = -self.tx * inv_sx;
+                let inv_ty = -self.ty * inv_sy;
+                if !inv_tx.is_finite() || !inv_ty.is_finite() {
+                    return None;
+                }
+                return Some(Matrix { sx: inv_sx, kx: 0.0, tx: inv_tx, ky: 0.0, sy: inv_sy, ty: inv_ty });
+            }
+            if !self.tx.is_finite() || !self.ty.is_finite() {
+                return None;
+            }
+            return Some(Matrix::translate(-self.tx, -self.ty));
+        }
+        // sk_inv_determinant: dcross(scaleX, scaleY, skewX, skewY) в double.
+        let det = self.sx as f64 * self.sy as f64 - self.kx as f64 * self.ky as f64;
+        let nz = SCALAR_NEARLY_ZERO * SCALAR_NEARLY_ZERO * SCALAR_NEARLY_ZERO;
+        if (det as f32).abs() <= nz {
+            return None;
+        }
+        let inv_det = 1.0 / det;
+        let dcross_dscale = |a: f32, b: f32, c: f32, d: f32| -> f32 {
+            ((a as f64 * b as f64 - c as f64 * d as f64) * inv_det) as f32
+        };
+        let m = Matrix {
+            sx: (self.sy as f64 * inv_det) as f32,
+            kx: (-self.kx as f64 * inv_det) as f32,
+            tx: dcross_dscale(self.kx, self.ty, self.sy, self.tx),
+            ky: (-self.ky as f64 * inv_det) as f32,
+            sy: (self.sx as f64 * inv_det) as f32,
+            ty: dcross_dscale(self.ky, self.tx, self.sx, self.ty),
+        };
+        if ![m.sx, m.kx, m.tx, m.ky, m.sy, m.ty].iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        Some(m)
+    }
+    /// `SkMatrix::PolyToPoly` для двух точек: `Poly2Proc(src)`⁻¹ · `Poly2Proc(dst)`.
+    pub fn poly_to_poly2(src: [Point; 2], dst: [Point; 2]) -> Option<Matrix> {
+        let poly2 = |p: [Point; 2]| Matrix {
+            sx: p[1].y - p[0].y,
+            ky: p[0].x - p[1].x,
+            kx: p[1].x - p[0].x,
+            sy: p[1].y - p[0].y,
+            tx: p[0].x,
+            ty: p[0].y,
+        };
+        let temp = poly2(src);
+        let inverse = temp.invert()?;
+        let temp = poly2(dst);
+        Some(Matrix::concat(&temp, &inverse))
+    }
+    /// `mapVectors` для одного вектора: без сноса.
+    pub fn map_vector(&self, v: Point) -> Point {
+        let mut t = *self;
+        t.tx = 0.0;
+        t.ty = 0.0;
+        t.map_point(v)
+    }
+    /// Девять чисел `get9` (row-major), как их читает конвейер.
+    pub fn get9(&self) -> [f32; 9] {
+        [self.sx, self.kx, self.tx, self.ky, self.sy, self.ty, 0.0, 0.0, 1.0]
+    }
+}
+
+// ── Кубики: резка по нескольким t, максимум кривизны (для волосяных линий) ─
+
+pub fn chop_cubic_at_ts(src: &[Point; 4], ts: &[f32]) -> Vec<Point> {
+    let mut out: Vec<Point> = Vec::new();
+    if ts.is_empty() {
+        out.extend_from_slice(src);
+        return out;
+    }
+    let mut cur = *src;
+    let mut i = 0usize;
+    let pin = |v: f32| v.clamp(0.0, 1.0);
+    while i + 1 < ts.len() {
+        let (mut t0, mut t1) = (ts[i], ts[i + 1]);
+        if i != 0 {
+            let last = ts[i - 1];
+            t0 = pin((t0 - last) / (1.0 - last));
+            t1 = pin((t1 - last) / (1.0 - last));
+        }
+        let d = chop_cubic_at2(&cur, t0, t1);
+        if out.is_empty() {
+            out.extend_from_slice(&d[..7]);
+        } else {
+            out.extend_from_slice(&d[1..7]);
+        }
+        cur = [d[6], d[7], d[8], d[9]];
+        i += 2;
+    }
+    if i < ts.len() {
+        let mut t = ts[i];
+        if i != 0 {
+            let last = ts[i - 1];
+            t = pin((t - last) / (1.0 - last));
+        }
+        let d = chop_cubic_at(&cur, t);
+        if out.is_empty() {
+            out.extend_from_slice(&d);
+        } else {
+            out.extend_from_slice(&d[1..]);
+        }
+    } else {
+        out.extend_from_slice(&cur[1..]);
+    }
+    out
+}
+
+fn solve_cubic_poly(coeff: [f32; 4]) -> Vec<f32> {
+    if coeff[0].abs() <= SCALAR_NEARLY_ZERO {
+        let (r, n) = find_unit_quad_roots(coeff[1], coeff[2], coeff[3]);
+        return r[..n].to_vec();
+    }
+    let inva = 1.0 / coeff[0];
+    let a = coeff[1] * inva;
+    let b = coeff[2] * inva;
+    let c = coeff[3] * inva;
+    let q = (a * a - b * 3.0) / 9.0;
+    let r = (2.0 * a * a * a - 9.0 * a * b + 27.0 * c) / 54.0;
+    let q3 = q * q * q;
+    let r2_minus_q3 = r * r - q3;
+    let adiv3 = a / 3.0;
+    if r2_minus_q3 < 0.0 {
+        let theta = (r / q3.sqrt()).clamp(-1.0, 1.0).acos();
+        let neg2_root_q = -2.0 * q.sqrt();
+        let mut t = [
+            (neg2_root_q * (theta / 3.0).cos() - adiv3).clamp(0.0, 1.0),
+            (neg2_root_q * ((theta + 2.0 * SCALAR_PI) / 3.0).cos() - adiv3).clamp(0.0, 1.0),
+            (neg2_root_q * ((theta - 2.0 * SCALAR_PI) / 3.0).cos() - adiv3).clamp(0.0, 1.0),
+        ];
+        // bubble_sort
+        for i in 0..3 {
+            for j in 0..2 - i {
+                if t[j] > t[j + 1] {
+                    t.swap(j, j + 1);
+                }
+            }
+        }
+        // collaps_duplicates
+        let mut v = t.to_vec();
+        v.dedup();
+        v
+    } else {
+        let mut aa = r.abs() + r2_minus_q3.sqrt();
+        aa = aa.powf(0.3333333);
+        if r > 0.0 {
+            aa = -aa;
+        }
+        if aa != 0.0 {
+            aa += q / aa;
+        }
+        vec![(aa - adiv3).clamp(0.0, 1.0)]
+    }
+}
+
+fn formulate_f1_dot_f2(s: [f32; 4]) -> [f32; 4] {
+    let a = s[1] - s[0];
+    let b = s[2] - 2.0 * s[1] + s[0];
+    let c = s[3] + 3.0 * (s[1] - s[2]) - s[0];
+    [c * c, 3.0 * b * c, 2.0 * b * b + c * a, a * b]
+}
+
+/// `SkChopCubicAtMaxCurvature`: кубики (по 4 точки с общими концами).
+pub fn chop_cubic_at_max_curvature(src: &[Point; 4]) -> Vec<Point> {
+    let cx = formulate_f1_dot_f2([src[0].x, src[1].x, src[2].x, src[3].x]);
+    let cy = formulate_f1_dot_f2([src[0].y, src[1].y, src[2].y, src[3].y]);
+    let coeff = [cx[0] + cy[0], cx[1] + cy[1], cx[2] + cy[2], cx[3] + cy[3]];
+    let roots = solve_cubic_poly(coeff);
+    let ts: Vec<f32> = roots.into_iter().filter(|t| 0.0 < *t && *t < 1.0).collect();
+    chop_cubic_at_ts(src, &ts)
 }

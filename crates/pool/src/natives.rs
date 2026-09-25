@@ -70,6 +70,8 @@ pub fn install(scope: &mut v8::PinScope) {
         bind(scope, "__pt_localFont", local_font);
         bind(scope, "__pt_canvasFillPath", canvas_fill_path);
         bind(scope, "__pt_canvasFillOps", canvas_fill_ops);
+        bind(scope, "__pt_canvasFillOpsGradient", canvas_fill_ops_gradient);
+        bind(scope, "__pt_canvasStrokeOps", canvas_stroke_ops);
         bind(
             scope,
             "__pt_canvasFillPathGradient",
@@ -364,6 +366,53 @@ fn canvas_fill_ops(
     ];
     crate::canvas::fill_ops(id, &ops, ctm, even_odd, rgba, &arg_f32s(args.get(8)),
         arg_usize(scope, args.get(9)) as u32);
+}
+
+/// `__pt_canvasFillOpsGradient(id, opsF32, ctmF32, evenOdd, gradF32, shF32, mode)`.
+#[cfg(feature = "render")]
+fn canvas_fill_ops_gradient(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let ops = arg_f32s(args.get(1));
+    let m = arg_f32s(args.get(2));
+    let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+    if m.len() >= 6 {
+        ctm.copy_from_slice(&m[..6]);
+    }
+    let even_odd = arg_usize(scope, args.get(3)) != 0;
+    let grad = arg_f32s(args.get(4));
+    crate::canvas::fill_ops_grad(id, &ops, ctm, even_odd, &grad, &arg_f32s(args.get(5)),
+        arg_usize(scope, args.get(6)) as u32);
+}
+
+/// `__pt_canvasStrokeOps(id, opsF32, ctmF32, lineWidth, r, g, b, a, gradF32, shF32, mode)` → bool.
+#[cfg(feature = "render")]
+fn canvas_stroke_ops(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let ops = arg_f32s(args.get(1));
+    let m = arg_f32s(args.get(2));
+    let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+    if m.len() >= 6 {
+        ctm.copy_from_slice(&m[..6]);
+    }
+    let lw = arg_f32(scope, args.get(3));
+    let rgba = [
+        arg_usize(scope, args.get(4)) as u8,
+        arg_usize(scope, args.get(5)) as u8,
+        arg_usize(scope, args.get(6)) as u8,
+        arg_usize(scope, args.get(7)) as u8,
+    ];
+    let grad = arg_f32s(args.get(8));
+    let ok = crate::canvas::stroke_ops(id, &ops, ctm, lw, rgba, &grad, &arg_f32s(args.get(9)),
+        arg_usize(scope, args.get(10)) as u32);
+    rv.set_bool(ok);
 }
 
 /// `__pt_canvasFillPathGradient(id, verbsF32, evenOdd, gradF32)` — gradient fill.

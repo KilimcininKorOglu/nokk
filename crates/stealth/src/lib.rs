@@ -7382,6 +7382,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // Заливка по операциям пути в координатах страницы и матрице холста:
       // дуги, коники и сглаживание считает движок, как Skia у Chrome.
       fillOps(ops, m, evenOdd, rgba, sh, mode) { sync(); __pt_canvasFillOps(id, new Float32Array(ops), new Float32Array(m), evenOdd ? 1 : 0, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(sh || []), mode | 0); },
+      fillOpsGradient(ops, m, evenOdd, grad, sh, mode) { sync(); __pt_canvasFillOpsGradient(id, new Float32Array(ops), new Float32Array(m), evenOdd ? 1 : 0, new Float32Array(grad), new Float32Array(sh || []), mode | 0); },
+      // Штрих по операциям: true — нарисован (волосяной), false — толще пикселя.
+      strokeOps(ops, m, lw, rgba, grad, sh, mode) { sync(); return !!__pt_canvasStrokeOps(id, new Float32Array(ops), new Float32Array(m), +lw || 0, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(grad || []), new Float32Array(sh || []), mode | 0); },
       fillPathGradient(verbs, evenOdd, grad, sh, mode) { sync(); __pt_canvasFillPathGradient(id, new Float32Array(verbs), evenOdd ? 1 : 0, new Float32Array(grad), new Float32Array(sh || []), mode | 0); },
       strokePath(verbs, lw, rgba, sh, mode) { sync(); __pt_canvasStrokePath(id, new Float32Array(verbs), lw, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(sh || []), mode | 0); },
       // Images we still can't rasterize: a deterministic semi-transparent fill
@@ -7865,12 +7868,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
     const gradOf = (v) => (v && GRAD.get(v)) || null;
     const encodeGrad = (g) => {
-      // Градиент задан в координатах страницы, а движок заливает по холсту:
-      // его точки и радиусы идут через ту же матрицу, что и путь.
+      // Точки и радиусы — в координатах пользователя: движок сам ставит
+      // матрицу холста в конвейер шейдера (MatrixRec: ptsToUnit · CTM⁻¹),
+      // как Skia; заранее переводить их на холст нельзя.
       const c = g.coords;
-      const k = tScale();
-      const co = [tX(c[0], c[1]), tY(c[0], c[1]), tX(c[2], c[3]), tY(c[2], c[3]),
-        (+c[4] || 0) * k, (+c[5] || 0) * k];
+      const co = [+c[0] || 0, +c[1] || 0, +c[2] || 0, +c[3] || 0, +c[4] || 0, +c[5] || 0];
       const a = [g.type, co[0], co[1], co[2], co[3], co[4], co[5], g.stops.length];
       for (let k = 0; k < g.stops.length; k++) { const s = g.stops[k]; a.push(s[0], s[1][0], s[1][1], s[1][2], s[1][3]); }
       return a;
@@ -7922,8 +7924,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const fs = this.fillStyle;
         const sh = shadowOf(this);
         const md = modeOf(this);
-        if (S.native && gradOf(fs)) S.fillPathGradient(rectVerbs(x, y, w, h), false, encodeGrad(gradOf(fs)), sh, md);
-        else if (S.native && (!plain() || sh || md)) S.fillOps([7, +x, +y, +w, +h], M, false, parseColor(fs), sh, md);
+        // ValidateRectForCanvas + AdjustRectForCanvas (в double), затем
+        // drawRect — маршрут SkScan::AntiFillRect, не путь (код операции 8).
+        let X = +x, Y = +y, W2 = +w, H2 = +h;
+        if (!(isFinite(X) && isFinite(Y) && isFinite(W2) && isFinite(H2))) return;
+        if (W2 < 0) { W2 = -W2; X -= W2; }
+        if (H2 < 0) { H2 = -H2; Y -= H2; }
+        if (S.native && gradOf(fs)) S.fillOpsGradient([8, X, Y, W2, H2], M, false, encodeGrad(gradOf(fs)), sh, md);
+        else if (S.native) S.fillOps([8, X, Y, W2, H2], M, false, parseColor(fs), sh, md);
         else solid(x, y, w, h, parseColor(fs));
         if (!gradOf(fs) && plain() && (+x || 0) <= 0 && (+y || 0) <= 0 &&
             (+w || 0) >= (canvas.width | 0) && (+h || 0) >= (canvas.height | 0)) {
@@ -7994,14 +8002,18 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         if (!S.native) return paintPath();
         const fs = this.fillStyle;
         const sh = shadowOf(this);
-        if (gradOf(fs)) S.fillPathGradient(verbs, String(rule) === 'evenodd', encodeGrad(gradOf(fs)), sh, modeOf(this));
+        if (gradOf(fs)) S.fillOpsGradient(ops, M, String(rule) === 'evenodd', encodeGrad(gradOf(fs)), sh, modeOf(this));
         else S.fillOps(ops, M, String(rule) === 'evenodd', parseColor(fs), sh, modeOf(this));
       },
       stroke() {
         note('stroke|' + [this.strokeStyle, this.lineWidth]);
-        if (S.native) S.strokePath(verbs, Math.max(0, +this.lineWidth || 1) * tScale(),
-          parseColor(this.strokeStyle), shadowOf(this), modeOf(this));
-        else paintPath();
+        if (S.native) {
+          const ss = this.strokeStyle, g = gradOf(ss);
+          if (!S.strokeOps(ops, M, Math.max(0, +this.lineWidth || 1), g ? [0, 0, 0, 255] : parseColor(ss), g ? encodeGrad(g) : [], shadowOf(this), modeOf(this))) {
+            S.strokePath(verbs, Math.max(0, +this.lineWidth || 1) * tScale(),
+              parseColor(ss), shadowOf(this), modeOf(this));
+          }
+        } else paintPath();
       },
       clip() { note('clip'); },
 

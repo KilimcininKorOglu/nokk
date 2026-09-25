@@ -1121,12 +1121,40 @@ pub fn fill_ops(id: u32, ops: &[f32], ctm: [f32; 6], even_odd: bool, rgba: [u8; 
     CANVASES.with(|c| {
         if let Some(pm) = c.borrow_mut().get_mut(&id) {
             let (w, h) = (pm.width(), pm.height());
-            paint_shadow(pm, sh, |sp, col| {
-                crate::skia::fill_ops(sp.data_mut(), w, h, ops, ctm, even_odd, col, 0);
-            });
-            crate::skia::fill_ops(pm.data_mut(), w, h, ops, ctm, even_odd, rgba, mode);
+            let shadow = crate::skia::Shadow::parse(sh);
+            crate::skia::fill_ops_paint(pm.data_mut(), w, h, ops, ctm, even_odd, &crate::skia::PaintKind::Solid(rgba), shadow, mode);
         }
     });
+}
+
+/// `fill()` градиентом: описание как у `fill_path_grad`.
+pub fn fill_ops_grad(id: u32, ops: &[f32], ctm: [f32; 6], even_odd: bool, grad: &[f32], sh: &[f32], mode: u32) {
+    let Some(desc) = crate::skia::gradient::GradientDesc::parse(grad) else { return };
+    CANVASES.with(|c| {
+        if let Some(pm) = c.borrow_mut().get_mut(&id) {
+            let (w, h) = (pm.width(), pm.height());
+            let shadow = crate::skia::Shadow::parse(sh);
+            crate::skia::fill_ops_paint(pm.data_mut(), w, h, ops, ctm, even_odd, &crate::skia::PaintKind::Gradient(desc), shadow, mode);
+        }
+    });
+}
+
+/// `stroke()` по операциям пути: волосяной штрих как у Skia; false —
+/// штрих толще пикселя, рисовать прежним путём.
+#[allow(clippy::too_many_arguments)]
+pub fn stroke_ops(id: u32, ops: &[f32], ctm: [f32; 6], line_width: f32, rgba: [u8; 4], grad: &[f32], sh: &[f32], mode: u32) -> bool {
+    let paint = match crate::skia::gradient::GradientDesc::parse(grad) {
+        Some(desc) if !grad.is_empty() => crate::skia::PaintKind::Gradient(desc),
+        _ => crate::skia::PaintKind::Solid(rgba),
+    };
+    CANVASES.with(|c| {
+        if let Some(pm) = c.borrow_mut().get_mut(&id) {
+            let (w, h) = (pm.width(), pm.height());
+            let shadow = crate::skia::Shadow::parse(sh);
+            return crate::skia::stroke_ops(pm.data_mut(), w, h, ops, ctm, line_width, &paint, shadow, mode);
+        }
+        true
+    })
 }
 
 /// Decode a flat gradient descriptor into a tiny-skia [`Shader`]:

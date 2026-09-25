@@ -245,6 +245,154 @@ impl<'a> Surface<'a> {
     }
 }
 
+/// `SkRectClipBlitter`: обёртка, которую `SkScanClipper` ставит перед
+/// настоящим блиттером, когда границы пути выходят за окно по горизонтали.
+/// Важна не обрезкой (наши блиттеры и так не пишут вне окна), а тем, что
+/// `blitAntiH2`/`blitAntiV2` у неё не переопределены: они уходят в базовые
+/// `SkBlitter::blitAntiH2/V2`, то есть в `blitAntiH` с пробегами, а это
+/// другая арифметика смешивания у `SkARGB32_*_Blitter`.
+pub struct RectClipBlitter<'a> {
+    inner: &'a mut dyn Blitter,
+    clip: IRect,
+}
+
+impl<'a> RectClipBlitter<'a> {
+    pub fn new(inner: &'a mut dyn Blitter, clip: IRect) -> Self {
+        RectClipBlitter { inner, clip }
+    }
+    #[inline]
+    fn y_in(&self, y: i32) -> bool {
+        ((y - self.clip.top) as u32) < (self.clip.height() as u32)
+    }
+    #[inline]
+    fn x_in(&self, x: i32) -> bool {
+        ((x - self.clip.left) as u32) < (self.clip.width() as u32)
+    }
+}
+
+fn compute_anti_width(runs: &[i16]) -> i32 {
+    let mut width = 0i32;
+    let mut i = 0usize;
+    loop {
+        let c = runs[i];
+        if c <= 0 {
+            break;
+        }
+        width += c as i32;
+        i += c as usize;
+    }
+    width
+}
+
+/// `SkAlphaRuns::BreakAt`: разрезать пробег на позиции `x`.
+fn break_at(runs: &mut [i16], alpha: &mut [u8], mut x: i32) {
+    let mut i = 0usize;
+    while x > 0 {
+        let n = runs[i] as i32;
+        let mut n_val = n;
+        if x < n {
+            alpha[i + x as usize] = alpha[i];
+            runs[i] = x as i16;
+            runs[i + x as usize] = (n - x) as i16;
+            n_val = x;
+        }
+        i += n_val as usize;
+        x -= n_val;
+    }
+}
+
+impl<'a> Blitter for RectClipBlitter<'a> {
+    fn blit_h(&mut self, left: i32, y: i32, width: i32) {
+        if !self.y_in(y) {
+            return;
+        }
+        let l = left.max(self.clip.left);
+        let r = (left + width).min(self.clip.right);
+        if r > l {
+            self.inner.blit_h(l, y, r - l);
+        }
+    }
+    fn blit_anti_h(&mut self, left: i32, y: i32, alphas: &[u8], runs: &[i16]) {
+        if !self.y_in(y) || left >= self.clip.right {
+            return;
+        }
+        let mut x0 = left;
+        let mut x1 = left + compute_anti_width(runs);
+        if x1 <= self.clip.left {
+            return;
+        }
+        let mut runs_v: Vec<i16> = runs.to_vec();
+        let mut aa_v: Vec<u8> = alphas.to_vec();
+        let mut off = 0usize;
+        if x0 < self.clip.left {
+            let dx = self.clip.left - x0;
+            break_at(&mut runs_v, &mut aa_v, dx);
+            off = dx as usize;
+            x0 = self.clip.left;
+        }
+        if x1 > self.clip.right {
+            x1 = self.clip.right;
+            break_at(&mut runs_v[off..], &mut aa_v[off..], x1 - x0);
+            runs_v[off + (x1 - x0) as usize] = 0;
+        }
+        self.inner.blit_anti_h(x0, y, &aa_v[off..], &runs_v[off..]);
+    }
+    fn blit_v(&mut self, x: i32, y: i32, height: i32, alpha: u8) {
+        if !self.x_in(x) {
+            return;
+        }
+        let y0 = y.max(self.clip.top);
+        let y1 = (y + height).min(self.clip.bottom);
+        if y0 < y1 {
+            self.inner.blit_v(x, y0, y1 - y0, alpha);
+        }
+    }
+    fn blit_rect(&mut self, left: i32, y: i32, width: i32, height: i32) {
+        let r = IRect::from_ltrb(left, y, left + width, y + height);
+        if let Some(r) = r.intersect(&self.clip) {
+            self.inner.blit_rect(r.left, r.top, r.width(), r.height());
+        }
+    }
+    fn blit_anti_h2(&mut self, x: i32, y: i32, a0: u8, a1: u8) {
+        // SkBlitter::blitAntiH2 (не переопределён у SkRectClipBlitter).
+        let runs = [1i16, 1, 0];
+        let aa = [a0, a1];
+        self.blit_anti_h(x, y, &aa, &runs);
+    }
+    fn blit_anti_v2(&mut self, x: i32, y: i32, a0: u8, a1: u8) {
+        // SkBlitter::blitAntiV2.
+        let runs = [1i16, 0];
+        self.blit_anti_h(x, y, &[a0], &runs);
+        self.blit_anti_h(x, y + 1, &[a1], &runs);
+    }
+    fn blit_anti_rect(&mut self, left: i32, y: i32, width: i32, height: i32, mut left_alpha: u8, mut right_alpha: u8) {
+        let full = IRect::from_ltrb(left, y, left + width + 2, y + height);
+        let Some(r) = full.intersect(&self.clip) else { return };
+        if r.left != left {
+            left_alpha = 255;
+        }
+        if r.right != left + width + 2 {
+            right_alpha = 255;
+        }
+        if left_alpha == 255 && right_alpha == 255 {
+            self.inner.blit_rect(r.left, r.top, r.width(), r.height());
+        } else if r.width() == 1 {
+            if r.left == left {
+                self.inner.blit_v(r.left, r.top, r.height(), left_alpha);
+            } else {
+                self.inner.blit_v(r.left, r.top, r.height(), right_alpha);
+            }
+        } else {
+            self.inner.blit_anti_rect(r.left, r.top, r.width() - 2, r.height(), left_alpha, right_alpha);
+        }
+    }
+    fn blit_mask(&mut self, mask: &[u8], mask_bounds: &IRect, row_bytes: usize, clip: &IRect) {
+        if let Some(r) = clip.intersect(&self.clip) {
+            self.inner.blit_mask(mask, mask_bounds, row_bytes, &r);
+        }
+    }
+}
+
 /// Интерфейс `SkBlitter` (то, что зовут обходчики).
 pub trait Blitter {
     fn blit_h(&mut self, x: i32, y: i32, width: i32);
@@ -252,6 +400,7 @@ pub trait Blitter {
     fn blit_v(&mut self, x: i32, y: i32, height: i32, alpha: u8);
     fn blit_rect(&mut self, x: i32, y: i32, width: i32, height: i32);
     fn blit_anti_h2(&mut self, x: i32, y: i32, a0: u8, a1: u8);
+    fn blit_anti_v2(&mut self, x: i32, y: i32, a0: u8, a1: u8);
     fn blit_anti_rect(&mut self, x: i32, y: i32, width: i32, height: i32, left_alpha: u8, right_alpha: u8);
     /// Маска A8: `mask[(yy-top)*row_bytes + (xx-left)]`, рисуется в `clip`.
     fn blit_mask(&mut self, mask: &[u8], mask_bounds: &IRect, row_bytes: usize, clip: &IRect);
@@ -624,6 +773,34 @@ impl<'a> Blitter for SolidBlitter<'a> {
             Strategy::Pipeline { .. } => {
                 let bounds = IRect::from_ltrb(x, y, x + 2, y + 1);
                 self.blit_mask(&[a0, a1], &bounds, 2, &bounds);
+            }
+        }
+    }
+    fn blit_anti_v2(&mut self, x: i32, y: i32, a0: u8, a1: u8) {
+        match self.st {
+            Strategy::Legacy { pm, opaque, black } => {
+                if x < 0 || x >= self.surf.width {
+                    return;
+                }
+                for (k, a) in [(0, a0), (1, a1)] {
+                    let yy = y + k;
+                    if !self.in_y(yy) {
+                        continue;
+                    }
+                    let d = self.get(x, yy);
+                    let out = if black {
+                        add4([0, 0, 0, a], alpha_mul_q(d, 256 - a as u32))
+                    } else if opaque {
+                        fast_four_byte_interp(pm, d, a)
+                    } else {
+                        blend_argb32(pm, d, a)
+                    };
+                    self.put(x, yy, out);
+                }
+            }
+            Strategy::Pipeline { .. } => {
+                let bounds = IRect::from_ltrb(x, y, x + 1, y + 2);
+                self.blit_mask(&[a0, a1], &bounds, 1, &bounds);
             }
         }
     }
