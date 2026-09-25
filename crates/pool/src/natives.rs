@@ -280,7 +280,7 @@ fn canvas_fill_text(
 }
 
 /// `__pt_canvasTextOps(id, text, x, y, ctmF32, size, families, bold, italic,
-/// stroke, lineWidth, r, g, b, a, gradF32, shF32, mode, align, baseline)` → bool.
+/// stroke, lineWidth, r, g, b, a, gradF32, shF32, mode, align, baseline, cap, join, miter)` → bool.
 #[cfg(feature = "render")]
 fn canvas_text_ops(
     scope: &mut v8::PinScope,
@@ -312,7 +312,9 @@ fn canvas_text_ops(
     let mode = arg_usize(scope, args.get(17)) as u32;
     let align = arg_usize(scope, args.get(18)) as u32;
     let baseline = arg_usize(scope, args.get(19)) as u32;
-    let ok = crate::canvas::text_ops(id, &text, x, y, ctm, size, &families, bold, italic, stroke, lw, rgba, &grad, &sh, mode, align, baseline);
+    let line = crate::skia::LineStyle::from_codes(lw, arg_usize(scope, args.get(20)) as u32,
+        arg_usize(scope, args.get(21)) as u32, arg_f32(scope, args.get(22)));
+    let ok = crate::canvas::text_ops(id, &text, x, y, ctm, size, &families, bold, italic, stroke, &line, rgba, &grad, &sh, mode, align, baseline);
     rv.set_bool(ok);
 }
 
@@ -448,7 +450,9 @@ fn canvas_stroke_ops(
         arg_usize(scope, args.get(7)) as u8,
     ];
     let grad = arg_f32s(args.get(8));
-    let ok = crate::canvas::stroke_ops(id, &ops, ctm, lw, rgba, &grad, &arg_f32s(args.get(9)),
+    let line = crate::skia::LineStyle::from_codes(lw, arg_usize(scope, args.get(11)) as u32,
+        arg_usize(scope, args.get(12)) as u32, arg_f32(scope, args.get(13)));
+    let ok = crate::canvas::stroke_ops(id, &ops, ctm, &line, rgba, &grad, &arg_f32s(args.get(9)),
         arg_usize(scope, args.get(10)) as u32);
     rv.set_bool(ok);
 }

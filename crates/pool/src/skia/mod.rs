@@ -16,6 +16,7 @@ pub mod gradient;
 pub mod hair;
 pub mod path;
 pub mod pipeline;
+pub mod stroke;
 pub mod text;
 
 use blit::{BlendMode, Blitter, SolidBlitter, SolidPaint, Surface};
@@ -425,19 +426,67 @@ pub fn fill_ops(data: &mut [u8], w: u32, h: u32, ops: &[f32], ctm: [f32; 6], eve
 /// `stroke()` холста. Возвращает false, если штрих не волосяной (толще
 /// пикселя устройства) — тогда рисует прежний растр.
 #[allow(clippy::too_many_arguments)]
-pub fn stroke_ops(data: &mut [u8], w: u32, h: u32, ops: &[f32], ctm: [f32; 6], line_width: f32, paint: &PaintKind, shadow: Option<Shadow>, mode: u32) -> bool {
+pub fn stroke_ops(data: &mut [u8], w: u32, h: u32, ops: &[f32], ctm: [f32; 6], line: &LineStyle, paint: &PaintKind, shadow: Option<Shadow>, mode: u32) -> bool {
     let Some(path) = path_for_ops(ops, false, false) else { return true };
-    draw_with_layers(data, w, h, &path, &ctm_of(ctm), Some(line_width), None, paint, shadow, blend_mode_from_index(mode))
+    let m = ctm_of(ctm);
+    // Тонкий штрих — волосяной путь Skia (DrawTreatAsHairline).
+    if hairline_coverage(line.width, &m).is_some() {
+        return draw_with_layers(data, w, h, &path, &m, Some(line.width), None, paint, shadow, blend_mode_from_index(mode));
+    }
+    // Иначе FillPathWithPaint: обводка в координатах пользователя с resScale
+    // от матрицы, затем заливка контура как пути.
+    if !path.is_finite() {
+        return true;
+    }
+    let params = stroke::StrokeParams { width: line.width, miter_limit: line.miter_limit, cap: line.cap, join: line.join, res_scale: stroke::res_scale_for_stroking(&m) };
+    let Some(stroked) = stroke::stroke_path(&path, &params) else { return false };
+    if !stroked.is_finite() {
+        return true;
+    }
+    draw_with_layers(data, w, h, &stroked, &m, None, None, paint, shadow, blend_mode_from_index(mode))
+}
+
+/// Параметры штриха холста: ширина, концы (0 butt, 1 round, 2 square), стыки
+/// (0 miter, 1 round, 2 bevel), предел скоса.
+#[derive(Clone, Copy, Debug)]
+pub struct LineStyle {
+    pub width: f32,
+    pub cap: stroke::Cap,
+    pub join: stroke::Join,
+    pub miter_limit: f32,
+}
+
+impl LineStyle {
+    pub fn from_codes(width: f32, cap: u32, join: u32, miter_limit: f32) -> LineStyle {
+        let cap = match cap {
+            1 => stroke::Cap::Round,
+            2 => stroke::Cap::Square,
+            _ => stroke::Cap::Butt,
+        };
+        let join = match join {
+            1 => stroke::Join::Round,
+            2 => stroke::Join::Bevel,
+            _ => stroke::Join::Miter,
+        };
+        LineStyle { width, cap, join, miter_limit }
+    }
 }
 
 /// Текст холста (`fillText`): слои как у путей, глифы как у Skia поверх
 /// Fontations (см. `text.rs`). `align`: 0 start/left, 1 center, 2 right/end;
 /// `baseline`: 0 alphabetic, 1 top/hanging, 2 middle, 3 bottom/ideographic.
 #[allow(clippy::too_many_arguments)]
-pub fn draw_text(data: &mut [u8], w: u32, h: u32, fonts: &[&'static [u8]], glyphs: &[text::ShapedGlyph], width: f32, x: f32, y: f32, ctm: [f32; 6], eff: f32, align: u32, baseline: u32, paint: &PaintKind, shadow: Option<Shadow>, mode: u32) -> bool {
+pub fn draw_text(data: &mut [u8], w: u32, h: u32, fonts: &[&'static [u8]], glyphs: &[text::ShapedGlyph], width: f32, x: f32, y: f32, ctm: [f32; 6], eff: f32, align: u32, baseline: u32, line: Option<&LineStyle>, paint: &PaintKind, shadow: Option<Shadow>, mode: u32) -> bool {
     if !x.is_finite() || !y.is_finite() || glyphs.is_empty() || fonts.is_empty() {
         return true;
     }
+    // strokeText: штрих контура глифа в пространстве кегля (`internalGetPath`),
+    // ширина 0 — волосяной глиф, его пока нет.
+    let stroke_params = match line {
+        Some(l) if l.width > 0.0 => Some(stroke::StrokeParams { width: l.width, miter_limit: l.miter_limit, cap: l.cap, join: l.join, res_scale: 1.0 }),
+        Some(_) => return false,
+        None => None,
+    };
     let mode = blend_mode_from_index(mode);
     let Some(first) = glyphs.first() else { return true };
     let Ok(font) = skrifa::FontRef::new(fonts[first.font]) else { return true };
@@ -490,7 +539,11 @@ pub fn draw_text(data: &mut [u8], w: u32, h: u32, fonts: &[&'static [u8]], glyph
         for g in glyphs {
             let Some(scaler) = scalers.get(g.font).and_then(|s| s.as_ref()) else { continue };
             let Some(dp) = text::device_position(&pos_m, g.x, ax, ay) else { continue };
-            let Some(mut mask) = scaler.fill_mask(g.gid, dp.sub_x, dp.sub_y) else { continue };
+            let mask = match &stroke_params {
+                None => scaler.fill_mask(g.gid, dp.sub_x, dp.sub_y),
+                Some(sp) => scaler.offset_path(g.gid, dp.sub_x, dp.sub_y).and_then(|p| text::stroke_mask(&p, &post, sp)),
+            };
+            let Some(mut mask) = mask else { continue };
             match layer.sigma {
                 Some(sigma) => {
                     // Маска-фильтр в контексте скейлера: без гамма-таблицы.

@@ -151,6 +151,12 @@ pub struct PathBuilder {
     needs_move_verb: bool,
 }
 
+impl Default for Path {
+    fn default() -> Self {
+        Path { verbs: Vec::new(), pts: Vec::new(), conics: Vec::new(), fill_type: FillType::Winding, convexity: Convexity::Unknown, segment_mask: 0 }
+    }
+}
+
 impl Default for PathBuilder {
     fn default() -> Self {
         Self::new()
@@ -178,6 +184,34 @@ impl PathBuilder {
     }
     pub fn last_pt(&self) -> Option<Point> {
         self.pts.last().copied()
+    }
+    /// После прямого дописывания вербов/точек (addPath): пересчитать маску
+    /// сегментов и признак «нужен Move».
+    pub fn note_appended(&mut self) {
+        let mut mask = 0u8;
+        for v in &self.verbs {
+            mask |= match v {
+                Verb::Line => SEG_LINE,
+                Verb::Quad => SEG_QUAD,
+                Verb::Conic => SEG_CONIC,
+                Verb::Cubic => SEG_CUBIC,
+                _ => 0,
+            };
+        }
+        self.segment_mask = mask;
+        self.convexity = Convexity::Unknown;
+        self.needs_move_verb = self.verbs.last() == Some(&Verb::Close);
+        // Точка последнего Move — для ensure_move после Close.
+        let mut pi = 0usize;
+        for v in &self.verbs {
+            match v {
+                Verb::Move => { self.last_move_point = self.pts[pi]; pi += 1; }
+                Verb::Line => pi += 1,
+                Verb::Quad | Verb::Conic => pi += 2,
+                Verb::Cubic => pi += 3,
+                Verb::Close => {}
+            }
+        }
     }
     pub fn bounds(&self) -> Rect {
         Rect::bounds(&self.pts)

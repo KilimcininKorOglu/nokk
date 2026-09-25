@@ -7375,7 +7375,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       },
       // Real glyphs. `y` is the alphabetic baseline, matching canvas semantics.
       text(t, x, y, size, rgba, fam, b, i, sh) { sync(); __pt_canvasFillText(id, String(t), x, y, size, rgba[0], rgba[1], rgba[2], rgba[3], fam || '', !!b, !!i, new Float32Array(sh || [])); },
-      textOps(t, x, y, M, size, fam, b, i, stroke, lw, rgba, grad, sh, mode, align, baseline) { sync(); return __pt_canvasTextOps(id, String(t), x, y, new Float32Array(M), size, fam || '', !!b, !!i, !!stroke, lw, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(grad || []), new Float32Array(sh || []), mode | 0, align | 0, baseline | 0); },
+      textOps(t, x, y, M, size, fam, b, i, stroke, lw, rgba, grad, sh, mode, align, baseline, cap, join, miter) { sync(); return __pt_canvasTextOps(id, String(t), x, y, new Float32Array(M), size, fam || '', !!b, !!i, !!stroke, lw, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(grad || []), new Float32Array(sh || []), mode | 0, align | 0, baseline | 0, cap | 0, join | 0, +miter || 10); },
       width(t, size, fam, b, i) { return __pt_canvasMeasureText(String(t), size, fam || '', !!b, !!i); },
       // Real vector paths: JS tessellates curves/arcs to a move/line/close verb
       // stream, tiny-skia fills or strokes it.
@@ -7385,7 +7385,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       fillOps(ops, m, evenOdd, rgba, sh, mode) { sync(); __pt_canvasFillOps(id, new Float32Array(ops), new Float32Array(m), evenOdd ? 1 : 0, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(sh || []), mode | 0); },
       fillOpsGradient(ops, m, evenOdd, grad, sh, mode) { sync(); __pt_canvasFillOpsGradient(id, new Float32Array(ops), new Float32Array(m), evenOdd ? 1 : 0, new Float32Array(grad), new Float32Array(sh || []), mode | 0); },
       // Штрих по операциям: true — нарисован (волосяной), false — толще пикселя.
-      strokeOps(ops, m, lw, rgba, grad, sh, mode) { sync(); return !!__pt_canvasStrokeOps(id, new Float32Array(ops), new Float32Array(m), +lw || 0, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(grad || []), new Float32Array(sh || []), mode | 0); },
+      strokeOps(ops, m, lw, rgba, grad, sh, mode, cap, join, miter) { sync(); return !!__pt_canvasStrokeOps(id, new Float32Array(ops), new Float32Array(m), +lw || 0, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(grad || []), new Float32Array(sh || []), mode | 0, cap | 0, join | 0, +miter || 10); },
       fillPathGradient(verbs, evenOdd, grad, sh, mode) { sync(); __pt_canvasFillPathGradient(id, new Float32Array(verbs), evenOdd ? 1 : 0, new Float32Array(grad), new Float32Array(sh || []), mode | 0); },
       strokePath(verbs, lw, rgba, sh, mode) { sync(); __pt_canvasStrokePath(id, new Float32Array(verbs), lw, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(sh || []), mode | 0); },
       // Images we still can't rasterize: a deterministic semi-transparent fill
@@ -7830,6 +7830,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       const m = /(?:\d+(?:\.\d+)?)(?:px|pt|em|%)\s*(?:\/\s*\S+\s*)?(.*)$/.exec(t);
       return (m ? m[1] : t).trim();
     };
+    // Коды концов и стыков штриха как у Skia: butt/round/square, miter/round/bevel.
+    const capCode = (c) => c === 'round' ? 1 : c === 'square' ? 2 : 0;
+    const joinCode = (j) => j === 'round' ? 1 : j === 'bevel' ? 2 : 0;
     const drawText = function (t, x, y, rgba, stroke, style) {
       const size = fontSize(this.font);
       // Текст как у Chrome: раскладка Blink, глифы Skia/Fontations, тень по
@@ -7840,7 +7843,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const bi = (b === 'top' || b === 'hanging') ? 1 : b === 'middle' ? 2 : (b === 'bottom' || b === 'ideographic') ? 3 : 0;
         const g = gradOf(style);
         if (S.textOps(t, +x || 0, +y || 0, M, size, fontFamily(this.font), fontBold(this.font), fontItalic(this.font),
-            !!stroke, Math.max(0, +this.lineWidth || 1), g ? [0, 0, 0, 255] : rgba, g ? encodeGrad(g) : [], shadowOf(this), modeOf(this), ai, bi)) return;
+            !!stroke, Math.max(0, +this.lineWidth || 1), g ? [0, 0, 0, 255] : rgba, g ? encodeGrad(g) : [], shadowOf(this), modeOf(this), ai, bi,
+            capCode(this.lineCap), joinCode(this.lineJoin), +this.miterLimit || 10)) return;
       }
       const w = this.measureText(t).width;
       let ox = +x || 0, oy = +y || 0;
@@ -8020,7 +8024,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         note('stroke|' + [this.strokeStyle, this.lineWidth]);
         if (S.native) {
           const ss = this.strokeStyle, g = gradOf(ss);
-          if (!S.strokeOps(ops, M, Math.max(0, +this.lineWidth || 1), g ? [0, 0, 0, 255] : parseColor(ss), g ? encodeGrad(g) : [], shadowOf(this), modeOf(this))) {
+          if (!S.strokeOps(ops, M, Math.max(0, +this.lineWidth || 1), g ? [0, 0, 0, 255] : parseColor(ss), g ? encodeGrad(g) : [], shadowOf(this), modeOf(this), capCode(this.lineCap), joinCode(this.lineJoin), +this.miterLimit || 10)) {
             S.strokePath(verbs, Math.max(0, +this.lineWidth || 1) * tScale(),
               parseColor(ss), shadowOf(this), modeOf(this));
           }

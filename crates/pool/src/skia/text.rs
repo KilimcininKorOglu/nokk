@@ -292,16 +292,31 @@ impl<'a> Scaler<'a> {
         }
     }
 
+    /// Контур глифа со субпиксельным сдвигом (`internalGetPath`: makeOffset).
+    pub fn offset_path(&self, gid: u16, sub_x: u32, sub_y: u32) -> Option<Path> {
+        let mut path = self.path(gid)?;
+        if sub_x != 0 || sub_y != 0 {
+            path = path.transform(&Matrix::translate(sub_x as f32 * 0.25, sub_y as f32 * 0.25));
+        }
+        Some(path)
+    }
+
     /// Маска заливки (`GenerateMetricsFromPath` + `GenerateImageFromPath`):
     /// `sub_x`/`sub_y` — субпиксельные доли (0..3 четверти).
     pub fn fill_mask(&self, gid: u16, sub_x: u32, sub_y: u32) -> Option<GlyphMask> {
-        let mut path = self.path(gid)?;
-        if sub_x != 0 || sub_y != 0 {
-            // internalGetPath: path.makeOffset(dx, dy)
-            path = path.transform(&Matrix::translate(sub_x as f32 * 0.25, sub_y as f32 * 0.25));
-        }
+        let path = self.offset_path(gid, sub_x, sub_y)?;
         mask_from_path(&path)
     }
+}
+
+/// Маска штриха (`internalGetPath` с fFrameWidth ≥ 0): контур в пространство
+/// кегля обратной матрицей 2×2, SkStroke, обратно матрицей, растр как заливка.
+pub fn stroke_mask(path: &Path, post: &Matrix, params: &super::stroke::StrokeParams) -> Option<GlyphMask> {
+    let inverse = post.invert()?;
+    let local = if post.is_identity() { path.clone() } else { path.transform(&inverse) };
+    let stroked = super::stroke::stroke_path(&local, params)?;
+    let dev = if post.is_identity() { stroked } else { stroked.transform(post) };
+    mask_from_path(&dev)
 }
 
 /// Маска из контура: границы `roundOut`, растр AAA в A8 через `SkA8_Blitter`.

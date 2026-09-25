@@ -1223,7 +1223,7 @@ pub fn fill_ops_grad(id: u32, ops: &[f32], ctm: [f32; 6], even_odd: bool, grad: 
 /// `stroke()` по операциям пути: волосяной штрих как у Skia; false —
 /// штрих толще пикселя, рисовать прежним путём.
 #[allow(clippy::too_many_arguments)]
-pub fn stroke_ops(id: u32, ops: &[f32], ctm: [f32; 6], line_width: f32, rgba: [u8; 4], grad: &[f32], sh: &[f32], mode: u32) -> bool {
+pub fn stroke_ops(id: u32, ops: &[f32], ctm: [f32; 6], line: &crate::skia::LineStyle, rgba: [u8; 4], grad: &[f32], sh: &[f32], mode: u32) -> bool {
     let paint = match crate::skia::gradient::GradientDesc::parse(grad) {
         Some(desc) if !grad.is_empty() => crate::skia::PaintKind::Gradient(desc),
         _ => crate::skia::PaintKind::Solid(rgba),
@@ -1232,7 +1232,7 @@ pub fn stroke_ops(id: u32, ops: &[f32], ctm: [f32; 6], line_width: f32, rgba: [u
         if let Some(pm) = c.borrow_mut().get_mut(&id) {
             let (w, h) = (pm.width(), pm.height());
             let shadow = crate::skia::Shadow::parse(sh);
-            return crate::skia::stroke_ops(pm.data_mut(), w, h, ops, ctm, line_width, &paint, shadow, mode);
+            return crate::skia::stroke_ops(pm.data_mut(), w, h, ops, ctm, line, &paint, shadow, mode);
         }
         true
     })
@@ -1447,10 +1447,7 @@ pub fn fill_text(
 /// `fillText`/`strokeText` как у Chrome: false — этот вызов движок ещё не
 /// умеет (штрих), рисовать прежним путём.
 #[allow(clippy::too_many_arguments)]
-pub fn text_ops(id: u32, text: &str, x: f32, y: f32, ctm: [f32; 6], size: f32, families: &str, bold: bool, italic: bool, stroke: bool, _line_width: f32, rgba: [u8; 4], grad: &[f32], sh: &[f32], mode: u32, align: u32, baseline: u32) -> bool {
-    if stroke {
-        return false;
-    }
+pub fn text_ops(id: u32, text: &str, x: f32, y: f32, ctm: [f32; 6], size: f32, families: &str, bold: bool, italic: bool, stroke: bool, line: &crate::skia::LineStyle, rgba: [u8; 4], grad: &[f32], sh: &[f32], mode: u32, align: u32, baseline: u32) -> bool {
     let chain = resolve_chain(families, bold, italic);
     if chain.is_empty() || text.is_empty() {
         return true;
@@ -1464,14 +1461,15 @@ pub fn text_ops(id: u32, text: &str, x: f32, y: f32, ctm: [f32; 6], size: f32, f
         Some(desc) if !grad.is_empty() => crate::skia::PaintKind::Gradient(desc),
         _ => crate::skia::PaintKind::Solid(rgba),
     };
+    let mut ok = true;
     CANVASES.with(|c| {
         if let Some(pm) = c.borrow_mut().get_mut(&id) {
             let (w, h) = (pm.width(), pm.height());
             let shadow = crate::skia::Shadow::parse(sh);
-            crate::skia::draw_text(pm.data_mut(), w, h, &fonts, &glyphs, width, x, y, ctm, eff, align, baseline, &paint, shadow, mode);
+            ok = crate::skia::draw_text(pm.data_mut(), w, h, &fonts, &glyphs, width, x, y, ctm, eff, align, baseline, if stroke { Some(line) } else { None }, &paint, shadow, mode);
         }
     });
-    true
+    ok
 }
 
 /// `measureText(text).width` for the bundled font at `size_px`.

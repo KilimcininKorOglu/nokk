@@ -961,7 +961,7 @@ pub fn chop_cubic_at_ts(src: &[Point; 4], ts: &[f32]) -> Vec<Point> {
     out
 }
 
-fn solve_cubic_poly(coeff: [f32; 4]) -> Vec<f32> {
+pub(crate) fn solve_cubic_poly(coeff: [f32; 4]) -> Vec<f32> {
     if coeff[0].abs() <= SCALAR_NEARLY_ZERO {
         let (r, n) = find_unit_quad_roots(coeff[1], coeff[2], coeff[3]);
         return r[..n].to_vec();
@@ -1008,7 +1008,7 @@ fn solve_cubic_poly(coeff: [f32; 4]) -> Vec<f32> {
     }
 }
 
-fn formulate_f1_dot_f2(s: [f32; 4]) -> [f32; 4] {
+pub(crate) fn formulate_f1_dot_f2(s: [f32; 4]) -> [f32; 4] {
     let a = s[1] - s[0];
     let b = s[2] - 2.0 * s[1] + s[0];
     let c = s[3] + 3.0 * (s[1] - s[2]) - s[0];
