@@ -1575,6 +1575,120 @@ const WORKER_SCOPE_ENUMERABLE: &str = r#"["atob", "btoa", "caches", "clearInterv
 /// аккуратно замаскированную обёртку в настоящем Chrome — по нашему обходу
 /// он не может не найти сотни. Проходит после всех слоёв, но до снимка
 /// методов движка.
+/// Форма прототипов — как у Chrome 151: состав и порядок собственных членов
+/// каждого интерфейса (crates/stealth/src/proto_shape.json, снято
+/// `scratchpad/protoshape.js`). У нас не было 4185 членов из 8880 (MathML,
+/// OffscreenCanvasRenderingContext2D, HTMLMediaElement, HTMLInputElement…),
+/// а у 169 интерфейсов порядок был свой; обход графа всё это видит.
+/// Недостающее: унаследованное копируется на своё место, остальное —
+/// заглушки (аксессор с ячейкой, метод-пустышка хромовской длины,
+/// константа со значением). Лишнее снимается, порядок — хромовский.
+pub fn proto_shape_script() -> String {
+    PROTO_SHAPE_TEMPLATE
+        .replace("__SHAPE__", PROTO_SHAPE)
+        .replace("__BRAND_TRACE__", if std::env::var_os("NOKK_TRACE_BRAND").is_some() { "true" } else { "false" })
+}
+
+const PROTO_SHAPE: &str = include_str!("proto_shape.json");
+
+const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
+  'use strict';
+  const T = __SHAPE__;
+  const TRACE = __BRAND_TRACE__;
+  const desc = (o, k) => { try { return Object.getOwnPropertyDescriptor(o, k); } catch (e) { return undefined; } };
+  const def = (o, k, d) => { try { Object.defineProperty(o, k, d); return true; } catch (e) { return false; } };
+  const del = (o, k) => { try { return delete o[k]; } catch (e) { return false; } };
+  let stubs = null;
+  try {
+    if (!globalThis.__pt_stubMembers) Object.defineProperty(globalThis, '__pt_stubMembers', { value: new Set(), configurable: true, enumerable: false, writable: true });
+    stubs = globalThis.__pt_stubMembers;
+  } catch (e) {}
+  const mark = (f) => { if (stubs) try { stubs.add(f); } catch (e) {} return f; };
+  const named = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return f; };
+  const writers = globalThis.__pt_writers;
+  const stubAccessor = (P, name, kind) => {
+    const slots = new WeakMap();
+    const get = mark(named(function () { const s = slots.get(this); return s ? s.v : undefined; }, 'get ' + name));
+    const write = function (v) { let s = slots.get(this); if (!s) { s = {}; try { slots.set(this, s); } catch (e) { return; } } s.v = v; };
+    let set = kind.indexOf('s') >= 0 ? mark(named(write, 'set ' + name)) : undefined;
+    // Только чтение снаружи — но движок пишет через `__pt_write`.
+    if (!set && writers) { let w = writers.get(P); if (!w) { w = Object.create(null); writers.set(P, w); } w[name] = write; }
+    // Под трассой запись в только-чтение видна с местом: кто и куда писал.
+    // Под трассой запись в только-чтение видна с местом и проходит: так
+    // собираются все места, где движок пишет мимо `__pt_write`.
+    if (!set && TRACE) set = function (v) {
+      try { console.error('[бренд] запись в только-чтение ' + name + ' на ' + Object.prototype.toString.call(this) + ' | ' + String(new Error().stack || '').split('\n').slice(2, 6).map((x) => x.trim().replace(/https?:\/\/[^ )]*\//, '')).join(' < ')); } catch (e) {}
+      write.call(this, v);
+    };
+    return { get, set };
+  };
+  const stubMethod = (name, len) => {
+    const f = mark(named(function () { return undefined; }, name));
+    try { Object.defineProperty(f, 'length', { value: len | 0, configurable: true }); } catch (e) {}
+    return f;
+  };
+  const protoOf = (name) => { try { const C = globalThis[name]; return C && typeof C === 'function' ? C.prototype : null; } catch (e) { return null; } };
+  const inherited = (P, k) => {
+    let p = Object.getPrototypeOf(P);
+    for (let i = 0; i < 12 && p && p !== Object.prototype; i++) { const d = desc(p, k); if (d) return d; p = Object.getPrototypeOf(p); }
+    return undefined;
+  };
+  // Где у Chrome лежит член: интерфейс → имя члена → есть.
+  const has = {};
+  for (const name of Object.keys(T)) { const set = {}; for (const r of T[name].m) set[r[0]] = 1; has[name] = set; }
+  const chromeOwnerUp = (name, k) => {
+    let n = T[name] && T[name].p;
+    for (let i = 0; i < 12 && n && T[n]; i++) { if (has[n][k]) return n; n = T[n].p; }
+    return null;
+  };
+  // Первый проход: то, что у нас лежит ниже, чем у Chrome, поднимается на
+  // своё место — иначе снятие лишнего оставило бы дыру.
+  for (const name of Object.keys(T)) {
+    const P = protoOf(name); if (!P || typeof P !== 'object') continue;
+    for (const k of Object.getOwnPropertyNames(P)) {
+      if (has[name][k] || k.slice(0, 4) === '__pt') continue;
+      const up = chromeOwnerUp(name, k);
+      if (!up) continue;
+      const A = protoOf(up);
+      if (A && !desc(A, k)) { const d = desc(P, k); if (d && d.configurable) def(A, k, d); }
+    }
+  }
+  // Второй проход: состав и порядок.
+  for (const name of Object.keys(T)) {
+    const P = protoOf(name); if (!P || typeof P !== 'object') continue;
+    const rows = T[name].m;
+    const built = [];
+    for (const r of rows) {
+      const k = r[0], kind = r[1];
+      let d = desc(P, k);
+      if (!d) {
+        const inh = inherited(P, k);
+        if (inh) d = Object.assign({}, inh);
+        else if (kind[0] === 'a') d = stubAccessor(P, k, kind);
+        else if (kind[1] === 'f') d = { value: stubMethod(k, r[2]), writable: true };
+        else d = { value: r[2], writable: kind.indexOf('w') >= 0 };
+      }
+      d.enumerable = kind.indexOf('e') >= 0;
+      d.configurable = kind.indexOf('c') >= 0;
+      if (!('get' in d) && !('set' in d) && kind[0] === 'v') d.writable = kind.indexOf('w') >= 0;
+      built.push([k, d]);
+    }
+    // Снять всё настраиваемое и положить заново по порядку. Лишнее (сорок
+    // членов, которыми пользуется сам движок: `Element.getElementById`,
+    // свои `addEventListener` у Worker и WebSocket…) остаётся, но в хвосте.
+    const extra = [];
+    for (const k of Object.getOwnPropertyNames(P)) {
+      if (k.slice(0, 4) === '__pt') continue;
+      const d = desc(P, k);
+      if (!d || !d.configurable) continue;
+      if (!has[name][k]) extra.push([k, d]);
+      del(P, k);
+    }
+    for (const [k, d] of built) { if (!desc(P, k)) def(P, k, d); }
+    for (const [k, d] of extra) { if (!desc(P, k)) def(P, k, d); }
+  }
+})();"#;
+
 pub fn naturalize_script() -> String {
     // `NOKK_NATURALIZE_SKIP=<regex>` — интерфейсы, которые не трогать: для
     // бисекции, когда что-то после натурализации ломается.
@@ -1617,13 +1731,16 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
   // именем (объект другого реалма тоже свой).
   const EXC = new Set(__BRAND_EXCEPTIONS__);
   const TRACE = __BRAND_TRACE__;
+  const trace = (what) => {
+    try {
+      const st = String(new Error().stack || '').split('\n').slice(2, 7).map((x) => x.trim().replace(/https?:\/\/[^ )]*\//, '')).join(' < ');
+      console.error('[бренд] ' + what + ' | ' + st);
+    } catch (e) {}
+  };
   const illegal = (label, t) => {
     if (TRACE) {
-      try {
-        let who = ''; try { who = t === null ? 'null' : typeof t !== 'object' && typeof t !== 'function' ? typeof t : (Object.prototype.toString.call(t) + ' ' + Object.getOwnPropertyNames(t).slice(0, 5).join(',')); } catch (e) {}
-        const st = String(new Error().stack || '').split('\n').slice(2, 6).map((x) => x.trim()).join(' < ');
-        console.error('[бренд] ' + label + ' this=' + who + ' | ' + st);
-      } catch (e) {}
+      let who = ''; try { who = t === null ? 'null' : typeof t !== 'object' && typeof t !== 'function' ? typeof t : (Object.prototype.toString.call(t) + ' ' + Object.getOwnPropertyNames(t).slice(0, 5).join(',')); } catch (e) {}
+      trace(label + ' this=' + who);
     }
     return new TypeError('Illegal invocation');
   };
@@ -1668,7 +1785,7 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
   // проверкой бренда, если она положена. `guard` — конструктор интерфейса или
   // null, когда владелец не прототип интерфейса.
   const LENGTHS = __METHOD_LENGTHS__;
-  const fewArgs = (what, need, got) => new TypeError('Failed to execute \'' + what.slice(what.indexOf('.') + 1) + '\' on \'' + what.slice(0, what.indexOf('.')) + '\': ' + need + ' argument' + (need === 1 ? '' : 's') + ' required, but only ' + got + ' present.');
+  const fewArgs = (what, need, got) => (TRACE && trace('доводы ' + what + ' нужно ' + need + ' дано ' + got), new TypeError('Failed to execute \'' + what.slice(what.indexOf('.') + 1) + '\' on \'' + what.slice(0, what.indexOf('.')) + '\': ' + need + ' argument' + (need === 1 ? '' : 's') + ' required, but only ' + got + ' present.'));
   const asMethod = (fn, key, guard) => {
     const name = keyName(key);
     const P = guard && guard.prototype;
@@ -1764,7 +1881,8 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     // Пространство имён без прототипа (NodeFilter) — не конструктор; фасад
     // ему ни к чему.
     if (!row || row.n === 'notctor' || !C.prototype) return;
-    const F = function () {
+    const F = { [name]: function () {
+      if (TRACE && (new.target === undefined || (new.target === F && row.n !== 'ok'))) trace('конструктор ' + name + ' new=' + (new.target !== undefined) + ' доводов=' + arguments.length + ' правило=' + row.n + '/' + row.c);
       if (new.target === undefined) {
         throw new TypeError(row.c === 'illegal' ? 'Illegal constructor'
           : 'Failed to construct \'' + name + '\': Please use the \'new\' operator, this DOM object constructor cannot be called as a function.');
@@ -1778,7 +1896,7 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
         throw new TypeError('Failed to construct \'' + name + '\': ' + m[1] + ' argument' + (m[1] === '1' ? '' : 's') + ' required, but only ' + arguments.length + ' present.');
       }
       return Reflect.construct(C, arguments, new.target === F ? C : new.target);
-    };
+    } }[name];
     def(F, 'name', { value: name, configurable: true });
     def(F, 'length', { value: row.l, configurable: true });
     def(F, 'prototype', { value: C.prototype, writable: false, enumerable: false, configurable: false });
@@ -5196,8 +5314,31 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   // ровно на это смотрит анти-бот, спрашивая getEntriesByType('resource').
   // Записи кладёт сюда движок, по мере того как запросы завершаются.
   const entries = [];
+  // Порядок полей в `toJSON` — тот, в каком запись собрана (он сверен с
+  // Chrome), а не порядок аксессоров на прототипе: у браузера они разные.
+  const ENTRY_ORDER = new WeakMap();
+  const putEntry = (o, bag) => { for (const k of Object.keys(bag)) __pt_write(o, k, bag[k]); };
   class PerformanceEntry {
-    toJSON() { const o = {}; for (const k of Object.keys(this)) o[k] = this[k]; return o; }
+    // Поля — аксессоры на прототипах, а не собственные свойства записи;
+    // `toJSON` идёт по цепочке от PerformanceEntry к своему виду, в порядке
+    // объявления на каждом прототипе — так собирает Chrome.
+    toJSON() {
+      const chain = [];
+      for (let p = Object.getPrototypeOf(this); p && p !== Object.prototype; p = Object.getPrototypeOf(p)) chain.unshift(p);
+      const o = {};
+      const first = ENTRY_ORDER.get(this);
+      if (first) for (const k of first) { try { o[k] = this[k]; } catch (e) {} }
+      for (const p of chain) {
+        for (const k of Object.getOwnPropertyNames(p)) {
+          if (k === 'constructor' || k === 'toJSON' || k.slice(0, 4) === '__pt') continue;
+          const d = Object.getOwnPropertyDescriptor(p, k);
+          if (!d || !d.get || k in o) continue;
+          try { o[k] = this[k]; } catch (e) {}
+        }
+      }
+      for (const k of Object.keys(this)) if (!(k in o)) o[k] = this[k];
+      return o;
+    }
   }
   tag(PerformanceEntry.prototype, 'PerformanceEntry');
   class PerformanceResourceTiming extends PerformanceEntry {}
@@ -5280,7 +5421,13 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
       const cEnd = isNav && span > 120 ? fs + span * 0.45 : fs;
       const rq = isNav ? cEnd + (span > 120 ? 0.3 : 0) : fs;
       const rs = isNav ? fs + span * 0.78 : fs + net * 0.8;
-      Object.assign(e, {
+      const put = (o, bag) => {
+        const keys = Object.keys(bag);
+        for (const k of keys) __pt_write(o, k, bag[k]);
+        const had = ENTRY_ORDER.get(o);
+        ENTRY_ORDER.set(o, had ? had.concat(keys.filter((k) => had.indexOf(k) < 0)) : keys);
+      };
+      put(e, {
         name: String(r.name || ''), entryType: r.entryType || 'resource',
         startTime: start, duration: Number(r.duration) || 0,
         navigationId: NAV_ID,
@@ -5304,7 +5451,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
         // Отметки документа — нули, пока событие не случилось, как у браузера;
         // их ставит __pt_markNav. Длительность навигации — до конца `load`.
         const m = NAV_MARKS;
-        Object.assign(e, {
+        put(e, {
           unloadEventStart: 0, unloadEventEnd: 0, domInteractive: m.interactive || 0,
           domContentLoadedEventStart: m.dclStart || 0, domContentLoadedEventEnd: m.dclEnd || 0,
           domComplete: m.complete || 0, loadEventStart: m.loadStart || 0, loadEventEnd: m.loadEnd || 0,
@@ -5335,7 +5482,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
         const at = Math.round((start + (Number(r.duration) || 0) * 0.92) * 10) / 10;
         for (const name of ['first-paint', 'first-contentful-paint']) {
           const p = new PerformancePaintTiming();
-          Object.assign(p, { name, entryType: 'paint', startTime: at, duration: 0 });
+          put(p, { name, entryType: 'paint', startTime: at, duration: 0 });
           entries.push(p);
           fresh.push(p);
         }
@@ -5415,7 +5562,8 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
     }
     mark(name, opts) {
       const e = new PerformanceEntry();
-      Object.assign(e, { name: String(name), entryType: 'mark',
+      ENTRY_ORDER.set(e, ['name', 'entryType', 'startTime', 'duration', 'detail']);
+      putEntry(e, { name: String(name), entryType: 'mark',
         startTime: (opts && typeof opts.startTime === 'number') ? opts.startTime : nowMs(),
         duration: 0, detail: (opts && opts.detail) !== undefined ? opts.detail : null });
       entries.push(e); __ptNotify([e]); return e;
@@ -5428,7 +5576,8 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
       const to = typeof end === 'string'
         ? (entries.filter((x) => x.name === end).pop() || { startTime: nowMs() }).startTime
         : nowMs();
-      Object.assign(e, { name: String(name), entryType: 'measure', startTime: from,
+      ENTRY_ORDER.set(e, ['name', 'entryType', 'startTime', 'duration', 'detail']);
+      putEntry(e, { name: String(name), entryType: 'measure', startTime: from,
                          duration: Math.max(0, to - from), detail: null });
       entries.push(e); __ptNotify([e]); return e;
     }
@@ -6121,20 +6270,20 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   if (!globalThis.AbortController) {
     // Класс держим сами: снаружи фасад, у которого `new AbortSignal()` — отказ.
     const __AbortSignal = globalThis.AbortSignal = globalThis.AbortSignal || class AbortSignal {
-      constructor() { this.aborted = false; this.reason = undefined; this.onabort = null; this._ls = []; }
+      constructor() { __pt_write(this, 'aborted', false); __pt_write(this, 'reason', undefined); this.onabort = null; this._ls = []; }
       addEventListener(t, fn) { if (t === 'abort' && typeof fn === 'function') this._ls.push(fn); }
       removeEventListener(t, fn) { const i = this._ls.indexOf(fn); if (i >= 0) this._ls.splice(i, 1); }
       dispatchEvent() { return true; }
       throwIfAborted() { if (this.aborted) throw this.reason; }
-      static abort(reason) { const s = new __AbortSignal(); s.aborted = true; s.reason = reason; return s; }
+      static abort(reason) { const s = new __AbortSignal(); __pt_write(s, 'aborted', true); __pt_write(s, 'reason', reason); return s; }
     };
     globalThis.AbortController = class AbortController {
-      constructor() { this.signal = new __AbortSignal(); }
+      constructor() { __pt_write(this, 'signal', new __AbortSignal()); }
       abort(reason) {
         const s = this.signal;
         if (s.aborted) return;
-        s.aborted = true;
-        s.reason = reason === undefined ? new Error('signal is aborted without reason') : reason;
+        __pt_write(s, 'aborted', true);
+        __pt_write(s, 'reason', reason === undefined ? new Error('signal is aborted without reason') : reason);
         const ev = { type: 'abort', target: s, currentTarget: s };
         try { if (typeof s.onabort === 'function') s.onabort(ev); } catch (e) {}
         for (const fn of s._ls.slice()) { try { fn(ev); } catch (e) {} }
@@ -6256,17 +6405,17 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     globalThis.Request = class Request {
       constructor(input, init) {
         init = init || {};
-        this.url = String(input && input.url !== undefined ? input.url : input);
-        this.method = String(init.method || (input && input.method) || 'GET').toUpperCase();
-        this.headers = new globalThis.Headers(init.headers || (input && input.headers));
+        __pt_write(this, 'url', String(input && input.url !== undefined ? input.url : input));
+        __pt_write(this, 'method', String(init.method || (input && input.method) || 'GET').toUpperCase());
+        __pt_write(this, 'headers', new globalThis.Headers(init.headers || (input && input.headers)));
         __pt_write(this, 'credentials', init.credentials || 'same-origin');
-        this.mode = init.mode || 'cors';
-        this.cache = init.cache || 'default';
-        this.redirect = init.redirect || 'follow';
+        __pt_write(this, 'mode', init.mode || 'cors');
+        __pt_write(this, 'cache', init.cache || 'default');
+        __pt_write(this, 'redirect', init.redirect || 'follow');
         __pt_write(this, 'referrer', init.referrer === undefined ? 'about:client' : String(init.referrer));
-        this.signal = init.signal || null;
+        __pt_write(this, 'signal', init.signal || null);
         Object.defineProperty(this, '__body', { value: init.body === undefined ? null : init.body, enumerable: false });
-        this.bodyUsed = false;
+        __pt_write(this, 'bodyUsed', false);
         // Тело само задаёт свой тип, если его не задали явно: строка —
         // `text/plain;charset=UTF-8`, форма — `multipart/form-data`, blob —
         // свой. Браузер так и делает, а мы оставляли заголовок пустым.
@@ -6285,7 +6434,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         } catch (e) {}
       }
       clone() { return new globalThis.Request(this); }
-      text() { this.bodyUsed = true; return Promise.resolve(this.__body == null ? '' : String(this.__body)); }
+      text() { __pt_write(this, 'bodyUsed', true); return Promise.resolve(this.__body == null ? '' : String(this.__body)); }
       json() { return this.text().then(JSON.parse); }
       arrayBuffer() { return this.text().then(t => new TextEncoder().encode(t).buffer); }
     };
@@ -6294,20 +6443,20 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     globalThis.Response = class Response {
       constructor(body, init) {
         init = init || {};
-        this.status = init.status === undefined ? 200 : (init.status | 0);
-        this.statusText = init.statusText === undefined ? '' : String(init.statusText);
-        this.headers = new globalThis.Headers(init.headers);
-        this.ok = this.status >= 200 && this.status < 300;
-        this.redirected = false;
+        __pt_write(this, 'status', init.status === undefined ? 200 : (init.status | 0));
+        __pt_write(this, 'statusText', init.statusText === undefined ? '' : String(init.statusText));
+        __pt_write(this, 'headers', new globalThis.Headers(init.headers));
+        __pt_write(this, 'ok', this.status >= 200 && this.status < 300);
+        __pt_write(this, 'redirected', false);
         __pt_write(this, 'type', 'default');
-        this.url = '';
-        this.bodyUsed = false;
+        __pt_write(this, 'url', '');
+        __pt_write(this, 'bodyUsed', false);
         Object.defineProperty(this, '__body', { value: body == null ? '' : body, enumerable: false });
       }
       static error() { const r = new globalThis.Response(null, { status: 0 }); __pt_write(r, 'type', 'error'); return r; }
       static json(data, init) { return new globalThis.Response(__ptJSON.stringify(data), init); }
       clone() { return new globalThis.Response(this.__body, { status: this.status, statusText: this.statusText, headers: this.headers }); }
-      text() { this.bodyUsed = true; return Promise.resolve(String(this.__body)); }
+      text() { __pt_write(this, 'bodyUsed', true); return Promise.resolve(String(this.__body)); }
       json() { return this.text().then(JSON.parse); }
       arrayBuffer() { return this.text().then(t => new TextEncoder().encode(t).buffer); }
       blob() { return this.text().then(t => new Blob([t])); }
@@ -6448,7 +6597,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     const __bcRooms = new Map();
     globalThis.BroadcastChannel = class BroadcastChannel {
       constructor(name) {
-        this.name = String(name);
+        __pt_write(this, 'name', String(name));
         this.onmessage = null; this.onmessageerror = null;
         Object.defineProperty(this, '__pt', { value: { closed: false, listeners: [] }, enumerable: false });
         if (!__bcRooms.has(this.name)) __bcRooms.set(this.name, new Set());
@@ -10288,16 +10437,16 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     globalThis.File = class File extends Blob {
       constructor(parts, name, opts) {
         super(parts, opts);
-        this.name = String(name);
-        this.lastModified = (opts && opts.lastModified) || 0;
-        this.webkitRelativePath = '';
+        __pt_write(this, 'name', String(name));
+        __pt_write(this, 'lastModified', (opts && opts.lastModified) || 0);
+        __pt_write(this, 'webkitRelativePath', '');
       }
     };
   }
   if (!globalThis.FileReader) {
     globalThis.FileReader = class FileReader {
       constructor() {
-        __pt_write(this, 'readyState', 0); this.result = null; this.error = null;
+        __pt_write(this, 'readyState', 0); __pt_write(this, 'result', null); __pt_write(this, 'error', null);
         this.onload = null; this.onloadend = null; this.onerror = null; this.onprogress = null;
         Object.defineProperty(this, '__ls', { value: {}, enumerable: false });
       }
@@ -10313,9 +10462,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       __ptRead(blob, make) {
         __pt_write(this, 'readyState', 1);
         Promise.resolve(blob && blob.text ? blob.text() : String(blob)).then((t) => {
-          this.result = make(t); __pt_write(this, 'readyState', 2);
+          __pt_write(this, 'result', make(t)); __pt_write(this, 'readyState', 2);
           this.__ptFire('load'); this.__ptFire('loadend');
-        }, (e) => { this.error = e; __pt_write(this, 'readyState', 2); this.__ptFire('error'); this.__ptFire('loadend'); });
+        }, (e) => { __pt_write(this, 'error', e); __pt_write(this, 'readyState', 2); this.__ptFire('error'); this.__ptFire('loadend'); });
       }
       readAsText(b) { this.__ptRead(b, (t) => t); }
       readAsDataURL(b) { this.__ptRead(b, (t) => 'data:' + ((b && b.type) || 'application/octet-stream') + ';base64,' + btoa(t)); }

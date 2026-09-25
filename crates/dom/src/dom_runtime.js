@@ -2070,8 +2070,19 @@
           const P = globalThis.OffscreenCanvasRenderingContext2D.prototype;
           if (P && Object.getPrototypeOf(g) !== P) {
             if (!P.__ptLinked) {
-              Object.setPrototypeOf(P, Object.getPrototypeOf(g));
+              const src = Object.getPrototypeOf(g);
+              Object.setPrototypeOf(P, src);
               Object.defineProperty(P, '__ptLinked', { value: true });
+              // Заглушки формы на месте настоящих членов уступают им: у
+              // Chrome эти члены — собственные у офскринного контекста.
+              try {
+                const S = globalThis.__pt_stubMembers;
+                for (const k of Object.getOwnPropertyNames(P)) {
+                  const d = Object.getOwnPropertyDescriptor(P, k);
+                  const real = Object.getOwnPropertyDescriptor(src, k);
+                  if (d && real && S && ((d.value && S.has(d.value)) || (d.get && S.has(d.get)))) Object.defineProperty(P, k, real);
+                }
+              } catch (e) {}
               if (!Object.getOwnPropertyDescriptor(P, Symbol.toStringTag)) {
                 Object.defineProperty(P, Symbol.toStringTag,
                   { value: 'OffscreenCanvasRenderingContext2D', configurable: true });

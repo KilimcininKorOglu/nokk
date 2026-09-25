@@ -444,8 +444,9 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
     // Натурализация — после поздних интерфейсов и до снимка: каждый член
     // должен выглядеть родным, а снимок — держать уже итоговые функции.
     let base = format!(
-        "{base}\n{}\n{}\n{}\n{}",
+        "{base}\n{}\n{}\n{}\n{}\n{}",
         nokk_stealth::late_interfaces_script(),
+        nokk_stealth::proto_shape_script(),
         nokk_stealth::naturalize_script(),
         nokk_stealth::late_originals_script(),
         // Порядок имён окна — последним: перечисление отдаёт их в порядке
