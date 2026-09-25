@@ -4455,6 +4455,11 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     const mk = (n) => (iface(n) ? Object.create(iface(n)) : {});
     const ST = new WeakMap();
     const st = (o) => ST.get(o) || {};
+    // Трасса WebGPU (NOKK_TRACE_GPU=1): что программа шлёт конвейеру —
+    // шейдеры, описания, буферы, вызовы, — невидимо для страницы.
+    const glog = (what, v) => {
+      try { if (!G.__pt_gpuTrace) return; (G.__pt_parentConsole || console).error('[gpu] ' + what + ' ' + (typeof v === 'string' ? v : JSON.stringify(v, (k, x) => (x && typeof x === 'object' && !Array.isArray(x) && ST.has(x)) ? '<' + (x.constructor && x.constructor.name) + '>' : (ArrayBuffer.isView(x) ? Array.from(x.subarray ? x.subarray(0, 64) : x).join(',') : x)))); } catch (e) {}
+    };
 
     // ---- WGSL -> GLSL ES 3.00 ------------------------------------------
     const wgslNum = (t) => t.replace(/(^|[^\w.])\.(\d)/g, '$10.$2');
@@ -4574,6 +4579,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     const GPUQueueP = iface('GPUQueue');
     if (GPUDeviceP && GPUQueueP) {
       put(GPUDeviceP, 'createShaderModule', function createShaderModule(desc) {
+        glog('shader', String((desc && desc.code) || ''));
         const o = mk('GPUShaderModule');
         ST.set(o, { code: String((desc && desc.code) || '') });
         return o;
@@ -4594,6 +4600,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         return o;
       });
       put(GPUDeviceP, 'createRenderPipeline', function createRenderPipeline(desc) {
+        glog('pipeline', desc);
         const o = mk('GPURenderPipeline');
         const mod = desc && desc.vertex && desc.vertex.module;
         const src = mod ? st(mod).code : '';
@@ -4628,6 +4635,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       const EncP = iface('GPUCommandEncoder');
       put(EncP, 'beginRenderPass', function beginRenderPass(desc) {
         const at = (desc && desc.colorAttachments && desc.colorAttachments[0]) || {};
+        glog('beginRenderPass', { loadOp: at.loadOp, storeOp: at.storeOp, clear: at.clearValue, tex: at.view && st(st(at.view).tex) && { w: st(st(at.view).tex).w, h: st(st(at.view).tex).h, format: st(st(at.view).tex).format } });
         const view = at.view;
         const tex = view ? st(view).tex : null;
         const pass = { tex, loadOp: at.loadOp, clear: at.clearValue, draws: [] };
@@ -4650,8 +4658,9 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       const PassP = iface('GPURenderPassEncoder');
       put(PassP, 'setPipeline', function setPipeline(p) { st(this).pending = p; });
       put(PassP, 'setBindGroup', function setBindGroup() {});
-      put(PassP, 'setVertexBuffer', function setVertexBuffer() {});
+      put(PassP, 'setVertexBuffer', function setVertexBuffer(slot, buf, off, size) { glog('setVertexBuffer', { slot, size: st(buf).size, off, bytes: st(buf).bytes && new Float32Array(st(buf).bytes.buffer, 0, Math.min(16, st(buf).size >> 2)) }); });
       put(PassP, 'draw', function draw(count, instances, first) {
+        glog('draw', { count, instances, first });
         st(this).pass.draws.push({ pipeline: st(this).pending, count: count | 0, first: first | 0 });
       });
       put(PassP, 'drawIndexed', function drawIndexed() {});
@@ -4693,9 +4702,11 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
               const px = new Uint8Array(tex.w * tex.h * 4);
               gl.readPixels(0, 0, tex.w, tex.h, gl.RGBA, gl.UNSIGNED_BYTE, px);
               // Строки в буфере выровнены: `bytesPerRow` больше ширины.
+              // И сверху вниз: у GL начало снизу, у WebGPU — сверху, и без
+              // переворота треугольник в отчёте стоял вершиной вниз.
               const stride = c.bytesPerRow || tex.w * 4;
               for (let y = 0; y < tex.h; y++) {
-                const from = y * tex.w * 4, to = y * stride;
+                const from = (tex.h - 1 - y) * tex.w * 4, to = y * stride;
                 if (to + tex.w * 4 > buf.bytes.length) break;
                 buf.bytes.set(px.subarray(from, from + tex.w * 4), to);
               }
@@ -4703,13 +4714,17 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
           }
         }
       });
-      put(GPUQueueP, 'writeBuffer', function writeBuffer() {});
+      put(GPUQueueP, 'writeBuffer', function writeBuffer(buf, off, data, dataOff, size) {
+        glog('writeBuffer', { size: st(buf).size, off, data: ArrayBuffer.isView(data) ? data : new Uint8Array(data) });
+        try { const bytes = st(buf).bytes; if (bytes) { const src = ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : new Uint8Array(data); bytes.set(src.subarray(dataOff | 0, size === undefined ? src.length : (dataOff | 0) + size), off | 0); } } catch (e) {}
+      });
       put(GPUQueueP, 'writeTexture', function writeTexture() {});
       put(GPUQueueP, 'onSubmittedWorkDone', function onSubmittedWorkDone() { return Promise.resolve(); });
 
       const BufP = iface('GPUBuffer');
       put(BufP, 'mapAsync', function mapAsync() { return Promise.resolve(); });
       put(BufP, 'getMappedRange', function getMappedRange(offset, size) {
+        glog('getMappedRange', { offset, size, nz: st(this).bytes && Array.from(st(this).bytes).map((b, i) => (b && (i & 3) !== 3) ? i + ':' + b : '').filter(Boolean).slice(0, 160).join(' ') });
         const s = st(this);
         const o = offset | 0;
         const n = size === undefined ? s.size - o : size | 0;

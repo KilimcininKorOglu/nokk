@@ -1137,6 +1137,13 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
             // в кадре и его свежем реалме останавливает виджет: POST не уходит
             // вовсе. Здесь три крючка, все с родным видом: `charCodeAt` (так
             // сериализатор читает каждое поле и значение), `open` и `send`.
+            // Трасса WebGPU: флаг для реализации (в кадре, в его реалмах и в воркере).
+            if std::env::var("NOKK_TRACE_GPU").is_ok() {
+                let flag = "Object.defineProperty(globalThis, '__pt_gpuTrace', { value: 1, configurable: true });";
+                c.add_frame_init_script(spread_to_realms(flag, "gpu"));
+                c.add_worker_init_script(flag.to_string());
+                c.add_init_script(flag.to_string());
+            }
             if std::env::var("NOKK_TRACE_FIELDS").is_ok() {
                 let probe = r#"(() => {
                   const nat = (f, src) => {
