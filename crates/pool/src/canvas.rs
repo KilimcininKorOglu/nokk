@@ -1116,6 +1116,19 @@ pub fn fill_path(id: u32, verbs: &[f32], even_odd: bool, rgba: [u8; 4], sh: &[f3
     });
 }
 
+/// `fill()` по операциям пути и матрице холста — растр Skia (см. `crate::skia`).
+pub fn fill_ops(id: u32, ops: &[f32], ctm: [f32; 6], even_odd: bool, rgba: [u8; 4], sh: &[f32], mode: u32) {
+    CANVASES.with(|c| {
+        if let Some(pm) = c.borrow_mut().get_mut(&id) {
+            let (w, h) = (pm.width(), pm.height());
+            paint_shadow(pm, sh, |sp, col| {
+                crate::skia::fill_ops(sp.data_mut(), w, h, ops, ctm, even_odd, col, 0);
+            });
+            crate::skia::fill_ops(pm.data_mut(), w, h, ops, ctm, even_odd, rgba, mode);
+        }
+    });
+}
+
 /// Decode a flat gradient descriptor into a tiny-skia [`Shader`]:
 /// `[type, x0,y0, x1,y1, r0,r1, nstops, (pos,r,g,b,a)×nstops]` — `type` 0 linear,
 /// 1 radial; colors are straight-alpha 0..255. Canvas's inner radius `r0` is
@@ -1449,19 +1462,9 @@ pub fn get_image_data(id: u32, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
                 }
                 let si = ((sy * pw + sx) * 4) as usize;
                 let di = ((row * w + col) * 4) as usize;
-                let a = data[si + 3];
-                // tiny-skia stores premultiplied alpha; getImageData is straight.
-                let unmul = |v: u8| {
-                    if a == 0 {
-                        0
-                    } else {
-                        (((v as u32) * 255 + (a as u32) / 2) / a as u32).min(255) as u8
-                    }
-                };
-                out[di] = unmul(data[si]);
-                out[di + 1] = unmul(data[si + 1]);
-                out[di + 2] = unmul(data[si + 2]);
-                out[di + 3] = a;
+                // Premul → straight, как `readPixels(kUnpremul)` у Chrome:
+                // деление во float и округление к ближайшему чётному.
+                crate::skia::read_unpremul(&data[si..si + 4], &mut out[di..di + 4]);
             }
         }
         out

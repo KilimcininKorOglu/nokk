@@ -7379,6 +7379,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // Real vector paths: JS tessellates curves/arcs to a move/line/close verb
       // stream, tiny-skia fills or strokes it.
       fillPath(verbs, evenOdd, rgba, sh, mode) { sync(); __pt_canvasFillPath(id, new Float32Array(verbs), evenOdd ? 1 : 0, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(sh || []), mode | 0); },
+      // Заливка по операциям пути в координатах страницы и матрице холста:
+      // дуги, коники и сглаживание считает движок, как Skia у Chrome.
+      fillOps(ops, m, evenOdd, rgba, sh, mode) { sync(); __pt_canvasFillOps(id, new Float32Array(ops), new Float32Array(m), evenOdd ? 1 : 0, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(sh || []), mode | 0); },
       fillPathGradient(verbs, evenOdd, grad, sh, mode) { sync(); __pt_canvasFillPathGradient(id, new Float32Array(verbs), evenOdd ? 1 : 0, new Float32Array(grad), new Float32Array(sh || []), mode | 0); },
       strokePath(verbs, lw, rgba, sh, mode) { sync(); __pt_canvasStrokePath(id, new Float32Array(verbs), lw, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(sh || []), mode | 0); },
       // Images we still can't rasterize: a deterministic semi-transparent fill
@@ -7710,7 +7713,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       lastW = w; lastH = h;
       M = [1, 0, 0, 1, 0, 0];
       __pt_write(mStack, 'length', 0);
-      verbs = []; sub = false; cx = 0; cy = 0;
+      verbs = []; ops = []; sub = false; cx = 0; cy = 0;
       bx0 = by0 = bx1 = by1 = 0;
       uniform = null;
       tainted = false;
@@ -7775,6 +7778,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
 
     let verbs = [], cx = 0, cy = 0, sub = false;
+    // Операции пути как их получил холст (в координатах страницы, до
+    // матрицы): по ним движок строит путь по правилам Blink.
+    let ops = [];
     // Текущая точка хранится в координатах страницы, а в список идут
     // преобразованные: иначе кривая считалась бы по смешанным системам.
     const moveV = (x, y) => { x = +x || 0; y = +y || 0; verbs.push(0, tX(x, y), tY(x, y)); cx = x; cy = y; sub = true; };
@@ -7917,7 +7923,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const sh = shadowOf(this);
         const md = modeOf(this);
         if (S.native && gradOf(fs)) S.fillPathGradient(rectVerbs(x, y, w, h), false, encodeGrad(gradOf(fs)), sh, md);
-        else if (S.native && (!plain() || sh || md)) S.fillPath(rectVerbs(x, y, w, h), false, parseColor(fs), sh, md);
+        else if (S.native && (!plain() || sh || md)) S.fillOps([7, +x, +y, +w, +h], M, false, parseColor(fs), sh, md);
         else solid(x, y, w, h, parseColor(fs));
         if (!gradOf(fs) && plain() && (+x || 0) <= 0 && (+y || 0) <= 0 &&
             (+w || 0) >= (canvas.width | 0) && (+h || 0) >= (canvas.height | 0)) {
@@ -7949,22 +7955,24 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       fillText(t, x, y) { note('fillText|' + [t, x, y, this.font, this.fillStyle, this.textAlign, this.textBaseline]); drawText.call(this, t, +x || 0, +y || 0, parseColor(this.fillStyle)); },
       strokeText(t, x, y) { note('strokeText|' + [t, x, y, this.font, this.strokeStyle]); drawText.call(this, t, +x || 0, +y || 0, parseColor(this.strokeStyle)); },
 
-      beginPath() { note('beginPath'); bx0 = by0 = bx1 = by1 = 0; verbs = []; sub = false; },
-      closePath() { note('closePath'); closeV(); },
-      moveTo(x, y) { note('moveTo|' + [x, y]); pathPoint(x, y); moveV(x, y); },
-      lineTo(x, y) { note('lineTo|' + [x, y]); pathPoint(x, y); lineV(x, y); },
+      beginPath() { note('beginPath'); bx0 = by0 = bx1 = by1 = 0; verbs = []; ops = []; sub = false; },
+      closePath() { note('closePath'); closeV(); ops.push(4); },
+      moveTo(x, y) { note('moveTo|' + [x, y]); pathPoint(x, y); moveV(x, y); ops.push(0, +x, +y); },
+      lineTo(x, y) { note('lineTo|' + [x, y]); pathPoint(x, y); lineV(x, y); ops.push(1, +x, +y); },
       rect(x, y, w, h) {
         note('rect|' + [x, y, w, h]);
         const X = +x || 0, Y = +y || 0, W2 = +w || 0, H2 = +h || 0;
         pathPoint(X, Y); pathPoint(X + W2, Y + H2);
         moveV(X, Y); lineV(X + W2, Y); lineV(X + W2, Y + H2); lineV(X, Y + H2); closeV();
+        ops.push(7, +x, +y, +w, +h);
       },
       arc(x, y, r, a0, a1, ccw) {
         note('arc|' + [x, y, r, a0, a1, ccw]);
         pathPoint((+x || 0) - (+r || 0), (+y || 0) - (+r || 0)); pathPoint((+x || 0) + (+r || 0), (+y || 0) + (+r || 0));
         arcV(x, y, r, +a0 || 0, a1 === undefined ? 2 * Math.PI : +a1, !!ccw);
+        ops.push(5, +x, +y, +r, +a0, +a1, ccw ? 1 : 0);
       },
-      arcTo(x1, y1, x2, y2) { note('arcTo|' + [x1, y1, x2, y2]); pathPoint(x1, y1); pathPoint(x2, y2); lineV(x1, y1); lineV(x2, y2); },
+      arcTo(x1, y1, x2, y2) { note('arcTo|' + [x1, y1, x2, y2]); pathPoint(x1, y1); pathPoint(x2, y2); lineV(x1, y1); lineV(x2, y2); ops.push(1, +x1, +y1, 1, +x2, +y2); },
       ellipse(x, y, rx, ry, rot, a0, a1, ccw) {
         needArgs(arguments.length, 7, 'ellipse', 'CanvasRenderingContext2D');
         note('ellipse|' + [x, y, rx, ry]);
@@ -7977,16 +7985,17 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         for (let k = 0; k <= steps; k++) { const a = s0 + sweep * (k / steps);
           const px = X + RX * Math.cos(a), py = Y + RY * Math.sin(a);
           if (k === 0 && !sub) moveV(px, py); else lineV(px, py); }
+        ops.push(6, +x, +y, +rx, +ry, +rot, +a0, +a1, ccw ? 1 : 0);
       },
-      bezierCurveTo(a, b, c, d, e, f) { note('bezierCurveTo|' + [a, b, c, d, e, f]); pathPoint(a, b); pathPoint(e, f); cubicV(+a || 0, +b || 0, +c || 0, +d || 0, +e || 0, +f || 0); },
-      quadraticCurveTo(a, b, c, d) { note('quadraticCurveTo|' + [a, b, c, d]); pathPoint(a, b); pathPoint(c, d); quadV(+a || 0, +b || 0, +c || 0, +d || 0); },
+      bezierCurveTo(a, b, c, d, e, f) { note('bezierCurveTo|' + [a, b, c, d, e, f]); pathPoint(a, b); pathPoint(e, f); cubicV(+a || 0, +b || 0, +c || 0, +d || 0, +e || 0, +f || 0); ops.push(3, +a, +b, +c, +d, +e, +f); },
+      quadraticCurveTo(a, b, c, d) { note('quadraticCurveTo|' + [a, b, c, d]); pathPoint(a, b); pathPoint(c, d); quadV(+a || 0, +b || 0, +c || 0, +d || 0); ops.push(2, +a, +b, +c, +d); },
       fill(rule) {
         note('fill|' + this.fillStyle);
         if (!S.native) return paintPath();
         const fs = this.fillStyle;
         const sh = shadowOf(this);
         if (gradOf(fs)) S.fillPathGradient(verbs, String(rule) === 'evenodd', encodeGrad(gradOf(fs)), sh, modeOf(this));
-        else S.fillPath(verbs, String(rule) === 'evenodd', parseColor(fs), sh, modeOf(this));
+        else S.fillOps(ops, M, String(rule) === 'evenodd', parseColor(fs), sh, modeOf(this));
       },
       stroke() {
         note('stroke|' + [this.strokeStyle, this.lineWidth]);

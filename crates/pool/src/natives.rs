@@ -69,6 +69,7 @@ pub fn install(scope: &mut v8::PinScope) {
         bind(scope, "__pt_canvasMeasureText", canvas_measure_text);
         bind(scope, "__pt_localFont", local_font);
         bind(scope, "__pt_canvasFillPath", canvas_fill_path);
+        bind(scope, "__pt_canvasFillOps", canvas_fill_ops);
         bind(
             scope,
             "__pt_canvasFillPathGradient",
@@ -337,6 +338,32 @@ fn canvas_fill_path(
     ];
     crate::canvas::fill_path(id, &verbs, even_odd, rgba, &arg_f32s(args.get(7)),
         arg_usize(scope, args.get(8)) as u32);
+}
+
+/// `__pt_canvasFillOps(id, opsF32, ctmF32, evenOdd, r, g, b, a, shF32, mode)` —
+/// заливка по операциям пути (координаты страницы) и матрице холста.
+#[cfg(feature = "render")]
+fn canvas_fill_ops(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let ops = arg_f32s(args.get(1));
+    let m = arg_f32s(args.get(2));
+    let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+    if m.len() >= 6 {
+        ctm.copy_from_slice(&m[..6]);
+    }
+    let even_odd = arg_usize(scope, args.get(3)) != 0;
+    let rgba = [
+        arg_usize(scope, args.get(4)) as u8,
+        arg_usize(scope, args.get(5)) as u8,
+        arg_usize(scope, args.get(6)) as u8,
+        arg_usize(scope, args.get(7)) as u8,
+    ];
+    crate::canvas::fill_ops(id, &ops, ctm, even_odd, rgba, &arg_f32s(args.get(8)),
+        arg_usize(scope, args.get(9)) as u32);
 }
 
 /// `__pt_canvasFillPathGradient(id, verbsF32, evenOdd, gradF32)` — gradient fill.

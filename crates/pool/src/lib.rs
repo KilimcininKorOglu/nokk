@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
 #[cfg(feature = "render")]
 mod canvas;
+pub mod skia;
 mod compressor;
 mod wavetable;
 mod isolate;
