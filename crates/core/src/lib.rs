@@ -429,8 +429,17 @@ fn emulation_os_for(profile: &StealthProfile) -> nokk_net::EmulationOs {
 /// and last the remaining platform surface — it only fills names nothing else
 /// defined, so everything real has to exist before it looks.
 fn build_bootstrap(profile: &StealthProfile) -> String {
+    // Флаги трасс реализации (`NOKK_TRACE_CANVAS`, `NOKK_TRACE_GPU`) — в самом
+    // начале загрузчика, чтобы стоять в каждом реалме раньше любого кода
+    // страницы: пробник, ставящий их позже, пропускает ранние вызовы.
+    let mut flags = String::new();
+    for (env, name) in [("NOKK_TRACE_CANVAS", "__pt_canvasTrace"), ("NOKK_TRACE_GPU", "__pt_gpuTrace")] {
+        if std::env::var_os(env).is_some() {
+            flags.push_str(&format!("Object.defineProperty(globalThis, '{name}', {{ value: 1, configurable: true }});\n"));
+        }
+    }
     let base = format!(
-        "{}\n{}\n{}\n{}\n{}",
+        "{flags}{}\n{}\n{}\n{}\n{}",
         // Первой строкой — запись изнутри: ею пользуются все слои, а свойства
         // только для чтения появляются лишь в последнем.
         nokk_stealth::write_helper_script(),

@@ -7506,6 +7506,25 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     lineJoin: ['round','bevel','miter'],
   };
 
+  // Трасса холста (NOKK_TRACE_CANVAS=1): каждый вызов и присваивание
+  // контекста, с меткой холста — изнутри переходника, невидимо странице.
+  const CTX_IDS = new WeakMap();
+  let ctxSeq = 0;
+  const ctrace = (t, what) => {
+    try {
+      if (!globalThis.__pt_canvasTrace) return;
+      let id = CTX_IDS.get(t);
+      if (!id) { id = ++ctxSeq; CTX_IDS.set(t, id); }
+      const c = t.canvas; const size = c ? (c.width | 0) + 'x' + (c.height | 0) : '?';
+      (globalThis.__pt_parentConsole || console).error('[холст ' + id + ' ' + size + '] ' + what);
+    } catch (e) {}
+  };
+  const cshow = (v) => {
+    if (typeof v === 'number') return String(v);
+    if (typeof v === 'string') return JSON.stringify(v.length > 60 ? v.slice(0, 60) + '…' : v);
+    if (v == null || typeof v !== 'object') return String(v);
+    try { return '<' + (Object.prototype.toString.call(v).slice(8, -1)) + (v.width ? ' ' + v.width + 'x' + v.height : '') + '>'; } catch (e) { return '<obj>'; }
+  };
   const publishContext = (impl, C, methods, attrs) => {
     if (!C || !C.prototype) return impl;
     const P = C.prototype;
@@ -7521,6 +7540,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           [name](...args) {
             const t = CTX_IMPL.get(this) || this;
             const m = Object.prototype.hasOwnProperty.call(t, name) ? t[name] : null;
+            if (globalThis.__pt_canvasTrace) ctrace(t, name + '(' + args.map(cshow).join(', ') + ')');
             return typeof m === 'function' ? m.apply(t, args) : undefined;
           },
         })[name];
@@ -7535,6 +7555,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           },
           set [name](v) {
             const t = CTX_IMPL.get(this) || this;
+            if (globalThis.__pt_canvasTrace) ctrace(t, name + ' = ' + cshow(v));
             // Недопустимое значение перечислимого свойства браузер отвергает
             // молча, оставляя прежнее; мы записывали что угодно.
             const allowed = CTX2D_ENUMS[name];
@@ -7827,9 +7848,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const GRAD = new WeakMap();
     const makeGradient = (type, coords) => {
       const state = { type, coords, stops: [] };
-      const g = globalThis.__pt_makeGradient
-        ? __pt_makeGradient({ add: (pos, color) => { note('stop|' + [pos, color]); state.stops.push([+pos || 0, parseColor(color)]); } })
-        : { addColorStop(pos, color) { note('stop|' + [pos, color]); state.stops.push([+pos || 0, parseColor(color)]); } };
+      const add = (pos, color) => {
+        note('stop|' + [pos, color]);
+        if (globalThis.__pt_canvasTrace) ctrace(impl, 'gradient.addColorStop(' + cshow(pos) + ', ' + cshow(color) + ')');
+        state.stops.push([+pos || 0, parseColor(color)]);
+      };
+      const g = globalThis.__pt_makeGradient ? __pt_makeGradient({ add }) : { addColorStop(pos, color) { add(pos, color); } };
       GRAD.set(g, state);
       return g;
     };
@@ -8811,7 +8835,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       }
       if (t !== '2d' && t !== 'webgl' && t !== 'webgl2') return null;
       this.__ptCtxType = t;
-      if (t === '2d') return this.__ptC2d || (this.__ptC2d = make2DContext(this, ctxAttrs));
+      if (t === '2d') {
+        if (!this.__ptC2d) { this.__ptC2d = make2DContext(this, ctxAttrs); ctrace(CTX_IMPL.get(this.__ptC2d) || this.__ptC2d, 'getContext("2d", ' + JSON.stringify(ctxAttrs === undefined ? null : ctxAttrs) + ')'); }
+        return this.__ptC2d;
+      }
       if (t === 'webgl') return this.__ptGl1 || (this.__ptGl1 = makeGL(this, 1));
       return this.__ptGl2 || (this.__ptGl2 = makeGL(this, 2));
     }, 'getContext');

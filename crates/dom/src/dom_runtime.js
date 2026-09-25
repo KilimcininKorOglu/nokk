@@ -1209,6 +1209,11 @@
       if (typeof globalThis.__pt_makeRealm !== 'function') return null;
       const w = globalThis.__pt_makeRealm();
       if (!w) return null;
+      // Трассы реализации (холст, WebGPU) из реалма пишут в консоль родителя:
+      // консоль реалма движок не читает. Только под флагом трассы.
+      if (globalThis.__pt_canvasTrace || globalThis.__pt_gpuTrace) {
+        try { Object.defineProperty(w, '__pt_parentConsole', { value: globalThis.__pt_parentConsole || console, configurable: true }); } catch (e) {}
+      }
       // It is a child: it sees us as its parent, and knows the element it is in.
       for (const [k, v] of [['parent', globalThis], ['top', globalThis.top || globalThis],
         ['frameElement', this], ['self', w], ['window', w]]) {
@@ -2052,6 +2057,7 @@
     get height() { return this.__ptO.h; }
     set height(v) { this.__ptO.h = v | 0; if (this.__ptO.c) this.__ptO.c.height = v | 0; }
     getContext(type, attrs) {
+      try { if (globalThis.__pt_canvasTrace) (globalThis.__pt_parentConsole || console).error('[холст getContext offscreen ' + (this.width | 0) + 'x' + (this.height | 0) + '] ' + String(type) + ' ' + JSON.stringify(attrs === undefined ? null : attrs)); } catch (e) {}
       // У офскрина свой набор имён: `experimental-webgl` и прочие браузер здесь
       // не принимает вовсе, а отвечает отказом.
       const t = String(type);
