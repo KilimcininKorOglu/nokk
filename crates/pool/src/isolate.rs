@@ -273,6 +273,12 @@ impl Isolate {
         // `Error.prepareStackTrace` сам — зовём мы, из `__pt_formatStack`, уже
         // без кадров собственного движка.
         isolate.set_prepare_stack_trace_callback(prepare_stack_trace);
+        // Content Security Policy: в контексте, где `__pt_setCodegen(false)`
+        // запретил порождение кода из строк, `eval`/`Function` получают вместо
+        // своего исходника бросок EvalError с текстом Chrome. Сам запрет —
+        // на контексте, поэтому подменять источник надо, а не запрещать: иначе
+        // V8 бросит своё «Code generation from strings disallowed».
+        isolate.set_modify_code_generation_from_strings_callback(modify_codegen);
 
         // Install the graceful-OOM callback once, if a cap is in effect.
         let heap_state = max_heap_mb.map(|mb| {
@@ -876,6 +882,43 @@ fn compile_module<'s>(
 /// `Error.prepareStackTrace` страницы, если та его ставила. Без этого всякий
 /// `new Error()` внутри обработчика показывал нашу кухню, которой в браузере
 /// на этом месте нет вовсе.
+/// Что компилировать вместо строки `eval`/`Function` в контексте с CSP без
+/// 'unsafe-eval': выражение, бросающее EvalError с текстом из
+/// `globalThis.__pt_cspEval`. Без такого текста — исходник как есть.
+fn modify_codegen<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    _source: v8::Local<'s, v8::Value>,
+    _is_code_like: bool,
+) -> v8::ModifyCodeGenerationFromStringsResult<'s> {
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let msg = v8::String::new(scope, "__pt_cspEval")
+        .and_then(|k| global.get(scope, k.into()))
+        .filter(|v| v.is_string())
+        .map(|v| v.to_rust_string_lossy(scope))
+        .filter(|m| !m.is_empty());
+    let Some(msg) = msg else {
+        return v8::ModifyCodeGenerationFromStringsResult { codegen_allowed: true, modified_source: None };
+    };
+    let mut quoted = String::with_capacity(msg.len() + 2);
+    quoted.push('"');
+    for ch in msg.chars() {
+        match ch {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\u{2028}' => quoted.push_str("\\u2028"),
+            '\u{2029}' => quoted.push_str("\\u2029"),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    let js = format!("(function () {{ try {{ if (typeof __pt_cspEvalViolation === 'function') __pt_cspEvalViolation(); }} catch (e) {{}} throw new EvalError({quoted}); }})()");
+    let modified = v8::String::new(scope, &js);
+    v8::ModifyCodeGenerationFromStringsResult { codegen_allowed: true, modified_source: modified }
+}
+
 fn prepare_stack_trace<'s, 'a>(
     scope: &mut v8::PinScope<'s, 'a>,
     error: v8::Local<'s, v8::Value>,

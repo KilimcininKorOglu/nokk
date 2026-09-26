@@ -56,6 +56,7 @@ pub fn install(scope: &mut v8::PinScope) {
     bind(scope, "__pt_compress", compress);
     bind(scope, "__pt_atob", atob_native);
     bind(scope, "__pt_heapStats", heap_stats);
+    bind(scope, "__pt_setCodegen", set_codegen);
 
     // Optional real 2D rasterization (the `render` feature). Their presence is the
     // signal the JS canvas checks to use real pixels instead of synthesis.
@@ -2066,6 +2067,20 @@ fn heap_stats(
         out.set_index(scope, i as u32, n.into());
     }
     rv.set(out.into());
+}
+
+/// `__pt_setCodegen(allowed)` — разрешено ли в этом контексте порождать код
+/// из строк (`eval`, `Function`). С запретом V8 зовёт наш крючок подмены
+/// источника (см. `modify_codegen` в isolate.rs), и CSP без 'unsafe-eval'
+/// отвечает EvalError с текстом Chrome даже на прямой `eval`.
+fn set_codegen(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let allowed = args.get(0).boolean_value(scope);
+    let context = scope.get_current_context();
+    context.set_allow_generation_from_strings(allowed);
 }
 
 fn hrtime(

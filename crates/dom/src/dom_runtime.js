@@ -159,7 +159,6 @@
   };
 
   const __collectionProto = {
-    get [Symbol.toStringTag]() { return 'HTMLCollection'; },
     get length() { return this.__ptLen | 0; },
     item(i) { return this[i] != null ? this[i] : null; },
     namedItem(n) {
@@ -169,15 +168,16 @@
       }
       return null;
     },
-    [Symbol.iterator]() { let i = 0; const self = this; return { next: () => i < self.length ? { value: self[i++], done: false } : { value: undefined, done: true } }; },
-  };
+  };  // Как у Chrome: метка типа — данные, перебор — Array.prototype.values, оба неперечислимы.
+  Object.defineProperty(__collectionProto, Symbol.toStringTag, { value: 'HTMLCollection', configurable: true });
+  Object.defineProperty(__collectionProto, Symbol.iterator, { value: Array.prototype.values, writable: true, configurable: true });
+
 
   // `document.all` — HTMLAllCollection: те же члены, что у HTMLCollection, но
   // на своём интерфейсе. Раньше коллекция строилась как HTMLCollection, а
   // потом ей подменяли прототип — и `length` с `item` терялись: страница
   // читала `document.all.length` и получала undefined.
   const __allProto = {
-    get [Symbol.toStringTag]() { return 'HTMLAllCollection'; },
     get length() { return this.__ptLen | 0; },
     item(i) {
       if (i === undefined) return null;
@@ -194,8 +194,10 @@
       if (!found.length) return null;
       return found.length === 1 ? found[0] : __collection(found);
     },
-    [Symbol.iterator]() { let i = 0; const self = this; return { next: () => i < self.length ? { value: self[i++], done: false } : { value: undefined, done: true } }; },
-  };
+  };  // Как у Chrome: метка типа — данные, перебор — Array.prototype.values, оба неперечислимы.
+  Object.defineProperty(__allProto, Symbol.toStringTag, { value: 'HTMLAllCollection', configurable: true });
+  Object.defineProperty(__allProto, Symbol.iterator, { value: Array.prototype.values, writable: true, configurable: true });
+
   function __allCollection(arr) {
     const list = Object.create(__link('HTMLAllCollection', __allProto));
     for (let i = 0; i < arr.length; i++) list[i] = arr[i];
@@ -377,6 +379,12 @@
         return child;
       }
       if (child.parentNode) __ptDrop.call(child.parentNode, child);
+      // Узел из другого документа усыновляется: ownerDocument у него и у всего
+      // поддерева становится документом нового родителя, как в браузере.
+      try {
+        const doc = this.nodeType === 9 ? this : this.__ptDoc;
+        if (doc && child.__ptDoc !== doc) __walkTree(child, (n) => { if (n.__ptDoc !== doc) n.__ptDoc = doc; });
+      } catch (e) {}
       const i = (ref === null || ref === undefined) ? -1 : this.__ptKids.indexOf(ref);
       if (i < 0) this.__ptKids.push(child); else this.__ptKids.splice(i, 0, child);
       child.__ptParent = this;
@@ -451,10 +459,14 @@
       // У документа и doctype его нет вовсе — браузер отвечает null, а не
       // склеенным текстом страницы.
       if (this.nodeType === 9 || this.nodeType === 10) return null;
+      // Текст, комментарий, инструкция — их данные (у Chrome это Node.textContent).
+      if (this.nodeType === 3 || this.nodeType === 4 || this.nodeType === 7) return this.data;
+      if (this.nodeType === 8) return this.data;
       let s = ''; for (const c of this.__ptKids) s += c.textContent; return s;
     }
     set textContent(v) {
       if (this.nodeType === 9 || this.nodeType === 10) return;
+      if (this.nodeType === 3 || this.nodeType === 4 || this.nodeType === 7 || this.nodeType === 8) { this.data = String(v); return; }
       this.__ptKids = [];
       if (v !== '') __ptAdd.call(this, new Text(String(v)));
     }
@@ -706,7 +718,7 @@
     set data(v) { this.__ptData = String(v); }
     get nodeName() { return '#comment'; }
     get nodeValue() { return this.data; }
-    get textContent() { return ''; }
+    get textContent() { return this.data; }
     get length() { return this.data.length; }
     __ptShallowClone() { return new Comment(this.data); }
   }
@@ -1363,6 +1375,9 @@
         for (let p = this; p && p.nodeType === ELEMENT_NODE; p = p.parentNode && p.parentNode.nodeType === 11 && p.parentNode.__ptHost ? p.parentNode.__ptHost : p.parentNode) {
           if (String((p.style && p.style.display) || '') === 'none' || __ptHasA(p, 'hidden')) { hidden = true; break; }
         }
+        // Сторонний кадр без коробки (0×0) Chrome не раскладывает вовсе:
+        // его пустые кадры остаются без размера — innerWidth 0.
+        if (!hidden && __ptHiddenFrame()) hidden = true;
         const [dw, dh] = __ptJSON.parse(__pt_frameBoxOf(this));
         __ptTellFrame(this, hidden ? null : { cw: dw, ch: dh });
       } catch (e) {}
@@ -1370,6 +1385,8 @@
       // страница туда пишет. `srcdoc` кладётся тем же путём.
       try {
         const markup = __ptGetA(this, 'srcdoc');
+        // Адрес srcdoc-кадра у браузера — about:srcdoc.
+        if (markup != null && typeof w.__pt_setLocation === 'function') w.__pt_setLocation({ href: 'about:srcdoc', protocol: 'about:', pathname: 'srcdoc', host: '', hostname: '', port: '', search: '', hash: '' });
         if (typeof w.__pt_writeDocument === 'function') w.__pt_writeDocument(markup || '');
       } catch (e) {}
       // Реферер и базовый адрес пустого кадра — документ-создатель, как у Chrome.
@@ -1393,6 +1410,11 @@
       // arrives, so the flag must not be set until there is something to do.
       if (!src && !this.textContent) return;
       Object.defineProperty(this, '__ptRan', { value: true, configurable: true, enumerable: false });
+      // CSP: инлайн без nonce и чужой адрес не исполняются.
+      if (globalThis.__pt_cspActive && __pt_cspActive()) {
+        if (!src && __pt_cspBlocksInline(this)) return;
+        if (src && __pt_cspBlocksScriptUrl(this, String(src))) return;
+      }
       // Модуль исполняется не как обычный скрипт: у него свой разбор, свои
       // `import` и своя область. Такой отдаём движку — и со ссылкой, и вписанный
       // прямо в страницу.
@@ -4584,9 +4606,19 @@
     const T = proto('HTMLTableElement');
     defGet(T, 'rows', function () { return __collection(tableRows(this)); });
     defGet(T, 'tBodies', function () { return __collection(kids(this).filter((k) => isTag(k, 'tbody'))); });
-    defGet(T, 'tHead', function () { return kids(this).find((k) => isTag(k, 'thead')) || null; });
-    defGet(T, 'tFoot', function () { return kids(this).find((k) => isTag(k, 'tfoot')) || null; });
-    defGet(T, 'caption', function () { return kids(this).find((k) => isTag(k, 'caption')) || null; });
+    const defAcc = (P, k, get, set) => { try { Object.defineProperty(P, k, { get, set, enumerable: true, configurable: true }); } catch (e) {} };
+    const tableSet = (t, tag, v, where) => {
+      if (v !== null && !(v && isTag(v, tag))) throw new TypeError("Failed to set the '" + (tag === 'thead' ? 'tHead' : tag === 'tfoot' ? 'tFoot' : tag) + "' property on 'HTMLTableElement': The provided value is not of type '" + (tag === 'caption' ? 'HTMLTableCaptionElement' : 'HTMLTableSectionElement') + "'.");
+      const old = kids(t).find((k) => isTag(k, tag)); if (old) t.removeChild(old);
+      if (!v) return;
+      const ref = where(t); ref ? t.insertBefore(v, ref) : t.appendChild(v);
+    };
+    defAcc(T, 'tHead', function () { return kids(this).find((k) => isTag(k, 'thead')) || null; },
+      function (v) { tableSet(this, 'thead', v, (t) => kids(t).find((k) => !isTag(k, 'caption') && !isTag(k, 'colgroup')) || null); });
+    defAcc(T, 'tFoot', function () { return kids(this).find((k) => isTag(k, 'tfoot')) || null; },
+      function (v) { tableSet(this, 'tfoot', v, () => null); });
+    defAcc(T, 'caption', function () { return kids(this).find((k) => isTag(k, 'caption')) || null; },
+      function (v) { tableSet(this, 'caption', v, (t) => kids(t)[0] || null); });
     const S = proto('HTMLTableSectionElement');
     defGet(S, 'rows', function () { return __collection(kids(this).filter((k) => isTag(k, 'tr'))); });
     const R = proto('HTMLTableRowElement');
@@ -4619,7 +4651,37 @@
     };
     const isSelected = (o) => !!(o.__ptSelected != null ? o.__ptSelected : __ptHasA(o, 'selected'));
     const SEL = proto('HTMLSelectElement');
-    defGet(SEL, 'options', function () { return branded(selOptions(this), 'HTMLOptionsCollection'); });
+    defGet(SEL, 'options', function () { const c = branded(selOptions(this), 'HTMLOptionsCollection'); try { Object.defineProperty(c, '__ptSelect', { value: this, configurable: true }); } catch (e) {} return c; });
+    // Сеттеры selectedIndex и length, как у HTMLSelectElement/HTMLOptionsCollection Chrome.
+    const selSetIndex = (sel, i) => {
+      const opts = selOptions(sel); i = i | 0;
+      opts.forEach((o, j) => { o.__ptSelected = (j === i); });
+    };
+    const selSetLength = (sel, n) => {
+      const opts = selOptions(sel); n = Math.max(0, n >>> 0);
+      if (n < opts.length) { for (const o of opts.slice(n)) o.parentNode && o.parentNode.removeChild(o); }
+      else for (let i = opts.length; i < n; i++) sel.appendChild(sel.ownerDocument.createElement('option'));
+    };
+    globalThis.__pt_selSetLength = selSetLength;
+    globalThis.__pt_selSetIndex = selSetIndex;
+    // `value` списка — значение выбранного пункта; `selected`/`value`/`text` пункта.
+    const optValue = (o) => { const v = __ptGetA(o, 'value'); return v != null ? String(v) : String(o.textContent || '').replace(/\s+/g, ' ').trim(); };
+    defAcc(SEL, 'value', function () {
+      const opts = selOptions(this); const multiple = __ptHasA(this, 'multiple');
+      let chosen = opts.filter(isSelected);
+      if (!multiple) { if (chosen.length > 1) chosen = [chosen[chosen.length - 1]]; if (!chosen.length && opts.length && __ptGetA(this, 'size') == null) chosen = [opts[0]]; }
+      return chosen.length ? optValue(chosen[0]) : '';
+    }, function (v) {
+      const opts = selOptions(this); v = String(v); let hit = false;
+      for (const o of opts) { if (!hit && optValue(o) === v) { o.__ptSelected = true; hit = true; } else o.__ptSelected = false; }
+    });
+    const O_ = proto('HTMLOptionElement');
+    defAcc(O_, 'selected', function () { return isSelected(this); }, function (v) {
+      this.__ptSelected = !!v;
+      if (v) { let p = this.parentNode; if (p && isTag(p, 'optgroup')) p = p.parentNode; if (p && isTag(p, 'select') && !__ptHasA(p, 'multiple')) for (const o of selOptions(p)) if (o !== this) o.__ptSelected = false; }
+    });
+    defAcc(O_, 'value', function () { return optValue(this); }, function (v) { __ptSetA(this, 'value', String(v)); });
+    defAcc(O_, 'text', function () { return String(this.textContent || '').replace(/\s+/g, ' ').trim(); }, function (v) { this.textContent = String(v); });
     defGet(SEL, 'selectedOptions', function () {
       const opts = selOptions(this);
       const multiple = __ptHasA(this, 'multiple');
@@ -4627,14 +4689,14 @@
       if (!multiple) { if (chosen.length > 1) chosen = [chosen[chosen.length - 1]]; if (!chosen.length && opts.length && __ptGetA(this, 'size') == null) chosen = [opts[0]]; }
       return __collection(chosen);
     });
-    defGet(SEL, 'selectedIndex', function () {
+    defAcc(SEL, 'selectedIndex', function () {
       const opts = selOptions(this);
       const multiple = __ptHasA(this, 'multiple');
       const chosen = opts.filter(isSelected);
       if (chosen.length) return opts.indexOf(multiple ? chosen[0] : chosen[chosen.length - 1]);
       return !multiple && opts.length && __ptGetA(this, 'size') == null ? 0 : -1;
-    });
-    defGet(SEL, 'length', function () { return selOptions(this).length; });
+    }, function (v) { selSetIndex(this, v); });
+    defAcc(SEL, 'length', function () { return selOptions(this).length; }, function (v) { selSetLength(this, v); });
     defGet(SEL, 'type', function () { return __ptHasA(this, 'multiple') ? 'select-multiple' : 'select-one'; });
     defFn(SEL, 'item', function item(i) { return selOptions(this)[i | 0] || null; });
     defFn(SEL, 'namedItem', function namedItem(n) { return selOptions(this).find((o) => o.id === n || __ptGetA(o, 'name') === n) || null; });
@@ -5627,6 +5689,286 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __syncSlots();
   }
 
+
+  // ---- Content Security Policy ---------------------------------------------
+  // Политика документа — из заголовка ответа (движок зовёт `__pt_applyCsp`) и
+  // из `<meta http-equiv="content-security-policy">`. Считается только
+  // `script-src` (с откатом к `default-src`): без 'unsafe-eval' строка в
+  // eval/Function/setTimeout бросает EvalError с текстом Chrome, WebAssembly
+  // без 'wasm-unsafe-eval' — CompileError, воркер с blob:/data: — SecurityError,
+  // инлайн-скрипт без nonce не исполняется, и документ получает
+  // securitypolicyviolation.
+  const __csp = { policies: [] };
+  const __cspParse = (text) => {
+    const out = {};
+    for (const part of String(text).split(';')) {
+      const toks = part.trim().split(/\s+/).filter(Boolean);
+      if (!toks.length) continue;
+      const name = toks[0].toLowerCase();
+      if (!(name in out)) out[name] = toks.slice(1);
+    }
+    return out;
+  };
+  const __cspScriptDirective = (p) => (p.dirs['script-src'] ? ['script-src', p.dirs['script-src']] : (p.dirs['default-src'] ? ['default-src', p.dirs['default-src']] : null));
+  const __cspHas = (list, kw) => list.some((t) => t.toLowerCase() === kw);
+  const __cspDirectiveText = (name, list) => name + (list.length ? ' ' + list.join(' ') : '');
+  // Строка и столбец места вызова — из стека, первый кадр страницы.
+  const __cspSite = () => {
+    try {
+      const st = String(new Error().stack || '').split('\n');
+      for (const line of st.slice(1)) {
+        const m = /(https?:[^\s()]+|about:[^\s()]+):(\d+):(\d+)\)?\s*$/.exec(line);
+        if (m && !/<anonymous>/.test(line)) return { file: m[1], line: +m[2], column: +m[3] };
+      }
+    } catch (e) {}
+    return { file: '', line: 0, column: 0 };
+  };
+  // SecurityPolicyViolationEvent с полями из init: заглушка интерфейса их не
+  // отражала (blockedURI отвечал undefined).
+  const __spveState = new WeakMap();
+  const __SPVE_FIELDS = [['documentURI', ''], ['referrer', ''], ['blockedURI', ''], ['effectiveDirective', ''], ['violatedDirective', ''], ['originalPolicy', ''], ['sourceFile', ''], ['sample', ''], ['disposition', 'enforce'], ['statusCode', 0], ['lineNumber', 0], ['columnNumber', 0]];
+  const __spveEnsure = () => {
+    const Ev = globalThis.Event;
+    if (!Ev) return null;
+    let E = globalThis.SecurityPolicyViolationEvent;
+    let ok = false;
+    try { const t = new E('x', { blockedURI: 'y' }); ok = t.blockedURI === 'y'; } catch (e) {}
+    if (ok) return E;
+    const nat = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
+    const oldProto = E && E.prototype && typeof E.prototype === 'object' ? E.prototype : null;
+    const C = function SecurityPolicyViolationEvent(type, init) {
+      if (!new.target) throw new TypeError("Failed to construct 'SecurityPolicyViolationEvent': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+      if (arguments.length < 1) throw new TypeError("Failed to construct 'SecurityPolicyViolationEvent': 1 argument required, but only 0 present.");
+      const ev = Reflect.construct(Ev, [type, init], new.target);
+      const st = {};
+      for (const [k, dflt] of __SPVE_FIELDS) { const v = init && init[k]; st[k] = v === undefined ? dflt : (typeof dflt === 'number' ? (Number(v) | 0) : String(v)); }
+      __spveState.set(ev, st);
+      return ev;
+    };
+    C.prototype = oldProto || Object.create(Ev.prototype);
+    try { Object.setPrototypeOf(C.prototype, Ev.prototype); } catch (e) {}
+    try { Object.setPrototypeOf(C, Ev); } catch (e) {}
+    try { Object.defineProperty(C.prototype, 'constructor', { value: C, writable: true, configurable: true }); } catch (e) {}
+    for (const [k] of __SPVE_FIELDS) {
+      try { Object.defineProperty(C.prototype, k, { get: nat(function () { const st = __spveState.get(this); if (!st) throw new TypeError('Illegal invocation'); return st[k]; }, 'get ' + k), enumerable: true, configurable: true }); } catch (e) {}
+    }
+    try { Object.defineProperty(C.prototype, Symbol.toStringTag, { value: 'SecurityPolicyViolationEvent', configurable: true }); } catch (e) {}
+    try { Object.defineProperty(C, 'length', { value: 1, configurable: true }); } catch (e) {}
+    try { Object.defineProperty(globalThis, 'SecurityPolicyViolationEvent', { value: nat(C, 'SecurityPolicyViolationEvent'), writable: true, enumerable: false, configurable: true }); } catch (e) {}
+    return C;
+  };
+  const __cspViolation = (name, list, blockedURI, sample, extra) => {
+    try {
+      const E = __spveEnsure();
+      const site = extra && extra.noSite ? { file: '', line: 0, column: 0 } : __cspSite();
+      const init = Object.assign({
+        documentURI: String((globalThis.location && location.href) || 'about:blank'), referrer: String(document.referrer || ''), blockedURI, violatedDirective: name, effectiveDirective: name,
+        originalPolicy: __csp.policies.map((p) => p.raw).join(', '), disposition: 'enforce', sourceFile: site.file, sample: String(sample || '').slice(0, 40), statusCode: 200, lineNumber: site.line, columnNumber: site.column,
+      }, extra || {});
+      delete init.noSite;
+      const ev = typeof E === 'function' ? new E('securitypolicyviolation', Object.assign({ bubbles: true, composed: true }, init)) : new Event('securitypolicyviolation', { bubbles: true });
+      setTimeout(() => { try { document.dispatchEvent(ev); } catch (e) {} }, 0);
+    } catch (e) {}
+  };
+  const __cspEvalMessage = () => {
+    for (const p of __csp.policies) {
+      const d = __cspScriptDirective(p);
+      if (!d || __cspHas(d[1], "'unsafe-eval'")) continue;
+      // Текст Chrome 151 — с его же висячей кавычкой в конце.
+      return { name: d[0], list: d[1], msg: "Evaluating a string as JavaScript violates the following Content Security Policy directive because 'unsafe-eval' is not an allowed source of script: " + __cspDirectiveText(d[0], d[1]) + "\".\n" };
+    }
+    return null;
+  };
+  const __cspWasmMessage = () => {
+    for (const p of __csp.policies) {
+      const d = __cspScriptDirective(p);
+      if (!d || __cspHas(d[1], "'unsafe-eval'") || __cspHas(d[1], "'wasm-unsafe-eval'")) continue;
+      return { name: d[0], list: d[1], msg: "Compiling or instantiating WebAssembly module violates the following Content Security policy directive because 'unsafe-eval' is not an allowed source of script in the following Content Security Policy directive: \"" + __cspDirectiveText(d[0], d[1]) + "\"." };
+    }
+    return null;
+  };
+  // Разрешён ли адрес скрипта по списку источников (без учёта nonce/hash).
+  const __cspAllowsUrl = (list, url, nonce) => {
+    const u = String(url || '');
+    if (nonce && list.some((t) => t.toLowerCase() === "'nonce-" + nonce.toLowerCase() + "'" || t === "'nonce-" + nonce + "'")) return true;
+    if (__cspHas(list, "'strict-dynamic'")) return false;
+    const scheme = (u.match(/^([a-z][a-z0-9+.-]*):/i) || [])[1];
+    const self_ = (globalThis.location && location.origin) || '';
+    for (const t of list) {
+      const low = t.toLowerCase();
+      if (low === '*') { if (scheme && !/^(blob|data|filesystem)$/i.test(scheme)) return true; continue; }
+      if (low === "'self'") { if (self_ && u.indexOf(self_ + '/') === 0) return true; continue; }
+      if (/^[a-z][a-z0-9+.-]*:$/i.test(low)) { if (scheme && low === scheme.toLowerCase() + ':') return true; continue; }
+      if (low.charAt(0) === "'") continue;
+      // host-source: сравнить схему+хост(+порт), звёздочка в начале хоста.
+      try {
+        const hs = low.indexOf('://') > 0 ? low : ((globalThis.location && location.protocol) || 'https:') + '//' + low;
+        const want = new URL(hs.replace(/\*\./g, 'wild.')), got = new URL(u, (globalThis.location && location.href) || undefined);
+        if (want.protocol !== got.protocol) continue;
+        const wh = want.hostname, gh = got.hostname;
+        const okHost = /^\*\./.test(low.replace(/^[a-z]+:\/\//, '')) ? (gh === wh.replace(/^wild\./, '') || gh.endsWith('.' + wh.replace(/^wild\./, ''))) : gh === wh;
+        if (!okHost) continue;
+        if (want.port && want.port !== got.port) continue;
+        if (want.pathname && want.pathname !== '/' && got.pathname.indexOf(want.pathname) !== 0) continue;
+        return true;
+      } catch (e) {}
+    }
+    return false;
+  };
+  // Инлайн-скрипт: nonce/hash/'unsafe-inline' (последний отменяется nonce/hash).
+  const __cspAllowsInline = (el) => {
+    for (const p of __csp.policies) {
+      const d = __cspScriptDirective(p);
+      if (!d) continue;
+      const list = d[1];
+      const hasNonceOrHash = list.some((t) => /^'(nonce-|sha(256|384|512)-)/i.test(t));
+      const nonce = el && (__ptGetA(el, 'nonce') || el.__ptNonce || '');
+      if (nonce && list.some((t) => t === "'nonce-" + nonce + "'")) continue;
+      if (!hasNonceOrHash && __cspHas(list, "'unsafe-inline'")) continue;
+      return { name: d[0], list };
+    }
+    return null;
+  };
+  const __cspReport = (what) => { try { (globalThis.__pt_parentConsole || console).error(what); } catch (e) {} };
+  globalThis.__pt_cspBlocksInline = (el) => {
+    const v = __cspAllowsInline(el);
+    if (!v) return false;
+    const text = __cspDirectiveText(v.name, v.list);
+    __cspReport("Refused to execute inline script because it violates the following Content Security Policy directive: \"" + text + "\". Either the 'unsafe-inline' keyword, a hash ('sha256-…'), or a nonce ('nonce-...') is required to enable inline execution.\n");
+    __cspViolation(v.name, v.list, 'inline', '', { violatedDirective: 'script-src-elem', effectiveDirective: 'script-src-elem', sourceFile: String((globalThis.location && location.href) || ''), lineNumber: (el && el.__ptLine) || 0, columnNumber: 0, noSite: true });
+    return true;
+  };
+  // Обработчик в атрибуте (`onclick="…"`): script-src-attr.
+  globalThis.__pt_cspBlocksHandler = (el, name, code) => {
+    const v = __cspAllowsInline(null);
+    if (!v) return false;
+    const text = __cspDirectiveText(v.name, v.list);
+    __cspReport("Refused to execute inline event handler because it violates the following Content Security Policy directive: \"" + text + "\". Either the 'unsafe-inline' keyword, a hash ('sha256-…'), or a nonce ('nonce-...') is required to enable inline execution.\n");
+    __cspViolation(v.name, v.list, 'inline', '', { violatedDirective: 'script-src-attr', effectiveDirective: 'script-src-attr', sourceFile: String((globalThis.location && location.href) || '') });
+    return true;
+  };
+  globalThis.__pt_cspBlocksScriptUrl = (el, url) => {
+    for (const p of __csp.policies) {
+      const d = __cspScriptDirective(p);
+      if (!d) continue;
+      const nonce = el && (__ptGetA(el, 'nonce') || el.__ptNonce || '');
+      if (__cspAllowsUrl(d[1], url, nonce)) continue;
+      const text = __cspDirectiveText(d[0], d[1]);
+      __cspReport("Refused to load the script '" + url + "' because it violates the following Content Security Policy directive: \"" + text + "\". Note that 'script-src-elem' was not explicitly set, so 'script-src' is used as a fallback.\n");
+      __cspViolation(d[0], d[1], String(url), '', { violatedDirective: 'script-src-elem', effectiveDirective: 'script-src-elem', sourceFile: '', lineNumber: 0, columnNumber: 0, noSite: true });
+      return true;
+    }
+    return false;
+  };
+  // Нарушение от прямого eval/Function: зовётся из подменённого источника
+  // (см. modify_codegen в pool) перед броском EvalError.
+  try { Object.defineProperty(globalThis, '__pt_cspEvalViolation', { value: () => { const e = __cspEvalMessage(); if (e) __cspViolation(e.name, e.list, 'eval'); }, writable: true, enumerable: false, configurable: true }); } catch (e) {}
+  const __cspWrapEval = () => {
+    const ev = __cspEvalMessage();
+    try { Object.defineProperty(globalThis, '__pt_cspEval', { value: ev ? ev.msg : '', writable: true, enumerable: false, configurable: true }); } catch (e) {}
+    try { if (typeof globalThis.__pt_setCodegen === 'function') __pt_setCodegen(!ev); } catch (e) {}
+    if (!ev || __csp.wrapped) return;
+    __csp.wrapped = true;
+    const nat = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
+    // Конструкторы функций из строки: Function и его async/generator-родня,
+    // в том числе через `.constructor` у прототипов.
+    try {
+      const evalErr = () => { const e = __cspEvalMessage(); __cspViolation(e.name, e.list, 'eval'); return new EvalError(e.msg); };
+      const seen = [];
+      const ctors = [globalThis.Function];
+      for (const mk of [() => Object.getPrototypeOf(async function () {}).constructor, () => Object.getPrototypeOf(function* () {}).constructor, () => Object.getPrototypeOf(async function* () {}).constructor]) { try { ctors.push(mk()); } catch (e) {} }
+      for (const real of ctors) {
+        if (typeof real !== 'function' || seen.includes(real)) continue;
+        seen.push(real);
+        const w = function (...a) { throw evalErr(); };
+        w.prototype = real.prototype;
+        try { Object.defineProperty(w, 'name', { value: real.name, configurable: true }); Object.defineProperty(w, 'length', { value: real.length, configurable: true }); } catch (e) {}
+        const masked = nat(w, real.name);
+        try { Object.defineProperty(real.prototype, 'constructor', { value: masked, writable: true, enumerable: false, configurable: true }); } catch (e) {}
+        if (real === globalThis.Function) { try { Object.defineProperty(globalThis, 'Function', { value: masked, writable: true, enumerable: false, configurable: true }); } catch (e) {} }
+      }
+    } catch (e) {}
+    // Таймеры со строкой: у Chrome вызов отвечает номером, строка не
+    // исполняется, документ получает нарушение с blockedURI 'eval'.
+    for (const name of ['setTimeout', 'setInterval']) {
+      try {
+        const real = globalThis[name]; if (typeof real !== 'function') continue;
+        const w = ({ [name](handler, ...rest) { if (typeof handler !== 'function') { const e = __cspEvalMessage(); if (e) { __cspViolation(e.name, e.list, 'eval'); return real.call(this, function () {}, ...rest); } } return real.call(this, handler, ...rest); } })[name];
+        try { Object.defineProperty(w, 'length', { value: real.length, configurable: true }); } catch (e) {}
+        Object.defineProperty(globalThis, name, { value: nat(w, name), writable: true, enumerable: true, configurable: true });
+      } catch (e) {}
+    }
+    // WebAssembly: компиляция и инстанцирование.
+    try {
+      const W = globalThis.WebAssembly;
+      if (W) {
+        const CE = W.CompileError || Error;
+        const wasmErr = (k) => { const m = __cspWasmMessage(); if (!m) return null; __cspViolation(m.name, m.list, 'wasm-eval'); return new CE('WebAssembly.' + k + '(): ' + m.msg); };
+        for (const k of ['compile', 'instantiate', 'compileStreaming', 'instantiateStreaming']) {
+          const real = W[k]; if (typeof real !== 'function') continue;
+          const w = ({ [k](...a) { const e = wasmErr(k); if (e) return Promise.reject(e); return real.apply(this, a); } })[k];
+          try { Object.defineProperty(w, 'length', { value: real.length, configurable: true }); } catch (e) {}
+          Object.defineProperty(W, k, { value: nat(w, k), writable: true, enumerable: false, configurable: true });
+        }
+        for (const k of ['Module', 'Instance']) {
+          const real = W[k]; if (typeof real !== 'function') continue;
+          const w = function (...a) { if (!new.target) throw new TypeError("WebAssembly." + k + " must be invoked with 'new'"); const e = wasmErr(k); if (e) throw e; return Reflect.construct(real, a, new.target); };
+          w.prototype = real.prototype;
+          for (const sk of Object.getOwnPropertyNames(real)) { if (['length', 'name', 'prototype'].includes(sk)) continue; try { Object.defineProperty(w, sk, Object.getOwnPropertyDescriptor(real, sk)); } catch (e) {} }
+          try { Object.defineProperty(w, 'length', { value: real.length, configurable: true }); } catch (e) {}
+          Object.defineProperty(W, k, { value: nat(w, k), writable: true, enumerable: false, configurable: true });
+        }
+      }
+    } catch (e) {}
+    // Воркеры: адрес скрипта против script-src (blob:/data: без явной схемы — нет).
+    for (const name of ['Worker', 'SharedWorker']) {
+      try {
+        const real = globalThis[name]; if (typeof real !== 'function') continue;
+        const w = function (url, opts) {
+          if (!new.target) throw new TypeError("Failed to construct '" + name + "': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+          const u = String(url);
+          for (const p of __csp.policies) {
+            const d = __cspScriptDirective(p);
+            if (!d) continue;
+            if (__cspAllowsUrl(d[1], u, '')) continue;
+            const text = __cspDirectiveText(d[0], d[1]);
+            __cspReport("Refused to create a worker from '" + u + "' because it violates the following Content Security Policy directive: \"" + text + "\". Note that 'worker-src' was not explicitly set, so 'script-src' is used as a fallback.\n");
+            const scheme = (u.match(/^([a-z][a-z0-9+.-]*):/i) || [])[1];
+            __cspViolation(d[0], d[1], /^(blob|data|filesystem)$/i.test(scheme || '') ? scheme.toLowerCase() : u, '', { violatedDirective: 'worker-src', effectiveDirective: 'worker-src' });
+            // У браузера конструктор отвечает объектом, а скрипт не грузится:
+            // воркер получает событие error.
+            const dead = Reflect.construct(real, ['data:text/javascript,', opts], new.target);
+            try { dead.terminate(); } catch (e) {}
+            setTimeout(() => { try { dead.dispatchEvent(new ErrorEvent('error', { message: 'Failed to load worker script' })); } catch (e) {} }, 0);
+            return dead;
+          }
+          return Reflect.construct(real, [url, opts], new.target);
+        };
+        w.prototype = real.prototype;
+        try { Object.defineProperty(w, 'length', { value: real.length, configurable: true }); } catch (e) {}
+        Object.defineProperty(globalThis, name, { value: nat(w, name), writable: true, enumerable: false, configurable: true });
+      } catch (e) {}
+    }
+  };
+  globalThis.__pt_applyCsp = (text, source) => {
+    const raw = String(text == null ? '' : text).trim();
+    if (!raw) return;
+    for (const one of raw.split(',')) {
+      const t = one.trim();
+      if (!t) continue;
+      __csp.policies.push({ raw: t, dirs: __cspParse(t), source: source || 'meta' });
+    }
+    __cspWrapEval();
+  };
+  globalThis.__pt_cspActive = () => __csp.policies.length > 0;
+  // Мета-политика документа: применяется, как только разметка разобрана.
+  globalThis.__pt_cspFromMeta = (root) => {
+    try {
+      const metas = [];
+      __walkTree(root, (n) => { if (n && n.nodeType === ELEMENT_NODE && String(n.__ptLocal || '').toLowerCase() === 'meta' && String(__ptGetA(n, 'http-equiv') || '').toLowerCase() === 'content-security-policy') metas.push(n); });
+      for (const m of metas) { const c = __ptGetA(m, 'content'); if (c) __pt_applyCsp(c, 'meta'); }
+    } catch (e) {}
+  };
   globalThis.__pt_writeDocument = (html) => {
     const nodes = parseFragment(String(html == null ? '' : html));
     let root = nodes.find((n) => n.nodeType === 1 && n.tagName === 'HTML');
@@ -5650,6 +5992,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     document.appendChild(root);
     document.__ptDocEl = root;
     document.__ptReady = 'complete';
+    __pt_cspFromMeta(root);
     // Скрипты разметки исполняются здесь и сейчас, в этом окне.
     for (const el of __tags(root, 'script')) {
       try { el.__ptRunScript(); } catch (e) {}
@@ -5686,6 +6029,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const html = buildNode(document, tree);
       document.appendChild(html);
       document.__ptDocEl = html;
+      __pt_cspFromMeta(html);
     }
     scriptNodes = __docTags(document, 'script');
     // Пока идут собственные скрипты документа, браузер отвечает 'loading', и
@@ -5699,6 +6043,16 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // (and therefore document.write's insertion point) is correct while it runs.
   // The index matches the loader's document-order script list.
   globalThis.__pt_beginScript = (i) => { document.__ptCurScript = scriptNodes[i] || null; };
+  // Скрипт документа под CSP: заблокирован ли (инлайн без nonce, чужой адрес).
+  globalThis.__pt_cspScriptBlocked = (i) => {
+    try {
+      if (!__pt_cspActive()) return false;
+      const el = scriptNodes[i]; if (!el) return false;
+      const src = __ptGetA(el, 'src');
+      if (src) { let abs = String(src); try { abs = new URL(src, (globalThis.location && location.href) || undefined).href; } catch (e) {} return __pt_cspBlocksScriptUrl(el, abs); }
+      return __pt_cspBlocksInline(el);
+    } catch (e) { return false; }
+  };
   globalThis.__pt_endScript = () => { document.__ptCurScript = null; };
 
   // Called after all page scripts have run: fire DOMContentLoaded then load.
@@ -9104,6 +9458,50 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     globalThis[n] = globalThis.__pt_native ? __pt_native(C) : C;
   }
   globalThis.__pt_makeRect = (x, y, w, h) => new DOMRect(x, y, w, h);
+
+  // Точка: у Chrome DOMPointReadOnly (x, y, z, w, matrixTransform, toJSON,
+  // fromPoint) и DOMPoint поверх неё с сеттерами. Была заглушкой без значений.
+  const __ptVals = new WeakMap();
+  const __ptNum = (v) => { const n = +v; return Number.isNaN(n) ? NaN : n; };
+  class DOMPointReadOnly {
+    constructor(x = 0, y = 0, z = 0, w = 1) {
+      __ptVals.set(this, { x: __ptNum(x), y: __ptNum(y), z: __ptNum(z), w: __ptNum(w) });
+    }
+    get x() { return __ptVals.get(this).x; }
+    get y() { return __ptVals.get(this).y; }
+    get z() { return __ptVals.get(this).z; }
+    get w() { return __ptVals.get(this).w; }
+    matrixTransform(m) {
+      const v = __ptVals.get(this);
+      const M = (m && typeof m === 'object') ? m : {};
+      const g = (k, d) => (M[k] === undefined ? d : +M[k]);
+      const m11 = g('m11', g('a', 1)), m12 = g('m12', g('b', 0)), m13 = g('m13', 0), m14 = g('m14', 0);
+      const m21 = g('m21', g('c', 0)), m22 = g('m22', g('d', 1)), m23 = g('m23', 0), m24 = g('m24', 0);
+      const m31 = g('m31', 0), m32 = g('m32', 0), m33 = g('m33', 1), m34 = g('m34', 0);
+      const m41 = g('m41', g('e', 0)), m42 = g('m42', g('f', 0)), m43 = g('m43', 0), m44 = g('m44', 1);
+      return new DOMPoint(m11 * v.x + m21 * v.y + m31 * v.z + m41 * v.w,
+                          m12 * v.x + m22 * v.y + m32 * v.z + m42 * v.w,
+                          m13 * v.x + m23 * v.y + m33 * v.z + m43 * v.w,
+                          m14 * v.x + m24 * v.y + m34 * v.z + m44 * v.w);
+    }
+    toJSON() { const v = __ptVals.get(this); return { x: v.x, y: v.y, z: v.z, w: v.w }; }
+    static fromPoint(o) { const M = (o && typeof o === 'object') ? o : {}; return new this(M.x === undefined ? 0 : M.x, M.y === undefined ? 0 : M.y, M.z === undefined ? 0 : M.z, M.w === undefined ? 1 : M.w); }
+  }
+  class DOMPoint extends DOMPointReadOnly {
+    get x() { return __ptVals.get(this).x; }
+    set x(v) { __ptVals.get(this).x = __ptNum(v); }
+    get y() { return __ptVals.get(this).y; }
+    set y(v) { __ptVals.get(this).y = __ptNum(v); }
+    get z() { return __ptVals.get(this).z; }
+    set z(v) { __ptVals.get(this).z = __ptNum(v); }
+    get w() { return __ptVals.get(this).w; }
+    set w(v) { __ptVals.get(this).w = __ptNum(v); }
+    static fromPoint(o) { return DOMPointReadOnly.fromPoint.call(DOMPoint, o); }
+  }
+  for (const [C, n] of [[DOMPointReadOnly, 'DOMPointReadOnly'], [DOMPoint, 'DOMPoint']]) {
+    try { Object.defineProperty(C.prototype, Symbol.toStringTag, { value: n, configurable: true }); } catch (e) {}
+    globalThis[n] = globalThis.__pt_native ? __pt_native(C) : C;
+  }
 
   // `TextMetrics`: значения на прототипе, у самого объекта своих свойств нет —
   // как и у всего, что отдаёт браузер. Базовые линии считаются от метрик

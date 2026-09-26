@@ -1202,6 +1202,15 @@ impl BrowserContext {
 
     /// Кодировка, объявленная заголовком `Content-Type` ответа на документ
     /// по этому адресу, если она там есть.
+    /// Заголовок Content-Security-Policy ответа документа — движок применяет
+    /// его к контексту до первого скрипта (`__pt_applyCsp`).
+    fn document_csp(&self, url: &str) -> Option<String> {
+        let log = self.requests.lock().ok()?;
+        let r = log.iter().rev().find(|r| r.url == url)?;
+        let v = r.headers.get("content-security-policy")?;
+        if v.trim().is_empty() { None } else { Some(v.to_string()) }
+    }
+
     fn document_charset(&self, url: &str) -> Option<String> {
         let log = self.requests.lock().ok()?;
         let r = log.iter().rev().find(|r| r.url == url)?;
@@ -1248,6 +1257,10 @@ impl BrowserContext {
 
         // Install the parsed tree as `document`.
         self.eval_in(index, &page.install_script()).await?;
+        if let Some(csp) = self.document_csp(base_url) {
+            let js = format!("try {{ if (typeof __pt_applyCsp === 'function') __pt_applyCsp({}, 'header'); }} catch (e) {{}}", js_str(&csp));
+            let _ = self.eval_in(index, &js).await;
+        }
         // Кодировка из заголовка ответа: документ с `charset=utf-8` в
         // Content-Type браузер называет UTF-8, даже если в разметке ни слова.
         if let Some(charset) = self.document_charset(base_url) {
@@ -1326,6 +1339,15 @@ impl BrowserContext {
             // the fallback as well.
             if matches!(script, nokk_dom::Script::Skipped) {
                 continue;
+            }
+            // CSP документа: инлайн без nonce и запрещённый адрес — мимо.
+            if let Ok(v) = self
+                .eval_in(index, &format!("(typeof __pt_cspScriptBlocked === 'function' && __pt_cspScriptBlocked({idx})) ? 'blocked' : ''"))
+                .await
+            {
+                if v.as_str() == Some("blocked") {
+                    continue;
+                }
             }
             // A module is not a script with different syntax: it is parsed, linked
             // and evaluated as a graph, so it goes down its own path.
@@ -6583,7 +6605,9 @@ mod tests {
               const m = performance.memory;
               const before = m.usedJSHeapSize;
               const junk = [];
-              for (let i = 0; i < 200000; i++) junk.push({ x: i, s: 'abc' + i });
+              // Миллион удерживаемых объектов: сборка мусора бутстрапа посреди
+              // цикла отдаёт десятки мегабайт, и меньший прирост её не перекрывал.
+              for (let i = 0; i < 1000000; i++) junk.push({ x: i, s: 'abc' + i });
               const after = m.usedJSHeapSize;
               return __ptJSON.stringify({
                 before, after, total: m.totalJSHeapSize, limit: m.jsHeapSizeLimit,
