@@ -873,6 +873,8 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   // Исключение из toString уходит наружу. Сверено на scratchpad/console_fmt.html.
   const FORMATTED = { log: 1, debug: 1, info: 1, warn: 1, error: 1, trace: 1, group: 1, groupCollapsed: 1, assert: 1 };
   const LABELED = { count: 1, countReset: 1, time: 1, timeEnd: 1, timeLog: 1, timeStamp: 1, profile: 1, profileEnd: 1, context: 1 };
+  // Методы, все доводы которых уходят в сообщение (и описываются инспектором).
+  const REPORTED = { log: 1, debug: 1, info: 1, warn: 1, error: 1, trace: 1, dir: 1, dirxml: 1, table: 1, group: 1, groupCollapsed: 1, assert: 1 };
   const format = (args, idx) => {
     if (args.length < idx + 2 || typeof args[idx] !== 'string') return;
     const s = args[idx]; let off = 0, ai = idx + 1;
@@ -906,9 +908,41 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
         const task = {}; Object.defineProperty(task, 'run', { value: ({ run(f) { return f(); } }).run, writable: true, enumerable: true, configurable: true });
         return task;
       }
+      // Как у инспектора V8 (v8-console-message.cc): текст сообщения — ToString
+      // первого довода (объект, функция; массив — поэлементно), а всякий довод-
+      // ошибка описывается через её же toString (имя, сообщение). Исключения
+      // глотаются. Страница меряет именно эти вызовы и их стек.
+      const texts = [];
+      if (REPORTED[name]) {
+        const base = name === 'assert' ? 1 : 0;
+        // V8ValueStringBuilder: обычный объект — Object.prototype.toString (без
+        // чужого кода); Date, функция, родная ошибка, RegExp — ToString (их
+        // toString зовётся); массив — поэлементно через запятую, null/undefined
+        // внутри пропускаются.
+        const tagOf = (v) => { try { return Object.prototype.toString.call(v); } catch (e) { return '[object Object]'; } };
+        const viaToString = (v) => typeof v === 'function' || v instanceof Date || v instanceof RegExp || tagOf(v) === '[object Error]';
+        const str = (v, depth, inArray) => {
+          try {
+            if (v === null || v === undefined) return inArray ? '' : String(v);
+            if (typeof v === 'symbol') return v.toString();
+            if (typeof v !== 'object' && typeof v !== 'function') return String(v);
+            if (v instanceof String || v instanceof Number || v instanceof Boolean || v instanceof BigInt) return String(v.valueOf());
+            if (Array.isArray(v)) { if (depth > 3) return ''; const parts = []; for (let i = 0; i < v.length && i < 100; i++) parts.push(str(v[i], depth + 1, true)); return parts.join(','); }
+            if (viaToString(v)) return `${v}`;
+            return tagOf(v);
+          } catch (e) { return ''; }
+        };
+        if (args.length > base) texts[base] = str(args[base], 0, false);
+        // Всякий довод-ошибка описывается через её toString (имя, сообщение) —
+        // кроме первого, который уже прошёл ToString выше.
+        for (let i = base + 1; i < args.length; i++) {
+          const v = args[i];
+          if (v !== null && typeof v === 'object' && tagOf(v) === '[object Error]') { try { texts[i] = String(v.toString()); } catch (e) {} }
+        }
+      }
       if (!SPOKEN[name] || said.length > 256) return undefined;
       const parts = [];
-      for (let i = 0; i < args.length && i < 8; i++) parts.push(show(args[i]));
+      for (let i = 0; i < args.length && i < 8; i++) parts.push(typeof texts[i] === 'string' ? texts[i] : show(args[i]));
       said.push([name, parts.join(' ').slice(0, 600)]);
       return undefined;
     } }[name];
