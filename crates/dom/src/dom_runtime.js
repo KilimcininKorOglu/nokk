@@ -1211,7 +1211,7 @@
       if (!w) return null;
       // Трассы реализации (холст, WebGPU) из реалма пишут в консоль родителя:
       // консоль реалма движок не читает. Только под флагом трассы.
-      if (globalThis.__pt_canvasTrace || globalThis.__pt_gpuTrace) {
+      if (globalThis.__pt_canvasTrace || globalThis.__pt_gpuTrace || globalThis.__pt_encTrace) {
         try { Object.defineProperty(w, '__pt_parentConsole', { value: globalThis.__pt_parentConsole || console, configurable: true }); } catch (e) {}
       }
       // It is a child: it sees us as its parent, and knows the element it is in.

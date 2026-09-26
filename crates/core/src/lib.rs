@@ -433,9 +433,12 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
     // начале загрузчика, чтобы стоять в каждом реалме раньше любого кода
     // страницы: пробник, ставящий их позже, пропускает ранние вызовы.
     let mut flags = String::new();
-    for (env, name) in [("NOKK_TRACE_CANVAS", "__pt_canvasTrace"), ("NOKK_TRACE_GPU", "__pt_gpuTrace")] {
-        if std::env::var_os(env).is_some() {
-            flags.push_str(&format!("Object.defineProperty(globalThis, '{name}', {{ value: 1, configurable: true }});\n"));
+    for (env, name) in [("NOKK_TRACE_CANVAS", "__pt_canvasTrace"), ("NOKK_TRACE_GPU", "__pt_gpuTrace"), ("NOKK_TRACE_ENC", "__pt_encTrace")] {
+        if let Some(v) = std::env::var_os(env) {
+            // Значение флага доступно трассе: `NOKK_TRACE_ENC=9000-9300,8600-8700`
+            // высыпает куски отчёта этих длин целиком.
+            let v = v.to_string_lossy().replace(['\'', '\\', '\n'], "");
+            flags.push_str(&format!("Object.defineProperty(globalThis, '{name}', {{ value: '{v}', configurable: true }});\n"));
         }
     }
     let base = format!(
@@ -10480,6 +10483,11 @@ variationSettings,weight",
               decoded: new TextDecoder('windows-1251').decode(new Uint8Array([207, 240, 232, 226, 229, 242])),
               koi: new TextDecoder('koi8-r').decode(new Uint8Array([208, 210, 201, 215, 197, 212])),
               labels: [new TextDecoder('cp1251').encoding, new TextDecoder('latin1').encoding],
+              // Пять «дыр» windows-1252 (0x81, 0x8D, 0x8F, 0x90, 0x9D) по
+              // Encoding Standard — управляющие C1, а не U+FFFD: холст
+              // челленджа читается через этот раскодировщик побайтно.
+              holes: [...new TextDecoder('windows-1252').decode(new Uint8Array([0x80, 0x81, 0x8d, 0x8f, 0x90, 0x9d, 0xff]))].map((c) => c.charCodeAt(0)),
+              koiu: [...new TextDecoder('koi8-u').decode(new Uint8Array([0xae, 0xbe]))].map((c) => c.charCodeAt(0)),
               badLabel: say(() => { new TextDecoder('вздор'); return 'без броска'; }),
               requestType: new Request('https://example.com/x', { method: 'POST', body: 'b' })
                 .headers.get('content-type'),
@@ -10497,6 +10505,8 @@ variationSettings,weight",
         assert_eq!(out["decoded"], "Привет");
         assert_eq!(out["koi"], "привет");
         assert_eq!(out["labels"], serde_json::json!(["windows-1251", "windows-1252"]));
+        assert_eq!(out["holes"], serde_json::json!([0x20ac, 0x81, 0x8d, 0x8f, 0x90, 0x9d, 0xff]));
+        assert_eq!(out["koiu"], serde_json::json!([0x45e, 0x40e]));
         assert_eq!(out["badLabel"], "бросок RangeError");
         assert_eq!(out["requestType"], "text/plain;charset=UTF-8");
         assert_eq!(out["entryTypes"], 15);
