@@ -1151,6 +1151,18 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                 c.add_worker_init_script(flag.to_string());
                 c.add_init_script(flag.to_string());
             }
+            // Свой сценарий в каждый кадр при рождении (`NOKK_FRAME_INIT=<файл>`):
+            // для сверок с Chrome, где то же самое ставится через CDP. Итог
+            // сценарий кладёт в глобальную, а `NOKK_EVAL_FRAMES` её вычитывает.
+            if let Ok(path) = std::env::var("NOKK_FRAME_INIT") {
+                match std::fs::read_to_string(&path) {
+                    Ok(js) => {
+                        c.add_frame_init_script(js.clone());
+                        c.add_init_script(js);
+                    }
+                    Err(e) => eprintln!("# NOKK_FRAME_INIT: {path}: {e}"),
+                }
+            }
             if std::env::var("NOKK_TRACE_FIELDS").is_ok() {
                 let probe = r#"(() => {
                   const nat = (f, src) => {
@@ -1168,7 +1180,12 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     const P = XMLHttpRequest.prototype, XO = P.open, XS = P.send;
                     P.open = nat(function open(m, u) {
                       try {
-                        if (cf() && /challenge-platform/.test(String(u)) && !globalThis.__ptСобрано) globalThis.__ptСериализуем = 1;
+                        if (cf() && /challenge-platform/.test(String(u))) {
+                          if (!globalThis.__ptСобрано) globalThis.__ptСериализуем = 1;
+                          // Второе окно — отчёт: тот же сериализатор, те же
+                          // строки знак за знаком, только тело за 50 К.
+                          else if (!globalThis.__ptОтчётСобран) globalThis.__ptСериализуем2 = 1;
+                        }
                       } catch (e) {}
                       return XO.apply(this, arguments);
                     }, XO);
@@ -1188,6 +1205,22 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           for (let q = 0; q < s1.length; q += 250) {
                             console.error('[поля ' + ряд.length + ':' + (q / 250) + '] ' + s1.slice(q, q + 250));
                           }
+                        }
+                        if (globalThis.__ptСериализуем2 && b && b.length > 50000 && !globalThis.__ptОтчётСобран) {
+                          globalThis.__ptОтчётСобран = 1;
+                          globalThis.__ptСериализуем2 = 0;
+                          const ряд = globalThis.__ptСтроки2 || [];
+                          const s1 = JSON.stringify(ряд);
+                          console.error('[отчёт] всего=' + ряд.length + ' тело=' + b.length + ' знаков=' + s1.length);
+                          // Консоль держит 256 строк между выемками — ломти
+                          // уходят пачками по таймеру.
+                          const всего = Math.ceil(s1.length / 250);
+                          let q = 0;
+                          const пачка = () => {
+                            for (let k = 0; k < 100 && q < всего; k++, q++) console.error('[отчёт ' + всего + ':' + q + '] ' + s1.slice(q * 250, (q + 1) * 250));
+                            if (q < всего) setTimeout(пачка, 40);
+                          };
+                          пачка();
                         }
                       } catch (e) {}
                       return XS.apply(this, arguments);
@@ -1249,6 +1282,9 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       if (i === 0 && globalThis.__ptСериализуем && this.length < 120) {
                         const ряд = globalThis.__ptСтроки || (globalThis.__ptСтроки = []);
                         if (ряд.length < 600) ряд.push(String(this));
+                      } else if (i === 0 && globalThis.__ptСериализуем2) {
+                        const ряд = globalThis.__ptСтроки2 || (globalThis.__ptСтроки2 = []);
+                        if (ряд.length < 60000) ряд.push(this.length < 400 ? String(this) : '\u0001' + this.length);
                       }
                       return CCA.call(this, i);
                     }, CCA);

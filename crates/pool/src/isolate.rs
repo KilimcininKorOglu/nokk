@@ -106,7 +106,7 @@ pub(crate) fn init_platform() {
         for path in icu_candidates() {
             let Ok(bytes) = std::fs::read(&path) else { continue };
             let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-            match v8::icu::set_common_data_77(leaked) {
+            match v8::icu::set_common_data_78(leaked) {
                 Ok(()) => {
                     ICU_READY.store(true, Ordering::Relaxed);
                     tracing::info!(path = %path.display(), "ICU data loaded");
