@@ -491,7 +491,19 @@ pub fn draw_text(data: &mut [u8], w: u32, h: u32, fonts: &[&'static [u8]], glyph
     let Some(first) = glyphs.first() else { return true };
     let Ok(font) = skrifa::FontRef::new(fonts[first.font]) else { return true };
     let m = ctm_of(ctm);
-    let post = Matrix { sx: m.sx, kx: m.kx, ky: m.ky, sy: m.sy, tx: 0.0, ty: 0.0 };
+    // MakeRecAndEffects: fPost2x2 из матрицы устройства через sk_relax
+    // (округление до 1/1024) — по типу матрицы, как считает SkMatrix.
+    let relax = |x: f32| (x * 1024.0).round() / 1024.0;
+    let affine = m.kx != 0.0 || m.ky != 0.0;
+    let scaled = affine || m.sx != 1.0 || m.sy != 1.0;
+    let post = Matrix {
+        sx: if scaled { relax(m.sx) } else { 1.0 },
+        sy: if scaled { relax(m.sy) } else { 1.0 },
+        kx: if affine { relax(m.kx) } else { 0.0 },
+        ky: if affine { relax(m.ky) } else { 0.0 },
+        tx: 0.0,
+        ty: 0.0,
+    };
     // Скейлер на каждый шрифт цепочки, что встретился в строке.
     let font_refs: Vec<Option<skrifa::FontRef>> = fonts.iter().map(|b| skrifa::FontRef::new(b).ok()).collect();
     let scalers: Vec<Option<text::Scaler>> = fonts
