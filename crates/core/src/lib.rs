@@ -677,6 +677,7 @@ impl Engine {
             frame_init_scripts: std::sync::Mutex::new(Vec::new()),
             worker_init_scripts: std::sync::Mutex::new(Vec::new()),
             init_scripts: std::sync::Mutex::new(Vec::new()),
+            inflight: std::sync::Mutex::new(Vec::new()),
             next_timer_at: std::sync::Mutex::new(None),
             session,
             _permit: permit,
@@ -773,6 +774,37 @@ impl Engine {
 ///
 /// Holds the live-context permit and load guard; dropping the context releases
 /// both, freeing a slot for a queued navigation.
+fn req_method(req: &Request) -> String {
+    req.method.clone()
+}
+
+/// Что нужно, чтобы после ответа сети записать запрос и разрешить обещание.
+struct FetchInfo {
+    context: usize,
+    id: i64,
+    url: String,
+    method: String,
+    kind: String,
+    sent: Vec<u8>,
+}
+
+/// Куда доставить итог: в кадр (по индексу контекста) или в воркер.
+enum Deliver {
+    Frame(usize),
+    Worker(nokk_pool::WorkerId, usize),
+}
+
+struct InFlight {
+    deliver: Deliver,
+    info: FetchInfo,
+    handle: tokio::task::JoinHandle<Result<nokk_net::Response, NetError>>,
+}
+
+enum Prepared {
+    Settled(String),
+    Send(Request, FetchInfo),
+}
+
 pub struct BrowserContext {
     engine: Arc<EngineInner>,
     /// This context's HTTP client — its own proxy + cookie jar when created with
@@ -828,6 +860,9 @@ pub struct BrowserContext {
     /// the page had already executed made them useless for anything that has to be
     /// in place first.
     init_scripts: std::sync::Mutex<Vec<String>>,
+    /// Запросы кадров и воркеров, ушедшие в сеть и ещё не отвеченные: сеть
+    /// идёт своим ходом, а JS в это время не стоит — как у браузера.
+    inflight: std::sync::Mutex<Vec<InFlight>>,
     /// When this page's earliest pending timer comes due, as of the last turn of
     /// the event loop. `None` means nothing is pending. Timers wait out their real
     /// delays now, so a page only advances while something drives it — this is how
@@ -1653,6 +1688,17 @@ impl BrowserContext {
             if busy || frames_ran > 0 || !frame_ops.is_empty() {
                 continue;
             }
+            // Ответы кадров и воркеров ещё в пути: подождать немного и дать
+            // кадрам ход, а не объявлять простой.
+            if self.inflight_pending() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(FRAME_PUMP_EVERY).await;
+                if self.has_frames() {
+                    last_frame_pump = std::time::Instant::now();
+                    self.pump_frames().await?;
+                }
+                let _ = self.settle_inflight().await?;
+                continue;
+            }
 
             // Nothing is runnable *right now*. If the page's next timer is close,
             // serve it — that is the load-critical `setTimeout` chain, and waiting
@@ -2434,10 +2480,12 @@ impl BrowserContext {
             if let Some(reqs) = queues["fetch"].as_array() {
                 for r in reqs.iter().take(32) {
                     work += 1;
-                    let settle = self.perform_fetch(owner, &state.fetch_base, r).await;
-                    let _ = self.eval_at(place, child, &settle).await;
+                    if let Some(settle) = self.start_fetch(Deliver::Worker(place, child), owner, &state.fetch_base, r) {
+                        let _ = self.eval_at(place, child, &settle).await;
+                    }
                 }
             }
+            work += self.settle_inflight().await?;
 
             // What it posted home, and whether it hung up: `close()` inside a
             // worker ends it, and a context nobody will ever pump again should
@@ -3266,10 +3314,15 @@ impl BrowserContext {
             if let Some(reqs) = queues["fetch"].as_array() {
                 for r in reqs.iter().take(64) {
                     work += 1;
-                    let settle = self.perform_fetch(index, &base, r).await;
-                    let _ = self.eval_in(index, &settle).await;
+                    // В сеть — сразу и без ожидания: JS кадра идёт дальше, а
+                    // ответ доставит `settle_inflight`. Пока запрос ждал
+                    // соседа по очереди, маячок челленджа держал всё на секунды.
+                    if let Some(settle) = self.start_fetch(Deliver::Frame(index), index, &base, r) {
+                        let _ = self.eval_in(index, &settle).await;
+                    }
                 }
             }
+            work += self.settle_inflight().await?;
 
             // A frame loads code into itself the same way a page does.
             if let Some(ops) = queues["scripts"].as_array() {
@@ -3469,6 +3522,75 @@ impl BrowserContext {
 
     /// Run one queued `fetch` request and build the JS call that settles it.
     async fn perform_fetch(&self, context: usize, base: &str, r: &Value) -> String {
+        match self.prepare_fetch(context, base, r) {
+            Prepared::Settled(js) => js,
+            Prepared::Send(req, info) => {
+                let res = self.client.send(req).await;
+                self.settle_fetch(&info, res)
+            }
+        }
+    }
+
+    /// Запустить запрос кадра или воркера, не дожидаясь ответа: ответ
+    /// заберёт `settle_inflight` на одном из следующих пульсов. Мгновенно
+    /// решённое (заблокированный адрес) возвращается сразу.
+    fn start_fetch(&self, deliver: Deliver, context: usize, base: &str, r: &Value) -> Option<String> {
+        match self.prepare_fetch(context, base, r) {
+            Prepared::Settled(js) => Some(js),
+            Prepared::Send(req, info) => {
+                let client = self.client.clone();
+                let handle = tokio::spawn(async move { client.send(req).await });
+                if let Ok(mut v) = self.inflight.lock() {
+                    v.push(InFlight { deliver, info, handle });
+                }
+                None
+            }
+        }
+    }
+
+    fn inflight_pending(&self) -> bool {
+        self.inflight.lock().map(|v| !v.is_empty()).unwrap_or(false)
+    }
+
+    /// Доставить ответы, которые уже пришли: записать запрос и разрешить
+    /// обещание там, откуда его просили.
+    async fn settle_inflight(&self) -> Result<usize, EngineError> {
+        let done: Vec<InFlight> = match self.inflight.lock() {
+            Ok(mut v) => {
+                let mut out = Vec::new();
+                let mut i = 0;
+                while i < v.len() {
+                    if v[i].handle.is_finished() {
+                        out.push(v.remove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+                out
+            }
+            Err(_) => Vec::new(),
+        };
+        let mut n = 0;
+        for f in done {
+            let res = match f.handle.await {
+                Ok(r) => r,
+                Err(e) => Err(NetError::Connect(format!("fetch task failed: {e}"))),
+            };
+            let settle = self.settle_fetch(&f.info, res);
+            match f.deliver {
+                Deliver::Frame(index) => {
+                    let _ = self.eval_in(index, &settle).await;
+                }
+                Deliver::Worker(place, child) => {
+                    let _ = self.eval_at(place, child, &settle).await;
+                }
+            }
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    fn prepare_fetch(&self, context: usize, base: &str, r: &Value) -> Prepared {
         let id = r["id"].as_i64().unwrap_or(0);
         let raw_url = r["url"].as_str().unwrap_or("").to_string();
         let url = resolve_url(base, &raw_url).unwrap_or(raw_url);
@@ -3495,11 +3617,11 @@ impl BrowserContext {
         // (ERR_BLOCKED_BY_CLIENT), and log it so the interception audit is complete.
         if self.engine.block_trackers && nokk_net::is_blocked_url(&url) {
             self.record_in(context, &method, &url, &kind, 0, &[]);
-            return format!(
+            return Prepared::Settled(format!(
                 "__pt_fetchReject({}, {})",
                 id,
                 serde_json::to_string("blocked by tracker filter").unwrap()
-            );
+            ));
         }
         let body = r["body"].as_str().map(|s| s.as_bytes().to_vec());
         let sent = body.clone().unwrap_or_default();
@@ -3514,9 +3636,14 @@ impl BrowserContext {
             third_party: r["storageAccess"].as_bool().unwrap_or(false),
             user_activated: false,
         };
+        let method = req_method(&req);
+        Prepared::Send(req, FetchInfo { context, id, url, method, kind, sent })
+    }
 
-        let method = req.method.clone();
-        match self.client.send(req).await {
+    fn settle_fetch(&self, info: &FetchInfo, res: Result<nokk_net::Response, NetError>) -> String {
+        let FetchInfo { context, id, url, method, kind, sent } = info;
+        let (context, id) = (*context, *id);
+        match res {
             Ok(resp) => {
                 self.record_full(
                     context,
@@ -3574,7 +3701,8 @@ impl BrowserContext {
                 };
                 let body = String::from_utf8_lossy(&resp.body);
                 // `response.url` is the final URL after redirects (fetch spec).
-                let final_url = if resp.url.is_empty() { &url } else { &resp.url };
+                let url_s: &str = url;
+                let final_url: &str = if resp.url.is_empty() { url_s } else { &resp.url };
                 format!(
                     "{}__pt_fetchResolve({}, {}, {}, {}, {}, {})",
                     meta,
@@ -3591,7 +3719,7 @@ impl BrowserContext {
                 // status 0 so the interception log stays complete. (Skip the
                 // "no real network" stub error, which never reached the wire.)
                 if !matches!(e, NetError::Unimplemented) {
-                    self.record_in(context, &method, &url, &kind, 0, &[]);
+                    self.record_in(context, method, url, kind, 0, &[]);
                 }
                 // Хост без маршрута мы одно время оставляли висеть, решив, что
                 // так поступает браузер. Лента Chrome с этой же машины говорит

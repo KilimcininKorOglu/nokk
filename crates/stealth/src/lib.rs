@@ -2244,6 +2244,26 @@ const SHAPE_FIXES: &str = r#"(() => {
   }
   try { if (globalThis.RTCPeerConnection) Object.defineProperty(RTCPeerConnection, 'length', { value: 0, configurable: true }); } catch (e) {}
   try { for (const k of ['permission', 'maxActions', 'requestPermission']) redo(globalThis.Notification, k); } catch (e) {}
+  // `tabIndex` отражается в атрибут `tabindex`, как у браузера: заглушка
+  // таблицы имён держала число в ячейке, и `el.tabIndex = -1` не оставлял
+  // следа в разметке (челлендж так помечает свой скрытый кадр).
+  try {
+    const HP = globalThis.HTMLElement && HTMLElement.prototype;
+    const natn = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
+    if (HP) {
+      const FOCUSABLE = new Set(['a', 'area', 'button', 'input', 'select', 'textarea', 'iframe', 'summary', 'details', 'frame', 'audio', 'video']);
+      Object.defineProperty(HP, 'tabIndex', {
+        get: natn(function () {
+          const v = this.getAttribute && this.getAttribute('tabindex');
+          if (v != null && /^\s*[-+]?\d+/.test(v)) return parseInt(v, 10) | 0;
+          const t = String(this.localName || '').toLowerCase();
+          return FOCUSABLE.has(t) || (this.hasAttribute && this.hasAttribute('contenteditable')) ? 0 : -1;
+        }, 'get tabIndex'),
+        set: natn(function (v) { if (this.setAttribute) this.setAttribute('tabindex', String(Number(v) | 0)); }, 'set tabIndex'),
+        enumerable: true, configurable: true,
+      });
+    }
+  } catch (e) {}
   // Планировщик: `postTask` отдаёт итог задачи обещанием, `yield` — пустое.
   // Ставится здесь, поверх заглушек таблицы имён.
   try {
@@ -6034,6 +6054,8 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       });
     }
     const id = fid++;
+    // Трасса реализации (`NOKK_TRACE_ENC=1`): запросы fetch челленджа.
+    if (globalThis.__pt_encTrace) { try { (globalThis.__pt_parentConsole || console).error('[fetch] ' + Math.round(performance.now()) + 'мс #' + id + ' ' + (opts.method || 'GET') + ' ' + String(url).slice(0, 120) + ' opts=' + JSON.stringify({ mode: opts.mode, credentials: opts.credentials, cache: opts.cache, redirect: opts.redirect, headers: headerObj(opts.headers), signal: !!opts.signal, keepalive: opts.keepalive })); } catch (e) {} }
     const req = {
       id, url: String(url),
       method: (opts.method || 'GET').toUpperCase(),
@@ -6092,6 +6114,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
 
   globalThis.__pt_fetchResolve = (id, status, statusText, headers, body, finalUrl) => {
     const p = pending.get(id); if (!p) return; pending.delete(id);
+    if (globalThis.__pt_encTrace) { try { (globalThis.__pt_parentConsole || console).error('[fetch] ' + Math.round(performance.now()) + 'мс #' + id + ' resp ' + status + ' len=' + (body == null ? 0 : (body.byteLength || body.length || 0)) + ' ' + String(p.url).slice(-60) + ' hdrs=' + JSON.stringify(headers).slice(0, 300) + ((body && (body.byteLength || body.length || 0) < 500) ? ' body=' + JSON.stringify(typeof body === 'string' ? body : new TextDecoder().decode(body)).slice(0, 400) : '')); } catch (e) {} }
     const lower = {}; for (const k in headers) lower[k.toLowerCase()] = headers[k];
     const resp = {
       ok: status >= 200 && status < 300, status, statusText: statusText || '',
@@ -6112,6 +6135,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   };
   globalThis.__pt_fetchReject = (id, msg) => {
     const p = pending.get(id); if (!p) return; pending.delete(id);
+    if (globalThis.__pt_encTrace) { try { (globalThis.__pt_parentConsole || console).error('[fetch] ' + Math.round(performance.now()) + 'мс #' + id + ' FAIL ' + String(msg).slice(0, 80) + ' ' + String(p.url).slice(-60)); } catch (e) {} }
     // Chrome says exactly `Failed to fetch` and nothing else, whatever went
     // wrong underneath. Ours used to append the transport's own words — and a
     // page that stringifies the error sends them onward: Cloudflare's worker

@@ -804,11 +804,17 @@ impl HttpClient for FingerprintClient {
                 headers.insert(k.to_string(), s.to_string());
             }
         }
-        let raw = resp
-            .bytes()
-            .await
-            .map_err(|e| NetError::Connect(e.to_string()))?
-            .to_vec();
+        // Ответ без тела (204/304) готов по заголовкам: браузер разрешает
+        // `fetch` сразу, а маячок челленджа держит поток открытым и ждёт,
+        // пока страница сама его не оборвёт, — мы ждали тело до таймаута.
+        let raw = if status == 204 || status == 304 {
+            Vec::new()
+        } else {
+            resp.bytes()
+                .await
+                .map_err(|e| NetError::Connect(e.to_string()))?
+                .to_vec()
+        };
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         let encoded_len = raw.len();
         // Распаковка наша, а не клиентская: только так остаётся известен
