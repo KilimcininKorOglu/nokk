@@ -2269,6 +2269,22 @@ impl BrowserContext {
                     let _ = self
                         .eval_at(place, child, &nokk_stealth::worker_scope_script(name, &url))
                         .await;
+                    // Область воркера наследует у создателя доступ к хранилищу
+                    // (`sec-fetch-storage-access: active` на его запросах), а
+                    // воркер из blob шлёт запросы без реферера — как у Chrome.
+                    let storage_access = self
+                        .eval_in(index, "!!globalThis.__ptStorageAccess")
+                        .await
+                        .ok()
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let _ = self
+                        .eval_at(
+                            place,
+                            child,
+                            &format!("globalThis.__ptStorageAccess = {storage_access}; globalThis.__ptNoReferrer = {local};"),
+                        )
+                        .await;
                     // Крючки наблюдателя — следом за областью: воркер стартует
                     // со своим реалмом, и всё, что поставлено странице, здесь
                     // не действует.
@@ -2754,6 +2770,7 @@ impl BrowserContext {
                             index,
                             &format!(
                                 "Object.defineProperty(globalThis, '__pt_crossSite', {{ value: {cross}, configurable: true }});\n\
+                                 if ({cross}) globalThis.__ptStorageAccess = true;\n\
                                  Object.defineProperty(globalThis, '__pt_referrer', {{ value: {0}, configurable: true }});\n\
                                  try {{ document.referrer = {0}; }} catch (e) {{}}",
                                 js_str(&referrer)
@@ -3610,7 +3627,8 @@ impl BrowserContext {
             .unwrap_or_else(|| "fetch".to_string());
         // Page-initiated requests carry the document that made them, which is
         // also what decides `Sec-Fetch-Site`.
-        if !base.is_empty() && base != "about:blank" && !headers.keys().any(|k| k.eq_ignore_ascii_case("referer")) {
+        let no_referrer = r["noReferrer"].as_bool().unwrap_or(false);
+        if !no_referrer && !base.is_empty() && base != "about:blank" && !headers.keys().any(|k| k.eq_ignore_ascii_case("referer")) {
             headers.insert("Referer".to_string(), base.to_string());
         }
         // Blocked tracker: never hit the wire; reject like a real ad-blocker

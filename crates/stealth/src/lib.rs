@@ -1142,6 +1142,13 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   globalThis.setInterval = (fn, delay, ...args) => add(fn, delay, true, args);
   globalThis.clearTimeout = (id) => { const t = q.get(id); if (t) t.cancelled = true; q.delete(id); };
   globalThis.clearInterval = globalThis.clearTimeout;
+  // Задача вне таймеров (`scheduler.postTask` с высоким приоритетом): у
+  // браузера она идёт раньше уже поставленных нулевых таймеров.
+  Object.defineProperty(globalThis, '__pt_addTask', { value: (fn, delay, front) => {
+    const id = add(fn, delay, false, []);
+    if (front) { const t = q.get(id); if (t) t.due = clock() - 1; }
+    return id;
+  }, configurable: true, enumerable: false });
   globalThis.queueMicrotask = (fn) => { Promise.resolve().then(fn); };
   // У кадров анимации свой счётчик, отдельный от таймеров: в браузере первый
   // `requestAnimationFrame` на странице возвращает 1, даже если до него уже
@@ -2264,6 +2271,34 @@ const SHAPE_FIXES: &str = r#"(() => {
       });
     }
   } catch (e) {}
+  // `window.postMessage` самому себе: сообщение приходит задачей, со своим
+  // источником и origin. Заглушка таблицы имён ничего не доставляла.
+  try {
+    const natp = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
+    const pm = function postMessage(message, targetOrigin) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'postMessage' on 'Window': 1 argument required, but only 0 present.");
+      let origin = '*';
+      if (targetOrigin && typeof targetOrigin === 'object') { if (targetOrigin.targetOrigin !== undefined) origin = String(targetOrigin.targetOrigin); }
+      else if (targetOrigin !== undefined) origin = String(targetOrigin);
+      const mine = (globalThis.location && location.origin) || 'null';
+      if (origin !== '*' && origin !== '/') {
+        let ok = false;
+        try { ok = new URL(origin).origin === mine; } catch (e) {
+          throw new (globalThis.DOMException || Error)("Failed to execute 'postMessage' on 'Window': Invalid target origin '" + origin + "' in a call to 'postMessage'.", 'SyntaxError');
+        }
+        if (!ok) return;
+      }
+      const data = typeof structuredClone === 'function' ? structuredClone(message) : message;
+      setTimeout(() => {
+        let ev;
+        try { ev = new MessageEvent('message', { data, origin: mine, lastEventId: '', source: globalThis, ports: [] }); } catch (e) { return; }
+        try { if (globalThis.__pt_trustEvent) __pt_trustEvent(ev); } catch (e) {}
+        try { globalThis.dispatchEvent(ev); } catch (e) {}
+      }, 0);
+    };
+    const d = Object.getOwnPropertyDescriptor(globalThis, 'postMessage');
+    if (!d || d.configurable) Object.defineProperty(globalThis, 'postMessage', { value: natp(pm, 'postMessage'), writable: true, enumerable: true, configurable: true });
+  } catch (e) {}
   // Планировщик: `postTask` отдаёт итог задачи обещанием, `yield` — пустое.
   // Ставится здесь, поверх заглушек таблицы имён.
   try {
@@ -2274,7 +2309,14 @@ const SHAPE_FIXES: &str = r#"(() => {
     if (SP) {
       Object.defineProperty(SP, 'postTask', { value: nat(function postTask(cb, opts) {
         const delay = opts && Number(opts.delay) > 0 ? Number(opts.delay) : 0;
-        return new Promise((res, rej) => { setTimeout(() => { try { res(cb()); } catch (e) { rej(e); } }, delay); });
+        const prio = String((opts && opts.priority) || (opts && opts.signal && opts.signal.priority) || 'user-visible');
+        // user-blocking/user-visible — раньше таймеров, background — как простой.
+        return new Promise((res, rej) => {
+          const run = () => { try { res(cb()); } catch (e) { rej(e); } };
+          if (prio === 'background') setTimeout(run, delay + 18);
+          else if (typeof globalThis.__pt_addTask === 'function') __pt_addTask(run, delay, true);
+          else setTimeout(run, delay);
+        });
       }, 'postTask'), writable: true, enumerable: true, configurable: true });
       Object.defineProperty(SP, 'yield', { value: nat(function () { return new Promise((r) => setTimeout(r, 0)); }, 'yield'), writable: true, enumerable: true, configurable: true });
     }
@@ -3667,17 +3709,151 @@ __OPFS__
       defg(Pres_.prototype, 'receiver', function () { return null; });
     }
     if (nav.devicePosture) {
-      try { const DP = Object.getPrototypeOf(nav.devicePosture); defg(DP, 'type', function () { return 'continuous'; }); } catch (e) {}
+      try { const DP = Object.getPrototypeOf(nav.devicePosture); if (DP && DP !== Object.prototype) defg(DP, 'type', function () { return 'continuous'; }); } catch (e) {}
     }
     if (nav.ink && typeof nav.ink.requestPresenter !== 'function') {
-      try { meth(Object.getPrototypeOf(nav.ink), 'requestPresenter', function requestPresenter() {
+      try { const IP = Object.getPrototypeOf(nav.ink); if (IP && IP !== Object.prototype) meth(IP, 'requestPresenter', function requestPresenter() {
         const D = globalThis.DelegatedInkTrailPresenter;
         const p = D && D.prototype ? Object.create(D.prototype) : {};
         __pt_write(p, 'presentationArea', null);
         return Promise.resolve(p);
       }); } catch (e) {}
     }
-    meth(Object.getPrototypeOf(nav), 'getInstalledRelatedApps', function getInstalledRelatedApps() { return Promise.resolve([]); });
+    try {
+    // Сторонний кадр в песочнице: Chrome отказывает по permissions policy и
+    // словами говорит почему; у нас методы молчали или отсутствовали.
+    const crossSite = () => !!globalThis.__pt_crossSite;
+    // Переопределение поверх заглушки любого вида: сначала снять, потом положить.
+    const setm = (o, k, f) => { try { const d = Object.getOwnPropertyDescriptor(o, k); if (d && d.configurable) delete o[k]; } catch (e) {} return meth(o, k, f); };
+    const dx = (msg, name) => new (globalThis.DOMException || Error)(msg, name);
+    const rejectDx = (msg, name) => Promise.reject(dx(msg, name));
+    const policy = (feature, what, iface) => rejectDx("Failed to execute '" + what + "' on '" + iface + "': Access to the feature \"" + feature + "\" is disallowed by permissions policy.", 'SecurityError');
+    setm(Object.getPrototypeOf(nav), 'getInstalledRelatedApps', function getInstalledRelatedApps() {
+      if (crossSite()) return rejectDx("Failed to execute 'getInstalledRelatedApps' on 'Navigator': getInstalledRelatedApps() is only supported in top-level browsing contexts.", 'InvalidStateError');
+      return Promise.resolve([]);
+    });
+    if (USB_) setm(USB_.prototype, 'getDevices', function getDevices() { return crossSite() ? policy('usb', 'getDevices', 'USB') : Promise.resolve([]); });
+    if (HID_) setm(HID_.prototype, 'getDevices', function getDevices() { return crossSite() ? policy('hid', 'getDevices', 'HID') : Promise.resolve([]); });
+    if (Serial_) setm(Serial_.prototype, 'getPorts', function getPorts() { return crossSite() ? policy('serial', 'getPorts', 'Serial') : Promise.resolve([]); });
+    if (WL_) setm(WL_.prototype, 'request', function request(type) {
+      if (crossSite()) return rejectDx("Failed to execute 'request' on 'WakeLock': Access to Screen Wake Lock features is disallowed by permissions policy", 'NotAllowedError');
+      const S = globalThis.WakeLockSentinel;
+      const s = S && S.prototype ? Object.create(S.prototype) : {};
+      __pt_write(s, 'type', type === undefined ? 'screen' : String(type));
+      __pt_write(s, 'released', false);
+      __pt_write(s, 'onrelease', null);
+      return Promise.resolve(s);
+    });
+    if (XR_) setm(XR_.prototype, 'requestSession', function requestSession(mode) {
+      if (String(mode) === 'inline') {
+        const XS = globalThis.XRSession;
+        const ses = XS && XS.prototype ? Object.create(XS.prototype) : {};
+        __pt_write(ses, 'visibilityState', 'visible'); __pt_write(ses, 'frameRate', undefined); __pt_write(ses, 'interactionMode', 'screen-space');
+        return Promise.resolve(ses);
+      }
+      return rejectDx('The specified session configuration is not supported.', 'NotSupportedError');
+    });
+    const Clip_ = rebrand(nav.clipboard, 'Clipboard', ET);
+    if (Clip_) {
+      setm(Clip_.prototype, 'read', function read() { return rejectDx("Failed to execute 'read' on 'Clipboard': Read permission denied.", 'NotAllowedError'); });
+      setm(Clip_.prototype, 'readText', function readText() { return rejectDx("Failed to execute 'readText' on 'Clipboard': Read permission denied.", 'NotAllowedError'); });
+      setm(Clip_.prototype, 'write', function write() { return crossSite() ? rejectDx("Failed to execute 'write' on 'Clipboard': Write permission denied.", 'NotAllowedError') : Promise.resolve(undefined); });
+      setm(Clip_.prototype, 'writeText', function writeText() { return crossSite() ? rejectDx("Failed to execute 'writeText' on 'Clipboard': Write permission denied.", 'NotAllowedError') : Promise.resolve(undefined); });
+    }
+    const Cred_ = rebrand(nav.credentials, 'CredentialsContainer');
+    if (Cred_) {
+      setm(Cred_.prototype, 'get', function get(opts) {
+        const o = opts || {};
+        if (o.publicKey) return crossSite()
+          ? rejectDx("The 'publickey-credentials-get' feature is not enabled in this document.", 'NotAllowedError')
+          : rejectDx('The operation either timed out or was not allowed. See: https://www.w3.org/TR/webauthn-2/#sctn-privacy-considerations-client.', 'NotAllowedError');
+        if (o.digital) return crossSite()
+          ? rejectDx("The 'digital-credentials-get' feature is not enabled in this document.", 'NotAllowedError')
+          : rejectDx("Failed to execute 'get' on 'CredentialsContainer': Digital credentials API requires user activation.", 'NotAllowedError');
+        if (o.identity) return crossSite()
+          ? rejectDx("The 'identity-credentials-get' feature is not enabled in this document.", 'NotAllowedError')
+          : rejectDx('Error retrieving a token.', 'NetworkError');
+        if (crossSite()) return rejectDx("The following credential operations can only occur in a document which is same-origin with all of its ancestors: storage/retrieval of 'PasswordCredential' and 'FederatedCredential', storage of 'PublicKeyCredential'.", 'NotAllowedError');
+        return Promise.resolve(null);
+      });
+      setm(Cred_.prototype, 'create', function create(opts) {
+        const o = opts || {};
+        if (o.password) {
+          const PC = globalThis.PasswordCredential;
+          const c = PC && PC.prototype ? Object.create(PC.prototype) : {};
+          const pw = o.password;
+          __pt_write(c, 'id', String(pw.id === undefined ? '' : pw.id)); __pt_write(c, 'type', 'password'); __pt_write(c, 'name', String(pw.name || '')); __pt_write(c, 'iconURL', String(pw.iconURL || '')); __pt_write(c, 'password', String(pw.password === undefined ? '' : pw.password));
+          return Promise.resolve(c);
+        }
+        if (o.publicKey) return rejectDx(crossSite() ? "The 'publickey-credentials-create' feature is not enabled in this document." : 'The operation either timed out or was not allowed. See: https://www.w3.org/TR/webauthn-2/#sctn-privacy-considerations-client.', 'NotAllowedError');
+        return Promise.resolve(null);
+      });
+      setm(Cred_.prototype, 'store', function store() { return Promise.resolve(undefined); });
+      setm(Cred_.prototype, 'preventSilentAccess', function preventSilentAccess() { return Promise.resolve(undefined); });
+    }
+    const Geo_ = rebrand(nav.geolocation, 'Geolocation');
+    if (Geo_) {
+      const posErr = (code, message) => { const E = globalThis.GeolocationPositionError; const e = E && E.prototype ? Object.create(E.prototype) : {}; __pt_write(e, 'code', code); __pt_write(e, 'message', message); return e; };
+      const deny = (err) => (crossSite() ? posErr(1, 'Geolocation has been disabled in this document by permissions policy.') : posErr(1, 'User denied Geolocation'));
+      setm(Geo_.prototype, 'getCurrentPosition', function getCurrentPosition(ok, err) { if (typeof err === 'function') setTimeout(() => { try { err(deny()); } catch (e) {} }, 0); });
+      setm(Geo_.prototype, 'watchPosition', function watchPosition(ok, err) { if (typeof err === 'function') setTimeout(() => { try { err(deny()); } catch (e) {} }, 0); return 1; });
+      setm(Geo_.prototype, 'clearWatch', function clearWatch() {});
+    }
+    setm(Object.getPrototypeOf(nav), 'requestMIDIAccess', function requestMIDIAccess() {
+      return crossSite() ? rejectDx("Failed to execute 'requestMIDIAccess' on 'Navigator': Midi has been disabled in this document by permissions policy.", 'SecurityError')
+        : rejectDx("Failed to execute 'requestMIDIAccess' on 'Navigator': Midi permission request denied.", 'SecurityError');
+    });
+    const protoOf = (o, name, base) => { if (!o) return null; let P = Object.getPrototypeOf(o); if (P === Object.prototype) { const C = rebrand(o, name, base); P = C && C.prototype; } return P && P !== Object.prototype ? P : null; };
+    const KB = protoOf(nav.keyboard, 'Keyboard');
+    if (KB) { try { setm(KB, 'lock', function lock() { return crossSite() ? rejectDx("Failed to execute 'lock' on 'Keyboard': lock() must be called from a primary top-level browsing context.", 'InvalidStateError') : Promise.resolve(undefined); }); } catch (e) {}
+    }
+    const SWP = protoOf(nav.serviceWorker, 'ServiceWorkerContainer', ET);
+    if (SWP) { try { try { delete SWP.ready; } catch (e) {} defg(SWP, 'ready', function () { return new Promise(() => {}); }); } catch (e) {} }
+    try { setm(globalThis, 'getScreenDetails', function getScreenDetails() { return rejectDx('Permission denied.', 'NotAllowedError'); }); } catch (e) {}
+    try { setm(globalThis, 'queryLocalFonts', function queryLocalFonts() { return crossSite() ? policy('local-fonts', 'queryLocalFonts', 'Window') : Promise.resolve([]); }); } catch (e) {}
+    for (const pk of ['showOpenFilePicker', 'showSaveFilePicker', 'showDirectoryPicker']) {
+      try { setm(globalThis, pk, function () { return crossSite() ? rejectDx("Failed to execute '" + pk + "' on 'Window': Cross origin sub frames aren't allowed to show a file picker.", 'SecurityError') : rejectDx("Failed to execute '" + pk + "' on 'Window': Must be handling a user gesture to show a file picker.", 'SecurityError'); }); try { Object.defineProperty(globalThis[pk], 'name', { value: pk, configurable: true }); } catch (e) {} } catch (e) {}
+    }
+    try {
+      const DP = globalThis.Document && Document.prototype;
+      if (DP) {
+        setm(DP, 'exitPictureInPicture', function exitPictureInPicture() { return rejectDx("Failed to execute 'exitPictureInPicture' on 'Document': There is no Picture-in-Picture element in this document.", 'InvalidStateError'); });
+        setm(DP, 'requestStorageAccess', function requestStorageAccess() { return crossSite() ? rejectDx('requestStorageAccess not allowed', 'NotAllowedError') : Promise.resolve(undefined); });
+        setm(DP, 'requestStorageAccessFor', function requestStorageAccessFor() { return crossSite() ? rejectDx('requestStorageAccessFor not allowed', 'NotAllowedError') : Promise.resolve(undefined); });
+      }
+      const EP = globalThis.Element && Element.prototype;
+      if (EP) {
+        setm(EP, 'requestFullscreen', function requestFullscreen() { return Promise.reject(new TypeError('Permissions check failed')); });
+        setm(EP, 'requestPointerLock', function requestPointerLock() { if (crossSite()) return rejectDx("Failed to execute 'requestPointerLock' on 'Element': Blocked pointer lock on an element because the element's frame is sandboxed and the 'allow-pointer-lock' permission is not set.", 'SecurityError'); return Promise.resolve(undefined); });
+      }
+    } catch (e) {}
+    // Конструкторы, которым в стороннем кадре Chrome отказывает ещё до работы.
+    const guardCtor = (name, msg, kind) => {
+      try {
+        const C = globalThis[name]; if (typeof C !== 'function') return;
+        const G = function () { if (crossSite()) throw dx(msg, kind); return Reflect.construct(C, arguments, new.target || G); };
+        G.prototype = C.prototype; Object.defineProperty(G, 'name', { value: name, configurable: true }); Object.defineProperty(G, 'length', { value: C.length, configurable: true });
+        for (const k of Object.getOwnPropertyNames(C)) { if (['length', 'name', 'prototype'].indexOf(k) >= 0) continue; try { Object.defineProperty(G, k, Object.getOwnPropertyDescriptor(C, k)); } catch (e) {} }
+        try { Object.defineProperty(C.prototype, 'constructor', { value: G, writable: true, configurable: true }); } catch (e) {}
+        Object.defineProperty(globalThis, name, { value: native(G), writable: true, enumerable: false, configurable: true });
+      } catch (e) {}
+    };
+    guardCtor('PaymentRequest', "Failed to construct 'PaymentRequest': Must be in a top-level browsing context or an iframe needs to specify allow=\"payment\" explicitly", 'SecurityError');
+    guardCtor('PresentationRequest', "Failed to construct 'PresentationRequest': The document is sandboxed and lacks the 'allow-presentation' flag.", 'SecurityError');
+    for (const sn of ['Accelerometer', 'Gyroscope', 'Magnetometer', 'LinearAccelerationSensor', 'GravitySensor', 'AbsoluteOrientationSensor', 'RelativeOrientationSensor']) guardCtor(sn, "Failed to construct '" + sn + "': Access to sensor features is disallowed by permissions policy", 'SecurityError');
+    try {
+      const ID = globalThis.IdleDetector;
+      if (typeof ID === 'function') {
+        Object.defineProperty(ID, 'requestPermission', { value: native(function requestPermission() { return rejectDx("Failed to execute 'requestPermission' on 'IdleDetector': Must be handling a user gesture to show a permission request.", 'NotAllowedError'); }), writable: true, enumerable: true, configurable: true });
+        setm(ID.prototype, 'start', function start() { return crossSite() ? policy('idle-detection', 'start', 'IdleDetector') : rejectDx("Failed to execute 'start' on 'IdleDetector': Idle detection permission not granted", 'NotAllowedError'); });
+      }
+    } catch (e) {}
+    try {
+      const SO = globalThis.screen && globalThis.screen.orientation && protoOf(globalThis.screen.orientation, 'ScreenOrientation', ET);
+      if (SO) setm(SO, 'lock', function lock() { return crossSite() ? rejectDx("Failed to execute 'lock' on 'ScreenOrientation': The window is sandboxed and lacks the 'allow-orientation-lock' flag.", 'SecurityError') : rejectDx('screen.orientation.lock() is not available on this device.', 'NotSupportedError'); });
+    } catch (e) {}
+    if (globalThis.cookieStore) { try { const CS = protoOf(globalThis.cookieStore, 'CookieStore', ET); if (CS) { setm(CS, 'getAll', function getAll() { return Promise.resolve([]); }); setm(CS, 'get', function get() { return Promise.resolve(null); }); setm(CS, 'set', function set() { return Promise.resolve(undefined); }); setm(CS, 'delete', function () { return Promise.resolve(undefined); }); } } catch (e) {} }
+    } catch (e) { try { console.error('[policy block] ' + (e && e.stack)); } catch (x) {} }
     // Планировщик: `postTask` отдаёт итог задачи обещанием, `yield` — пустое.
     if (globalThis.scheduler) {
       try {
@@ -4237,7 +4413,11 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       // `application/wasm` и удачным статусом, иначе TypeError его словами.
       const bytesOf = (src, what) => Promise.resolve(src).then((r) => {
         const head = "Failed to execute '" + what + "' on 'WebAssembly': ";
-        if (!(globalThis.Response && r instanceof Response)) {
+        if (globalThis.__pt_encTrace) { try { (globalThis.__pt_parentConsole || console).error('[wasm] ' + what + 'Streaming src=' + Object.prototype.toString.call(r) + ' ct=' + (r && r.headers && typeof r.headers.get === 'function' ? r.headers.get('content-type') : '?') + ' status=' + (r && r.status) + ' used=' + (r && r.bodyUsed) + ' ab=' + typeof (r && r.arrayBuffer)); } catch (e) {} }
+        // Ответ может прийти из другой области (свой Response песочницы):
+        // узнаём его по форме, а не по instanceof.
+        const looksResponse = r && typeof r === 'object' && typeof r.arrayBuffer === 'function' && r.headers && typeof r.headers.get === 'function';
+        if (!looksResponse) {
           throw new TypeError(head + "An argument must be provided, which must be a Response or Promise<Response> object");
         }
         const mime = String((r.headers && r.headers.get('content-type')) || '').split(';')[0].trim().toLowerCase();
@@ -4246,10 +4426,28 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         if (r.bodyUsed) throw new TypeError(head + 'Response already read');
         return r.arrayBuffer();
       });
-      const cs = function compileStreaming(source) { return bytesOf(source, 'compile').then((b) => W.compile(b)); };
+      const traceRej = (what) => (e) => { if (globalThis.__pt_encTrace) { try { (globalThis.__pt_parentConsole || console).error('[wasm] ' + what + ' rejected: ' + String(e && e.message).slice(0, 120)); } catch (x) {} } throw e; };
+      const cs = function compileStreaming(source) { return bytesOf(source, 'compile').then((b) => W.compile(b)).catch(traceRej('compileStreaming')); };
       const is = function instantiateStreaming(source, imports) {
-        return bytesOf(source, 'instantiate').then((b) => W.instantiate(b, imports));
+        return bytesOf(source, 'instantiate').then((b) => W.instantiate(b, imports)).catch(traceRej('instantiateStreaming'));
       };
+      // Трасса (`NOKK_TRACE_ENC=1`): чем и с чем зовут WebAssembly.
+      if (globalThis.__pt_encTrace) {
+        for (const k of ['instantiate', 'compile', 'validate']) {
+          const F = W[k];
+          if (typeof F !== 'function') continue;
+          const wrapped = function (a, b) {
+            const desc = a && typeof a === 'object' ? Object.prototype.toString.call(a) + (a.byteLength !== undefined ? '#' + a.byteLength : '') : typeof a;
+            let r;
+            try { r = F.call(this, a, b); } catch (e) { try { (globalThis.__pt_parentConsole || console).error('[wasm] ' + k + '(' + desc + ') threw ' + String(e && e.message).slice(0, 100)); } catch (x) {} throw e; }
+            if (r && typeof r.then === 'function') r.then((v) => { try { (globalThis.__pt_parentConsole || console).error('[wasm] ' + k + '(' + desc + ') ok ' + Object.prototype.toString.call(v)); } catch (x) {} }, (e) => { try { (globalThis.__pt_parentConsole || console).error('[wasm] ' + k + '(' + desc + ') rejected ' + String(e && e.message).slice(0, 120)); } catch (x) {} });
+            else { try { (globalThis.__pt_parentConsole || console).error('[wasm] ' + k + '(' + desc + ') = ' + String(r)); } catch (x) {} }
+            return r;
+          };
+          try { Object.defineProperty(wrapped, 'name', { value: k, configurable: true }); Object.defineProperty(wrapped, 'length', { value: F.length, configurable: true }); } catch (e) {}
+          Object.defineProperty(W, k, { value: native(wrapped), writable: true, enumerable: false, configurable: true });
+        }
+      }
       Object.defineProperty(W, 'compileStreaming', {
         value: native(cs), writable: true, enumerable: false, configurable: true });
       Object.defineProperty(W, 'instantiateStreaming', {
@@ -6056,10 +6254,18 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     const id = fid++;
     // Трасса реализации (`NOKK_TRACE_ENC=1`): запросы fetch челленджа.
     if (globalThis.__pt_encTrace) { try { (globalThis.__pt_parentConsole || console).error('[fetch] ' + Math.round(performance.now()) + 'мс #' + id + ' ' + (opts.method || 'GET') + ' ' + String(url).slice(0, 120) + ' opts=' + JSON.stringify({ mode: opts.mode, credentials: opts.credentials, cache: opts.cache, redirect: opts.redirect, headers: headerObj(opts.headers), signal: !!opts.signal, keepalive: opts.keepalive })); } catch (e) {} }
+    // `cache` у браузера превращается в заголовки: no-cache → max-age=0,
+    // no-store/reload → no-cache + Pragma. Сервер челленджа видит их.
+    const hdrs = headerObj(opts.headers);
+    const cacheMode = String(opts.cache || 'default');
+    if (cacheMode === 'no-cache' && !('cache-control' in hdrs)) hdrs['cache-control'] = 'max-age=0';
+    else if ((cacheMode === 'no-store' || cacheMode === 'reload') && !('cache-control' in hdrs)) { hdrs['cache-control'] = 'no-cache'; hdrs['pragma'] = 'no-cache'; }
     const req = {
       id, url: String(url),
       method: (opts.method || 'GET').toUpperCase(),
-      headers: headerObj(opts.headers),
+      headers: hdrs,
+      // Воркер из blob: реферера у его запросов нет.
+      noReferrer: !!globalThis.__ptNoReferrer,
       body: opts.body != null ? String(opts.body) : null,
       // Кадр, которому дали доступ к своим кукам, помечает этим свои
       // запросы: браузер добавляет к ним отдельный заголовок.
@@ -6594,11 +6800,13 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         const peer = this.__pt.peer;
         if (!peer) return;
         const ev = { type: 'message', data, origin: '', lastEventId: '', source: null, ports: [], isTrusted: true, target: peer, currentTarget: peer };
-        queueMicrotask(() => {
+        // Сообщение по порту — задача, а не микрозадача: у браузера оно идёт
+        // после уже поставленных нулевых таймеров.
+        setTimeout(() => {
           const st = peer.__pt;
           if (!st.started) { st.queue.push(ev); return; }
           peer.__ptDeliver(ev);
-        });
+        }, 0);
       }
       __ptDeliver(ev) {
         const st = this.__pt;
@@ -6871,11 +7079,13 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         if (!peers) return;
         for (const p of peers) {
           if (p === this || p.__pt.closed) continue;   // never echoes to the sender
-          queueMicrotask(() => {
+          // Широковещание у браузера идёт через другой поток и приходит позже
+          // таймеров на несколько миллисекунд.
+          setTimeout(() => {
             const ev = { type: 'message', data, origin: (globalThis.location && location.origin) || '', lastEventId: '', source: null, ports: [], isTrusted: true, target: p, currentTarget: p };
             try { if (typeof p.onmessage === 'function') p.onmessage(ev); } catch (e) {}
             for (const fn of p.__pt.listeners.slice()) { try { fn.call(p, ev); } catch (e) {} }
-          });
+          }, 5);
         }
       }
       addEventListener(t, fn) { if (t === 'message' && typeof fn === 'function') this.__pt.listeners.push(fn); }
@@ -10628,7 +10838,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     });
   };
   globalThis.getComputedStyle = globalThis.getComputedStyle || (() => ({ getPropertyValue: () => '', getPropertyPriority: () => '', length: 0, cssText: '', item: () => '', display: '', visibility: 'visible' }));
-  globalThis.requestIdleCallback = globalThis.requestIdleCallback || ((cb) => setTimeout(() => cb({ didTimeout: false, timeRemaining: () => 50 }), 1));
+  // Простой у браузера наступает после ближайшего кадра, не через миллисекунду.
+  globalThis.requestIdleCallback = globalThis.requestIdleCallback || ((cb) => setTimeout(() => cb({ didTimeout: false, timeRemaining: () => 50 }), 18));
   globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || ((id) => clearTimeout(id));
 
   navExtra('serviceWorker', {

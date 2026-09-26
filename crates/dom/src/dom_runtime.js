@@ -628,6 +628,7 @@
     set nodeValue(v) { this.data = String(v); }
     get textContent() { return this.data; }
     set textContent(v) { this.data = String(v); }
+    get length() { return this.data.length; }
     __ptShallowClone() { return new Text(this.data); }
   }
   class Comment extends Node {
@@ -637,6 +638,7 @@
     get nodeName() { return '#comment'; }
     get nodeValue() { return this.data; }
     get textContent() { return ''; }
+    get length() { return this.data.length; }
     __ptShallowClone() { return new Comment(this.data); }
   }
 
@@ -748,7 +750,12 @@
     }
     append(...ns) { for (const n of ns) this.appendChild(typeof n === 'string' ? new Text(n) : n); }
     prepend(...ns) { for (const n of ns.reverse()) this.insertBefore(typeof n === 'string' ? new Text(n) : n, this.firstChild); }
-    elementFromPoint() { return null; }
+    // DocumentOrShadowRoot: у теневого корня — те же ответы, что у документа
+    // (Chrome отдаёт стопку до <html>), а не пустота.
+    elementFromPoint(x, y) { const d = globalThis.document; return d ? d.elementFromPoint(x, y) : null; }
+    elementsFromPoint(x, y) { const d = globalThis.document; return d ? d.elementsFromPoint(x, y) : []; }
+    getSelection() { return typeof globalThis.getSelection === 'function' ? globalThis.getSelection() : null; }
+    getAnimations() { return []; }
   }
 
   // --- пользовательские элементы -------------------------------------------
@@ -916,7 +923,28 @@
       Object.defineProperty(this, '__ptImgDone', { value: false, writable: true, configurable: true, enumerable: false });
       if (url.slice(0, 5) === 'data:' || url.slice(0, 5) === 'blob:') {
         this.__ptImgDone = true;
-        __pt_soon(() => this.__ptFireLoad(true));
+        // Не картинка (`data:,x`, текстовый blob) — у браузера это `error`.
+        let isImage = true;
+        try {
+          if (url.slice(0, 5) === 'data:') {
+            const comma = url.indexOf(',');
+            const meta = comma < 0 ? '' : url.slice(5, comma).toLowerCase();
+            const mime = meta.split(';')[0];
+            if (mime && mime.slice(0, 6) !== 'image/') isImage = false;
+            if (!mime) isImage = false;
+            if (isImage && mime !== 'image/svg+xml') {
+              const payload = comma < 0 ? '' : url.slice(comma + 1);
+              const head = /;base64/.test(meta) ? globalThis.atob(payload.slice(0, 16)) : decodeURIComponent(payload.slice(0, 24));
+              isImage = /^(\x89PNG|GIF8|\xff\xd8|RIFF|BM|\x00\x00\x01\x00|<svg|<\?xml)/.test(head);
+            }
+          } else if (globalThis.__pt_blobs) {
+            const b = __pt_blobs.get(url);
+            if (b && !/^image\//.test(String(b.type || ''))) isImage = false;
+          }
+        } catch (e) {}
+        // Итог декодирования — задача после уже поставленных сообщений, как в
+        // браузере (декодер отвечает из другого потока).
+        setTimeout(() => this.__ptFireLoad(isImage), 0);
         return;
       }
       if (typeof globalThis.__pt_subresource !== 'function') return;
@@ -1381,6 +1409,7 @@
       __markDirty();
       return sr;
     }
+    getAnimations() { return []; }
     getHTML(opts) {
       const kids = (this.__ptLocal === 'template' ? __templateContent(this) : this).__ptKids;
       const withShadow = !!(opts && opts.serializableShadowRoots);
@@ -1605,11 +1634,50 @@
     get activeElement() { return this.__ptActive || this.body || null; }
     set activeElement(v) { this.__ptActive = v; }
     elementFromPoint(x, y) { return __elementFromPoint(x, y); }
+    getAnimations() { return []; }
+    // DOMImplementation: у нас была заглушка без методов, а
+    // `document.implementation.createHTMLDocument()` — обычный способ взять
+    // чистый документ.
+    get implementation() {
+      if (this.__ptImpl) return this.__ptImpl;
+      const self = this;
+      const impl = {
+        createHTMLDocument(title) {
+          const d = globalThis.__pt_lateDom.parseDocument('<!doctype html><html><head></head><body></body></html>', 'text/html');
+          if (title !== undefined) { const t = d.createElement('title'); __ptAdd.call(t, d.createTextNode(String(title))); __ptAdd.call(d.head, t); }
+          return d;
+        },
+        createDocument(ns, qname, doctype) {
+          const d = globalThis.__pt_lateDom.parseDocument(qname ? '<' + String(qname) + '/>' : '', ns === 'http://www.w3.org/1999/xhtml' ? 'application/xhtml+xml' : 'application/xml');
+          if (!qname) { for (const k of d.__ptKids.slice()) d.removeChild(k); }
+          return d;
+        },
+        createDocumentType(name, publicId, systemId) { return { nodeType: 10, name: String(name), publicId: String(publicId || ''), systemId: String(systemId || ''), nodeName: String(name) }; },
+        hasFeature() { return true; },
+      };
+      try { const D = globalThis.DOMImplementation; if (D && D.prototype) { for (const k of Object.keys(impl)) { Object.defineProperty(D.prototype, k, { value: impl[k], writable: true, enumerable: true, configurable: true }); } const o = Object.create(D.prototype); Object.defineProperty(this, '__ptImpl', { value: o, configurable: true }); return o; } } catch (e) {}
+      Object.defineProperty(this, '__ptImpl', { value: impl, configurable: true });
+      return impl;
+    }
+    // `document.all` — коллекция всех элементов в порядке дерева (у Chrome
+    // она «необнаружима» — typeof undefined; этого V8 нам не даёт, зато по
+    // индексу она отвечает, а не роняет читающего).
+    get all() {
+      const out = [];
+      if (this.documentElement) __walkTree(this.documentElement, (n) => { if (n.nodeType === ELEMENT_NODE) out.push(n); });
+      const c = __collection(out);
+      try { const H = globalThis.HTMLAllCollection; if (H && H.prototype) Object.setPrototypeOf(c, H.prototype); } catch (e) {}
+      return c;
+    }
+    get applets() { return __collection([]); }
     // Не один элемент, а вся стопка под точкой: браузер отдаёт цепочку от
     // самого глубокого до `<html>`.
     elementsFromPoint(x, y) {
       const out = [];
       for (let e = __elementFromPoint(x, y); e && e.nodeType === ELEMENT_NODE; e = e.parentNode) out.push(e);
+      // Точка в окне всегда попадает хотя бы в <html>: пустой стопки у
+      // браузера не бывает, пока точка внутри вида.
+      if (!out.length && this.documentElement && x >= 0 && y >= 0 && x < (globalThis.innerWidth || 0) && y < (globalThis.innerHeight || 0)) out.push(this.documentElement);
       return out;
     }
     get nodeName() { return '#document'; }
@@ -4018,6 +4086,14 @@
           // из них узлы, и `div.innerHTML = '<html><body></body></html>'`
           // давал двух детей там, где у браузера пусто.
         } else {
+          // Подразумеваемое закрытие, как у разбора HTML: новый блочный тег
+          // закрывает открытый <p>, `<li>` — открытый <li>, и т. п. Без этого
+          // `<p>a<p>b` вкладывался, а Chrome даёт двух соседей.
+          const CLOSES_P = new Set(['address', 'article', 'aside', 'blockquote', 'details', 'dialog', 'div', 'dl', 'fieldset', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hgroup', 'hr', 'main', 'menu', 'nav', 'ol', 'p', 'pre', 'section', 'table', 'ul']);
+          const SELF_CLOSES = { li: ['li'], dt: ['dt', 'dd'], dd: ['dt', 'dd'], option: ['option', 'optgroup'], optgroup: ['optgroup'], tr: ['tr', 'td', 'th'], td: ['td', 'th'], th: ['td', 'th'], thead: ['tbody', 'tfoot', 'thead'], tbody: ['tbody', 'tfoot', 'thead'], tfoot: ['tbody', 'tfoot', 'thead'] };
+          if (CLOSES_P.has(tag)) { for (let s = stack.length - 1; s > 0; s--) { if (stack[s].localName === 'p') { stack.length = s; break; } if (CLOSES_P.has(stack[s].localName) && stack[s].localName !== 'p') break; } }
+          const closes = SELF_CLOSES[tag];
+          if (closes) { for (let s = stack.length - 1; s > 0; s--) { const ln = stack[s].localName; if (closes.indexOf(ln) >= 0) { stack.length = s; break; } if (ln === 'table' || ln === 'ul' || ln === 'ol' || ln === 'select' || ln === 'dl') break; } }
           const el = elem(tag);
           for (const am of m[2].matchAll(/([\w-]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g)) {
             let v = am[2] || '';
@@ -4999,7 +5075,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         if (n.nodeType === TEXT_NODE) return esc(String(n.data), false);
         if (n.nodeType === COMMENT_NODE) return '<!--' + n.data + '-->';
         if (n.nodeType !== ELEMENT_NODE) {
-          return (n.__ptKids || []).map((c) => one(c, false)).join('');
+          // Дети обрывка (в том числе теневого корня) — каждый сам себе корень:
+          // xmlns у каждого элемента верхнего уровня, как у Chrome.
+          return (n.__ptKids || []).map((c) => one(c, root)).join('');
         }
         const tag = n.localName;
         let attrs = '';
@@ -5009,7 +5087,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         if (!kids && VOID_XML.has(tag)) return '<' + tag + attrs + ' />';
         return '<' + tag + attrs + '>' + kids + '</' + tag + '>';
       };
-      return one(node, node && node.nodeType === ELEMENT_NODE);
+      // Обрывок и теневой корень: их дети верхнего уровня — корни (xmlns).
+      return one(node, node && (node.nodeType === ELEMENT_NODE || node.nodeType === DOCUMENT_FRAGMENT_NODE));
     },
   };
 
@@ -8575,8 +8654,9 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     const D = globalThis.document && Object.getPrototypeOf(globalThis.document);
     if (D) {
       try {
+        const docSel = globalThis.__pt_native ? __pt_native(function getSelection() { return this === globalThis.document ? sel : null; }) : function getSelection() { return this === globalThis.document ? sel : null; };
         Object.defineProperty(D, 'getSelection', {
-          value: globalThis.getSelection, writable: true, enumerable: true, configurable: true,
+          value: docSel, writable: true, enumerable: true, configurable: true,
         });
       } catch (e) {}
     }

@@ -1043,10 +1043,23 @@ fn exception_message(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
 ) -> String {
     match tc.exception() {
-        Some(ex) => ex
-            .to_string(tc)
-            .map(|s| s.to_rust_string_lossy(tc))
-            .unwrap_or_else(|| "uncatchable JS exception".to_string()),
+        Some(ex) => {
+            let msg = ex
+                .to_string(tc)
+                .map(|s| s.to_rust_string_lossy(tc))
+                .unwrap_or_else(|| "uncatchable JS exception".to_string());
+            // Со стеком, когда он есть: ошибка загрузчика без него — иголка в
+            // стоге на сотню тысяч строк.
+            let stack = ex
+                .to_object(tc)
+                .and_then(|o| {
+                    let key = v8::String::new(tc, "stack")?;
+                    let v = o.get(tc, key.into())?;
+                    if v.is_string() { Some(v.to_rust_string_lossy(tc)) } else { None }
+                })
+                .unwrap_or_default();
+            if stack.len() > msg.len() { stack } else { msg }
+        }
         None => "unknown JS error".to_string(),
     }
 }
