@@ -872,7 +872,7 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   // %% и неизвестные — ничего не едят; Symbol под %d — NaN, без броска.
   // Исключение из toString уходит наружу. Сверено на scratchpad/console_fmt.html.
   const FORMATTED = { log: 1, debug: 1, info: 1, warn: 1, error: 1, trace: 1, group: 1, groupCollapsed: 1, assert: 1 };
-  const LABELED = { count: 1, countReset: 1, time: 1, timeEnd: 1, timeLog: 1 };
+  const LABELED = { count: 1, countReset: 1, time: 1, timeEnd: 1, timeLog: 1, timeStamp: 1, profile: 1, profileEnd: 1, context: 1 };
   const format = (args, idx) => {
     if (args.length < idx + 2 || typeof args[idx] !== 'string') return;
     const s = args[idx]; let off = 0, ai = idx + 1;
@@ -897,9 +897,14 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
         if (name === 'assert') { if (args[0]) return undefined; format(args, 1); }
         else format(args, 0);
       } else if (LABELED[name] && args.length) {
-        // Метка счётчика/таймера — ToString первого довода (Symbol бросает).
+        // Метка счётчика/таймера — ToString первого довода (Symbol бросает);
+        // шаблонной строкой, чтобы в стеке не появился кадр `String`.
         if (typeof args[0] === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
-        args[0] = String(args[0]);
+        args[0] = `${args[0]}`;
+      } else if (name === 'createTask') {
+        if (typeof args[0] !== 'string' || !args[0]) throw new Error('First argument must be a non-empty string.');
+        const task = {}; Object.defineProperty(task, 'run', { value: ({ run(f) { return f(); } }).run, writable: true, enumerable: true, configurable: true });
+        return task;
       }
       if (!SPOKEN[name] || said.length > 256) return undefined;
       const parts = [];
@@ -6184,10 +6189,33 @@ const STACK_TEMPLATE: &str = r##"(() => {
         // нашим; встроенное, позванное самой страницей, остаётся.
         const mine = Array.prototype.map.call(sites, (f) => ours(f));
         const builtin = (f) => { try { return f.getLineNumber() == null && !f.getFileName() && !f.isEval(); } catch (e) { return false; } };
-        // Снаружи внутрь: цепочка встроенных над нашим кадром прячется целиком.
-        const hidden = new Array(sites.length);
-        for (let i = sites.length - 1; i >= 0; i--) hidden[i] = mine[i] || (builtin(sites[i]) && !!hidden[i + 1]);
-        keep = Array.prototype.filter.call(sites, (f, i) => !hidden[i]);
+        // Консоль у браузера — встроенная: её кадр виден как
+        // `console.log (<anonymous>)`, а преобразование довода из
+        // форматирования (parseInt/parseFloat/String) — своим кадром над ним.
+        // Наш метод консоли — обычная функция пролога: её кадр не прячется, а
+        // подменяется таким же, и встроенные внутри неё остаются видны.
+        const CONS = new Set(['assert', 'clear', 'context', 'count', 'countReset', 'createTask', 'debug', 'dir', 'dirxml', 'error', 'group', 'groupCollapsed', 'groupEnd', 'info', 'log', 'profile', 'profileEnd', 'table', 'time', 'timeEnd', 'timeLog', 'timeStamp', 'trace', 'warn']);
+        const consoleName = (f, i) => { try { const n = f.getFunctionName(); const t = f.getTypeName(); return mine[i] && CONS.has(n) && (t === 'console' || t === 'Object' || t == null) ? n : null; } catch (e) { return null; } };
+        const fake = (name) => {
+          const label = 'console.' + name + ' (<anonymous>)';
+          const u = () => undefined, n = () => null, no = () => false;
+          return { toString: () => label, getFunctionName: () => 'console.' + name, getMethodName: () => name, getTypeName: n, getFileName: u, getScriptNameOrSourceURL: u, getLineNumber: n, getColumnNumber: n, getEnclosingLineNumber: n, getEnclosingColumnNumber: n, getPosition: () => 0, getPromiseIndex: n, getEvalOrigin: u, getThis: u, getFunction: u, getScriptHash: () => '', isNative: no, isEval: no, isConstructor: no, isToplevel: no, isAsync: no, isPromiseAll: no };
+        };
+        // Снаружи внутрь: цепочка встроенных над нашим кадром прячется целиком —
+        // кроме той, что внутри кадра консоли.
+        const hidden = new Array(sites.length), swap = new Array(sites.length);
+        let inside = false;
+        for (let i = sites.length - 1; i >= 0; i--) {
+          const cn = consoleName(sites[i], i);
+          if (cn) {
+            // Вложенные обёртки одного метода — один кадр.
+            if (swap[i + 1] && swap[i + 1].getMethodName() === cn) { hidden[i] = true; continue; }
+            hidden[i] = false; swap[i] = fake(cn); inside = true; continue;
+          }
+          hidden[i] = mine[i] || (builtin(sites[i]) && !inside && !!hidden[i + 1]);
+        }
+        keep = [];
+        for (let i = 0; i < sites.length; i++) if (!hidden[i]) keep.push(swap[i] || sites[i]);
       } catch (e) {}
     }
     try {
