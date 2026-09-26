@@ -1141,7 +1141,8 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   globalThis.setTimeout = (fn, delay, ...args) => add(fn, delay, false, args);
   globalThis.setInterval = (fn, delay, ...args) => add(fn, delay, true, args);
   globalThis.clearTimeout = (id) => { const t = q.get(id); if (t) t.cancelled = true; q.delete(id); };
-  globalThis.clearInterval = globalThis.clearTimeout;
+  // Отдельная функция, а не тот же объект: у браузера clearTimeout !== clearInterval.
+  globalThis.clearInterval = (id) => { const t = q.get(id); if (t) t.cancelled = true; q.delete(id); };
   // Задача вне таймеров (`scheduler.postTask` с высоким приоритетом): у
   // браузера она идёт раньше уже поставленных нулевых таймеров.
   Object.defineProperty(globalThis, '__pt_addTask', { value: (fn, delay, front) => {
@@ -1778,8 +1779,12 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     }
     return new TypeError('Illegal invocation');
   };
+  // Сам прототип интерфейса — не экземпляр: у него собственный `constructor`,
+  // и обход графа зовёт на нём каждый геттер, ожидая «Illegal invocation».
+  // Поэтому цепочка смотрится начиная с прототипа объекта, а не с него самого.
   const chainHas = (t, name) => {
-    let p = t;
+    let p;
+    try { p = Object.getPrototypeOf(t); } catch (e) { return false; }
     for (let i = 0; i < 12 && p; i++) {
       try {
         const c = Object.getOwnPropertyDescriptor(p, 'constructor');
@@ -1838,10 +1843,14 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     def(m, 'name', { value: typeof key === 'symbol' ? name : key, configurable: true });
     return m;
   };
+  // Геттеры-обещания (`closed`, `ready`, `finished`…) на чужом `this` у
+  // браузера не бросают, а отдают отклонённое обещание с тем же TypeError.
+  const PROMISE_GETTERS = new Set(['WritableStreamDefaultWriter.closed', 'WritableStreamDefaultWriter.ready', 'ViewTransition.finished', 'ViewTransition.ready', 'ViewTransition.updateCallbackDone', 'ReadableStreamDefaultReader.closed', 'ReadableStreamBYOBReader.closed', 'NavigationTransition.committed', 'NavigationTransition.finished', 'BeforeInstallPromptEvent.userChoice', 'Animation.finished', 'Animation.ready', 'ImageDecoder.completed', 'ImageTrackList.ready', 'MediaKeySession.closed', 'WebTransport.ready', 'WebTransport.closed', 'PresentationReceiver.connectionList', 'BackgroundFetchRecord.responseReady', 'WebSocketStream.opened', 'WebSocketStream.closed']);
   const asAccessor = (fn, key, kind, guard) => {
     const P = guard && guard.prototype;
+    const rejects = !!guard && PROMISE_GETTERS.has(guard.name + '.' + keyName(key));
     const g = kind === 'get '
-      ? (guard ? function () { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + keyName(key) + '#get', this); return fn.call(asThis(P, this)); }
+      ? (guard ? function () { if (!ownerOk(guard, P, this)) { const err = illegal(guard.name + '.' + keyName(key) + '#get', this); if (rejects) return Promise.reject(err); throw err; } return fn.call(asThis(P, this)); }
                : function () { return fn.call(this); })
       : (guard ? function (v) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + keyName(key) + '#set', this); return fn.call(asThis(P, this), v); }
                : function (v) { return fn.call(this, v); });
@@ -1880,7 +1889,7 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
       for (const kind of ['get ', 'set ']) {
         const f = kind === 'get ' ? get : set;
         if (typeof f !== 'function') continue;
-        const wantG = guard && !EXC.has(label + '#' + kind.trim());
+        const wantG = guard && (!EXC.has(label + '#' + kind.trim()) || (kind === 'get ' && PROMISE_GETTERS.has(label)));
         if ((wantG || !isStrict(f)) && d.configurable) {
           const w = asAccessor(f, key, kind, wantG ? guard : null);
           const S = stubs(); if (S && S.has(f)) S.add(w);
@@ -2250,6 +2259,231 @@ const SHAPE_FIXES: &str = r#"(() => {
     } catch (e) {}
   }
   try { if (globalThis.RTCPeerConnection) Object.defineProperty(RTCPeerConnection, 'length', { value: 0, configurable: true }); } catch (e) {}
+  // Форма графа по сверке с Chrome 151 (scratchpad/walker_diff.js).
+  try {
+    const nat = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
+    // Метод без `.prototype` и в маске: обёртка синтаксисом метода.
+    const methodize = (o, k) => {
+      try {
+        const d = Object.getOwnPropertyDescriptor(o, k);
+        if (!d || typeof d.value !== 'function' || !d.configurable) return;
+        const f = d.value;
+        const isAsync = Object.prototype.toString.call(f) === '[object AsyncFunction]';
+        if (!Object.prototype.hasOwnProperty.call(f, 'prototype') && !isAsync && globalThis.__pt_native && /\[native code\]/.test(Function.prototype.toString.call(f))) return;
+        const m = ({ [k](...a) { return f.apply(this, a); } })[k];
+        try { Object.defineProperty(m, 'length', { value: f.length, configurable: true }); } catch (e) {}
+        Object.defineProperty(o, k, { value: nat(m, k), writable: d.writable, enumerable: d.enumerable, configurable: true });
+      } catch (e) {}
+    };
+    // Итерируемые списки делят методы с Array.prototype, как у браузера.
+    for (const n of ['NodeList', 'DOMTokenList', 'CSSUnparsedValue', 'CSSTransformValue', 'CSSNumericArray', 'XRInputSourceArray', 'TimelineTriggerRangeList']) {
+      const P = globalThis[n] && globalThis[n].prototype; if (!P) continue;
+      for (const k of ['entries', 'keys', 'values', 'forEach']) { try { Object.defineProperty(P, k, { value: Array.prototype[k], writable: true, enumerable: true, configurable: true }); } catch (e) {} }
+      try { Object.defineProperty(P, Symbol.iterator, { value: Array.prototype.values, writable: true, enumerable: false, configurable: true }); } catch (e) {}
+    }
+    // console: прототип-пустышка, `memory`, методы без `.prototype`.
+    if (globalThis.console && typeof console === 'object') {
+      try { if (Object.getPrototypeOf(console) === Object.prototype) Object.setPrototypeOf(console, Object.create(Object.prototype)); } catch (e) {}
+      try {
+        if (!('memory' in console)) {
+          const mem = globalThis.performance && performance.memory;
+          const MI = mem ? Object.getPrototypeOf(mem) : Object.prototype;
+          const m = Object.create(MI);
+          Object.defineProperty(console, 'memory', { get: nat(function () { return m; }, 'get memory'), set: nat(function () {}, 'set memory'), enumerable: true, configurable: true });
+        }
+      } catch (e) {}
+      for (const k of Object.getOwnPropertyNames(console)) methodize(console, k);
+    }
+    // CSS: фабрики единиц, highlights, paintWorklet, registerProperty.
+    if (globalThis.CSS && typeof CSS === 'object') {
+      const UNITS = ['Hz', 'Q', 'cap', 'ch', 'cm', 'cqb', 'cqh', 'cqi', 'cqmax', 'cqmin', 'cqw', 'deg', 'dpcm', 'dpi', 'dppx', 'dvb', 'dvh', 'dvi', 'dvmax', 'dvmin', 'dvw', 'em', 'ex', 'fr', 'grad', 'ic', 'in', 'kHz', 'lh', 'lvb', 'lvh', 'lvi', 'lvmax', 'lvmin', 'lvw', 'mm', 'ms', 'number', 'pc', 'percent', 'pt', 'px', 'rad', 'rcap', 'rch', 'rem', 'rex', 'ric', 'rlh', 's', 'svb', 'svh', 'svi', 'svmax', 'svmin', 'svw', 'turn', 'vb', 'vh', 'vi', 'vmax', 'vmin', 'vw', 'x'];
+      let U = globalThis.CSSUnitValue;
+      let ok = false; try { const t = new U(1, 'px'); ok = t && t.unit === 'px' && t.value === 1; } catch (e) {}
+      if (!ok) {
+        const NV = globalThis.CSSNumericValue;
+        const STATE = new WeakMap();
+        const CU = function CSSUnitValue(value, unit) {
+          if (!new.target) throw new TypeError("Failed to construct 'CSSUnitValue': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+          if (arguments.length < 2) throw new TypeError("Failed to construct 'CSSUnitValue': 2 arguments required, but only " + arguments.length + ' present.');
+          const v = Number(value); const u = String(unit);
+          if (!isFinite(v)) throw new TypeError("Failed to construct 'CSSUnitValue': The provided double value is non-finite.");
+          if (!UNITS.includes(u)) throw new TypeError("Failed to construct 'CSSUnitValue': Invalid unit: " + u);
+          STATE.set(this, { value: v, unit: u });
+        };
+        const oldP = U && U.prototype;
+        CU.prototype = oldP && typeof oldP === 'object' ? oldP : Object.create(NV ? NV.prototype : Object.prototype);
+        try { Object.defineProperty(CU.prototype, 'constructor', { value: CU, writable: true, configurable: true }); } catch (e) {}
+        const st = (o) => { const x = STATE.get(o); if (!x) throw new TypeError('Illegal invocation'); return x; };
+        Object.defineProperty(CU.prototype, 'value', { get: nat(function () { return st(this).value; }, 'get value'), set: nat(function (v) { st(this).value = Number(v); }, 'set value'), enumerable: true, configurable: true });
+        Object.defineProperty(CU.prototype, 'unit', { get: nat(function () { return st(this).unit; }, 'get unit'), enumerable: true, configurable: true });
+        const suffix = (u) => (u === 'number' ? '' : u === 'percent' ? '%' : u);
+        Object.defineProperty(CU.prototype, 'toString', { value: nat(({ toString() { const x = st(this); return String(x.value) + suffix(x.unit); } }).toString, 'toString'), writable: true, enumerable: true, configurable: true });
+        try { Object.defineProperty(CU.prototype, Symbol.toStringTag, { value: 'CSSUnitValue', configurable: true }); } catch (e) {}
+        try { Object.defineProperty(CU, 'length', { value: 2, configurable: true }); } catch (e) {}
+        Object.defineProperty(globalThis, 'CSSUnitValue', { value: nat(CU, 'CSSUnitValue'), writable: true, enumerable: false, configurable: true });
+        U = CU;
+      }
+      for (const u of UNITS) {
+        if (typeof CSS[u] === 'function') continue;
+        const f = ({ [u](value) { if (arguments.length < 1) throw new TypeError("Failed to execute '" + u + "' on 'CSS': 1 argument required, but only 0 present."); return new U(value, u); } })[u];
+        Object.defineProperty(CSS, u, { value: nat(f, u), writable: true, enumerable: true, configurable: true });
+      }
+      if (!('highlights' in CSS)) { const HR = globalThis.HighlightRegistry; const h = HR && HR.prototype ? Object.create(HR.prototype) : new Map(); Object.defineProperty(CSS, 'highlights', { get: nat(function () { return h; }, 'get highlights'), enumerable: true, configurable: true }); }
+      if (!('paintWorklet' in CSS)) { const W = globalThis.Worklet; const w = W && W.prototype ? Object.create(W.prototype) : {}; Object.defineProperty(CSS, 'paintWorklet', { get: nat(function () { return w; }, 'get paintWorklet'), enumerable: true, configurable: true }); }
+      if (typeof CSS.registerProperty !== 'function') { Object.defineProperty(CSS, 'registerProperty', { value: nat(({ registerProperty(d) { if (arguments.length < 1) throw new TypeError("Failed to execute 'registerProperty' on 'CSS': 1 argument required, but only 0 present."); } }).registerProperty, 'registerProperty'), writable: true, enumerable: true, configurable: true }); }
+      for (const k of ['escape', 'supports']) methodize(CSS, k);
+    }
+    // Замороженные статические списки.
+    const FROZEN_ENC = Object.freeze(['aes128gcm', 'aesgcm']);
+    const FROZEN_SRC = Object.freeze(['cpu']);
+    try { if (globalThis.PushManager) Object.defineProperty(PushManager, 'supportedContentEncodings', { get: nat(function () { return FROZEN_ENC; }, 'get supportedContentEncodings'), set: undefined, enumerable: true, configurable: true }); } catch (e) {}
+    try { if (globalThis.PressureObserver) Object.defineProperty(PressureObserver, 'knownSources', { get: nat(function () { return FROZEN_SRC; }, 'get knownSources'), set: undefined, enumerable: true, configurable: true }); } catch (e) {}
+    try { const t = globalThis.PerformanceObserver && PerformanceObserver.supportedEntryTypes; if (Array.isArray(t) && !Object.isFrozen(t)) Object.freeze(t); } catch (e) {}
+    // styleMedia: интерфейс StyleMedia с `type` и `matchMedium`.
+    try {
+      if (globalThis.styleMedia && typeof styleMedia === 'object' && Object.getPrototypeOf(styleMedia) === Object.prototype) {
+        // Конструктор скрыт (у Chrome глобального StyleMedia нет), прототип — свой.
+        const SM = nat(function StyleMedia() { throw new TypeError('Illegal constructor'); }, 'StyleMedia');
+        const P = SM.prototype;
+        Object.defineProperty(P, 'type', { get: nat(function () { if (this !== styleMedia) throw new TypeError('Illegal invocation'); return 'screen'; }, 'get type'), enumerable: true, configurable: true });
+        Object.defineProperty(P, 'matchMedium', { value: nat(({ matchMedium(q) { if (this !== styleMedia) throw new TypeError('Illegal invocation'); try { return !!matchMedia(String(q)).matches; } catch (e) { return false; } } }).matchMedium, 'matchMedium'), writable: true, enumerable: true, configurable: true });
+        try { Object.defineProperty(P, Symbol.toStringTag, { value: 'StyleMedia', configurable: true }); } catch (e) {}
+        try { delete P.constructor; } catch (e) {}
+        for (const k of Object.getOwnPropertyNames(styleMedia)) { try { delete styleMedia[k]; } catch (e) {} }
+        Object.setPrototypeOf(styleMedia, P);
+      }
+    } catch (e) {}
+    // Option.prototype — прототип HTMLOptionElement, как Image/Audio.
+    try {
+      if (globalThis.Option && globalThis.HTMLOptionElement && Option.prototype !== HTMLOptionElement.prototype) {
+        const d = Object.getOwnPropertyDescriptor(globalThis, 'Option');
+        const O = function Option(text, value, defaultSelected, selected) {
+          if (!new.target) throw new TypeError("Failed to construct 'Option': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+          const o = document.createElement('option');
+          if (text !== undefined) o.text = String(text);
+          if (value !== undefined) o.value = String(value);
+          if (defaultSelected) o.setAttribute('selected', '');
+          if (selected) o.selected = true;
+          return o;
+        };
+        O.prototype = HTMLOptionElement.prototype;
+        try { Object.defineProperty(O, 'length', { value: 0, configurable: true }); } catch (e) {}
+        Object.defineProperty(globalThis, 'Option', { value: nat(O, 'Option'), writable: true, enumerable: d ? d.enumerable : false, configurable: true });
+      }
+    } catch (e) {}
+    // Цепочка окна: Window.prototype → WindowProperties → EventTarget.prototype.
+    try {
+      const WPp = Object.getPrototypeOf(Window.prototype);
+      if (WPp && Object.prototype.toString.call(WPp) !== '[object WindowProperties]') {
+        // Пустая прослойка над EventTarget.prototype уже есть — это она и есть.
+        if (WPp !== EventTarget.prototype && Object.getOwnPropertyNames(WPp).length === 0 && Object.getPrototypeOf(WPp) === EventTarget.prototype) {
+          Object.defineProperty(WPp, Symbol.toStringTag, { value: 'WindowProperties', configurable: true });
+        } else {
+          const WP = Object.create(WPp);
+          Object.defineProperty(WP, Symbol.toStringTag, { value: 'WindowProperties', configurable: true });
+          Object.setPrototypeOf(Window.prototype, WP);
+        }
+      }
+    } catch (e) {}
+    // Псевдонимы webkit* — те же функции.
+    for (const [alias, orig] of [['webkitSpeechRecognition', 'SpeechRecognition'], ['webkitSpeechGrammar', 'SpeechGrammar'], ['webkitSpeechGrammarList', 'SpeechGrammarList'], ['webkitSpeechRecognitionError', 'SpeechRecognitionErrorEvent'], ['webkitSpeechRecognitionEvent', 'SpeechRecognitionEvent']]) {
+      try { const d = Object.getOwnPropertyDescriptor(globalThis, alias); const o = globalThis[orig]; if (d && d.configurable && typeof o === 'function' && d.value !== o) Object.defineProperty(globalThis, alias, { value: o, writable: true, enumerable: false, configurable: true }); } catch (e) {}
+    }
+    // Лишние собственные члены: remove у Text/Comment живёт на CharacterData.
+    for (const n of ['Text', 'Comment']) { try { const P = globalThis[n] && globalThis[n].prototype; if (P && Object.prototype.hasOwnProperty.call(P, 'remove') && globalThis.CharacterData && 'remove' in CharacterData.prototype) delete P.remove; } catch (e) {} }
+    // Асинхронные методы — обычные функции, отдающие обещание.
+    for (const n of ['RTCPeerConnection']) { const P = globalThis[n] && globalThis[n].prototype; if (!P) continue; for (const k of Object.getOwnPropertyNames(P)) { try { const d = Object.getOwnPropertyDescriptor(P, k); if (d && typeof d.value === 'function' && Object.prototype.toString.call(d.value) === '[object AsyncFunction]') methodize(P, k); } catch (e) {} } }
+    // Методы без `.prototype` и в маске.
+    for (const [o, keys] of [[globalThis.WebAssembly, ['compileStreaming', 'instantiateStreaming']], [globalThis.location, ['valueOf']], [globalThis, ['postMessage']], [globalThis.External && External.prototype, ['AddSearchProvider', 'IsSearchProviderInstalled']], [globalThis.Scheduler && Scheduler.prototype, ['postTask', 'yield']], [globalThis.Navigation && Navigation.prototype, ['entries']], [globalThis.chrome && chrome.app, ['getDetails', 'getIsInstalled', 'installState', 'runningState']], [globalThis.DOMImplementation && DOMImplementation.prototype, ['createDocument', 'createDocumentType', 'createHTMLDocument', 'hasFeature']]]) {
+      if (!o) continue; for (const k of keys) methodize(o, k);
+    }
+    globalThis.__pt_methodize = methodize;
+    // Наследуемое не дублируется: EventTarget-методы и потоковые close/abort
+    // живут на предках, а `resume` — только у AudioContext.
+    // Свои реализации слушателей (WebSocket, Worker…) уезжают с прототипов
+    // в таблицу, а EventTarget.prototype передаёт им вызов по цепочке — так
+    // у прототипов нет чужих для браузера собственных методов.
+    try {
+      const ETP = globalThis.EventTarget && EventTarget.prototype;
+      const EVT = new WeakMap();
+      if (ETP) {
+        for (const n of ['Worker', 'WebSocket', 'MessagePort', 'FileReader', 'BroadcastChannel', 'BaseAudioContext', 'AbortSignal']) {
+          const P = globalThis[n] && globalThis[n].prototype; if (!P) continue;
+          const impl = {}; let any = false;
+          for (const k of ['addEventListener', 'removeEventListener', 'dispatchEvent']) {
+            const d = Object.getOwnPropertyDescriptor(P, k);
+            if (d && typeof d.value === 'function' && d.configurable && d.value !== ETP[k]) { impl[k] = d.value; delete P[k]; any = true; }
+          }
+          if (any) EVT.set(P, impl);
+        }
+        const find = (t) => { let p = t; for (let i = 0; i < 12 && p; i++) { const e = EVT.get(p); if (e) return e; p = Object.getPrototypeOf(p); } return null; };
+        for (const k of ['addEventListener', 'removeEventListener', 'dispatchEvent']) {
+          const d = Object.getOwnPropertyDescriptor(ETP, k);
+          if (!d || typeof d.value !== 'function') continue;
+          const base = d.value;
+          const w = ({ [k](...a) {
+            const t = this;
+            if (t !== null && (typeof t === 'object' || typeof t === 'function')) { const e = find(Object.getPrototypeOf(t)); if (e && e[k]) return e[k].apply(t, a); }
+            return base.apply(this, a);
+          } })[k];
+          try { Object.defineProperty(w, 'length', { value: base.length, configurable: true }); } catch (e) {}
+          Object.defineProperty(ETP, k, { value: nat(w, k), writable: d.writable, enumerable: d.enumerable, configurable: d.configurable });
+        }
+      }
+    } catch (e) {}
+    try { const P = globalThis.FileSystemWritableFileStream && FileSystemWritableFileStream.prototype; if (P && globalThis.WritableStream) for (const k of ['close', 'abort']) if (Object.prototype.hasOwnProperty.call(P, k) && k in WritableStream.prototype) delete P[k]; } catch (e) {}
+    try { const B = globalThis.BaseAudioContext && BaseAudioContext.prototype, A = globalThis.AudioContext && AudioContext.prototype; if (B && A && Object.prototype.hasOwnProperty.call(B, 'resume') && Object.prototype.hasOwnProperty.call(A, 'resume')) delete B.resume; } catch (e) {}
+    // toString у единиц CSS — на CSSNumericValue.prototype, как у браузера.
+    try { const SV = globalThis.CSSStyleValue && CSSStyleValue.prototype, U = globalThis.CSSUnitValue && CSSUnitValue.prototype; if (SV && U && Object.prototype.hasOwnProperty.call(U, 'toString')) { const d = Object.getOwnPropertyDescriptor(U, 'toString'); Object.defineProperty(SV, 'toString', d); delete U.toString; } } catch (e) {}
+    // chrome.loadTimes/csi: безымянные функции с `.prototype`, но родные на вид.
+    try { if (globalThis.chrome && globalThis.__pt_native) for (const k of ['loadTimes', 'csi']) if (typeof chrome[k] === 'function') __pt_native(chrome[k]); } catch (e) {}
+  } catch (e) {}
+  // Navigation API: `navigation.currentEntry` и `navigation.activation` — у
+  // Chrome это объекты с адресом и ключами записи; у нас заглушка отвечала
+  // undefined, и страница, читающая их поля, падала.
+  try {
+    const N = globalThis.Navigation, nav = globalThis.navigation;
+    const natn = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
+    if (N && N.prototype && nav && typeof nav === 'object') {
+      const uuid = () => { const h = '0123456789abcdef'; let out = ''; for (let i = 0; i < 36; i++) { if (i === 8 || i === 13 || i === 18 || i === 23) out += '-'; else if (i === 14) out += '4'; else if (i === 19) out += h[8 + Math.floor(Math.random() * 4)]; else out += h[Math.floor(Math.random() * 16)]; } return out; };
+      const mkEntry = () => {
+        const EP = globalThis.NavigationHistoryEntry && NavigationHistoryEntry.prototype;
+        const e = Object.create(EP || Object.prototype);
+        const key = uuid(), id = uuid();
+        const vals = { url: String(globalThis.location && location.href || ''), key, id, index: 0, sameDocument: true };
+        if (EP) {
+          for (const k of Object.keys(vals)) {
+            try { Object.defineProperty(EP, k, { get: natn(function () { const st = ENTRY_STATE.get(this); if (!st) throw new TypeError('Illegal invocation'); return st[k]; }, 'get ' + k), enumerable: true, configurable: true }); } catch (x) {}
+          }
+          try { Object.defineProperty(EP, 'getState', { value: natn(function getState() { if (!ENTRY_STATE.has(this)) throw new TypeError('Illegal invocation'); return undefined; }, 'getState'), writable: true, enumerable: true, configurable: true }); } catch (x) {}
+        }
+        ENTRY_STATE.set(e, vals);
+        return e;
+      };
+      const ENTRY_STATE = new WeakMap();
+      let current = null;
+      const cur = () => (current || (current = mkEntry()));
+      let activation = null;
+      const act = () => {
+        if (activation) return activation;
+        const AP = globalThis.NavigationActivation && NavigationActivation.prototype;
+        activation = Object.create(AP || Object.prototype);
+        const vals = { entry: cur(), from: null, navigationType: 'push' };
+        if (AP) for (const k of Object.keys(vals)) {
+          try { Object.defineProperty(AP, k, { get: natn(function () { if (this !== activation) throw new TypeError('Illegal invocation'); return vals[k]; }, 'get ' + k), enumerable: true, configurable: true }); } catch (x) {}
+        }
+        return activation;
+      };
+      const P = N.prototype;
+      const acc = (k, get) => { try { Object.defineProperty(P, k, { get: natn(function () { if (this !== nav) throw new TypeError('Illegal invocation'); return get.call(this); }, 'get ' + k), enumerable: true, configurable: true }); } catch (e) {} };
+      acc('currentEntry', function () { return cur(); });
+      acc('activation', function () { return act(); });
+      acc('transition', function () { return null; });
+      acc('canGoBack', function () { return false; });
+      acc('canGoForward', function () { return false; });
+      try { Object.defineProperty(P, 'entries', { value: natn(({ entries() { if (this !== nav) throw new TypeError('Illegal invocation'); return [cur()]; } }).entries, 'entries'), writable: true, enumerable: true, configurable: true }); } catch (e) {}
+    }
+  } catch (e) {}
   try { for (const k of ['permission', 'maxActions', 'requestPermission']) redo(globalThis.Notification, k); } catch (e) {}
   // `tabIndex` отражается в атрибут `tabindex`, как у браузера: заглушка
   // таблицы имён держала число в ячейке, и `el.tabIndex = -1` не оставлял
@@ -2321,6 +2555,8 @@ const SHAPE_FIXES: &str = r#"(() => {
       Object.defineProperty(SP, 'yield', { value: nat(function () { return new Promise((r) => setTimeout(r, 0)); }, 'yield'), writable: true, enumerable: true, configurable: true });
     }
   } catch (e) {}
+  // Поздние методы без `.prototype`: postMessage, scheduler, navigation.
+  try { const mz = globalThis.__pt_methodize; if (typeof mz === 'function') { for (const [o, keys] of [[globalThis, ['postMessage']], [globalThis.Scheduler && Scheduler.prototype, ['postTask', 'yield']], [globalThis.Navigation && Navigation.prototype, ['entries']]]) { if (!o) continue; for (const k of keys) mz(o, k); } } delete globalThis.__pt_methodize; } catch (e) {}
 })();"#;
 
 pub fn window_order_script() -> String {
@@ -4005,7 +4241,12 @@ __OPFS__
   }
 
   if (globalThis.screen) {
-    const SO = rebrand(screen.orientation, 'ScreenOrientation', ET);
+    // Уже пересажен раньше (блок правил кадра): второй пересад терял angle и
+    // type — их геттеры оставались на старом прототипе, а новый получал
+    // заглушки, отвечающие undefined.
+    const so = screen.orientation, sp = so && Object.getPrototypeOf(so);
+    const SO = (sp && sp !== Object.prototype && typeof sp.constructor === 'function' && sp.constructor.name === 'ScreenOrientation')
+      ? sp.constructor : rebrand(so, 'ScreenOrientation', ET);
     // `onchange` — обработчик события: null, с чтением и записью.
     if (SO && !Object.getOwnPropertyDescriptor(SO.prototype, 'onchange')) {
       const cell = new WeakMap();
@@ -4897,7 +5138,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         ? keep.WebGL2RenderingContext : keep.WebGLRenderingContext) || null;
       if (!table) return gl;
       const bound = new Map();
-      return new Proxy(gl, {
+      return __pt_proxy(gl, {
         get(t, k) {
           const own = table[k];
           if (typeof own === 'function') {
@@ -5575,6 +5816,26 @@ const STACK_TEMPLATE: &str = r##"(() => {
       return f.getLineNumber() != null;       // безымянный, но с позицией — наш
     } catch (e) { return false; }
   };
+  // Прокси, которую нельзя замкнуть на себя: `Object.setPrototypeOf(x, x)`
+  // у браузера бросает «Cyclic __proto__ value» на любом объекте, а у прокси
+  // без ловушки проверка цикла обрывается на ней самой — и цель получала
+  // прототипом свою же обёртку. Обход глобального графа делает ровно это со
+  // всем подряд, и после него `Function.prototype.toString` уходил в
+  // бесконечную цепочку прототипов.
+  Object.defineProperty(globalThis, '__pt_proxy', {
+    value: (target, handler) => {
+      const px = new Proxy(target, handler);
+      handler.setPrototypeOf = (t, proto) => {
+        for (let q = proto, i = 0; q !== null && q !== undefined && i < 100000; i++) {
+          if (q === t || q === px) throw new TypeError('Cyclic __proto__ value');
+          q = Object.getPrototypeOf(q);
+        }
+        return Reflect.setPrototypeOf(t, proto);
+      };
+      return px;
+    },
+    writable: true, enumerable: false, configurable: true,
+  });
   globalThis.__pt_formatStack = (err, sites) => {
     let keep = sites;
     // Сырой стек — для разбора собственных поломок: с ним видно, в каком
@@ -5884,7 +6145,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
       if (isNav && !globalThis.__ptVisEntry) {
         try {
           Object.defineProperty(globalThis, '__ptVisEntry', { value: true, configurable: true });
-          const v = new (globalThis.VisibilityStateEntry || PerformanceEntry)();
+          const v = Object.create((globalThis.VisibilityStateEntry || PerformanceEntry).prototype);
           put(v, { name: 'visible', entryType: 'visibility-state', startTime: 0, duration: 0 });
           entries.push(v);
           fresh.push(v);
@@ -5893,7 +6154,10 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
       // Отрисовка: у браузера рядом с переходом стоят две записи — первая
       // краска и первая содержательная, — и страницы их читают. У нас их не
       // было вовсе, и `getEntriesByType('paint')` возвращал пустоту.
-      if (r.entryType === 'navigation' && !entries.some((x) => x.entryType === 'paint')) {
+      // Кадр без коробки (0×0 у api.js Turnstile до первого ответа, или
+      // 1×1) не красится: у Chrome в таком окне записей краски нет.
+      const painted = (globalThis.innerWidth | 0) > 1 && (globalThis.innerHeight | 0) > 1;
+      if (r.entryType === 'navigation' && painted && !entries.some((x) => x.entryType === 'paint')) {
         const at = Math.round((start + (Number(r.duration) || 0) * 0.92) * 10) / 10;
         for (const name of ['first-paint', 'first-contentful-paint']) {
           const p = new PerformancePaintTiming();
@@ -5946,10 +6210,10 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   }
   tag(PerformanceObserver.prototype, 'PerformanceObserver');
   // Порядок и состав — как у Chrome 148.
-  PerformanceObserver.supportedEntryTypes = ['element', 'event', 'first-input',
+  PerformanceObserver.supportedEntryTypes = Object.freeze(['element', 'event', 'first-input',
     'interaction-contentful-paint', 'largest-contentful-paint', 'layout-shift',
     'long-animation-frame', 'longtask', 'mark', 'measure', 'navigation', 'paint',
-    'resource', 'soft-navigation', 'visibility-state'];
+    'resource', 'soft-navigation', 'visibility-state']);
   globalThis.PerformanceObserver = PerformanceObserver;
   globalThis.PerformanceObserverEntryList = PerformanceObserverEntryList;
 
@@ -7379,7 +7643,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // `Function.prototype.toString.toString()` reads native too, and `.name`/
   // `.length` are forwarded from the original (both preserved).
   const __ptNative = new WeakSet();
-  const __ptToStr = new Proxy(Function.prototype.toString, {
+  const __ptToStr = __pt_proxy(Function.prototype.toString, {
     apply(target, thisArg, args) {
       if (__ptNative.has(thisArg)) {
         return 'function ' + ((thisArg && thisArg.name) || '') + '() { [native code] }';
@@ -7917,6 +8181,29 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   const CTX2D_METHODS = ['clip','createConicGradient','createImageData','createLinearGradient','createPattern','createRadialGradient','drawFocusIfNeeded','drawImage','fill','fillText','getContextAttributes','getImageData','getLineDash','getTransform','isContextLost','isPointInPath','isPointInStroke','measureText','reset','roundRect','setLineDash','strokeText','arc','arcTo','beginPath','bezierCurveTo','clearRect','closePath','ellipse','fillRect','lineTo','moveTo','putImageData','quadraticCurveTo','rect','resetTransform','restore','rotate','save','scale','setTransform','stroke','strokeRect','transform','translate'];
   const CTX2D_ATTRS = ['canvas','lang','font','textAlign','textBaseline','direction','fontKerning','fontStretch','fontVariantCaps','letterSpacing','textRendering','wordSpacing','globalCompositeOperation','filter','imageSmoothingQuality','strokeStyle','fillStyle','shadowColor','lineCap','lineJoin','globalAlpha','imageSmoothingEnabled','shadowOffsetX','shadowOffsetY','shadowBlur','lineWidth','miterLimit','lineDashOffset'];
   const CTX_IMPL = new WeakMap();
+  // Член контекста, позванный не на контексте: у браузера это `TypeError:
+  // Illegal invocation`. У нас переходник на прототипе находил самого себя
+  // (свой же аксессор — собственное свойство прототипа) и звал себя без
+  // конца, пока не кончался стек. Обход глобального графа зовёт каждый
+  // геттер на каждом прототипе — и ловил RangeError вместо TypeError.
+  // Сами переходники (в масках) — чтобы узнать прототип и по его копии:
+  // реалм получает OffscreenCanvasRenderingContext2D переносом тех же членов.
+  const CTX_STUBS = new WeakSet();
+  const ctxOf = (self, P, name) => {
+    const t = CTX_IMPL.get(self);
+    if (t) return t;
+    if (self === P || self === null || (typeof self !== 'object' && typeof self !== 'function')) {
+      throw new TypeError('Illegal invocation');
+    }
+    const own = Object.getOwnPropertyDescriptor(self, name);
+    // Прототип (свой `constructor`, а член — сам переходник) — не контекст.
+    if (!own || Object.prototype.hasOwnProperty.call(self, 'constructor') ||
+        (own.get && CTX_STUBS.has(own.get)) || (own.set && CTX_STUBS.has(own.set)) ||
+        (own.value && CTX_STUBS.has(own.value))) {
+      throw new TypeError('Illegal invocation');
+    }
+    return self;
+  };
   // `save()`/`restore()` в браузере откатывают не только матрицу, но и всё
   // состояние рисования. Мы не откатывали ничего.
   const SAVED = ['fillStyle', 'strokeStyle', 'globalAlpha', 'globalCompositeOperation',
@@ -7976,23 +8263,25 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         // же переходник и позовёт сам себя.
         const f = ({
           [name](...args) {
-            const t = CTX_IMPL.get(this) || this;
+            const t = ctxOf(this, P, name);
             const m = Object.prototype.hasOwnProperty.call(t, name) ? t[name] : null;
             if (globalThis.__pt_canvasTrace) ctrace(t, name + '(' + args.map(cshow).join(', ') + ')');
             return typeof m === 'function' ? m.apply(t, args) : undefined;
           },
         })[name];
         try { Object.defineProperty(f, 'length', { value: 0, configurable: true }); } catch (e) {}
-        try { Object.defineProperty(P, name, { value: mask(f, name), writable: true, enumerable: true, configurable: true }); } catch (e) {}
+        const mf = mask(f, name);
+        try { CTX_STUBS.add(mf); } catch (e) {}
+        try { Object.defineProperty(P, name, { value: mf, writable: true, enumerable: true, configurable: true }); } catch (e) {}
       }
       for (const name of attrs) {
         const acc = {
           get [name]() {
-            const t = CTX_IMPL.get(this) || this;
+            const t = ctxOf(this, P, name);
             return Object.prototype.hasOwnProperty.call(t, name) ? t[name] : undefined;
           },
           set [name](v) {
-            const t = CTX_IMPL.get(this) || this;
+            const t = ctxOf(this, P, name);
             if (globalThis.__pt_canvasTrace) ctrace(t, name + ' = ' + cshow(v));
             // Недопустимое значение перечислимого свойства браузер отвергает
             // молча, оставляя прежнее; мы записывали что угодно.
@@ -8013,11 +8302,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         };
         const d0 = Object.getOwnPropertyDescriptor(acc, name);
         const get = d0.get, set = d0.set;
+        const mg = mask(get, 'get ' + name), ms = mask(set, 'set ' + name);
+        try { CTX_STUBS.add(mg); CTX_STUBS.add(ms); } catch (e) {}
         try {
-          Object.defineProperty(P, name, {
-            get: mask(get, 'get ' + name), set: mask(set, 'set ' + name),
-            enumerable: true, configurable: true,
-          });
+          Object.defineProperty(P, name, { get: mg, set: ms, enumerable: true, configurable: true });
         } catch (e) {}
       }
     }
@@ -8781,28 +9069,31 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
                 "': " + need + ' argument' + (need === 1 ? '' : 's') +
                 ' required, but only ' + args.length + ' present.');
             }
-            const t = CTX_IMPL.get(this) || this;
+            const t = ctxOf(this, P, name);
             const m = Object.prototype.hasOwnProperty.call(t, name) ? t[name] : null;
             return typeof m === 'function' ? m.apply(t, args) : undefined;
           },
         })[name];
         try { Object.defineProperty(f, 'length', { value: need, configurable: true }); } catch (e) {}
-        try { Object.defineProperty(P, name, { value: mask(f, name), writable: true, enumerable: true, configurable: true }); } catch (e) {}
+        const mf = mask(f, name);
+        try { CTX_STUBS.add(mf); } catch (e) {}
+        try { Object.defineProperty(P, name, { value: mf, writable: true, enumerable: true, configurable: true }); } catch (e) {}
       }
       for (const name of GL_ATTRS) {
         const acc = {
           get [name]() {
-            const t = CTX_IMPL.get(this) || this;
+            const t = ctxOf(this, P, name);
             return Object.prototype.hasOwnProperty.call(t, name) ? t[name] : undefined;
           },
-          set [name](v) { const t = CTX_IMPL.get(this) || this; t[name] = v; },
+          set [name](v) { const t = ctxOf(this, P, name); t[name] = v; },
         };
         const d0 = Object.getOwnPropertyDescriptor(acc, name);
         const get = d0.get, set = d0.set;
-        try { Object.defineProperty(P, name, { get: mask(get, 'get ' + name), set: mask(set, 'set ' + name), enumerable: true, configurable: true }); } catch (e) {}
+        const mg = mask(get, 'get ' + name), ms = mask(set, 'set ' + name);
+        try { CTX_STUBS.add(mg); CTX_STUBS.add(ms); } catch (e) {}
+        try { Object.defineProperty(P, name, { get: mg, set: ms, enumerable: true, configurable: true }); } catch (e) {}
       }
     }
-    if (!impl) return null;                    // только объявить интерфейс
     if (!impl) return null;                    // только объявить интерфейс
     const pub = Object.create(P);
     CTX_IMPL.set(pub, impl);
@@ -10711,7 +11002,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // всё остальное на прототипе, как в браузере.
     const api = Object.create(Storage.prototype);
     StorageData.set(api, m);
-    const proxy = new Proxy(api, {
+    const proxy = __pt_proxy(api, {
       get: (t, p) => (p in t ? t[p] : (m.has(String(p)) ? m.get(String(p)) : undefined)),
       set: (t, p, v) => { if (p in t) return true; m.set(String(p), String(v)); return true; },
       has: (t, p) => p in t || m.has(String(p)),

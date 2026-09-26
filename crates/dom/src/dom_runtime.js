@@ -95,6 +95,32 @@
   // уровнем: у Chrome `Object.getPrototypeOf(document.querySelectorAll('*'))`
   // это сам `NodeList.prototype`, а у нас — пустой объект перед ним. Так было у
   // всех списков разом, и любой обход прототипов это видел.
+  const __ptHiddenFrame = () => {
+    if (!globalThis.__pt_crossSite) return false;
+    let w = globalThis;
+    for (let i = 0; i < 8 && w; i++) {
+      if (typeof w.innerWidth !== 'number') break;
+      if ((w.innerWidth | 0) === 0 && (w.innerHeight | 0) === 0) return true;
+      let p = null;
+      try { p = w.parent; } catch (e) { break; }
+      if (!p || p === w) break;
+      w = p;
+    }
+    return false;
+  };
+  // Прокси с проверкой цикла прототипов (см. __pt_proxy в прологе).
+  const __ptProxy = (target, handler) => {
+    if (typeof globalThis.__pt_proxy === 'function') return globalThis.__pt_proxy(target, handler);
+    const px = new Proxy(target, handler);
+    handler.setPrototypeOf = (t, proto) => {
+      for (let q = proto, i = 0; q !== null && q !== undefined && i < 100000; i++) {
+        if (q === t || q === px) throw new TypeError('Cyclic __proto__ value');
+        q = Object.getPrototypeOf(q);
+      }
+      return Reflect.setPrototypeOf(t, proto);
+    };
+    return px;
+  };
   const __link = (name, proto) => {
     const I = globalThis[name];
     if (!I || !I.prototype) return proto;
@@ -145,6 +171,37 @@
     },
     [Symbol.iterator]() { let i = 0; const self = this; return { next: () => i < self.length ? { value: self[i++], done: false } : { value: undefined, done: true } }; },
   };
+
+  // `document.all` — HTMLAllCollection: те же члены, что у HTMLCollection, но
+  // на своём интерфейсе. Раньше коллекция строилась как HTMLCollection, а
+  // потом ей подменяли прототип — и `length` с `item` терялись: страница
+  // читала `document.all.length` и получала undefined.
+  const __allProto = {
+    get [Symbol.toStringTag]() { return 'HTMLAllCollection'; },
+    get length() { return this.__ptLen | 0; },
+    item(i) {
+      if (i === undefined) return null;
+      const n = String(i);
+      if (/^\d+$/.test(n)) return this[+n] != null ? this[+n] : null;
+      return this.namedItem(n);
+    },
+    namedItem(n) {
+      const found = [];
+      for (let i = 0; i < this.length; i++) {
+        const e = this[i];
+        if (e && (e.id === n || (e.getAttribute && __ptGetA(e, 'name') === n))) found.push(e);
+      }
+      if (!found.length) return null;
+      return found.length === 1 ? found[0] : __collection(found);
+    },
+    [Symbol.iterator]() { let i = 0; const self = this; return { next: () => i < self.length ? { value: self[i++], done: false } : { value: undefined, done: true } }; },
+  };
+  function __allCollection(arr) {
+    const list = Object.create(__link('HTMLAllCollection', __allProto));
+    for (let i = 0; i < arr.length; i++) list[i] = arr[i];
+    Object.defineProperty(list, '__ptLen', { value: arr.length, enumerable: false, configurable: true });
+    return list;
+  }
 
   // `el.attributes` — NamedNodeMap из Attr, а не массив объектов: сборщик
   // отпечатка читает и `Object.prototype.toString`, и цепочку прототипов, и
@@ -370,6 +427,18 @@
     }
     cloneNode(deep) {
       const c = this.__ptShallowClone();
+      // Копия несёт точные числа инлайнового стиля, а не напечатанные
+      // шестью знаками: браузер клонирует разобранное объявление, и
+      // `scale(1.000998)` у копии остаётся 1.000998, хотя в атрибуте 1.001.
+      try {
+        if (this.__ptStyle && c.style) {
+          const sr = __declRaw.get(this.__ptStyle), sm = sr && sr();
+          if (sm && sm.__ptPrecise && sm.__ptPrecise.size) {
+            const dr = __declRaw.get(c.style), dm = dr && dr();
+            if (dm) { const pm = __cssPrecise(dm); for (const [k, v] of sm.__ptPrecise) if (dm.has(k)) pm.set(k, v); }
+          }
+        }
+      } catch (e) {}
       if (deep) for (const ch of this.__ptKids) c.appendChild(ch.cloneNode(true));
       if (deep && this.__ptLocal === 'template' && this.__ptContent) {
         const into = __templateContent(c);
@@ -1180,7 +1249,7 @@
     prepend(...ns) { for (const n of ns.reverse()) this.insertBefore(typeof n === 'string' ? new Text(n) : n, this.firstChild); }
 
     // Queries (scoped to this subtree)
-    getElementById(id) { return firstMatch(this, e => e.id === id); }
+    // getElementById у Element браузер не имеет — только у документа и фрагмента.
     getElementsByTagName(t) { return __collection(__tags(this, t)); }
     getElementsByClassName(c) {
       const cs = String(c).split(/\s+/).filter(Boolean);
@@ -1263,6 +1332,14 @@
       // Песочница наследует стороннесть кадра: разрешения и Notification в ней
       // отвечают как в нём.
       try { Object.defineProperty(w, '__pt_crossSite', { value: !!globalThis.__pt_crossSite, configurable: true }); } catch (e) {}
+      // Окно пустого кадра внутри стороннего кадра у Chrome не знает ни
+      // внешнего размера, ни положения на экране: outerWidth/outerHeight и
+      // screenX/screenY там нули (так отвечает отчёт челленджа).
+      if (globalThis.__pt_crossSite) {
+        for (const k of ['outerWidth', 'outerHeight', 'screenX', 'screenY', 'screenLeft', 'screenTop']) {
+          try { const d = Object.getOwnPropertyDescriptor(w, k); Object.defineProperty(w, k, { value: 0, writable: true, enumerable: d ? d.enumerable : true, configurable: true }); } catch (e) {}
+        }
+      }
       // Происхождение `about:blank` — от создателя: origin и document.domain
       // отвечают его словами, адрес остаётся about:blank.
       try {
@@ -1610,8 +1687,10 @@
     set defaultView(v) { this.__ptView = v; }
     get currentScript() { return this.__ptCurScript; }
     set currentScript(v) { this.__ptCurScript = v; }
-    get visibilityState() { return globalThis.__ptDetached ? 'hidden' : 'visible'; }
-    get hidden() { return !!globalThis.__ptDetached; }
+    // Сторонний кадр без коробки (0×0) у Chrome скрыт: его окно ещё не
+    // показано, и `visibilityState` в нём и в его пустых кадрах — hidden.
+    get visibilityState() { return globalThis.__ptDetached || __ptHiddenFrame() ? 'hidden' : 'visible'; }
+    get hidden() { return !!globalThis.__ptDetached || __ptHiddenFrame(); }
     get documentElement() { return this.__ptDocEl; }
     // ParentNode у документа — своё, а не наследованное: у браузера
     // `children` лежит на `Document.prototype`, и без него поверхность
@@ -1665,9 +1744,7 @@
     get all() {
       const out = [];
       if (this.documentElement) __walkTree(this.documentElement, (n) => { if (n.nodeType === ELEMENT_NODE) out.push(n); });
-      const c = __collection(out);
-      try { const H = globalThis.HTMLAllCollection; if (H && H.prototype) Object.setPrototypeOf(c, H.prototype); } catch (e) {}
-      return c;
+      return __allCollection(out);
     }
     get applets() { return __collection([]); }
     // Не один элемент, а вся стопка под точкой: браузер отдаёт цепочку от
@@ -1815,7 +1892,8 @@
       if (String(ns) === 'http://www.w3.org/2000/svg' && globalThis.__pt_svgProto) {
         const proto = __pt_svgProto(String(tag));
         // Имя тега в SVG регистрозависимо: `clipPath`, не `clippath`.
-        if (proto) { try { Object.setPrototypeOf(e, proto); e.__ptNS = String(ns); e.__ptLocal = String(tag); } catch (x) {} }
+        // И `tagName` у SVG — как написано (`text`, `clipPath`), а не заглавными.
+        if (proto) { try { Object.setPrototypeOf(e, proto); e.__ptNS = String(ns); e.__ptLocal = String(tag); e.__ptTag = String(tag); } catch (x) {} }
       }
       return e;
     }
@@ -1853,7 +1931,7 @@
       return node;
     }
 
-    getElementById(id) { return this.documentElement ? this.documentElement.getElementById(id) : null; }
+    getElementById(id) { return this.documentElement ? firstMatch(this.documentElement, (e) => e.id === String(id)) : null; }
     getElementsByTagName(t) { return __collection(this.documentElement ? __tags(this.documentElement, t) : []); }
     getElementsByClassName(c) { return this.documentElement ? this.documentElement.getElementsByClassName(c) : []; }
     querySelector(s) {
@@ -2378,7 +2456,7 @@
       get: () => get().join(' '), set: (v) => __ptSetA(el, name, String(v)), configurable: true,
     });
     // Числовые ключи живые: список читается из атрибута при каждом обращении.
-    return new Proxy(api, {
+    return __ptProxy(api, {
       get(t, k, r) {
         if (typeof k === 'string' && /^\d+$/.test(k)) return get()[+k];
         return Reflect.get(t, k, r);
@@ -2578,7 +2656,60 @@
     const s = String(p).trim();
     return s.charCodeAt(0) === 45 && s.charCodeAt(1) === 45 ? s : s.toLowerCase();
   };
+  // Числа в значениях браузер печатает шестью значащими цифрами:
+  // `scale(1.000998)` становится `scale(1.001)`, `138.828125px` — `138.828px`.
+  // Строки в кавычках и адреса не трогаются, как и знаки внутри слов
+  // (`translate3d`, `#ff8800`).
+  const __cssNum1 = (t) => {
+    const n = Number(t);
+    if (!isFinite(n)) return t;
+    return String(Number(n.toPrecision(6)));
+  };
+  // Преобразование как матрица: `scale(1.000998)` → [a, b, c, d, e, f].
+  const __parseTransform = (str) => {
+    const src = String(str || '').trim();
+    if (!src || src === 'none') return null;
+    let M = [1, 0, 0, 1, 0, 0];
+    let any = false;
+    const mul = (n) => {
+      const [a, b, c, d, e, f] = M; const [a2, b2, c2, d2, e2, f2] = n;
+      M = [a * a2 + c * b2, b * a2 + d * b2, a * c2 + c * d2, b * c2 + d * d2, a * e2 + c * f2 + e, b * e2 + d * f2 + f];
+    };
+    const re = /([a-zA-Z0-9]+)\s*\(([^)]*)\)/g;
+    let m;
+    while ((m = re.exec(src))) {
+      const fn = m[1].toLowerCase();
+      const v = m[2].split(/[\s,]+/).filter(Boolean).map((x) => parseFloat(x));
+      if (v.some((x) => !isFinite(x))) return null;
+      any = true;
+      const rad = (x) => (x || 0) * Math.PI / 180;
+      switch (fn) {
+        case 'matrix': if (v.length !== 6) return null; mul(v); break;
+        case 'scale': mul([v[0], 0, 0, v.length > 1 ? v[1] : v[0], 0, 0]); break;
+        case 'scalex': mul([v[0], 0, 0, 1, 0, 0]); break;
+        case 'scaley': mul([1, 0, 0, v[0], 0, 0]); break;
+        case 'scale3d': mul([v[0], 0, 0, v[1], 0, 0]); break;
+        case 'translate': mul([1, 0, 0, 1, v[0] || 0, v[1] || 0]); break;
+        case 'translatex': mul([1, 0, 0, 1, v[0] || 0, 0]); break;
+        case 'translatey': mul([1, 0, 0, 1, 0, v[0] || 0]); break;
+        case 'translate3d': mul([1, 0, 0, 1, v[0] || 0, v[1] || 0]); break;
+        case 'rotate': { const c = Math.cos(rad(v[0])), sn = Math.sin(rad(v[0])); mul([c, sn, -sn, c, 0, 0]); break; }
+        case 'skewx': mul([1, 0, Math.tan(rad(v[0])), 1, 0, 0]); break;
+        case 'skewy': mul([1, Math.tan(rad(v[0])), 0, 1, 0, 0]); break;
+        default: return null;
+      }
+    }
+    return any ? M : null;
+  };
+  const __cssNumbers = (v) => v.replace(
+    /("[^"]*"|'[^']*'|url\([^)]*\))|(?<![A-Za-z0-9_#.\-])([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)(?=[A-Za-z%]*(?![A-Za-z0-9_.#\-]))/g,
+    (m, q, num) => (q ? q : __cssNum1(num)));
   const __cssValue = (prop, value) => {
+    const r = __cssValueRaw(prop, value);
+    if ((prop.charCodeAt(0) === 45 && prop.charCodeAt(1) === 45) || prop === 'unicode-range') return r;
+    try { return __cssNumbers(r); } catch (e) { return r; }
+  };
+  const __cssValueRaw = (prop, value) => {
     // Значение собственного свойства браузер хранит как написано.
     if (prop.charCodeAt(0) === 45 && prop.charCodeAt(1) === 45) return String(value).trim();
     let v = __cssZero(__cssHex(String(value).trim().replace(/\s+/g, ' ')));
@@ -2840,6 +2971,40 @@
   /// `padding-left: 9px` выходит одной записью `padding: 1px 1px 1px 9px`, а
   /// `border` с перебитой стороной распадается на составляющие. Мы печатали
   /// написанное автором, и правило расходилось с браузерным.
+  // Набор имён с `!important` живёт при карте объявления: карта строится
+  // заново при каждой правке атрибута, и набор вместе с ней.
+  const __cssImp = (m) => {
+    if (!m.__ptImp) { try { Object.defineProperty(m, '__ptImp', { value: new Set(), enumerable: false, configurable: true }); } catch (e) { return new Set(); } }
+    return m.__ptImp;
+  };
+  const __cssImportantIn = (v) => typeof v === 'string' && /!\s*important\s*$/i.test(v);
+  // Точное значение — рядом с напечатанным: браузер хранит число как разобрал,
+  // а шестью знаками только печатает. Раскладка и масштаб текста считают по
+  // точному; страница читает напечатанное.
+  const __cssPrecise = (m) => {
+    if (!m.__ptPrecise) { try { Object.defineProperty(m, '__ptPrecise', { value: new Map(), enumerable: false, configurable: true }); } catch (e) { return new Map(); } }
+    return m.__ptPrecise;
+  };
+  const __cssStore = (m, k, v) => {
+    const raw = __cssValueRaw(k, v);
+    let shown = raw;
+    if (!((k.charCodeAt(0) === 45 && k.charCodeAt(1) === 45) || k === 'unicode-range')) { try { shown = __cssNumbers(raw); } catch (e) {} }
+    m.set(k, shown);
+    const pm = __cssPrecise(m);
+    if (shown !== raw) pm.set(k, raw); else pm.delete(k);
+  };
+  const __cssDrop = (m, k) => { m.delete(k); if (m.__ptImp) m.__ptImp.delete(k); if (m.__ptPrecise) m.__ptPrecise.delete(k); };
+  const __cssPreciseGet = (m, k) => (m.__ptPrecise && m.__ptPrecise.has(k) ? m.__ptPrecise.get(k) : m.get(k));
+  const __styleText = (m) => {
+    const imp = m.__ptImp;
+    const important = (k) => {
+      if (!imp || !imp.size) return false;
+      if (imp.has(k)) return true;
+      for (const sh of imp) if ((CSS_LONGHANDS[sh] || []).includes(k)) return true;
+      return false;
+    };
+    return __styleEntries(m).map(([k, v]) => `${k}: ${v}${important(k) ? ' !important' : ''};`).join(' ');
+  };
   const __styleEntries = (m) => {
     // Какие длинные имена написаны отдельно: только из-за них сокращение
     // разбирают.
@@ -2964,7 +3129,7 @@
         enumerable: true, configurable: true,
       });
     }
-    const px = new Proxy(target, {
+    const px = __ptProxy(target, {
       get: (t, p) => {
         if (typeof p === 'string' && !(p in t)) return map.get(dash(p).toLowerCase()) || '';
         const v = t[p];
@@ -3189,7 +3354,7 @@
     const target = {};
     for (const k of el.getAttributeNames()) if (k.startsWith('data-'))
       target[camel(k.slice(5))] = __ptGetA(el, k);
-    return new Proxy(target, {
+    return __ptProxy(target, {
       get: (t, p) => __ptGetA(el, 'data-' + dash(String(p))) ?? undefined,
       set: (t, p, v) => { __ptSetA(el, 'data-' + dash(String(p)), v); return true; },
       has: (t, p) => __ptHasA(el, 'data-' + dash(String(p))),
@@ -3233,11 +3398,14 @@
       if (!map) return null;
       return { read: () => map, write: () => {}, computed: false, map, el: null };
     };
+    const nat = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
     const def = (name, value) => {
-      try { Object.defineProperty(proto, name, { value, writable: true, enumerable: true, configurable: true }); } catch (e) {}
+      const m = ({ [name](...a) { return value.apply(this, a); } })[name];
+      try { Object.defineProperty(m, 'length', { value: value.length, configurable: true }); } catch (e) {}
+      try { Object.defineProperty(proto, name, { value: nat(m, name), writable: true, enumerable: true, configurable: true }); } catch (e) {}
     };
     const acc = (name, get, set) => {
-      try { Object.defineProperty(proto, name, { get, set, enumerable: true, configurable: true }); } catch (e) {}
+      try { Object.defineProperty(proto, name, { get: nat(get, 'get ' + name), set: set ? nat(set, 'set ' + name) : undefined, enumerable: true, configurable: true }); } catch (e) {}
     };
     def('getPropertyValue', function getPropertyValue(p) {
       const s = st(this); if (!s) return '';
@@ -3252,22 +3420,36 @@
       return m.get(k) || (k.charCodeAt(0) === 45 ? m.get(k.slice(1)) || '' : '')
         || __longhandFrom(m, k);
     });
-    def('getPropertyPriority', function getPropertyPriority() { return ''; });
-    def('setProperty', function setProperty(p, v) {
+    def('getPropertyPriority', function getPropertyPriority(p) {
+      const s = st(this); if (!s || s.computed) return '';
+      const m = s.read(), k = __cssKey(p), imp = m.__ptImp;
+      if (!imp || !imp.size) return '';
+      if (imp.has(k)) return 'important';
+      for (const sh of imp) if ((CSS_LONGHANDS[sh] || []).includes(k)) return 'important';
+      return '';
+    });
+    def('setProperty', function setProperty(p, v, prio) {
       const s = st(this); if (!s) return;
       if (s.computed) throw new TypeError('Cannot modify computed style');
+      // Приоритет — либо пусто, либо `important`; иное браузер молча
+      // отвергает вместе со всем вызовом. И `!important` внутри значения —
+      // тоже отказ.
+      const pr = prio == null ? '' : String(prio).trim().toLowerCase();
+      if (pr !== '' && pr !== 'important') return;
+      if (__cssImportantIn(v)) return;
       const m = s.read(), k = __cssKey(p);
       // Пустое значение свойство удаляет, а не оставляет пустым. Мы писали
       // `opacity: ` без значения — строки, которой браузер не производит; кадр
       // виджета читает свой `style` десятками тысяч раз и видел именно её.
-      if (v === '' || v == null) m.delete(k); else m.set(k, __cssValue(k, v));
+      if (v === '' || v == null) __cssDrop(m, k);
+      else { __cssStore(m, k, v); if (pr === 'important') __cssImp(m).add(k); else __cssImp(m).delete(k); }
       s.write(m);
     });
     def('removeProperty', function removeProperty(p) {
       const s = st(this); if (!s) return '';
       if (s.computed) throw new TypeError('Cannot modify computed style');
       const m = s.read(), k = __cssKey(p), had = m.get(k) || '';
-      m.delete(k); s.write(m); return had;
+      __cssDrop(m, k); s.write(m); return had;
     });
     def('item', function item(i) {
       const s = st(this); if (!s) return '';
@@ -3286,7 +3468,7 @@
         const s = st(this); if (!s) return '';
         // У вычисленного стиля он пуст, как в браузере.
         if (s.computed) return '';
-        return __styleEntries(s.read()).map(([k, v]) => k + ': ' + v + ';').join(' ');
+        return __styleText(s.read());
       },
       function cssText(v) {
         const s = st(this); if (!s) return;
@@ -3369,7 +3551,8 @@
           const s = __cssReaders.get(this);
           if (!s || s.computed) return;
           const m = s.read();
-          if (v === '' || v == null) m.delete(key); else m.set(key, __cssValue(key, v));
+          if (__cssImportantIn(v)) return;
+          if (v === '' || v == null) __cssDrop(m, key); else { __cssStore(m, key, v); __cssImp(m).delete(key); }
           s.write(m);
         },
         enumerable: true, configurable: true,
@@ -3389,8 +3572,12 @@
         const i = part.indexOf(':');
         if (i < 0) continue;
         const k = __cssKey(part.slice(0, i));
-        const v = part.slice(i + 1).trim();
-        if (k) m.set(k, v);
+        let v = part.slice(i + 1).trim();
+        // Приоритет хранится рядом со значением, а не в нём: `getPropertyValue`
+        // отвечает без `!important`, `getPropertyPriority` — им.
+        const im = /!\s*important\s*$/i.exec(v);
+        if (im) v = v.slice(0, im.index).trim();
+        if (k) { m.set(k, v); if (im) __cssImp(m).add(k); }
       }
       cachedText = text; cachedMap = m;
       return m;
@@ -3409,7 +3596,7 @@
     };
     const write = (m) => {
       // Точка с запятой в конце обязательна: браузер её ставит.
-      const text = __styleEntries(m).map(([k, v]) => `${k}: ${v};`).join(' ');
+      const text = __styleText(m);
       cachedText = text; cachedMap = m;
       if (el && el.setAttribute) __ptSetA(el, 'style', text);
       reindex(__styleNames(m));
@@ -3422,7 +3609,7 @@
     const target = Object.create(__inlineStyleProto(), __styleDescs());
     __cssReaders.set(target, { read, write, el });
     reindex(__styleNames(read()));
-    const px = new Proxy(target, {
+    const px = __ptProxy(target, {
       ...__declTraps((t, p) => { const m = read(), k = dash(p); return m.get(k) || __longhandFrom(m, k); }),
       get: (t, p) => {
         if (typeof p === 'string' && EPUB_SET.has(p)) return undefined;
@@ -3438,7 +3625,9 @@
         // Через перехватчик — те же правила, что через установщик: пустое
         // значение удаляет свойство. Раньше он писал мимо и оставлял `opacity: `.
         const m = read(), k = dash(String(p));
-        if (v === '' || v == null) m.delete(k); else m.set(k, __cssValue(k, v));
+        // Значение с `!important` через свойство браузер отвергает целиком.
+        if (__cssImportantIn(v)) return true;
+        if (v === '' || v == null) __cssDrop(m, k); else { __cssStore(m, k, v); __cssImp(m).delete(k); }
         write(m); return true;
       },
     });
@@ -4094,6 +4283,17 @@
           if (CLOSES_P.has(tag)) { for (let s = stack.length - 1; s > 0; s--) { if (stack[s].localName === 'p') { stack.length = s; break; } if (CLOSES_P.has(stack[s].localName) && stack[s].localName !== 'p') break; } }
           const closes = SELF_CLOSES[tag];
           if (closes) { for (let s = stack.length - 1; s > 0; s--) { const ln = stack[s].localName; if (closes.indexOf(ln) >= 0) { stack.length = s; break; } if (ln === 'table' || ln === 'ul' || ln === 'ol' || ln === 'select' || ln === 'dl') break; } }
+          // Подразумеваемые обёртки таблицы: `<table><tr>` получает `<tbody>`,
+          // а `<td>` без строки — `<tr>`; браузер вставляет их сам, и
+          // `table.tBodies[0].rows` у него есть всегда.
+          if (tag === 'tr' || tag === 'td' || tag === 'th') {
+            const tl = top().localName;
+            if (tag === 'tr' && tl === 'table') { const tb = elem('tbody'); put(top(), tb); stack.push(tb); }
+            else if ((tag === 'td' || tag === 'th') && (tl === 'table' || tl === 'tbody' || tl === 'thead' || tl === 'tfoot')) {
+              if (tl === 'table') { const tb = elem('tbody'); put(top(), tb); stack.push(tb); }
+              const row = elem('tr'); put(top(), row); stack.push(row);
+            }
+          }
           const el = elem(tag);
           for (const am of m[2].matchAll(/([\w-]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g)) {
             let v = am[2] || '';
@@ -4353,6 +4553,159 @@
                    'HTMLDirectoryElement', 'HTMLFontElement', 'HTMLParamElement']) {
     if (!globalThis[n]) __mkIface(n, __htmlProto);
   }
+  // Коллекции форм и таблиц: `table.rows`, `tr.cells`, `select.options`,
+  // `form.elements`… Их не было вовсе, и `table.rows[0]` ронял страницу
+  // (челлендж Cloudflare разбирает так свою тестовую разметку).
+  {
+    const proto = (n) => __ifaceProto.get(n);
+    const defGet = (P, k, get) => { if (!P) return; try { Object.defineProperty(P, k, { get, enumerable: true, configurable: true }); } catch (e) {} };
+    const defFn = (P, k, fn) => { if (!P) return; try { Object.defineProperty(P, k, { value: fn, writable: true, enumerable: true, configurable: true }); } catch (e) {} };
+    const kids = (el) => (el && el.__ptKids ? el.__ptKids : []).filter((k) => k.nodeType === ELEMENT_NODE);
+    const local = (el) => String(el.__ptLocal || '').toLowerCase();
+    const isTag = (el, ...names) => el && el.nodeType === ELEMENT_NODE && names.includes(local(el));
+    const branded = (arr, name) => {
+      const c = __collection(arr);
+      try { const I = globalThis[name]; if (I && I.prototype) Object.setPrototypeOf(c, I.prototype); } catch (e) {}
+      return c;
+    };
+    // Таблица.
+    const tableRows = (t) => {
+      const out = [];
+      const heads = kids(t).filter((k) => isTag(k, 'thead'));
+      const feet = kids(t).filter((k) => isTag(k, 'tfoot'));
+      for (const h of heads) for (const r of kids(h)) if (isTag(r, 'tr')) out.push(r);
+      for (const k of kids(t)) {
+        if (isTag(k, 'tr')) out.push(k);
+        else if (isTag(k, 'tbody')) for (const r of kids(k)) if (isTag(r, 'tr')) out.push(r);
+      }
+      for (const f of feet) for (const r of kids(f)) if (isTag(r, 'tr')) out.push(r);
+      return out;
+    };
+    const T = proto('HTMLTableElement');
+    defGet(T, 'rows', function () { return __collection(tableRows(this)); });
+    defGet(T, 'tBodies', function () { return __collection(kids(this).filter((k) => isTag(k, 'tbody'))); });
+    defGet(T, 'tHead', function () { return kids(this).find((k) => isTag(k, 'thead')) || null; });
+    defGet(T, 'tFoot', function () { return kids(this).find((k) => isTag(k, 'tfoot')) || null; });
+    defGet(T, 'caption', function () { return kids(this).find((k) => isTag(k, 'caption')) || null; });
+    const S = proto('HTMLTableSectionElement');
+    defGet(S, 'rows', function () { return __collection(kids(this).filter((k) => isTag(k, 'tr'))); });
+    const R = proto('HTMLTableRowElement');
+    defGet(R, 'cells', function () { return __collection(kids(this).filter((k) => isTag(k, 'td', 'th'))); });
+    defGet(R, 'rowIndex', function () {
+      let t = this.parentNode;
+      if (t && isTag(t, 'thead', 'tbody', 'tfoot')) t = t.parentNode;
+      if (!t || !isTag(t, 'table')) return -1;
+      return tableRows(t).indexOf(this);
+    });
+    defGet(R, 'sectionRowIndex', function () {
+      const p = this.parentNode;
+      if (!p || !isTag(p, 'table', 'thead', 'tbody', 'tfoot')) return -1;
+      return kids(p).filter((k) => isTag(k, 'tr')).indexOf(this);
+    });
+    const C = proto('HTMLTableCellElement');
+    defGet(C, 'cellIndex', function () {
+      const p = this.parentNode;
+      if (!p || !isTag(p, 'tr')) return -1;
+      return kids(p).filter((k) => isTag(k, 'td', 'th')).indexOf(this);
+    });
+    // Список выбора.
+    const selOptions = (sel) => {
+      const out = [];
+      for (const k of kids(sel)) {
+        if (isTag(k, 'option')) out.push(k);
+        else if (isTag(k, 'optgroup')) for (const o of kids(k)) if (isTag(o, 'option')) out.push(o);
+      }
+      return out;
+    };
+    const isSelected = (o) => !!(o.__ptSelected != null ? o.__ptSelected : __ptHasA(o, 'selected'));
+    const SEL = proto('HTMLSelectElement');
+    defGet(SEL, 'options', function () { return branded(selOptions(this), 'HTMLOptionsCollection'); });
+    defGet(SEL, 'selectedOptions', function () {
+      const opts = selOptions(this);
+      const multiple = __ptHasA(this, 'multiple');
+      let chosen = opts.filter(isSelected);
+      if (!multiple) { if (chosen.length > 1) chosen = [chosen[chosen.length - 1]]; if (!chosen.length && opts.length && __ptGetA(this, 'size') == null) chosen = [opts[0]]; }
+      return __collection(chosen);
+    });
+    defGet(SEL, 'selectedIndex', function () {
+      const opts = selOptions(this);
+      const multiple = __ptHasA(this, 'multiple');
+      const chosen = opts.filter(isSelected);
+      if (chosen.length) return opts.indexOf(multiple ? chosen[0] : chosen[chosen.length - 1]);
+      return !multiple && opts.length && __ptGetA(this, 'size') == null ? 0 : -1;
+    });
+    defGet(SEL, 'length', function () { return selOptions(this).length; });
+    defGet(SEL, 'type', function () { return __ptHasA(this, 'multiple') ? 'select-multiple' : 'select-one'; });
+    defFn(SEL, 'item', function item(i) { return selOptions(this)[i | 0] || null; });
+    defFn(SEL, 'namedItem', function namedItem(n) { return selOptions(this).find((o) => o.id === n || __ptGetA(o, 'name') === n) || null; });
+    const DL = proto('HTMLDataListElement');
+    defGet(DL, 'options', function () { const out = []; __walkTree(this, (n) => { if (isTag(n, 'option')) out.push(n); }); return __collection(out); });
+    // Форма и её элементы.
+    const LISTED = new Set(['button', 'fieldset', 'input', 'object', 'output', 'select', 'textarea']);
+    const formOf = (el) => {
+      const id = __ptGetA(el, 'form');
+      if (id != null && el.ownerDocument && el.ownerDocument.getElementById) return el.ownerDocument.getElementById(id) || null;
+      for (let p = el.parentNode; p; p = p.parentNode) { if (isTag(p, 'form')) return p; if (p.nodeType === 11 && p.__ptHost) { p = p.__ptHost; } }
+      return null;
+    };
+    const formControls = (form) => {
+      const out = [];
+      const doc = form.ownerDocument;
+      const root = doc && doc.documentElement ? doc.documentElement : form;
+      __walkTree(root, (n) => {
+        if (!n || n.nodeType !== ELEMENT_NODE || !LISTED.has(local(n))) return;
+        if (local(n) === 'input' && String(__ptGetA(n, 'type') || '').toLowerCase() === 'image') return;
+        if (formOf(n) === form) out.push(n);
+      });
+      return out;
+    };
+    const F = proto('HTMLFormElement');
+    defGet(F, 'elements', function () { return branded(formControls(this), 'HTMLFormControlsCollection'); });
+    defGet(F, 'length', function () { return formControls(this).length; });
+    const labelsOf = (el) => {
+      const out = [];
+      const doc = el.ownerDocument;
+      const root = doc && doc.documentElement ? doc.documentElement : null;
+      if (!root) return out;
+      __walkTree(root, (n) => {
+        if (!isTag(n, 'label')) return;
+        const f = __ptGetA(n, 'for');
+        if (f != null) { if (f === el.id) out.push(n); return; }
+        let found = null;
+        __walkTree(n, (m) => { if (!found && m !== n && m.nodeType === ELEMENT_NODE && LABELABLE.has(local(m)) && !(local(m) === 'input' && String(__ptGetA(m, 'type') || '').toLowerCase() === 'hidden')) found = m; });
+        if (found === el) out.push(n);
+      });
+      return out;
+    };
+    const LABELABLE = new Set(['button', 'input', 'meter', 'output', 'progress', 'select', 'textarea']);
+    for (const n of ['HTMLButtonElement', 'HTMLInputElement', 'HTMLMeterElement', 'HTMLOutputElement', 'HTMLProgressElement', 'HTMLSelectElement', 'HTMLTextAreaElement']) {
+      const P = proto(n);
+      defGet(P, 'labels', function () {
+        if (local(this) === 'input' && String(__ptGetA(this, 'type') || '').toLowerCase() === 'hidden') return null;
+        return __staticNodeList(labelsOf(this));
+      });
+    }
+    for (const n of ['HTMLButtonElement', 'HTMLInputElement', 'HTMLOutputElement', 'HTMLSelectElement', 'HTMLTextAreaElement', 'HTMLFieldSetElement', 'HTMLObjectElement', 'HTMLLabelElement', 'HTMLLegendElement']) {
+      const P = proto(n);
+      defGet(P, 'form', function () {
+        if (local(this) === 'legend') { const p = this.parentNode; return p && isTag(p, 'fieldset') ? formOf(p) : null; }
+        if (local(this) === 'label') { const c = this.control; return c ? formOf(c) : null; }
+        return formOf(this);
+      });
+    }
+    const L = proto('HTMLLabelElement');
+    defGet(L, 'control', function () {
+      const f = __ptGetA(this, 'for');
+      if (f != null) { const el = this.ownerDocument && this.ownerDocument.getElementById ? this.ownerDocument.getElementById(f) : null; return el && LABELABLE.has(local(el)) ? el : null; }
+      let found = null;
+      __walkTree(this, (m) => { if (!found && m !== this && m.nodeType === ELEMENT_NODE && LABELABLE.has(local(m)) && !(local(m) === 'input' && String(__ptGetA(m, 'type') || '').toLowerCase() === 'hidden')) found = m; });
+      return found;
+    });
+    const M = proto('HTMLMapElement');
+    defGet(M, 'areas', function () { const out = []; __walkTree(this, (n) => { if (isTag(n, 'area')) out.push(n); }); return __collection(out); });
+    const O = proto('HTMLOptionElement');
+    defGet(O, 'index', function () { let p = this.parentNode; if (p && isTag(p, 'optgroup')) p = p.parentNode; return p && isTag(p, 'select') ? selOptions(p).indexOf(this) : 0; });
+  }
   globalThis.__pt_elementProto = (tag) => {
     tag = String(tag).toLowerCase();
     const iface = TAG_IFACE[tag];
@@ -4597,10 +4950,10 @@
         // Кегль и гарнитура берутся из каскада, а не из вычисленного стиля:
         // тот строит все четыре с лишним сотни свойств, и рамка одного
         // `<text>` обходилась в восьмую долю секунды.
-        const fs = __usedFontSize(this) || 16;
-        let famRaw = __cascadeFor(this).get('font-family');
-        if (famRaw == null) famRaw = __inheritedValue(this, 'font-family');
-        const fam = String(famRaw || '').trim() || 'sans-serif';
+        if (!__svgLaidOut(this)) return svgRect(0, 0, 0, 0);
+        const s = __svgScale(this);
+        const fs = __svgSizeEff(__usedFontSize(this) || 16, s);
+        const { fam, bold, italic } = __svgFont(this);
         // Рамка — объединение двух: коробки чернил и коробки раскладки.
         // Вправо берётся дальняя из них (у «W» чернила вылезают за ширину
         // знака), влево — только если чернила уходят левее начала («jjj» у
@@ -4610,23 +4963,43 @@
         // Текста нет — и рамки нет: браузер отдаёт нули, а не полоску высотой
         // в строку.
         if (!txt) return svgRect(0, 0, 0, 0);
-        const m = __textMetrics(txt, fs, fam, false, false);
-        const adv = Math.ceil((m[0] || 0) * 64) / 64;
+        // Текст под преобразованием браузер раскладывает в кегле, умноженном
+        // на масштаб (усечённом до сотых), ширину округляет вверх до 1/64, а
+        // потом делит обратно — в одинарной точности.
+        const m = __textMetrics(txt, fs, fam, bold, italic);
+        const adv = m[0] || 0;
         const over = Math.max(m[1] || 0, 0);
-        const w = over + Math.max(m[2] || 0, adv);
-        const fb = __fontBox(fs, fam);
-        return svgRect(num(this, 'x') - over, num(this, 'y') - fb.asc, w, fb.asc + fb.desc);
+        const w = over + Math.ceil(Math.max(m[2] || 0, adv) * 64) / 64;
+        const { asc, desc } = __svgAscDesc(txt, fs, fam);
+        const x = num(this, 'x'), y = num(this, 'y');
+        if (s === 1) return svgRect(x - over, y - asc, w, asc + desc);
+        // Обратно из масштабированного пространства браузер идёт умножением
+        // на обратный масштаб в одинарной точности, а не делением.
+        const fr = Math.fround;
+        const s32 = fr(s), inv = fr(1 / s32);
+        return svgRect(fr(fr(fr(x * s32) - over) * inv), fr(fr(fr(y * s32) - asc) * inv), fr(w * inv), fr((asc + desc) * inv));
       }
       const kids = [...(this.__ptKids || [])].filter((k) => k.nodeType === ELEMENT_NODE);
       if (!outline(this).length && kids.length) {
+        // Рамка группы — объединение рамок детей, каждая в её собственном
+        // преобразовании; числа одинарной точности, как у браузера.
+        const fr = Math.fround;
         let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
         for (const k of kids) {
           if (!k.getBBox) continue;
           const b = k.getBBox();
-          x0 = Math.min(x0, b.x); y0 = Math.min(y0, b.y);
-          x1 = Math.max(x1, b.x + b.width); y1 = Math.max(y1, b.y + b.height);
+          let bx = b.x, by = b.y, bw = b.width, bh = b.height;
+          const M = __svgOwnMatrix(k);
+          if (M) {
+            const pts = [[bx, by], [bx + bw, by], [bx, by + bh], [bx + bw, by + bh]]
+              .map(([px, py]) => [fr(M[0] * px + M[2] * py + M[4]), fr(M[1] * px + M[3] * py + M[5])]);
+            const xs = pts.map((q) => q[0]), ys = pts.map((q) => q[1]);
+            bx = Math.min(...xs); by = Math.min(...ys); bw = fr(Math.max(...xs) - bx); bh = fr(Math.max(...ys) - by);
+          }
+          x0 = Math.min(x0, bx); y0 = Math.min(y0, by);
+          x1 = Math.max(x1, fr(bx + bw)); y1 = Math.max(y1, fr(by + bh));
         }
-        if (x0 !== Infinity) return svgRect(x0, y0, x1 - x0, y1 - y0);
+        if (x0 !== Infinity) return svgRect(x0, y0, fr(x1 - x0), fr(y1 - y0));
       }
       const [x, y, w, h] = boxOfPoints(outline(this));
       return svgRect(x, y, w, h);
@@ -4657,15 +5030,124 @@
     acc(geometry, 'pathLength', function pathLength() { return animLength(() => num(this, 'pathLength')); });
     // Длина строки — это её ширина при раскладке, а не рамка: у рамки бывают
     // чернила шире знака, и тогда числа расходятся.
+    // Гарнитура и начертание текста SVG — из каскада, а без них — то, что у
+    // документа по умолчанию (Times New Roman у Chrome), а не sans-serif.
+    const __svgFont = (el) => {
+      const c = __cascadeFor(el);
+      let famRaw = c.get('font-family');
+      if (famRaw == null) famRaw = __inheritedValue(el, 'font-family');
+      const fam = String(famRaw || '').trim() || String((typeof CS_BASE !== 'undefined' && CS_BASE['font-family']) || '"Times New Roman"');
+      let st = c.get('font-style'); if (st == null) st = __inheritedValue(el, 'font-style');
+      let wt = c.get('font-weight'); if (wt == null) wt = __inheritedValue(el, 'font-weight');
+      const italic = /^(italic|oblique)/i.test(String(st || ''));
+      const w = String(wt || '').toLowerCase();
+      const bold = w === 'bold' || w === 'bolder' || (Number(w) >= 600);
+      return { fam, bold, italic };
+    };
+    // Масштаб текста: произведение равномерных масштабов преобразований
+    // самого элемента и предков до корня svg — так браузер выбирает кегль
+    // раскладки (`CalculateScreenFontSizeScalingFactor`).
+    const __svgOwnMatrix = (n) => {
+      let t = null;
+      try { t = __cascadeFor(n).get('transform'); } catch (e) {}
+      if (t == null) t = __ptGetA(n, 'transform');
+      return __parseTransform(t);
+    };
+    const __svgOwnScale = (n) => {
+      const M = __svgOwnMatrix(n);
+      if (!M) return 1;
+      const sc = Math.sqrt((M[0] * M[0] + M[1] * M[1] + M[2] * M[2] + M[3] * M[3]) / 2);
+      return isFinite(sc) && sc > 0 ? sc : 1;
+    };
+    const __svgScale = (el) => {
+      let s = 1;
+      for (let n = el; n && n.nodeType === ELEMENT_NODE; n = n.parentNode) {
+        s *= __svgOwnScale(n);
+        if (n.__ptLocal === 'svg') break;
+      }
+      return s;
+    };
+    const __svgSizeEff = (fs, s) => (s === 1 ? fs : Math.floor(fs * s * 100 + 1e-7) / 100);
+    // Подъём и спуск строки — из гарнитуры прогона: эмодзи набираются Noto
+    // Color Emoji, и рамка у них по её метрикам (1900/512 на 2048).
+    const EMOJI_RE = /\p{Extended_Pictographic}/u;
+    const __svgAscDesc = (txt, fs, fam) => {
+      const fb = __fontBox(fs, fam);
+      let asc = fb.asc, desc = fb.desc;
+      if (EMOJI_RE.test(txt)) {
+        const rest = txt.replace(/\p{Extended_Pictographic}|\uFE0F|\u200D|[\u{1F3FB}-\u{1F3FF}]|\s/gu, '');
+        // У растровой гарнитуры эмодзи подъём и спуск — это границы самой
+        // картинки: то же, что actualBoundingBox у холста (15/4 на 16px,
+        // 23/6 на 24px, 139/38 на 150px).
+        const m = __textMetrics(txt, fs, fam, false, false);
+        const ea = Math.round(m[3] || fs * 1900 / 2048), ed = Math.round(m[4] || fs * 512 / 2048);
+        if (!rest) { asc = ea; desc = ed; } else { asc = Math.max(asc, ea); desc = Math.max(desc, ed); }
+      }
+      return { asc, desc };
+    };
+    // Без раскладки (документ без окна, оторванный узел, дитя хозяина без
+    // слота) длины и рамки у браузера нулевые.
+    const __svgLaidOut = (el) => {
+      if (!el || !el.isConnected) return false;
+      if (el.ownerDocument && el.ownerDocument !== document && !el.ownerDocument.defaultView) return false;
+      if (typeof globalThis.__pt_inFlatTree === 'function' && !globalThis.__pt_inFlatTree(el)) return false;
+      return true;
+    };
     def(textContent, 'getComputedTextLength', function getComputedTextLength() {
       __relayout();
-      const fs = __usedFontSize(this) || 16;
-      let famRaw = __cascadeFor(this).get('font-family');
-      if (famRaw == null) famRaw = __inheritedValue(this, 'font-family');
-      const fam = String(famRaw || '').trim() || 'sans-serif';
+      if (!__svgLaidOut(this)) return 0;
+      const s = __svgScale(this);
+      const fs = __svgSizeEff(__usedFontSize(this) || 16, s);
+      const { fam, bold, italic } = __svgFont(this);
       const txt = __svgText(this);
       if (!txt) return 0;
-      return Math.ceil(__textWidth(txt, fs, fam, false, false) * 64) / 64;
+      const w = Math.ceil(__textWidth(txt, fs, fam, bold, italic) * 64) / 64;
+      // Длина — деление на масштаб в одинарной точности (рамка, напротив,
+      // умножается на обратный: у браузера это два разных пути).
+      return s === 1 ? w : Math.fround(w / Math.fround(s));
+    });
+    def(textContent, 'getSubStringLength', function getSubStringLength(start, n) {
+      __relayout();
+      if (!__svgLaidOut(this)) return 0;
+      const s = __svgScale(this);
+      const fs = __svgSizeEff(__usedFontSize(this) || 16, s);
+      const { fam, bold, italic } = __svgFont(this);
+      const full = __svgText(this);
+      const from = Math.max(0, start | 0), len = Math.max(0, n | 0);
+      const txt = full.slice(from, from + len);
+      if (!txt) return 0;
+      const w = Math.ceil(__textWidth(txt, fs, fam, bold, italic) * 64) / 64;
+      // Длина — деление на масштаб в одинарной точности (рамка, напротив,
+      // умножается на обратный: у браузера это два разных пути).
+      return s === 1 ? w : Math.fround(w / Math.fround(s));
+    });
+    // Протяжённость знака: рамка строки гарнитуры элемента (подъём и спуск
+    // основного шрифта) шириной в продвижение самого знака.
+    def(textContent, 'getExtentOfChar', function getExtentOfChar(i) {
+      __relayout();
+      if (!__svgLaidOut(this)) return svgRect(0, 0, 0, 0);
+      const s = __svgScale(this);
+      const fs = __svgSizeEff(__usedFontSize(this) || 16, s);
+      const { fam, bold, italic } = __svgFont(this);
+      const full = __svgText(this);
+      let idx = Number(i); if (!isFinite(idx) || idx < 0) idx = 0; idx = Math.floor(idx);
+      if (!full || idx >= full.length) {
+        throw new (globalThis.DOMException || Error)("Failed to execute 'getExtentOfChar' on 'SVGTextContentElement': The index provided (" + idx + ") is outside the range of characters.", 'IndexSizeError');
+      }
+      // Знак — вместе с парным суррогатом и модификаторами: у эмодзи одно
+      // продвижение на всю последовательность.
+      const cps = Array.from(full);
+      let at = 0, ci = 0;
+      for (; ci < cps.length && at + cps[ci].length <= idx; ci++) at += cps[ci].length;
+      const before = full.slice(0, at);
+      const ch = full.slice(at, at + (cps[ci] ? cps[ci].length : 1)) || full.slice(at, at + 1);
+      const wAll = __textWidth(before + ch, fs, fam, bold, italic), wBefore = before ? __textWidth(before, fs, fam, bold, italic) : 0;
+      const adv = Math.ceil(Math.max(0, wAll - wBefore) * 64) / 64;
+      const fb = __fontBox(fs, fam);
+      const x = num(this, 'x') + wBefore, y = num(this, 'y');
+      if (s === 1) return svgRect(x, y - fb.asc, adv, fb.asc + fb.desc);
+      const fr = Math.fround; const s32 = fr(s), inv = fr(1 / s32);
+      return svgRect(fr(fr(x * s32) * inv), fr(fr(fr(y * s32) - fb.asc) * inv), fr(adv / s32), fr((fb.asc + fb.desc) * inv));
     });
     def(textContent, 'getNumberOfChars', function getNumberOfChars() { return String(this.textContent || '').length; });
 
@@ -5988,13 +6470,15 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return /^(abbr|address|article|aside|b|bdi|bdo|cite|code|dd|dfn|dt|em|figcaption|figure|footer|h1|h2|h3|h4|h5|h6|header|hgroup|i|ins|del|kbd|main|mark|nav|noscript|rp|rt|ruby|s|samp|section|small|strong|sub|summary|sup|time|u|var|wbr|details|blockquote|caption|colgroup|col)$/.test(local)
       ? 'HTMLElement' : 'HTMLUnknownElement';
   };
-  for (const [C, name] of [[Node, null], [Element, null], [Text, 'Text'], [Comment, 'Comment'],
-    [Document, 'HTMLDocument'], [DocumentFragment, 'DocumentFragment']]) {
+  for (const [C, name] of [[Node, 'Node'], [Element, 'Element'], [Text, 'Text'], [Comment, 'Comment'],
+    [Document, 'Document'], [DocumentFragment, 'DocumentFragment'], [ShadowRoot, 'ShadowRoot']]) {
     if (!C) continue;
     try {
+      // На самом прототипе — его имя (`[object Element]`), на экземпляре —
+      // имя интерфейса тега.
       Object.defineProperty(C.prototype, Symbol.toStringTag, name
         ? { value: name, configurable: true }
-        : { get: function () { return this.nodeType === ELEMENT_NODE ? __tagFor(this) : 'Node'; }, configurable: true });
+        : { get: function () { if (this === C.prototype) return C === Element ? 'Element' : 'Node'; return this.nodeType === ELEMENT_NODE ? __tagFor(this) : 'Node'; }, configurable: true });
     } catch (e) {}
   }
 
@@ -6312,7 +6796,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     };
     const noteAll = (d) => {
       const raw = __declRaw.get(d);
-      if (raw) { for (const [n, v] of raw()) note(n, String(v)); return; }
+      if (raw) { const m = raw(); for (const [n, v] of m) note(n, String(__cssPreciseGet(m, n))); return; }
       for (let i = 0; i < d.length; i++) {
         const n = d.item(i);
         note(n, d.getPropertyValue(n));
@@ -7934,6 +8418,31 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   // дерева.
   const __computedCache = new WeakMap();
 
+  // В плоском дереве ли узел: дитя хозяина теневого корня попадает туда только
+  // через слот с тем же именем; остальные хозяин прячет, и стиля у них нет.
+  function __inFlatTree(el) {
+    let n = el;
+    for (let guard = 0; n && guard < 10000; guard++) {
+      const p = n.parentNode;
+      // Корень — документ (какой именно, проверяет вызывающий по ownerDocument:
+      // у реалма корень дерева и глобальный `document` — разные объекты).
+      if (!p) return n.nodeType === 9;
+      if (p.nodeType === ELEMENT_NODE && p.__ptShadow) {
+        const sr = p.__ptShadow;
+        const want = n.nodeType === ELEMENT_NODE ? (__ptGetA(n, 'slot') || '') : '';
+        let slot = null;
+        try { __walkTree(sr, (x) => { if (!slot && x.nodeType === ELEMENT_NODE && x.__ptLocal === 'slot' && (__ptGetA(x, 'name') || '') === want) slot = x; }); } catch (e) {}
+        if (!slot) return false;
+        n = slot;
+        continue;
+      }
+      if (p.nodeType === 11 && p.__ptHost) { n = p.__ptHost; continue; }
+      n = p;
+    }
+    return false;
+  }
+  globalThis.__pt_inFlatTree = __inFlatTree;
+
   globalThis.getComputedStyle = (el, pseudo) => {
     if (el && !pseudo && el.nodeType === ELEMENT_NODE) {
       __relayout();
@@ -7946,10 +8455,20 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     // значениями по умолчанию — то есть утверждали, что оторванный `<div>`
     // блочный и чёрный, чего браузер про него не говорит. Проверяется одной
     // строкой: создать элемент и спросить его `display`.
-    const rendered = !!(el && el.nodeType === ELEMENT_NODE && el.isConnected);
-    if (!rendered) {
+    const connected = !!(el && el.nodeType === ELEMENT_NODE && el.isConnected);
+    // Документ без окна (DOMParser, createHTMLDocument): стиль не считается
+    // вовсе — пусто и длина ноль. Узел в окне, но вне плоского дерева (дитя
+    // хозяина теневого корня без слота): имена есть, значения пусты.
+    const inView = connected && (!el.ownerDocument || el.ownerDocument === document || !!el.ownerDocument.defaultView);
+    if (!connected || !inView) {
       for (const k of CS_ORDER) map.set(k, '');
       return __makeComputed(map, []);
+    }
+    if (!__inFlatTree(el)) {
+      for (const k of CS_ORDER) map.set(k, '');
+      const names = [...map.keys()];
+      __addShorthands(map);
+      return __makeComputed(map, names);
     }
     for (const k of CS_ORDER) map.set(k, CS_BASE[k]);
     const tag = (el && el.localName) || 'div';
@@ -8019,6 +8538,14 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
                                 ['margin-left', ab.ml], ['margin-right', ab.mr]]) {
             if (v != null && /^auto$/i.test(String(map.get(k) || ''))) map.set(k, q(v));
           }
+        }
+      }
+      // Преобразование браузер печатает матрицей: `matrix(1.001, 0, 0, 1.001, 0, 0)`.
+      {
+        const tr = map.get('transform');
+        if (tr && tr !== 'none') {
+          const M = __parseTransform(tr);
+          if (M) map.set('transform', 'matrix(' + M.map(__cssNum1).join(', ') + ')');
         }
       }
       // Цвет по записи браузера: всякая запись sRGB приводится к `rgb(…)`.
@@ -8158,6 +8685,14 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
           break;
         }
         if (why) map.set('display', to);
+      }
+    }
+    // Числа в вычисленном стиле печатаются шестью значащими цифрами, как и
+    // в объявлении: `138.828125px` → `138.828px`.
+    for (const k of map.keys()) {
+      const v = map.get(k);
+      if (typeof v === 'string' && v && /\d/.test(v) && !(k.charCodeAt(0) === 45 && k.charCodeAt(1) === 45)) {
+        try { map.set(k, __cssNumbers(v)); } catch (e) {}
       }
     }
     const names = [...map.keys()];
@@ -8375,7 +8910,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       own(name, { value: v, writable: true, enumerable: true, configurable: true });
     }
     const dashOf = (p) => String(p).replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
-    return new Proxy(decl, {
+    return __ptProxy(decl, {
       // Только список имён: описания у свойств уже такие, как надо, а лишняя
       // ловушка стоила бы полторы миллисекунды на каждый перебор стиля.
       ownKeys: (t) => __withEpub(Reflect.ownKeys(t)),
