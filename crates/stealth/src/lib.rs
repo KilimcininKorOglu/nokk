@@ -817,7 +817,8 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
 
   // --- history ----------------------------------------------------------
   const HistoryProto = defClass("History");
-  staticProps(HistoryProto, { length: 1, scrollRestoration: "auto", state: null });
+  // Вкладка, открытая человеком, уже прошла новую вкладку: у Chrome длина 2.
+  staticProps(HistoryProto, { length: 2, scrollRestoration: "auto", state: null });
   for (const m of ["back", "forward", "go", "pushState", "replaceState"]) protoMethod(HistoryProto, m, function(){});
   win.history = Object.create(HistoryProto);
 
@@ -2223,6 +2224,43 @@ const WINDOW_ORDER: &str = r#"["Option","Image","Audio","webkitURL","webkitRTCPe
 /// заведённое заново, встаёт в конец, поэтому один проход по списку
 /// выстраивает весь хвост. Идёт последним — после всех слоёв, иначе порядок
 /// снова разъедется.
+/// Поздние правки формы, поверх всех слоёв: порядок имён WebAssembly (у
+/// Chrome compileStreaming/instantiateStreaming заведены раньше JSPI), алиасы
+/// с приставкой webkit — те же объекты, что оригиналы, арность
+/// RTCPeerConnection, порядок статики Notification.
+pub fn shape_fixes_script() -> String {
+    SHAPE_FIXES.to_string()
+}
+
+const SHAPE_FIXES: &str = r#"(() => {
+  const redo = (o, k) => { try { const d = Object.getOwnPropertyDescriptor(o, k); if (d && d.configurable) { delete o[k]; Object.defineProperty(o, k, d); } } catch (e) {} };
+  try { for (const k of ['Suspending', 'promising', 'SuspendError']) redo(globalThis.WebAssembly, k); } catch (e) {}
+  for (const [alias, orig] of [['webkitURL', 'URL'], ['webkitMediaStream', 'MediaStream'], ['WebKitMutationObserver', 'MutationObserver'],
+                               ['WebKitCSSMatrix', 'DOMMatrix'], ['webkitRTCPeerConnection', 'RTCPeerConnection']]) {
+    try {
+      const d = Object.getOwnPropertyDescriptor(globalThis, alias); const o = globalThis[orig];
+      if (d && d.configurable && typeof o === 'function' && d.value !== o) Object.defineProperty(globalThis, alias, { value: o, writable: true, enumerable: false, configurable: true });
+    } catch (e) {}
+  }
+  try { if (globalThis.RTCPeerConnection) Object.defineProperty(RTCPeerConnection, 'length', { value: 0, configurable: true }); } catch (e) {}
+  try { for (const k of ['permission', 'maxActions', 'requestPermission']) redo(globalThis.Notification, k); } catch (e) {}
+  // Планировщик: `postTask` отдаёт итог задачи обещанием, `yield` — пустое.
+  // Ставится здесь, поверх заглушек таблицы имён.
+  try {
+    let SP = globalThis.scheduler && Object.getPrototypeOf(globalThis.scheduler);
+    // У голого объекта прототип — Object.prototype: туда нельзя.
+    if (SP === Object.prototype) SP = globalThis.scheduler;
+    const nat = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
+    if (SP) {
+      Object.defineProperty(SP, 'postTask', { value: nat(function postTask(cb, opts) {
+        const delay = opts && Number(opts.delay) > 0 ? Number(opts.delay) : 0;
+        return new Promise((res, rej) => { setTimeout(() => { try { res(cb()); } catch (e) { rej(e); } }, delay); });
+      }, 'postTask'), writable: true, enumerable: true, configurable: true });
+      Object.defineProperty(SP, 'yield', { value: nat(function () { return new Promise((r) => setTimeout(r, 0)); }, 'yield'), writable: true, enumerable: true, configurable: true });
+    }
+  } catch (e) {}
+})();"#;
+
 pub fn window_order_script() -> String {
     WINDOW_ORDER_TEMPLATE.replace("__WINDOW_ORDER__", WINDOW_ORDER)
 }
@@ -2653,8 +2691,11 @@ const IFACE_KINDS_TEMPLATE: &str = r#"(() => {
           } else {
             let value = d.value;
             if (d.get) { try { value = d.get.call(P); } catch (e) { value = undefined; } }
+            // Настраиваемость — пока да: окончательные флаги и хромовский
+            // порядок членов ставит слой формы прототипов, а неперенастраиваемую
+            // константу ему уже не переставить (у Node константы шли первыми).
             Object.defineProperty(P, name, {
-              value, writable: kind.indexOf('w') >= 0, enumerable: wantE, configurable: wantC,
+              value, writable: kind.indexOf('w') >= 0, enumerable: wantE, configurable: true,
             });
           }
         } catch (e) {}
@@ -2773,7 +2814,11 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
           ancestors = Object.create(P);
         }
       } catch (e) {}
-      for (const name of Object.getOwnPropertyNames(lproto)) {
+      // Порядок собственных членов — хромовский (`valueOf` первым).
+      const LOC_ORDER = ['valueOf', 'ancestorOrigins', 'href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash', 'assign', 'reload', 'replace', 'toString'];
+      const lnames = LOC_ORDER.filter((n) => Object.prototype.hasOwnProperty.call(lproto, n))
+        .concat(Object.getOwnPropertyNames(lproto).filter((n) => LOC_ORDER.indexOf(n) < 0));
+      for (const name of lnames) {
         if (name === 'constructor') continue;
         let d = Object.getOwnPropertyDescriptor(lproto, name);
         if (!d) continue;
@@ -3391,6 +3436,9 @@ __OPFS__
       let d;
       try { d = Object.getOwnPropertyDescriptor(obj, k); } catch (e) { continue; }
       if (!d || !d.configurable) continue;
+      // Что уже есть у предка (addEventListener у EventTarget), на прототип
+      // не копируется — только снимается с объекта и наследуется.
+      if (base && (k in base)) { try { delete obj[k]; } catch (e) {} continue; }
       try {
         if (typeof d.value === 'function') defv(C.prototype, k, native(d.value));
         else if ('value' in d) { const v = d.value; defg(C.prototype, k, function () { return v; }); }
@@ -3555,6 +3603,74 @@ __OPFS__
     rebrand(nav.ink, 'Ink');
     rebrand(nav.locks, 'LockManager');
     rebrand(nav.devicePosture, 'DevicePosture', ET);
+    // Члены — на прототипе, а не на самом объекте: у Chrome у них ничего своего.
+    rebrand(nav.mediaDevices, 'MediaDevices', ET);
+    rebrand(nav.userActivation, 'UserActivation');
+    // Устройства, которых у пустого профиля нет: браузер отвечает пустыми
+    // списками и отказами, а не отсутствием методов. Сверено с Chrome 151.
+    const USB_ = rebrand(nav.usb, 'USB', ET);
+    if (USB_) {
+      meth(USB_.prototype, 'getDevices', function getDevices() { return Promise.resolve([]); });
+      meth(USB_.prototype, 'requestDevice', function requestDevice() { return Promise.reject(new (globalThis.DOMException || Error)("Failed to execute 'requestDevice' on 'USB': Must be handling a user gesture to show a permission request.", 'SecurityError')); });
+    }
+    const HID_ = rebrand(nav.hid, 'HID', ET);
+    if (HID_) {
+      meth(HID_.prototype, 'getDevices', function getDevices() { return Promise.resolve([]); });
+      meth(HID_.prototype, 'requestDevice', function requestDevice() { return Promise.reject(new (globalThis.DOMException || Error)("Failed to execute 'requestDevice' on 'HID': Must be handling a user gesture to show a permission request.", 'SecurityError')); });
+    }
+    const Serial_ = rebrand(nav.serial, 'Serial', ET);
+    if (Serial_) {
+      meth(Serial_.prototype, 'getPorts', function getPorts() { return Promise.resolve([]); });
+      meth(Serial_.prototype, 'requestPort', function requestPort() { return Promise.reject(new (globalThis.DOMException || Error)("Failed to execute 'requestPort' on 'Serial': Must be handling a user gesture to show a permission request.", 'SecurityError')); });
+    }
+    const XR_ = rebrand(nav.xr, 'XRSystem', ET);
+    if (XR_) {
+      meth(XR_.prototype, 'isSessionSupported', function isSessionSupported() { return Promise.resolve(false); });
+      meth(XR_.prototype, 'requestSession', function requestSession() { return Promise.reject(new (globalThis.DOMException || Error)('The specified session configuration is not supported.', 'NotSupportedError')); });
+    }
+    const WL_ = rebrand(nav.wakeLock, 'WakeLock');
+    if (WL_) {
+      meth(WL_.prototype, 'request', function request(type) {
+        const S = globalThis.WakeLockSentinel;
+        const s = S && S.prototype ? Object.create(S.prototype) : {};
+        __pt_write(s, 'type', type === undefined ? 'screen' : String(type));
+        __pt_write(s, 'released', false);
+        __pt_write(s, 'onrelease', null);
+        return Promise.resolve(s);
+      });
+    }
+    const Login_ = rebrand(nav.login, 'NavigatorLogin');
+    if (Login_) meth(Login_.prototype, 'setStatus', function setStatus() { return Promise.resolve(undefined); });
+    const Pres_ = rebrand(nav.presentation, 'Presentation');
+    if (Pres_) {
+      defg(Pres_.prototype, 'defaultRequest', function () { return null; });
+      defg(Pres_.prototype, 'receiver', function () { return null; });
+    }
+    if (nav.devicePosture) {
+      try { const DP = Object.getPrototypeOf(nav.devicePosture); defg(DP, 'type', function () { return 'continuous'; }); } catch (e) {}
+    }
+    if (nav.ink && typeof nav.ink.requestPresenter !== 'function') {
+      try { meth(Object.getPrototypeOf(nav.ink), 'requestPresenter', function requestPresenter() {
+        const D = globalThis.DelegatedInkTrailPresenter;
+        const p = D && D.prototype ? Object.create(D.prototype) : {};
+        __pt_write(p, 'presentationArea', null);
+        return Promise.resolve(p);
+      }); } catch (e) {}
+    }
+    meth(Object.getPrototypeOf(nav), 'getInstalledRelatedApps', function getInstalledRelatedApps() { return Promise.resolve([]); });
+    // Планировщик: `postTask` отдаёт итог задачи обещанием, `yield` — пустое.
+    if (globalThis.scheduler) {
+      try {
+        let SP = Object.getPrototypeOf(globalThis.scheduler);
+        if (SP === Object.prototype) SP = globalThis.scheduler;
+        meth(SP, 'postTask', function postTask(cb, opts) {
+          const delay = opts && Number(opts.delay) > 0 ? Number(opts.delay) : 0;
+          return new Promise((res, rej) => { setTimeout(() => { try { res(cb()); } catch (e) { rej(e); } }, delay); });
+        });
+        meth(SP, 'yield', function () { return new Promise((r) => setTimeout(r, 0)); });
+        try { Object.defineProperty(SP.yield, 'name', { value: 'yield', configurable: true }); } catch (e) {}
+      } catch (e) {}
+    }
 
     const MC = rebrand(nav.mediaCapabilities, 'MediaCapabilities');
     if (MC) {
@@ -3615,10 +3731,13 @@ __OPFS__
     // ── WebGPU ─────────────────────────────────────────────────────────────
     const GPU_ = rebrand(nav.gpu, 'GPU');
     if (GPU_) {
-      const LIMITS = {"maxTextureDimension1D":16384,"maxTextureDimension2D":16384,"maxTextureDimension3D":2048,"maxTextureArrayLayers":2048,"maxBindGroups":4,"maxBindGroupsPlusVertexBuffers":24,"maxBindingsPerBindGroup":1000,"maxDynamicUniformBuffersPerPipelineLayout":8,"maxDynamicStorageBuffersPerPipelineLayout":4,"maxSampledTexturesPerShaderStage":16,"maxSamplersPerShaderStage":16,"maxStorageBuffersPerShaderStage":16,"maxStorageTexturesPerShaderStage":4,"maxUniformBuffersPerShaderStage":12,"maxUniformBufferBindingSize":65536,"maxStorageBufferBindingSize":1073741824,"minUniformBufferOffsetAlignment":256,"minStorageBufferOffsetAlignment":256,"maxVertexBuffers":8,"maxBufferSize":1073741824,"maxVertexAttributes":16,"maxVertexBufferArrayStride":2048,"maxInterStageShaderVariables":16,"maxColorAttachments":8,"maxColorAttachmentBytesPerSample":128,"maxComputeWorkgroupStorageSize":65536,"maxComputeInvocationsPerWorkgroup":1024,"maxComputeWorkgroupSizeX":1024,"maxComputeWorkgroupSizeY":1024,"maxComputeWorkgroupSizeZ":64,"maxComputeWorkgroupsPerDimension":65535,"maxStorageBuffersInFragmentStage":16,"maxStorageTexturesInFragmentStage":4,"maxStorageBuffersInVertexStage":16,"maxStorageTexturesInVertexStage":4};
-      const FEATURES = ["bgra8unorm-storage","clip-distances","core-features-and-limits","depth-clip-control","depth32float-stencil8","dual-source-blending","float32-blendable","float32-filterable","indirect-first-instance","primitive-index","rg11b10ufloat-renderable","shader-f16","subgroups","texture-component-swizzle","texture-compression-astc","texture-compression-astc-sliced-3d","texture-compression-bc","texture-compression-bc-sliced-3d","texture-compression-etc2","texture-formats-tier1","texture-formats-tier2","timestamp-query"];
+      const LIMITS = {"maxTextureDimension1D": 16384, "maxTextureDimension2D": 16384, "maxTextureDimension3D": 2048, "maxTextureArrayLayers": 2048, "maxBindGroups": 4, "maxBindGroupsPlusVertexBuffers": 24, "maxBindingsPerBindGroup": 1000, "maxDynamicUniformBuffersPerPipelineLayout": 8, "maxDynamicStorageBuffersPerPipelineLayout": 4, "maxSampledTexturesPerShaderStage": 16, "maxSamplersPerShaderStage": 16, "maxStorageBuffersPerShaderStage": 16, "maxStorageTexturesPerShaderStage": 4, "maxUniformBuffersPerShaderStage": 12, "maxUniformBufferBindingSize": 65536, "maxStorageBufferBindingSize": 1073741824, "minUniformBufferOffsetAlignment": 256, "minStorageBufferOffsetAlignment": 256, "maxVertexBuffers": 8, "maxBufferSize": 1073741824, "maxVertexAttributes": 16, "maxVertexBufferArrayStride": 2048, "maxInterStageShaderVariables": 16, "maxColorAttachments": 8, "maxColorAttachmentBytesPerSample": 128, "maxComputeWorkgroupStorageSize": 65536, "maxComputeInvocationsPerWorkgroup": 1024, "maxComputeWorkgroupSizeX": 1024, "maxComputeWorkgroupSizeY": 1024, "maxComputeWorkgroupSizeZ": 64, "maxComputeWorkgroupsPerDimension": 65535, "maxImmediateSize": 64, "maxStorageBuffersInFragmentStage": 16, "maxStorageTexturesInFragmentStage": 4, "maxStorageBuffersInVertexStage": 16, "maxStorageTexturesInVertexStage": 4};
+      // Устройство без requiredLimits/requiredFeatures — с пределами по умолчанию
+      // и одной core-features-and-limits, а не с адаптерными.
+      const DEV_LIMITS = {"maxTextureDimension1D": 8192, "maxTextureDimension2D": 8192, "maxTextureDimension3D": 2048, "maxTextureArrayLayers": 256, "maxBindGroups": 4, "maxBindGroupsPlusVertexBuffers": 24, "maxBindingsPerBindGroup": 1000, "maxDynamicUniformBuffersPerPipelineLayout": 8, "maxDynamicStorageBuffersPerPipelineLayout": 4, "maxSampledTexturesPerShaderStage": 16, "maxSamplersPerShaderStage": 16, "maxStorageBuffersPerShaderStage": 8, "maxStorageTexturesPerShaderStage": 4, "maxUniformBuffersPerShaderStage": 12, "maxUniformBufferBindingSize": 65536, "maxStorageBufferBindingSize": 134217728, "minUniformBufferOffsetAlignment": 256, "minStorageBufferOffsetAlignment": 256, "maxVertexBuffers": 8, "maxBufferSize": 268435456, "maxVertexAttributes": 16, "maxVertexBufferArrayStride": 2048, "maxInterStageShaderVariables": 16, "maxColorAttachments": 8, "maxColorAttachmentBytesPerSample": 32, "maxComputeWorkgroupStorageSize": 16384, "maxComputeInvocationsPerWorkgroup": 256, "maxComputeWorkgroupSizeX": 256, "maxComputeWorkgroupSizeY": 256, "maxComputeWorkgroupSizeZ": 64, "maxComputeWorkgroupsPerDimension": 65535, "maxImmediateSize": 64, "maxStorageBuffersInFragmentStage": 8, "maxStorageTexturesInFragmentStage": 4, "maxStorageBuffersInVertexStage": 8, "maxStorageTexturesInVertexStage": 4};
+      const FEATURES = ["depth32float-stencil8", "rg11b10ufloat-renderable", "bgra8unorm-storage", "texture-formats-tier1", "texture-compression-bc", "dual-source-blending", "core-features-and-limits", "float32-filterable", "indirect-first-instance", "texture-compression-astc-sliced-3d", "float32-blendable", "texture-compression-astc", "texture-compression-etc2", "depth-clip-control", "texture-compression-bc-sliced-3d", "texture-formats-tier2", "clip-distances", "shader-f16", "timestamp-query", "primitive-index", "texture-component-swizzle", "subgroups"];
       const INFO = {"vendor":"intel","architecture":"gen-12lp","device":"","description":"","subgroupMinSize":8,"subgroupMaxSize":32,"isFallbackAdapter":false};
-      const WGSL = ["linear_indexing","packed_4x8_integer_dot_product","pointer_composite_access","readonly_and_readwrite_storage_textures","subgroup_id","subgroup_uniformity","texture_and_sampler_let","uniform_buffer_standard_layout","unrestricted_pointer_parameters"];
+      const WGSL = ["packed_4x8_integer_dot_product", "subgroup_uniformity", "immediate_address_space", "subgroup_id", "linear_indexing", "readonly_and_readwrite_storage_textures", "unrestricted_pointer_parameters", "texture_and_sampler_let", "pointer_composite_access", "uniform_buffer_standard_layout"];
 
       // setlike-интерфейс: Chrome отдаёт их именно так, а не массивом.
       const setlike = (name) => {
@@ -3642,10 +3761,12 @@ __OPFS__
       const mkWgsl = setlike('WGSLLanguageFeatures');
 
       const GPUSupportedLimits = iface('GPUSupportedLimits');
+      const LIMVALS = new WeakMap();
       for (const k of Object.keys(LIMITS)) {
         const v = LIMITS[k];
-        defg(GPUSupportedLimits.prototype, k, function () { return v; });
+        defg(GPUSupportedLimits.prototype, k, function () { const m = LIMVALS.get(this); return m ? m[k] : v; });
       }
+      const mkLimits = (vals) => { const o = Object.create(GPUSupportedLimits.prototype); LIMVALS.set(o, vals); return o; };
       const GPUAdapterInfo = iface('GPUAdapterInfo');
       for (const k of Object.keys(INFO)) {
         const v = INFO[k];
@@ -3655,14 +3776,16 @@ __OPFS__
       const GPUDevice = iface('GPUDevice', ET);
       const GPUAdapter = iface('GPUAdapter');
 
-      const limits = Object.create(GPUSupportedLimits.prototype);
+      const limits = mkLimits(LIMITS);
+      const devLimits = mkLimits(DEV_LIMITS);
       const info = Object.create(GPUAdapterInfo.prototype);
       const features = mkFeatures(FEATURES);
+      const devFeatures = mkFeatures(['core-features-and-limits']);
       defg(GPUAdapter.prototype, 'features', function () { return features; });
       defg(GPUAdapter.prototype, 'limits', function () { return limits; });
       defg(GPUAdapter.prototype, 'info', function () { return info; });
-      defg(GPUDevice.prototype, 'features', function () { return features; });
-      defg(GPUDevice.prototype, 'limits', function () { return limits; });
+      defg(GPUDevice.prototype, 'features', function () { return devFeatures; });
+      defg(GPUDevice.prototype, 'limits', function () { return devLimits; });
       defg(GPUDevice.prototype, 'adapterInfo', function () { return info; });
       defg(GPUDevice.prototype, 'label', function () { return ''; });
       // Живое устройство свой `lost` не разрешает — так это и выглядит.
@@ -3685,7 +3808,18 @@ __OPFS__
     }
   }
 
-  if (globalThis.screen) rebrand(screen.orientation, 'ScreenOrientation', ET);
+  if (globalThis.screen) {
+    const SO = rebrand(screen.orientation, 'ScreenOrientation', ET);
+    // `onchange` — обработчик события: null, с чтением и записью.
+    if (SO && !Object.getOwnPropertyDescriptor(SO.prototype, 'onchange')) {
+      const cell = new WeakMap();
+      Object.defineProperty(SO.prototype, 'onchange', {
+        get: fn('get onchange', function () { return cell.has(this) ? cell.get(this) : null; }),
+        set: fn('set onchange', function (v) { cell.set(this, typeof v === 'function' ? v : null); }),
+        enumerable: true, configurable: true,
+      });
+    }
+  }
 
   // Всё, что стоит на окне до первого скрипта страницы, — браузерное, и
   // `toString` обязан говорить [native code]. Интерфейсы, объявленные раньше
@@ -4079,13 +4213,22 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
   try {
     const W = globalThis.WebAssembly;
     if (W && typeof W.compile === 'function' && typeof W.compileStreaming !== 'function') {
-      const bytesOf = (src) => Promise.resolve(src).then((r) => {
-        if (r && typeof r.arrayBuffer === 'function') return r.arrayBuffer();
-        return r;
+      // Как у браузера: принимается только `Response` с MIME
+      // `application/wasm` и удачным статусом, иначе TypeError его словами.
+      const bytesOf = (src, what) => Promise.resolve(src).then((r) => {
+        const head = "Failed to execute '" + what + "' on 'WebAssembly': ";
+        if (!(globalThis.Response && r instanceof Response)) {
+          throw new TypeError(head + "An argument must be provided, which must be a Response or Promise<Response> object");
+        }
+        const mime = String((r.headers && r.headers.get('content-type')) || '').split(';')[0].trim().toLowerCase();
+        if (mime !== 'application/wasm') throw new TypeError(head + "Incorrect response MIME type. Expected 'application/wasm'.");
+        if (!r.ok) throw new TypeError(head + 'HTTP status code is not ok');
+        if (r.bodyUsed) throw new TypeError(head + 'Response already read');
+        return r.arrayBuffer();
       });
-      const cs = function compileStreaming(source) { return bytesOf(source).then((b) => W.compile(b)); };
+      const cs = function compileStreaming(source) { return bytesOf(source, 'compile').then((b) => W.compile(b)); };
       const is = function instantiateStreaming(source, imports) {
-        return bytesOf(source).then((b) => W.instantiate(b, imports));
+        return bytesOf(source, 'instantiate').then((b) => W.instantiate(b, imports));
       };
       Object.defineProperty(W, 'compileStreaming', {
         value: native(cs), writable: true, enumerable: false, configurable: true });
@@ -5065,17 +5208,20 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
   // пустоту там, где браузер отвечает словом.
   try {
     const N = globalThis.Notification;
-    if (typeof N === 'function' && N.permission === undefined) {
-      const get = function () { return 'default'; };
-      const ask = function () { return Promise.resolve('default'); };
+    if (typeof N === 'function') {
+      // В стороннем кадре (и в его песочницах) Chrome отвечает «denied», не
+      // спрашивая; признак ставит движок при рождении кадра. `maxActions` у
+      // Chrome на Linux — 2. Порядок статики — хромовский.
+      const get = function () { return globalThis.__pt_crossSite ? 'denied' : 'default'; };
+      const getMax = function () { return 2; };
+      const ask = function () { return Promise.resolve(get()); };
       try { Object.defineProperty(get, 'name', { value: 'get permission', configurable: true }); } catch (e) {}
+      try { Object.defineProperty(getMax, 'name', { value: 'get maxActions', configurable: true }); } catch (e) {}
       try { Object.defineProperty(ask, 'name', { value: 'requestPermission', configurable: true }); } catch (e) {}
-      Object.defineProperty(N, 'permission', {
-        get: native(get), enumerable: true, configurable: true,
-      });
-      Object.defineProperty(N, 'requestPermission', {
-        value: native(ask), writable: true, enumerable: true, configurable: true,
-      });
+      for (const k of ['permission', 'maxActions', 'requestPermission']) { try { delete N[k]; } catch (e) {} }
+      Object.defineProperty(N, 'permission', { get: native(get), enumerable: true, configurable: true });
+      Object.defineProperty(N, 'maxActions', { get: native(getMax), enumerable: true, configurable: true });
+      Object.defineProperty(N, 'requestPermission', { value: native(ask), writable: true, enumerable: true, configurable: true });
     }
   } catch (e) {}
 
@@ -5516,6 +5662,16 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
       }
       entries.push(e);
       fresh.push(e);
+      // Запись видимости — сразу за навигацией: у Chrome она есть всегда.
+      if (isNav && !globalThis.__ptVisEntry) {
+        try {
+          Object.defineProperty(globalThis, '__ptVisEntry', { value: true, configurable: true });
+          const v = new (globalThis.VisibilityStateEntry || PerformanceEntry)();
+          put(v, { name: 'visible', entryType: 'visibility-state', startTime: 0, duration: 0 });
+          entries.push(v);
+          fresh.push(v);
+        } catch (e2) {}
+      }
       // Отрисовка: у браузера рядом с переходом стоят две записи — первая
       // краска и первая содержательная, — и страницы их читают. У нас их не
       // было вовсе, и `getEntriesByType('paint')` возвращал пустоту.
@@ -6514,15 +6670,34 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         __pt_write(this, 'type', 'default');
         __pt_write(this, 'url', '');
         __pt_write(this, 'bodyUsed', false);
-        Object.defineProperty(this, '__body', { value: body == null ? '' : body, enumerable: false });
+        // Тело хранится байтами, если пришло байтами: `new Response(u8)` у
+        // браузера отдаёт те же байты в `arrayBuffer()`, а у нас массив
+        // превращался в текст «0,97,115…» — и WebAssembly.instantiateStreaming
+        // спотыкался о «магическое слово».
+        let raw = body == null ? '' : body;
+        try {
+          if (raw instanceof ArrayBuffer) raw = new Uint8Array(raw.slice(0));
+          else if (ArrayBuffer.isView(raw)) raw = new Uint8Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength));
+          else if (typeof raw !== 'string' && !(globalThis.Blob && raw instanceof Blob) && !(globalThis.FormData && raw instanceof FormData) && !(globalThis.URLSearchParams && raw instanceof URLSearchParams) && !(globalThis.ReadableStream && raw instanceof ReadableStream)) raw = String(raw);
+        } catch (e) { raw = String(raw); }
+        Object.defineProperty(this, '__body', { value: raw, enumerable: false });
       }
       static error() { const r = new globalThis.Response(null, { status: 0 }); __pt_write(r, 'type', 'error'); return r; }
       static json(data, init) { return new globalThis.Response(__ptJSON.stringify(data), init); }
       clone() { return new globalThis.Response(this.__body, { status: this.status, statusText: this.statusText, headers: this.headers }); }
-      text() { __pt_write(this, 'bodyUsed', true); return Promise.resolve(String(this.__body)); }
+      __ptBytes() {
+        __pt_write(this, 'bodyUsed', true);
+        const b = this.__body;
+        if (b instanceof Uint8Array) return Promise.resolve(b);
+        if (globalThis.Blob && b instanceof Blob && typeof b.arrayBuffer === 'function') return b.arrayBuffer().then((ab) => new Uint8Array(ab));
+        if (globalThis.URLSearchParams && b instanceof URLSearchParams) return Promise.resolve(new TextEncoder().encode(b.toString()));
+        return Promise.resolve(new TextEncoder().encode(String(b)));
+      }
+      text() { return this.__ptBytes().then((u) => new TextDecoder().decode(u)); }
       json() { return this.text().then(JSON.parse); }
-      arrayBuffer() { return this.text().then(t => new TextEncoder().encode(t).buffer); }
-      blob() { return this.text().then(t => new Blob([t])); }
+      arrayBuffer() { return this.__ptBytes().then((u) => u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength)); }
+      bytes() { return this.__ptBytes().then((u) => u.slice()); }
+      blob() { return this.__ptBytes().then((u) => new Blob([u], { type: String(this.headers.get('content-type') || '') })); }
     };
   }
 
@@ -8412,7 +8587,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     publishGL(null, globalThis.WebGL2RenderingContext, GL2_CONSTS, GL2_METHODS);
   } catch (e) {}
 
-  const makeGL = (canvas, ver) => {
+  const makeGL = (canvas, ver, want) => {
+    // Что положили в uniform — то и вернёт getUniform: числа с плавающей
+    // точкой уже в float32, как у браузера.
+    const US = new Map();
     const P = {
       0x1F00: 'WebKit',                                   // VENDOR
       0x1F01: 'WebKit WebGL',                             // RENDERER
@@ -8536,7 +8714,18 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       },
       getSupportedExtensions(){ return (ver === 2 ? GL2_SUPPORTED : GL1_SUPPORTED).slice(); },
       getAttribLocation(){ return 0; },
-      getContextAttributes(){ return { alpha: true, antialias: true, depth: true, desynchronized: false, failIfMajorPerformanceCaveat: false, powerPreference: 'default', premultipliedAlpha: true, preserveDrawingBuffer: false, stencil: false, xrCompatible: false }; },
+      getContextAttributes(){
+        // Запрошенное отражается, как у браузера: `powerPreference: 'low-power'`
+        // возвращается словом, а не «default».
+        const w = (want && typeof want === 'object') ? want : {};
+        const b = (k, d) => (k in w ? !!w[k] : d);
+        const pp = String(w.powerPreference || 'default');
+        return { alpha: b('alpha', true), antialias: b('antialias', true), depth: b('depth', true), desynchronized: b('desynchronized', false),
+          failIfMajorPerformanceCaveat: b('failIfMajorPerformanceCaveat', false),
+          powerPreference: (pp === 'high-performance' || pp === 'low-power') ? pp : 'default',
+          premultipliedAlpha: b('premultipliedAlpha', true), preserveDrawingBuffer: b('preserveDrawingBuffer', false),
+          stencil: b('stencil', false), xrCompatible: b('xrCompatible', false) };
+      },
 
       getContextAttributes_: null,
     });
@@ -8611,13 +8800,22 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         bufferData(t, data, usage) { __pt_glBufferData(gid, t >>> 0, bytesOf(data), (usage || 0) >>> 0); },
         enableVertexAttribArray(i) { __pt_glEnableVertexAttribArray(gid, i >>> 0); },
         vertexAttribPointer(i, size, type, norm, stride, offset) { __pt_glVertexAttribPointer(gid, i >>> 0, size | 0, type >>> 0, norm ? 1 : 0, stride | 0, offset | 0); },
-        uniform1f(l, x) { __pt_glUniformF(gid, L(l), new Float32Array([x])); },
-        uniform2f(l, a, b) { __pt_glUniformF(gid, L(l), new Float32Array([a, b])); },
-        uniform3f(l, a, b, c2) { __pt_glUniformF(gid, L(l), new Float32Array([a, b, c2])); },
-        uniform4f(l, a, b, c2, d) { __pt_glUniformF(gid, L(l), new Float32Array([a, b, c2, d])); },
-        uniform1i(l, x) { __pt_glUniform1i(gid, L(l), x | 0); },
-        uniformMatrix4fv(l, transpose, v) { __pt_glUniformMatrix4(gid, L(l), transpose ? 1 : 0, new Float32Array(v)); },
-        clearColor(r, g, b, a) { const q = (v) => Math.max(0, Math.min(255, Math.round((+v || 0) * 255))); clearRGBA = [q(r), q(g), q(b), q(a)]; },
+        uniform1f(l, x) { const a = new Float32Array([x]); US.set(L(l), a); __pt_glUniformF(gid, L(l), a); },
+        uniform2f(l, a, b) { const v = new Float32Array([a, b]); US.set(L(l), v); __pt_glUniformF(gid, L(l), v); },
+        uniform3f(l, a, b, c2) { const v = new Float32Array([a, b, c2]); US.set(L(l), v); __pt_glUniformF(gid, L(l), v); },
+        uniform4f(l, a, b, c2, d) { const v = new Float32Array([a, b, c2, d]); US.set(L(l), v); __pt_glUniformF(gid, L(l), v); },
+        uniform1i(l, x) { US.set(L(l), new Int32Array([x | 0])); __pt_glUniform1i(gid, L(l), x | 0); },
+        uniformMatrix4fv(l, transpose, v) { const a = new Float32Array(v); US.set(L(l), a); __pt_glUniformMatrix4(gid, L(l), transpose ? 1 : 0, a); },
+        getUniform(p, l) { const v = US.get(L(l)); if (!v) return null; return v.length === 1 ? v[0] : v.slice(); },
+        clearColor(r, g, b, a) { const q = (v) => Math.max(0, Math.min(255, Math.round((+v || 0) * 255))); clearRGBA = [q(r), q(g), q(b), q(a)]; P[0x0C22] = new Float32Array([+r || 0, +g || 0, +b || 0, +a || 0]); },
+        // Состояние, которое читается обратно через getParameter — уже в float32,
+        // как у браузера: 11.2 возвращается как 11.199999809265137.
+        lineWidth(w) { P[0x0B21] = Math.fround(+w || 0); },
+        polygonOffset(f, u) { P[0x8038] = Math.fround(+f || 0); P[0x2A00] = Math.fround(+u || 0); },
+        depthRange(n, f) { P[0x0B70] = new Float32Array([Math.max(0, Math.min(1, +n || 0)), Math.max(0, Math.min(1, +f || 0))]); },
+        sampleCoverage(v, invert) { P[0x80AA] = Math.fround(Math.max(0, Math.min(1, +v || 0))); P[0x80AB] = !!invert; },
+        blendColor(r, g, b, a) { P[0x8005] = new Float32Array([+r || 0, +g || 0, +b || 0, +a || 0]); },
+        clearDepth(d) { P[0x0B73] = Math.fround(Math.max(0, Math.min(1, +d || 0))); },
         clear(mask) { syncSize(); __pt_glClear(gid, clearRGBA[0], clearRGBA[1], clearRGBA[2], clearRGBA[3], mask | 0); },
         viewport(x, y, w, h) { syncSize(); vp = [x | 0, y | 0, w | 0, h | 0]; __pt_glViewport(gid, x | 0, y | 0, w | 0, h | 0); },
         enable(cap) { __pt_glEnable(gid, cap >>> 0, 1); },
@@ -8897,8 +9095,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         if (!this.__ptC2d) { this.__ptC2d = make2DContext(this, ctxAttrs); ctrace(CTX_IMPL.get(this.__ptC2d) || this.__ptC2d, 'getContext("2d", ' + JSON.stringify(ctxAttrs === undefined ? null : ctxAttrs) + ')'); }
         return this.__ptC2d;
       }
-      if (t === 'webgl') return this.__ptGl1 || (this.__ptGl1 = makeGL(this, 1));
-      return this.__ptGl2 || (this.__ptGl2 = makeGL(this, 2));
+      if (t === 'webgl') return this.__ptGl1 || (this.__ptGl1 = makeGL(this, 1, ctxAttrs));
+      return this.__ptGl2 || (this.__ptGl2 = makeGL(this, 2, ctxAttrs));
     }, 'getContext');
     proto.toDataURL = mask(function toDataURL() {
       if (this.localName !== 'canvas') return 'data:,';
@@ -9848,48 +10046,78 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // у человека, а имени вне перечня отвечает броском — и `push` особым. Мы
   // отвечали `prompt` на что угодно, включая выдуманное, и это само по себе
   // ответ не браузера.
-  const PERM_GRANTED = new Set(['screen-wake-lock', 'storage-access', 'clipboard-write',
-    'payment-handler', 'background-sync', 'accelerometer', 'gyroscope', 'magnetometer']);
-  const PERM_PROMPT = new Set(['geolocation', 'notifications', 'camera', 'microphone', 'midi',
-    'persistent-storage', 'clipboard-read', 'idle-detection', 'local-fonts', 'window-management',
-    'display-capture', 'captured-surface-control', 'bluetooth', 'periodic-background-sync']);
+  // Имена, которые Chrome 151 принимает: как он их называет в ответе, что
+  // отвечает наверху и что — в стороннем кадре (сверено на chess.com).
+  // Прочие имена — ошибка с его же текстом.
+  const PERMS = {
+    'geolocation': ['geolocation', 'prompt', 'denied'], 'notifications': ['notifications', 'prompt', 'denied'],
+    'midi': ['midi', 'prompt', 'denied'], 'camera': ['video_capture', 'prompt', 'denied'],
+    'microphone': ['audio_capture', 'prompt', 'denied'], 'background-fetch': ['background_fetch', 'granted', 'granted'],
+    'background-sync': ['background_sync', 'granted', 'granted'], 'persistent-storage': ['durable_storage', 'prompt', 'prompt'],
+    'accelerometer': ['sensors', 'granted', 'granted'], 'gyroscope': ['sensors', 'granted', 'granted'],
+    'magnetometer': ['sensors', 'granted', 'granted'], 'screen-wake-lock': ['screen_wake_lock', 'granted', 'denied'],
+    'display-capture': ['display_capture', 'prompt', 'denied'], 'clipboard-read': ['clipboard_read', 'prompt', 'denied'],
+    'clipboard-write': ['clipboard_write', 'granted', 'denied'], 'payment-handler': ['payment_handler', 'granted', 'granted'],
+    'idle-detection': ['idle_detection', 'prompt', 'denied'], 'periodic-background-sync': ['periodic_background_sync', 'denied', 'denied'],
+    'storage-access': ['storage-access', 'granted', 'prompt'], 'window-management': ['window-management', 'prompt', 'denied'],
+    'local-fonts': ['local_fonts', 'prompt', 'denied'], 'captured-surface-control': ['captured-surface-control', 'prompt', 'denied'],
+    'keyboard-lock': ['keyboard-lock', 'granted', 'granted'], 'pointer-lock': ['pointer-lock', 'granted', 'granted'],
+  };
+  const PERM_ERRORS = {
+    'push': ['NotSupportedError', "Push Permission without userVisibleOnly:true isn't supported yet."],
+    'ambient-light-sensor': ['TypeError', 'GenericSensorExtraClasses flag is not enabled.'],
+    'nfc': ['TypeError', 'Web NFC is not enabled.'],
+    'system-wake-lock': ['TypeError', 'System Wake Lock is not enabled.'],
+    'top-level-storage-access': ['TypeError', 'The requested origin is invalid.'],
+    'speaker-selection': ['TypeError', 'The Speaker Selection API is not enabled.'],
+    'web-app-installation': ['TypeError', 'The Web App Install API is not enabled.'],
+    'fullscreen': ['TypeError', 'Fullscreen Permission only supports allowWithoutGesture:true.'],
+  };
   const permissions = { query: mask(function query(desc){
     const name = desc && desc.name;
-    if (name === 'push') {
-      return Promise.reject(new (globalThis.DOMException || Error)(
-        "Failed to execute 'query' on 'Permissions': Push Permission without " +
-        "userVisibleOnly:true isn't supported yet.", 'NotSupportedError'));
+    const head = "Failed to execute 'query' on 'Permissions': ";
+    const known = PERM_ERRORS[name];
+    if (known) {
+      const [kind, text] = known;
+      return Promise.reject(kind === 'TypeError' ? new TypeError(head + text)
+        : new (globalThis.DOMException || Error)(head + text, kind));
     }
-    if (!PERM_GRANTED.has(name) && !PERM_PROMPT.has(name)) {
-      return Promise.reject(new TypeError(
-        "Failed to execute 'query' on 'Permissions': Failed to read the 'name' property from " +
+    const row = PERMS[name];
+    if (!row) {
+      return Promise.reject(new TypeError(head + "Failed to read the 'name' property from " +
         "'PermissionDescriptor': The provided value '" + name +
         "' is not a valid enum value of type PermissionName."));
     }
-    const state = PERM_GRANTED.has(name) ? 'granted' : 'prompt';
-    return Promise.resolve({ state, name, onchange: null, addEventListener(){}, removeEventListener(){} });
+    const state = globalThis.__pt_crossSite ? row[2] : row[1];
+    // Ответ — настоящий PermissionStatus, а не голый объект: по нему смотрят
+    // `Object.prototype.toString` и конструктор.
+    const PS = globalThis.PermissionStatus;
+    const status = PS && PS.prototype ? Object.create(PS.prototype) : { addEventListener(){}, removeEventListener(){} };
+    __pt_write(status, 'name', row[0]);
+    __pt_write(status, 'state', state);
+    __pt_write(status, 'onchange', null);
+    return Promise.resolve(status);
   }, 'query') };
   try { Object.defineProperty(navProto, 'permissions', { get: () => permissions, enumerable: true, configurable: true }); } catch (e) {}
 
   // --- window.chrome (its absence/shape is a classic headless tell) -----
   if (!globalThis.chrome) {
     const ts = () => performance.now() / 1000;
+    // У Chrome `loadTimes`/`csi` безымянные, `runtime` без расширений нет,
+    // порядок членов — loadTimes, csi, app; в `app` есть `installState`.
+    const anon = (f) => { try { Object.defineProperty(f, 'name', { value: '', configurable: true }); } catch (e) {} return f; };
     globalThis.chrome = {
+      loadTimes: anon(function () { return { requestTime: ts(), startLoadTime: ts(), commitLoadTime: ts(), finishDocumentLoadTime: ts(), finishLoadTime: ts(), firstPaintTime: ts(), firstPaintAfterLoadTime: 0, navigationType: 'Other', wasFetchedViaSpdy: true, wasNpnNegotiated: true, npnNegotiatedProtocol: 'h2', wasAlternateProtocolAvailable: false, connectionInfo: 'h2' }; }),
+      csi: anon(function () { return { startE: Date.now(), onloadT: Date.now(), pageT: performance.now(), tran: 15 }; }),
       app: {
         isInstalled: false,
+        getDetails: function getDetails() { return null; },
+        getIsInstalled: function getIsInstalled() { return false; },
+        installState: function installState() { return 'not_installed'; },
+        runningState: function runningState() { return 'cannot_run'; },
         InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
         RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
-        getDetails: () => null, getIsInstalled: () => false, runningState: () => 'cannot_run',
       },
-      runtime: {
-        OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
-        OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
-        PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
-        PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
-        connect: noop, sendMessage: noop, id: undefined,
-      },
-      loadTimes: () => ({ requestTime: ts(), startLoadTime: ts(), commitLoadTime: ts(), finishDocumentLoadTime: ts(), finishLoadTime: ts(), firstPaintTime: ts(), firstPaintAfterLoadTime: 0, navigationType: 'Other', wasFetchedViaSpdy: true, wasNpnNegotiated: true, npnNegotiatedProtocol: 'h2', wasAlternateProtocolAvailable: false, connectionInfo: 'h2' }),
-      csi: () => ({ startE: Date.now(), onloadT: Date.now(), pageT: performance.now(), tran: 15 }),
     };
   }
 
@@ -9930,10 +10158,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       const all = [nav].concat(performance.getEntriesByType('resource'));
       const rtts = all.map((e) => Math.max(0, (e.responseStart || 0) - (e.requestStart || 0)))
         .filter((x) => x > 0).sort((a, b) => a - b);
-      const mid = rtts.length ? rtts[rtts.length >> 1] : 100;
+      // Оценка у браузера транспортная (TCP/QUIC), а не HTTP: ближе всего к
+      // ней самый быстрый из наших ответов, не середина.
+      const mid = rtts.length ? rtts[0] : 50;
       // Не ниже пятидесяти и не выше трёхсот: в этих пределах живёт домашняя
       // сеть, а нули и тысячи браузер на ней не печатает.
-      const rtt = Math.min(300, Math.max(50, Math.round(mid / 25) * 25));
+      // Быстрая сеть у Chrome — ровно 50: всё, что быстрее сотни, туда же.
+      const rtt = mid < 100 ? 50 : Math.min(300, Math.round(mid / 25) * 25);
       let bytes = 0, secs = 0;
       for (const e of all) {
         bytes += Number(e.transferSize) || 0;
@@ -9954,7 +10185,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // описывает ноутбук, а наш облик — настольный.
   const batteryLevel = 1;
   navExtra('getBattery', mask(function getBattery() { return Promise.resolve({ charging: true, chargingTime: 0, dischargingTime: Infinity, level: Math.round(batteryLevel * 100) / 100, onchargingchange: null, onchargingtimechange: null, ondischargingtimechange: null, onlevelchange: null, addEventListener: noop, removeEventListener: noop }); }, 'getBattery'));
-  navExtra('storage', { estimate: () => Promise.resolve({ quota: 299977155072, usage: 0, usageDetails: {} }), persist: () => Promise.resolve(false), persisted: () => Promise.resolve(false) });
+  navExtra('storage', { estimate: () => Promise.resolve({ quota: 10737418240, usage: 0, usageDetails: {} }), persist: () => Promise.resolve(false), persisted: () => Promise.resolve(false) });
   // До первого жеста браузер отвечает ложью на оба: страница, открытая
   // движком, ничего ещё не нажимала. Нажатие поднимает флаг само.
   navExtra('userActivation', {
@@ -10388,8 +10619,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // On the *prototype*, not the instance: a real `document` has no own
     // properties, so defining these on it would be a tell.
     const dproto = (globalThis.Document && globalThis.Document.prototype) || document;
-    Object.defineProperty(dproto, 'visibilityState', { get: () => 'visible', configurable: true });
-    Object.defineProperty(dproto, 'hidden', { get: () => false, configurable: true });
+    // Окно вынутого из документа кадра — скрыто, как у браузера.
+    Object.defineProperty(dproto, 'visibilityState', { get: () => (globalThis.__ptDetached ? 'hidden' : 'visible'), configurable: true });
+    Object.defineProperty(dproto, 'hidden', { get: () => !!globalThis.__ptDetached, configurable: true });
   } catch (e) {}
 
   if (!globalThis.TextDecoder) {
@@ -10932,7 +11164,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
   // `origin` есть у окна, `valueOf` — у location.
   if (!('origin' in globalThis)) {
-    try { Object.defineProperty(globalThis, 'origin', { get: () => (globalThis.location && location.origin) || 'null', enumerable: true, configurable: true }); } catch (e) {}
+    // У `about:blank` origin окна унаследован от создателя (location.origin при
+    // этом остаётся "null", как у браузера); подсказку кладёт родитель.
+    try { Object.defineProperty(globalThis, 'origin', { get: () => ((globalThis.location && location.href === 'about:blank' && globalThis.__pt_inheritedOrigin) || (globalThis.location && location.origin) || 'null'), enumerable: true, configurable: true }); } catch (e) {}
   }
   try {
     const lp = globalThis.location && Object.getPrototypeOf(globalThis.location);

@@ -456,12 +456,13 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
     // Натурализация — после поздних интерфейсов и до снимка: каждый член
     // должен выглядеть родным, а снимок — держать уже итоговые функции.
     let base = format!(
-        "{base}\n{}\n{}\n{}\n{}\n{}",
+        "{base}\n{}\n{}\n{}\n{}\n{}\n{}",
         nokk_stealth::late_interfaces_script(),
         // `NOKK_NO_PROTO_SHAPE=1` — без слоя формы, для бисекции.
         if std::env::var_os("NOKK_NO_PROTO_SHAPE").is_some() { String::new() } else { nokk_stealth::proto_shape_script() },
         nokk_stealth::naturalize_script(),
         nokk_stealth::late_originals_script(),
+        nokk_stealth::shape_fixes_script(),
         // Порядок имён окна — последним: перечисление отдаёт их в порядке
         // заведения, и всякий слой, заводящий своё имя, этот порядок сдвигает.
         nokk_stealth::window_order_script(),
@@ -1164,6 +1165,22 @@ impl BrowserContext {
         Ok(())
     }
 
+    /// Кодировка, объявленная заголовком `Content-Type` ответа на документ
+    /// по этому адресу, если она там есть.
+    fn document_charset(&self, url: &str) -> Option<String> {
+        let log = self.requests.lock().ok()?;
+        let r = log.iter().rev().find(|r| r.url == url)?;
+        let ct = r.headers.get("content-type")?.to_ascii_lowercase();
+        let i = ct.find("charset=")?;
+        let rest = &ct[i + 8..];
+        let label: String = rest
+            .trim_start_matches('"')
+            .chars()
+            .take_while(|c| !matches!(c, ';' | '"' | ' ' | ','))
+            .collect();
+        if label.is_empty() { None } else { Some(label) }
+    }
+
     /// [`Self::load_html`] against a chosen context — the same steps, so an
     /// iframe's document is built exactly the way the top-level one is (its own
     /// `location`, its own tree, its own scripts, its own lifecycle events).
@@ -1196,6 +1213,15 @@ impl BrowserContext {
 
         // Install the parsed tree as `document`.
         self.eval_in(index, &page.install_script()).await?;
+        // Кодировка из заголовка ответа: документ с `charset=utf-8` в
+        // Content-Type браузер называет UTF-8, даже если в разметке ни слова.
+        if let Some(charset) = self.document_charset(base_url) {
+            let js = format!(
+                "try {{ Object.defineProperty(document, '__ptCharset', {{ value: (typeof __normEncoding === 'function' ? __normEncoding({0}) : {0}), configurable: true, enumerable: false }}); }} catch (e) {{}}",
+                js_str(&charset)
+            );
+            let _ = self.eval_in(index, &js).await;
+        }
 
         // Execute scripts in order against the live document. `idx` matches the
         // document-order script list the DOM runtime built, so `__pt_beginScript`
@@ -2666,6 +2692,25 @@ impl BrowserContext {
                     // is not the top-level window.
                     let _ = self
                         .eval_in(index, &format!("__pt_markAsFrame({id});"))
+                        .await;
+                    // Стороннесть и реферер: в стороннем кадре Chrome отвечает
+                    // «denied» на разрешения, а `document.referrer` при
+                    // strict-origin-when-cross-origin — только источник родителя.
+                    let referrer = if cross {
+                        format!("{}/", origin_of(base))
+                    } else {
+                        base.split('#').next().unwrap_or(base).to_string()
+                    };
+                    let _ = self
+                        .eval_in(
+                            index,
+                            &format!(
+                                "Object.defineProperty(globalThis, '__pt_crossSite', {{ value: {cross}, configurable: true }});\n\
+                                 Object.defineProperty(globalThis, '__pt_referrer', {{ value: {0}, configurable: true }});\n\
+                                 try {{ document.referrer = {0}; }} catch (e) {{}}",
+                                js_str(&referrer)
+                            ),
+                        )
                         .await;
                     // И своё окно: у кадра оно размером с его `<iframe>`, а не со
                     // страницей. Виджет Turnstile живёт в 300×65 и этот размер
@@ -6021,6 +6066,12 @@ mod tests {
             let leaked = p[key]
                 .as_array()
                 .unwrap_or_else(|| panic!("probe missing {key}"));
+            // У события одно своё свойство и у браузера: `isTrusted`
+            // ([LegacyUnforgeable]).
+            if key == "evtOwn" {
+                assert_eq!(leaked, &vec![serde_json::json!("isTrusted")], "evtOwn: {leaked:?}");
+                continue;
+            }
             assert!(
                 leaked.is_empty(),
                 "{key} exposes own properties: {leaked:?}"

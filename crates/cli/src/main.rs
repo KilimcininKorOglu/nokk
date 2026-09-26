@@ -1284,7 +1284,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                         if (ряд.length < 600) ряд.push(String(this));
                       } else if (i === 0 && globalThis.__ptСериализуем2) {
                         const ряд = globalThis.__ptСтроки2 || (globalThis.__ptСтроки2 = []);
-                        if (ряд.length < 60000) ряд.push(this.length < 400 ? String(this) : '\u0001' + this.length);
+                        if (ряд.length < 60000) ряд.push(this.length < 2000 ? String(this) : '\u0001' + this.length);
                       }
                       return CCA.call(this, i);
                     }, CCA);

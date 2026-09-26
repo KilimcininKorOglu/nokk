@@ -275,6 +275,11 @@
     contains(n) { for (; n; n = n.parentNode) if (n === this) return true; return false; }
     // Walks out through a shadow host too: a node inside an attached shadow tree
     // is connected, even though the root itself has no parent.
+    // Базовый адрес — у документа: у `about:blank` он от создателя.
+    get baseURI() {
+      const d = this.nodeType === 9 ? this : (this.ownerDocument || null);
+      return d && typeof d.__ptBaseURI === 'function' ? d.__ptBaseURI() : ((globalThis.location && globalThis.location.href) || 'about:blank');
+    }
     get isConnected() {
       for (let n = this; n; n = n.parentNode || n.__ptHost) {
         if (n.nodeType === DOCUMENT_NODE) return true;
@@ -347,6 +352,9 @@
       // whole subtree goes, for the same reason it connects as a whole.
       __walkTree(child, (f) => {
         if (f.__ptFrameId) __ptDisconnectFrame(f);
+        // Кадр с песочницей: его окно остаётся у страницы в руках, но контекст
+        // закрыт — размеры нулевые, `closed`, без `frameElement`.
+        if (f.__ptRealm) { try { if (typeof f.__ptRealm.__pt_detach === 'function') f.__ptRealm.__pt_detach(); } catch (e) {} try { __realmFrames.delete(f); } catch (e) {} }
         if (f.__ptUpgraded) __customCallback(f, 'disconnectedCallback');
       });
       return child;
@@ -684,6 +692,11 @@
     get [Symbol.toStringTag]() { return 'ShadowRoot'; }
     get host() { return this.__ptHost; }
     get mode() { return this.__ptMode; }
+    get delegatesFocus() { return !!this.__ptDelegatesFocus; }
+    get clonable() { return !!this.__ptClonable; }
+    get serializable() { return !!this.__ptSerializable; }
+    get slotAssignment() { return this.__ptSlotAssignment || 'named'; }
+    getHTML(opts) { return this.__ptKids.map((n) => serializeNode(n, !!(opts && opts.serializableShadowRoots))).join(''); }
     get nodeName() { return '#document-fragment'; }
     get nodeValue() { return null; }
     get textContent() { return this.__ptKids.map(n => n.textContent).join(''); }
@@ -1219,6 +1232,15 @@
         ['frameElement', this], ['self', w], ['window', w]]) {
         try { Object.defineProperty(w, k, { value: v, configurable: true }); } catch (e) {}
       }
+      // Песочница наследует стороннесть кадра: разрешения и Notification в ней
+      // отвечают как в нём.
+      try { Object.defineProperty(w, '__pt_crossSite', { value: !!globalThis.__pt_crossSite, configurable: true }); } catch (e) {}
+      // Происхождение `about:blank` — от создателя: origin и document.domain
+      // отвечают его словами, адрес остаётся about:blank.
+      try {
+        Object.defineProperty(w, '__pt_inheritedOrigin', { value: (globalThis.location && location.origin) || 'null', configurable: true });
+        Object.defineProperty(w, '__pt_inheritedHost', { value: (globalThis.location && location.hostname) || '', configurable: true });
+      } catch (e) {}
       Object.defineProperty(this, '__ptRealm', { value: w, configurable: true, enumerable: false });
       try { __realmFrames.add(this); } catch (e) {}
       // Окно кадра — его собственная коробка, а не окно страницы. Кадр
@@ -1230,7 +1252,12 @@
       // размер кадр получит с ближайшей раскладкой — её итог раздаётся всем
       // окнам кадров.
       try {
-        const hidden = String((this.style && this.style.display) || '') === 'none' || __ptHasA(this, 'hidden');
+        // Скрыт сам или любым предком (через хозяев теневых корней): окно
+        // такого кадра у Chrome 0×0.
+        let hidden = false;
+        for (let p = this; p && p.nodeType === ELEMENT_NODE; p = p.parentNode && p.parentNode.nodeType === 11 && p.parentNode.__ptHost ? p.parentNode.__ptHost : p.parentNode) {
+          if (String((p.style && p.style.display) || '') === 'none' || __ptHasA(p, 'hidden')) { hidden = true; break; }
+        }
         const [dw, dh] = __ptJSON.parse(__pt_frameBoxOf(this));
         __ptTellFrame(this, hidden ? null : { cw: dw, ch: dh });
       } catch (e) {}
@@ -1240,6 +1267,8 @@
         const markup = __ptGetA(this, 'srcdoc');
         if (typeof w.__pt_writeDocument === 'function') w.__pt_writeDocument(markup || '');
       } catch (e) {}
+      // Реферер и базовый адрес пустого кадра — документ-создатель, как у Chrome.
+      try { Object.defineProperty(w, '__pt_creatorURL', { value: (globalThis.location && location.href) || '', configurable: true }); } catch (e) {}
       return w;
     }
     // A `<script>` that has just entered the document runs — once. The "already
@@ -1310,7 +1339,13 @@
         // вечно — а это обычный способ дождаться готового кадра.
         if (!this.__ptBlankLoaded) {
           Object.defineProperty(this, '__ptBlankLoaded', { value: true, configurable: true, enumerable: false });
-          __pt_soon(() => { try { this.__ptFireLoad(true); } catch (e) {} });
+          // Пустой кадр у Chrome загружен уже при вставке: `load` уходит тут же,
+          // в том же такте. Челлендж вставляет песочницу, ждёт load, снимает
+          // окно и вынимает кадр за один оборот — у нас на это уходило полсекунды,
+          // и окно мерилось ещё вставленным (300×150 вместо 0×0). Кадр с srcdoc
+          // разбирается, и его load — следующим оборотом.
+          if (__ptGetA(this, 'srcdoc') === null) { try { this.__ptFireLoad(true); } catch (e) {} }
+          else __pt_soon(() => { try { this.__ptFireLoad(true); } catch (e) {} });
         }
         return;
       }
@@ -1332,11 +1367,24 @@
     // first line without this. The tree is genuinely separate: nothing inside is
     // reachable from `document.querySelector`, which is the point of it.
     attachShadow(init) {
-      const mode = (init && init.mode) === 'closed' ? 'closed' : 'open';
-      if (this.__ptShadow) throw new Error("Failed to execute 'attachShadow' on 'Element': Shadow root cannot be created on a host which already hosts a shadow tree.");
-      this.__ptShadow = new ShadowRoot(this, mode);
+      const m = init && init.mode;
+      if (m !== 'open' && m !== 'closed') {
+        throw new TypeError("Failed to execute 'attachShadow' on 'Element': Failed to read the 'mode' property from 'ShadowRootInit': The provided value '" + m + "' is not a valid enum value of type ShadowRootMode.");
+      }
+      if (this.__ptShadow) throw new (globalThis.DOMException || Error)("Failed to execute 'attachShadow' on 'Element': Shadow root cannot be created on a host which already hosts a shadow tree.", 'NotSupportedError');
+      const sr = new ShadowRoot(this, m);
+      sr.__ptDelegatesFocus = !!init.delegatesFocus;
+      sr.__ptClonable = !!init.clonable;
+      sr.__ptSerializable = !!init.serializable;
+      sr.__ptSlotAssignment = init.slotAssignment === 'manual' ? 'manual' : 'named';
+      this.__ptShadow = sr;
       __markDirty();
-      return this.__ptShadow;
+      return sr;
+    }
+    getHTML(opts) {
+      const kids = (this.__ptLocal === 'template' ? __templateContent(this) : this).__ptKids;
+      const withShadow = !!(opts && opts.serializableShadowRoots);
+      return kids.map((n) => serializeNode(n, withShadow)).join('');
     }
     get shadowRoot() {
       const r = this.__ptShadow;
@@ -1533,8 +1581,8 @@
     set defaultView(v) { this.__ptView = v; }
     get currentScript() { return this.__ptCurScript; }
     set currentScript(v) { this.__ptCurScript = v; }
-    get visibilityState() { return 'visible'; }
-    get hidden() { return false; }
+    get visibilityState() { return globalThis.__ptDetached ? 'hidden' : 'visible'; }
+    get hidden() { return !!globalThis.__ptDetached; }
     get documentElement() { return this.__ptDocEl; }
     // ParentNode у документа — своё, а не наследованное: у браузера
     // `children` лежит на `Document.prototype`, и без него поверхность
@@ -1548,6 +1596,8 @@
     }
     set documentElement(v) { this.__ptDocEl = v; }
     get readyState() { return this.__ptReady; }
+    // Окно у человека в фокусе; DevTools-окно Chrome отвечает false, живое — true.
+    hasFocus() { return !globalThis.__ptDetached; }
     set readyState(v) { this.__ptReady = v; }
     // В браузере это `<body>`, как только тело есть, и никогда не null у
     // загруженного документа: сборщик отпечатка кладёт его в корзину объектов,
@@ -1597,6 +1647,8 @@
     // «UTF-8» на документ, который ничего не объявил, — заметная разница.
     get characterSet() {
       if (this.__ptCharset) return this.__ptCharset;
+      // Документы из строки (DOMParser) — всегда UTF-8.
+      if (this.__ptContentType) return 'UTF-8';
       for (const m of __docTags(this, 'meta')) {
         const c = __ptGetA(m, 'charset');
         if (c) return __normEncoding(c);
@@ -1605,15 +1657,17 @@
           if (hit) return __normEncoding(hit[1]);
         }
       }
-      return 'windows-1252';
+      // Пустой документ (`about:blank`, песочница челленджа) у браузера в UTF-8.
+      return this.URL === 'about:blank' ? 'UTF-8' : 'windows-1252';
     }
     get charset() { return this.characterSet; }
     get inputEncoding() { return this.characterSet; }
-    get contentType() { return 'text/html'; }
+    get contentType() { return this.__ptContentType || 'text/html'; }
+    get xmlVersion() { return this.__ptXml ? '1.0' : null; }
     // Страница без `<!DOCTYPE>` живёт в режиме совместимости, и браузер это
     // говорит: `BackCompat` и `doctype === null`. Мы отвечали «стандартный
     // режим» всегда и выдавали объект-заглушку вместо узла.
-    get compatMode() { return this.__ptDoctype ? 'CSS1Compat' : 'BackCompat'; }
+    get compatMode() { return this.__ptDoctype || this.__ptXml ? 'CSS1Compat' : 'BackCompat'; }
     get doctype() { return this.__ptDoctype || null; }
     get designMode() { return 'off'; }
     set designMode(v) {}
@@ -1630,7 +1684,8 @@
     get textContent() { return null; }
     set textContent(v) {}
 
-    get referrer() { return this.__ptReferrer || ''; }
+    // У `about:blank` в кадре реферер — документ-создатель.
+    get referrer() { return this.__ptReferrer || (this.URL === 'about:blank' && globalThis.__pt_creatorURL) || (this === globalThis.document && globalThis.__pt_referrer) || ''; }
     set referrer(v) { this.__ptReferrer = String(v); }
 
     // `document.location` is `window.location` — the same object, not a copy. Its
@@ -1638,12 +1693,14 @@
     // deal of code asks where it is, and against `undefined` that throws. It is
     // what stopped Cloudflare's full-page challenge here, inside its own timer,
     // where nothing surfaced the error.
-    get location() { return globalThis.location; }
+    // У документа без окна (DOMParser, XHR) `location` — null.
+    get location() { return this === globalThis.document ? globalThis.location : null; }
     set location(v) { try { globalThis.location.href = String(v); } catch (e) {} }
     get URL() { return (globalThis.location && globalThis.location.href) || 'about:blank'; }
     get documentURI() { return this.URL; }
-    get baseURI() { return this.URL; }
-    get domain() { return (globalThis.location && globalThis.location.hostname) || ''; }
+    // У `about:blank` базовый адрес — адрес создателя (запасной по спецификации).
+    __ptBaseURI() { return this.URL === 'about:blank' && globalThis.__pt_creatorURL ? globalThis.__pt_creatorURL : this.URL; }
+    get domain() { return (globalThis.location && globalThis.location.hostname) || globalThis.__pt_inheritedHost || ''; }
     set domain(v) { /* only ever narrowed to a parent domain; nothing to do here */ }
 
     get cookie() { return this.__ptCookie; }
@@ -1664,6 +1721,14 @@
       const raw = String(tag);
       if (!/^[A-Za-z_:\u00C0-\u{10FFFF}][A-Za-z0-9_:.\-\u00B7\u00C0-\u{10FFFF}]*$/u.test(raw)) {
         throw new (globalThis.DOMException || Error)("Failed to execute 'createElement' on 'Document': The tag name provided ('" + raw + "') is not a valid name.", 'InvalidCharacterError');
+      }
+      // В XML-документе имя хранится как есть, а элемент — просто Element.
+      if (this.__ptXml) {
+        const e = new Element(raw);
+        e.__ptTag = raw; e.__ptLocal = raw;
+        try { if (globalThis.Element && globalThis.Element.prototype) Object.setPrototypeOf(e, globalThis.Element.prototype); } catch (x) {}
+        e.__ptDoc = this;
+        return e;
       }
       const C = __customs.get(raw.toLowerCase());
       if (globalThis.__pt_setPendingTag) __pt_setPendingTag(tag);
@@ -1770,9 +1835,18 @@
     }
   };
 
+  // `isTrusted` у браузера — собственное свойство каждого события
+  // ([LegacyUnforgeable]), а не аксессор прототипа: перечисление прототипа
+  // Event его не показывает, а у экземпляра оно неперенастраиваемое.
+  const __ptIsTrustedGet = (() => {
+    const g = function () { return !!(this.__ptE && this.__ptE.isTrusted); };
+    try { Object.defineProperty(g, 'name', { value: 'get isTrusted', configurable: true }); } catch (e) {}
+    return globalThis.__pt_native ? __pt_native(g) : g;
+  })();
   class Event {
     constructor(type, init) {
       init = init || {};
+      Object.defineProperty(this, 'isTrusted', { get: __ptIsTrustedGet, set: undefined, enumerable: true, configurable: false });
       this.__ptE = {
         type, bubbles: !!init.bubbles, cancelable: !!init.cancelable,
         // `composed` — обычное поле события, и у браузера оно false, а не
@@ -1801,7 +1875,7 @@
   try { Object.defineProperty(globalThis, '__pt_trustEvent', { value: __ptTrust, enumerable: false, configurable: true }); } catch (e) {}
 
   evtAccessors(Event, ['type', 'bubbles', 'cancelable', 'composed', 'defaultPrevented', 'target',
-    'currentTarget', 'eventPhase', 'timeStamp', 'isTrusted']);
+    'currentTarget', 'eventPhase', 'timeStamp']);
 
   class CustomEvent extends Event {
     constructor(type, init) { super(type, init); this.__ptE.detail = (init && init.detail) || null; }
@@ -3882,15 +3956,24 @@
   // ---- HTML serialization (innerHTML getter) --------------------------------
   const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
   const esc = (s, attr) => s.replace(attr ? /[&<>"]/g : /[&<>]/g, c => ESC[c]);
-  function serializeNode(n) {
+  function serializeNode(n, withShadow) {
     if (n.nodeType === TEXT_NODE) return esc(n.data, false);
     if (n.nodeType === COMMENT_NODE) return `<!--${n.data}-->`;
-    if (n.nodeType !== ELEMENT_NODE) return n.__ptKids.map(serializeNode).join('');
+    if (n.nodeType !== ELEMENT_NODE) return n.__ptKids.map((c) => serializeNode(c, withShadow)).join('');
     const tag = n.localName;
     let attrs = '';
     for (const { name, value } of n.attributes) attrs += ` ${name}="${esc(value, true)}"`;
     if (VOID.has(tag)) return `<${tag}${attrs}>`;
-    return `<${tag}${attrs}>${n.__ptKids.map(serializeNode).join('')}</${tag}>`;
+    // `<template>` сериализует своё содержимое; сериализуемый теневой корень
+    // (getHTML с serializableShadowRoots) — как <template shadowrootmode>.
+    let inner = '';
+    if (withShadow && n.__ptShadow && n.__ptShadow.__ptSerializable) {
+      const sr = n.__ptShadow;
+      inner += `<template shadowrootmode="${sr.mode}"${sr.__ptDelegatesFocus ? ' shadowrootdelegatesfocus=""' : ''}${sr.__ptSerializable ? ' shadowrootserializable=""' : ''}${sr.__ptClonable ? ' shadowrootclonable=""' : ''}>${sr.__ptKids.map((c) => serializeNode(c, withShadow)).join('')}</template>`;
+    }
+    const kids = tag === 'template' ? __templateContent(n).__ptKids : n.__ptKids;
+    inner += kids.map((c) => serializeNode(c, withShadow)).join('');
+    return `<${tag}${attrs}>${inner}</${tag}>`;
   }
 
   // ---- HTML fragment parser (innerHTML setter) ------------------------------
@@ -3939,7 +4022,9 @@
           for (const am of m[2].matchAll(/([\w-]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g)) {
             let v = am[2] || '';
             if (v && (v[0] === '"' || v[0] === "'")) v = v.slice(1, -1);
-            attr(el, am[1], v);
+            // Ссылки на знаки в значении разбираются, как и в тексте: `&quot;`
+            // становится кавычкой, а при сериализации — снова `&quot;`, не `&amp;quot;`.
+            attr(el, am[1], unescapeEntities(v));
           }
           put(top(), el);
           const selfClose = m[0].endsWith('/>') || VOID.has(tag);
@@ -3956,9 +4041,17 @@
     }
     return root.__ptKids.slice();
   }
+  const NAMED_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00a0', copy: '\u00a9', reg: '\u00ae', trade: '\u2122', hellip: '\u2026', mdash: '\u2014', ndash: '\u2013', laquo: '\u00ab', raquo: '\u00bb', times: '\u00d7', middot: '\u00b7', bull: '\u2022', lsquo: '\u2018', rsquo: '\u2019', ldquo: '\u201c', rdquo: '\u201d', euro: '\u20ac', pound: '\u00a3', yen: '\u00a5', cent: '\u00a2', sect: '\u00a7', deg: '\u00b0', plusmn: '\u00b1', para: '\u00b6', shy: '\u00ad', iexcl: '\u00a1', iquest: '\u00bf', larr: '\u2190', rarr: '\u2192', uarr: '\u2191', darr: '\u2193', ensp: '\u2002', emsp: '\u2003', thinsp: '\u2009', zwnj: '\u200c', zwj: '\u200d' };
   function unescapeEntities(s) {
-    return s.replace(/&(amp|lt|gt|quot|#39|apos|nbsp);/g, (_, e) =>
-      ({ amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'", apos: "'", nbsp: ' ' })[e]);
+    if (s.indexOf('&') < 0) return s;
+    return s.replace(/&(#[xX][0-9a-fA-F]+|#[0-9]+|[a-zA-Z][a-zA-Z0-9]*);/g, (m, e) => {
+      if (e[0] === '#') {
+        const cp = e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+        if (!Number.isFinite(cp) || cp <= 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return '\ufffd';
+        return String.fromCodePoint(cp);
+      }
+      return Object.prototype.hasOwnProperty.call(NAMED_ENTITIES, e) ? NAMED_ENTITIES[e] : m;
+    });
   }
 
   // ---- build DOM from the Rust-parsed tree ----------------------------------
@@ -4770,8 +4863,24 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const kind = String(type || 'text/html').toLowerCase();
       const doc = new Document();
       Object.defineProperty(doc, '__ptContentType', { value: kind, writable: true, configurable: true });
-      const nodes = parseFragment(String(markup == null ? '' : markup));
       const isHtml = kind === 'text/html';
+      if (!isHtml) Object.defineProperty(doc, '__ptXml', { value: true, writable: true, configurable: true });
+      const nodes = isHtml ? parseFragment(String(markup == null ? '' : markup)) : (() => {
+        const r = this.parseXml(doc, String(markup == null ? '' : markup));
+        let root = r.nodes.find((n) => n.nodeType === ELEMENT_NODE);
+        if (r.error) {
+          // Ошибка разбора у Chrome (libxml2): <parsererror> первым ребёнком
+          // корня, а без корня — html/body/parsererror.
+          const pe = this.parseErrorNode(doc, r.error);
+          if (root) __ptInsert.call(root, pe, root.firstChild);
+          else {
+            root = doc.createElement('html'); __ptSetAttr.call(root, 'xmlns', 'http://www.w3.org/1999/xhtml');
+            const body = doc.createElement('body'); __ptAdd.call(root, body); __ptAdd.call(body, pe);
+            return [root];
+          }
+        }
+        return r.nodes;
+      })();
       let root = nodes.find((n) => n.nodeType === ELEMENT_NODE && n.localName === 'html');
       if (!root && isHtml) {
         root = doc.createElement('html');
@@ -4789,9 +4898,103 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       __ptAdd.call(doc, root);
       doc.__ptDocEl = root;
       __walkTree(doc, (n) => { n.__ptDoc = doc; });
+      // Документ из строки готов сразу, окна у него нет (`location` — своё
+      // свойство, null), а класс — HTMLDocument или XMLDocument, как у Chrome.
+      doc.__ptReady = 'complete';
+      try {
+        const g = function () { return null; };
+        try { Object.defineProperty(g, 'name', { value: 'get location', configurable: true }); } catch (e) {}
+        Object.defineProperty(doc, 'location', { get: globalThis.__pt_native ? __pt_native(g) : g, set: undefined, enumerable: true, configurable: false });
+      } catch (e) {}
+      try {
+        if (isHtml) {
+          const hp = globalThis.document && Object.getPrototypeOf(globalThis.document);
+          if (hp && hp !== Document.prototype && hp.constructor && hp.constructor.name === 'HTMLDocument') Object.setPrototypeOf(doc, hp);
+          else if (typeof globalThis.HTMLDocument === 'function' && globalThis.HTMLDocument.prototype && Object.getPrototypeOf(globalThis.HTMLDocument.prototype) === Document.prototype) Object.setPrototypeOf(doc, globalThis.HTMLDocument.prototype);
+        } else if (typeof globalThis.XMLDocument === 'function' && globalThis.XMLDocument.prototype && Object.getPrototypeOf(globalThis.XMLDocument.prototype) === Document.prototype) {
+          Object.setPrototypeOf(doc, globalThis.XMLDocument.prototype);
+        }
+      } catch (e) {}
       return doc;
     },
+    // ---- XML: разбор по правилам XML с ошибками в словах libxml2 — так их
+    // показывает Chrome (`error on line L at column C: …`).
+    parseXml(doc, src) {
+      const out = { nodes: [], error: null };
+      let i = 0; const n = src.length; let line = 1, ls = 0;
+      const stack = [];
+      const push = (node) => { const top = stack[stack.length - 1]; if (top) __ptAdd.call(top, node); else out.nodes.push(node); };
+      const col = (at) => at - ls + 1;
+      const fail = (msg, at) => { if (!out.error) out.error = { msg, line, col: col(at === undefined ? i : at) }; };
+      const text = (t) => doc.createTextNode(t);
+      const decode = (s) => s.replace(/&(#[xX][0-9a-fA-F]+|#[0-9]+|[A-Za-z_][\w.\-]*);/g, (m, e) => {
+        if (e[0] === '#') { const cp = e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10); return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '\ufffd'; }
+        const p = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }[e];
+        if (p === undefined) { fail("Entity '" + e + "' not defined"); return ''; }
+        return p;
+      });
+      let rootSeen = false;
+      const advance = (from, to) => { for (let k = from; k < to; k++) if (src.charCodeAt(k) === 10) { line++; ls = k + 1; } };
+      while (i < n && !out.error) {
+        if (src[i] === '<') {
+          if (src.startsWith('<?', i)) { const e = src.indexOf('?>', i + 2); if (e < 0) { fail("Parsing XML declaration: '?>' expected"); break; } advance(i, e + 2); i = e + 2; continue; }
+          if (src.startsWith('<!--', i)) { const e = src.indexOf('-->', i + 4); if (e < 0) { fail('Comment not terminated'); break; } push(doc.createComment(src.slice(i + 4, e))); advance(i, e + 3); i = e + 3; continue; }
+          if (src.startsWith('<![CDATA[', i)) { const e = src.indexOf(']]>', i + 9); if (e < 0) { fail('CData section not finished'); break; } if (!stack.length) { fail('Extra content at the end of the document'); break; } push(text(src.slice(i + 9, e))); advance(i, e + 3); i = e + 3; continue; }
+          if (src.startsWith('<!DOCTYPE', i)) { const e = src.indexOf('>', i); if (e < 0) { fail('DOCTYPE improperly terminated'); break; } advance(i, e + 1); i = e + 1; continue; }
+          if (src[i + 1] === '/') {
+            const m = /^<\/([^\s>]+)\s*>/.exec(src.slice(i));
+            if (!m) { fail("expected '>'"); break; }
+            const top = stack[stack.length - 1];
+            if (!top) { fail('Extra content at the end of the document'); break; }
+            if (top.__ptLocal !== m[1]) { fail('Opening and ending tag mismatch: ' + top.__ptLocal + ' line ' + top.__ptLine + ' and ' + m[1], i + m[0].length + 1); break; }
+            stack.pop(); i += m[0].length; continue;
+          }
+          const m = /^<([A-Za-z_:][\w:.\-]*)/.exec(src.slice(i));
+          if (!m) { fail('StartTag: invalid element name', i + 1); break; }
+          if (!stack.length && rootSeen) { fail('Extra content at the end of the document'); break; }
+          let el = doc.createElement(m[1]); el.__ptLine = line;
+          let j = i + m[0].length;
+          for (;;) {
+            j += /^\s*/.exec(src.slice(j))[0].length;
+            if (src[j] === '>') { j++; break; }
+            if (src.startsWith('/>', j)) { j += 2; push(el); if (!stack.length) rootSeen = true; el = null; break; }
+            const am = /^([A-Za-z_:][\w:.\-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(src.slice(j));
+            if (!am) {
+              const nm = /^([A-Za-z_:][\w:.\-]*)/.exec(src.slice(j));
+              if (nm) fail('Specification mandates value for attribute ' + nm[1], j + nm[0].length); else fail('error parsing attribute name', j);
+              break;
+            }
+            const val = am[2] !== undefined ? am[2] : am[3];
+            if (val.indexOf('<') >= 0) { fail("Unescaped '<' not allowed in attributes values", j); break; }
+            if (__ptHasA(el, am[1])) { fail('Attribute ' + am[1] + ' redefined', j); break; }
+            __ptSetAttr.call(el, am[1], decode(val)); j += am[0].length;
+          }
+          if (out.error) break;
+          if (el) { push(el); if (!stack.length) rootSeen = true; stack.push(el); }
+          advance(i, j); i = j; continue;
+        }
+        const next = src.indexOf('<', i); const stop = next < 0 ? n : next;
+        const chunk = src.slice(i, stop);
+        if (!stack.length) {
+          if (chunk.trim()) { fail(rootSeen ? 'Extra content at the end of the document' : "Start tag expected, '<' not found", i + (chunk.length - chunk.replace(/^\s+/, '').length)); break; }
+        } else push(text(decode(chunk)));
+        advance(i, stop); i = stop;
+      }
+      if (!out.error && stack.length) { const top = stack[stack.length - 1]; fail('Premature end of data in tag ' + top.__ptLocal + ' line ' + top.__ptLine, n); }
+      if (!out.error && !rootSeen) fail(src.trim() ? "Start tag expected, '<' not found" : 'Document is empty', 0);
+      return out;
+    },
+    parseErrorNode(doc, err) {
+      const mk = (name, attrs, txt) => { const e = doc.createElement(name); for (const k of Object.keys(attrs)) __ptSetAttr.call(e, k, attrs[k]); if (txt != null) __ptAdd.call(e, doc.createTextNode(txt)); return e; };
+      const pe = mk('parsererror', { xmlns: 'http://www.w3.org/1999/xhtml', style: 'display: block; white-space: pre; border: 2px solid #c77; padding: 0 1em 0 1em; margin: 1em; background-color: #fdd; color: black' }, null);
+      __ptAdd.call(pe, mk('h3', {}, 'This page contains the following errors:'));
+      __ptAdd.call(pe, mk('div', { style: 'font-family:monospace;font-size:12px' }, 'error on line ' + err.line + ' at column ' + err.col + ': ' + err.msg + '\n'));
+      __ptAdd.call(pe, mk('h3', {}, 'Below is a rendering of the page up to the first error.'));
+      return pe;
+    },
     serializeXml(node) {
+      // Документ целиком — это его корневой элемент с xmlns.
+      if (node && node.nodeType === 9 && node.documentElement) node = node.documentElement;
       const one = (n, root) => {
         if (n.nodeType === TEXT_NODE) return esc(String(n.data), false);
         if (n.nodeType === COMMENT_NODE) return '<!--' + n.data + '-->';
@@ -4800,7 +5003,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         }
         const tag = n.localName;
         let attrs = '';
-        if (root) attrs += ' xmlns="http://www.w3.org/1999/xhtml"';
+        if (root && !(n.ownerDocument && n.ownerDocument.__ptXml)) attrs += ' xmlns="http://www.w3.org/1999/xhtml"';
         for (const { name, value } of n.attributes) attrs += ' ' + name + '="' + esc(String(value), true) + '"';
         const kids = (n.__ptKids || []).map((c) => one(c, false)).join('');
         if (!kids && VOID_XML.has(tag)) return '<' + tag + attrs + ' />';
@@ -4819,9 +5022,13 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const out = [];
       const doc = globalThis.document;
       if (!doc || !doc.documentElement) return out;
-      __walkTree(doc.documentElement, (n) => {
+      // Только светлое дерево: кадры внутри теневых корней в `window.length`
+      // у Chrome не считаются.
+      const walk = (n) => {
         if (n.nodeType === ELEMENT_NODE && (n.__ptLocal === 'iframe' || n.__ptLocal === 'frame')) out.push(n);
-      });
+        for (const k of (n.__ptKids || [])) walk(k);
+      };
+      walk(doc.documentElement);
       return out;
     };
     const windowOf = (el) => {
@@ -5084,6 +5291,16 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // страницы меряет узлы своего кадра, а раскладывает их кадр сам.
   globalThis.__pt_relayout = () => { try { __relayout(); } catch (e) {} };
 
+  // Окно кадра, вынутого из документа: у браузера это закрытый контекст.
+  // Страница, оставившая себе ссылку на окно, читает нули и `closed`.
+  globalThis.__pt_detach = () => {
+    try { Object.defineProperty(globalThis, '__ptDetached', { value: true, configurable: true }); } catch (e) {}
+    try { globalThis.__pt_setViewport(0, 0); } catch (e) {}
+    const nat = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
+    const put = (k, v) => { try { const d = Object.getOwnPropertyDescriptor(globalThis, k); if (d && !d.configurable) return; Object.defineProperty(globalThis, k, { get: nat(function () { return v; }, 'get ' + k), set: undefined, enumerable: true, configurable: true }); } catch (e) {} };
+    put('outerWidth', 0); put('outerHeight', 0); put('closed', true); put('frameElement', null);
+    put('parent', globalThis); put('top', globalThis);
+  };
   globalThis.__pt_setViewport = (w, h) => {
     w = Math.max(0, Math.round(Number(w) || 0));
     h = Math.max(0, Math.round(Number(h) || 0));
@@ -5239,10 +5456,13 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   globalThis.__pt_frameBoxOf = (el) => {
     // Заданный размер важнее посчитанного: у виджета он стоит в стиле или в
     // атрибутах, а раскладка к моменту вопроса может быть ещё прошлой.
-    const px = (v) => { const n = parseFloat(v); return Number.isFinite(n) && n > 0 ? Math.round(n) : 0; };
-    let w = 0, h = 0;
-    try { w = px(el.style && el.style.width) || px(__ptGetA(el, 'width')); } catch (e) {}
-    try { h = px(el.style && el.style.height) || px(__ptGetA(el, 'height')); } catch (e) {}
+    // Заявленный ноль — ноль (у Chrome окно такого кадра 0×0), не заявлено — -1.
+    const px = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? Math.max(0, Math.round(n)) : -1; };
+    let w = -1, h = -1;
+    try { w = px(el.style && el.style.width); if (w < 0) w = px(__ptGetA(el, 'width')); } catch (e) {}
+    try { h = px(el.style && el.style.height); if (h < 0) h = px(__ptGetA(el, 'height')); } catch (e) {}
+    if (w >= 0 || h >= 0) return __ptJSON.stringify([w < 0 ? 300 : w, h < 0 ? 150 : h]);
+    w = 0; h = 0;
     // Только заявленный размер: спросить раскладку значит построить её прямо
     // сейчас, посреди загрузки, и заморозить в недостроенном виде — страница
     // потом получала нулевые коробки. Не заявлен — размер по умолчанию, как у
@@ -5369,6 +5589,15 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       Object.defineProperty(globalThis, 'parent', { value: up, configurable: true });
       Object.defineProperty(globalThis, 'top', { value: up, configurable: true });
     } catch (e) {}
+    // Из стороннего кадра свой `<iframe>` не виден: `frameElement` — null, как
+    // и `opener`; у нас их не было вовсе, и страница читала undefined.
+    for (const k of ['frameElement', 'opener']) {
+      try {
+        const g = function () { return null; };
+        try { Object.defineProperty(g, 'name', { value: 'get ' + k, configurable: true }); } catch (e) {}
+        Object.defineProperty(globalThis, k, { get: globalThis.__pt_native ? __pt_native(g) : g, set: undefined, enumerable: true, configurable: true });
+      } catch (e) {}
+    }
   };
 
   // --- tree traversal ------------------------------------------------------
@@ -7217,6 +7446,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     try {
       if (!box) {
         if (typeof w.__pt_setRendered === 'function') w.__pt_setRendered(false);
+        // Окно кадра без коробки — нулевое: innerWidth/innerHeight у Chrome 0.
+        if ((el.__ptSeenW !== 0 || el.__ptSeenH !== 0) && typeof w.__pt_setViewport === 'function') {
+          el.__ptSeenW = 0; el.__ptSeenH = 0;
+          w.__pt_setViewport(0, 0);
+        }
         return;
       }
       if (typeof w.__pt_setRendered === 'function') w.__pt_setRendered(true);
