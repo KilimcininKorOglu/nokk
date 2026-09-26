@@ -1224,12 +1224,40 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   // empty or nothing is due yet — either way the driver stops pumping and asks
   // `__pt_nextTimerDelay` what to do next. Microtasks scheduled by the callback
   // drain automatically when this returns to Rust.
+  // Реалмы (окна пустых и srcdoc-кадров) живут в этом же изоляте, но своих
+  // водителей у них нет: их очереди крутятся отсюда. Отцепленный кадр из
+  // списка выпадает.
+  const children = [];
+  Object.defineProperty(globalThis, '__pt_addChildRealm', { value: (w) => { if (w && children.indexOf(w) < 0) children.push(w); }, configurable: true, enumerable: false });
+  const liveChildren = () => {
+    for (let i = children.length - 1; i >= 0; i--) {
+      let ok = false;
+      try { const fe = children[i].frameElement; ok = !fe || fe.isConnected !== false; } catch (e) { ok = false; }
+      if (!ok) children.splice(i, 1);
+    }
+    return children;
+  };
+  const childDue = () => {
+    let best = -1;
+    for (const w of liveChildren()) {
+      let d = -1; try { d = typeof w.__pt_nextTimerDelay === 'function' ? w.__pt_nextTimerDelay() : -1; } catch (e) {}
+      if (d >= 0 && (best < 0 || d < best)) best = d;
+    }
+    return best;
+  };
+  const runChild = () => {
+    for (const w of liveChildren()) {
+      let d = -1; try { d = typeof w.__pt_nextTimerDelay === 'function' ? w.__pt_nextTimerDelay() : -1; } catch (e) {}
+      if (d === 0) { try { if (w.__pt_runNextTimer()) return 1; } catch (e) {} }
+    }
+    return 0;
+  };
   globalThis.__pt_runNextTimer = () => {
     const best = earliest();
-    if (!best) return 0;
+    if (!best) return children.length ? runChild() : 0;
     const now = clock();
     if (best.due > now) {
-      if (!FAST) return 0;
+      if (!FAST) return children.length ? runChild() : 0;
       virt = best.due; // fast mode: skip the wait rather than serve it
     }
     // An interval that fell behind (a long callback, a busy worker) schedules
@@ -1251,9 +1279,12 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   // asked for instead of polling.
   globalThis.__pt_nextTimerDelay = () => {
     const best = earliest();
-    return best ? Math.max(0, best.due - clock()) : -1;
+    const own = best ? Math.max(0, best.due - clock()) : -1;
+    if (!children.length) return own;
+    const c = childDue();
+    return own < 0 ? c : c < 0 ? own : Math.min(own, c);
   };
-  globalThis.__pt_pendingTimers = () => q.size;
+  globalThis.__pt_pendingTimers = () => { let n = q.size; for (const w of liveChildren()) { try { n += w.__pt_pendingTimers() | 0; } catch (e) {} } return n; };
 })();"#;
 
 /// The rest of the platform surface, by name.
@@ -1340,6 +1371,7 @@ const TRACER_TEMPLATE: &str = r##"(() => {
     try { globalThis.__pt_atMark = __ptJSON.stringify(tail.slice(-400)); } catch (e) {}
   };
   globalThis.__pt_probeHead = (n) => __ptJSON.stringify(head.slice(0, n || 40000));
+  globalThis.__pt_probeT0 = () => t0;
 
   const native = globalThis.__pt_native || ((f) => f);
   const rename = (f, name) => {
@@ -2621,7 +2653,7 @@ const SHAPE_FIXES: &str = r#"(() => {
     const PS = __PROTO_MEMBERS__;
     const nat = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
     const isStrictF = (f) => { try { void f.caller; return false; } catch (e) { return true; } };
-    const isNativeF = (f) => { try { return /\[native code\]/.test(Function.prototype.toString.call(f)); } catch (e) { return false; } };
+    const isNativeF = globalThis.__pt_isNative ? __pt_isNative : ((f) => { try { return /\[native code\]/.test(Function.prototype.toString.call(f)); } catch (e) { return false; } });
     const resolve = (path) => { let o = globalThis; for (const part of path.split('.')) { if (o === null || o === undefined) return null; o = part === '__proto__' ? Object.getPrototypeOf(o) : o[part]; } return o; };
     const fixFn = (f, key, sig, kindName) => {
       // sig = "Nsp/name/len": родной, строгий, без prototype.
@@ -2651,6 +2683,12 @@ const SHAPE_FIXES: &str = r#"(() => {
           const enumerable = flags.includes('e'), writable = flags.includes('w');
           if (kind[0] === 'f') {
             if (typeof d.value !== 'function') continue;
+            const f0 = d.value;
+            // Быстрый путь: длина, имя, нативность и отсутствие prototype уже сошлись.
+            if (d.enumerable === enumerable && d.writable === writable && kind[3] === 'p' && !Object.prototype.hasOwnProperty.call(f0, 'prototype') && isNativeF(f0)) {
+              const m0 = /^f...\/(.*)\/(\d+)$/.exec(kind);
+              if (m0 && f0.name === m0[1] && f0.length === +m0[2] && isStrictF(f0)) continue;
+            }
             const f = fixFn(d.value, key, kind.slice(1), 'fn');
             if (f !== d.value || d.enumerable !== enumerable || d.writable !== writable) Object.defineProperty(O, key, { value: f, writable, enumerable, configurable: true });
           } else if (kind[0] === 'a') {
@@ -6813,7 +6851,9 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     const resp = {
       ok: status >= 200 && status < 300, status, statusText: statusText || '',
       url: finalUrl || p.url, redirected: false, type: 'basic', bodyUsed: false, _body: body,
-      headers: {
+      // Настоящий Headers: страница перебирает `[...r.headers]` и `for…of`,
+      // а голый объект с пятью методами на это бросал TypeError.
+      headers: (typeof globalThis.Headers === 'function' ? (() => { try { return new Headers(lower); } catch (e) { return null; } })() : null) || {
         get: (k) => (k.toLowerCase() in lower ? lower[k.toLowerCase()] : null),
         has: (k) => k.toLowerCase() in lower,
         forEach: (f) => { for (const k in lower) f(lower[k], k); },
@@ -7889,6 +7929,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // Отдаём наружу под __pt-именем (фильтр интроспекции его прячет): поверхность
   // из WEB_SURFACE_TEMPLATE помечает свои функции нативными через него.
   globalThis.__pt_native = (fn) => { if (typeof fn === 'function') __ptNative.add(fn); return fn; };
+  // Проверка без прохода через toString-прокси — для поздних слоёв формы.
+  globalThis.__pt_isNative = (fn) => __ptNative.has(fn);
 
   // Метод браузера — не конструктор: у него нет `prototype`, и `new` по нему
   // бросает. Обычная функция несёт и то и другое, а `prototype` у неё удалить

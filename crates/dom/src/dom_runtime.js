@@ -1331,6 +1331,8 @@
       if (typeof globalThis.__pt_makeRealm !== 'function') return null;
       const w = globalThis.__pt_makeRealm();
       if (!w) return null;
+      // Таймеры реалма крутит очередь родителя: у самого реалма водителя нет.
+      try { if (typeof globalThis.__pt_addChildRealm === 'function') __pt_addChildRealm(w); } catch (e) {}
       // Трассы реализации (холст, WebGPU) из реалма пишут в консоль родителя:
       // консоль реалма движок не читает. Только под флагом трассы.
       if (globalThis.__pt_canvasTrace || globalThis.__pt_gpuTrace || globalThis.__pt_encTrace) {
@@ -1381,6 +1383,9 @@
         const [dw, dh] = __ptJSON.parse(__pt_frameBoxOf(this));
         __ptTellFrame(this, hidden ? null : { cw: dw, ch: dh });
       } catch (e) {}
+      // Реферер и базовый адрес пустого кадра — документ-создатель, как у Chrome;
+      // ставится до записи разметки: её скрипты уже читают document.referrer.
+      try { Object.defineProperty(w, '__pt_creatorURL', { value: (globalThis.location && location.href) || '', configurable: true }); } catch (e) {}
       // Пустое окно — не пустой документ: у браузера там html/head/body, и
       // страница туда пишет. `srcdoc` кладётся тем же путём.
       try {
@@ -1389,8 +1394,6 @@
         if (markup != null && typeof w.__pt_setLocation === 'function') w.__pt_setLocation({ href: 'about:srcdoc', protocol: 'about:', pathname: 'srcdoc', host: '', hostname: '', port: '', search: '', hash: '' });
         if (typeof w.__pt_writeDocument === 'function') w.__pt_writeDocument(markup || '');
       } catch (e) {}
-      // Реферер и базовый адрес пустого кадра — документ-создатель, как у Chrome.
-      try { Object.defineProperty(w, '__pt_creatorURL', { value: (globalThis.location && location.href) || '', configurable: true }); } catch (e) {}
       return w;
     }
     // A `<script>` that has just entered the document runs — once. The "already
@@ -1443,7 +1446,8 @@
         // в `<anonymous>` — метку, видную всякому, кто читает `Error().stack`.
         let where_ = '';
         try { where_ = String((this.ownerDocument && this.ownerDocument.URL) || location.href || ''); } catch (e) {}
-        if (typeof __pt_evalScript === 'function') __pt_evalScript(String(code), where_);
+        const line = typeof __pt_markupLine === 'function' ? __pt_markupLine(String(code)) : 0;
+        if (typeof __pt_evalScript === 'function') __pt_evalScript(String(code), where_, line > 0 ? line - 1 : 0);
         else (0, eval)(code);
       } catch (e) { __pt_reportError(e, 'inline script'); }
     }
@@ -1852,7 +1856,8 @@
     set textContent(v) {}
 
     // У `about:blank` в кадре реферер — документ-создатель.
-    get referrer() { return this.__ptReferrer || (this.URL === 'about:blank' && globalThis.__pt_creatorURL) || (this === globalThis.document && globalThis.__pt_referrer) || ''; }
+    // У srcdoc-кадра Chrome отвечает только источником создателя («http://host/»).
+    get referrer() { return this.__ptReferrer || (this.URL === 'about:blank' && globalThis.__pt_creatorURL) || (this.URL === 'about:srcdoc' && globalThis.__pt_creatorURL && (() => { try { return new URL(globalThis.__pt_creatorURL).origin + '/'; } catch (e) { return globalThis.__pt_creatorURL; } })()) || (this === globalThis.document && globalThis.__pt_referrer) || ''; }
     set referrer(v) { this.__ptReferrer = String(v); }
 
     // `document.location` is `window.location` — the same object, not a copy. Its
@@ -1866,7 +1871,7 @@
     get URL() { return (globalThis.location && globalThis.location.href) || 'about:blank'; }
     get documentURI() { return this.URL; }
     // У `about:blank` базовый адрес — адрес создателя (запасной по спецификации).
-    __ptBaseURI() { return this.URL === 'about:blank' && globalThis.__pt_creatorURL ? globalThis.__pt_creatorURL : this.URL; }
+    __ptBaseURI() { return (this.URL === 'about:blank' || this.URL === 'about:srcdoc') && globalThis.__pt_creatorURL ? globalThis.__pt_creatorURL : this.URL; }
     get domain() { return (globalThis.location && globalThis.location.hostname) || globalThis.__pt_inheritedHost || ''; }
     set domain(v) { /* only ever narrowed to a parent domain; nothing to do here */ }
 
@@ -5757,13 +5762,21 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     try { Object.defineProperty(globalThis, 'SecurityPolicyViolationEvent', { value: nat(C, 'SecurityPolicyViolationEvent'), writable: true, enumerable: false, configurable: true }); } catch (e) {}
     return C;
   };
+  // Адрес в отчёте о нарушении: у http(s) — без учётных данных и якоря, у
+  // остальных схем (about:srcdoc, blob:) — одна схема, как у браузера.
+  const __cspStripURL = (u) => {
+    u = String(u || ''); if (!u) return '';
+    if (/^https?:|^wss?:/.test(u)) { try { const x = new URL(u); x.username = ''; x.password = ''; x.hash = ''; return x.href; } catch (e) { return u; } }
+    const m = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(u); return m ? m[1] : u;
+  };
   const __cspViolation = (name, list, blockedURI, sample, extra) => {
     try {
       const E = __spveEnsure();
       const site = extra && extra.noSite ? { file: '', line: 0, column: 0 } : __cspSite();
+      const docURL = String((globalThis.location && location.href) || 'about:blank');
       const init = Object.assign({
-        documentURI: String((globalThis.location && location.href) || 'about:blank'), referrer: String(document.referrer || ''), blockedURI, violatedDirective: name, effectiveDirective: name,
-        originalPolicy: __csp.policies.map((p) => p.raw).join(', '), disposition: 'enforce', sourceFile: site.file, sample: String(sample || '').slice(0, 40), statusCode: 200, lineNumber: site.line, columnNumber: site.column,
+        documentURI: __cspStripURL(docURL), referrer: String(document.referrer || ''), blockedURI, violatedDirective: name, effectiveDirective: name,
+        originalPolicy: __csp.policies.map((p) => p.raw).join(', '), disposition: 'enforce', sourceFile: __cspStripURL(site.file), sample: String(sample || '').slice(0, 40), statusCode: /^https?:/.test(docURL) ? 200 : 0, lineNumber: site.line, columnNumber: site.column,
       }, extra || {});
       delete init.noSite;
       const ev = typeof E === 'function' ? new E('securitypolicyviolation', Object.assign({ bubbles: true, composed: true }, init)) : new Event('securitypolicyviolation', { bubbles: true });
@@ -5835,7 +5848,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (!v) return false;
     const text = __cspDirectiveText(v.name, v.list);
     __cspReport("Refused to execute inline script because it violates the following Content Security Policy directive: \"" + text + "\". Either the 'unsafe-inline' keyword, a hash ('sha256-…'), or a nonce ('nonce-...') is required to enable inline execution.\n");
-    __cspViolation(v.name, v.list, 'inline', '', { violatedDirective: 'script-src-elem', effectiveDirective: 'script-src-elem', sourceFile: String((globalThis.location && location.href) || ''), lineNumber: (el && el.__ptLine) || 0, columnNumber: 0, noSite: true });
+    __cspViolation(v.name, v.list, 'inline', '', { violatedDirective: 'script-src-elem', effectiveDirective: 'script-src-elem', sourceFile: __cspStripURL(String((globalThis.location && location.href) || '')), lineNumber: (typeof __pt_markupLine === 'function' ? __pt_markupLine(String(el.textContent || '')) : 0) || 0, columnNumber: 0, noSite: true });
     return true;
   };
   // Обработчик в атрибуте (`onclick="…"`): script-src-attr.
@@ -5893,7 +5906,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     for (const name of ['setTimeout', 'setInterval']) {
       try {
         const real = globalThis[name]; if (typeof real !== 'function') continue;
-        const w = ({ [name](handler, ...rest) { if (typeof handler !== 'function') { const e = __cspEvalMessage(); if (e) { __cspViolation(e.name, e.list, 'eval'); return real.call(this, function () {}, ...rest); } } return real.call(this, handler, ...rest); } })[name];
+        const w = ({ [name](handler, ...rest) { if (typeof handler !== 'function') { const e = __cspEvalMessage(); if (e) { __cspViolation(e.name, e.list, 'eval'); return 0; } } return real.call(this, handler, ...rest); } })[name];
         try { Object.defineProperty(w, 'length', { value: real.length, configurable: true }); } catch (e) {}
         Object.defineProperty(globalThis, name, { value: nat(w, name), writable: true, enumerable: true, configurable: true });
       } catch (e) {}
@@ -5969,7 +5982,18 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       for (const m of metas) { const c = __ptGetA(m, 'content'); if (c) __pt_applyCsp(c, 'meta'); }
     } catch (e) {}
   };
+  // Строка разметки, с которой начинается текст: для номеров строк стека и
+  // нарушений CSP (браузер считает их от начала документа).
+  globalThis.__pt_markupLine = (text) => {
+    try {
+      const m = document.__ptMarkup; if (typeof m !== 'string' || !text) return 0;
+      const i = m.indexOf(text); if (i < 0) return 0;
+      let n = 1; for (let k = 0; k < i; k++) if (m.charCodeAt(k) === 10) n++;
+      return n;
+    } catch (e) { return 0; }
+  };
   globalThis.__pt_writeDocument = (html) => {
+    try { Object.defineProperty(document, '__ptMarkup', { value: String(html == null ? '' : html), configurable: true, writable: true }); } catch (e) {}
     const nodes = parseFragment(String(html == null ? '' : html));
     let root = nodes.find((n) => n.nodeType === 1 && n.tagName === 'HTML');
     if (!root) {
@@ -5989,10 +6013,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     document.__ptKids = [];
     document.__ptDocEl = null;
+    // Политика — до подключения дерева: скрипты исполняются при подключении.
+    __pt_cspFromMeta(root);
     document.appendChild(root);
     document.__ptDocEl = root;
     document.__ptReady = 'complete';
-    __pt_cspFromMeta(root);
     // Скрипты разметки исполняются здесь и сейчас, в этом окне.
     for (const el of __tags(root, 'script')) {
       try { el.__ptRunScript(); } catch (e) {}
@@ -6000,7 +6025,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return document;
   };
 
-  globalThis.__pt_installDocument = (tree, dt) => {
+  globalThis.__pt_installDocument = (tree, dt, markup) => {
+    if (typeof markup === 'string') { try { Object.defineProperty(document, '__ptMarkup', { value: markup, configurable: true, writable: true }); } catch (e) {} }
     document.__ptKids = [];
     document.__ptDocEl = null;
     document.__ptCurScript = null;
@@ -6027,9 +6053,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     if (tree && tree.k === 'e') {
       const html = buildNode(document, tree);
+      __pt_cspFromMeta(html);
       document.appendChild(html);
       document.__ptDocEl = html;
-      __pt_cspFromMeta(html);
     }
     scriptNodes = __docTags(document, 'script');
     // Пока идут собственные скрипты документа, браузер отвечает 'loading', и

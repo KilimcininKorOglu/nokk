@@ -1704,11 +1704,14 @@ fn make_realm(
         let inner = &mut v8::ContextScope::new(scope, context);
         install(inner);
         v8::tc_scope!(inner, inner);
+        let t0 = std::time::Instant::now();
         if let Some(src) = v8::String::new(inner, &bootstrap) {
             if let Some(script) = v8::Script::compile(inner, src, None) {
+                let compiled = t0.elapsed();
                 // A realm whose bootstrap threw is still a realm; the page gets
                 // what did get built rather than a null it cannot use.
                 let _ = script.run(inner);
+                tracing::debug!(target: "nokk::realm", compile_ms = compiled.as_millis() as u64, run_ms = (t0.elapsed() - compiled).as_millis() as u64, "realm bootstrap");
             }
         }
     }
@@ -1727,6 +1730,9 @@ fn eval_script(
 ) {
     let code = arg_string(scope, args.get(0));
     let url = arg_string(scope, args.get(1));
+    // Строка документа, с которой начинается вписанный скрипт: браузер считает
+    // строки стека и нарушений CSP от начала разметки, а не от `<script>`.
+    let line_offset = args.get(2).int32_value(scope).unwrap_or(0).max(0);
     tracing::debug!(target: "nokk::script", bytes = code.len(), url = %url, "inline script");
     let Some(src) = v8::String::new(scope, &code) else {
         return;
@@ -1737,7 +1743,7 @@ fn eval_script(
     let origin = v8::ScriptOrigin::new(
         scope,
         name.into(),
-        0,
+        line_offset,
         0,
         false,
         0,

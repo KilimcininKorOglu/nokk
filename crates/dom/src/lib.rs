@@ -67,6 +67,9 @@ pub struct ParsedPage {
     /// both of which a fingerprint reads, so the difference has to survive the
     /// parse instead of being dropped with the node.
     pub doctype: Option<(String, String, String)>,
+    /// Исходная разметка: по ней считаются номера строк вписанных скриптов
+    /// (стек и нарушения CSP браузер считает от начала документа).
+    pub markup: String,
 }
 
 impl ParsedPage {
@@ -78,7 +81,7 @@ impl ParsedPage {
             }),
             None => Value::Null,
         };
-        format!("globalThis.__pt_installDocument({}, {});", self.root, dt)
+        format!("globalThis.__pt_installDocument({}, {}, {});", self.root, dt, Value::String(self.markup.clone()))
     }
 }
 
@@ -118,6 +121,7 @@ pub fn parse(html: &str) -> ParsedPage {
         scripts,
         script_modes,
         doctype,
+        markup: html.to_string(),
     }
 }
 

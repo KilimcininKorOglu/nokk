@@ -441,32 +441,41 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
             flags.push_str(&format!("Object.defineProperty(globalThis, '{name}', {{ value: '{v}', configurable: true }});\n"));
         }
     }
-    let base = format!(
-        "{flags}{}\n{}\n{}\n{}\n{}",
+    // `NOKK_TRACE_BOOT=1` — время каждого слоя загрузчика в консоль (`[boot]`).
+    let timed = std::env::var_os("NOKK_TRACE_BOOT").is_some();
+    let mark = |name: &str| -> String {
+        if timed { format!("\n;(globalThis.__pt_bootT = globalThis.__pt_bootT || []).push(['{name}', Date.now()]);\n") } else { "\n".to_string() }
+    };
+    let pieces: Vec<(&str, String)> = vec![
         // Первой строкой — запись изнутри: ею пользуются все слои, а свойства
         // только для чтения появляются лишь в последнем.
-        nokk_stealth::write_helper_script(),
-        nokk_stealth::bootstrap_script(profile),
-        nokk_dom::runtime_js(),
-        nokk_stealth::fingerprint_script(profile),
-        nokk_stealth::web_surface_script(),
-    );
-    // И последним — снимок методов, которыми движок пользуется сам: он должен
-    // лечь поверх всех слоёв, но раньше любого скрипта страницы.
-    // Натурализация — после поздних интерфейсов и до снимка: каждый член
-    // должен выглядеть родным, а снимок — держать уже итоговые функции.
-    let base = format!(
-        "{base}\n{}\n{}\n{}\n{}\n{}\n{}",
-        nokk_stealth::late_interfaces_script(),
+        ("write_helper", nokk_stealth::write_helper_script()),
+        ("bootstrap", nokk_stealth::bootstrap_script(profile)),
+        ("dom_runtime", nokk_dom::runtime_js().to_string()),
+        ("fingerprint", nokk_stealth::fingerprint_script(profile)),
+        ("web_surface", nokk_stealth::web_surface_script()),
+        // И последним — снимок методов, которыми движок пользуется сам: он должен
+        // лечь поверх всех слоёв, но раньше любого скрипта страницы.
+        // Натурализация — после поздних интерфейсов и до снимка: каждый член
+        // должен выглядеть родным, а снимок — держать уже итоговые функции.
+        ("late_interfaces", nokk_stealth::late_interfaces_script()),
         // `NOKK_NO_PROTO_SHAPE=1` — без слоя формы, для бисекции.
-        if std::env::var_os("NOKK_NO_PROTO_SHAPE").is_some() { String::new() } else { nokk_stealth::proto_shape_script() },
-        nokk_stealth::naturalize_script(),
-        nokk_stealth::late_originals_script(),
-        nokk_stealth::shape_fixes_script(),
+        ("proto_shape", if std::env::var_os("NOKK_NO_PROTO_SHAPE").is_some() { String::new() } else { nokk_stealth::proto_shape_script() }),
+        ("naturalize", nokk_stealth::naturalize_script()),
+        ("late_originals", nokk_stealth::late_originals_script()),
+        ("shape_fixes", nokk_stealth::shape_fixes_script()),
         // Порядок имён окна — последним: перечисление отдаёт их в порядке
         // заведения, и всякий слой, заводящий своё имя, этот порядок сдвигает.
-        nokk_stealth::window_order_script(),
-    );
+        ("window_order", nokk_stealth::window_order_script()),
+    ];
+    let mut base = format!("{flags}{}", mark("start"));
+    for (name, js) in pieces {
+        base.push_str(&js);
+        base.push_str(&mark(name));
+    }
+    if timed {
+        base.push_str("\n;try { const t = globalThis.__pt_bootT; const d = []; for (let i = 1; i < t.length; i++) d.push(t[i][0] + '=' + (t[i][1] - t[i - 1][1])); console.error('[boot] ' + d.join(' ') + ' total=' + (t[t.length - 1][1] - t[0][1])); } catch (e) {}\n");
+    }
     // Diagnostic only, and last so it wraps a finished surface. Reading
     // `__pt_probeLog()` afterwards says what the page asked us and what we said.
     match std::env::var("NOKK_TRACE_PROBES").ok().as_deref() {
@@ -1757,7 +1766,7 @@ impl BrowserContext {
 
             // Простой страницы — добрать запас пустых реалмов на её потоке.
             if std::env::var_os("NOKK_NO_SPARE_REALMS").is_none() {
-                self.engine.pool.dispatch_detached(self.worker, |iso| iso.top_up_realms(3, 1));
+                self.engine.pool.dispatch_detached(self.worker, |iso| iso.top_up_realms(4, 1));
             }
             // Idle — but an open socket means "not finished", only "nothing right
             // now". Wait briefly for a frame rather than spinning, and still return
@@ -2730,7 +2739,7 @@ impl BrowserContext {
                         let boot = self.bootstrap.clone();
                         self.engine
                             .pool
-                            .dispatch_detached(self.frame_worker, move |iso| iso.prewarm_realms(&boot, 2));
+                            .dispatch_detached(self.frame_worker, move |iso| iso.prewarm_realms(&boot, 3));
                     }
                     let nav_started = std::time::Instant::now();
                     let Ok((_, html)) = self.fetch_text(&url, "document").await else {
@@ -3301,7 +3310,7 @@ impl BrowserContext {
             // его потоке: следующий вставленный им кадр получит готовый.
             if ran == 0 && index & OWN_THREAD != 0 && std::env::var_os("NOKK_NO_SPARE_REALMS").is_none() {
                 let (w, _) = self.route(index);
-                self.engine.pool.dispatch_detached(w, |iso| iso.top_up_realms(5, 1));
+                self.engine.pool.dispatch_detached(w, |iso| iso.top_up_realms(8, 1));
             }
             tracing::debug!(target: "nokk::pace", frame = id, ran, slice_ms = t_slice.elapsed().as_millis() as u64, "срез кадра");
             let qjson = self.eval_in(index, DRAIN_IO).await?;
