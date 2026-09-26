@@ -39,6 +39,10 @@ pub struct RealmBootstrap(pub String);
 #[derive(Default)]
 pub struct SpareRealms(pub Vec<v8::Global<v8::Context>>);
 
+/// Запас готовых контекстов для воркеров — см. `Isolate::prewarm_contexts`.
+#[derive(Default)]
+pub struct SpareContexts(pub Vec<v8::Global<v8::Context>>);
+
 /// Install every native binding on the current context's global object.
 pub fn install(scope: &mut v8::PinScope) {
     bind(scope, "__pt_makeRealm", make_realm);

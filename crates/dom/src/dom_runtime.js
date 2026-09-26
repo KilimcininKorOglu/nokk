@@ -1390,6 +1390,8 @@
       // страница туда пишет. `srcdoc` кладётся тем же путём.
       try {
         const markup = __ptGetA(this, 'srcdoc');
+        // Трасса NOKK_TRACE_SRCDOC=1: разметка srcdoc-кадра в консоль родителя.
+        if (globalThis.__pt_srcdocTrace && markup != null) { try { (globalThis.__pt_parentConsole || console).error('[srcdoc] ' + String(markup).slice(0, 4000)); } catch (e) {} }
         // Адрес srcdoc-кадра у браузера — about:srcdoc.
         if (markup != null && typeof w.__pt_setLocation === 'function') w.__pt_setLocation({ href: 'about:srcdoc', protocol: 'about:', pathname: 'srcdoc', host: '', hostname: '', port: '', search: '', hash: '' });
         if (typeof w.__pt_writeDocument === 'function') w.__pt_writeDocument(markup || '');

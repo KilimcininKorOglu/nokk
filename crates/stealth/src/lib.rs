@@ -839,20 +839,71 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   const SPOKEN = { log: 1, info: 1, warn: 1, error: 1, debug: 1, trace: 1, assert: 1, dir: 1 };
   const said = [];
   globalThis.__pt_drainConsole = () => said.splice(0);
+  // Показ для журнала — без чужого кода: у браузера консоль не зовёт ни
+  // toString, ни toJSON, ни геттеры (кроме форматирования ниже), а страница
+  // это меряет.
   const show = (v) => {
     try {
       if (typeof v === 'string') return v;
       if (v instanceof Error) return String(v.stack || v.message || v);
-      if (typeof v === 'object' && v !== null) { try { return __ptJSON.stringify(v); } catch (e) { return String(v); } }
+      if (typeof v === 'function') return 'function ' + (v.name || '');
+      if (typeof v === 'symbol') return v.toString();
+      if (typeof v === 'object' && v !== null) {
+        const tag = Object.prototype.toString.call(v);
+        if (Array.isArray(v)) return 'Array(' + v.length + ')';
+        if (tag !== '[object Object]') return tag;
+        const parts = [];
+        for (const k of Object.keys(v).slice(0, 12)) {
+          const d = Object.getOwnPropertyDescriptor(v, k);
+          if (!d || !('value' in d)) { parts.push(k + ': (...)'); continue; }
+          const x = d.value;
+          parts.push(k + ': ' + (typeof x === 'string' ? JSON.stringify(x).slice(0, 60) : typeof x === 'object' && x !== null ? Object.prototype.toString.call(x) : typeof x === 'function' ? 'ƒ' : String(x)));
+        }
+        return '{' + parts.join(', ') + '}';
+      }
       return String(v);
     } catch (e) { return '?'; }
+  };
+  // Форматирование V8 (builtins-console.cc): у log/debug/info/warn/error/trace/
+  // group/groupCollapsed (и assert с второго довода, если условие ложно) первая
+  // строка с %d/%i/%f/%s преобразует следующий довод — через parseInt/parseFloat/
+  // String, то есть ToString с подсказкой «string» (toString раньше valueOf,
+  // Symbol.toPrimitive('string')); %c/%o/%O съедают довод без преобразования,
+  // %% и неизвестные — ничего не едят; Symbol под %d — NaN, без броска.
+  // Исключение из toString уходит наружу. Сверено на scratchpad/console_fmt.html.
+  const FORMATTED = { log: 1, debug: 1, info: 1, warn: 1, error: 1, trace: 1, group: 1, groupCollapsed: 1, assert: 1 };
+  const LABELED = { count: 1, countReset: 1, time: 1, timeEnd: 1, timeLog: 1 };
+  const format = (args, idx) => {
+    if (args.length < idx + 2 || typeof args[idx] !== 'string') return;
+    const s = args[idx]; let off = 0, ai = idx + 1;
+    while (ai < args.length) {
+      const p = s.indexOf('%', off);
+      if (p < 0 || p === s.length - 1) break;
+      const c = s[p + 1], cur = args[ai];
+      if (c === 'd' || c === 'i') args[ai] = typeof cur === 'symbol' ? NaN : parseInt(cur, 10);
+      else if (c === 'f') args[ai] = typeof cur === 'symbol' ? NaN : parseFloat(cur);
+      else if (c === 's') args[ai] = String(cur);
+      else if (c === 'c' || c === 'o' || c === 'O') { /* съедается как есть */ }
+      else if (c === '%') { off = p + 2; continue; }
+      else { off = p + 1; continue; }
+      ai++; off = p + 2;
+    }
   };
   const con = {};
   for (const name of CONSOLE) {
     con[name] = { [name]: function () {
+      const args = Array.prototype.slice.call(arguments);
+      if (FORMATTED[name]) {
+        if (name === 'assert') { if (args[0]) return undefined; format(args, 1); }
+        else format(args, 0);
+      } else if (LABELED[name] && args.length) {
+        // Метка счётчика/таймера — ToString первого довода (Symbol бросает).
+        if (typeof args[0] === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
+        args[0] = String(args[0]);
+      }
       if (!SPOKEN[name] || said.length > 256) return undefined;
       const parts = [];
-      for (let i = 0; i < arguments.length && i < 8; i++) parts.push(show(arguments[i]));
+      for (let i = 0; i < args.length && i < 8; i++) parts.push(show(args[i]));
       said.push([name, parts.join(' ').slice(0, 600)]);
       return undefined;
     } }[name];
@@ -1229,6 +1280,11 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   // списка выпадает.
   const children = [];
   Object.defineProperty(globalThis, '__pt_addChildRealm', { value: (w) => { if (w && children.indexOf(w) < 0) children.push(w); }, configurable: true, enumerable: false });
+  // Диагностика: все реалмы, что заводило это окно (и уже отцепленные тоже).
+  const everyChild = [];
+  Object.defineProperty(globalThis, '__pt_childRealms', { value: () => everyChild.slice(), configurable: true, enumerable: false });
+  const addEvery = globalThis.__pt_addChildRealm;
+  Object.defineProperty(globalThis, '__pt_addChildRealm', { value: (w) => { if (w && everyChild.indexOf(w) < 0) everyChild.push(w); addEvery(w); }, configurable: true, enumerable: false });
   const liveChildren = () => {
     for (let i = children.length - 1; i >= 0; i--) {
       let ok = false;
@@ -4770,6 +4826,23 @@ __OPFS__
     rebrand(v, name, base);
   };
   try { brandInPlace(document && document.timeline, 'DocumentTimeline'); } catch (e) {}
+  // `document.timeline.currentTime` — часы кадра: число (у нас было undefined),
+  // замороженное на время задачи, как у Chrome (в одной задаче все чтения равны).
+  try {
+    const TL = document && document.timeline;
+    const TP = TL && Object.getPrototypeOf(TL);
+    if (TP && (typeof TL.currentTime !== 'number')) {
+      let frozen = null;
+      const g = ({ get currentTime() {
+        if (frozen === null) {
+          frozen = Math.floor(performance.now());
+          try { if (typeof globalThis.__pt_addTask === 'function') __pt_addTask(() => { frozen = null; }, 0, true); else setTimeout(() => { frozen = null; }, 0); } catch (e) {}
+        }
+        return frozen;
+      } }).__lookupGetter__('currentTime');
+      Object.defineProperty(TP, 'currentTime', { get: native(g), enumerable: true, configurable: true });
+    }
+  } catch (e) {}
   try { brandInPlace(globalThis.navigator && navigator.serviceWorker, 'ServiceWorkerContainer', ET); } catch (e) {}
   // Канал WebRTC создаётся уже во время работы страницы — ему нужен готовый
   // прототип с меткой, а не пустышка из таблицы.

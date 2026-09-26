@@ -433,7 +433,7 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
     // начале загрузчика, чтобы стоять в каждом реалме раньше любого кода
     // страницы: пробник, ставящий их позже, пропускает ранние вызовы.
     let mut flags = String::new();
-    for (env, name) in [("NOKK_TRACE_CANVAS", "__pt_canvasTrace"), ("NOKK_TRACE_GPU", "__pt_gpuTrace"), ("NOKK_TRACE_ENC", "__pt_encTrace")] {
+    for (env, name) in [("NOKK_TRACE_CANVAS", "__pt_canvasTrace"), ("NOKK_TRACE_GPU", "__pt_gpuTrace"), ("NOKK_TRACE_ENC", "__pt_encTrace"), ("NOKK_TRACE_SRCDOC", "__pt_srcdocTrace")] {
         if let Some(v) = std::env::var_os(env) {
             // Значение флага доступно трассе: `NOKK_TRACE_ENC=9000-9300,8600-8700`
             // высыпает куски отчёта этих длин целиком.
@@ -1531,6 +1531,7 @@ impl BrowserContext {
         // Due on the first round: a frame inserted by the document's own scripts
         // has been waiting since before this call started.
         let mut last_frame_pump = std::time::Instant::now() - FRAME_PUMP_EVERY;
+        let mut last_spare_topup = std::time::Instant::now() - std::time::Duration::from_secs(1);
 
         for _ in 0..MAX_ROUNDS {
             if std::time::Instant::now() >= deadline {
@@ -1764,9 +1765,20 @@ impl BrowserContext {
                 }
             }
 
-            // Простой страницы — добрать запас пустых реалмов на её потоке.
+            // Простой страницы — добрать запас пустых реалмов на её потоке и
+            // по готовому контексту воркера на каждом потоке пула (не чаще
+            // раза в полсекунды: пустая проверка — тоже задача в очереди потока).
             if std::env::var_os("NOKK_NO_SPARE_REALMS").is_none() {
                 self.engine.pool.dispatch_detached(self.worker, |iso| iso.top_up_realms(4, 1));
+                if last_spare_topup.elapsed() >= std::time::Duration::from_millis(500) {
+                    last_spare_topup = std::time::Instant::now();
+                    for w in 0..self.engine.pool.worker_count() {
+                        let boot = self.bootstrap.clone();
+                        self.engine
+                            .pool
+                            .dispatch_detached(nokk_pool::WorkerId(w), move |iso| iso.prewarm_contexts(&boot, 1));
+                    }
+                }
             }
             // Idle — but an open socket means "not finished", only "nothing right
             // now". Wait briefly for a frame rather than spinning, and still return
@@ -2279,14 +2291,20 @@ impl BrowserContext {
                     // изоляте, и каждый ход воркера отнимался у страницы.
                     let place = self.engine.pool.pick_worker();
                     let load = std::sync::Arc::new(self.engine.pool.register_context(place));
+                    let t_create = std::time::Instant::now();
                     let Ok(Ok(child)) = self
                         .engine
                         .pool
-                        .dispatch(place, move |iso| iso.create_context(&boot))
+                        .dispatch(place, {
+                            let boot = boot.clone();
+                            move |iso| iso.create_context_or_spare(&boot)
+                        })
                         .await
                     else {
                         continue;
                     };
+
+                    tracing::debug!(worker = id, place = place.0, context_ms = t_create.elapsed().as_millis() as u64, "worker context ready");
                     let name = op["name"].as_str().unwrap_or("");
                     // A blob's address is its own — resolving it against the
                     // document turns `blob:http://host/uuid` into nonsense, and
@@ -2427,6 +2445,26 @@ impl BrowserContext {
                 iso.run_worker_loop(child, 400, TURN, NEAR)
             })
             .await;
+        // Запросы сети, которые задание поставило сразу (fetch из воркера),
+        // уходят тут же: до общего круга они лежали в очереди до полутора
+        // секунд, и челлендж мерил это как время ответа сервера.
+        if let Ok(Value::String(qjson)) = self.eval_at(place, child, DRAIN_IO).await {
+            let queues: Value = serde_json::from_str(&qjson).unwrap_or_default();
+            self.log_console("worker", &queues);
+            let fetch_base = self
+                .workers
+                .lock()
+                .ok()
+                .and_then(|w| w.get(&(owner, id)).map(|st| st.fetch_base.clone()))
+                .unwrap_or_default();
+            if let Some(reqs) = queues["fetch"].as_array() {
+                for r in reqs.iter().take(32) {
+                    if let Some(settle) = self.start_fetch(Deliver::Worker(place, child), owner, &fetch_base, r) {
+                        let _ = self.eval_at(place, child, &settle).await;
+                    }
+                }
+            }
+        }
         // Ответ уходит домой сразу же, а не следующим общим кругом: это
         // последние миллисекунды, которые челлендж приписывает к нашему времени
         // отклика.
@@ -2739,7 +2777,19 @@ impl BrowserContext {
                         let boot = self.bootstrap.clone();
                         self.engine
                             .pool
-                            .dispatch_detached(self.frame_worker, move |iso| iso.prewarm_realms(&boot, 3));
+                            .dispatch_detached(self.frame_worker, {
+                                let boot = boot.clone();
+                                move |iso| iso.prewarm_realms(&boot, 3)
+                            });
+                        // И по готовому контексту воркера на каждом потоке пула:
+                        // программа челленджа заводит воркеры один за другим и
+                        // ждёт ответа в пределах сотен миллисекунд.
+                        for w in 0..self.engine.pool.worker_count() {
+                            let boot = boot.clone();
+                            self.engine
+                                .pool
+                                .dispatch_detached(nokk_pool::WorkerId(w), move |iso| iso.prewarm_contexts(&boot, 1));
+                        }
                     }
                     let nav_started = std::time::Instant::now();
                     let Ok((_, html)) = self.fetch_text(&url, "document").await else {

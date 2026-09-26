@@ -393,6 +393,72 @@ impl Isolate {
         }
     }
 
+    /// Запас готовых контекстов (загрузчик исполнен, номер не выдан) — для
+    /// воркеров: страница создаёт воркер и тут же шлёт ему задание, а
+    /// загрузчик стоит триста миллисекунд. Строится в простое потока.
+    pub fn prewarm_contexts(&mut self, bootstrap: &str, n: usize) {
+        loop {
+            let have = self
+                .isolate
+                .get_slot::<crate::natives::SpareContexts>()
+                .map(|s| s.0.len())
+                .unwrap_or(0);
+            if have >= n {
+                break;
+            }
+            let ready = {
+                v8::scope!(scope, &mut self.isolate);
+                let context = v8::Context::new(scope, v8::ContextOptions::default());
+                let global = v8::Global::new(scope, context);
+                let scope = &mut v8::ContextScope::new(scope, context);
+                crate::natives::install(scope);
+                if run_script(scope, bootstrap).is_err() {
+                    return;
+                }
+                global
+            };
+            if self.isolate.get_slot::<crate::natives::SpareContexts>().is_none() {
+                self.isolate.set_slot(crate::natives::SpareContexts::default());
+            }
+            if let Some(s) = self.isolate.get_slot_mut::<crate::natives::SpareContexts>() {
+                s.0.push(ready);
+            }
+        }
+    }
+
+    /// Как [`Self::create_context`], но из запаса, если он есть: часы контекста
+    /// начинаются в миг выдачи.
+    pub fn create_context_or_spare(&mut self, bootstrap: &str) -> Result<usize, String> {
+        let spare = self
+            .isolate
+            .get_slot_mut::<crate::natives::SpareContexts>()
+            .and_then(|s| s.0.pop());
+        tracing::debug!(target: "nokk::realm", from_spare = spare.is_some(), "a page asked for a worker context");
+        let Some(global) = spare else {
+            return self.create_context(bootstrap);
+        };
+        if self.isolate.get_slot::<crate::natives::RealmBootstrap>().is_none() {
+            self.isolate
+                .set_slot(crate::natives::RealmBootstrap(bootstrap.to_string()));
+        }
+        let index = self.contexts.len();
+        {
+            v8::scope!(scope, &mut self.isolate);
+            let context = v8::Local::new(scope, &global);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let _ = run_script(
+                scope,
+                &format!(
+                    "Object.defineProperty(globalThis, '__pt_ctxIndex', \
+                     {{ value: {index}, writable: true, configurable: true }}); \
+                     globalThis.__pt_resetClock && __pt_resetClock();"
+                ),
+            );
+        }
+        self.contexts.push(Some(global));
+        Ok(index)
+    }
+
     pub fn create_context(&mut self, bootstrap: &str) -> Result<usize, String> {
         let index = self.contexts.len();
         // Keep the bootstrap on the isolate so a *realm* can be built from it
