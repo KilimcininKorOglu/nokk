@@ -536,6 +536,7 @@ pub fn draw_text(data: &mut [u8], w: u32, h: u32, fonts: &[&'static [u8]], glyph
         PaintKind::Solid(c) => text::luminance_byte([c[0], c[1], c[2]]),
         PaintKind::Gradient(_) => 128,
     };
+    let mut bitmap_glyphs: Vec<(usize, u16, f32, f32)> = Vec::new();
     let mut layers: Vec<Layer> = Vec::new();
     if let Some(sh) = shadow {
         let mut lm = m;
@@ -550,6 +551,13 @@ pub fn draw_text(data: &mut [u8], w: u32, h: u32, fonts: &[&'static [u8]], glyph
         let pos_m = text::pre_translate(&layer.ctm, loc.x, loc.y);
         for g in glyphs {
             let Some(scaler) = scalers.get(g.font).and_then(|s| s.as_ref()) else { continue };
+            // Картиночный знак (цветной смайлик) рисуется отдельно, после слоёв.
+            if scaler.path(g.gid).is_none_or(|p| p.pts.is_empty()) {
+                if layer.filter.is_none() && stroke_params.is_none() {
+                    bitmap_glyphs.push((g.font, g.gid, pos_m.sx * g.x + pos_m.tx, pos_m.ky * g.x + pos_m.ty));
+                }
+                continue;
+            }
             let Some(dp) = text::device_position(&pos_m, g.x, ax, ay) else { continue };
             let mask = match &stroke_params {
                 None => scaler.fill_mask(g.gid, dp.sub_x, dp.sub_y),
@@ -569,7 +577,119 @@ pub fn draw_text(data: &mut [u8], w: u32, h: u32, fonts: &[&'static [u8]], glyph
             }
         }
     }
+    // Цветные знаки-картинки (Noto Color Emoji, CBDT): у Chrome FreeType даёт
+    // растр полосы, Skia масштабирует его к кеглю; цвет — свой, от заливки
+    // берётся только прозрачность. Флаг-смайлик 1px на холсте 1×1 — проба
+    // челленджа (секция pYHZ2): у Chrome пиксель цветной, у нас был пустой.
+    let alpha = match paint {
+        PaintKind::Solid(c) => c[3] as f32 / 255.0,
+        PaintKind::Gradient(_) => 1.0,
+    };
+    let size_dev = eff * ((m.sx * m.sx + m.ky * m.ky).sqrt()).max(1e-6);
+    for (fi, gid, px, py) in bitmap_glyphs {
+        if let Some(b) = fonts.get(fi) {
+            draw_bitmap_glyph(data, w, h, b, gid, px, py, size_dev, alpha);
+        }
+    }
     true
+}
+
+/// Растровый знак шрифта (PNG полосы CBDT/sbix) — в буфер premul RGBA:
+/// масштаб площадным усреднением, наложение source-over.
+#[allow(clippy::too_many_arguments)]
+fn draw_bitmap_glyph(data: &mut [u8], w: u32, h: u32, font: &[u8], gid: u16, x: f32, y: f32, size: f32, alpha: f32) {
+    let Ok(face) = ttf_parser::Face::parse(font, 0) else { return };
+    let Some(img) = face.glyph_raster_image(ttf_parser::GlyphId(gid), size.ceil().max(1.0) as u16) else { return };
+    if img.format != ttf_parser::RasterImageFormat::PNG || img.pixels_per_em == 0 {
+        return;
+    }
+    let mut dec = png::Decoder::new(std::io::Cursor::new(img.data));
+    // Полосы Noto Color Emoji — палитровые PNG с tRNS: раскрыть в RGBA.
+    dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let Ok(mut reader) = dec.read_info() else { return };
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let Ok(info) = reader.next_frame(&mut buf) else { return };
+    if info.bit_depth != png::BitDepth::Eight {
+        return;
+    }
+    let chans = match info.color_type {
+        png::ColorType::Rgba => 4,
+        png::ColorType::Rgb => 3,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Grayscale => 1,
+        _ => return,
+    };
+    let (sw, sh) = (info.width as usize, info.height as usize);
+    let k = size / img.pixels_per_em as f32;
+    let left = x + img.x as f32 * k;
+    let top = y - (img.y as f32 + sh as f32) * k;
+    let x0 = left.floor().max(0.0) as i64;
+    let y0 = top.floor().max(0.0) as i64;
+    let x1 = ((left + sw as f32 * k).ceil() as i64).min(w as i64);
+    let y1 = ((top + sh as f32 * k).ceil() as i64).min(h as i64);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let (ow, oh) = ((x1 - x0) as usize, (y1 - y0) as usize);
+    let mut acc = vec![0f32; ow * oh * 4];
+    for sy in 0..sh {
+        let ya = top + sy as f32 * k;
+        let yb = ya + k;
+        for sx in 0..sw {
+            let o = (sy * sw + sx) * chans;
+            let (r, g, b, a) = match chans {
+                4 => (buf[o], buf[o + 1], buf[o + 2], buf[o + 3]),
+                3 => (buf[o], buf[o + 1], buf[o + 2], 255),
+                2 => (buf[o], buf[o], buf[o], buf[o + 1]),
+                _ => (buf[o], buf[o], buf[o], 255),
+            };
+            if a == 0 {
+                continue;
+            }
+            let af = a as f32 / 255.0;
+            let xa = left + sx as f32 * k;
+            let xb = xa + k;
+            let mut cy = ya.max(y0 as f32);
+            let ey = yb.min(y1 as f32);
+            while cy < ey {
+                let ny = (cy.floor() + 1.0).min(ey);
+                let hy = ny - cy;
+                let iy = cy.floor() as i64 - y0;
+                let mut cx = xa.max(x0 as f32);
+                let ex = xb.min(x1 as f32);
+                while cx < ex {
+                    let nx = (cx.floor() + 1.0).min(ex);
+                    let ar = (nx - cx) * hy;
+                    let ix = cx.floor() as i64 - x0;
+                    if ix >= 0 && iy >= 0 && (ix as usize) < ow && (iy as usize) < oh && ar > 0.0 {
+                        let q = (iy as usize * ow + ix as usize) * 4;
+                        acc[q] += r as f32 * af * ar;
+                        acc[q + 1] += g as f32 * af * ar;
+                        acc[q + 2] += b as f32 * af * ar;
+                        acc[q + 3] += 255.0 * af * ar;
+                    }
+                    cx = nx;
+                }
+                cy = ny;
+            }
+        }
+    }
+    for iy in 0..oh {
+        for ix in 0..ow {
+            let q = (iy * ow + ix) * 4;
+            let sa = (acc[q + 3] * alpha).min(255.0);
+            if sa <= 0.0 {
+                continue;
+            }
+            let d = (((y0 as usize + iy) * w as usize) + x0 as usize + ix) * 4;
+            let inv = 1.0 - sa / 255.0;
+            for c in 0..3 {
+                let sc = (acc[q + c] * alpha).min(255.0);
+                data[d + c] = (sc + data[d + c] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+            }
+            data[d + 3] = (sa + data[d + 3] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+        }
+    }
 }
 
 fn rect_touches(r: &Rect, c: &IRect) -> bool {
