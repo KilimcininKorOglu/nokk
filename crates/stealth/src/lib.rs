@@ -920,13 +920,15 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
         // toString зовётся); массив — поэлементно через запятую, null/undefined
         // внутри пропускаются.
         const tagOf = (v) => { try { return Object.prototype.toString.call(v); } catch (e) { return '[object Object]'; } };
-        const viaToString = (v) => typeof v === 'function' || v instanceof Date || v instanceof RegExp || tagOf(v) === '[object Error]';
+        // По внутреннему тегу, а не instanceof: объект другого окна (виджет
+        // пишет в консоль своего srcdoc-кадра) иначе не распознаётся.
+        const viaToString = (v) => { if (typeof v === 'function') return true; const t = tagOf(v); return t === '[object Date]' || t === '[object RegExp]' || t === '[object Error]'; };
         const str = (v, depth, inArray) => {
           try {
             if (v === null || v === undefined) return inArray ? '' : String(v);
             if (typeof v === 'symbol') return v.toString();
             if (typeof v !== 'object' && typeof v !== 'function') return String(v);
-            if (v instanceof String || v instanceof Number || v instanceof Boolean || v instanceof BigInt) return String(v.valueOf());
+            { const t = tagOf(v); if (t === '[object String]' || t === '[object Number]' || t === '[object Boolean]' || t === '[object BigInt]') { try { return String(v.valueOf()); } catch (e) { return ''; } } }
             if (Array.isArray(v)) { if (depth > 3) return ''; const parts = []; for (let i = 0; i < v.length && i < 100; i++) parts.push(str(v[i], depth + 1, true)); return parts.join(','); }
             if (viaToString(v)) return `${v}`;
             return tagOf(v);
@@ -4865,8 +4867,9 @@ __OPFS__
     rebrand(v, name, base);
   };
   try { brandInPlace(document && document.timeline, 'DocumentTimeline'); } catch (e) {}
-  // `document.timeline.currentTime` — часы кадра: число (у нас было undefined),
-  // замороженное на время задачи, как у Chrome (в одной задаче все чтения равны).
+  // `document.timeline.currentTime` — часы кадра: число с тремя знаками
+  // (у Chrome 1514.782; у нас было undefined), замороженное на время задачи,
+  // как у Chrome (в одной задаче все чтения равны).
   try {
     const TL = document && document.timeline;
     const TP = TL && Object.getPrototypeOf(TL);
@@ -4874,7 +4877,7 @@ __OPFS__
       let frozen = null;
       const g = ({ get currentTime() {
         if (frozen === null) {
-          frozen = Math.floor(performance.now());
+          frozen = Math.round(performance.now() * 1000) / 1000;
           try { if (typeof globalThis.__pt_addTask === 'function') __pt_addTask(() => { frozen = null; }, 0, true); else setTimeout(() => { frozen = null; }, 0); } catch (e) {}
         }
         return frozen;
@@ -7345,9 +7348,25 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       return out;
     };
   }
-  // A deep clone that covers what pages actually pass through it.
+  // Структурное клонирование по правилам HTML (StructuredSerializeInternal),
+  // сверено с Chrome 151 на 30 видах значений (scratchpad/sclone_probe.js):
+  // обёртки Boolean/Number/String/BigInt, ошибки (имя из семи родных, иначе
+  // Error; message, cause и stack — свои), дыры и нечисловые свойства
+  // массивов, геттеры читаются в данные, прототип не переносится; Symbol,
+  // функции, WeakMap/Promise и платформенные объекты — DataCloneError с
+  // текстом Chrome. Блоб, файл, ImageData и DOMException клонируются.
   if (!globalThis.structuredClone) {
-    globalThis.structuredClone = function structuredClone(v, opts) {
+    const ERR_NAMES = new Set(['Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError', 'URIError']);
+    const JS_UNCLONEABLE = new Set(['WeakMap', 'WeakSet', 'WeakRef', 'FinalizationRegistry', 'Promise', 'Generator', 'AsyncGenerator', 'Module']);
+    const tagOf = (x) => { try { return Object.prototype.toString.call(x).slice(8, -1); } catch (e) { return 'Object'; } };
+    const cloneErr = (what) => {
+      const m = "Failed to execute 'structuredClone' on 'Window': " + what + ' could not be cloned.';
+      return typeof DOMException === 'function' ? new DOMException(m, 'DataCloneError') : new Error(m);
+    };
+    const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+    globalThis.structuredClone = function structuredClone(v) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'structuredClone' on 'Window': 1 argument required, but only 0 present.");
+      const opts = arguments[1];
       const seen = new Map();
       // Перенос — это отцепление: у браузера исходный буфер после него
       // нулевой длины, а у нас оставался целым.
@@ -7359,16 +7378,48 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         }
       } catch (e) {}
       const walk = (x) => {
+        if (typeof x === 'symbol') throw cloneErr(x.toString());
+        if (typeof x === 'function') { let src = ''; try { src = Function.prototype.toString.call(x); } catch (e) {} throw cloneErr(src); }
         if (x === null || typeof x !== 'object') return x;
         if (seen.has(x)) return seen.get(x);
-        if (x instanceof Date) return new Date(x.getTime());
-        if (x instanceof RegExp) return new RegExp(x.source, x.flags);
-        if (ArrayBuffer.isView(x)) return new x.constructor(x);
-        if (x instanceof ArrayBuffer) return x.slice(0);
-        if (x instanceof Map) { const m = new Map(); seen.set(x, m); for (const [k, val] of x) m.set(walk(k), walk(val)); return m; }
-        if (x instanceof Set) { const st = new Set(); seen.set(x, st); for (const val of x) st.add(walk(val)); return st; }
-        if (Array.isArray(x)) { const a = []; seen.set(x, a); for (const val of x) a.push(walk(val)); return a; }
-        const o = {}; seen.set(x, o);
+        const tag = tagOf(x);
+        const keep = (c) => { seen.set(x, c); return c; };
+        switch (tag) {
+          case 'Boolean': return keep(Object(Boolean.prototype.valueOf.call(x)));
+          case 'Number': return keep(Object(Number.prototype.valueOf.call(x)));
+          case 'String': return keep(Object(String.prototype.valueOf.call(x)));
+          case 'BigInt': return keep(Object(BigInt.prototype.valueOf.call(x)));
+          case 'Date': return keep(new Date(Date.prototype.getTime.call(x)));
+          case 'RegExp': return keep(new RegExp(x.source, x.flags));
+          case 'ArrayBuffer': return keep(x.slice(0));
+          case 'Map': { const m = keep(new Map()); for (const [k, val] of Map.prototype.entries.call(x)) m.set(walk(k), walk(val)); return m; }
+          case 'Set': { const st = keep(new Set()); for (const val of Set.prototype.values.call(x)) st.add(walk(val)); return st; }
+          case 'Error': {
+            let name = 'Error'; try { const n = x.name; if (ERR_NAMES.has(n)) name = n; } catch (e) {}
+            const C = globalThis[name] || Error;
+            // Настоящая ошибка (внутренний слот [[ErrorData]]), не Object.create.
+            const e = keep(new C());
+            const d = Object.getOwnPropertyDescriptor(x, 'message');
+            if (d && 'value' in d) Object.defineProperty(e, 'message', { value: String(d.value), writable: true, enumerable: false, configurable: true });
+            if (own(x, 'cause')) { let c; try { c = x.cause; } catch (er) {} Object.defineProperty(e, 'cause', { value: walk(c), writable: true, enumerable: false, configurable: true }); }
+            let st; try { st = x.stack; } catch (er) {}
+            if (typeof st === 'string') Object.defineProperty(e, 'stack', { value: st, writable: true, enumerable: false, configurable: true });
+            return e;
+          }
+        }
+        if (ArrayBuffer.isView(x)) return keep(new x.constructor(x));
+        if (Array.isArray(x)) {
+          const a = keep(new Array(x.length));
+          for (const k of Object.keys(x)) a[k] = walk(x[k]);
+          return a;
+        }
+        if (tag === 'Blob' && typeof x.slice === 'function') return keep(x.slice(0, x.size, x.type));
+        if (tag === 'File' && typeof File === 'function') return keep(new File([x], x.name, { type: x.type, lastModified: x.lastModified }));
+        if (tag === 'ImageData' && typeof ImageData === 'function') return keep(new ImageData(new Uint8ClampedArray(x.data), x.width, x.height));
+        if (tag === 'DOMException' && typeof DOMException === 'function') return keep(new DOMException(x.message, x.name));
+        if (JS_UNCLONEABLE.has(tag)) throw cloneErr('#<' + tag + '>');
+        if (tag !== 'Object' && tag !== 'Arguments') throw cloneErr(tag + ' object');
+        const o = keep({});
         for (const k of Object.keys(x)) o[k] = walk(x[k]);
         return o;
       };

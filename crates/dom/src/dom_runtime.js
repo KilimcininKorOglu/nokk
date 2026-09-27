@@ -7052,10 +7052,27 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return ix;
   }
   /// Правила, которые могут подойти элементу.
+  // Корень дерева элемента: теневой корень или элемент документа. Таблицы
+  // стилей действуют только в своём дереве — стили документа в теневое не
+  // достают, и наоборот (у Chrome div в теневом корне не видит `.x{display:flex}`
+  // из <style> страницы).
+  function __treeRootOf(el) {
+    let n = el;
+    while (n) {
+      const p = n.parentNode;
+      if (!p) return n.nodeType === 11 && n.__ptHost ? n : (n.ownerDocument && n.ownerDocument.documentElement) || n;
+      if (p.nodeType === 11 && p.__ptHost) return p;
+      n = p;
+    }
+    return null;
+  }
   function __candidateRules(el) {
     const ix = __ruleIndex(__rulesFor(el.ownerDocument));
-    const out = ix.any.slice();
-    const add = (k) => { const l = ix.keyed.get(k); if (l) for (const r of l) out.push(r); };
+    const root = __treeRootOf(el);
+    const docEl = el.ownerDocument && el.ownerDocument.documentElement;
+    const inScope = (r) => !r.root || r.root === root || (root === docEl && r.root === docEl) || (root && root.nodeType !== 11 && r.root && r.root.nodeType !== 11);
+    const out = ix.any.filter(inScope);
+    const add = (k) => { const l = ix.keyed.get(k); if (l) for (const r of l) if (inScope(r)) out.push(r); };
     add('t' + String(el.localName || '').toLowerCase());
     const id = __ptGetA(el, 'id');
     if (id) add('i' + id);
