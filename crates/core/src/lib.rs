@@ -468,7 +468,14 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
         // заведения, и всякий слой, заводящий своё имя, этот порядок сдвигает.
         ("window_order", nokk_stealth::window_order_script()),
     ];
-    let mut base = format!("{flags}{}", mark("start"));
+    // Служебные поля движка (`node.__ptKids = …`) создавались обычным
+    // присваиванием — перечислимыми: `for…in` по узлу, событию, окну показывал
+    // их, `Object.entries` считал, а `JSON.stringify(div)` бросал «circular
+    // structure» (у Chrome — "{}"). Сеттер на Object.prototype для каждого
+    // такого имени заводит поле неперечислимым; имена собираются из самих
+    // исходников загрузчика.
+    let hide = internal_field_setters(pieces.iter().map(|(_, js)| js.as_str()));
+    let mut base = format!("{flags}{hide}{}", mark("start"));
     for (name, js) in pieces {
         base.push_str(&js);
         base.push_str(&mark(name));
@@ -482,6 +489,39 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
         Some("1") | Some("true") => format!("{base}\n{}", nokk_stealth::probe_tracer_script()),
         _ => base,
     }
+}
+
+/// Скрипт: для каждого имени вида `__pt…`, которому где-либо в `sources`
+/// присваивают значение (`.__ptX = `), — сеттер на Object.prototype, заводящий
+/// поле собственным неперечислимым свойством.
+fn internal_field_setters<'a>(sources: impl Iterator<Item = &'a str>) -> String {
+    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for src in sources {
+        let b = src.as_bytes();
+        let mut i = 0;
+        while let Some(off) = src[i..].find(".__pt") {
+            let start = i + off + 1;
+            let mut end = start;
+            while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_' || b[end] == b'$') {
+                end += 1;
+            }
+            let mut k = end;
+            while k < b.len() && (b[k] == b' ' || b[k] == b'\t') {
+                k += 1;
+            }
+            if k < b.len() && b[k] == b'=' && !(k + 1 < b.len() && (b[k + 1] == b'=' || b[k + 1] == b'>')) {
+                names.insert(src[start..end].to_string());
+            }
+            i = end.max(start + 1);
+        }
+    }
+    let list = serde_json::to_string(&names.into_iter().collect::<Vec<_>>()).unwrap_or_else(|_| "[]".into());
+    format!(
+        "(() => {{ const P = Object.prototype; const def = Object.defineProperty, own = Object.prototype.hasOwnProperty; \
+         for (const n of {list}) {{ if (own.call(P, n)) continue; \
+         def(P, n, {{ get: undefined, set(v) {{ if (this === null || (typeof this !== 'object' && typeof this !== 'function')) return; \
+         try {{ def(this, n, {{ value: v, writable: true, enumerable: false, configurable: true }}); }} catch (e) {{}} }}, enumerable: false, configurable: true }}); }} }})();\n"
+    )
 }
 
 /// A stable 64-bit seed (FNV-1a) for a context identity, so a given browser
@@ -2346,7 +2386,10 @@ impl BrowserContext {
                         .eval_at(
                             place,
                             child,
-                            &format!("globalThis.__ptStorageAccess = {storage_access}; globalThis.__ptNoReferrer = {local};"),
+                            &format!("globalThis.__ptStorageAccess = {storage_access}; globalThis.__ptNoReferrer = {local}; \
+                                      (() => {{ const N = globalThis.__pt_rawGOPN || Object.getOwnPropertyNames, D = globalThis.__pt_rawGOPD || Object.getOwnPropertyDescriptor; \
+                                      for (const k of N(globalThis)) {{ if (k.charCodeAt(0) !== 95 || k.charCodeAt(1) !== 95) continue; \
+                                      try {{ const d = D(globalThis, k); if (d && d.enumerable && d.configurable) {{ d.enumerable = false; Object.defineProperty(globalThis, k, d); }} }} catch (e) {{}} }} }})();"),
                         )
                         .await;
                     // Крючки наблюдателя — следом за областью: воркер стартует

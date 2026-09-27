@@ -2960,6 +2960,28 @@ pub fn window_order_script() -> String {
 }
 
 const WINDOW_ORDER_TEMPLATE: &str = r#"(() => {
+  // Служебные имена движка (`__pt…`, `__…`) не должны перечисляться ни на
+  // прототипах интерфейсов, ни на окне: `for…in` по узлу у Chrome их не
+  // показывает. Ищем их самим for…in — его фильтр интроспекции не трогает.
+  try {
+    const GOPN = globalThis.__pt_rawGOPN || Object.getOwnPropertyNames, GOPD = globalThis.__pt_rawGOPD || Object.getOwnPropertyDescriptor;
+    const hideOn = (o) => {
+      if (!o || (typeof o !== 'object' && typeof o !== 'function')) return;
+      let ks = [];
+      try { ks = GOPN(o).filter((k) => k.charCodeAt(0) === 95 && k.charCodeAt(1) === 95); } catch (e) { return; }
+      for (const k of ks) {
+        try { const d = GOPD(o, k); if (d && d.enumerable && d.configurable) { d.enumerable = false; Object.defineProperty(o, k, d); } } catch (e) {}
+      }
+    };
+    hideOn(globalThis);
+    const seen = new Set();
+    for (const n of Object.getOwnPropertyNames(globalThis)) {
+      let C; try { C = globalThis[n]; } catch (e) { continue; }
+      if (typeof C !== 'function') continue;
+      for (let P = C.prototype, i = 0; P && i < 12 && !seen.has(P); P = Object.getPrototypeOf(P), i++) { seen.add(P); hideOn(P); }
+    }
+    try { if (globalThis.document) for (let P = document, i = 0; P && i < 12; P = Object.getPrototypeOf(P), i++) hideOn(P); } catch (e) {}
+  } catch (e) {}
   const ORDER = __WINDOW_ORDER__;
   for (const name of ORDER) {
     let d;
@@ -12448,6 +12470,18 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     value: mask(function hasOwnProperty(k) { return __ptHidden(k) ? false : origHOP.call(this, k); }, 'hasOwnProperty'),
     configurable: true, writable: true,
   });
+  // Object.hasOwn тоже: он видел служебные поля узлов.
+  const origHasOwn = Object.hasOwn;
+  if (typeof origHasOwn === 'function') {
+    Object.defineProperty(Object, 'hasOwn', {
+      value: mask(function hasOwn(o, k) { return __ptHidden(k) ? (origHasOwn(o, k), false) : origHasOwn(o, k); }, 'hasOwn'),
+      configurable: true, writable: true,
+    });
+  }
+  // Сырые версии — для последнего прохода загрузчика (прячет перечислимость
+  // служебных методов прототипов); сами под скрытым именем.
+  Object.defineProperty(globalThis, '__pt_rawGOPN', { value: origGOPN, configurable: true });
+  Object.defineProperty(globalThis, '__pt_rawGOPD', { value: origGOPD, configurable: true });
 })();"#;
 
 fn json_string_array(items: &[String]) -> String {

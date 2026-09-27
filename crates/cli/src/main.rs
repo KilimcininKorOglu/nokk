@@ -213,11 +213,12 @@ fn render(v: &serde_json::Value) -> String {
 async fn eval_and_print(ctx: &BrowserContext, js: &str) -> Result<()> {
     // Route both sync values and Promise resolutions through `__out`.
     let wrapped = format!(
-        "(() => {{ globalThis.__outDone = false; const v = ({js}); \
+        "(() => {{ const put = (k, v) => Object.defineProperty(globalThis, k, {{ value: v, writable: true, enumerable: false, configurable: true }}); \
+           put('__outDone', false); const v = ({js}); \
            if (v && typeof v.then === 'function') {{ \
-             v.then(x => {{ globalThis.__out = x; globalThis.__outDone = true; }}, \
-                    e => {{ globalThis.__out = 'ERR: ' + e; globalThis.__outDone = true; }}); \
-           }} else {{ globalThis.__out = v; globalThis.__outDone = true; }} \
+             v.then(x => {{ put('__out', x); put('__outDone', true); }}, \
+                    e => {{ put('__out', 'ERR: ' + e); put('__outDone', true); }}); \
+           }} else {{ put('__out', v); put('__outDone', true); }} \
            return undefined; }})()"
     );
     if let Err(e) = ctx.evaluate(&wrapped).await {

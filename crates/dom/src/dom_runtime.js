@@ -1349,9 +1349,12 @@
       // Окно пустого кадра внутри стороннего кадра у Chrome не знает ни
       // внешнего размера, ни положения на экране: outerWidth/outerHeight и
       // screenX/screenY там нули (так отвечает отчёт челленджа).
+      // Уточнено 27.09 по эталону без пробников: внешний размер у такого окна —
+      // размер окна браузера (как у окна кадра), положение на экране — 0.
       if (globalThis.__pt_crossSite) {
+        const outer = { outerWidth: globalThis.outerWidth | 0, outerHeight: globalThis.outerHeight | 0 };
         for (const k of ['outerWidth', 'outerHeight', 'screenX', 'screenY', 'screenLeft', 'screenTop']) {
-          try { const d = Object.getOwnPropertyDescriptor(w, k); Object.defineProperty(w, k, { value: 0, writable: true, enumerable: d ? d.enumerable : true, configurable: true }); } catch (e) {}
+          try { const d = Object.getOwnPropertyDescriptor(w, k); Object.defineProperty(w, k, { value: k in outer ? outer[k] : 0, writable: true, enumerable: d ? d.enumerable : true, configurable: true }); } catch (e) {}
         }
       }
       // Происхождение `about:blank` — от создателя: origin и document.domain
@@ -1380,7 +1383,24 @@
         // Сторонний кадр без коробки (0×0) Chrome не раскладывает вовсе:
         // его пустые кадры остаются без размера — innerWidth 0.
         if (!hidden && __ptHiddenFrame()) hidden = true;
+        // Сторонний кадр размером не больше 1×1 (виджет Turnstile в режиме
+        // «невидимый») Chrome не отрисовывает: раскладка в нём не идёт, и
+        // только что вставленные пустые кадры остаются без размера — 0×0
+        // (эталон без пробников, секция Mrvi5). Видимость документа — прежняя.
+        if (!hidden && globalThis.__pt_crossSite && (globalThis.innerWidth | 0) <= 1 && (globalThis.innerHeight | 0) <= 1) hidden = true;
         const [dw, dh] = __ptJSON.parse(__pt_frameBoxOf(this));
+        // Трасса NOKK_TRACE_SRCDOC=1: чем окружён пустой кадр в миг создания.
+        if (globalThis.__pt_srcdocTrace) {
+          try {
+            const chain = [];
+            for (let p = this; p; p = p.parentNode && p.parentNode.nodeType === 11 && p.parentNode.__ptHost ? (chain.push('#shadow'), p.parentNode.__ptHost) : p.parentNode) {
+              if (p.nodeType !== 1) { chain.push('#' + p.nodeType); break; }
+              chain.push(p.localName + (p.id ? '#' + p.id : '') + (p.getAttribute('style') ? '[' + p.getAttribute('style') + ']' : '') + (p.className ? '.' + String(p.className).slice(0, 30) : ''));
+            }
+            let cs = ''; try { const c = getComputedStyle(this); cs = [c.display, c.width, c.height, c.visibility, c.position, c.left, c.top].join(','); } catch (e) {}
+            (globalThis.__pt_parentConsole || console).error('[realm] ' + String(this.outerHTML).slice(0, 300) + ' | chain ' + chain.join(' < ') + ' | cs ' + cs + ' | box ' + dw + 'x' + dh + ' | hidden ' + hidden + ' | flat ' + (typeof __pt_inFlatTree === 'function' ? __pt_inFlatTree(this) : '?'));
+          } catch (e) {}
+        }
         __ptTellFrame(this, hidden ? null : { cw: dw, ch: dh });
       } catch (e) {}
       // Реферер и базовый адрес пустого кадра — документ-создатель, как у Chrome;
