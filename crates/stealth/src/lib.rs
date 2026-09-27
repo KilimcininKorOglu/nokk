@@ -1137,6 +1137,7 @@ const INTL_SHIM_TEMPLATE: &str = r#"(() => {
 /// and masks patched functions so `fn.toString()` still reads `[native code]`.
 pub fn fingerprint_script(profile: &StealthProfile) -> String {
     FINGERPRINT_TEMPLATE
+        .replace("__RTC_CHROME__", RTC_CHROME)
         .replace("__GL_ARITY__", GL_ARITY)
         .replace("__WEBGL_VENDOR__", &quoted(&profile.webgl_vendor))
         .replace("__WEBGL_RENDERER__", &quoted(&profile.webgl_renderer))
@@ -2705,6 +2706,7 @@ const SHAPE_FIXES: &str = r#"(() => {
   } catch (e) {}
   // Статические члены конструкторов и пространств имён — как у Chrome 151:
   // порядок, флаги описаний, длины и имена функций, без `.prototype`.
+  try { if (typeof globalThis.__pt_installRtcCaps === 'function') __pt_installRtcCaps(); } catch (e) {}
   try {
     const TAB = __CTOR_STATICS__;
     const NS = new Set(['console', 'CSS', 'WebAssembly']);
@@ -8224,6 +8226,9 @@ const IFACE_STATICS: &str = r#"{"AbortSignal":{"f":{"any":1,"timeout":1}},"Audio
 /// message; ours answered `undefined` and carried on.
 const GL_ARITY: &str = r#"{"activeTexture":1,"attachShader":2,"bindAttribLocation":3,"bindRenderbuffer":2,"blendColor":4,"blendEquation":1,"blendEquationSeparate":2,"blendFunc":2,"blendFuncSeparate":4,"bufferData":3,"bufferSubData":3,"checkFramebufferStatus":1,"compileShader":1,"compressedTexImage2D":7,"compressedTexSubImage2D":8,"copyTexImage2D":8,"copyTexSubImage2D":8,"createShader":1,"cullFace":1,"deleteBuffer":1,"deleteFramebuffer":1,"deleteProgram":1,"deleteRenderbuffer":1,"deleteShader":1,"deleteTexture":1,"depthFunc":1,"depthMask":1,"depthRange":2,"detachShader":2,"disable":1,"enable":1,"framebufferRenderbuffer":4,"framebufferTexture2D":5,"frontFace":1,"generateMipmap":1,"getActiveAttrib":2,"getActiveUniform":2,"getAttachedShaders":1,"getAttribLocation":2,"getBufferParameter":2,"getExtension":1,"getFramebufferAttachmentParameter":3,"getParameter":1,"getProgramInfoLog":1,"getProgramParameter":2,"getRenderbufferParameter":2,"getShaderInfoLog":1,"getShaderParameter":2,"getShaderPrecisionFormat":2,"getShaderSource":1,"getTexParameter":2,"getUniform":2,"getUniformLocation":2,"getVertexAttrib":2,"getVertexAttribOffset":2,"hint":2,"isBuffer":1,"isEnabled":1,"isFramebuffer":1,"isProgram":1,"isRenderbuffer":1,"isShader":1,"isTexture":1,"lineWidth":1,"linkProgram":1,"pixelStorei":2,"polygonOffset":2,"readPixels":7,"renderbufferStorage":4,"sampleCoverage":2,"shaderSource":2,"stencilFunc":3,"stencilFuncSeparate":4,"stencilMask":1,"stencilMaskSeparate":2,"stencilOp":3,"stencilOpSeparate":4,"texImage2D":6,"texParameterf":3,"texParameteri":3,"texSubImage2D":7,"useProgram":1,"validateProgram":1,"bindBuffer":2,"bindFramebuffer":2,"bindTexture":2,"clear":1,"clearColor":4,"clearDepth":1,"clearStencil":1,"colorMask":4,"disableVertexAttribArray":1,"drawArrays":3,"drawElements":4,"enableVertexAttribArray":1,"scissor":4,"uniform1f":2,"uniform1fv":2,"uniform1i":2,"uniform1iv":2,"uniform2f":3,"uniform2fv":2,"uniform2i":3,"uniform2iv":2,"uniform3f":4,"uniform3fv":2,"uniform3i":4,"uniform3iv":2,"uniform4f":5,"uniform4fv":2,"uniform4i":5,"uniform4iv":2,"uniformMatrix2fv":3,"uniformMatrix3fv":3,"uniformMatrix4fv":3,"vertexAttrib1f":2,"vertexAttrib1fv":2,"vertexAttrib2f":3,"vertexAttrib2fv":2,"vertexAttrib3f":4,"vertexAttrib3fv":2,"vertexAttrib4f":5,"vertexAttrib4fv":2,"vertexAttribPointer":6,"viewport":4,"drawingBufferStorage":3,"beginQuery":2,"beginTransformFeedback":1,"bindBufferBase":3,"bindBufferRange":5,"bindSampler":2,"bindTransformFeedback":2,"bindVertexArray":1,"blitFramebuffer":10,"clientWaitSync":3,"compressedTexImage3D":8,"compressedTexSubImage3D":10,"copyBufferSubData":5,"copyTexSubImage3D":9,"deleteQuery":1,"deleteSampler":1,"deleteSync":1,"deleteTransformFeedback":1,"deleteVertexArray":1,"drawArraysInstanced":4,"drawElementsInstanced":5,"drawRangeElements":6,"endQuery":1,"fenceSync":2,"framebufferTextureLayer":5,"getActiveUniformBlockName":2,"getActiveUniformBlockParameter":3,"getActiveUniforms":3,"getBufferSubData":3,"getFragDataLocation":2,"getIndexedParameter":2,"getInternalformatParameter":3,"getQuery":2,"getQueryParameter":2,"getSamplerParameter":2,"getSyncParameter":2,"getTransformFeedbackVarying":2,"getUniformBlockIndex":2,"getUniformIndices":2,"invalidateFramebuffer":2,"invalidateSubFramebuffer":6,"isQuery":1,"isSampler":1,"isSync":1,"isTransformFeedback":1,"isVertexArray":1,"readBuffer":1,"renderbufferStorageMultisample":5,"samplerParameterf":3,"samplerParameteri":3,"texImage3D":10,"texStorage2D":5,"texStorage3D":6,"texSubImage3D":11,"transformFeedbackVaryings":3,"uniform1ui":2,"uniform2ui":3,"uniform3ui":4,"uniform4ui":5,"uniformBlockBinding":3,"vertexAttribDivisor":2,"vertexAttribI4i":5,"vertexAttribI4ui":5,"vertexAttribIPointer":5,"waitSync":3,"clearBufferfi":4,"clearBufferfv":3,"clearBufferiv":3,"clearBufferuiv":3,"drawBuffers":1,"uniform1uiv":2,"uniform2uiv":2,"uniform3uiv":2,"uniform4uiv":2,"uniformMatrix2x3fv":3,"uniformMatrix2x4fv":3,"uniformMatrix3x2fv":3,"uniformMatrix3x4fv":3,"uniformMatrix4x2fv":3,"uniformMatrix4x3fv":3,"vertexAttribI4iv":2,"vertexAttribI4uiv":2}"#;
 
+/// Снятое у Chrome 151: разделы предложения WebRTC и getCapabilities.
+const RTC_CHROME: &str = include_str!("rtc_chrome.json");
+
 const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // Форма интерфейсного объекта. Обычная функция несёт собственные `arguments`
   // и `caller` — у браузерного интерфейса их нет, и обход графа видит два лишних
@@ -11476,94 +11481,195 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     return [...bytes].map((b) => b.toString(16).padStart(2, '0').toUpperCase()).join(':');
   };
 
+  // WebRTC как у Chrome 151 (сверено на scratchpad/rtc_cap.html, секция
+  // cHOXt5 отчёта): предложение — из снятых у Chrome разделов (audio, video,
+  // application; BUNDLE), сбор — по разделу на семейство адресов: хост под
+  // именем mDNS на настоящем порту сокета и srflx по ответу STUN (натив
+  // __pt_rtcStart / __pt_rtcPoll). localDescription дополняется так же, как у
+  // Chrome: кандидаты за `a=rtcp`, порт `m=` и адрес `c=` — от srflx IPv4.
+  const RTC_CHROME = __RTC_CHROME__;
+  const rtcUuid = () => {
+    const h = (n) => Array.from({ length: n }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('');
+    return h(8) + '-' + h(4) + '-4' + h(3) + '-' + '89ab'[Math.floor(Math.random() * 4)] + h(3) + '-' + h(12);
+  };
+  const rtcFoundation = () => String(Math.floor(1e9 + Math.random() * 3.2e9));
+  const rtcEvent = (type, extra) => {
+    let ev;
+    try { ev = new Event(type); } catch (e) { ev = { type }; }
+    const C = extra && 'candidate' in extra ? globalThis.RTCPeerConnectionIceEvent : null;
+    try { if (C && C.prototype) Object.setPrototypeOf(ev, C.prototype); } catch (e) {}
+    for (const k of Object.keys(extra || {})) { try { Object.defineProperty(ev, k, { value: extra[k], enumerable: false, configurable: true }); } catch (e) {} }
+    try { if (typeof globalThis.__ptTrust === 'function') globalThis.__ptTrust(ev); } catch (e) {}
+    return ev;
+  };
+  const rtcCandidate = (line, mid, idx, ufrag, f) => {
+    const C = globalThis.RTCIceCandidate;
+    const o = Object.create(C && C.prototype ? C.prototype : Object.prototype);
+    // В полях объекта Chrome берёт IPv6 в скобки (в строке кандидата — нет).
+    const br = (a) => (typeof a === 'string' && a.indexOf(':') >= 0 ? '[' + a + ']' : a);
+    const bag = { candidate: line, sdpMid: String(mid), sdpMLineIndex: idx, foundation: f.foundation, component: 'rtp', priority: f.priority,
+      address: br(f.address), protocol: 'udp', port: f.port, type: f.type, tcpType: null, relatedAddress: f.raddr === undefined ? null : br(f.raddr),
+      relatedPort: f.rport === undefined ? null : f.rport, usernameFragment: ufrag };
+    for (const k of Object.keys(bag)) __pt_write(o, k, bag[k]);
+    try { Object.defineProperty(o, 'toJSON', { value: ({ toJSON() { return { candidate: this.candidate, sdpMid: this.sdpMid, sdpMLineIndex: this.sdpMLineIndex, usernameFragment: this.usernameFragment }; } }).toJSON, enumerable: false, configurable: true }); } catch (e) {}
+    return o;
+  };
+  const rtcDesc = (type, sdp) => {
+    const C = globalThis.RTCSessionDescription;
+    const o = Object.create(C && C.prototype ? C.prototype : Object.prototype);
+    __pt_write(o, 'type', type); __pt_write(o, 'sdp', sdp);
+    try { Object.defineProperty(o, 'toJSON', { value: ({ toJSON() { return { type: this.type, sdp: this.sdp }; } }).toJSON, enumerable: false, configurable: true }); } catch (e) {}
+    return o;
+  };
+  const rtcTransceiver = (kind) => {
+    const mk = (n) => { const C = globalThis[n]; return Object.create(C && C.prototype ? C.prototype : Object.prototype); };
+    const t = mk('RTCRtpTransceiver'), rcv = mk('RTCRtpReceiver'), snd = mk('RTCRtpSender'), tr = mk('MediaStreamTrack');
+    __pt_write(tr, 'kind', kind); __pt_write(tr, 'id', rtcUuid()); __pt_write(tr, 'label', 'remote ' + kind); __pt_write(tr, 'enabled', true);
+    __pt_write(tr, 'muted', true); __pt_write(tr, 'readyState', 'live');
+    __pt_write(rcv, 'track', tr); __pt_write(rcv, 'transport', null);
+    __pt_write(snd, 'track', null); __pt_write(snd, 'transport', null);
+    __pt_write(t, 'mid', null); __pt_write(t, 'direction', 'recvonly'); __pt_write(t, 'currentDirection', null);
+    __pt_write(t, 'receiver', rcv); __pt_write(t, 'sender', snd); __pt_write(t, 'stopped', false);
+    return t;
+  };
+
   globalThis.RTCPeerConnection = globalThis.RTCPeerConnection || mask(class RTCPeerConnection extends EventTarget {
     constructor(config) {
       super();
-      const ufrag = b64ish(4), pwd = b64ish(24);
+      const sid = String(Math.floor(1 + Math.random() * 9)) + Array.from({ length: 18 }, () => Math.floor(Math.random() * 10)).join('');
       Object.defineProperty(this, '__pt', {
         value: {
-          ufrag, pwd, print: dtlsPrint(),
-          // Имя mDNS вместо адреса — ровно то, что отдаёт Chrome.
-          mdns: (globalThis.crypto && crypto.randomUUID ? crypto.randomUUID() : hex(16)) + '.local',
-          mids: [], gathered: false, closed: false, config: config || {},
+          ufrag: b64ish(4), pwd: b64ish(24), print: dtlsPrint(), sid,
+          mdns4: rtcUuid() + '.local', mdns6: rtcUuid() + '.local',
+          fh4: rtcFoundation(), fh6: rtcFoundation(), fs4: rtcFoundation(), fs6: rtcFoundation(),
+          tx: [], data: false, kinds: [], cands: [], srflx4: [], gathered: false, closed: false, config: config || {}, neg: false,
         },
         enumerable: false,
       });
-      __pt_write(this, 'localDescription', null);
-      __pt_write(this, 'remoteDescription', null);
-      __pt_write(this, 'currentLocalDescription', null);
-      __pt_write(this, 'pendingLocalDescription', null);
-      __pt_write(this, 'iceGatheringState', 'new');
-      __pt_write(this, 'iceConnectionState', 'new');
-      __pt_write(this, 'connectionState', 'new');
-      __pt_write(this, 'signalingState', 'stable');
-      this.onicecandidate = null;
-      this.onicegatheringstatechange = null;
-      this.oniceconnectionstatechange = null;
-      this.onconnectionstatechange = null;
-      this.ondatachannel = null;
-      this.onnegotiationneeded = null;
+      for (const [k, v] of [['localDescription', null], ['remoteDescription', null], ['currentLocalDescription', null], ['pendingLocalDescription', null],
+        ['currentRemoteDescription', null], ['pendingRemoteDescription', null], ['iceGatheringState', 'new'], ['iceConnectionState', 'new'],
+        ['connectionState', 'new'], ['signalingState', 'stable'], ['canTrickleIceCandidates', null], ['sctp', null]]) __pt_write(this, k, v);
+      for (const k of ['onicecandidate', 'onicegatheringstatechange', 'oniceconnectionstatechange', 'onconnectionstatechange', 'ondatachannel',
+        'onnegotiationneeded', 'onsignalingstatechange', 'onicecandidateerror', 'ontrack']) this[k] = null;
     }
     __ptFire(type, extra) {
-      const ev = Object.assign({ type, target: this, currentTarget: this, isTrusted: true }, extra || {});
-      // Одна доставка, а не две: `dispatchEvent` сам зовёт и слушателей, и
-      // `on<событие>`. Пока звали обоих, каждый кандидат приходил дважды, и
-      // состояние сбора менялось дважды — у браузера так не бывает, а тот,
-      // кто считает кандидатов, считает именно события.
+      const ev = rtcEvent(type, extra);
       try { this.dispatchEvent(ev); } catch (e) {
         const on = this['on' + type];
         if (typeof on === 'function') { try { on.call(this, ev); } catch (e2) {} }
       }
     }
-    __ptSdp(kind) {
+    __ptNeg() {
       const st = this.__pt;
-      const mid = st.mids.length ? st.mids : ['0'];
-      return 'v=0\r\n'
-        + 'o=- ' + hex(8).replace(/\D/g, '').padEnd(19, '3').slice(0, 19) + ' 2 IN IP4 127.0.0.1\r\n'
-        + 's=-\r\nt=0 0\r\n'
-        + 'a=group:BUNDLE ' + mid.join(' ') + '\r\n'
-        + 'a=extmap-allow-mixed\r\na=msid-semantic: WMS\r\n'
-        + 'm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n'
-        + 'c=IN IP4 0.0.0.0\r\na=ice-ufrag:' + st.ufrag + '\r\na=ice-pwd:' + st.pwd + '\r\n'
-        + 'a=ice-options:trickle\r\na=fingerprint:sha-256 ' + st.print + '\r\n'
-        + 'a=setup:' + (kind === 'offer' ? 'actpass' : 'active') + '\r\n'
-        + 'a=mid:' + mid[0] + '\r\na=sctp-port:5000\r\na=max-message-size:262144\r\n';
-      // Предложение у браузера кончается переводом строки — он уже есть выше;
-      // отдельной строкой это отмечено, чтобы правка не съела его случайно.
+      if (st.neg || st.closed) return;
+      st.neg = true;
+      setTimeout(() => { st.neg = false; if (!st.closed) this.__ptFire('negotiationneeded'); }, 0);
+    }
+    __ptKinds() {
+      const st = this.__pt;
+      const k = st.tx.map((t) => t.receiver.track.kind);
+      if (st.data) k.push('application');
+      return k.length ? k : ['application'];
+    }
+    __ptSection(kind, mid, withCands) {
+      const st = this.__pt;
+      let sec = RTC_CHROME.sections[kind] || RTC_CHROME.sections.application;
+      sec = sec.split('{UFRAG}').join(st.ufrag).split('{PWD}').join(st.pwd).split('{FP}').join(st.print).replace(/a=mid:\d+/, 'a=mid:' + mid);
+      if (!withCands) return sec;
+      const mine = st.cands.filter((c) => c.idx === mid);
+      if (!mine.length) return sec;
+      const lines = mine.map((c) => 'a=' + c.sdpLine + '\r\n').join('');
+      const s4 = st.srflx4[mid];
+      if (s4) sec = sec.replace(/^m=(\S+) 9 /, 'm=$1 ' + s4.port + ' ').replace('c=IN IP4 0.0.0.0', 'c=IN IP4 ' + s4.ip);
+      const anchor = sec.indexOf('a=rtcp:9 IN IP4 0.0.0.0\r\n');
+      if (anchor >= 0) { const at = anchor + 'a=rtcp:9 IN IP4 0.0.0.0\r\n'.length; return sec.slice(0, at) + lines + sec.slice(at); }
+      const c = sec.indexOf('\r\n', sec.indexOf('c=IN IP4')) + 2;
+      return sec.slice(0, c) + lines + sec.slice(c);
+    }
+    __ptSdp(withCands) {
+      const st = this.__pt;
+      const kinds = st.kinds.length ? st.kinds : this.__ptKinds();
+      const head = RTC_CHROME.head.split('{SID}').join(st.sid).replace(/a=group:BUNDLE[^\r]*/, 'a=group:BUNDLE ' + kinds.map((_, i) => i).join(' '));
+      return head + kinds.map((k, i) => this.__ptSection(k, i, withCands)).join('');
     }
     createDataChannel(label, opts) {
       const st = this.__pt;
-      if (!st.mids.length) st.mids.push('0');
-      const channel = Object.assign(new EventTarget(), {
-        label: String(label == null ? '' : label), ordered: !(opts && opts.ordered === false),
-        readyState: 'connecting', bufferedAmount: 0, id: null, protocol: (opts && opts.protocol) || '',
-        send() {}, close() { __pt_write(this, 'readyState', 'closed'); },
-      });
-      // Канал обязан называть себя каналом: `Object.prototype.toString` по
-      // нему — обычная проверка, и `[object Object]` выдаёт нас с головой.
-      // Прототип интерфейса таблица имён уже создала.
-      try {
-        const C = globalThis.RTCDataChannel;
-        if (C && C.prototype) Object.setPrototypeOf(channel, C.prototype);
-      } catch (e) {}
+      if (st.closed) throw (typeof DOMException === 'function' ? new DOMException("Failed to execute 'createDataChannel' on 'RTCPeerConnection': The RTCPeerConnection's signalingState is 'closed'.", 'InvalidStateError') : new Error('closed'));
+      const first = !st.data;
+      st.data = true;
+      const C = globalThis.RTCDataChannel;
+      const channel = Object.create(C && C.prototype ? C.prototype : EventTarget.prototype);
+      const bag = { label: String(label == null ? '' : label), ordered: !(opts && opts.ordered === false), maxPacketLifeTime: (opts && opts.maxPacketLifeTime != null) ? opts.maxPacketLifeTime : null,
+        maxRetransmits: (opts && opts.maxRetransmits != null) ? opts.maxRetransmits : null, protocol: (opts && opts.protocol) || '', negotiated: !!(opts && opts.negotiated),
+        id: (opts && opts.negotiated && opts.id != null) ? opts.id : null, readyState: 'connecting', bufferedAmount: 0, bufferedAmountLowThreshold: 0, binaryType: 'arraybuffer' };
+      for (const k of Object.keys(bag)) __pt_write(channel, k, bag[k]);
+      if (first) this.__ptNeg();
       return channel;
     }
-    async createOffer() {
-      return { type: 'offer', sdp: this.__ptSdp('offer') };
+    addTransceiver(kind) {
+      const k = typeof kind === 'string' ? kind : (kind && kind.kind) || 'audio';
+      const t = rtcTransceiver(k);
+      this.__pt.tx.push(t);
+      this.__ptNeg();
+      return t;
+    }
+    async createOffer(opts) {
+      const st = this.__pt;
+      if (st.closed) throw (typeof DOMException === 'function' ? new DOMException("Failed to execute 'createOffer' on 'RTCPeerConnection': The RTCPeerConnection's signalingState is 'closed'.", 'InvalidStateError') : new Error('closed'));
+      if (opts && typeof opts === 'object') {
+        for (const [key, kind] of [['offerToReceiveAudio', 'audio'], ['offerToReceiveVideo', 'video']]) {
+          if (opts[key] && !st.tx.some((t) => t.receiver.track.kind === kind)) st.tx.push(rtcTransceiver(kind));
+        }
+      }
+      // Порядок разделов: аудио, видео, данные (так кладёт Chrome при
+      // устаревших опциях предложения).
+      st.tx.sort((a, b) => (a.receiver.track.kind === 'audio' ? 0 : 1) - (b.receiver.track.kind === 'audio' ? 0 : 1));
+      if (!st.kinds.length) st.kinds = this.__ptKinds();
+      // Chrome строит предложение на своём потоке (~25 мс) и отдаёт словарь
+      // RTCSessionDescriptionInit, а не RTCSessionDescription.
+      const sdp = this.__ptSdp(false);
+      await new Promise((r) => setTimeout(r, 20 + Math.random() * 8));
+      return { type: 'offer', sdp };
     }
     async createAnswer() {
-      return { type: 'answer', sdp: this.__ptSdp('answer') };
+      const sdp = this.__ptSdp(false).replace(/a=setup:actpass/g, 'a=setup:active');
+      await new Promise((r) => setTimeout(r, 5));
+      return { type: 'answer', sdp };
     }
     async setLocalDescription(desc) {
-      const value = desc || { type: 'offer', sdp: this.__ptSdp('offer') };
+      const st = this.__pt;
+      if (!st.kinds.length) st.kinds = this.__ptKinds();
+      const type = (desc && desc.type) || 'offer';
+      const value = rtcDesc(type, (desc && desc.sdp) || this.__ptSdp(false));
       __pt_write(this, 'localDescription', value);
-      __pt_write(this, 'currentLocalDescription', value);
-      __pt_write(this, 'signalingState', value.type === 'offer' ? 'have-local-offer' : 'stable');
-      this.__ptGather();
+      __pt_write(this, 'pendingLocalDescription', type === 'offer' ? value : null);
+      __pt_write(this, 'currentLocalDescription', type === 'offer' ? null : value);
+      st.tx.forEach((t, i) => __pt_write(t, 'mid', String(i)));
+      const was = this.signalingState;
+      __pt_write(this, 'signalingState', type === 'offer' ? 'have-local-offer' : 'stable');
+      if (was !== this.signalingState) this.__ptFire('signalingstatechange');
+      setTimeout(() => this.__ptGather(), 0);
     }
     async setRemoteDescription(desc) {
-      __pt_write(this, 'remoteDescription', desc || null);
+      __pt_write(this, 'remoteDescription', desc ? rtcDesc(desc.type, desc.sdp) : null);
       __pt_write(this, 'signalingState', 'stable');
+    }
+    __ptRefreshLocal() {
+      const st = this.__pt, ld = this.localDescription;
+      if (!ld || ld.type !== 'offer') return;
+      const v = rtcDesc(ld.type, this.__ptSdp(true));
+      __pt_write(this, 'localDescription', v);
+      __pt_write(this, 'pendingLocalDescription', v);
+    }
+    __ptAddCand(idx, f) {
+      const st = this.__pt;
+      const base = 'candidate:' + f.foundation + ' 1 udp ' + f.priority + ' ' + f.address + ' ' + f.port + ' typ ' + f.type
+        + (f.type === 'srflx' ? ' raddr ' + f.raddr + ' rport 0' : '') + ' generation 0';
+      const line = base + ' ufrag ' + st.ufrag + ' network-cost 999';
+      st.cands.push({ idx, sdpLine: base + ' network-cost 999' });
+      if (f.type === 'srflx' && f.fam === 4) st.srflx4[idx] = { ip: f.address, port: f.port };
+      this.__ptRefreshLocal();
+      this.__ptFire('icecandidate', { candidate: rtcCandidate(line, idx, idx, st.ufrag, f) });
     }
     __ptGather() {
       const st = this.__pt;
@@ -11571,75 +11677,82 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       st.gathered = true;
       __pt_write(this, 'iceGatheringState', 'gathering');
       this.__ptFire('icegatheringstatechange');
-      const st_ = st, self = this;
-      // Сбор идёт не мгновенно: браузеру нужен цикл событий, и код, который
-      // ждёт кандидата в обработчике, обязан успеть подписаться.
-      setTimeout(() => {
-        if (st_.closed) return;
-        // Кандидатов у браузера два: хост по IPv4 и хост по IPv6. У каждого своё
-        // имя `.local` (mDNS прячет настоящий адрес), свой порт, своя основа и
-        // свой вес — 2113937151 у первого, 2113939711 у второго. Мы слали один
-        // и тот же дважды, и это видно всякому, кто их считает.
-        const uuid = () => {
-          const h = (n) => Array.from({ length: n }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('');
-          return h(8) + '-' + h(4) + '-4' + h(3) + '-' + '89ab'[Math.floor(Math.random() * 4)] + h(3) + '-' + h(12);
-        };
-        const пара = [
-          { prio: 2113937151, mdns: st_.mdns },
-          { prio: 2113939711, mdns: uuid() + '.local' },
-        ];
-        for (const { prio, mdns } of пара) {
-          const foundation = String(Math.floor(Math.random() * 4000000000));
-          const port = 40000 + Math.floor(Math.random() * 20000);
-          const line = 'candidate:' + foundation + ' 1 udp ' + prio + ' ' + mdns + ' ' + port
-            + ' typ host generation 0 ufrag ' + st_.ufrag + ' network-cost 999';
-          // Собранный кандидат браузер вписывает и в само предложение — сразу
-          // за строкой `c=`, и без `ufrag`, в отличие от события. У нас
-          // `localDescription` оставался без кандидатов вовсе.
-          try {
-            const вSdp = 'a=candidate:' + foundation + ' 1 udp ' + prio + ' ' + mdns + ' ' + port
-              + ' typ host generation 0 network-cost 999';
-            const было = self.localDescription;
-            if (было && typeof было.sdp === 'string') {
-              const sdp = было.sdp.replace('a=ice-ufrag:', вSdp + '\r\na=ice-ufrag:');
-              const стало = { type: было.type, sdp, toJSON() { return { type: this.type, sdp: this.sdp }; } };
-              __pt_write(self, 'localDescription', стало);
-              __pt_write(self, 'currentLocalDescription', стало);
-            }
-          } catch (e) {}
-          self.__ptFire('icecandidate', {
-            candidate: {
-              candidate: line, sdpMid: (st_.mids[0] || '0'), sdpMLineIndex: 0,
-              foundation, component: 'rtp', protocol: 'udp', priority: prio,
-              address: mdns, port, type: 'host', usernameFragment: st_.ufrag,
-              relatedAddress: null, relatedPort: null, tcpType: null,
-              toJSON() { return { candidate: line, sdpMid: this.sdpMid, sdpMLineIndex: 0, usernameFragment: this.usernameFragment }; },
-            },
-          });
+      const n = st.kinds.length;
+      const servers = [];
+      try {
+        for (const s of (st.config.iceServers || [])) {
+          for (const u of [].concat(s && s.urls || s && s.url || [])) {
+            const m = /^stuns?:([^:?]+|\[[^\]]+\])(?::(\d+))?/.exec(String(u));
+            if (m) servers.push(m[1].replace(/^\[|\]$/g, '') + ':' + (m[2] || '3478'));
+          }
         }
-        setTimeout(() => {
-          if (st_.closed) return;
+      } catch (e) {}
+      let job = null;
+      try { if (typeof __pt_rtcStart === 'function') job = JSON.parse(__pt_rtcStart(n, JSON.stringify(servers))); } catch (e) {}
+      const rnd = () => 32768 + Math.floor(Math.random() * 28000);
+      const ports4 = (job && job.v4) || Array.from({ length: n }, rnd);
+      const ports6 = (job && job.v6) || [];
+      const self = this;
+      setTimeout(() => {
+        if (st.closed) return;
+        for (let i = 0; i < n; i++) {
+          if (ports4[i]) self.__ptAddCand(i, { fam: 4, type: 'host', foundation: st.fh4, priority: 2113937151, address: st.mdns4, port: ports4[i] });
+          if (ports6[i]) self.__ptAddCand(i, { fam: 6, type: 'host', foundation: st.fh6, priority: 2113939711, address: st.mdns6, port: ports6[i] });
+        }
+        const finish = () => setTimeout(() => {
+          if (st.closed) return;
           __pt_write(self, 'iceGatheringState', 'complete');
-          self.__ptFire('icecandidate', { candidate: null });
           self.__ptFire('icegatheringstatechange');
-        }, 30);
-      }, 20);
+          self.__ptFire('icecandidate', { candidate: null });
+        }, 60);
+        if (!job) { finish(); return; }
+        const poll = () => {
+          if (st.closed) return;
+          let r = { r: [], done: true };
+          try { r = JSON.parse(__pt_rtcPoll(job.id)); } catch (e) {}
+          for (const [fam, i, ip, port] of r.r) {
+            self.__ptAddCand(i, fam === 4
+              ? { fam: 4, type: 'srflx', foundation: st.fs4, priority: 1677729535, address: ip, port, raddr: '0.0.0.0' }
+              : { fam: 6, type: 'srflx', foundation: st.fs6, priority: 1677732095, address: ip, port, raddr: '::' });
+          }
+          if (r.done) finish(); else setTimeout(poll, 4);
+        };
+        setTimeout(poll, 4);
+      }, 2);
     }
     addIceCandidate() { return Promise.resolve(); }
     getStats() { return Promise.resolve(new Map()); }
-    getSenders() { return []; }
-    getReceivers() { return []; }
-    getTransceivers() { return []; }
+    getSenders() { return this.__pt.tx.map((t) => t.sender); }
+    getReceivers() { return this.__pt.tx.map((t) => t.receiver); }
+    getTransceivers() { return this.__pt.tx.slice(); }
     getConfiguration() { return this.__pt.config; }
     setConfiguration(c) { this.__pt.config = c || {}; }
     restartIce() {}
     close() {
-      this.__pt.closed = true;
+      const st = this.__pt;
+      if (st.closed) return;
+      st.closed = true;
       __pt_write(this, 'signalingState', 'closed');
       __pt_write(this, 'iceConnectionState', 'closed');
       __pt_write(this, 'connectionState', 'closed');
     }
   }, 'RTCPeerConnection');
+
+  // Кодеки и расширения заголовка — список Chrome 151 (getCapabilities).
+  // Интерфейсы RTCRtp* появляются позже этого слоя — ставит поздний проход
+  // (SHAPE_FIXES зовёт __pt_installRtcCaps).
+  Object.defineProperty(globalThis, '__pt_installRtcCaps', { configurable: true, value: () => {
+  for (const n of ['RTCRtpReceiver', 'RTCRtpSender']) {
+    const C = globalThis[n];
+    if (typeof C !== 'function') continue;
+    const f = ({ getCapabilities(kind) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'getCapabilities' on '" + n + "': 1 argument required, but only 0 present.");
+      const v = RTC_CHROME.caps[n + '.' + String(kind)];
+      return v ? JSON.parse(JSON.stringify(v)) : null;
+    } }).getCapabilities;
+    try { Object.defineProperty(C, 'getCapabilities', { value: mask(f, 'getCapabilities'), writable: true, enumerable: true, configurable: true }); } catch (e) {}
+  }
+  } });
 
   globalThis.webkitRTCPeerConnection = globalThis.RTCPeerConnection;
 

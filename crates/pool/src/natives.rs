@@ -62,6 +62,8 @@ pub fn install(scope: &mut v8::PinScope) {
     bind(scope, "__pt_heapStats", heap_stats);
     bind(scope, "__pt_setCodegen", set_codegen);
     bind(scope, "__pt_fnLocation", fn_location);
+    bind(scope, "__pt_rtcStart", rtc_start);
+    bind(scope, "__pt_rtcPoll", rtc_poll);
 
     // Optional real 2D rasterization (the `render` feature). Their presence is the
     // signal the JS canvas checks to use real pixels instead of synthesis.
@@ -2084,6 +2086,207 @@ fn heap_stats(
 /// из строк (`eval`, `Function`). С запретом V8 зовёт наш крючок подмены
 /// источника (см. `modify_codegen` в isolate.rs), и CSP без 'unsafe-eval'
 /// отвечает EvalError с текстом Chrome даже на прямой `eval`.
+// --- WebRTC: настоящие сокеты и STUN ---------------------------------------
+//
+// Chrome на каждый раздел предложения открывает по UDP-сокету на семейство
+// адресов (хост-кандидаты — их порты, под именами mDNS) и шлёт STUN Binding
+// на серверы из конфигурации; ответ (XOR-MAPPED-ADDRESS) — srflx-кандидат с
+// публичным адресом. Сервер stun.cloudflare.com принадлежит тому же, кто
+// проверяет отчёт, поэтому запрос должен быть настоящим.
+
+struct RtcJob {
+    results: Vec<(u8, usize, String, u16)>,
+    done: bool,
+}
+
+fn rtc_jobs() -> &'static std::sync::Mutex<std::collections::HashMap<u32, RtcJob>> {
+    static JOBS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, RtcJob>>> = std::sync::OnceLock::new();
+    JOBS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn stun_request(txid: &[u8; 12]) -> [u8; 20] {
+    let mut m = [0u8; 20];
+    m[0] = 0x00;
+    m[1] = 0x01; // Binding Request
+    m[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes());
+    m[8..20].copy_from_slice(txid);
+    m
+}
+
+fn stun_mapped(buf: &[u8], txid: &[u8; 12]) -> Option<(String, u16)> {
+    if buf.len() < 20 || buf[0] != 0x01 || buf[1] != 0x01 || &buf[8..20] != txid {
+        return None;
+    }
+    let len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    let mut i = 20;
+    let end = (20 + len).min(buf.len());
+    let cookie = 0x2112A442u32.to_be_bytes();
+    while i + 4 <= end {
+        let t = u16::from_be_bytes([buf[i], buf[i + 1]]);
+        let l = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) as usize;
+        let v = &buf[(i + 4).min(end)..(i + 4 + l).min(end)];
+        if (t == 0x0020 || t == 0x0001) && v.len() >= 8 {
+            let xor = t == 0x0020;
+            let port = u16::from_be_bytes([v[2], v[3]]) ^ if xor { 0x2112 } else { 0 };
+            if v[1] == 0x01 && v.len() >= 8 {
+                let mut a = [v[4], v[5], v[6], v[7]];
+                if xor {
+                    for k in 0..4 {
+                        a[k] ^= cookie[k];
+                    }
+                }
+                return Some((std::net::Ipv4Addr::from(a).to_string(), port));
+            }
+            if v[1] == 0x02 && v.len() >= 20 {
+                let mut a = [0u8; 16];
+                a.copy_from_slice(&v[4..20]);
+                if xor {
+                    let mut key = [0u8; 16];
+                    key[..4].copy_from_slice(&cookie);
+                    key[4..].copy_from_slice(txid);
+                    for k in 0..16 {
+                        a[k] ^= key[k];
+                    }
+                }
+                return Some((std::net::Ipv6Addr::from(a).to_string(), port));
+            }
+        }
+        i += 4 + ((l + 3) & !3);
+    }
+    None
+}
+
+/// `__pt_rtcStart(n, serversJson)` → `{"id","v4":[порты],"v6":[порты]}`:
+/// открыть по `n` сокетов на семейство и в фоне спросить STUN.
+fn rtc_start(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    use std::net::{ToSocketAddrs, UdpSocket};
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let n = args.get(0).int32_value(scope).unwrap_or(1).clamp(1, 8) as usize;
+    let servers: Vec<String> = serde_json::from_str(&arg_string(scope, args.get(1))).unwrap_or_default();
+    let mut v4: Vec<UdpSocket> = Vec::new();
+    let mut v6: Vec<UdpSocket> = Vec::new();
+    for _ in 0..n {
+        if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {
+            v4.push(s);
+        }
+    }
+    // IPv6 — только если есть маршрут наружу (как у Chrome: хост-кандидат по
+    // v6 есть лишь при глобальном адресе).
+    let has6 = UdpSocket::bind("[::]:0")
+        .and_then(|s| s.connect("[2606:4700:4700::1111]:53").map(|_| s))
+        .is_ok();
+    if has6 {
+        for _ in 0..n {
+            if let Ok(s) = UdpSocket::bind("[::]:0") {
+                v6.push(s);
+            }
+        }
+    }
+    let ports = |v: &Vec<UdpSocket>| v.iter().map(|s| s.local_addr().map(|a| a.port()).unwrap_or(0)).collect::<Vec<_>>();
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let out = serde_json::json!({ "id": id, "v4": ports(&v4), "v6": ports(&v6) }).to_string();
+    if let Ok(mut m) = rtc_jobs().lock() {
+        m.insert(id, RtcJob { results: Vec::new(), done: false });
+    }
+    let off = std::env::var_os("NOKK_NO_STUN").is_some() || servers.is_empty();
+    std::thread::spawn(move || {
+        if !off {
+            let mut socks: Vec<(u8, usize, UdpSocket)> = Vec::new();
+            for (i, s) in v4.into_iter().enumerate() {
+                socks.push((4, i, s));
+            }
+            for (i, s) in v6.into_iter().enumerate() {
+                socks.push((6, i, s));
+            }
+            // Адреса серверов по семействам.
+            let mut addrs4 = Vec::new();
+            let mut addrs6 = Vec::new();
+            for srv in &servers {
+                if let Ok(it) = srv.to_socket_addrs() {
+                    for a in it {
+                        if a.is_ipv4() { addrs4.push(a) } else { addrs6.push(a) }
+                    }
+                }
+            }
+            let mut pending: Vec<(u8, usize, UdpSocket, [u8; 12])> = Vec::new();
+            for (fam, i, s) in socks {
+                let mut tx = [0u8; 12];
+                for (k, b) in tx.iter_mut().enumerate() {
+                    *b = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0) >> (k % 4 * 8)) as u8 ^ (i as u8).wrapping_mul(31) ^ (k as u8).wrapping_mul(97) ^ fam;
+                }
+                let targets = if fam == 4 { &addrs4 } else { &addrs6 };
+                for t in targets.iter() {
+                    let _ = s.send_to(&stun_request(&tx), t);
+                }
+                let _ = s.set_nonblocking(true);
+                pending.push((fam, i, s, tx));
+            }
+            let start = std::time::Instant::now();
+            let mut buf = [0u8; 1500];
+            while !pending.is_empty() && start.elapsed() < std::time::Duration::from_millis(1500) {
+                let mut k = 0;
+                while k < pending.len() {
+                    let mut got = None;
+                    if let Ok((n, _)) = pending[k].2.recv_from(&mut buf) {
+                        got = stun_mapped(&buf[..n], &pending[k].3);
+                    }
+                    if let Some((ip, port)) = got {
+                        let (fam, i, _, _) = pending.remove(k);
+                        if let Ok(mut m) = rtc_jobs().lock() {
+                            if let Some(j) = m.get_mut(&id) {
+                                j.results.push((fam, i, ip, port));
+                            }
+                        }
+                    } else {
+                        k += 1;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        if let Ok(mut m) = rtc_jobs().lock() {
+            if let Some(j) = m.get_mut(&id) {
+                j.done = true;
+            }
+        }
+    });
+    if let Some(s) = v8::String::new(scope, &out) {
+        rv.set(s.into());
+    }
+}
+
+/// `__pt_rtcPoll(id)` → `{"r":[[семейство,номер,адрес,порт]…],"done"}` —
+/// пришедшие с прошлого опроса ответы STUN.
+fn rtc_poll(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let id = args.get(0).uint32_value(scope).unwrap_or(0);
+    let (r, done) = match rtc_jobs().lock() {
+        Ok(mut m) => match m.get_mut(&id) {
+            Some(j) => {
+                let r: Vec<_> = j.results.drain(..).collect();
+                let done = j.done;
+                if done {
+                    m.remove(&id);
+                }
+                (r, done)
+            }
+            None => (Vec::new(), true),
+        },
+        Err(_) => (Vec::new(), true),
+    };
+    let out = serde_json::json!({ "r": r, "done": done }).to_string();
+    if let Some(s) = v8::String::new(scope, &out) {
+        rv.set(s.into());
+    }
+}
+
 /// `__pt_fnLocation(fn)` → `[имя ресурса, строка, столбец]` (с нуля) или null:
 /// где в исходнике начинается функция — для записей long-animation-frame
 /// (sourceURL / sourceCharPosition у PerformanceScriptTiming).

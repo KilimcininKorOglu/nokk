@@ -29,6 +29,7 @@ webgl = ["dep:glow", "dep:khronos-egl", "dep:libloading"]
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
 
 # Real 2D rasterizer + glyph rasterizer for the optional `render` feature
 # (pure Rust, no GPU). A bundled Liberation Sans (fonts/) gives fillText real,
