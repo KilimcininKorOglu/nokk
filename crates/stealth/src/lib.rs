@@ -9833,9 +9833,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const w = (want && typeof want === 'object') ? want : {};
         const b = (k, d) => (k in w ? !!w[k] : d);
         const pp = String(w.powerPreference || 'default');
+        // В стороннем кадре Chrome отдаёт «default» как «low-power» (в воркере — нет).
+        const dflt = globalThis.__pt_crossSite && typeof document !== 'undefined' ? 'low-power' : 'default';
         return { alpha: b('alpha', true), antialias: b('antialias', true), depth: b('depth', true), desynchronized: b('desynchronized', false),
           failIfMajorPerformanceCaveat: b('failIfMajorPerformanceCaveat', false),
-          powerPreference: (pp === 'high-performance' || pp === 'low-power') ? pp : 'default',
+          powerPreference: (pp === 'high-performance' || pp === 'low-power') ? pp : dflt,
           premultipliedAlpha: b('premultipliedAlpha', true), preserveDrawingBuffer: b('preserveDrawingBuffer', false),
           stencil: b('stencil', false), xrCompatible: b('xrCompatible', false) };
       },
@@ -10066,7 +10068,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // runs `instanceof`) would otherwise see straight through the context.
     for (const [m, n] of [['createShader','WebGLShader'],['createProgram','WebGLProgram'],
       ['createBuffer','WebGLBuffer'],['createTexture','WebGLTexture'],['createFramebuffer','WebGLFramebuffer'],
-      ['createRenderbuffer','WebGLRenderbuffer'],['createVertexArray','WebGLVertexArrayObject']]) {
+      ['createRenderbuffer','WebGLRenderbuffer'],['createVertexArray','WebGLVertexArrayObject'],
+      ...(ver === 2 ? [['createQuery','WebGLQuery'],['createSampler','WebGLSampler'],['createTransformFeedback','WebGLTransformFeedback'],['fenceSync','WebGLSync']] : [])]) {
       if (!gl[m]) gl[m] = function () { return Object.create(iface(n)); };
     }
     // No-op the GL calls a fingerprinter drives before reading parameters.
@@ -10096,6 +10099,75 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // and stops a page (or tells a fingerprinter it is not talking to Chrome).
     if (!gl.getShaderParameter) gl.getShaderParameter = function (sh, pn) { return pn === 0x8B4F ? (sh && sh.__type) : true; };
     if (!gl.getProgramParameter) gl.getProgramParameter = function (p, pn) { return pn === C.LINK_STATUS ? true : 0; };
+    // Состояние, которое читается обратно, — как у Chrome 151 (сверено на
+    // scratchpad/gl_probe.js): текущее значение атрибута вершины (float32),
+    // параметры текстуры и сэмплера с умолчаниями GL (LOD — float32;
+    // неизвестное или не своё для WebGL1 — null), blendColor у WebGL1
+    // зажимается в [0, 1].
+    {
+      const after = (name, fn) => { const f = gl[name]; gl[name] = function () { const r = typeof f === 'function' ? f.apply(this, arguments) : undefined; try { fn.apply(this, arguments); } catch (e) {} return r; }; };
+      const VA = new Map();
+      const vaOf = (i) => { i = i >>> 0; let v = VA.get(i); if (!v) { v = new Float32Array([0, 0, 0, 1]); VA.set(i, v); } return v; };
+      for (let n = 1; n <= 4; n++) {
+        after('vertexAttrib' + n + 'f', function (i, ...xs) { const v = vaOf(i); v.set([0, 0, 0, 1]); for (let k = 0; k < n; k++) v[k] = +xs[k] || 0; });
+        after('vertexAttrib' + n + 'fv', function (i, arr) { const v = vaOf(i); v.set([0, 0, 0, 1]); for (let k = 0; k < n; k++) v[k] = +(arr && arr[k]) || 0; });
+      }
+      const ENABLED = new Set();
+      after('enableVertexAttribArray', (i) => ENABLED.add(i >>> 0));
+      after('disableVertexAttribArray', (i) => ENABLED.delete(i >>> 0));
+      gl.getVertexAttrib = function (i, pn) {
+        i = i >>> 0;
+        switch (pn >>> 0) {
+          case 0x8626: return new Float32Array(vaOf(i));
+          case 0x8622: return ENABLED.has(i);
+          case 0x8623: return 4;
+          case 0x8624: return 0;
+          case 0x8625: return 0x1406;
+          case 0x886A: return false;
+          case 0x889F: return null;
+          case 0x88FE: return ver === 2 ? 0 : null;
+          case 0x88FD: return ver === 2 ? false : null;
+        }
+        return null;
+      };
+      const TEX_INT = { 0x2800: 0x2601, 0x2801: 0x2702, 0x2802: 0x2901, 0x2803: 0x2901 };
+      const TEX2_INT = { 0x8072: 0x2901, 0x813C: 0, 0x813D: 1000, 0x884C: 0, 0x884D: 0x0203, 0x912F: false, 0x82DF: 0 };
+      const TEX2_F = { 0x813A: -1000, 0x813B: 1000 };
+      const BOUND = {}; const TP = new WeakMap();
+      after('bindTexture', (t, tex) => { BOUND[t >>> 0] = tex || null; });
+      const texStore = (t, pn, v, isF) => { const tex = BOUND[t >>> 0]; if (!tex || typeof tex !== 'object') return; let m = TP.get(tex); if (!m) TP.set(tex, (m = new Map())); m.set(pn >>> 0, isF ? Math.fround(+v || 0) : (v | 0)); };
+      after('texParameterf', (t, pn, v) => texStore(t, pn, v, true));
+      after('texParameteri', (t, pn, v) => texStore(t, pn, v, false));
+      const known = (pn) => pn in TEX_INT || (ver === 2 && (pn in TEX2_INT || pn in TEX2_F));
+      gl.getTexParameter = function (t, pn) {
+        pn = pn >>> 0;
+        const tex = BOUND[t >>> 0];
+        if (!tex || !known(pn)) return null;
+        const m = TP.get(tex);
+        if (m && m.has(pn)) { const v = m.get(pn); return pn in TEX2_F ? Math.fround(v) : v; }
+        if (pn in TEX_INT) return TEX_INT[pn];
+        if (pn in TEX2_INT) return TEX2_INT[pn];
+        return TEX2_F[pn];
+      };
+      if (ver === 2) {
+        const SP = new WeakMap();
+        const SMP_INT = { 0x2800: 0x2601, 0x2801: 0x2702, 0x2802: 0x2901, 0x2803: 0x2901, 0x8072: 0x2901, 0x884C: 0, 0x884D: 0x0203 };
+        const SMP_F = { 0x813A: -1000, 0x813B: 1000 };
+        const put = (smp, pn, v, isF) => { if (!smp || typeof smp !== 'object') return; let m = SP.get(smp); if (!m) SP.set(smp, (m = new Map())); m.set(pn >>> 0, isF ? Math.fround(+v || 0) : (v | 0)); };
+        after('samplerParameterf', (smp, pn, v) => put(smp, pn, v, true));
+        after('samplerParameteri', (smp, pn, v) => put(smp, pn, v, false));
+        gl.getSamplerParameter = function (smp, pn) {
+          pn = pn >>> 0;
+          if (!(pn in SMP_INT || pn in SMP_F)) return null;
+          const m = SP.get(smp);
+          if (m && m.has(pn)) return m.get(pn);
+          return pn in SMP_INT ? SMP_INT[pn] : SMP_F[pn];
+        };
+      }
+      if (ver !== 2) {
+        after('blendColor', function () { const v = gl.getParameter(0x8005); if (v && v.length === 4) { for (let k = 0; k < 4; k++) v[k] = Math.min(1, Math.max(0, v[k])); } });
+      }
+    }
     const impl = maskProto(gl);
     const Ctor = ver === 2 ? globalThis.WebGL2RenderingContext : globalThis.WebGLRenderingContext;
     return publishGL(impl, Ctor, ver === 2 ? GL2_CONSTS : GL1_CONSTS, ver === 2 ? GL2_METHODS : GL1_METHODS);
