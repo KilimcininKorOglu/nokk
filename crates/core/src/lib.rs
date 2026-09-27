@@ -788,6 +788,9 @@ fn req_method(req: &Request) -> String {
 }
 
 /// Что нужно, чтобы после ответа сети записать запрос и разрешить обещание.
+/// Номера контекстов для записей о запросах воркеров: вне диапазона кадров.
+const WORKER_RECORD_BASE: usize = 1 << 40;
+
 struct FetchInfo {
     context: usize,
     id: i64,
@@ -3647,7 +3650,12 @@ impl BrowserContext {
     fn start_fetch(&self, deliver: Deliver, context: usize, base: &str, r: &Value) -> Option<String> {
         match self.prepare_fetch(context, base, r) {
             Prepared::Settled(js) => Some(js),
-            Prepared::Send(req, info) => {
+            Prepared::Send(req, mut info) => {
+                // Запрос воркера — в ленте воркера, а не кадра-хозяина: у Chrome
+                // fetch из воркера в performance кадра не попадает.
+                if matches!(deliver, Deliver::Worker(..)) {
+                    info.context = WORKER_RECORD_BASE + context;
+                }
                 let client = self.client.clone();
                 let handle = tokio::spawn(async move { client.send(req).await });
                 if let Ok(mut v) = self.inflight.lock() {

@@ -2915,6 +2915,42 @@ const SHAPE_FIXES: &str = r#"(() => {
       }
     }
   } catch (e) {}
+  // Встроенный ИИ Chrome 151 (LanguageModel, Summarizer, Translator,
+  // LanguageDetector): availability() — обещание строки. В окне верхнего
+  // уровня модели «downloadable» (детектор языка — «available»), create()
+  // без жеста пользователя отказывает NotAllowedError; в стороннем кадре без
+  // разрешения политики — «unavailable» и отказ «Access denied…». Заглушки
+  // отдавали undefined, и секция CMJGg7 отчёта писала ошибку вместо
+  // «unavailable». Сверено на scratchpad/ai_probe2.js (страница и кадр).
+  try {
+    const nat = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
+    // Флаг стороннего кадра ставится после загрузчика — читаем при вызове.
+    const isCross = () => !!globalThis.__pt_crossSite;
+    const dom = (msg, name) => (typeof DOMException === 'function' ? new DOMException(msg, name) : new Error(msg));
+    const GESTURE = 'Requires a user gesture when availability is "downloading" or "downloadable".';
+    const POLICY = 'Access denied because the Permission Policy is not enabled.';
+    const spec = { LanguageModel: 'downloadable', Summarizer: 'downloadable', Translator: 'downloadable', LanguageDetector: 'available' };
+    for (const n of Object.keys(spec)) {
+      const C = globalThis[n]; if (typeof C !== 'function') continue;
+      const needsArg = n === 'Translator';
+      const stateNow = () => (isCross() ? 'unavailable' : spec[n]);
+      const few = (m) => new TypeError("Failed to execute '" + m + "' on '" + n + "': 1 argument required, but only 0 present.");
+      const lenA = typeof C.availability === 'function' ? C.availability.length : (needsArg ? 1 : 0);
+      const lenC = typeof C.create === 'function' ? C.create.length : (needsArg ? 1 : 0);
+      const av = ({ availability(o) { if (needsArg && arguments.length < 1) return Promise.reject(few('availability')); return Promise.resolve(stateNow()); } }).availability;
+      const cr = ({ create(o) {
+        if (needsArg && arguments.length < 1) return Promise.reject(few('create'));
+        if (isCross()) return Promise.reject(dom(POLICY, 'NotAllowedError'));
+        if (stateNow() === 'available') return Promise.resolve(Object.create(C.prototype));
+        return Promise.reject(dom(GESTURE, 'NotAllowedError'));
+      } }).create;
+      for (const [k, f, len] of [['availability', av, lenA], ['create', cr, lenC]]) {
+        try { Object.defineProperty(f, 'length', { value: len, configurable: true }); } catch (e) {}
+        const d = Object.getOwnPropertyDescriptor(C, k);
+        Object.defineProperty(C, k, { value: nat(f), writable: d ? d.writable : true, enumerable: d ? d.enumerable : true, configurable: true });
+      }
+    }
+  } catch (e) {}
   // Поздние методы без `.prototype`: postMessage, scheduler, navigation.
   try { const mz = globalThis.__pt_methodize; if (typeof mz === 'function') { for (const [o, keys] of [[globalThis, ['postMessage']], [globalThis.Scheduler && Scheduler.prototype, ['postTask', 'yield']], [globalThis.Navigation && Navigation.prototype, ['entries']]]) { if (!o) continue; for (const k of keys) mz(o, k); } } delete globalThis.__pt_methodize; } catch (e) {}
 })();"#;
