@@ -1498,7 +1498,37 @@ pub fn measure_text(
     let (mut ink_t, mut ink_b) = (f64::MAX, f64::MIN);
     let (glyphs, _old_width) = shape(&chain, text, size_px);
     // Ширина — по раскладке Blink (кегль до сотых, ширины Skia, кернинг HarfBuzz).
-    let width = shape_blink(&chain, text, crate::skia::text::effective_size(size_px)).1 as f64;
+    let eff = crate::skia::text::effective_size(size_px);
+    let (bglyphs, bwidth, bfonts) = shape_blink(&chain, text, eff);
+    let width = bwidth as f64;
+    // Границы чернил контурных знаков — как у Skia (generateMetrics): контур
+    // с хинтингом, его рамка roundOut, сдвинутая на место знака в строке.
+    // Так Chrome отдаёт 0 для спуска «Hello» (перелёт «o» хинтинг снимает) и
+    // 9 для подъёма 13.3px Arial. Ab_glyph без хинтинга давал 1 и 10.
+    {
+        use crate::skia::geometry::Matrix;
+        let refs: Vec<Option<skrifa::FontRef>> = bfonts.iter().map(|b| skrifa::FontRef::new(b).ok()).collect();
+        let scalers: Vec<Option<crate::skia::text::Scaler>> = bfonts
+            .iter()
+            .zip(refs.iter())
+            .map(|(b, f)| f.as_ref().and_then(|f| crate::skia::text::Scaler::new(b, f, eff, &Matrix::IDENTITY)))
+            .collect();
+        for g in &bglyphs {
+            let Some(Some(sc)) = scalers.get(g.font) else { continue };
+            let Some(path) = sc.path(g.gid) else { continue };
+            if path.pts.is_empty() {
+                continue;
+            }
+            let ir = path.bounds().round_out();
+            if ir.width() <= 0 || ir.height() <= 0 {
+                continue;
+            }
+            ink_l = ink_l.min(g.x as f64 + ir.left as f64);
+            ink_r = ink_r.max(g.x as f64 + ir.right as f64);
+            ink_t = ink_t.min(ir.top as f64);
+            ink_b = ink_b.max(ir.bottom as f64);
+        }
+    }
     for g in &glyphs {
         // Знак берётся из первого семейства цепочки, где он есть, — как в
         // браузере. Кегль при подмене считается по метрикам того шрифта.
@@ -1510,12 +1540,8 @@ pub fn measure_text(
         // дробное начало «V» после кернинга, а 7 — её собственная коробка.
         // Округляли бы после сдвига — обе вышли бы целыми.
         let glyph = g.id.with_scale_and_position(cscale, ab_glyph::point(0.0, 0.0));
-        if let Some(og) = cf.outline_glyph(glyph) {
-            let bb = og.px_bounds();
-            ink_l = ink_l.min(g.x + bb.min.x as f64);
-            ink_r = ink_r.max(g.x + bb.max.x as f64);
-            ink_t = ink_t.min(bb.min.y as f64);
-            ink_b = ink_b.max(bb.max.y as f64);
+        if cf.outline_glyph(glyph).is_some() {
+            // Контурный знак уже учтён выше, по Skia.
         } else if let Some(img) = shaper(cf)
             .and_then(|f| raster_image(f, ttf_parser::GlyphId(g.id.0), size_px))
         {

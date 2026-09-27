@@ -9595,7 +9595,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       actualBoundingBoxAscent: v.ascent || 0, actualBoundingBoxDescent: v.descent || 0,
       fontBoundingBoxAscent: v.fontAscent || 0, fontBoundingBoxDescent: v.fontDescent || 0,
       alphabeticBaseline: 0,
-      hangingBaseline: Math.round((v.fontAscent || 0) * 0.8 * 1e4) / 1e4,
+      // Chrome держит висячую базовую линию во float32 (10.399999618530273).
+      hangingBaseline: Math.fround((v.fontAscent || 0) * 0.8),
       ideographicBaseline: -(v.fontDescent || 0),
     });
     return m;

@@ -9820,7 +9820,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           if (!k) continue;
           const known = EXT_VALUES[k];
           if (typeof known === 'number') { try { Object.defineProperty(o, k, { value: known, enumerable: true }); } catch (e) {} }
-          else if (/^[a-z]/.test(k)) { const f = ({ [k](){ } })[k]; try { Object.defineProperty(o, k, { value: mask(f, k), enumerable: true, writable: true, configurable: true }); } catch (e) {} }
+          else if (/^[a-z]/.test(k)) {
+            // Ответы, которые читают: профили ASTC у Chrome — ['ldr'],
+            // isVertexArrayOES без довода — false.
+            const EXT_IMPL = { getSupportedProfiles() { return ['ldr']; }, isVertexArrayOES(v) { return !!(v && typeof v === 'object'); } };
+            const f = EXT_IMPL[k] ? ({ [k]: EXT_IMPL[k] })[k] : ({ [k](){ } })[k];
+            try { Object.defineProperty(o, k, { value: mask(f, k), enumerable: true, writable: true, configurable: true }); } catch (e) {}
+          }
           else { try { Object.defineProperty(o, k, { value: 0, enumerable: true }); } catch (e) {} }
         }
         return o;
