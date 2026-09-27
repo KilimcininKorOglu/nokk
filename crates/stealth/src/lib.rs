@@ -11493,12 +11493,33 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     return h(8) + '-' + h(4) + '-4' + h(3) + '-' + '89ab'[Math.floor(Math.random() * 4)] + h(3) + '-' + h(12);
   };
   const rtcFoundation = () => String(Math.floor(1e9 + Math.random() * 3.2e9));
+  // Поля событий, кандидатов и описаний — на прототипах, как у Chrome: свои
+  // свойства у объекта были видны getOwnPropertyNames.
+  const RTC_EV = new WeakMap();
+  const rtcProtoOnce = () => {
+    if (rtcProtoOnce.done) return; rtcProtoOnce.done = true;
+    const nat2 = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
+    try {
+      const EP = globalThis.RTCPeerConnectionIceEvent && RTCPeerConnectionIceEvent.prototype;
+      if (EP) for (const k of ['candidate', 'url']) {
+        const d = Object.getOwnPropertyDescriptor(EP, k);
+        Object.defineProperty(EP, k, { get: nat2(({ get [k]() { const v = RTC_EV.get(this); if (v && k in v) return v[k]; return d && d.get ? d.get.call(this) : null; } }).__lookupGetter__(k)), enumerable: true, configurable: true });
+      }
+      for (const [n, keys] of [['RTCSessionDescription', ['type', 'sdp']], ['RTCIceCandidate', ['candidate', 'sdpMid', 'sdpMLineIndex', 'usernameFragment']]]) {
+        const P = globalThis[n] && globalThis[n].prototype; if (!P) continue;
+        const f = ({ toJSON() { const o = {}; for (const k of keys) o[k] = this[k]; return o; } }).toJSON;
+        Object.defineProperty(P, 'toJSON', { value: nat2(f), writable: true, enumerable: true, configurable: true });
+      }
+    } catch (e) {}
+  };
   const rtcEvent = (type, extra) => {
+    rtcProtoOnce();
     let ev;
     try { ev = new Event(type); } catch (e) { ev = { type }; }
     const C = extra && 'candidate' in extra ? globalThis.RTCPeerConnectionIceEvent : null;
     try { if (C && C.prototype) Object.setPrototypeOf(ev, C.prototype); } catch (e) {}
-    for (const k of Object.keys(extra || {})) { try { Object.defineProperty(ev, k, { value: extra[k], enumerable: false, configurable: true }); } catch (e) {} }
+    if (C) RTC_EV.set(ev, Object.assign({ url: null }, extra));
+    else for (const k of Object.keys(extra || {})) { try { Object.defineProperty(ev, k, { value: extra[k], enumerable: false, configurable: true }); } catch (e) {} }
     try { if (typeof globalThis.__ptTrust === 'function') globalThis.__ptTrust(ev); } catch (e) {}
     return ev;
   };
@@ -11511,14 +11532,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       address: br(f.address), protocol: 'udp', port: f.port, type: f.type, tcpType: null, relatedAddress: f.raddr === undefined ? null : br(f.raddr),
       relatedPort: f.rport === undefined ? null : f.rport, usernameFragment: ufrag };
     for (const k of Object.keys(bag)) __pt_write(o, k, bag[k]);
-    try { Object.defineProperty(o, 'toJSON', { value: ({ toJSON() { return { candidate: this.candidate, sdpMid: this.sdpMid, sdpMLineIndex: this.sdpMLineIndex, usernameFragment: this.usernameFragment }; } }).toJSON, enumerable: false, configurable: true }); } catch (e) {}
+    rtcProtoOnce();
     return o;
   };
   const rtcDesc = (type, sdp) => {
     const C = globalThis.RTCSessionDescription;
     const o = Object.create(C && C.prototype ? C.prototype : Object.prototype);
     __pt_write(o, 'type', type); __pt_write(o, 'sdp', sdp);
-    try { Object.defineProperty(o, 'toJSON', { value: ({ toJSON() { return { type: this.type, sdp: this.sdp }; } }).toJSON, enumerable: false, configurable: true }); } catch (e) {}
+    rtcProtoOnce();
     return o;
   };
   const rtcTransceiver = (kind) => {
@@ -11629,12 +11650,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // RTCSessionDescriptionInit, а не RTCSessionDescription.
       const sdp = this.__ptSdp(false);
       await new Promise((r) => setTimeout(r, 20 + Math.random() * 8));
-      return { type: 'offer', sdp };
+      return { sdp, type: 'offer' };
     }
     async createAnswer() {
       const sdp = this.__ptSdp(false).replace(/a=setup:actpass/g, 'a=setup:active');
       await new Promise((r) => setTimeout(r, 5));
-      return { type: 'answer', sdp };
+      return { sdp, type: 'answer' };
     }
     async setLocalDescription(desc) {
       const st = this.__pt;
