@@ -2078,8 +2078,20 @@ impl BrowserContext {
         if let Ok(mut c) = self.timings_sent.lock() {
             c.insert(index, records.len());
         }
+        // Времена записей — по часам страницы; у кадра свои часы (его
+        // timeOrigin позже), поэтому кадру передаём начало часов страницы в
+        // миллисекундах эпохи, и запись переводится на его время.
+        let page_epoch = if index != self.index {
+            let since = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            since - self.started.elapsed().as_secs_f64() * 1000.0
+        } else {
+            0.0
+        };
         let js = format!(
-            "globalThis.__pt_noteResources && __pt_noteResources({})",
+            "globalThis.__pt_noteResources && __pt_noteResources({}, {page_epoch})",
             js_str(&Value::Array(fresh).to_string())
         );
         let _ = self.eval_in(index, &js).await;
@@ -3677,6 +3689,9 @@ impl BrowserContext {
             let settle = self.settle_fetch(&f.info, res);
             match f.deliver {
                 Deliver::Frame(index) => {
+                    // Запись о ресурсе у браузера появляется раньше, чем
+                    // страница узнаёт об ответе (load/then), — ставим её до.
+                    self.flush_resource_timings(index).await;
                     let _ = self.eval_in(index, &settle).await;
                 }
                 Deliver::Worker(place, child) => {

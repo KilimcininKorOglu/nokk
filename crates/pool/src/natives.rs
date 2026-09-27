@@ -61,6 +61,7 @@ pub fn install(scope: &mut v8::PinScope) {
     bind(scope, "__pt_atob", atob_native);
     bind(scope, "__pt_heapStats", heap_stats);
     bind(scope, "__pt_setCodegen", set_codegen);
+    bind(scope, "__pt_fnLocation", fn_location);
 
     // Optional real 2D rasterization (the `render` feature). Their presence is the
     // signal the JS canvas checks to use real pixels instead of synthesis.
@@ -2083,6 +2084,35 @@ fn heap_stats(
 /// из строк (`eval`, `Function`). С запретом V8 зовёт наш крючок подмены
 /// источника (см. `modify_codegen` в isolate.rs), и CSP без 'unsafe-eval'
 /// отвечает EvalError с текстом Chrome даже на прямой `eval`.
+/// `__pt_fnLocation(fn)` → `[имя ресурса, строка, столбец]` (с нуля) или null:
+/// где в исходнике начинается функция — для записей long-animation-frame
+/// (sourceURL / sourceCharPosition у PerformanceScriptTiming).
+fn fn_location(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let Ok(f) = v8::Local::<v8::Function>::try_from(args.get(0)) else {
+        rv.set_null();
+        return;
+    };
+    let line = f.get_script_line_number();
+    let col = f.get_script_column_number();
+    let origin = f.get_script_origin(scope);
+    let name = origin.resource_name();
+    let arr = v8::Array::new(scope, 3);
+    let n: v8::Local<v8::Value> = match name {
+        Some(v) if v.is_string() => v,
+        _ => v8::String::empty(scope).into(),
+    };
+    arr.set_index(scope, 0, n);
+    let l = v8::Integer::new(scope, line.map(|x| x as i32).unwrap_or(-1));
+    arr.set_index(scope, 1, l.into());
+    let c = v8::Integer::new(scope, col.map(|x| x as i32).unwrap_or(-1));
+    arr.set_index(scope, 2, c.into());
+    rv.set(arr.into());
+}
+
 fn set_codegen(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,

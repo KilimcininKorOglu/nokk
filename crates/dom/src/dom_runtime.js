@@ -2193,10 +2193,18 @@
     try { __ptEvSet(ev, 'target', W.worker); __ptEvSet(ev, 'currentTarget', W.worker); } catch (e) {}
     // Внутри обработчика `window.event` — это событие, снаружи ничего.
     const снимок = __ptTakeEvent(ev);
+    let t0 = 0; try { t0 = performance.now(); } catch (e) {}
     try {
       try { if (typeof W.onmessage === 'function') W.onmessage.call(W.worker, ev); } catch (e) {}
       for (const h of (W.listeners.message || [])) { try { h.call(W.worker, ev); } catch (e) {} }
     } finally {
+      try {
+        const dt = performance.now() - t0;
+        if (dt > 50 && typeof globalThis.__pt_noteLoaf === 'function') {
+          const h = typeof W.onmessage === 'function' ? W.onmessage : (W.listeners.message || [])[0];
+          __pt_noteLoaf(t0, dt, typeof W.onmessage === 'function' ? 'Worker.onmessage' : 'Worker.addEventListener:message', 'event-listener', h);
+        }
+      } catch (e) {}
       __ptDropEvent(снимок);
     }
   };
@@ -6070,7 +6078,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // The loader brackets each page script with these so `document.currentScript`
   // (and therefore document.write's insertion point) is correct while it runs.
   // The index matches the loader's document-order script list.
-  globalThis.__pt_beginScript = (i) => { document.__ptCurScript = scriptNodes[i] || null; };
+  // Скрипт документа — задача; дольше 50 мс — запись long-animation-frame.
+  let __ptScriptT0 = 0;
+  globalThis.__pt_beginScript = (i) => { document.__ptCurScript = scriptNodes[i] || null; try { __ptScriptT0 = performance.now(); } catch (e) {} };
   // Скрипт документа под CSP: заблокирован ли (инлайн без nonce, чужой адрес).
   globalThis.__pt_cspScriptBlocked = (i) => {
     try {
@@ -6081,7 +6091,19 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       return __pt_cspBlocksInline(el);
     } catch (e) { return false; }
   };
-  globalThis.__pt_endScript = () => { document.__ptCurScript = null; };
+  globalThis.__pt_endScript = () => {
+    const el = document.__ptCurScript;
+    document.__ptCurScript = null;
+    try {
+      const dt = performance.now() - __ptScriptT0;
+      if (dt > 50 && typeof globalThis.__pt_noteLoaf === 'function') {
+        let src = el ? __ptGetA(el, 'src') : null;
+        try { if (src) src = new URL(src, location.href).href; } catch (e) {}
+        const url = src || String(location.href || '');
+        __pt_noteLoaf(__ptScriptT0, dt, url, 'classic-script', null, url);
+      }
+    } catch (e) {}
+  };
 
   // Called after all page scripts have run: fire DOMContentLoaded then load.
   // Разбор кончился: дальше идут отложенные скрипты, и видят они уже

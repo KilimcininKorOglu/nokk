@@ -1226,7 +1226,7 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
     if (!(d > 0)) d = 0; // negative, NaN and undefined all mean "as soon as possible"
     if (depth > 5 && d < 4) d = 4;
     const id = seq++;
-    q.set(id, { fn: () => fn.apply(globalThis, args), delay: d, interval,
+    q.set(id, { fn: () => fn.apply(globalThis, args), orig: fn, delay: d, interval,
                 due: clock() + d, cancelled: false, id, depth: depth + 1 });
     return id;
   };
@@ -1269,7 +1269,7 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
     if (!frameSlot || frameSlot.at !== at) {
       const slot = { at, list: [] };
       frameSlot = slot;
-      add(() => {
+      const tid = add(() => {
         if (frameSlot === slot) frameSlot = null;
         // Отметка времени у всех обработчиков одного кадра одна и та же —
         // время самого кадра, а не момент вызова.
@@ -1284,6 +1284,8 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
           }
         }
       }, Math.max(0, at - now), false, []);
+      // Длинный кадр анимации записывается как FrameRequestCallback.
+      try { const t = q.get(tid); if (t) { t.invoker = 'FrameRequestCallback'; t.orig = fn; } } catch (e) {}
     }
     frameSlot.list.push([rid, fn]);
     rafIds.set(rid, frameSlot);
@@ -1363,11 +1365,18 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
     else q.delete(best.id);
     const outer = depth;
     depth = best.depth;
+    const t0 = hi();
     try { best.fn(); } catch (e) {
       // То же, что и у обработчика события: браузер про это сообщает.
       if (typeof globalThis.__pt_reportError === 'function') __pt_reportError(e, 'timer');
     }
-    finally { depth = outer; }
+    finally {
+      depth = outer;
+      const dt = hi() - t0;
+      if (dt > 50 && typeof globalThis.__pt_noteLoaf === 'function') {
+        try { __pt_noteLoaf(t0, dt, best.invoker || (best.interval ? 'TimerHandler:setInterval' : 'TimerHandler:setTimeout'), best.invokerType || 'user-callback', best.orig); } catch (e) {}
+      }
+    }
     return 1;
   };
 
@@ -6383,6 +6392,24 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   // Порядок полей в `toJSON` — тот, в каком запись собрана (он сверен с
   // Chrome), а не порядок аксессоров на прототипе: у браузера они разные.
   const ENTRY_ORDER = new WeakMap();
+  // Записи, у которых toJSON — ровно поля из ENTRY_ORDER (long-animation-frame
+  // и её script: у Chrome paintTime/presentationTime/window туда не входят).
+  const ENTRY_STRICT = new WeakSet();
+  // navigation.confidence — PerformanceTimingConfidence, как у Chrome 151.
+  const __ptConfidence = () => {
+    const C = globalThis.PerformanceTimingConfidence;
+    const o = Object.create(C && C.prototype ? C.prototype : Object.prototype);
+    __pt_write(o, 'randomizedTriggerRate', 0.4994798);
+    __pt_write(o, 'value', 'low');
+    try {
+      if (C && C.prototype && !C.prototype.__ptJson) {
+        Object.defineProperty(C.prototype, '__ptJson', { value: true });
+        const f = ({ toJSON() { return { randomizedTriggerRate: this.randomizedTriggerRate, value: this.value }; } }).toJSON;
+        Object.defineProperty(C.prototype, 'toJSON', { value: globalThis.__pt_native ? __pt_native(f) : f, writable: true, enumerable: true, configurable: true });
+      }
+    } catch (e) {}
+    return o;
+  };
   const putEntry = (o, bag) => { for (const k of Object.keys(bag)) __pt_write(o, k, bag[k]); };
   class PerformanceEntry {
     // Поля — аксессоры на прототипах, а не собственные свойства записи;
@@ -6394,15 +6421,20 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
       const o = {};
       const first = ENTRY_ORDER.get(this);
       if (first) for (const k of first) { try { o[k] = this[k]; } catch (e) {} }
+      if (ENTRY_STRICT.has(this)) {
+        if (Array.isArray(o.scripts)) o.scripts = o.scripts.map((x) => (x && typeof x.toJSON === 'function' ? x.toJSON() : x));
+        return o;
+      }
       for (const p of chain) {
         for (const k of Object.getOwnPropertyNames(p)) {
-          if (k === 'constructor' || k === 'toJSON' || k.slice(0, 4) === '__pt') continue;
+          // `detail` у метки и замера в JSON у Chrome не входит.
+          if (k === 'constructor' || k === 'toJSON' || k === 'detail' || k.slice(0, 4) === '__pt') continue;
           const d = Object.getOwnPropertyDescriptor(p, k);
           if (!d || !d.get || k in o) continue;
           try { o[k] = this[k]; } catch (e) {}
         }
       }
-      for (const k of Object.keys(this)) if (!(k in o)) o[k] = this[k];
+      for (const k of Object.keys(this)) if (!(k in o) && k !== 'detail') o[k] = this[k];
       return o;
     }
   }
@@ -6461,14 +6493,16 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
     },
     enumerable: false, configurable: true,
   });
-  globalThis.__pt_noteResources = (json) => {
+  globalThis.__pt_noteResources = (json, pageEpoch) => {
     let list;
     const fresh = [];
     try { list = __ptJSON.parse(json); } catch (e) { return 0; }
+    // Сдвиг с часов страницы на часы этого окна (у кадра timeOrigin позже).
+    const shift = pageEpoch ? pageEpoch - ORIGIN : 0;
     for (const r of list) {
       const Ctor = r.entryType === 'navigation' ? PerformanceNavigationTiming : PerformanceResourceTiming;
       const e = new Ctor();
-      const start = Number(r.start) || 0;
+      const start = r.entryType === 'navigation' ? (Number(r.start) || 0) : Math.max(0, (Number(r.start) || 0) + shift);
       const end = start + (Number(r.duration) || 0);
       // Поля — в том порядке, в каком их отдаёт браузер (`toJSON` идёт по
       // собственным именам): его запись api.js Turnstile пересылает виджету
@@ -6522,7 +6556,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
           domContentLoadedEventStart: m.dclStart || 0, domContentLoadedEventEnd: m.dclEnd || 0,
           domComplete: m.complete || 0, loadEventStart: m.loadStart || 0, loadEventEnd: m.loadEnd || 0,
           type: 'navigate', redirectCount: 0, activationStart: 0, criticalCHRestart: 0,
-          notRestoredReasons: null,
+          notRestoredReasons: null, confidence: __ptConfidence(),
         });
       }
       if (r.entryType === 'navigation') {
@@ -6546,7 +6580,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
         try {
           Object.defineProperty(globalThis, '__ptVisEntry', { value: true, configurable: true });
           const v = Object.create((globalThis.VisibilityStateEntry || PerformanceEntry).prototype);
-          put(v, { name: 'visible', entryType: 'visibility-state', startTime: 0, duration: 0 });
+          put(v, { name: 'visible', entryType: 'visibility-state', startTime: 0, duration: 0, navigationId: NAV_ID });
           entries.push(v);
           fresh.push(v);
         } catch (e2) {}
@@ -6561,7 +6595,10 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
         const at = Math.round((start + (Number(r.duration) || 0) * 0.92) * 10) / 10;
         for (const name of ['first-paint', 'first-contentful-paint']) {
           const p = new PerformancePaintTiming();
-          put(p, { name, entryType: 'paint', startTime: at, duration: 0 });
+          // Chrome: startTime = presentationTime (показ кадра), paintTime —
+          // раньше, когда кадр отрисован.
+          const painted_at = Math.round(at * 0.3 * 10) / 10;
+          put(p, { name, entryType: 'paint', startTime: at, duration: 0, navigationId: NAV_ID, paintTime: painted_at, presentationTime: at });
           entries.push(p);
           fresh.push(p);
         }
@@ -6631,33 +6668,96 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
       if (mine.length) { obs.__ptQueue.push(...mine); __ptFlush(obs); }
     }
   };
+  // long-animation-frame: у Chrome 151 такие записи лежат в общей ленте
+  // (getEntries) — кадр, чья работа длилась больше 50 мс. Без отрисовки
+  // (renderStart 0) это одна длинная задача: таймер, кадр анимации, скрипт
+  // документа, обработчик сообщения. В записи — скрипт-виновник со ссылкой
+  // на место функции в исходнике. Отчёт Turnstile перечисляет ленту целиком.
+  let loafCount = 0;
+  Object.defineProperty(globalThis, '__pt_noteLoaf', { value: (start, dur, invoker, invokerType, fn, url) => {
+    try {
+      if (!(dur > 50) || loafCount >= 200) return;
+      loafCount++;
+      const L = globalThis.PerformanceLongAnimationFrameTiming, ST = globalThis.PerformanceScriptTiming;
+      const e = Object.create(L && L.prototype ? L.prototype : PerformanceEntry.prototype);
+      const s = Object.create(ST && ST.prototype ? ST.prototype : PerformanceEntry.prototype);
+      let src = String(url || ''), fname = '', pos = -1;
+      if (typeof fn === 'function') {
+        try {
+          const loc = typeof __pt_fnLocation === 'function' ? __pt_fnLocation(fn) : null;
+          if (loc) {
+            if (!src) src = String(loc[0] || '');
+            pos = loc[2];
+            // Вписанный скрипт: у Chrome позиция — от начала текста этого
+            // <script>; строки у нас считаются от начала разметки документа.
+            const m = globalThis.document && document.__ptMarkup;
+            if (typeof m === 'string' && String(loc[0]) === String(document.URL)) {
+              const lineOf = (idx) => { let n = 0; for (let k = m.indexOf('\n'); k >= 0 && k < idx; k = m.indexOf('\n', k + 1)) n++; return n; };
+              let best = null;
+              for (const el of Array.from(document.scripts || [])) {
+                const t = el.textContent; if (!t || el.getAttribute('src')) continue;
+                const idx = m.indexOf(t); if (idx < 0) continue;
+                const ln = lineOf(idx);
+                if (ln <= loc[1] && (!best || ln >= best.ln)) best = { idx, ln };
+              }
+              if (best) {
+                let abs;
+                if (loc[1] === best.ln) abs = best.idx + loc[2];
+                else { let off = 0, line = 0; while (line < loc[1]) { const nl = m.indexOf('\n', off); if (nl < 0) break; off = nl + 1; line++; } abs = off + loc[2]; }
+                pos = abs - best.idx;
+              }
+            }
+          }
+        } catch (x) {}
+        try { const n = fn.name; fname = typeof n === 'string' && !/^bound /.test(n) ? n : ''; } catch (x) {}
+      }
+      const d3 = Math.round(dur * 1000) / 1000;
+      const sStart = Math.round((start + 0.1) * 10) / 10;
+      ENTRY_ORDER.set(s, ['name', 'entryType', 'startTime', 'duration', 'navigationId', 'invoker', 'invokerType', 'windowAttribution', 'executionStart', 'forcedStyleAndLayoutDuration', 'pauseDuration', 'sourceURL', 'sourceFunctionName', 'sourceCharPosition']);
+      ENTRY_STRICT.add(s);
+      putEntry(s, { name: 'script', entryType: 'script', startTime: sStart, duration: Math.max(0, Math.round((dur - 0.1) * 10) / 10),
+        navigationId: NAV_ID, invoker: String(invoker || ''), invokerType: String(invokerType || 'user-callback'), windowAttribution: 'self',
+        executionStart: sStart, forcedStyleAndLayoutDuration: 0, pauseDuration: 0, sourceURL: src, sourceFunctionName: fname,
+        sourceCharPosition: pos, window: globalThis });
+      ENTRY_ORDER.set(e, ['name', 'entryType', 'startTime', 'duration', 'navigationId', 'renderStart', 'styleAndLayoutStart', 'firstUIEventTimestamp', 'blockingDuration', 'scripts']);
+      ENTRY_STRICT.add(e);
+      putEntry(e, { name: 'long-animation-frame', entryType: 'long-animation-frame', startTime: Math.round(start * 10) / 10, duration: d3,
+        navigationId: NAV_ID, renderStart: 0, styleAndLayoutStart: 0, firstUIEventTimestamp: 0,
+        blockingDuration: Math.round((dur - 50) * 10) / 10, scripts: Object.freeze([s]), paintTime: 0, presentationTime: 0 });
+      entries.push(e);
+      __ptNotify([e]);
+    } catch (x) {}
+  }, configurable: true, enumerable: false });
 
+  const __ptByStart = (list) => list.map((e, i) => [e, i]).sort((a, b) => ((Number(a[0].startTime) || 0) - (Number(b[0].startTime) || 0)) || (a[1] - b[1])).map((x) => x[0]);
   class Performance {
     now() { return nowMs(); }
-    getEntries() { return entries.slice(); }
-    getEntriesByType(type) { return entries.filter((e) => e.entryType === String(type)); }
+    // По времени начала, как у Chrome (записи о ресурсах приходят позже,
+    // чем начались; сортировка устойчивая).
+    getEntries() { return __ptByStart(entries.slice()); }
+    getEntriesByType(type) { return __ptByStart(entries.filter((e) => e.entryType === String(type))); }
     getEntriesByName(name, type) {
-      return entries.filter((e) => e.name === String(name) && (!type || e.entryType === String(type)));
+      return __ptByStart(entries.filter((e) => e.name === String(name) && (!type || e.entryType === String(type))));
     }
     mark(name, opts) {
-      const e = new PerformanceEntry();
-      ENTRY_ORDER.set(e, ['name', 'entryType', 'startTime', 'duration', 'detail']);
+      const e = Object.create((globalThis.PerformanceMark || PerformanceEntry).prototype);
+      ENTRY_ORDER.set(e, ['name', 'entryType', 'startTime', 'duration', 'navigationId']);
       putEntry(e, { name: String(name), entryType: 'mark',
         startTime: (opts && typeof opts.startTime === 'number') ? opts.startTime : nowMs(),
-        duration: 0, detail: (opts && opts.detail) !== undefined ? opts.detail : null });
+        duration: 0, navigationId: NAV_ID, detail: (opts && opts.detail) !== undefined ? opts.detail : null });
       entries.push(e); __ptNotify([e]); return e;
     }
     measure(name, startOrOpts, end) {
-      const e = new PerformanceEntry();
+      const e = Object.create((globalThis.PerformanceMeasure || PerformanceEntry).prototype);
       const from = typeof startOrOpts === 'string'
         ? (entries.filter((x) => x.name === startOrOpts).pop() || { startTime: 0 }).startTime
         : (startOrOpts && typeof startOrOpts.start === 'number') ? startOrOpts.start : 0;
       const to = typeof end === 'string'
         ? (entries.filter((x) => x.name === end).pop() || { startTime: nowMs() }).startTime
         : nowMs();
-      ENTRY_ORDER.set(e, ['name', 'entryType', 'startTime', 'duration', 'detail']);
+      ENTRY_ORDER.set(e, ['name', 'entryType', 'startTime', 'duration', 'navigationId']);
       putEntry(e, { name: String(name), entryType: 'measure', startTime: from,
-                         duration: Math.max(0, to - from), detail: null });
+                         duration: Math.max(0, to - from), navigationId: NAV_ID, detail: null });
       entries.push(e); __ptNotify([e]); return e;
     }
     clearMarks() {}
