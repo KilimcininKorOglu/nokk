@@ -77,6 +77,147 @@ static V8_INIT: Once = Once::new();
 /// startup-only cost per worker, so a global lock here is free in practice.
 static CREATE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Снимок V8 с уже исполненным загрузчиком: контекст из него восстанавливается
+/// за миллисекунды вместо ~300 мс загрузчика. Один на процесс — для загрузчика
+/// по умолчанию; остальные (повёрнутые профили, геолокация) идут прежним путём.
+pub struct Snapshot {
+    bootstrap: String,
+    data: &'static [u8],
+}
+static SNAPSHOT: std::sync::OnceLock<Snapshot> = std::sync::OnceLock::new();
+
+pub(crate) fn snapshot_matches(bootstrap: &str) -> bool {
+    snapshot_for(bootstrap)
+}
+
+fn snapshot_for(bootstrap: &str) -> bool {
+    if std::env::var_os("NOKK_SNAP_CUT").is_some() {
+        return SNAPSHOT.get().is_some();
+    }
+    SNAPSHOT.get().is_some_and(|s| s.bootstrap.len() == bootstrap.len() && s.bootstrap == bootstrap)
+}
+
+const NORMALIZE_FOR_SNAPSHOT: &str = r#"(() => {
+  const N = globalThis.__pt_rawGOPN || Object.getOwnPropertyNames;
+  const seen = new Set();
+  const norm = (o) => {
+    if (!o || (typeof o !== 'object' && typeof o !== 'function') || seen.has(o)) return;
+    seen.add(o);
+    try {
+      if (!Object.isExtensible(o)) return;
+      const a = Symbol('a'), b = Symbol('b');
+      Object.defineProperty(o, a, { value: 1, configurable: true, writable: true });
+      Object.defineProperty(o, b, { value: 1, configurable: true, writable: true });
+      delete o[a]; delete o[b];
+    } catch (e) {}
+  };
+  for (const k of N(globalThis)) {
+    let v; try { const d = Object.getOwnPropertyDescriptor(globalThis, k); v = d && d.value; } catch (e) { continue; }
+    if (typeof v === 'function') { norm(v); for (let p = v.prototype, i = 0; p && i < 16; p = Object.getPrototypeOf(p), i++) norm(p); }
+    else if (v && typeof v === 'object') { norm(v); for (let p = Object.getPrototypeOf(v), i = 0; p && i < 16; p = Object.getPrototypeOf(p), i++) norm(p); }
+  }
+})();"#;
+
+/// После восстановления из снимка: часы — с этого мига, а не с постройки.
+/// И то, что V8 доставил при восстановлении, — в тот вид, какой придал бы
+/// загрузчик (`__pt_afterRestore`, заводится только при сборке снимка).
+pub(crate) const AFTER_SNAPSHOT: &str = "globalThis.__pt_resetClock && __pt_resetClock();\n\
+    if (globalThis.__pt_afterRestore) { try { __pt_afterRestore(); } catch (e) {} delete globalThis.__pt_afterRestore; delete globalThis.__pt_wasmStreaming; delete globalThis.__pt_lateShape; }";
+
+/// Собрать снимок для `bootstrap`. Вызывать до создания пула (изоляты
+/// получают снимок при рождении). `NOKK_NO_SNAPSHOT=1` — не собирать.
+pub fn build_snapshot(bootstrap: &str) -> Result<usize, String> {
+    if std::env::var_os("NOKK_NO_SNAPSHOT").is_some() {
+        return Err("disabled".into());
+    }
+    if SNAPSHOT.get().is_some() {
+        return Ok(0);
+    }
+    init_platform();
+    let t0 = std::time::Instant::now();
+    // Сначала полная установка нативов в пустом изоляте — чтобы список внешних
+    // ссылок был полон до создания снимка. Заодно — имена глобалей обычного
+    // контекста: часть их V8 при сборке снимка не заводит (экспериментальное
+    // по флагам, WebAssembly, SharedArrayBuffer) и доставляет при
+    // восстановлении — поверх того, что успел сделать загрузчик.
+    const GLOBAL_NAMES: &str = "JSON.stringify(Object.getOwnPropertyNames(globalThis))";
+    let plain_names: Vec<String> = {
+        let _guard = CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut iso = v8::Isolate::new(v8::CreateParams::default());
+        let names = {
+            v8::scope!(scope, &mut iso);
+            let context = v8::Context::new(scope, v8::ContextOptions::default());
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let names = run_script(scope, GLOBAL_NAMES).unwrap_or_default();
+            crate::natives::install(scope);
+            names
+        };
+        drop(iso);
+        serde_json::from_str(&names).unwrap_or_default()
+    };
+    let refs = crate::natives::external_refs();
+    // Отладка: NOKK_SNAP_CUT=<слой> — снимок загрузчика до конца слоя (нужен
+    // NOKK_TRACE_BOOT, чтобы в тексте были метки слоёв).
+    let cut: String;
+    let bootstrap = match std::env::var("NOKK_SNAP_CUT") {
+        Ok(layer) => {
+            let key = format!("push(['{layer}'");
+            match bootstrap.find(&key) {
+                Some(i) => {
+                    let end = bootstrap[i..].find('\n').map(|j| i + j).unwrap_or(bootstrap.len());
+                    cut = bootstrap[..end].to_string();
+                    &cut
+                }
+                None => bootstrap,
+            }
+        }
+        Err(_) => bootstrap,
+    };
+    let blob = {
+        let _guard = CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut iso = v8::Isolate::snapshot_creator(Some(refs), None);
+        {
+            v8::scope!(scope, &mut iso);
+            let default = v8::Context::new(scope, v8::ContextOptions::default());
+            scope.set_default_context(default);
+            let context = v8::Context::new(scope, v8::ContextOptions::default());
+            {
+                let cs = &mut v8::ContextScope::new(scope, context);
+                let here: Vec<String> = serde_json::from_str(&run_script(cs, GLOBAL_NAMES)?).unwrap_or_default();
+                let late: Vec<&String> = plain_names.iter().filter(|n| !here.contains(n)).collect();
+                tracing::debug!(?late, "names V8 adds after restore");
+                let late = serde_json::to_string(&late).unwrap_or_else(|_| "[]".into());
+                run_script(cs, &format!("Object.defineProperty(globalThis, '__pt_lateNames', {{ value: new Set({late}), configurable: true }});"))?;
+                crate::natives::install(cs);
+                run_script(cs, bootstrap)?;
+                cs.perform_microtask_checkpoint();
+                run_script(cs, "delete globalThis.__pt_lateNames;")?;
+                // Перед снимком — объекты интерфейсов в словарный режим:
+                // десериализатор V8 спотыкался о разделяемые массивы описаний
+                // («Check failed: LinearSearch…») после наших перестановок
+                // членов. Добавить два свойства и удалить первое — перевод в
+                // словарь без следа.
+                let _ = run_script(cs, NORMALIZE_FOR_SNAPSHOT);
+            }
+            scope.add_context(context);
+        }
+        iso.create_blob(v8::FunctionCodeHandling::Clear).ok_or_else(|| "snapshot blob failed".to_string())?
+    };
+    let data: &'static [u8] = Box::leak(blob.to_vec().into_boxed_slice());
+    let size = data.len();
+    let _ = SNAPSHOT.set(Snapshot { bootstrap: bootstrap.to_string(), data });
+    tracing::info!(bytes = size, ms = t0.elapsed().as_millis() as u64, "v8 snapshot built");
+    Ok(size)
+}
+
+/// Контекст из снимка (если загрузчик тот же) — уже с нативами и загрузчиком.
+fn context_from_snapshot<'s>(scope: &mut v8::PinScope<'s, '_, ()>, bootstrap: &str) -> Option<v8::Local<'s, v8::Context>> {
+    if !snapshot_for(bootstrap) {
+        return None;
+    }
+    v8::Context::from_snapshot(scope, 0, v8::ContextOptions::default())
+}
+
 /// Initialise the V8 platform exactly once per process. This MUST run on the
 /// main thread before any worker thread is spawned — triggering the platform
 /// init from a worker (racing other workers) segfaults. [`crate::IsolatePool::new`]
@@ -246,6 +387,11 @@ impl Isolate {
     pub(crate) fn new(id: WorkerId, max_heap_mb: Option<usize>) -> Self {
         init_platform();
         let mut params = v8::CreateParams::default();
+        if let Some(snap) = SNAPSHOT.get() {
+            params = params
+                .snapshot_blob(v8::StartupData::from(snap.data))
+                .external_references(crate::natives::external_refs());
+        }
         if let Some(mb) = max_heap_mb {
             // initial = 0 lets V8 pick its default starting heap; max is the cap.
             params = params.heap_limits(0, mb * 1024 * 1024);
@@ -373,17 +519,26 @@ impl Isolate {
             if have >= n {
                 break;
             }
+            let t0 = std::time::Instant::now();
             let ready = {
                 v8::scope!(scope, &mut self.isolate);
-                let context = v8::Context::new(scope, v8::ContextOptions::default());
-                let global = v8::Global::new(scope, context);
-                let scope = &mut v8::ContextScope::new(scope, context);
-                crate::natives::install(scope);
-                if run_script(scope, &boot).is_err() {
-                    return;
+                if let Some(context) = context_from_snapshot(scope, &boot) {
+                    let global = v8::Global::new(scope, context);
+                    let scope = &mut v8::ContextScope::new(scope, context);
+                    let _ = run_script(scope, AFTER_SNAPSHOT);
+                    global
+                } else {
+                    let context = v8::Context::new(scope, v8::ContextOptions::default());
+                    let global = v8::Global::new(scope, context);
+                    let scope = &mut v8::ContextScope::new(scope, context);
+                    crate::natives::install(scope);
+                    if run_script(scope, &boot).is_err() {
+                        return;
+                    }
+                    global
                 }
-                global
             };
+            tracing::debug!(target: "nokk::build", kind = "spare realm", ms = t0.elapsed().as_millis() as u64, thread = ?std::thread::current().name(), "context built");
             if self.isolate.get_slot::<crate::natives::SpareRealms>().is_none() {
                 self.isolate.set_slot(crate::natives::SpareRealms::default());
             }
@@ -406,17 +561,26 @@ impl Isolate {
             if have >= n {
                 break;
             }
+            let t0 = std::time::Instant::now();
             let ready = {
                 v8::scope!(scope, &mut self.isolate);
-                let context = v8::Context::new(scope, v8::ContextOptions::default());
-                let global = v8::Global::new(scope, context);
-                let scope = &mut v8::ContextScope::new(scope, context);
-                crate::natives::install(scope);
-                if run_script(scope, bootstrap).is_err() {
-                    return;
+                if let Some(context) = context_from_snapshot(scope, bootstrap) {
+                    let global = v8::Global::new(scope, context);
+                    let scope = &mut v8::ContextScope::new(scope, context);
+                    let _ = run_script(scope, AFTER_SNAPSHOT);
+                    global
+                } else {
+                    let context = v8::Context::new(scope, v8::ContextOptions::default());
+                    let global = v8::Global::new(scope, context);
+                    let scope = &mut v8::ContextScope::new(scope, context);
+                    crate::natives::install(scope);
+                    if run_script(scope, bootstrap).is_err() {
+                        return;
+                    }
+                    global
                 }
-                global
             };
+            tracing::debug!(target: "nokk::build", kind = "spare context", ms = t0.elapsed().as_millis() as u64, thread = ?std::thread::current().name(), "context built");
             if self.isolate.get_slot::<crate::natives::SpareContexts>().is_none() {
                 self.isolate.set_slot(crate::natives::SpareContexts::default());
             }
@@ -460,6 +624,13 @@ impl Isolate {
     }
 
     pub fn create_context(&mut self, bootstrap: &str) -> Result<usize, String> {
+        let t_build = std::time::Instant::now();
+        let r = self.create_context_inner(bootstrap);
+        tracing::debug!(target: "nokk::build", kind = "context", ms = t_build.elapsed().as_millis() as u64, thread = ?std::thread::current().name(), "context built");
+        r
+    }
+
+    fn create_context_inner(&mut self, bootstrap: &str) -> Result<usize, String> {
         let index = self.contexts.len();
         // Keep the bootstrap on the isolate so a *realm* can be built from it
         // later without the page ever seeing the source. A same-origin `<iframe>`
@@ -473,13 +644,29 @@ impl Isolate {
         }
         let global = {
             v8::scope!(scope, &mut self.isolate);
-            let context = v8::Context::new(scope, v8::ContextOptions::default());
+            let snapped = context_from_snapshot(scope, bootstrap);
+            let from_snapshot = snapped.is_some();
+            let context = snapped.unwrap_or_else(|| v8::Context::new(scope, v8::ContextOptions::default()));
             let global = v8::Global::new(scope, context);
             let scope = &mut v8::ContextScope::new(scope, context);
-            // Native bindings must exist before the bootstrap runs — the JS
-            // WebCrypto layer is built on top of them.
-            crate::natives::install(scope);
-            run_script(scope, bootstrap)?;
+            if from_snapshot {
+                let _ = run_script(scope, AFTER_SNAPSHOT);
+            } else {
+                // Native bindings must exist before the bootstrap runs — the JS
+                // WebCrypto layer is built on top of them.
+                crate::natives::install(scope);
+                // NOKK_AUDIT_NATIVES=1: какие нативы зовёт сам загрузчик.
+                let audit = std::env::var_os("NOKK_AUDIT_NATIVES").is_some();
+                if audit {
+                    let _ = run_script(scope, "(() => { const c = {}; Object.defineProperty(globalThis, '__pt_auditCounts', { value: c, configurable: true }); for (const k of Object.getOwnPropertyNames(globalThis)) { if (!k.startsWith('__pt_')) continue; const f = globalThis[k]; if (typeof f !== 'function') continue; globalThis[k] = function () { c[k] = (c[k] || 0) + 1; return f.apply(this, arguments); }; } })();");
+                }
+                run_script(scope, bootstrap)?;
+                if audit {
+                    if let Ok(v) = run_script(scope, "JSON.stringify(globalThis.__pt_auditCounts)") {
+                        eprintln!("[audit natives] {v}");
+                    }
+                }
+            }
             // Крючок динамического импорта видит только область; чтобы он знал,
             // в каком контексте спросили, контекст носит свой номер под
             // `__pt`-именем — такие имена перечисление не показывает.

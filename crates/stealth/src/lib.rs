@@ -2707,7 +2707,9 @@ const SHAPE_FIXES: &str = r#"(() => {
   // Статические члены конструкторов и пространств имён — как у Chrome 151:
   // порядок, флаги описаний, длины и имена функций, без `.prototype`.
   try { if (typeof globalThis.__pt_installRtcCaps === 'function') __pt_installRtcCaps(); } catch (e) {}
-  try {
+  // ONLY — набор корней: после восстановления из снимка V8 проходим только
+  // то, что V8 доставил сам (см. __pt_lateShape ниже).
+  const ctorStatics = (ONLY) => { try {
     const TAB = __CTOR_STATICS__;
     const NS = new Set(['console', 'CSS', 'WebAssembly']);
     const nat2 = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
@@ -2720,6 +2722,7 @@ const SHAPE_FIXES: &str = r#"(() => {
       return nat2(f, fname);
     };
     for (const name of Object.keys(TAB)) {
+      if (ONLY && !ONLY.has(name)) continue;
       let I; try { I = globalThis[name]; } catch (e) { continue; }
       if (I === null || I === undefined) continue;
       if (typeof I !== 'function' && !(typeof I === 'object' && NS.has(name))) continue;
@@ -2753,11 +2756,12 @@ const SHAPE_FIXES: &str = r#"(() => {
         for (const [k, d] of saved) { try { if (!Object.getOwnPropertyDescriptor(I, k)) Object.defineProperty(I, k, d); } catch (x) {} }
       }
     }
-  } catch (e) {}
+  } catch (e) {} };
+  ctorStatics(null);
   // Члены прототипов — по хромовской таблице: имя, длина, строгость, отсутствие
   // `.prototype` у методов и аксессоров, родной toString; лишний setter
   // снимается. Недостающих членов не добавляем (см. заметку про Performance*).
-  try {
+  const protoMembers = (ONLY) => { try {
     const PS = __PROTO_MEMBERS__;
     const nat = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
     const isStrictF = (f) => { try { void f.caller; return false; } catch (e) { return true; } };
@@ -2780,6 +2784,7 @@ const SHAPE_FIXES: &str = r#"(() => {
       return g;
     };
     for (const path of Object.keys(PS)) {
+      if (ONLY && !ONLY.has(path.split('.')[0])) continue;
       let O; try { O = resolve(path); } catch (e) { continue; }
       if (O === null || (typeof O !== 'object' && typeof O !== 'function')) continue;
       for (const [key, spec] of PS[path]) {
@@ -2812,7 +2817,20 @@ const SHAPE_FIXES: &str = r#"(() => {
         } catch (e) {}
       }
     }
-  } catch (e) {}
+  } catch (e) {} };
+  protoMembers(null);
+  // То, что V8 доставляет при восстановлении из снимка (WebAssembly,
+  // DisposableStack…), загрузчик при сборке не видел: повторяем для этих
+  // имён ровно те проходы, что их касаются, в том же порядке.
+  if (globalThis.__pt_lateNames) {
+    const late = __pt_lateNames;
+    Object.defineProperty(globalThis, '__pt_lateShape', { writable: true, configurable: true, value: () => {
+      try { for (const k of ['Suspending', 'promising', 'SuspendError']) redo(globalThis.WebAssembly, k); } catch (e) {}
+      try { if (globalThis.WebAssembly && globalThis.__pt_methodize) for (const k of ['compileStreaming', 'instantiateStreaming']) __pt_methodize(WebAssembly, k); } catch (e) {}
+      ctorStatics(late);
+      protoMembers(late);
+    } });
+  }
   // Символьные члены прототипов — как у Chrome 151 (снято syms_probe.js):
   // списки перебираются Array.prototype.values, maplike — своим entries,
   // setlike — своим values; метка типа идёт первой; у пяти узловых
@@ -3423,19 +3441,24 @@ const IFACE_KINDS_TEMPLATE: &str = r#"(() => {
 })();"#;
 
 pub fn web_surface_script() -> String {
+    // Метки подслоёв для NOKK_TRACE_BOOT (и отладочного NOKK_SNAP_CUT).
+    let m = |n: &str| if std::env::var_os("NOKK_TRACE_BOOT").is_some() { format!("\n;(globalThis.__pt_bootT = globalThis.__pt_bootT || []).push(['{n}', Date.now()]);\n") } else { "\n".to_string() };
     format!(
-        "{WEB_SURFACE_TEMPLATE}\n{}\n{}\n{}",
+        "{WEB_SURFACE_TEMPLATE}{}{}{}{}{}{}",
+        m("surf_fill"),
         WEB_BODIES_TEMPLATE
             .replace("__CLONE__", CLONE_TEMPLATE)
             .replace("__OPFS__", OPFS_TEMPLATE)
             .replace("__CHROME_FULL__", CHROME_FULL),
+        m("surf_bodies"),
         WINDOW_SHAPE_TEMPLATE.replace("__WINDOW_ENUMERABLE__", WINDOW_ENUMERABLE),
+        m("surf_window"),
         IFACE_STATICS_TEMPLATE
             .replace("__IFACE_STATICS__", IFACE_STATICS)
             .replace("__IFACE_PROTO_MOVES__", IFACE_PROTO_MOVES)
             .replace("__IFACE_CHAIN__", IFACE_CHAIN)
             .replace("__IFACE_LIFT__", IFACE_LIFT),
-    ) + "\n" + &IFACE_KINDS_TEMPLATE.replace("__IFACE_KINDS__", IFACE_KINDS)
+    ) + &m("surf_statics") + &IFACE_KINDS_TEMPLATE.replace("__IFACE_KINDS__", IFACE_KINDS)
 }
 
 /// Приводит перечислимость собственных свойств окна к браузерной. Идёт
@@ -5088,7 +5111,9 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
   // `Response` и читают из него байты. У V8 их нет вовсе, и в перечислении
   // пространства имён нам не хватало ровно этих двух имён против Chrome.
   // Реализуем честно — через тот же ответ, что отдаёт наш `fetch`.
-  try {
+  // Отдельной функцией: контекст из снимка получает WebAssembly от V8 уже
+  // после загрузчика, и тогда её зовёт __pt_afterRestore.
+  const wasmStreaming = () => { try {
     const W = globalThis.WebAssembly;
     if (W && typeof W.compile === 'function' && typeof W.compileStreaming !== 'function') {
       // Как у браузера: принимается только `Response` с MIME
@@ -5135,7 +5160,9 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       Object.defineProperty(W, 'instantiateStreaming', {
         value: native(is), writable: true, enumerable: false, configurable: true });
     }
-  } catch (e) {}
+  } catch (e) {} };
+  wasmStreaming();
+  if (globalThis.__pt_lateNames) Object.defineProperty(globalThis, '__pt_wasmStreaming', { value: wasmStreaming, writable: true, configurable: true });
 
   const STATICS = __IFACE_STATICS__;
   for (const iface of Object.keys(STATICS)) {
@@ -6217,6 +6244,10 @@ const WEB_SURFACE_TEMPLATE: &str = r##"(() => {
     for (const cat of Object.keys(T[root])) {
       for (const name of T[root][cat]) {
         if (has(name)) continue;                    // реализованное не трогаем
+        // При сборке снимка V8 прячет часть встроенного (Float16Array,
+        // DisposableStack, WebAssembly…) и доставляет его при восстановлении:
+        // заглушка на этом месте заслонила бы настоящее.
+        if (root === 'window' && globalThis.__pt_lateNames && __pt_lateNames.has(name)) continue;
         try {
           Object.defineProperty(target, name, {
             value: stub(name, cat), writable: true, enumerable: true, configurable: true,
@@ -11824,15 +11855,19 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // всё остальное на прототипе, как в браузере.
     const api = Object.create(Storage.prototype);
     StorageData.set(api, m);
+    // Символ — обычное свойство объекта, не ключ хранилища: у Chrome
+    // `localStorage[sym] = 1; delete localStorage[sym]` не трогает данные и
+    // не оставляет следа (у нас удаление символа молча ничего не делало).
+    const sym = (p) => typeof p === 'symbol';
     const proxy = __pt_proxy(api, {
-      get: (t, p) => (p in t ? t[p] : (m.has(String(p)) ? m.get(String(p)) : undefined)),
-      set: (t, p, v) => { if (p in t) return true; m.set(String(p), String(v)); return true; },
-      has: (t, p) => p in t || m.has(String(p)),
-      deleteProperty: (t, p) => { m.delete(String(p)); return true; },
+      get: (t, p) => (p in t || sym(p) ? t[p] : (m.has(p) ? m.get(p) : undefined)),
+      set: (t, p, v, r) => { if (sym(p)) return Reflect.set(t, p, v); if (p in t) return true; m.set(String(p), String(v)); return true; },
+      has: (t, p) => p in t || (!sym(p) && m.has(p)),
+      deleteProperty: (t, p) => { if (sym(p)) return Reflect.deleteProperty(t, p); m.delete(String(p)); return true; },
       // Ключи хранилища — собственные свойства объекта: `Object.keys(localStorage)`
       // в браузере перечисляет то, что записано.
       ownKeys: (t) => [...new Set([...m.keys(), ...Reflect.ownKeys(t)])],
-      getOwnPropertyDescriptor: (t, p) => (m.has(String(p))
+      getOwnPropertyDescriptor: (t, p) => (!sym(p) && m.has(p)
         ? { value: m.get(String(p)), writable: true, enumerable: true, configurable: true }
         : Reflect.getOwnPropertyDescriptor(t, p)),
     });

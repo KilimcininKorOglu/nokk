@@ -1453,12 +1453,44 @@ fn gl_depth_func(
     );
 }
 
+/// Указатели всех нативных обработчиков в порядке первой установки — список
+/// внешних ссылок для снимка V8 (одинаковый при создании и восстановлении:
+/// тот же процесс, те же адреса).
+static NATIVE_REFS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Замороженный список внешних ссылок (после первой полной установки).
+struct RefsSlice(&'static [v8::ExternalReference]);
+// Только адреса функций, неизменные всю жизнь процесса.
+unsafe impl Send for RefsSlice {}
+unsafe impl Sync for RefsSlice {}
+
+pub fn external_refs() -> std::borrow::Cow<'static, [v8::ExternalReference]> {
+    static REFS: std::sync::OnceLock<RefsSlice> = std::sync::OnceLock::new();
+    let v = REFS.get_or_init(|| {
+        let ptrs = NATIVE_REFS.lock().map(|v| v.clone()).unwrap_or_default();
+        let list: Vec<v8::ExternalReference> = ptrs
+            .into_iter()
+            .map(|p| v8::ExternalReference { function: unsafe { std::mem::transmute::<usize, v8::FunctionCallback>(p) } })
+            .chain(std::iter::once(v8::ExternalReference { pointer: std::ptr::null_mut() }))
+            .collect();
+        RefsSlice(Box::leak(list.into_boxed_slice()))
+    });
+    std::borrow::Cow::Borrowed(v.0)
+}
+
 fn bind(scope: &mut v8::PinScope, name: &str, cb: impl v8::MapFnTo<v8::FunctionCallback>) {
     let global = scope.get_current_context().global(scope);
     let Some(key) = v8::String::new(scope, name) else {
         return;
     };
-    let tmpl = v8::FunctionTemplate::new(scope, cb);
+    let raw: v8::FunctionCallback = cb.map_fn_to();
+    if let Ok(mut v) = NATIVE_REFS.lock() {
+        let p = raw as usize;
+        if !v.contains(&p) {
+            v.push(p);
+        }
+    }
+    let tmpl = v8::FunctionTemplate::new_raw(scope, raw);
     if let Some(func) = tmpl.get_function(scope) {
         global.set(scope, key.into(), func.into());
     }
@@ -1700,7 +1732,13 @@ fn make_realm(
         rv.set(global.into());
         return;
     }
-    let context = v8::Context::new(scope, v8::ContextOptions::default());
+    let snapped = if crate::isolate::snapshot_matches(&bootstrap) {
+        v8::Context::from_snapshot(scope, 0, v8::ContextOptions::default())
+    } else {
+        None
+    };
+    let from_snapshot = snapped.is_some();
+    let context = snapped.unwrap_or_else(|| v8::Context::new(scope, v8::ContextOptions::default()));
     // Same origin, in V8's own terms: without a shared security token every
     // property read across the boundary answers "no access", which is exactly
     // what a *cross*-origin frame should do and precisely wrong for this one.
@@ -1709,6 +1747,16 @@ fn make_realm(
     let global = context.global(scope);
     {
         let inner = &mut v8::ContextScope::new(scope, context);
+        if from_snapshot {
+            v8::tc_scope!(inner, inner);
+            if let Some(src) = v8::String::new(inner, crate::isolate::AFTER_SNAPSHOT) {
+                if let Some(script) = v8::Script::compile(inner, src, None) {
+                    let _ = script.run(inner);
+                }
+            }
+            rv.set(global.into());
+            return;
+        }
         install(inner);
         v8::tc_scope!(inner, inner);
         let t0 = std::time::Instant::now();
@@ -1718,7 +1766,7 @@ fn make_realm(
                 // A realm whose bootstrap threw is still a realm; the page gets
                 // what did get built rather than a null it cannot use.
                 let _ = script.run(inner);
-                tracing::debug!(target: "nokk::realm", compile_ms = compiled.as_millis() as u64, run_ms = (t0.elapsed() - compiled).as_millis() as u64, "realm bootstrap");
+                tracing::debug!(target: "nokk::build", kind = "realm on demand", ms = t0.elapsed().as_millis() as u64, thread = ?std::thread::current().name(), "context built");
             }
         }
     }

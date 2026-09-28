@@ -467,6 +467,17 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
         // Порядок имён окна — последним: перечисление отдаёт их в порядке
         // заведения, и всякий слой, заводящий своё имя, этот порядок сдвигает.
         ("window_order", nokk_stealth::window_order_script()),
+        // Только при сборке снимка V8 (`__pt_lateNames` заводит сборщик):
+        // что V8 доставит при восстановлении — SharedArrayBuffer, WebAssembly,
+        // Float16Array, DisposableStack… — загрузчик не видел; после
+        // восстановления повторяем для них то, что он сделал бы.
+        ("restore_hook", format!(
+            "if (globalThis.__pt_lateNames) Object.defineProperty(globalThis, '__pt_afterRestore', {{ writable: true, configurable: true, value: () => {{\n\
+             try {{ delete globalThis.SharedArrayBuffer; }} catch (e) {{}}\n\
+             try {{ if (globalThis.__pt_wasmStreaming) __pt_wasmStreaming(); }} catch (e) {{}}\n\
+             try {{ if (globalThis.__pt_lateShape) __pt_lateShape(); }} catch (e) {{}}\n{}\n}} }});\n",
+            nokk_stealth::window_order_script()
+        )),
     ];
     // Служебные поля движка (`node.__ptKids = …`) создавались обычным
     // присваиванием — перечислимыми: `for…in` по узлу, событию, окну показывал
@@ -567,11 +578,17 @@ impl Engine {
                 EngineError::Session(format!("create store `{}`: {e}", dir.display()))
             })?;
         }
-        let pool = IsolatePool::new(config.pool);
-        // Пул поднимает V8 и, если находит данные ICU, включает родной `Intl`.
-        // Тогда заглушка не нужна: движок отвечает на локали сам и правильно —
-        // валюты, склонения, часовые пояса, разбор на слова.
+        // V8 и данные ICU — первыми: от ICU зависит загрузчик (родной `Intl`
+        // вместо заглушки), а загрузчик по умолчанию уходит в снимок V8, с
+        // которым рождаются изоляты пула. Контекст из снимка поднимается за
+        // миллисекунды вместо ~300 мс исполнения загрузчика.
+        nokk_pool::init_v8();
         nokk_stealth::set_native_intl(nokk_pool::icu_ready());
+        match nokk_pool::build_snapshot(&build_bootstrap(&config.stealth)) {
+            Ok(_) => {}
+            Err(e) => tracing::debug!(error = %e, "v8 snapshot not used"),
+        }
+        let pool = IsolatePool::new(config.pool);
         let client = if config.use_real_network {
             Client::Fingerprint(FingerprintClient::new(&config.client)?)
         } else {
@@ -1816,6 +1833,11 @@ impl BrowserContext {
                 if last_spare_topup.elapsed() >= std::time::Duration::from_millis(500) {
                     last_spare_topup = std::time::Instant::now();
                     for w in 0..self.engine.pool.worker_count() {
+                        // Не на потоках страницы и кадров: сборка занимает их на
+                        // сотни миллисекунд, и таймеры страницы ждут.
+                        if w == self.worker.0 || w == self.frame_worker.0 {
+                            continue;
+                        }
                         let boot = self.bootstrap.clone();
                         self.engine
                             .pool
@@ -2344,7 +2366,7 @@ impl BrowserContext {
                     // свою, и ответ приходит через время сообщения, а не через
                     // время «страница освободилась». У нас всё жило на одном
                     // изоляте, и каждый ход воркера отнимался у страницы.
-                    let place = self.engine.pool.pick_worker();
+                    let place = self.engine.pool.pick_worker_avoiding(&[self.worker, self.frame_worker]);
                     let load = std::sync::Arc::new(self.engine.pool.register_context(place));
                     let t_create = std::time::Instant::now();
                     let Ok(Ok(child)) = self
@@ -2843,6 +2865,9 @@ impl BrowserContext {
                         // программа челленджа заводит воркеры один за другим и
                         // ждёт ответа в пределах сотен миллисекунд.
                         for w in 0..self.engine.pool.worker_count() {
+                            if w == self.worker.0 || w == self.frame_worker.0 {
+                                continue;
+                            }
                             let boot = boot.clone();
                             self.engine
                                 .pool
@@ -3416,16 +3441,23 @@ impl BrowserContext {
             work += ran as usize;
             // Кадр простаивает — самое время добрать запас пустых реалмов на
             // его потоке: следующий вставленный им кадр получит готовый.
-            if ran == 0 && index & OWN_THREAD != 0 && std::env::var_os("NOKK_NO_SPARE_REALMS").is_none() {
-                let (w, _) = self.route(index);
-                self.engine.pool.dispatch_detached(w, |iso| iso.top_up_realms(8, 1));
-            }
             tracing::debug!(target: "nokk::pace", frame = id, ran, slice_ms = t_slice.elapsed().as_millis() as u64, "срез кадра");
             let qjson = self.eval_in(index, DRAIN_IO).await?;
             let queues: Value = match qjson {
                 Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
                 _ => Value::Null,
             };
+            // Кадр простаивает — можно добрать запас пустых реалмов на его
+            // потоке, но только если ближайший таймер не скоро: сборка реалма
+            // занимает поток на ~300 мс, и таймер кадра, стоящий за ней,
+            // опаздывал на столько же (секции отчёта растягивались втрое).
+            let next_timer = queues["timers"].as_f64().unwrap_or(-1.0);
+            if ran == 0 && index & OWN_THREAD != 0 && (next_timer < 0.0 || next_timer > 400.0)
+                && std::env::var_os("NOKK_NO_SPARE_REALMS").is_none()
+            {
+                let (w, _) = self.route(index);
+                self.engine.pool.dispatch_detached(w, |iso| iso.top_up_realms(8, 1));
+            }
             let base = self.frame_base(id);
             self.log_console(&format!("frame {id}"), &queues);
 

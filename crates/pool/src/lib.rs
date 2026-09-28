@@ -34,7 +34,12 @@ mod natives;
 #[allow(dead_code)]
 mod webgl;
 
-pub use isolate::{icu_ready, Isolate};
+pub use isolate::{build_snapshot, icu_ready, Isolate};
+
+/// Поднять платформу V8 (и данные ICU) на этом потоке — до сборки снимка.
+pub fn init_v8() {
+    isolate::init_platform();
+}
 
 /// Errors surfaced by the pool.
 #[derive(Debug, thiserror::Error)]
@@ -176,6 +181,18 @@ impl IsolatePool {
             .min_by_key(|w| w.load.load(Ordering::Relaxed))
             .map(|w| w.id)
             .unwrap_or(avoid)
+    }
+
+    /// Наименее занятый поток, кроме перечисленных (потоки страницы и её
+    /// кадров): контекст воркера там строился бы и работал в щелях их
+    /// таймеров. Если других потоков нет — наименее занятый вообще.
+    pub fn pick_worker_avoiding(&self, avoid: &[WorkerId]) -> WorkerId {
+        self.workers
+            .iter()
+            .filter(|w| !avoid.contains(&w.id))
+            .min_by_key(|w| w.load.load(Ordering::Relaxed))
+            .map(|w| w.id)
+            .unwrap_or_else(|| self.pick_worker())
     }
 
     pub fn pick_worker(&self) -> WorkerId {
