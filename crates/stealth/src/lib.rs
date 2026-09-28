@@ -2984,6 +2984,37 @@ const SHAPE_FIXES: &str = r#"(() => {
   } catch (e) {}
   // Поздние методы без `.prototype`: postMessage, scheduler, navigation.
   try { const mz = globalThis.__pt_methodize; if (typeof mz === 'function') { for (const [o, keys] of [[globalThis, ['postMessage']], [globalThis.Scheduler && Scheduler.prototype, ['postTask', 'yield']], [globalThis.Navigation && Navigation.prototype, ['entries']]]) { if (!o) continue; for (const k of keys) mz(o, k); } } delete globalThis.__pt_methodize; } catch (e) {}
+  // Объект интерфейса наследует объект родителя (WebIDL): у Chrome
+  // Object.getPrototypeOf(HTMLDivElement) === HTMLElement, Worker → EventTarget.
+  // У нас все 532 таких конструктора смотрели прямо в Function.prototype.
+  // Родитель — ближайший по цепочке прототип со своим `constructor`, который
+  // стоит на окне под своим именем. Кроме встроенного в язык (у него своё) и
+  // фабрик Image/Audio/Option и DOMException — у Chrome они прямо от Function.
+  try {
+    const SKIP = new Set(['Image', 'Audio', 'Option', 'DOMException', 'Object', 'Function', 'Array', 'Error',
+      'AggregateError', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError', 'URIError', 'SuppressedError',
+      'Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array',
+      'Float16Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array', 'Promise', 'Map', 'Set',
+      'WeakMap', 'WeakSet', 'WeakRef', 'FinalizationRegistry', 'ArrayBuffer', 'SharedArrayBuffer', 'DataView',
+      'Boolean', 'Number', 'String', 'Symbol', 'BigInt', 'Date', 'RegExp', 'Proxy', 'Iterator',
+      'DisposableStack', 'AsyncDisposableStack']);
+    const GOPN = globalThis.__pt_rawGOPN || Object.getOwnPropertyNames;
+    const names = GOPN(globalThis);
+    const has = new Set(names);
+    for (const k of names) {
+      if (SKIP.has(k) || k.charCodeAt(0) < 65 || k.charCodeAt(0) > 90) continue;
+      let C; try { C = globalThis[k]; } catch (e) { continue; }
+      if (typeof C !== 'function' || !C.prototype || typeof C.prototype !== 'object') continue;
+      if (Object.getPrototypeOf(C) !== Function.prototype) continue;
+      let parent = null;
+      for (let P = Object.getPrototypeOf(C.prototype), i = 0; P && P !== Object.prototype && i < 20; P = Object.getPrototypeOf(P), i++) {
+        const d = Object.getOwnPropertyDescriptor(P, 'constructor');
+        const f = d && d.value;
+        if (typeof f === 'function' && f !== C && has.has(f.name) && globalThis[f.name] === f) { parent = f; break; }
+      }
+      if (parent) { try { Object.setPrototypeOf(C, parent); } catch (e) {} }
+    }
+  } catch (e) {}
 })();"#;
 
 pub fn window_order_script() -> String {
@@ -3201,6 +3232,9 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
   try {{ Object.defineProperty(dwgsProto, Symbol.toStringTag, {{ value: 'DedicatedWorkerGlobalScope', configurable: true }}); }} catch (e) {{}}
   globalThis.WorkerGlobalScope = WorkerGlobalScope;
   globalThis.DedicatedWorkerGlobalScope = DedicatedWorkerGlobalScope;
+  // Объекты интерфейсов наследуют родителей, как на окне (WebIDL).
+  try {{ if (typeof EventTarget === 'function') Object.setPrototypeOf(WorkerGlobalScope, EventTarget); }} catch (e) {{}}
+  try {{ Object.setPrototypeOf(DedicatedWorkerGlobalScope, WorkerGlobalScope); }} catch (e) {{}}
   try {{ Object.setPrototypeOf(globalThis, dwgsProto); }} catch (e) {{}}
   // Окно называло себя окном — здесь это имя принадлежит прототипу области.
   try {{ delete globalThis[Symbol.toStringTag]; }} catch (e) {{}}
@@ -3223,6 +3257,15 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
       }});
     }} catch (e) {{}}
   }}
+  // RTCTransformEvent — событие: и объект, и прототип наследуют Event.
+  try {{
+    const E = globalThis.RTCTransformEvent;
+    if (typeof E === 'function' && typeof Event === 'function' && E.prototype) {{
+      Object.setPrototypeOf(E, Event);
+      Object.setPrototypeOf(E.prototype, Event.prototype);
+      Object.defineProperty(E.prototype, Symbol.toStringTag, {{ value: 'RTCTransformEvent', configurable: true }});
+    }}
+  }} catch (e) {{}}
   for (const k of ['importScripts']) {{
     if (k in wgsProto) continue;
     const f = function importScripts() {{}};
