@@ -2202,6 +2202,13 @@ impl BrowserContext {
                 None => self.evaluate("__pt_findControl(true)").await,
                 Some(id) => self.evaluate_in_frame(id, "__pt_findControl(false)").await,
             };
+            if std::env::var_os("NOKK_TRACE_CONTROLS").is_some() {
+                let dbg = match frame {
+                    None => self.evaluate("typeof __pt_ctlDebug === 'function' ? __pt_ctlDebug() : ''").await,
+                    Some(id) => self.evaluate_in_frame(id, "typeof __pt_ctlDebug === 'function' ? __pt_ctlDebug() : ''").await,
+                };
+                tracing::info!(target: "nokk::press", ?frame, found = ?found.as_ref().ok(), dbg = ?dbg.ok(), "controls");
+            }
             let Ok(v) = found else { continue };
             let Some(list) = v
                 .as_str()
@@ -2225,11 +2232,17 @@ impl BrowserContext {
             // Поэтому: подвод по дуге, пауза перед нажатием, удержание, и
             // конечная точка чуть в стороне от центра — руки в центр не
             // попадают.
+            let trace = std::env::var_os("NOKK_TRACE_CONTROLS").is_some();
+            let press_t0 = std::time::Instant::now();
             let send = async |js: String| {
+                let t = std::time::Instant::now();
                 let _ = match frame {
                     None => self.evaluate(&js).await,
                     Some(id) => self.evaluate_in_frame(id, &js).await,
                 };
+                if trace {
+                    tracing::info!(target: "nokk::press", took_ms = t.elapsed().as_millis() as u64, at_ms = press_t0.elapsed().as_millis() as u64, what = %js.chars().take(40).collect::<String>(), "step");
+                }
             };
             // Экранная точка начала документа, где лежит флажок: окно плюс
             // рамка браузера плюс положение кадра на странице. Без неё

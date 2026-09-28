@@ -9890,6 +9890,29 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     return __ptJSON.stringify(seen.slice(0, 8));
   };
 
+  // Отладка решателя: все поля ввода и подписи документа (с тенями) с их
+  // прямоугольниками и видимостью — чтобы понять, почему нечего нажать.
+  globalThis.__pt_ctlDebug = () => {
+    const out = [];
+    const walk = (n, depth) => {
+      for (let c = n.firstChild; c; c = c.nextSibling) {
+        if (c.nodeType !== ELEMENT_NODE) continue;
+        const t = c.tagName;
+        if (t === 'INPUT' || t === 'LABEL' || t === 'BUTTON' || (c.getAttribute && __ptGetA(c, 'role'))) {
+          let r = null; try { r = c.getBoundingClientRect(); } catch (e) {}
+          let cs = null; try { cs = getComputedStyle(c); } catch (e) {}
+          out.push([t, (c.getAttribute && (__ptGetA(c, 'type') || __ptGetA(c, 'role'))) || '', depth,
+            r ? [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)] : null,
+            cs ? cs.display + '/' + cs.visibility + '/' + cs.opacity : '', c.isConnected]);
+        }
+        if (c.__ptShadow) walk(c.__ptShadow, depth + 1);
+        walk(c, depth);
+      }
+    };
+    if (globalThis.document) walk(globalThis.document, 0);
+    return __ptJSON.stringify({ ctl: out.slice(0, 20), body: globalThis.document && document.body ? (document.body.innerText || '').slice(0, 120) : '' });
+  };
+
   // Прямоугольник элемента кадра по его номеру — где бы он ни стоял, в том
   // числе в теневом дереве (кадр виджета живёт в закрытой тени).
   globalThis.__pt_frameRectById = (id) => {
