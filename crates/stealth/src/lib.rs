@@ -3015,6 +3015,21 @@ const SHAPE_FIXES: &str = r#"(() => {
       if (parent) { try { Object.setPrototypeOf(C, parent); } catch (e) {} }
     }
   } catch (e) {}
+  // InputDeviceCapabilities: firesTouchEvents — из словаря конструктора
+  // (по умолчанию false); заглушка отвечала undefined, а у мышиного ввода
+  // Chrome это объект с false.
+  try {
+    const C = globalThis.InputDeviceCapabilities;
+    if (typeof C === 'function' && C.prototype) {
+      const V = new WeakMap();
+      const d = Object.getOwnPropertyDescriptor(C.prototype, 'firesTouchEvents');
+      const g = ({ get firesTouchEvents() { return V.has(this) ? V.get(this) : false; } });
+      const get = Object.getOwnPropertyDescriptor(g, 'firesTouchEvents').get;
+      if (globalThis.__pt_native) __pt_native(get);
+      Object.defineProperty(C.prototype, 'firesTouchEvents', { get, set: undefined, enumerable: d ? d.enumerable : true, configurable: true });
+      Object.defineProperty(globalThis, '__pt_idcSet', { value: (o, v) => V.set(o, !!v), writable: true, configurable: true });
+    }
+  } catch (e) {}
 })();"#;
 
 pub fn window_order_script() -> String {

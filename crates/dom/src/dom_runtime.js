@@ -501,18 +501,57 @@
       // но живое свойство: у нас оно было `undefined` всегда, а в Chrome внутри
       // обработчика там лежит само событие.
       const снимок = __ptTakeEvent(event);
-      // Build the ancestor path for capture/bubble.
-      const path = []; for (let n = this; n; n = n.parentNode) path.push(n);
-      // Capture phase (root -> target), then bubble (target -> root).
-      const fire = (node) => {
-        const l = node.__ptLis[event.type]; if (!l) return;
-        for (const { fn } of l.slice()) {
-          if (event.__ptStopImm) break;
-          __ptEvSet(event, 'currentTarget', node);
-          try { fn.call(node, event); } catch (e) { __pt_reportError(e, 'listener ' + event.type); }
+      // Путь события, как в браузере: вверх по parentNode, из теневого дерева —
+      // через хозяина (для composed), от документа — к окну (кроме load).
+      // Для узлов снаружи тени цель подменяется хозяином. Раньше путь кончался
+      // на корне тени и никогда не доходил до окна: слушатели мыши на window и
+      // document у виджета не слышали ни одного нашего движения.
+      const path = [], targets = [];
+      let tgt = this;
+      // enter/leave у Chrome слушатели предков (и окна) не слышат вовсе.
+      const local = event.type === 'mouseenter' || event.type === 'mouseleave' || event.type === 'pointerenter' || event.type === 'pointerleave';
+      for (let n = this; n; ) {
+        if (local && n !== this) break;
+        path.push(n); targets.push(tgt);
+        if (n.nodeType === 11 && n.host) {
+          if (!event.composed) break;
+          n = n.host; tgt = n; continue;
+        }
+        if (n.nodeType === 9) {
+          const w = n.defaultView;
+          if (w && event.type !== 'load') { path.push(w); targets.push(tgt); }
+          break;
+        }
+        n = n.parentNode;
+      }
+      __ptEvSet(event, '__ptPathNow', path);
+      const fireAt = (i, phase) => {
+        const node = path[i];
+        const l = node.__ptLis && node.__ptLis[event.type];
+        __ptEvSet(event, 'target', targets[i]);
+        // Хозяин тени после подмены цели сам и есть цель: фаза «у цели».
+        __ptEvSet(event, 'eventPhase', targets[i] === node ? 2 : phase);
+        if (l) {
+          for (const e of l.slice()) {
+            if (event.__ptStopImm) break;
+            if (phase === 1 && !e.cap) continue;
+            if (phase === 3 && e.cap) continue;
+            __ptEvSet(event, 'currentTarget', node);
+            try { e.fn.call(node, event); } catch (x) { __pt_reportError(x, 'listener ' + event.type); }
+          }
+        }
+        // Обработчик-свойство предка (`document.onmousemove`, `window.onclick`)
+        // — тоже слушатель всплытия.
+        if (phase === 3 && !event.__ptStopImm) {
+          let on; try { on = node['on' + event.type]; } catch (x) {}
+          if (typeof on === 'function') {
+            __ptEvSet(event, 'currentTarget', node);
+            try { on.call(node, event); } catch (x) { __pt_reportError(x, 'listener ' + event.type); }
+          }
         }
       };
-      for (let i = path.length - 1; i >= 1; i--) { if (event.__ptStop) break; if (path[i].__ptLis && path[i].__ptLis[event.type]) { __ptEvSet(event, 'eventPhase', 1); fireCapture(path[i], event); } }
+      for (let i = path.length - 1; i >= 1; i--) { if (event.__ptStop) break; fireAt(i, 1); }
+      __ptEvSet(event, 'target', this);
       __ptEvSet(event, 'eventPhase', 2);
       // Обработчик-свойство (`onclick`, `onload`, `onmessage`) — такой же
       // слушатель цели, и вызывает его тот же dispatch, а не вызывающий код.
@@ -526,10 +565,26 @@
           try { on.call(this, event); } catch (e) { __pt_reportError(e, 'listener ' + event.type); }
         }
       };
+      // У цели — сначала слушатели захвата, потом остальные (Chrome ≥ 89).
+      const atTarget = (capture) => {
+        const l = this.__ptLis && this.__ptLis[event.type]; if (!l) return;
+        for (const e of l.slice()) {
+          if (event.__ptStopImm) break;
+          if (!!e.cap !== capture) continue;
+          __ptEvSet(event, 'currentTarget', this);
+          try { e.fn.call(this, event); } catch (x) { __pt_reportError(x, 'listener ' + event.type); }
+        }
+      };
+      if (!event.__ptStop) atTarget(true);
       if (!event.__ptStop && onFirst) callOn();
-      if (!event.__ptStop) fire(this);
+      if (!event.__ptStop) atTarget(false);
       if (!onFirst) callOn();
-      if (event.bubbles) for (let i = 1; i < path.length; i++) { if (event.__ptStop) break; __ptEvSet(event, 'eventPhase', 3); fire(path[i]); }
+      if (event.bubbles) for (let i = 1; i < path.length; i++) { if (event.__ptStop) break; fireAt(i, 3); }
+      __ptEvSet(event, 'eventPhase', 0);
+      __ptEvSet(event, 'currentTarget', null);
+      // Снаружи после рассылки видна цель со стороны документа (хозяин тени).
+      __ptEvSet(event, 'target', targets[targets.length - 1]);
+      __ptEvSet(event, '__ptPathNow', null);
       // Возвращаем `window.event` как было: вне обработки его нет.
       __ptDropEvent(снимок);
       return !event.defaultPrevented;
@@ -675,12 +730,15 @@
   const __ptFocusEvent = (type, related, bubbles) => {
     const C = globalThis.FocusEvent || globalThis.Event;
     let ev;
-    try { ev = new C(type, { bubbles: !!bubbles, cancelable: false, relatedTarget: related || null }); }
+    // focus/blur/focusin/focusout у браузера composed — проходят сквозь тень.
+    try { ev = new C(type, { bubbles: !!bubbles, cancelable: false, composed: true, relatedTarget: related || null }); }
     catch (e) { ev = new Event(type, { bubbles: !!bubbles }); }
     if (!('relatedTarget' in ev)) {
       try { Object.defineProperty(ev, 'relatedTarget', { value: related || null, enumerable: true, configurable: true }); }
       catch (e) {}
     }
+    // Фокус от нажатия мыши несёт устройство ввода, как у Chrome.
+    if (globalThis.__ptFocusCaps && ev.__ptE) ev.__ptE.sourceCapabilities = globalThis.__ptFocusCaps;
     return __ptTrust(ev);
   };
 
@@ -2059,7 +2117,20 @@
     preventDefault() { if (this.cancelable) this.__ptE.defaultPrevented = true; }
     stopPropagation() { this.__ptStop = true; }
     stopImmediatePropagation() { this.__ptStop = true; this.__ptStopImm = true; }
-    composedPath() { const p = []; for (let n = this.target; n; n = n.parentNode) p.push(n); return p; }
+    // Путь той же рассылки; вне её — пусто, как у Chrome. Узлы закрытой тени
+    // не видны слушателю снаружи неё.
+    composedPath() {
+      const p = this.__ptE ? this.__ptE.__ptPathNow : this.__ptPathNow; if (!p) return [];
+      const cur = this.currentTarget; const out = [];
+      let hidden = false;
+      for (let i = 0; i < p.length; i++) {
+        const n = p[i];
+        out.push(n);
+        if (n.nodeType === 11 && n.mode === 'closed' && cur && cur !== n && !(n.contains && n.contains(cur))) hidden = true;
+        if (hidden && n.nodeType === 11) { out.length = 0; hidden = false; }
+      }
+      return out;
+    }
   }
   // Пометить событие как пришедшее от движка. Страница до этого не дотянется:
   // имя __pt-скрыто из любого перечисления, а слепок делается один раз.
@@ -2084,9 +2155,13 @@
       super(type, init); init = init || {};
       this.__ptE.detail = init.detail || 0;
       this.__ptE.view = globalThis;
+      // Устройство, породившее событие: у собранного страницей — null; ввод
+      // мыши движок помечает сам (InputDeviceCapabilities, см. __pt_mouse).
+      this.__ptE.sourceCapabilities = init.sourceCapabilities || null;
+      this.__ptE.which = init.which || 0;
     }
   }
-  evtAccessors(UIEvent, ['detail', 'view']);
+  evtAccessors(UIEvent, ['detail', 'view', 'which', 'sourceCapabilities']);
 
   const MODS = ['ctrlKey', 'shiftKey', 'altKey', 'metaKey'];
   const modifierState = function (k) {
@@ -2106,8 +2181,15 @@
         ctrlKey: !!init.ctrlKey, shiftKey: !!init.shiftKey,
         altKey: !!init.altKey, metaKey: !!init.metaKey,
         relatedTarget: init.relatedTarget || null,
+        // x/y — те же clientX/Y; layerX/Y и сдвиг у собранного страницей
+        // события — от его координат; which — кнопка плюс один (легаси Blink).
+        x, y, layerX: Math.trunc(x), layerY: Math.trunc(y),
+        movementX: init.movementX || 0, movementY: init.movementY || 0,
+        which: (init.button || 0) + 1,
       });
     }
+    get fromElement() { const t = this.type; return t === 'mouseover' || t === 'mouseenter' || t === 'pointerover' || t === 'pointerenter' ? this.relatedTarget : this.target; }
+    get toElement() { const t = this.type; return t === 'mouseout' || t === 'mouseleave' || t === 'pointerout' || t === 'pointerleave' ? this.relatedTarget : this.target; }
     getModifierState(k) { return modifierState.call(this, k); }
   }
   evtAccessors(MouseEvent, ['clientX', 'clientY', 'screenX', 'screenY', 'pageX', 'pageY',
@@ -9808,6 +9890,26 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     return __ptJSON.stringify(seen.slice(0, 8));
   };
 
+  // Прямоугольник элемента кадра по его номеру — где бы он ни стоял, в том
+  // числе в теневом дереве (кадр виджета живёт в закрытой тени).
+  globalThis.__pt_frameRectById = (id) => {
+    const walk = (n) => {
+      for (let c = n.firstChild; c; c = c.nextSibling) {
+        if (c.nodeType !== ELEMENT_NODE) continue;
+        if (c.__ptLocal === 'iframe' && c.__ptFrameId === id) return c;
+        const inShadow = c.__ptShadow ? walk(c.__ptShadow) : null;
+        if (inShadow) return inShadow;
+        const deeper = walk(c);
+        if (deeper) return deeper;
+      }
+      return null;
+    };
+    const el = globalThis.document && walk(globalThis.document);
+    if (!el) return '';
+    const r = el.getBoundingClientRect();
+    return __ptJSON.stringify({ x: r.x, y: r.y, w: r.width, h: r.height });
+  };
+
   globalThis.__pt_hitFrame = (x, y) => {
     for (let el = __elementFromPoint(x, y); el && el.nodeType === ELEMENT_NODE; el = el.parentNode) {
       if (el.__ptLocal === 'iframe' && el.__ptFrameId) {
@@ -9840,67 +9942,135 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     return null;
   }
 
-  globalThis.__pt_mouse = (type, x, y, button, clickCount) => {
+  // Ввод мыши движком — так, как его видит страница в Chrome (сверено по
+  // записи настоящего нажатия в кадре виджета): у указательных событий
+  // дробные координаты, у мышиных — целые; экранные — с положением окна и
+  // кадра; сдвиг от прошлой точки; у движения button −1 (у мышиного 0) и
+  // which 0; у нажатия which 1; click — PointerEvent; у мышиных событий
+  // sourceCapabilities, у указательных — null. `ox`/`oy` — экранная точка
+  // начала кадра (передаёт ядро; без них — начало своего окна).
+  let __lastSX = null, __lastSY = null, __idc = null, __winFocused = false;
+  const __devCaps = () => {
+    if (__idc) return __idc;
+    try { __idc = new InputDeviceCapabilities({ firesTouchEvents: false }); if (globalThis.__pt_idcSet) __pt_idcSet(__idc, false); } catch (e) { __idc = null; }
+    return __idc;
+  };
+  const __q = (v) => Math.round(v * 256) / 256;
+  globalThis.__pt_screenOrigin = () => {
+    const w = globalThis;
+    const ox = (w.screenX || 0) + Math.max(0, ((w.outerWidth || 0) - (w.innerWidth || 0)) / 2);
+    const oy = (w.screenY || 0) + Math.max(0, (w.outerHeight || 0) - (w.innerHeight || 0));
+    return __ptJSON.stringify([ox, oy]);
+  };
+  globalThis.__pt_mouse = (type, x, y, button, clickCount, ox, oy) => {
+    x = __q(+x || 0); y = __q(+y || 0);
     const el = __elementFromPoint(x, y) || (globalThis.document && globalThis.document.body);
     if (!el) return false;
+    if (ox === undefined || oy === undefined) {
+      try { const o = __ptJSON.parse(globalThis.__pt_screenOrigin()); ox = o[0]; oy = o[1]; } catch (e) { ox = 0; oy = 0; }
+    }
+    const sx = __q(x + ox), sy = __q(y + oy);
+    const mx = __lastSX === null ? 0 : Math.round(sx - __lastSX), my = __lastSY === null ? 0 : Math.round(sy - __lastSY);
+    let r = null; try { r = el.getBoundingClientRect(); } catch (e) {}
+    const rl = r ? r.left : 0, rt = r ? r.top : 0;
+    const scX = globalThis.scrollX || 0, scY = globalThis.scrollY || 0;
     const b = button === 'right' ? 2 : button === 'middle' ? 1 : (button | 0);
-    const base = { bubbles: true, cancelable: true, composed: true,
-                   clientX: x, clientY: y, screenX: x, screenY: y,
-                   button: b, detail: clickCount || 1 };
-    // Настоящий указатель мыши: первый, шириной в пиксель. Нажим у браузера
-    // ненулевой только пока кнопка внизу.
-    const ptr = (extra) => Object.assign({}, base, {
-      pointerId: 1, pointerType: 'mouse', isPrimary: true, width: 1, height: 1,
-    }, extra || {});
-    // Ввод от движка — доверенный: настоящий клик несёт isTrusted=true, и
-    // виджеты, которые ждут нажатия человека, только такой и принимают.
-    const send = (ev) => el.dispatchEvent(__ptTrust(ev));
-    if (type === 'mousePressed') {
-      if (__hoverEl !== el) {
-        __hoverEl = el;
-        send(new PointerEvent('pointerover', ptr()));
-        send(new MouseEvent('mouseover', base));
+    const down = type === 'mousePressed', up = type === 'mouseReleased', move = type === 'mouseMoved';
+    const clicks = clickCount || 1;
+    // Поля, которых нет в словаре конструктора, ставятся после создания.
+    const finish = (ev, mouse, extra) => {
+      const cx = mouse ? Math.trunc(x) : x, cy = mouse ? Math.trunc(y) : y;
+      const E = ev.__ptE;
+      if (E) Object.assign(E, {
+        clientX: cx, clientY: cy, x: cx, y: cy,
+        screenX: mouse ? Math.trunc(sx) : sx, screenY: mouse ? Math.trunc(sy) : sy,
+        pageX: mouse ? Math.trunc(x + scX) : x + scX, pageY: mouse ? Math.trunc(y + scY) : y + scY,
+        offsetX: mouse ? Math.round(x - rl) : x - rl, offsetY: mouse ? Math.round(y - rt) : y - rt,
+        layerX: Math.trunc(x + scX), layerY: Math.trunc(y + scY),
+        movementX: move ? mx : 0, movementY: move ? my : 0,
+        sourceCapabilities: mouse ? __devCaps() : null,
+      }, extra || {});
+      return __ptTrust(ev);
+    };
+    const base = { bubbles: true, cancelable: true, composed: true, view: globalThis, clientX: x, clientY: y, screenX: sx, screenY: sy };
+    const ptrInit = (extra) => Object.assign({}, base, { pointerId: 1, pointerType: 'mouse', isPrimary: true, width: 1, height: 1 }, extra || {});
+    const P = (t, extra, fields) => { const ev = new PointerEvent(t, ptrInit(extra)); finish(ev, false, fields); return ev; };
+    const M = (t, init, fields) => { const ev = new MouseEvent(t, Object.assign({}, base, init)); finish(ev, true, fields); return ev; };
+    const send = (target, ev) => target.dispatchEvent(ev);
+    const hoverTo = (next) => {
+      const prev = __hoverEl;
+      if (prev === next) return;
+      const nb = () => { const o = { ...base }; o.bubbles = false; o.cancelable = false; return o; };
+      if (prev && prev.isConnected !== false) {
+        send(prev, P('pointerout', { button: -1, relatedTarget: next }, { button: -1, which: 0, detail: 0 }));
+        send(prev, P('pointerleave', { button: -1, bubbles: false, cancelable: false, relatedTarget: next }, { button: -1, which: 0, detail: 0 }));
+        send(prev, M('mouseout', { relatedTarget: next }, { which: 0, detail: 0 }));
+        send(prev, M('mouseleave', { ...nb(), relatedTarget: next }, { which: 0, detail: 0 }));
       }
-      send(new PointerEvent('pointerdown', ptr({ buttons: 1, pressure: 0.5 })));
-      send(new MouseEvent('mousedown', { ...base, buttons: 1 }));
+      __hoverEl = next;
+      send(next, P('pointerover', { button: -1, relatedTarget: prev || null }, { button: -1, which: 0, detail: 0 }));
+      send(next, P('pointerenter', { button: -1, bubbles: false, cancelable: false, relatedTarget: prev || null }, { button: -1, which: 0, detail: 0 }));
+      send(next, M('mouseover', { relatedTarget: prev || null }, { which: 0, detail: 0 }));
+      send(next, M('mouseenter', { ...nb(), relatedTarget: prev || null }, { which: 0, detail: 0 }));
+    };
+    const held = __mouseDownEl ? 1 : 0;
+    if (down) {
+      hoverTo(el);
+      send(el, P('pointerdown', { button: b, buttons: 1, pressure: 0.5 }, { which: b + 1, detail: 0 }));
+      send(el, M('mousedown', { button: b, buttons: 1, detail: clicks }, { which: b + 1 }));
+      // Окно, получившее нажатие впервые, само получает focus — до элемента.
+      if (!__winFocused) {
+        __winFocused = true;
+        try { const wf = new FocusEvent('focus', { bubbles: false, cancelable: false, composed: false }); globalThis.dispatchEvent(__ptTrust(wf)); } catch (e) {}
+      }
       const f = __focusableAncestor(el);
-      if (f) f.focus(); else if (globalThis.document) { const a = globalThis.document.activeElement; if (a && a.blur) a.blur(); }
+      try { Object.defineProperty(globalThis, '__ptFocusCaps', { value: __devCaps(), writable: true, configurable: true }); } catch (e) {}
+      try {
+        if (f) f.focus(); else if (globalThis.document) { const a = globalThis.document.activeElement; if (a && a.blur) a.blur(); }
+      } finally { try { globalThis.__ptFocusCaps = null; } catch (e) {} }
       __mouseDownEl = el;
-    } else if (type === 'mouseReleased') {
-      send(new PointerEvent('pointerup', ptr()));
-      send(new MouseEvent('mouseup', base));
+    } else if (up) {
+      send(el, P('pointerup', { button: b, buttons: 0, pressure: 0 }, { which: b + 1, detail: 0 }));
+      send(el, M('mouseup', { button: b, buttons: 0, detail: clicks }, { which: b + 1 }));
       if (__mouseDownEl === el) {
-        const toggle = (c) => {
-          // Нажатие на чекбокс/радио переключает его до того, как всплывёт
-          // click, — обработчик читает уже новое состояние.
-          c.checked = String(__ptGetA(c, 'type')).toLowerCase() === 'radio' ? true : !c.checked;
-          c.dispatchEvent(__ptTrust(new Event('input', { bubbles: true })));
-          c.dispatchEvent(__ptTrust(new Event('change', { bubbles: true })));
+        const isBox = (n) => n && n.tagName === 'INPUT' && /^(checkbox|radio)$/i.test(__ptGetA(n, 'type') || '');
+        // Флажок переключается до click (его обработчик читает новое
+        // состояние), а input/change идут после click — как у браузера; click
+        // с preventDefault откатывает переключение.
+        const clickOn = (target) => {
+          const box = isBox(target) ? target : null;
+          const was = box ? box.checked : null;
+          if (box) box.checked = String(__ptGetA(box, 'type')).toLowerCase() === 'radio' ? true : !box.checked;
+          // click у Chrome — PointerEvent, но с целыми координатами мыши и
+          // isPrimary false.
+          const ev = new PointerEvent('click', ptrInit({ button: b, buttons: 0, pressure: 0, detail: clicks, isPrimary: false }));
+          finish(ev, true, { which: b + 1, detail: clicks, isPrimary: false });
+          const ok = send(target, ev);
+          if (box) {
+            if (!ok) box.checked = was;
+            else if (box.checked !== was) {
+              box.dispatchEvent(__ptTrust(new Event('input', { bubbles: true, composed: true })));
+              box.dispatchEvent(__ptTrust(new Event('change', { bubbles: true })));
+            }
+          }
         };
-        const isBox = (n) => n && n.tagName === 'INPUT'
-          && /^(checkbox|radio)$/i.test(__ptGetA(n, 'type') || '');
-        if (isBox(el)) toggle(el);
-        send(new MouseEvent('click', base));
+        clickOn(el);
         // Нажатие на подпись — это нажатие на её поле. Виджет прячет свой
         // флажок нулевым размером и кладёт поверх видимую обёртку внутри
         // `<label>`; человек попадает в обёртку, а переключается флажок.
         const lbl = __labelFor(el);
         if (lbl && lbl !== el) {
-          if (isBox(lbl)) toggle(lbl);
-          lbl.dispatchEvent(__ptTrust(new MouseEvent('click', base)));
+          clickOn(lbl);
           if (lbl.focus) lbl.focus();
         }
       }
       __mouseDownEl = null;
-    } else if (type === 'mouseMoved') {
-      if (__hoverEl !== el) {
-        __hoverEl = el;
-        send(new PointerEvent('pointerover', ptr()));
-        send(new MouseEvent('mouseover', base));
-      }
-      send(new PointerEvent('pointermove', ptr()));
-      send(new MouseEvent('mousemove', base));
+    } else if (move) {
+      hoverTo(el);
+      send(el, P('pointermove', { button: -1, buttons: held, pressure: held ? 0.5 : 0 }, { button: -1, which: 0, detail: 0 }));
+      send(el, M('mousemove', { button: 0, buttons: held }, { which: 0, detail: 0 }));
     }
+    __lastSX = sx; __lastSY = sy;
     return true;
   };
 

@@ -2231,31 +2231,64 @@ impl BrowserContext {
                     Some(id) => self.evaluate_in_frame(id, &js).await,
                 };
             };
+            // Экранная точка начала документа, где лежит флажок: окно плюс
+            // рамка браузера плюс положение кадра на странице. Без неё
+            // screenX/Y равнялись clientX/Y — у настоящей мыши так не бывает.
+            let origin_js = match frame {
+                None => "__pt_screenOrigin()".to_string(),
+                Some(id) => format!(
+                    "(() => {{ const o = JSON.parse(__pt_screenOrigin()); let r = null; try {{ r = JSON.parse(__pt_frameRectById({id}) || 'null'); }} catch (e) {{}} return JSON.stringify([o[0] + (r ? r.x : 0), o[1] + (r ? r.y : 0)]); }})()"
+                ),
+            };
+            let (ox, oy) = self
+                .evaluate(&origin_js)
+                .await
+                .ok()
+                .and_then(|v| v.as_str().and_then(|t| serde_json::from_str::<Vec<f64>>(t).ok()))
+                .filter(|v| v.len() == 2)
+                .map(|v| (v[0], v[1]))
+                .unwrap_or((0.0, 0.0));
             // Разброс берём из самих координат: он постоянен для одной цели и
             // разный у разных, без обращения к случайности.
             let spread = ((x + y * 7.0) as i64).unsigned_abs() % 5;
-            let (tx, ty) = (x + 1.0 + spread as f64 * 0.5, y - 1.0 + (spread % 3) as f64 * 0.5);
-            let steps = 5 + spread as usize % 3;
+            let mut seed = ((x * 131.0 + y * 977.0) as i64).unsigned_abs() | 1;
+            let mut rnd = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % 10_000) as f64 / 10_000.0
+            };
+            let (tx, ty) = (x + 1.0 + spread as f64 * 0.37 + rnd() * 0.6, y - 1.0 + (spread % 3) as f64 * 0.41 + rnd() * 0.6);
+            // Подвод, как у записанной руки в Chrome: два десятка точек за
+            // полсекунды с лишним, шаг неровный (8–60 мс, изредка дольше),
+            // издалека по дуге и с замедлением у цели.
+            let steps = 18 + (spread as usize * 2) % 7;
+            let (sx0, sy0) = (tx + 55.0 + rnd() * 20.0, ty + 18.0 + rnd() * 12.0);
             for i in 1..=steps {
                 let t = i as f64 / steps as f64;
-                // Замедление к концу, как у руки: быстро подвели, медленно
-                // навели.
-                let e = 1.0 - (1.0 - t) * (1.0 - t);
-                let px = tx - 24.0 * (1.0 - e);
-                let py = ty - 14.0 * (1.0 - e) + (t * std::f64::consts::PI).sin() * 3.0;
+                let e = 1.0 - (1.0 - t).powi(3);
+                let bow = (t * std::f64::consts::PI).sin();
+                let px = sx0 + (tx - sx0) * e + bow * (4.0 + rnd() * 2.0);
+                let py = sy0 + (ty - sy0) * e - bow * (6.0 + rnd() * 3.0);
                 send(format!(
-                    "__pt_mouse(\"mouseMoved\", {px:.1}, {py:.1}, \"left\", 0)"
+                    "__pt_mouse(\"mouseMoved\", {px:.4}, {py:.4}, \"left\", 0, {ox:.4}, {oy:.4})"
                 ))
                 .await;
-                self.settle(std::time::Duration::from_millis(12 + (i as u64 * 7) % 18))
-                    .await;
+                let gap = if rnd() < 0.12 { 60.0 + rnd() * 120.0 } else { 8.0 + rnd() * 40.0 };
+                self.settle(std::time::Duration::from_millis(gap as u64)).await;
             }
-            self.settle(std::time::Duration::from_millis(60 + spread as u64 * 11))
+            self.settle(std::time::Duration::from_millis(90 + (rnd() * 140.0) as u64))
                 .await;
-            send(format!("__pt_mouse(\"mousePressed\", {tx:.1}, {ty:.1}, \"left\", 1)")).await;
-            self.settle(std::time::Duration::from_millis(58 + spread as u64 * 9))
+            send(format!("__pt_mouse(\"mousePressed\", {tx:.4}, {ty:.4}, \"left\", 1, {ox:.4}, {oy:.4})")).await;
+            self.settle(std::time::Duration::from_millis(85 + (rnd() * 50.0) as u64))
                 .await;
-            send(format!("__pt_mouse(\"mouseReleased\", {tx:.1}, {ty:.1}, \"left\", 1)")).await;
+            send(format!("__pt_mouse(\"mouseReleased\", {tx:.4}, {ty:.4}, \"left\", 1, {ox:.4}, {oy:.4})")).await;
+            // Рука после нажатия не замирает: пара точек в сторону.
+            for k in 1..=3 {
+                self.settle(std::time::Duration::from_millis(30 + (rnd() * 60.0) as u64)).await;
+                let (px, py) = (tx + k as f64 * (2.0 + rnd() * 3.0), ty + k as f64 * (4.0 + rnd() * 5.0));
+                send(format!("__pt_mouse(\"mouseMoved\", {px:.4}, {py:.4}, \"left\", 0, {ox:.4}, {oy:.4})")).await;
+            }
             let what = format!(
                 "{}[{}]@{}{}",
                 c["tag"].as_str().unwrap_or("?"),
