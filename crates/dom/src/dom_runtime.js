@@ -134,7 +134,9 @@
       if (k === '__ptLinked') continue;
       const d = Object.getOwnPropertyDescriptor(proto, k);
       const label = typeof k === 'symbol' ? '[' + (k.description || '') + ']' : k;
-      if (typeof d.value === 'function') d.value = named(d.value, label);
+      // Под символом часто стоит чужая встроенная функция (итератор списков —
+      // сам Array.prototype.values): у Chrome её имя остаётся «values».
+      if (typeof d.value === 'function' && !(typeof k === 'symbol' && d.value.name && d.value.name.charCodeAt(0) !== 91)) d.value = named(d.value, label);
       if (typeof d.get === 'function') d.get = named(d.get, 'get ' + label);
       if (typeof d.set === 'function') d.set = named(d.set, 'set ' + label);
       Object.defineProperty(I.prototype, k, d);
@@ -6183,7 +6185,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     } catch (e) {}
   };
 
-  // window is an EventTarget too.
+  // window is an EventTarget too. Таблица слушателей нужна окну всегда: с
+  // цепочкой из шаблона V8 методы окно наследует от EventTarget.prototype
+  // сразу, и ветка ниже не срабатывает.
+  if (!Object.prototype.hasOwnProperty.call(globalThis, '__ptLis')) {
+    try { Object.defineProperty(globalThis, '__ptLis', { value: Object.create(null), enumerable: false, writable: true, configurable: true }); } catch (e) {}
+  }
   if (!globalThis.addEventListener) {
     globalThis.__ptLis = Object.create(null);
     globalThis.addEventListener = Node.prototype.addEventListener.bind(globalThis);

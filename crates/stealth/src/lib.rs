@@ -684,9 +684,16 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   // `Object.keys(navigator)` is [], the prototype chain is correct, and
   // `navigator instanceof Navigator` holds. A plain object literal (the old
   // approach) fails all three, an instant headless tell.
-  const defClass = (name) => {
+  const defClass = (name, proto) => {
     const Ctor = __ptIllegal();
     try { Object.defineProperty(Ctor, "name", { value: name, configurable: true }); } catch (e) {}
+    // Прототип из шаблона V8 (неизменяемый, как у Chrome) — см. __pt_protoTemplates.
+    if (proto) {
+      try {
+        Ctor.prototype = proto;
+        Object.defineProperty(proto, 'constructor', { value: Ctor, writable: true, enumerable: false, configurable: true });
+      } catch (e) {}
+    }
     // Без этого `Object.prototype.toString.call(navigator)` отвечает
     // `[object Object]` вместо `[object Navigator]` — самая дешёвая проверка на
     // подделку из всех, и мы её не проходили.
@@ -768,7 +775,8 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   }
 
   // --- location (getters read a backing store the Rust driver updates) --
-  const LocationProto = defClass("Location");
+  const __T = (globalThis.__pt_protos !== undefined ? globalThis.__pt_protos : (() => { let t = null; try { if (typeof __pt_protoTemplates === 'function') t = __pt_protoTemplates() || null; } catch (e) {} try { Object.defineProperty(globalThis, '__pt_protos', { value: t, configurable: true }); } catch (e) {} return t; })());
+  const LocationProto = defClass("Location", __T && __T.loc);
   const locState = { href: "about:blank", protocol: "about:", host: "", hostname: "", port: "", pathname: "blank", search: "", hash: "", origin: "null" };
   // A page navigating itself is not a detail: `location.href = …`,
   // `location.replace(…)` and `location.reload()` are how a form handoff, an
@@ -807,7 +815,7 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   // именно им завершают себя многие потоки (в том числе челлендж Cloudflare).
   // Данным свойством окно ловило строку вместо объекта: адрес затирался,
   // перехода не было, и страница дальше жила со сломанным `location`.
-  const locationObject = Object.create(LocationProto);
+  const locationObject = (__T && __T.location && Object.getPrototypeOf(__T.location) === LocationProto) ? __T.location : Object.create(LocationProto);
   accessor(win, 'location', () => locationObject, (v) => {
     if (v !== locationObject) askNav(v, false);
   });
@@ -1233,6 +1241,9 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   };
   globalThis.setTimeout = (fn, delay, ...args) => add(fn, delay, false, args);
   globalThis.setInterval = (fn, delay, ...args) => add(fn, delay, true, args);
+  // У Chrome длина обоих — 1 (обязателен только обработчик).
+  try { Object.defineProperty(globalThis.setTimeout, 'length', { value: 1, configurable: true }); } catch (e) {}
+  try { Object.defineProperty(globalThis.setInterval, 'length', { value: 1, configurable: true }); } catch (e) {}
   globalThis.clearTimeout = (id) => { const t = q.get(id); if (t) t.cancelled = true; q.delete(id); };
   // Отдельная функция, а не тот же объект: у браузера clearTimeout !== clearInterval.
   globalThis.clearInterval = (id) => { const t = q.get(id); if (t) t.cancelled = true; q.delete(id); };
@@ -3090,7 +3101,13 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
   // 1. Уровень WorkerGlobalScope: то, что в браузере лежит на прототипе, туда и
   //    переезжает вместе со своей реализацией.
   const EventTargetProto = (globalThis.EventTarget && EventTarget.prototype) || Object.prototype;
-  const wgsProto = Object.create(EventTargetProto);
+  // Глобальный объект рождён шаблоном V8 и сменить прототип не даёт (как у
+  // Chrome): звенья окна (Window.prototype, WindowProperties) становятся
+  // звеньями воркера, очищенными от оконного.
+  const __T = globalThis.__pt_protos;
+  const __reuse = !!(__T && __T.w && Object.getPrototypeOf(globalThis) === __T.w && Object.getPrototypeOf(__T.wp) === EventTargetProto);
+  const __clear = (o) => {{ for (const k of Reflect.ownKeys(o)) {{ try {{ delete o[k]; }} catch (e) {{}} }} return o; }};
+  const wgsProto = __reuse ? __clear(__T.wp) : Object.create(EventTargetProto);
   for (const k of SCOPE) {{
     let d;
     try {{ d = Object.getOwnPropertyDescriptor(globalThis, k); }} catch (e) {{ continue; }}
@@ -3174,12 +3191,13 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
   try {{ Object.defineProperty(wgsProto, Symbol.toStringTag, {{ value: 'WorkerGlobalScope', configurable: true }}); }} catch (e) {{}}
   Object.defineProperty(wgsProto, 'self', {{ get: () => globalThis, enumerable: true, configurable: true }});
 
-  const dwgsProto = Object.create(wgsProto);
+  const dwgsProto = __reuse ? __clear(__T.w) : Object.create(wgsProto);
   const DedicatedWorkerGlobalScope = __ptName(__ptIllegal(), 'DedicatedWorkerGlobalScope');
   DedicatedWorkerGlobalScope.prototype = dwgsProto;
   Object.defineProperty(dwgsProto, 'constructor', {{ value: DedicatedWorkerGlobalScope, writable: true, configurable: true }});
-  Object.defineProperty(dwgsProto, 'TEMPORARY', {{ value: 0, enumerable: true, configurable: true }});
-  Object.defineProperty(dwgsProto, 'PERSISTENT', {{ value: 1, enumerable: true, configurable: true }});
+  // Константы интерфейса, как у Chrome: только чтение, неудаляемые.
+  try {{ Object.defineProperty(dwgsProto, 'TEMPORARY', {{ value: 0, writable: false, enumerable: true, configurable: false }}); }} catch (e) {{}}
+  try {{ Object.defineProperty(dwgsProto, 'PERSISTENT', {{ value: 1, writable: false, enumerable: true, configurable: false }}); }} catch (e) {{}}
   try {{ Object.defineProperty(dwgsProto, Symbol.toStringTag, {{ value: 'DedicatedWorkerGlobalScope', configurable: true }}); }} catch (e) {{}}
   globalThis.WorkerGlobalScope = WorkerGlobalScope;
   globalThis.DedicatedWorkerGlobalScope = DedicatedWorkerGlobalScope;
@@ -3487,11 +3505,16 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
     try { delete globalThis[name]; } catch (e) {}
   }
 
-  const windowProperties = Object.create(etProto);
+  // Глобальный объект рождён шаблоном Window: его цепочка уже стоит и
+  // неизменяема, как у Chrome, — берём её звенья, а не строим свои.
+  const T = (globalThis.__pt_protos !== undefined ? globalThis.__pt_protos : (() => { let t = null; try { if (typeof __pt_protoTemplates === 'function') t = __pt_protoTemplates() || null; } catch (e) {} try { Object.defineProperty(globalThis, '__pt_protos', { value: t, configurable: true }); } catch (e) {} return t; })());
+  const fromTemplate = !!(T && T.w && Object.getPrototypeOf(globalThis) === T.w && Object.getPrototypeOf(T.wp) === etProto);
+  const windowProperties = fromTemplate ? T.wp : Object.create(etProto);
+  if (fromTemplate) { try { delete windowProperties.constructor; } catch (e) {} }
   const Window = globalThis.Window && typeof globalThis.Window === 'function'
     ? globalThis.Window
     : native(__ptName(__ptIllegal(), 'Window'));
-  const winProto = Object.create(windowProperties);
+  const winProto = fromTemplate ? T.w : Object.create(windowProperties);
   for (const [name, fallback] of [['TEMPORARY', 0], ['PERSISTENT', 1]]) {
     let own;
     try { own = Object.getOwnPropertyDescriptor(globalThis, name); } catch (e) {}
@@ -4200,51 +4223,26 @@ __OPFS__
   const TrustedHTML = iface('TrustedHTML');
   const TrustedScript = iface('TrustedScript');
   const TrustedScriptURL = iface('TrustedScriptURL');
-  const wrapped = (C, s) => { const o = Object.create(C.prototype); VAL.set(o, String(s)); return o; };
+  const wrapped = (C, s) => {
+    let o = null;
+    if (C === TrustedScript && typeof globalThis.__pt_codeLike === 'function') {
+      try { o = __pt_codeLike(String(s)); Object.setPrototypeOf(o, C.prototype); } catch (e) { o = null; }
+    }
+    if (!o) o = Object.create(C.prototype);
+    VAL.set(o, String(s)); return o;
+  };
   for (const C of [TrustedHTML, TrustedScript, TrustedScriptURL]) {
     meth(C.prototype, 'toString', function () { return VAL.get(this); });
     meth(C.prototype, 'toJSON', function () { return VAL.get(this); });
   }
 
-  let sinksInstalled = false;
-  const installTrustedSinks = () => {
-    if (sinksInstalled) return;
-    sinksInstalled = true;
-    try {
-      const realEval = globalThis.eval;
-      if (typeof realEval === 'function') {
-        const W = function eval(x) {
-          if (x !== null && typeof x === 'object' && isTrustedScript(x)) return realEval(String(x));
-          return realEval.apply(this, arguments);
-        };
-        try { Object.defineProperty(W, 'length', { value: 1, configurable: true }); } catch (e) {}
-        Object.defineProperty(globalThis, 'eval', {
-          value: native(W), writable: true, enumerable: false, configurable: true,
-        });
-      }
-    } catch (e) {}
-    // Те же ворота у отложенного исполнения строки: с Trusted Types туда кладут
-    // TrustedScript, и браузер его принимает.
-    for (const name of ['setTimeout', 'setInterval']) {
-      try {
-        const real = globalThis[name];
-        if (typeof real !== 'function') continue;
-        const W = function (handler) {
-          if (handler !== null && typeof handler === 'object' && isTrustedScript(handler)) {
-            const args = Array.prototype.slice.call(arguments);
-            args[0] = String(handler);
-            return real.apply(this, args);
-          }
-          return real.apply(this, arguments);
-        };
-        try { Object.defineProperty(W, 'name', { value: name, configurable: true }); } catch (e) {}
-        try { Object.defineProperty(W, 'length', { value: real.length, configurable: true }); } catch (e) {}
-        Object.defineProperty(globalThis, name, {
-          value: native(W), writable: true, enumerable: true, configurable: true,
-        });
-      } catch (e) {}
-    }
-  };
+  // Ворота исполнения строки для TrustedScript — не обёртки над eval и
+  // таймерами (у обёртки свой `prototype`, её видит проверка родных функций
+  // челленджа, а обёрнутый eval перестаёт быть прямым): TrustedScript несёт
+  // свой текст скрытым полем (`__pt_codeLike`), и eval / new Function берут
+  // его сами через обработчик генерации кода; таймеры принимают его в своей
+  // очереди.
+  const installTrustedSinks = () => {};
 
   const isTrustedScript = (v) => { try { return v instanceof TrustedScript; } catch (e) { return false; } };
   const POL = new WeakMap();
@@ -6299,15 +6297,17 @@ const STACK_TEMPLATE: &str = r##"(() => {
   // прототипом свою же обёртку. Обход глобального графа делает ровно это со
   // всем подряд, и после него `Function.prototype.toString` уходил в
   // бесконечную цепочку прототипов.
+  // Взяты заранее: ловушка не должна звать то, что страница могла обернуть.
+  const __pxGPO = Reflect.getPrototypeOf, __pxSPO = Reflect.setPrototypeOf, __pxProxy = Proxy;
   Object.defineProperty(globalThis, '__pt_proxy', {
     value: (target, handler) => {
-      const px = new Proxy(target, handler);
+      const px = new __pxProxy(target, handler);
       handler.setPrototypeOf = (t, proto) => {
         for (let q = proto, i = 0; q !== null && q !== undefined && i < 100000; i++) {
           if (q === t || q === px) throw new TypeError('Cyclic __proto__ value');
-          q = Object.getPrototypeOf(q);
+          q = __pxGPO(q);
         }
-        return Reflect.setPrototypeOf(t, proto);
+        return __pxSPO(t, proto);
       };
       return px;
     },
@@ -7261,6 +7261,27 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         return !ev || !ev.defaultPrevented;
       }
     };
+    // Прототип EventTarget у Chrome неизменяем (цепочка окна): берём его из
+    // шаблона V8 (`__pt_protoTemplates`), члены класса переносим туда, а
+    // снаружи ставим строгую функцию, строящую экземпляр тем же классом.
+    const T = (globalThis.__pt_protos !== undefined ? globalThis.__pt_protos : (() => { let t = null; try { if (typeof __pt_protoTemplates === 'function') t = __pt_protoTemplates() || null; } catch (e) {} try { Object.defineProperty(globalThis, '__pt_protos', { value: t, configurable: true }); } catch (e) {} return t; })());
+    if (T && T.et) {
+      const C = globalThis.EventTarget, P = T.et, old = C.prototype;
+      for (const k of Reflect.ownKeys(old)) {
+        if (k === 'constructor') continue;
+        try { Object.defineProperty(P, k, Object.getOwnPropertyDescriptor(old, k)); } catch (e) {}
+      }
+      const F = (function () {
+        'use strict';
+        return function EventTarget() {
+          if (new.target === undefined) throw new TypeError("Failed to construct 'EventTarget': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+          return Reflect.construct(C, [], new.target);
+        };
+      })();
+      Object.defineProperty(F, 'prototype', { value: P, writable: false, enumerable: false, configurable: false });
+      Object.defineProperty(P, 'constructor', { value: F, writable: true, enumerable: false, configurable: true });
+      globalThis.EventTarget = globalThis.__pt_native ? __pt_native(F) : F;
+    }
   }
 
   // XHR так, как он устроен в браузере: состояние — в скрытой сумке, всё
@@ -8287,12 +8308,35 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // `Function.prototype.toString.toString()` reads native too, and `.name`/
   // `.length` are forwarded from the original (both preserved).
   const __ptNative = new WeakSet();
+  // Всё, чем пользуется ловушка, взято заранее: страница, обернувшая
+  // Reflect.apply или повесившая геттер `name` на функцию, иначе видела бы,
+  // что toString зовёт её код (у Chrome он не зовёт ничего).
+  const __ptRApply = Reflect.apply, __ptGOPD = Object.getOwnPropertyDescriptor;
+  // Для журналов холста/GL: склейка и хэш без единого вызова того, что
+  // страница может обернуть (Array.prototype.join, String.prototype.charCodeAt).
+  const __ptRA = Reflect.apply, __ptCCA = String.prototype.charCodeAt, __ptCCA1 = [0], __ptImul = Math.imul;
+  const __ptJ = function () {
+    let out = '';
+    for (let i = 0; i < arguments.length; i++) {
+      const v = arguments[i];
+      if (i) out += ',';
+      if (v === null || v === undefined) continue;
+      out += (typeof v === 'object' || typeof v === 'function' || typeof v === 'symbol') ? '[o]' : '' + v;
+    }
+    return out;
+  };
+  const __ptFnName = (f) => {
+    try {
+      const d = __ptGOPD(f, 'name');
+      return d && typeof d.value === 'string' ? d.value : '';
+    } catch (e) { return ''; }
+  };
   const __ptToStr = __pt_proxy(Function.prototype.toString, {
     apply(target, thisArg, args) {
       if (__ptNative.has(thisArg)) {
-        return 'function ' + ((thisArg && thisArg.name) || '') + '() { [native code] }';
+        return 'function ' + __ptFnName(thisArg) + '() { [native code] }';
       }
-      return Reflect.apply(target, thisArg, args);
+      return __ptRApply(target, thisArg, args);
     },
   });
   try {
@@ -8474,6 +8518,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // Цвет в четыре байта. Всё, что браузер понимает записью, понимаем и мы;
   // непонятое — не чёрный, а отказ: в браузере `fillStyle` тогда не меняется.
   const parseColorRaw = (c) => {
+    // Градиент или узор — не цвет; приводить объект к строке значило бы звать
+    // его toString (страница это видит).
+    if (c !== null && (typeof c === 'object' || typeof c === 'function')) return null;
     let t = String(c == null ? '' : c).trim().toLowerCase();
     if (!t) return null;
     if (t === 'transparent') return [0, 0, 0, 0];
@@ -8697,8 +8744,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     return {
       native: true,
       note(s) {
-        s = String(s);
-        for (let i = 0; i < s.length; i++) { ops ^= s.charCodeAt(i); ops = Math.imul(ops, 16777619) >>> 0; }
+        s = '' + s;
+        for (let i = 0; i < s.length; i++) { __ptCCA1[0] = i; ops ^= __ptRA(__ptCCA, s, __ptCCA1); ops = __ptImul(ops, 16777619) >>> 0; }
       },
       // Настоящая картинка на холсте. Байты остались в Rust — сюда едет только
       // адрес; если по нему ничего не декодировано, зовущий ставит свой штамп.
@@ -8776,8 +8823,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
     return {
       note(s) {
-        s = String(s);
-        for (let i = 0; i < s.length; i++) { ops ^= s.charCodeAt(i); ops = Math.imul(ops, 16777619) >>> 0; }
+        s = '' + s;
+        for (let i = 0; i < s.length; i++) { __ptCCA1[0] = i; ops ^= __ptRA(__ptCCA, s, __ptCCA1); ops = __ptImul(ops, 16777619) >>> 0; }
       },
       // Exact rendering, for the operations we can honour precisely.
       solid(x, y, w, h, rgba) {
@@ -8896,6 +8943,153 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     if (v == null || typeof v !== 'object') return String(v);
     try { return '<' + (Object.prototype.toString.call(v).slice(8, -1)) + (v.width ? ' ' + v.width + 'x' + v.height : '') + '>'; } catch (e) { return '<obj>'; }
   };
+  // Привязка WebIDL, как у Chrome: каждый довод преобразуется ровно один раз,
+  // по порядку, до вызова реализации; ошибки преобразования — с приставкой
+  // «Failed to execute 'x' on 'Y': ». Наша реализация звала toString/valueOf
+  // доводов по нескольку раз и не в том порядке, пропускала NaN там, где
+  // браузер бросает, и не проверяла перегрузки. Проверка родных функций в
+  // челлендже (секция oebe1) зовёт методы холста именно так.
+  const IDL = (() => {
+    const symMsg = (e) => e && (e.message === 'Cannot convert a Symbol value to a number' || e.message === 'Cannot convert a BigInt value to a number' || e.message === 'Cannot convert a Symbol value to a string');
+    const num = (x, pre) => { try { return +x; } catch (e) { if (e instanceof TypeError && symMsg(e)) throw new TypeError(pre + e.message); throw e; } };
+    const str = (x, pre) => { if (typeof x === 'symbol') throw new TypeError(pre + 'Cannot convert a Symbol value to a string'); try { return String(x); } catch (e) { if (e instanceof TypeError && symMsg(e)) throw new TypeError(pre + e.message); throw e; } };
+    const dbl = (x, pre) => { const v = num(x, pre); if (!Number.isFinite(v)) throw new TypeError(pre + 'The provided double value is non-finite.'); return v; };
+    const lng = (x, pre) => {
+      const v = num(x, pre);
+      if (Number.isNaN(v)) throw new TypeError(pre + "Value is not of type 'long'.");
+      if (!Number.isFinite(v)) throw new TypeError(pre + "Value is infinite and not of type 'long'.");
+      const t = Math.trunc(v);
+      if (t < -2147483648 || t > 2147483647) throw new TypeError(pre + "Value is outside the 'long' value range.");
+      return t === 0 ? 0 : t;
+    };
+    const rule = (x, pre) => { const v = str(x, pre); if (v !== 'nonzero' && v !== 'evenodd') throw new TypeError(pre + "The provided value '" + v + "' is not a valid enum value of type CanvasFillRule."); return v; };
+    const T = { u: num, d: dbl, L: lng, s: str, b: (x) => !!x, r: rule, a: (x) => x };
+    // Копия без Array.prototype.slice — его страница может обернуть.
+    const copy = (a) => { const o = []; for (let i = 0; i < a.length; i++) o[i] = a[i]; return o; };
+    // Сигнатура: буквы типов; `?` — необязательный (undefined не трогаем).
+    const run = (sig, args, pre) => {
+      const out = copy(args);
+      for (let i = 0, k = 0; k < sig.length; k++) {
+        const ch = sig[k];
+        if (ch === '?') continue;
+        const opt = sig[k + 1] === '?';
+        if (i >= args.length) break;
+        if (!(opt && args[i] === undefined)) out[i] = T[ch](args[i], pre);
+        i++;
+      }
+      return out;
+    };
+    const isA = (v, names) => {
+      for (let i = 0; i < names.length; i++) { const C = globalThis[names[i]]; try { if (typeof C === 'function' && v instanceof C) return true; } catch (e) {} }
+      return false;
+    };
+    const oneOf = (v, list) => { for (let i = 0; i < list.length; i++) if (list[i] === v) return true; return false; };
+    const IMG = ['HTMLCanvasElement', 'HTMLImageElement', 'HTMLVideoElement', 'ImageBitmap', 'OffscreenCanvas', 'SVGImageElement', 'VideoFrame', 'CSSImageValue'];
+    const imgCheck = (v, pre) => { if (!isA(v, IMG)) throw new TypeError(pre + "The provided value is not of type '(CSSImageValue or HTMLCanvasElement or HTMLImageElement or HTMLVideoElement or ImageBitmap or OffscreenCanvas or SVGImageElement or VideoFrame)'."); };
+    const isPath = (v) => isA(v, ['Path2D']);
+    const isImageData = (v) => isA(v, ['ImageData']);
+    const idx = (msg) => new DOMException(msg, 'IndexSizeError');
+    // fill/clip: при двух доводах и больше перегрузка одна — (Path2D, правило).
+    const fillLike = (a, pre) => {
+      if (a.length >= 2) {
+        if (!isPath(a[0])) throw new TypeError(pre + "parameter 1 is not of type 'Path2D'.");
+        return run('ar?', a, pre);
+      }
+      return a.length && isPath(a[0]) ? a : run('r?', a, pre);
+    };
+    const S = {
+      moveTo: 'uu', lineTo: 'uu', quadraticCurveTo: 'uuuu', bezierCurveTo: 'uuuuuu', rect: 'uuuu',
+      fillRect: 'uuuu', strokeRect: 'uuuu', clearRect: 'uuuu', scale: 'uu', translate: 'uu', rotate: 'u',
+      transform: 'uuuuuu', fillText: 'suuu?', strokeText: 'suuu?', measureText: 's',
+      createLinearGradient: 'dddd', createConicGradient: 'ddd',
+    };
+    const F = {
+      arcTo: (a, pre) => { const o = run('uuuuu', a, pre); if (o[4] < 0) throw idx(pre + 'The radius provided (' + o[4] + ') is negative.'); return o; },
+      arc: (a, pre) => { const o = run('uuuuub?', a, pre); if (o[2] < 0) throw idx(pre + 'The radius provided (' + o[2] + ') is negative.'); return o; },
+      ellipse: (a, pre) => {
+        const o = run('uuuuuuub?', a, pre);
+        if (o[2] < 0) throw idx(pre + 'The major-axis radius provided (' + o[2] + ') is negative.');
+        if (o[3] < 0) throw idx(pre + 'The minor-axis radius provided (' + o[3] + ') is negative.');
+        return o;
+      },
+      createRadialGradient: (a, pre) => {
+        const o = run('dddddd', a, pre);
+        if (o[2] < 0) throw idx(pre + 'The r0 provided is less than 0.');
+        if (o[5] < 0) throw idx(pre + 'The r1 provided is less than 0.');
+        return o;
+      },
+      fill: (a, pre) => fillLike(a, pre),
+      clip: (a, pre) => fillLike(a, pre),
+      stroke: (a, pre) => { if (a.length && !isPath(a[0])) throw new TypeError(pre + "parameter 1 is not of type 'Path2D'."); return a; },
+      isPointInPath: (a, pre) => {
+        if (a.length >= 4 && !isPath(a[0])) throw new TypeError(pre + "parameter 1 is not of type 'Path2D'.");
+        return isPath(a[0]) && a.length >= 3 ? run('auur?', a, pre) : run('uur?', a, pre);
+      },
+      isPointInStroke: (a, pre) => (isPath(a[0]) ? run('auu', a, pre) : run('uu', a, pre)),
+      setTransform: (a, pre) => {
+        if (a.length >= 6) return run('uuuuuu', a, pre);
+        const m = a[0];
+        if (m !== undefined && m !== null && typeof m !== 'object' && typeof m !== 'function') throw new TypeError(pre + "The provided value is not of type 'DOMMatrixInit'.");
+        if (a.length > 1) throw new TypeError(pre + "The provided value is not of type 'DOMMatrixInit'.");
+        return a;
+      },
+      getImageData: (a, pre) => { const o = run('LLLL', a, pre); return o; },
+      createImageData: (a, pre) => {
+        if (a.length === 1) { if (!isImageData(a[0])) throw new TypeError(pre + "parameter 1 is not of type 'ImageData'."); return a; }
+        return run('LL', a, pre);
+      },
+      putImageData: (a, pre) => {
+        if (!isImageData(a[0])) throw new TypeError(pre + "parameter 1 is not of type 'ImageData'.");
+        if (a.length > 3 && a.length < 7) throw new TypeError(pre + 'Overload resolution failed.');
+        return run(a.length >= 7 ? 'aLLLLLL' : 'aLL', a, pre);
+      },
+      drawImage: (a, pre) => {
+        const n = a.length;
+        if (n === 4 || (n > 5 && n < 9)) throw new TypeError(pre + 'Overload resolution failed.');
+        imgCheck(a[0], pre);
+        return run(n >= 9 ? 'auuuuuuuu' : n >= 5 ? 'auuuu' : 'auu', a, pre);
+      },
+      createPattern: (a, pre) => {
+        imgCheck(a[0], pre);
+        const o = copy(a);
+        o[1] = a[1] === null ? '' : str(a[1], pre);
+        if (!oneOf(o[1], ['', 'repeat', 'no-repeat', 'repeat-x', 'repeat-y'])) {
+          throw new DOMException(pre + "The provided type ('" + o[1] + "') is not one of 'repeat', 'no-repeat', 'repeat-x', or 'repeat-y'.", 'SyntaxError');
+        }
+        return o;
+      },
+      setLineDash: (a, pre) => {
+        const v = a[0];
+        if (v === null || (typeof v !== 'object' && typeof v !== 'function') || typeof v[Symbol.iterator] !== 'function') throw new TypeError(pre + 'The provided value cannot be converted to a sequence.');
+        const list = []; for (const x of v) list[list.length] = num(x, pre);
+        const o = copy(a); o[0] = list; return o;
+      },
+      roundRect: (a, pre) => {
+        const o = run('uuuu', a, pre);
+        if (a.length > 4 && a[4] !== undefined) {
+          const r = a[4];
+          const one = (x) => {
+            if (x !== null && typeof x === 'object') return x;
+            const v = num(x, pre);
+            if (v < 0) throw new RangeError(pre + 'Radius value ' + v + ' is negative.');
+            return v;
+          };
+          if (r !== null && typeof r === 'object' && typeof r[Symbol.iterator] === 'function') {
+            const list = []; for (const x of r) list[list.length] = one(x);
+            if (list.length < 1 || list.length > 4) throw new RangeError(pre + list.length + ' radii provided. Between one and four radii are necessary.');
+            o[4] = list;
+          } else o[4] = one(r);
+        }
+        return o;
+      },
+    };
+    return (name, iface, args) => {
+      const pre = "Failed to execute '" + name + "' on '" + iface + "': ";
+      if (F[name]) return F[name](args, pre);
+      if (S[name]) return run(S[name], args, pre);
+      return args;
+    };
+  })();
   const publishContext = (impl, C, methods, attrs) => {
     if (!C || !C.prototype) return impl;
     const P = C.prototype;
@@ -8907,9 +9101,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         // видна первой же проверкой. Заодно только собственный метод
         // реализации: иначе имя, которого у неё нет, найдёт на прототипе этот
         // же переходник и позовёт сам себя.
+        const IFACE = C.name;
         const f = ({
           [name](...args) {
             const t = ctxOf(this, P, name);
+            args = IDL(name, IFACE, args);
             const m = Object.prototype.hasOwnProperty.call(t, name) ? t[name] : null;
             if (globalThis.__pt_canvasTrace) ctrace(t, name + '(' + args.map(cshow).join(', ') + ')');
             return typeof m === 'function' ? m.apply(t, args) : undefined;
@@ -9238,7 +9434,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const makeGradient = (type, coords) => {
       const state = { type, coords, stops: [] };
       const add = (pos, color) => {
-        note('stop|' + [pos, color]);
+        // Проверки Chrome, в его порядке: число, диапазон, потом цвет.
+        const head = "Failed to execute 'addColorStop' on 'CanvasGradient': ";
+        const at = Number(pos);
+        if (!Number.isFinite(at)) throw new TypeError(head + 'The provided double value is non-finite.');
+        const cs = String(color);
+        if (at < 0 || at > 1) throw new DOMException(head + 'The provided value (' + at + ') is outside the range (0.0, 1.0).', 'IndexSizeError');
+        if (!parseColorRaw(cs)) throw new DOMException(head + "The value provided ('" + cs + "') could not be parsed as a color.", 'SyntaxError');
+        note('stop|' + __ptJ(pos, color));
         if (globalThis.__pt_canvasTrace) ctrace(impl, 'gradient.addColorStop(' + cshow(pos) + ', ' + cshow(color) + ')');
         state.stops.push([+pos || 0, parseColor(color)]);
       };
@@ -9300,7 +9503,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       shadowOffsetX: 0, shadowOffsetY: 0,
 
       fillRect(x, y, w, h) {
-        note('fillRect|' + [x, y, w, h, this.fillStyle]);
+        note('fillRect|' + __ptJ(x, y, w, h, this.fillStyle));
         const fs = this.fillStyle;
         const sh = shadowOf(this);
         const md = modeOf(this);
@@ -9320,7 +9523,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         }
       },
       clearRect(x, y, w, h) {
-        note('clearRect|' + [x, y, w, h]);
+        note('clearRect|' + __ptJ(x, y, w, h));
         solid(x, y, w, h, [0, 0, 0, 0]);
         if (plain() && (+x || 0) <= 0 && (+y || 0) <= 0 &&
             (+w || 0) >= (canvas.width | 0) && (+h || 0) >= (canvas.height | 0)) {
@@ -9328,7 +9531,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         }
       },
       strokeRect(x, y, w, h) {
-        note('strokeRect|' + [x, y, w, h, this.strokeStyle, this.lineWidth]);
+        note('strokeRect|' + __ptJ(x, y, w, h, this.strokeStyle, this.lineWidth));
         const X = +x || 0, Y = +y || 0, W2 = +w || 0, H2 = +h || 0;
         if (S.native) {
           S.strokePath(rectVerbs(X, Y, W2, H2),
@@ -9340,30 +9543,30 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         stamp(X, Y, W2, lw); stamp(X, Y + H2 - lw, W2, lw);
         stamp(X, Y, lw, H2); stamp(X + W2 - lw, Y, lw, H2);
       },
-      fillText(t, x, y) { note('fillText|' + [t, x, y, this.font, this.fillStyle, this.textAlign, this.textBaseline]); drawText.call(this, t, +x || 0, +y || 0, parseColor(this.fillStyle), false, this.fillStyle); },
-      strokeText(t, x, y) { note('strokeText|' + [t, x, y, this.font, this.strokeStyle]); drawText.call(this, t, +x || 0, +y || 0, parseColor(this.strokeStyle), true, this.strokeStyle); },
+      fillText(t, x, y) { note('fillText|' + __ptJ(t, x, y, this.font, this.fillStyle, this.textAlign, this.textBaseline)); drawText.call(this, t, +x || 0, +y || 0, parseColor(this.fillStyle), false, this.fillStyle); },
+      strokeText(t, x, y) { note('strokeText|' + __ptJ(t, x, y, this.font, this.strokeStyle)); drawText.call(this, t, +x || 0, +y || 0, parseColor(this.strokeStyle), true, this.strokeStyle); },
 
       beginPath() { note('beginPath'); bx0 = by0 = bx1 = by1 = 0; verbs = []; ops = []; sub = false; },
       closePath() { note('closePath'); closeV(); ops.push(4); },
-      moveTo(x, y) { note('moveTo|' + [x, y]); pathPoint(x, y); moveV(x, y); ops.push(0, +x, +y); },
-      lineTo(x, y) { note('lineTo|' + [x, y]); pathPoint(x, y); lineV(x, y); ops.push(1, +x, +y); },
+      moveTo(x, y) { note('moveTo|' + __ptJ(x, y)); pathPoint(x, y); moveV(x, y); ops.push(0, +x, +y); },
+      lineTo(x, y) { note('lineTo|' + __ptJ(x, y)); pathPoint(x, y); lineV(x, y); ops.push(1, +x, +y); },
       rect(x, y, w, h) {
-        note('rect|' + [x, y, w, h]);
+        note('rect|' + __ptJ(x, y, w, h));
         const X = +x || 0, Y = +y || 0, W2 = +w || 0, H2 = +h || 0;
         pathPoint(X, Y); pathPoint(X + W2, Y + H2);
         moveV(X, Y); lineV(X + W2, Y); lineV(X + W2, Y + H2); lineV(X, Y + H2); closeV();
         ops.push(7, +x, +y, +w, +h);
       },
       arc(x, y, r, a0, a1, ccw) {
-        note('arc|' + [x, y, r, a0, a1, ccw]);
+        note('arc|' + __ptJ(x, y, r, a0, a1, ccw));
         pathPoint((+x || 0) - (+r || 0), (+y || 0) - (+r || 0)); pathPoint((+x || 0) + (+r || 0), (+y || 0) + (+r || 0));
         arcV(x, y, r, +a0 || 0, a1 === undefined ? 2 * Math.PI : +a1, !!ccw);
         ops.push(5, +x, +y, +r, +a0, +a1, ccw ? 1 : 0);
       },
-      arcTo(x1, y1, x2, y2) { note('arcTo|' + [x1, y1, x2, y2]); pathPoint(x1, y1); pathPoint(x2, y2); lineV(x1, y1); lineV(x2, y2); ops.push(1, +x1, +y1, 1, +x2, +y2); },
+      arcTo(x1, y1, x2, y2) { note('arcTo|' + __ptJ(x1, y1, x2, y2)); pathPoint(x1, y1); pathPoint(x2, y2); lineV(x1, y1); lineV(x2, y2); ops.push(1, +x1, +y1, 1, +x2, +y2); },
       ellipse(x, y, rx, ry, rot, a0, a1, ccw) {
         needArgs(arguments.length, 7, 'ellipse', 'CanvasRenderingContext2D');
-        note('ellipse|' + [x, y, rx, ry]);
+        note('ellipse|' + __ptJ(x, y, rx, ry));
         pathPoint((+x || 0) - (+rx || 0), (+y || 0) - (+ry || 0)); pathPoint((+x || 0) + (+rx || 0), (+y || 0) + (+ry || 0));
         // Approximate as a circle of radius rx then squash y — good enough, deterministic.
         const X = +x || 0, Y = +y || 0, RX = +rx || 0, RY = +ry || 0;
@@ -9375,10 +9578,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           if (k === 0 && !sub) moveV(px, py); else lineV(px, py); }
         ops.push(6, +x, +y, +rx, +ry, +rot, +a0, +a1, ccw ? 1 : 0);
       },
-      bezierCurveTo(a, b, c, d, e, f) { note('bezierCurveTo|' + [a, b, c, d, e, f]); pathPoint(a, b); pathPoint(e, f); cubicV(+a || 0, +b || 0, +c || 0, +d || 0, +e || 0, +f || 0); ops.push(3, +a, +b, +c, +d, +e, +f); },
-      quadraticCurveTo(a, b, c, d) { note('quadraticCurveTo|' + [a, b, c, d]); pathPoint(a, b); pathPoint(c, d); quadV(+a || 0, +b || 0, +c || 0, +d || 0); ops.push(2, +a, +b, +c, +d); },
+      bezierCurveTo(a, b, c, d, e, f) { note('bezierCurveTo|' + __ptJ(a, b, c, d, e, f)); pathPoint(a, b); pathPoint(e, f); cubicV(+a || 0, +b || 0, +c || 0, +d || 0, +e || 0, +f || 0); ops.push(3, +a, +b, +c, +d, +e, +f); },
+      quadraticCurveTo(a, b, c, d) { note('quadraticCurveTo|' + __ptJ(a, b, c, d)); pathPoint(a, b); pathPoint(c, d); quadV(+a || 0, +b || 0, +c || 0, +d || 0); ops.push(2, +a, +b, +c, +d); },
       fill(rule) {
-        note('fill|' + this.fillStyle);
+        note('fill|' + __ptJ(this.fillStyle));
         if (!S.native) return paintPath();
         const fs = this.fillStyle;
         const sh = shadowOf(this);
@@ -9386,7 +9589,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         else S.fillOps(ops, M, String(rule) === 'evenodd', parseColor(fs), sh, modeOf(this));
       },
       stroke() {
-        note('stroke|' + [this.strokeStyle, this.lineWidth]);
+        note('stroke|' + __ptJ(this.strokeStyle, this.lineWidth));
         if (S.native) {
           const ss = this.strokeStyle, g = gradOf(ss);
           if (!S.strokeOps(ops, M, Math.max(0, +this.lineWidth || 1), g ? [0, 0, 0, 255] : parseColor(ss), g ? encodeGrad(g) : [], shadowOf(this), modeOf(this), capCode(this.lineCap), joinCode(this.lineJoin), +this.miterLimit || 10)) {
@@ -9412,15 +9615,15 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const t = CTX_IMPL.get(this) || this;
         for (const k of SAVED) t[k] = top.style[k];
       },
-      translate(x, y) { note('translate|' + [x, y]); mulM(1, 0, 0, 1, +x || 0, +y || 0); },
-      scale(x, y) { note('scale|' + [x, y]); mulM(+x || 0, 0, 0, +y || 0, 0, 0); },
+      translate(x, y) { note('translate|' + __ptJ(x, y)); mulM(1, 0, 0, 1, +x || 0, +y || 0); },
+      scale(x, y) { note('scale|' + __ptJ(x, y)); mulM(+x || 0, 0, 0, +y || 0, 0, 0); },
       rotate(a) {
         note('rotate|' + a);
         const r = +a || 0, c = Math.cos(r), n = Math.sin(r);
         mulM(c, n, -n, c, 0, 0);
       },
       setTransform(a, b, c, d, e, f) {
-        note('setTransform|' + [].slice.call(arguments));
+        note('setTransform|' + __ptRA(__ptJ, null, arguments));
         if (a && typeof a === 'object') {
           M = [+a.a || 0, +a.b || 0, +a.c || 0, +a.d || 0, +a.e || 0, +a.f || 0];
           return;
@@ -9428,7 +9631,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         M = arguments.length ? [+a || 0, +b || 0, +c || 0, +d || 0, +e || 0, +f || 0] : [1, 0, 0, 1, 0, 0];
       },
       transform(a, b, c, d, e, f) {
-        note('transform|' + [].slice.call(arguments));
+        note('transform|' + __ptRA(__ptJ, null, arguments));
         mulM(+a || 0, +b || 0, +c || 0, +d || 0, +e || 0, +f || 0);
       },
       resetTransform() { note('resetTransform'); M = [1, 0, 0, 1, 0, 0]; },
@@ -9437,7 +9640,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         return D ? new D([M[0], M[1], M[2], M[3], M[4], M[5]])
           : { a: M[0], b: M[1], c: M[2], d: M[3], e: M[4], f: M[5] };
       },
-      setLineDash(d) { note('setLineDash|' + d); }, getLineDash() { return []; },
+      setLineDash(d) { note('setLineDash|' + (d && typeof d === 'object' ? __ptRA(__ptJ, null, d) : __ptJ(d))); }, getLineDash() { return []; },
 
       drawImage(img, a1, a2, a3, a4, a5, a6, a7, a8) {
         needArgs(arguments.length, 3, 'drawImage', 'CanvasRenderingContext2D');
@@ -9460,7 +9663,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
             "HTMLImageElement or HTMLVideoElement or ImageBitmap or OffscreenCanvas or " +
             "SVGImageElement or VideoFrame)'.");
         }
-        note('drawImage|' + [sx, sy, sw, sh, x, y, w, h, img && (img.src || img.localName)]);
+        note('drawImage|' + __ptJ(sx, sy, sw, sh, x, y, w, h, img && (img.src || img.localName)));
         if (taints(img)) tainted = true;
         // Сперва настоящие пиксели: страница, которая рисует картинку и читает
         // холст обратно, должна увидеть картинку. Челлендж именно так читает
@@ -9478,7 +9681,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       },
       putImageData(data, x, y) {
         needArgs(arguments.length, 3, 'putImageData', 'CanvasRenderingContext2D');
-        note('putImageData|' + [x, y, data && data.width, data && data.height]);
+        note('putImageData|' + __ptJ(x, y, data && data.width, data && data.height));
         if (!data || !data.data) return;
         if (S.native) { S.put(data.data, x | 0, y | 0, data.width | 0, data.height | 0); return; }
         const p = S.pixels(), W = p.w, H = p.h, px = p.data;
@@ -9515,9 +9718,30 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       },
       getImageData(x, y, w, h) {
         needArgs(arguments.length, 4, 'getImageData', 'CanvasRenderingContext2D');
+        // Пятый довод — словарь ImageDataSettings; привязка Chrome проверяет его
+        // раньше всего остального: тип, затем перечисления по алфавиту.
+        if (arguments.length > 4) {
+          const st = arguments[4];
+          const head = "Failed to execute 'getImageData' on 'CanvasRenderingContext2D': ";
+          if (st !== undefined && st !== null && typeof st !== 'object' && typeof st !== 'function') {
+            throw new TypeError(head + "The provided value is not of type 'ImageDataSettings'.");
+          }
+          if (st) {
+            for (const [k, T, ok] of [['colorSpace', 'PredefinedColorSpace', ['srgb', 'display-p3']],
+                                      ['pixelFormat', 'ImageDataPixelFormat', ['rgba-unorm8', 'rgba-float16']]]) {
+              const v = st[k];
+              if (v === undefined) continue;
+              const sv = String(v);
+              if (ok.indexOf(sv) < 0) throw new TypeError(head + "Failed to read the '" + k + "' property from 'ImageDataSettings': The provided value '" + sv + "' is not a valid enum value of type " + T + '.');
+            }
+          }
+        }
         if (tainted) throw securityError('getImageData', 'CanvasRenderingContext2D',
           'The canvas has been tainted by cross-origin data.');
         w = w | 0; h = h | 0;
+        // Отрицательная ширина — прямоугольник в другую сторону, как у Chrome.
+        if (w < 0) { x = (x | 0) + w; w = -w; }
+        if (h < 0) { y = (y | 0) + h; h = -h; }
         if (w === 0) throw sizeError('getImageData', 'The source width is 0.');
         if (h === 0) throw sizeError('getImageData', 'The source height is 0.');
         const o = arguments.length > 4 ? arguments[4] : null;
@@ -9579,6 +9803,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       },
       createImageData(w, h) {
         needArgs(arguments.length, 1, 'createImageData', 'CanvasRenderingContext2D');
+        // Перегрузка с ImageData: пустая картинка того же размера и пространства.
+        if (arguments.length === 1 && w !== null && typeof w === 'object') {
+          const W = w.width | 0, H = w.height | 0;
+          return makeImageData(new Uint8ClampedArray(Math.max(0, W * H * 4)), W, H, w.colorSpace || CS, w.pixelFormat);
+        }
+        // Знак размера браузер отбрасывает: (-2, 3) — картинка 2×3.
+        if (typeof w === 'number' && w < 0) w = -w;
+        if (typeof h === 'number' && h < 0) h = -h;
         if ((w | 0) === 0) throw sizeError('createImageData', 'The source width is zero or not a number.');
         if (arguments.length > 1 && (h | 0) === 0) {
           throw sizeError('createImageData', 'The source height is zero or not a number.');
@@ -9592,8 +9824,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         return makeImageData(new Uint8ClampedArray(n), w | 0, h | 0,
           (o && o.colorSpace) || CS, o && o.pixelFormat);
       },
-      createLinearGradient(x0, y0, x1, y1) { note('linearGradient|' + [x0, y0, x1, y1]); return makeGradient(0, [+x0 || 0, +y0 || 0, +x1 || 0, +y1 || 0, 0, 0]); },
-      createRadialGradient(x0, y0, r0, x1, y1, r1) { note('radialGradient|' + [x0, y0, r0, x1, y1, r1]); return makeGradient(1, [+x0 || 0, +y0 || 0, +x1 || 0, +y1 || 0, +r0 || 0, +r1 || 0]); },
+      createLinearGradient(x0, y0, x1, y1) { note('linearGradient|' + __ptJ(x0, y0, x1, y1)); return makeGradient(0, [+x0 || 0, +y0 || 0, +x1 || 0, +y1 || 0, 0, 0]); },
+      createRadialGradient(x0, y0, r0, x1, y1, r1) { note('radialGradient|' + __ptJ(x0, y0, r0, x1, y1, r1)); return makeGradient(1, [+x0 || 0, +y0 || 0, +x1 || 0, +y1 || 0, +r0 || 0, +r1 || 0]); },
       createPattern(img, rep) {
         note('pattern|' + rep);
         return globalThis.__pt_makePattern ? __pt_makePattern({ img, repetition: rep }) : {};
@@ -9601,7 +9833,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // Конического градиента у нас не было вовсе — `undefined` там, где
       // браузер отдаёт объект.
       createConicGradient(angle, x, y) {
-        note('conicGradient|' + [angle, x, y]);
+        note('conicGradient|' + __ptJ(angle, x, y));
         return makeGradient(2, [+x || 0, +y || 0, 0, 0, +angle || 0, 0]);
       },
       getContextAttributes() {
@@ -10094,7 +10326,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       let clearRGBA = [0, 0, 0, 0];
       Object.assign(gl, {
         clearColor(r, g, b, a) {
-          S.note('clearColor|' + [r, g, b, a]);
+          S.note('clearColor|' + __ptJ(r, g, b, a));
           const q = (v) => Math.max(0, Math.min(255, Math.round((+v || 0) * 255)));
           clearRGBA = [q(r), q(g), q(b), q(a)];
         },
@@ -10102,23 +10334,23 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           S.note('clear|' + mask);
           if ((mask | 0) & C.COLOR_BUFFER_BIT) { const p = S.pixels(); S.solid(0, 0, p.w, p.h, clearRGBA); }
         },
-        viewport(x, y, w, h) { vp = [x | 0, y | 0, w | 0, h | 0]; S.note('viewport|' + [x, y, w, h]); },
-        shaderSource(sh, src) { S.note('shaderSource|' + src); },
-        bufferData(target, data) { S.note('bufferData|' + [target, data && (data.length || data.byteLength)]); },
+        viewport(x, y, w, h) { vp = [x | 0, y | 0, w | 0, h | 0]; S.note('viewport|' + __ptJ(x, y, w, h)); },
+        shaderSource(sh, src) { S.note('shaderSource|' + __ptJ(src)); },
+        bufferData(target, data) { S.note('bufferData|' + __ptJ(target, data && (data.length || data.byteLength))); },
         uniform1f(l, v) { S.note('uniform1f|' + v); },
         uniform2f(l, a, b) { S.note('uniform2f|' + [a, b]); },
         uniform3f(l, a, b, c2) { S.note('uniform3f|' + [a, b, c2]); },
         uniform4f(l, a, b, c2, d) { S.note('uniform4f|' + [a, b, c2, d]); },
         drawArrays(mode, first, count) {
-          S.note('drawArrays|' + [mode, first, count]);
+          S.note('drawArrays|' + __ptJ(mode, first, count));
           const p = S.pixels(); S.stamp(0, 0, p.w, p.h);
         },
         drawElements(mode, count, type, offset) {
-          S.note('drawElements|' + [mode, count, type, offset]);
+          S.note('drawElements|' + __ptJ(mode, count, type, offset));
           const p = S.pixels(); S.stamp(0, 0, p.w, p.h);
         },
         readPixels(x, y, w, h, format, type, dst) {
-          S.note('readPixels|' + [x, y, w, h, format, type]);
+          S.note('readPixels|' + __ptJ(x, y, w, h, format, type));
           w = w | 0; h = h | 0;
           if (dst && dst.length >= w * h * 4) S.read(x, y, w, h, dst);
           // Пиксели уходят в переданный массив; сам вызов — undefined.

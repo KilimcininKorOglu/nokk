@@ -146,7 +146,7 @@ pub fn build_snapshot(bootstrap: &str) -> Result<usize, String> {
         let mut iso = v8::Isolate::new(v8::CreateParams::default());
         let names = {
             v8::scope!(scope, &mut iso);
-            let context = v8::Context::new(scope, v8::ContextOptions::default());
+            let context = crate::natives::new_page_context(scope);
             let scope = &mut v8::ContextScope::new(scope, context);
             let names = run_script(scope, GLOBAL_NAMES).unwrap_or_default();
             crate::natives::install(scope);
@@ -176,11 +176,13 @@ pub fn build_snapshot(bootstrap: &str) -> Result<usize, String> {
     let blob = {
         let _guard = CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut iso = v8::Isolate::snapshot_creator(Some(refs), None);
-        {
+        // Ошибка загрузчика не должна ронять процесс: изолят-создатель снимка
+        // обязан закончить create_blob, иначе rusty_v8 паникует при сбросе.
+        let built: Result<(), String> = (|| {
             v8::scope!(scope, &mut iso);
             let default = v8::Context::new(scope, v8::ContextOptions::default());
             scope.set_default_context(default);
-            let context = v8::Context::new(scope, v8::ContextOptions::default());
+            let context = crate::natives::new_page_context(scope);
             {
                 let cs = &mut v8::ContextScope::new(scope, context);
                 let here: Vec<String> = serde_json::from_str(&run_script(cs, GLOBAL_NAMES)?).unwrap_or_default();
@@ -200,8 +202,12 @@ pub fn build_snapshot(bootstrap: &str) -> Result<usize, String> {
                 let _ = run_script(cs, NORMALIZE_FOR_SNAPSHOT);
             }
             scope.add_context(context);
-        }
-        iso.create_blob(v8::FunctionCodeHandling::Clear).ok_or_else(|| "snapshot blob failed".to_string())?
+            Ok(())
+        })();
+        crate::natives::drop_proto_templates(&mut iso);
+        let blob = iso.create_blob(v8::FunctionCodeHandling::Clear);
+        built?;
+        blob.ok_or_else(|| "snapshot blob failed".to_string())?
     };
     let data: &'static [u8] = Box::leak(blob.to_vec().into_boxed_slice());
     let size = data.len();
@@ -528,7 +534,7 @@ impl Isolate {
                     let _ = run_script(scope, AFTER_SNAPSHOT);
                     global
                 } else {
-                    let context = v8::Context::new(scope, v8::ContextOptions::default());
+                    let context = crate::natives::new_page_context(scope);
                     let global = v8::Global::new(scope, context);
                     let scope = &mut v8::ContextScope::new(scope, context);
                     crate::natives::install(scope);
@@ -570,7 +576,7 @@ impl Isolate {
                     let _ = run_script(scope, AFTER_SNAPSHOT);
                     global
                 } else {
-                    let context = v8::Context::new(scope, v8::ContextOptions::default());
+                    let context = crate::natives::new_page_context(scope);
                     let global = v8::Global::new(scope, context);
                     let scope = &mut v8::ContextScope::new(scope, context);
                     crate::natives::install(scope);
@@ -646,7 +652,7 @@ impl Isolate {
             v8::scope!(scope, &mut self.isolate);
             let snapped = context_from_snapshot(scope, bootstrap);
             let from_snapshot = snapped.is_some();
-            let context = snapped.unwrap_or_else(|| v8::Context::new(scope, v8::ContextOptions::default()));
+            let context = snapped.unwrap_or_else(|| crate::natives::new_page_context(scope));
             let global = v8::Global::new(scope, context);
             let scope = &mut v8::ContextScope::new(scope, context);
             if from_snapshot {
@@ -1138,10 +1144,21 @@ fn compile_module<'s>(
 /// Что компилировать вместо строки `eval`/`Function` в контексте с CSP без
 /// 'unsafe-eval': выражение, бросающее EvalError с текстом из
 /// `globalThis.__pt_cspEval`. Без такого текста — исходник как есть.
+fn trusted_script_text<'s>(scope: &mut v8::PinScope<'s, '_>, source: v8::Local<'s, v8::Value>) -> Option<v8::Local<'s, v8::String>> {
+    if source.is_string() || !source.is_object() {
+        return None;
+    }
+    let obj = source.to_object(scope)?;
+    let name = v8::String::new(scope, crate::natives::TRUSTED_SCRIPT_KEY)?;
+    let key = v8::Private::for_api(scope, Some(name));
+    let v = obj.get_private(scope, key)?;
+    if v.is_string() { v.to_string(scope) } else { None }
+}
+
 fn modify_codegen<'s, 'i>(
     scope: &mut v8::PinScope<'s, 'i>,
-    _source: v8::Local<'s, v8::Value>,
-    _is_code_like: bool,
+    source: v8::Local<'s, v8::Value>,
+    is_code_like: bool,
 ) -> v8::ModifyCodeGenerationFromStringsResult<'s> {
     let context = scope.get_current_context();
     let global = context.global(scope);
@@ -1151,7 +1168,11 @@ fn modify_codegen<'s, 'i>(
         .map(|v| v.to_rust_string_lossy(scope))
         .filter(|m| !m.is_empty());
     let Some(msg) = msg else {
-        return v8::ModifyCodeGenerationFromStringsResult { codegen_allowed: true, modified_source: None };
+        // TrustedScript исполняется своим текстом (скрытое поле, см.
+        // natives::TRUSTED_SCRIPT_KEY); прочие объекты eval возвращает как есть.
+        let _ = is_code_like;
+        let modified = trusted_script_text(scope, source);
+        return v8::ModifyCodeGenerationFromStringsResult { codegen_allowed: true, modified_source: modified };
     };
     let mut quoted = String::with_capacity(msg.len() + 2);
     quoted.push('"');

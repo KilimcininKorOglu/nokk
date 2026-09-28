@@ -9830,7 +9830,11 @@ mod tests {
         let out = probe(&ctx, r#"(() => {
             const p = trustedTypes.createPolicy('nokk-eval', { createScript: (s) => s });
             const code = p.createScript('function __declared(){ return 42 }');
-            eval(code);
+            // Как у Chrome: косвенный eval объявляет глобально, прямой видит
+            // локальную область (обёртка над eval делала прямой вызов косвенным).
+            (0, eval)(code);
+            const local = 5;
+            const direct = eval(p.createScript('local * 2'));
             let timer = 'no';
             try { setTimeout(p.createScript('globalThis.__fromTimer = 1'), 0); timer = 'accepted'; }
             catch (e) { timer = 'THREW ' + e.name; }
@@ -9843,10 +9847,14 @@ mod tests {
               native: /native code/.test(Function.prototype.toString.call(eval)),
               enumerable: Object.keys(globalThis).indexOf('eval') >= 0,
               timer,
+              direct,
+              evalOwn: Reflect.ownKeys(eval).join(','),
             });
         })()"#).await;
 
         assert_eq!(out["kind"], "[object TrustedScript]");
+        assert_eq!(out["direct"], 10, "a direct eval of a TrustedScript sees the local scope");
+        assert_eq!(out["evalOwn"], "length,name", "eval stays the engine's own function");
         assert_eq!(out["declared"], "function", "the declaration reached the global scope");
         assert_eq!(out["value"], 42);
         assert_eq!(out["plain"], 2, "a plain string still evaluates");

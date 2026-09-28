@@ -46,6 +46,8 @@ pub struct SpareContexts(pub Vec<v8::Global<v8::Context>>);
 /// Install every native binding on the current context's global object.
 pub fn install(scope: &mut v8::PinScope) {
     bind(scope, "__pt_makeRealm", make_realm);
+    bind(scope, "__pt_protoTemplates", proto_templates_js);
+    bind(scope, "__pt_codeLike", code_like_js);
     bind(scope, "__pt_randomBytes", random_bytes);
     bind(scope, "__pt_digest", digest);
     bind(scope, "__pt_hmac", hmac_sign);
@@ -1738,7 +1740,7 @@ fn make_realm(
         None
     };
     let from_snapshot = snapped.is_some();
-    let context = snapped.unwrap_or_else(|| v8::Context::new(scope, v8::ContextOptions::default()));
+    let context = snapped.unwrap_or_else(|| new_page_context(scope));
     // Same origin, in V8's own terms: without a shared security token every
     // property read across the boundary answers "no access", which is exactly
     // what a *cross*-origin frame should do and precisely wrong for this one.
@@ -2383,4 +2385,168 @@ fn hrtime(
     let start = START.get_or_init(std::time::Instant::now);
     let ms = start.elapsed().as_nanos() as f64 / 1.0e6;
     rv.set(v8::Number::new(scope, ms).into());
+}
+
+// ---- неизменяемые прототипы ---------------------------------------------
+//
+// У Chrome прототип нельзя сменить у окна, Window.prototype, WindowProperties,
+// EventTarget.prototype, location и Location.prototype: `Object.setPrototypeOf`
+// бросает «Immutable prototype object '#<Window>' cannot have their prototype
+// set», а тот же прототип принимает молча. Обход графа в челлендже (секция
+// oebe1) проверяет это на каждом объекте. Из JS такой объект не сделать —
+// только шаблоном V8, как делает Blink: прототипы рождаются из цепочки
+// FunctionTemplate (EventTarget ← WindowProperties ← Window), глобальный
+// объект — из шаблона экземпляра Window.
+
+struct ProtoTemplates {
+    et: v8::Global<v8::FunctionTemplate>,
+    wp: v8::Global<v8::FunctionTemplate>,
+    w: v8::Global<v8::FunctionTemplate>,
+    loc: v8::Global<v8::FunctionTemplate>,
+}
+
+fn note_ref(p: usize) {
+    if let Ok(mut v) = NATIVE_REFS.lock() {
+        if !v.contains(&p) {
+            v.push(p);
+        }
+    }
+}
+
+/// Функции шаблонов странице не видны (у интерфейсов свои фасады), но
+/// конструктором быть не должны.
+fn template_ctor(scope: &mut v8::PinScope, _args: v8::FunctionCallbackArguments, _rv: v8::ReturnValue) {
+    if let Some(msg) = v8::String::new(scope, "Illegal constructor") {
+        let err = v8::Exception::type_error(scope, msg);
+        scope.throw_exception(err);
+    }
+}
+
+/// WindowProperties у Chrome — объект именованных свойств: своё свойство на
+/// нём не заводится («Named property setter is not supported»).
+fn named_props_definer<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    key: v8::Local<'s, v8::Name>,
+    _desc: &v8::PropertyDescriptor,
+    args: v8::PropertyCallbackArguments<'s>,
+    _rv: v8::ReturnValue<v8::Boolean>,
+) -> v8::Intercepted {
+    // Отказ — только пока объект и есть WindowProperties: воркер берёт это
+    // же звено под WorkerGlobalScope.prototype (сняв метку) и заводит на нём
+    // свои члены.
+    let tag = v8::Symbol::get_to_string_tag(scope);
+    let is_wp = args
+        .holder()
+        .get(scope, tag.into())
+        .is_some_and(|v| v.is_string() && v.to_rust_string_lossy(scope) == "WindowProperties");
+    if !is_wp {
+        return v8::Intercepted::kNo;
+    }
+    let name = key.to_rust_string_lossy(scope);
+    let text = format!("Failed to set a named property '{name}' on 'WindowProperties': Named property setter is not supported.");
+    if let Some(msg) = v8::String::new(scope, &text) {
+        let err = v8::Exception::type_error(scope, msg);
+        scope.throw_exception(err);
+    }
+    v8::Intercepted::kYes
+}
+
+fn build_proto_templates(scope: &mut v8::PinScope<'_, '_, ()>) -> ProtoTemplates {
+    use v8::MapFnTo;
+    let ctor: v8::FunctionCallback = template_ctor.map_fn_to();
+    note_ref(ctor as usize);
+    let definer: v8::NamedPropertyDefinerCallback = named_props_definer.map_fn_to();
+    note_ref(definer as usize);
+    let et = v8::FunctionTemplate::new_raw(scope, ctor);
+    et.prototype_template(scope).set_immutable_proto();
+    let wp = v8::FunctionTemplate::new_raw(scope, ctor);
+    wp.inherit(et);
+    let wpt = wp.prototype_template(scope);
+    wpt.set_immutable_proto();
+    wpt.set_named_property_handler(
+        v8::NamedPropertyHandlerConfiguration::new()
+            .definer_raw(definer)
+            .flags(v8::PropertyHandlerFlags::ONLY_INTERCEPT_STRINGS | v8::PropertyHandlerFlags::NON_MASKING),
+    );
+    // Имени класса у Window нет намеренно: V8 назвал бы им и глобальный
+    // объект воркера. Без него имя в сообщении берётся из метки прототипа —
+    // «Window» в окне, «DedicatedWorkerGlobalScope» в воркере.
+    let w = v8::FunctionTemplate::new_raw(scope, ctor);
+    w.inherit(wp);
+    w.prototype_template(scope).set_immutable_proto();
+    w.instance_template(scope).set_immutable_proto();
+    let loc = v8::FunctionTemplate::new_raw(scope, ctor);
+    loc.prototype_template(scope).set_immutable_proto();
+    loc.instance_template(scope).set_immutable_proto();
+    ProtoTemplates {
+        et: v8::Global::new(scope, et),
+        wp: v8::Global::new(scope, wp),
+        w: v8::Global::new(scope, w),
+        loc: v8::Global::new(scope, loc),
+    }
+}
+
+fn proto_templates_ready(scope: &mut v8::PinScope<'_, '_, ()>) {
+    if scope.get_slot::<std::rc::Rc<ProtoTemplates>>().is_none() {
+        let t = build_proto_templates(scope);
+        scope.set_slot(std::rc::Rc::new(t));
+    }
+}
+
+/// Снять шаблоны с изолята: создатель снимка не принимает живых глобальных
+/// ручек (сами шаблоны уходят в снимок через объекты контекста).
+pub(crate) fn drop_proto_templates(iso: &mut v8::Isolate) {
+    let _ = iso.remove_slot::<std::rc::Rc<ProtoTemplates>>();
+}
+
+/// Контекст страницы: глобальный объект — из шаблона Window (прототип
+/// неизменяем, цепочка Window → WindowProperties → EventTarget готова).
+pub(crate) fn new_page_context<'s>(scope: &mut v8::PinScope<'s, '_, ()>) -> v8::Local<'s, v8::Context> {
+    proto_templates_ready(scope);
+    let t = scope.get_slot::<std::rc::Rc<ProtoTemplates>>().cloned();
+    let global = t.map(|t| {
+        let w = v8::Local::new(scope, &t.w);
+        w.instance_template(scope)
+    });
+    v8::Context::new(scope, v8::ContextOptions { global_template: global, ..Default::default() })
+}
+
+/// `__pt_protoTemplates()` → `{et, wp, w, loc, location}`: прототипы из
+/// шаблонов этого контекста и экземпляр Location. Зовётся загрузчиком один раз.
+fn proto_templates_js(scope: &mut v8::PinScope, _args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
+    let Some(t) = scope.get_slot::<std::rc::Rc<ProtoTemplates>>().cloned() else {
+        return;
+    };
+    let out = v8::Object::new(scope);
+    let proto_key = v8::String::new(scope, "prototype").unwrap();
+    for (name, g) in [("et", &t.et), ("wp", &t.wp), ("w", &t.w), ("loc", &t.loc)] {
+        let ft = v8::Local::new(scope, g);
+        let Some(f) = ft.get_function(scope) else { return };
+        let Some(p) = f.get(scope, proto_key.into()) else { return };
+        let k = v8::String::new(scope, name).unwrap();
+        out.set(scope, k.into(), p);
+        if name == "loc" {
+            // Шаблон экземпляра, а не вызов функции: та бросает «Illegal constructor».
+            if let Some(inst) = ft.instance_template(scope).new_instance(scope) {
+                let k = v8::String::new(scope, "location").unwrap();
+                out.set(scope, k.into(), inst.into());
+            }
+        }
+    }
+    rv.set(out.into());
+}
+
+/// Скрытое поле TrustedScript: текст сценария. Его читает обработчик
+/// генерации кода (isolate.rs), не исполняя JS.
+pub(crate) const TRUSTED_SCRIPT_KEY: &str = "nokk::trustedScript";
+
+/// `__pt_codeLike(text)` → пустой объект, несущий текст сценария скрыто: eval и
+/// new Function исполняют его как строку (из него загрузчик делает TrustedScript).
+fn code_like_js(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
+    let Some(text) = args.get(0).to_string(scope) else { return };
+    let o = v8::Object::new(scope);
+    let Some(name) = v8::String::new(scope, TRUSTED_SCRIPT_KEY) else { return };
+    let key = v8::Private::for_api(scope, Some(name));
+    o.set_private(scope, key, text.into());
+    rv.set(o.into());
 }
