@@ -2183,6 +2183,13 @@
   }
   evtAccessors(CustomEvent, ['detail']);
 
+  // Событие потери/восстановления контекста WebGL: заглушка таблицы форм
+  // падала на словаре параметров ('statusMessage').
+  class WebGLContextEvent extends Event {
+    constructor(type, init) { super(type, init); this.__ptE.statusMessage = init && init.statusMessage !== undefined ? String(init.statusMessage) : ''; }
+  }
+  evtAccessors(WebGLContextEvent, ['statusMessage']);
+
   class UIEvent extends Event {
     constructor(type, init) {
       super(type, init); init = init || {};
@@ -2248,6 +2255,7 @@
         twist: init.twist || 0,
         altitudeAngle: init.altitudeAngle === undefined ? Math.PI / 2 : init.altitudeAngle,
         azimuthAngle: init.azimuthAngle || 0,
+        persistentDeviceId: init.persistentDeviceId || 0,
       });
     }
     // Список слитых событий у ненастоящего события пуст — это его и выдаёт.
@@ -2255,7 +2263,7 @@
     getPredictedEvents() { return []; }
   }
   evtAccessors(PointerEvent, ['pointerId', 'pointerType', 'isPrimary', 'width', 'height',
-    'pressure', 'tangentialPressure', 'tiltX', 'tiltY', 'twist', 'altitudeAngle', 'azimuthAngle']);
+    'pressure', 'tangentialPressure', 'tiltX', 'tiltY', 'twist', 'altitudeAngle', 'azimuthAngle', 'persistentDeviceId']);
 
   class KeyboardEvent extends UIEvent {
     constructor(type, init) {
@@ -2265,24 +2273,25 @@
         keyCode: init.keyCode || 0, which: init.keyCode || 0, charCode: init.charCode || 0,
         location: init.location || 0, repeat: !!init.repeat,
         ctrlKey: !!init.ctrlKey, shiftKey: !!init.shiftKey,
-        altKey: !!init.altKey, metaKey: !!init.metaKey,
+        altKey: !!init.altKey, metaKey: !!init.metaKey, isComposing: !!init.isComposing,
       });
     }
     getModifierState(k) { return modifierState.call(this, k); }
   }
   evtAccessors(KeyboardEvent, ['key', 'code', 'keyCode', 'which', 'charCode',
-    'location', 'repeat'].concat(MODS));
+    'location', 'repeat', 'isComposing'].concat(MODS));
 
   class InputEvent extends UIEvent {
     constructor(type, init) {
       super(type, init); init = init || {};
       Object.assign(this.__ptE, {
         data: init.data == null ? null : String(init.data),
-        inputType: init.inputType || '', isComposing: false,
+        inputType: init.inputType || '', isComposing: !!init.isComposing,
+        dataTransfer: init.dataTransfer || null,
       });
     }
   }
-  evtAccessors(InputEvent, ['data', 'inputType', 'isComposing']);
+  evtAccessors(InputEvent, ['data', 'inputType', 'isComposing', 'dataTransfer']);
 
   class FocusEvent extends UIEvent {
     constructor(type, init) { super(type, init); this.__ptE.relatedTarget = (init && init.relatedTarget) || null; }
@@ -2297,9 +2306,10 @@
       this.__ptE.lastEventId = init.lastEventId || '';
       this.__ptE.source = init.source || null;
       this.__ptE.ports = init.ports || [];
+      this.__ptE.userActivation = null;
     }
   }
-  evtAccessors(MessageEvent, ['data', 'origin', 'lastEventId', 'source', 'ports']);
+  evtAccessors(MessageEvent, ['data', 'origin', 'lastEventId', 'source', 'ports', 'userActivation']);
 
   for (const [n, C] of [['UIEvent', UIEvent], ['MouseEvent', MouseEvent], ['PointerEvent', PointerEvent],
     ['KeyboardEvent', KeyboardEvent], ['InputEvent', InputEvent], ['FocusEvent', FocusEvent],
@@ -2460,6 +2470,9 @@
           + t + "' is not a valid enum value of type OffscreenRenderingContextType.");
       }
       const c = this.__ptO.c;
+      // Внутренний холст знает своего офскрина: `ctx.canvas` отдаёт его, а не
+      // спрятанный <canvas>, и события контекста (потеря WebGL) идут ему.
+      if (c && !c.__ptOwner) { try { Object.defineProperty(c, '__ptOwner', { value: this, configurable: true }); } catch (e) {} }
       const orig = globalThis.__pt_canvasOrig;
       const get = (orig && orig.getContext) || (c && c.getContext);
       const g = c && get ? get.call(c, t, attrs) : null;
@@ -5638,6 +5651,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   globalThis.Document = Document;
   globalThis.Event = Event;
   globalThis.CustomEvent = CustomEvent;
+  globalThis.WebGLContextEvent = WebGLContextEvent;
   globalThis.DocumentFragment = DocumentFragment;
   document.__ptView = globalThis;
 

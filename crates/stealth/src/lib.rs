@@ -1886,6 +1886,7 @@ pub fn naturalize_script() -> String {
         .replace("__SKIP__", &skip)
         .replace("__BRAND_EXCEPTIONS__", BRAND_EXCEPTIONS)
         .replace("__CTOR_TABLE__", CTOR_TABLE)
+        .replace("__EVENT_DEFAULTS__", EVENT_DEFAULTS)
         .replace("__METHOD_LENGTHS__", METHOD_LENGTHS)
         .replace("__BRAND_TRACE__", if std::env::var_os("NOKK_TRACE_BRAND").is_some() { "true" } else { "false" })
 }
@@ -1898,6 +1899,9 @@ const BRAND_EXCEPTIONS: &str = include_str!("brand_exceptions.json");
 /// доводов (`illegal`, `args:N`, `ok`) и на вызов без `new` (`illegal`,
 /// `nonew`). Снято `scratchpad/ctorsweep.js`.
 const CTOR_TABLE: &str = include_str!("ctor_table.json");
+/// Значения полей событий Chrome 151 по умолчанию (`new X('t')` без словаря)
+/// — снято `scratchpad/evdef.js`.
+const EVENT_DEFAULTS: &str = include_str!("event_defaults.json");
 /// Длины методов на прототипах интерфейсов Chrome 151 (`Iface.method` →
 /// число обязательных доводов); у нас 262 из 1115 были не те.
 const METHOD_LENGTHS: &str = include_str!("method_lengths.json");
@@ -2074,6 +2078,80 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
   // настоящего класса; движок внутри держит сам класс. У нас `new Node()`
   // строил узел, а `Event()` без `new` — событие: 719 и 648 таких случаев.
   const CT = __CTOR_TABLE__;
+  // Взято заранее: фасад конструктора не должен звать то, что страница
+  // может обернуть.
+  const RC = Reflect.construct, GPO = Object.getPrototypeOf, GOPD = Object.getOwnPropertyDescriptor;
+  // События-заглушки (ErrorEvent, ProgressEvent, WheelEvent… — 79 из 93)
+  // строились без состояния события, и первое же `e.type` бросало. Строим
+  // через ближайшего настоящего предка (Event, UIEvent, MouseEvent…), а поля
+  // словаря кладём в свойства интерфейса.
+  const REAL_EVENT = new Map();
+  const isRealEvent = (K) => {
+    if (REAL_EVENT.has(K)) return REAL_EVENT.get(K);
+    let ok = false;
+    try { const o = RC(K, ['x'], K); ok = !!(o && o.__ptE); } catch (e) { ok = false; }
+    REAL_EVENT.set(K, ok);
+    return ok;
+  };
+  // Обязательные члены словарей событий — у Chrome без них конструктор
+  // отказывает (снято со всех событий окна).
+  const EV_REQUIRED = {"WindowControlsOverlayGeometryChangeEvent":["titlebarAreaRect","WindowControlsOverlayGeometryChangeEventInit"],"TaskPriorityChangeEvent":["previousPriority","TaskPriorityChangeEventInit"],"RTCTrackEvent":["receiver","RTCTrackEventInit"],"RTCPeerConnectionIceErrorEvent":["errorCode","RTCPeerConnectionIceErrorEventInit"],"RTCErrorEvent":["error","RTCErrorEventInit"],"RTCDataChannelEvent":["channel","RTCDataChannelEventInit"],"PromiseRejectionEvent":["promise","PromiseRejectionEventInit"],"PictureInPictureEvent":["pictureInPictureWindow","PictureInPictureEventInit"],"OfflineAudioCompletionEvent":["renderedBuffer","OfflineAudioCompletionEventInit"],"NavigationCurrentEntryChangeEvent":["from","NavigationCurrentEntryChangeEventInit"],"NavigateEvent":["destination","NavigateEventInit"],"MediaStreamTrackEvent":["track","MediaStreamTrackEventInit"],"FormDataEvent":["formData","FormDataEventInit"],"BlobEvent":["data","BlobEventInit"],"AudioProcessingEvent":["inputBuffer","AudioProcessingEventInit"],"GPUUncapturedErrorEvent":["error","GPUUncapturedErrorEventInit"],"MediaKeyMessageEvent":["message","MediaKeyMessageEventInit"],"SensorErrorEvent":["error","SensorErrorEventInit"],"HIDConnectionEvent":["device","HIDConnectionEventInit"],"PresentationConnectionAvailableEvent":["connection","PresentationConnectionAvailableEventInit"],"PresentationConnectionCloseEvent":["reason","PresentationConnectionCloseEventInit"],"USBConnectionEvent":["device","USBConnectionEventInit"],"XRInputSourceEvent":["frame","XRInputSourceEventInit"],"XRInputSourcesChangeEvent":["added","XRInputSourcesChangeEventInit"],"XRReferenceSpaceEvent":["referenceSpace","XRReferenceSpaceEventInit"],"XRSessionEvent":["session","XRSessionEventInit"],"XRLayerEvent":["layer","XRLayerEventInit"],"XRVisibilityMaskChangeEvent":["eye","XRVisibilityMaskChangeEventInit"],"DocumentPictureInPictureEvent":["window","DocumentPictureInPictureEventInit"],"SpeechSynthesisErrorEvent":["utterance","SpeechSynthesisEventInit"],"SpeechSynthesisEvent":["utterance","SpeechSynthesisEventInit"]};
+  // Чьи словари не наследуют EventInit (bubbles/cancelable не читаются) и
+  // чей тип задан самим интерфейсом.
+  const EV_DEFAULTS = __EVENT_DEFAULTS__;
+  const EV_FORCE = { IDBVersionChangeEvent: { bubbles: false, cancelable: false }, VirtualKeyboardGeometryChangeEvent: { bubbles: false, cancelable: false }, SecurityPolicyViolationEvent: { cancelable: false }, RTCDTMFToneChangeEvent: { type: 'tonechange' } };
+  const eventFromStub = (C, args, nt, name) => {
+    const req = EV_REQUIRED[name];
+    if (req) {
+      const i0 = args.length > 1 ? args[1] : undefined;
+      if (!i0 || typeof i0 !== 'object' || i0[req[0]] === undefined) {
+        throw new TypeError("Failed to construct '" + name + "': Failed to read the '" + req[0] + "' property from '" + req[1] + "': Required member is undefined.");
+      }
+    }
+    let base = null, stopAt = null;
+    for (let p = GPO(C.prototype); p; p = GPO(p)) {
+      const cd = GOPD(p, 'constructor');
+      const K = cd && cd.value;
+      if (typeof K === 'function' && K !== C && isRealEvent(K)) { base = K; stopAt = p; break; }
+    }
+    if (!base) return null;
+    const force = EV_FORCE[name] || null;
+    const type = force && force.type ? force.type : (args.length > 0 ? String(args[0]) : '');
+    let init = args.length > 1 && args[1] && typeof args[1] === 'object' ? args[1] : undefined;
+    let baseInit = init;
+    if (force && init) { baseInit = Object.assign({}, init); for (const k of ['bubbles', 'cancelable']) if (k in force) baseInit[k] = force[k]; }
+    const e = RC(base, baseInit === undefined ? [type] : [type, baseInit], nt);
+    const W = globalThis.__pt_writers;
+    const writeMember = (k, v) => {
+      for (let p = C.prototype; p && p !== stopAt; p = GPO(p)) {
+        const pd = GOPD(p, k);
+        if (!pd) continue;
+        const w = (W && W.get(p) && W.get(p)[k]) || pd.set;
+        if (typeof w === 'function') { try { Reflect.apply(w, e, [v]); } catch (x) {} }
+        return;
+      }
+    };
+    // Чего в словаре нет — значение Chrome по умолчанию ('' / 0 / false / null).
+    const DEF = EV_DEFAULTS[name];
+    if (DEF) for (const k of Object.keys(DEF)) {
+      if (init && init[k] !== undefined) continue;
+      writeMember(k, DEF[k] === '__arr' ? [] : DEF[k]);
+    }
+    if (init) {
+      for (const k in init) {
+        if (k === 'bubbles' || k === 'cancelable' || k === 'composed') continue;
+        for (let p = C.prototype; p && p !== stopAt; p = GPO(p)) {
+          const pd = GOPD(p, k);
+          if (!pd) continue;
+          const w = (W && W.get(p) && W.get(p)[k]) || pd.set;
+          if (typeof w === 'function') { try { Reflect.apply(w, e, [init[k]]); } catch (x) {} }
+          break;
+        }
+      }
+    }
+    return e;
+  };
+  const EVENT_P = globalThis.Event && globalThis.Event.prototype;
   const facade = (name, C, d) => {
     const row = CT[name];
     // Пространство имён без прототипа (NodeFilter) — не конструктор; фасад
@@ -2093,7 +2171,13 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
       if (m && arguments.length < +m[1]) {
         throw new TypeError('Failed to construct \'' + name + '\': ' + m[1] + ' argument' + (m[1] === '1' ? '' : 's') + ' required, but only ' + arguments.length + ' present.');
       }
-      return Reflect.construct(C, arguments, new.target === F ? C : new.target);
+      const nt = new.target === F ? C : new.target;
+      const made = RC(C, arguments, nt);
+      if (EVENT_P && made && typeof made === 'object' && !made.__ptE && EVENT_P.isPrototypeOf(made)) {
+        const e = eventFromStub(C, arguments, nt, name);
+        if (e) return e;
+      }
+      return made;
     } }[name];
     def(F, 'name', { value: name, configurable: true });
     def(F, 'length', { value: row.l, configurable: true });
@@ -9223,7 +9307,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const acc = {
           get [name]() {
             const t = ctxOf(this, P, name);
-            return Object.prototype.hasOwnProperty.call(t, name) ? t[name] : undefined;
+            const v = Object.prototype.hasOwnProperty.call(t, name) ? t[name] : undefined;
+            return name === 'canvas' && v && v.__ptOwner ? v.__ptOwner : v;
           },
           set [name](v) {
             const t = ctxOf(this, P, name);
@@ -10022,6 +10107,41 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   };
 
   const GL_ARITY = __GL_ARITY__;
+  // Потерянный контекст WebGL (WEBGL_lose_context.loseContext): у Chrome
+  // событие webglcontextlost приходит сразу, isContextLost — true, getError
+  // один раз отвечает CONTEXT_LOST_WEBGL (0x9242), запросы — null, остальное
+  // ничего не делает. У нас loseContext был пустым.
+  const GL_LOST = new WeakMap();
+  const glLostAnswer = (name, lost) => {
+    if (name === 'isContextLost') return true;
+    if (name === 'getError') { if (lost.pending) { lost.pending = false; return 0x9242; } return 0; }
+    if (name === 'checkFramebufferStatus') return 0x8CDD;
+    if (/^is[A-Z]/.test(name)) return false;
+    if (/^(get|create|fenceSync|clientWaitSync)/.test(name)) return name === 'clientWaitSync' ? 0x911D : null;
+    return undefined;
+  };
+  const glEventTarget = (impl) => { const c = impl && impl.canvas; return (c && c.__ptOwner) || c || null; };
+  const glFire = (impl, type) => {
+    const target = glEventTarget(impl);
+    if (!target || typeof target.dispatchEvent !== 'function') return true;
+    let ev;
+    try { ev = new WebGLContextEvent(type, { cancelable: type === 'webglcontextlost', statusMessage: '' }); }
+    catch (e) { ev = new Event(type, { cancelable: type === 'webglcontextlost' }); }
+    if (globalThis.__pt_trustEvent) globalThis.__pt_trustEvent(ev);
+    return target.dispatchEvent(ev);
+  };
+  const glLose = (impl) => {
+    if (!impl || GL_LOST.has(impl)) return;
+    const lost = { pending: true, restorable: false };
+    GL_LOST.set(impl, lost);
+    // Отменённое событие разрешает restoreContext (как в спецификации).
+    lost.restorable = !glFire(impl, 'webglcontextlost');
+  };
+  const glRestore = (impl) => {
+    const lost = impl && GL_LOST.get(impl);
+    if (!lost) return;
+    setTimeout(() => { if (GL_LOST.get(impl) !== lost) return; GL_LOST.delete(impl); glFire(impl, 'webglcontextrestored'); }, 0);
+  };
   const publishGL = (impl, C, constsStr, methodsStr) => {
     if (!C || !C.prototype) return impl;
     const P = C.prototype;
@@ -10051,6 +10171,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
                 ' required, but only ' + args.length + ' present.');
             }
             const t = ctxOf(this, P, name);
+            const lost = GL_LOST.get(t);
+            if (lost) return glLostAnswer(name, lost);
             const m = Object.prototype.hasOwnProperty.call(t, name) ? t[name] : null;
             return typeof m === 'function' ? m.apply(t, args) : undefined;
           },
@@ -10064,7 +10186,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const acc = {
           get [name]() {
             const t = ctxOf(this, P, name);
-            return Object.prototype.hasOwnProperty.call(t, name) ? t[name] : undefined;
+            const v = Object.prototype.hasOwnProperty.call(t, name) ? t[name] : undefined;
+            return name === 'canvas' && v && v.__ptOwner ? v.__ptOwner : v;
           },
           set [name](v) { const t = ctxOf(this, P, name); t[name] = v; },
         };
@@ -10197,6 +10320,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       getExtension(name){
         const shape = (ver === 2 ? GL2_EXT_SHAPE : GL1_EXT_SHAPE)[name];
         if (!shape) return null;
+        const selfImpl = this;
         asked.add(name);
         const [iface, keys] = shape;
         const C_ = globalThis[iface];
@@ -10216,7 +10340,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           else if (/^[a-z]/.test(k)) {
             // Ответы, которые читают: профили ASTC у Chrome — ['ldr'],
             // isVertexArrayOES без довода — false.
-            const EXT_IMPL = { getSupportedProfiles() { return ['ldr']; }, isVertexArrayOES(v) { return !!(v && typeof v === 'object'); } };
+            const EXT_IMPL = { getSupportedProfiles() { return ['ldr']; }, isVertexArrayOES(v) { return !!(v && typeof v === 'object'); },
+              loseContext() { glLose(selfImpl); }, restoreContext() { glRestore(selfImpl); } };
             const f = EXT_IMPL[k] ? ({ [k]: EXT_IMPL[k] })[k] : ({ [k](){ } })[k];
             try { Object.defineProperty(o, k, { value: mask(f, k), enumerable: true, writable: true, configurable: true }); } catch (e) {}
           }
