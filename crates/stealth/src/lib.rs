@@ -3083,6 +3083,7 @@ pub fn late_originals_script() -> String {
       keep.createTextNode = D.createTextNode;
       keep.createComment = D.createComment;
       keep.createDocumentFragment = D.createDocumentFragment;
+      keep.createElementNS = D.createElementNS;
     }
     const N = globalThis.Node && Node.prototype;
     if (N) { keep.appendChild = N.appendChild; keep.insertBefore = N.insertBefore; }
@@ -6497,10 +6498,35 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   // примета, так что запасные значения остаются на случай сборки без натива.
   const MEMORY_FALLBACK = { jsHeapSizeLimit: 4395630592, totalJSHeapSize: 12800000, usedJSHeapSize: 10600000 };
   const heapStats = typeof __pt_heapStats === 'function' ? __pt_heapStats : null;
+  // Как у Chrome (сверено в кадре виджета, секция LYTA4 читает это восемь
+  // раз): каждое обращение к performance.memory — новый объект со снятыми
+  // значениями; сами значения обновляются не чаще раза в 50 мс; и это память
+  // своего контекста, а не всего изолята — у нас в нём живут и другие окна,
+  // и кадр виджета отвечал 266 МБ против 33 у Chrome. Считаем от рождения
+  // контекста: уровень свежей страницы Chrome плюс прирост кучи с тех пор.
+  const MEM_FRESH_USED = 733790, MEM_FRESH_TOTAL = 1317838;
+  let MEM_BASE = null, MEM_SNAP = null, MEM_AT = -1e12;
+  const memReset = () => { MEM_BASE = heapStats ? heapStats() : null; MEM_SNAP = null; MEM_AT = -1e12; };
+  memReset();
+  const memSnap = () => {
+    const now = Date.now();
+    if (MEM_SNAP && now - MEM_AT < 50) return MEM_SNAP;
+    let snap;
+    if (heapStats && MEM_BASE) {
+      const raw = heapStats();
+      const used = MEM_FRESH_USED + Math.max(0, raw[0] - MEM_BASE[0]);
+      const total = Math.max(used + 4096, MEM_FRESH_TOTAL + Math.max(0, raw[1] - MEM_BASE[1]));
+      snap = [used, total, raw[2]];
+    } else snap = [MEMORY_FALLBACK.usedJSHeapSize, MEMORY_FALLBACK.totalJSHeapSize, MEMORY_FALLBACK.jsHeapSizeLimit];
+    MEM_SNAP = snap; MEM_AT = now;
+    return snap;
+  };
+  const MEM_OF = new WeakMap();
+  const memOf = (o) => MEM_OF.get(o) || memSnap();
   const MEMORY = {
-    get totalJSHeapSize() { return heapStats ? heapStats()[1] : MEMORY_FALLBACK.totalJSHeapSize; },
-    get usedJSHeapSize() { return heapStats ? heapStats()[0] : MEMORY_FALLBACK.usedJSHeapSize; },
-    get jsHeapSizeLimit() { return heapStats ? heapStats()[2] : MEMORY_FALLBACK.jsHeapSizeLimit; },
+    get totalJSHeapSize() { return memOf(this)[1]; },
+    get usedJSHeapSize() { return memOf(this)[0]; },
+    get jsHeapSizeLimit() { return memOf(this)[2]; },
   };
 
   // Expose a value bag as enumerable prototype getters, so instances stay free
@@ -6920,6 +6946,12 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
     }
   }
   const PERF_BAG = { timeOrigin: ORIGIN, timing, navigation, memory };
+  // performance.memory — новый MemoryInfo на каждое обращение, со значениями,
+  // снятыми в этот миг (из кэша на 50 мс).
+  Object.defineProperty(PERF_BAG, 'memory', {
+    get() { const m = new MemoryInfo(); MEM_OF.set(m, memSnap()); return m; },
+    enumerable: true, configurable: true,
+  });
   onProto(Performance.prototype, PERF_BAG);
   // Запасной реалм строится заранее, а выдаётся, когда страница вставит
   // пустой кадр: его часы должны начаться в миг выдачи, как у нового окна.
@@ -6942,6 +6974,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
     });
     Object.defineProperty(globalThis, '__pt_resetClock', {
       value: () => {
+        memReset();
         ORIGIN = originNow();
         HR_BASE = typeof hr === 'function' ? hr() : 0;
         last = 0;

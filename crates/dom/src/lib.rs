@@ -227,7 +227,14 @@ fn serialize(node: &Handle, scripts: &mut Vec<Script>, modes: &mut Vec<ScriptMod
                 .filter(|v| !v.is_null())
                 .collect();
 
-            json!({ "k": "e", "tag": tag, "attrs": attrs_json, "children": children })
+            // Пространство имён — для чужого содержимого (SVG, MathML): без него
+            // встроенный <svg> страницы становился HTMLUnknownElement.
+            let ns = name.ns.to_string();
+            if ns.is_empty() || ns == "http://www.w3.org/1999/xhtml" {
+                json!({ "k": "e", "tag": tag, "attrs": attrs_json, "children": children })
+            } else {
+                json!({ "k": "e", "tag": tag, "ns": ns, "attrs": attrs_json, "children": children })
+            }
         }
         NodeData::Text { contents } => json!({ "k": "t", "v": contents.borrow().to_string() }),
         NodeData::Comment { contents } => json!({ "k": "c", "v": contents.to_string() }),

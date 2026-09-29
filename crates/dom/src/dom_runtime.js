@@ -25,6 +25,10 @@
   // Every node in a subtree, shadow trees included. Frames and scripts come to
   // life as part of whatever tree they are inserted with — a widget hands the DOM
   // a finished tree, not a bare element.
+  function __attrName(el, n) {
+    const s = String(n);
+    return el.__ptNS === undefined || el.__ptNS === 'http://www.w3.org/1999/xhtml' ? s.toLowerCase() : s;
+  }
   function __walkTree(node, fn) {
     if (!node) return;
     fn(node);
@@ -985,6 +989,10 @@
     get nodeName() { return this.tagName; }
     get tagName() { return this.__ptTag; }
     get localName() { return this.__ptLocal; }
+    // Пространство имён элемента: заглушка таблицы форм отвечала XHTML всем,
+    // в том числе SVG из createElementNS.
+    get namespaceURI() { return this.__ptNS === undefined ? 'http://www.w3.org/1999/xhtml' : this.__ptNS; }
+    get prefix() { return this.__ptPrefix || null; }
     // Объявление стиля строится при первом обращении, а не при создании
     // узла: у него семьсот собственных свойств, и на страницу с тысячей
     // элементов это полсекунды на пустом месте. Браузер создаёт узел за
@@ -998,11 +1006,12 @@
       return this.__ptStyle;
     }
 
-    // Attributes
-    getAttribute(n) { const v = this.__ptAttrs.get(n.toLowerCase()); return v === undefined ? null : v; }
+    // Attributes. Имена в нижний регистр — только у HTML-элементов; у SVG и
+    // прочих чужих имена регистрозависимы (`viewBox`), как в спецификации.
+    getAttribute(n) { const v = this.__ptAttrs.get(__attrName(this, n)); return v === undefined ? null : v; }
     setAttribute(n, v) {
       __needArgs(arguments.length, 2, 'setAttribute', 'Element');
-      const name = n.toLowerCase(), old = this.__ptAttrs.get(name);
+      const name = __attrName(this, n), old = this.__ptAttrs.get(name);
       this.__ptAttrs.set(name, String(v));
       if (this.__ptUpgraded) {
         const watched = this.constructor && this.constructor.observedAttributes;
@@ -1017,14 +1026,14 @@
         previousSibling: null, nextSibling: null });
     }
     removeAttribute(n) {
-      const name = n.toLowerCase(), old = this.__ptAttrs.get(name);
+      const name = __attrName(this, n), old = this.__ptAttrs.get(name);
       this.__ptAttrs.delete(name);
       __markDirty();
       __mutation({ type: 'attributes', target: this, attributeName: name, attributeNamespace: null,
         oldValue: old === undefined ? null : old, addedNodes: [], removedNodes: [],
         previousSibling: null, nextSibling: null });
     }
-    hasAttribute(n) { return this.__ptAttrs.has(n.toLowerCase()); }
+    hasAttribute(n) { return this.__ptAttrs.has(__attrName(this, n)); }
     getAttributeNames() { return [...this.__ptAttrs.keys()]; }
     get attributes() { return __namedNodeMap(this); }
 
@@ -1323,11 +1332,12 @@
     // Queries (scoped to this subtree)
     // getElementById у Element браузер не имеет — только у документа и фрагмента.
     getElementsByTagName(t) { return __collection(__tags(this, t)); }
+    getElementsByTagNameNS(ns, local) { return __collection(__tagsNS(this, ns, local)); }
     getElementsByClassName(c) {
       const cs = String(c).split(/\s+/).filter(Boolean);
       return __collection(collect(this, (e) => {
         const own = (e.__ptAttrs.get('class') || '').split(/\s+/);
-        return cs.every((x) => own.indexOf(x) >= 0);
+        return cs.length > 0 && cs.every((x) => own.indexOf(x) >= 0);
       }));
     }
     querySelector(sel) {
@@ -1849,11 +1859,9 @@
     // `document.all` — коллекция всех элементов в порядке дерева (у Chrome
     // она «необнаружима» — typeof undefined; этого V8 нам не даёт, зато по
     // индексу она отвечает, а не роняет читающего).
-    get all() {
-      const out = [];
-      if (this.documentElement) __walkTree(this.documentElement, (n) => { if (n.nodeType === ELEMENT_NODE) out.push(n); });
-      return __allCollection(out);
-    }
+    // Только светлое дерево: теневые корни в document.all не входят (у нас
+    // кадр виджета отвечал 96 элементов против 12 у Chrome).
+    get all() { return __allCollection(collect(this, () => true)); }
     get applets() { return __collection([]); }
     // Не один элемент, а вся стопка под точкой: браузер отдаёт цепочку от
     // самого глубокого до `<html>`.
@@ -1996,13 +2004,24 @@
       e.__ptDoc = this;
       return e;
     }
-    createElementNS(ns, tag) {
+    createElementNS(ns, qname) {
+      const q = String(qname), colon = q.indexOf(':');
+      const prefix = colon > 0 ? q.slice(0, colon) : null, tag = colon > 0 ? q.slice(colon + 1) : q;
+      const NS = ns === null || ns === undefined || ns === '' ? null : String(ns);
       const e = this.createElement(tag);
-      if (String(ns) === 'http://www.w3.org/2000/svg' && globalThis.__pt_svgProto) {
+      e.__ptNS = NS;
+      if (prefix) { e.__ptPrefix = prefix; e.__ptTag = q; }
+      // Не-HTML элемент: имя как написано, без перевода в заглавные.
+      if (NS !== 'http://www.w3.org/1999/xhtml') { e.__ptLocal = tag; e.__ptTag = q; }
+      if (NS === 'http://www.w3.org/2000/svg' && globalThis.__pt_svgProto) {
         const proto = __pt_svgProto(String(tag));
         // Имя тега в SVG регистрозависимо: `clipPath`, не `clippath`.
         // И `tagName` у SVG — как написано (`text`, `clipPath`), а не заглавными.
-        if (proto) { try { Object.setPrototypeOf(e, proto); e.__ptNS = String(ns); e.__ptLocal = String(tag); e.__ptTag = String(tag); } catch (x) {} }
+        if (proto) { try { Object.setPrototypeOf(e, proto); e.__ptNS = String(ns); e.__ptLocal = String(tag); e.__ptTag = q; } catch (x) {} }
+      } else if (NS === 'http://www.w3.org/1998/Math/MathML' && typeof globalThis.MathMLElement === 'function') {
+        try { Object.setPrototypeOf(e, MathMLElement.prototype); } catch (x) {}
+      } else if (NS !== 'http://www.w3.org/1999/xhtml' && NS !== 'http://www.w3.org/2000/svg') {
+        try { Object.setPrototypeOf(e, Element.prototype); } catch (x) {}
       }
       return e;
     }
@@ -2040,9 +2059,23 @@
       return node;
     }
 
-    getElementById(id) { return this.documentElement ? firstMatch(this.documentElement, (e) => e.id === String(id)) : null; }
-    getElementsByTagName(t) { return __collection(this.documentElement ? __tags(this.documentElement, t) : []); }
-    getElementsByClassName(c) { return this.documentElement ? this.documentElement.getElementsByClassName(c) : []; }
+    // Обход — от самого документа: <html> тоже его потомок. Прежде корнем был
+    // documentElement, и он сам в выборку не попадал (getElementsByTagName('*')
+    // давал на один меньше, чем querySelectorAll, id на <html> не находился).
+    getElementById(id) { return firstMatch(this, (e) => e.id === String(id)); }
+    getElementsByTagName(t) { return __collection(__tags(this, t)); }
+    getElementsByClassName(c) {
+      const cs = String(c).split(/\s+/).filter(Boolean);
+      return __collection(collect(this, (e) => {
+        const own = ((e.__ptAttrs && e.__ptAttrs.get('class')) || '').split(/\s+/);
+        return cs.length > 0 && cs.every((x) => own.indexOf(x) >= 0);
+      }));
+    }
+    getElementsByName(n) {
+      const want = String(n);
+      return __staticNodeList(collect(this, (e) => e.__ptAttrs && e.__ptAttrs.get('name') === want));
+    }
+    getElementsByTagNameNS(ns, local) { return __collection(__tagsNS(this, ns, local)); }
     querySelector(s) {
       __needArgs(arguments.length, 1, 'querySelector', 'Document');
       __checkSelector(s, 'querySelector', 'Document');
@@ -3786,6 +3819,11 @@
     const local = String(t).toLowerCase();
     return collect(root, (e) => t === '*' || e.__ptLocal === local);
   }
+  function __tagsNS(root, ns, local) {
+    const L = String(local), N = ns === null ? null : String(ns);
+    return collect(root, (e) => (L === '*' || e.__ptLocal === L || e.localName === L)
+      && (N === '*' || (e.namespaceURI || null) === (N === '' ? null : N)));
+  }
   function collect(root, pred) {
     const out = []; walk(root, e => { if (pred(e)) out.push(e); });
     out.item = (i) => out[i] || null; return out;
@@ -4378,6 +4416,17 @@
   // A forgiving tokenizer: handles tags, attributes (quoted/unquoted/bare),
   // text, comments, and void/self-closing elements. Not spec-perfect, but
   // covers the markup scripts typically inject.
+  const __SVG_NS = 'http://www.w3.org/2000/svg', __MATH_NS = 'http://www.w3.org/1998/Math/MathML';
+  // Таблицы регистра из спецификации HTML (adjust SVG tag/attribute names).
+  const __SVG_CASE = {};
+  for (const n of ['altGlyph', 'altGlyphDef', 'altGlyphItem', 'animateColor', 'animateMotion', 'animateTransform', 'clipPath', 'feBlend', 'feColorMatrix', 'feComponentTransfer', 'feComposite', 'feConvolveMatrix', 'feDiffuseLighting', 'feDisplacementMap', 'feDistantLight', 'feDropShadow', 'feFlood', 'feFuncA', 'feFuncB', 'feFuncG', 'feFuncR', 'feGaussianBlur', 'feImage', 'feMerge', 'feMergeNode', 'feMorphology', 'feOffset', 'fePointLight', 'feSpecularLighting', 'feSpotLight', 'feTile', 'feTurbulence', 'foreignObject', 'glyphRef', 'linearGradient', 'radialGradient', 'textPath']) __SVG_CASE[n.toLowerCase()] = n;
+  const __SVG_ATTR_CASE = {};
+  for (const n of ['attributeName', 'attributeType', 'baseFrequency', 'baseProfile', 'calcMode', 'clipPathUnits', 'diffuseConstant', 'edgeMode', 'filterUnits', 'glyphRef', 'gradientTransform', 'gradientUnits', 'kernelMatrix', 'kernelUnitLength', 'keyPoints', 'keySplines', 'keyTimes', 'lengthAdjust', 'limitingConeAngle', 'markerHeight', 'markerUnits', 'markerWidth', 'maskContentUnits', 'maskUnits', 'numOctaves', 'pathLength', 'patternContentUnits', 'patternTransform', 'patternUnits', 'pointsAtX', 'pointsAtY', 'pointsAtZ', 'preserveAlpha', 'preserveAspectRatio', 'primitiveUnits', 'refX', 'refY', 'repeatCount', 'repeatDur', 'requiredExtensions', 'requiredFeatures', 'specularConstant', 'specularExponent', 'spreadMethod', 'startOffset', 'stdDeviation', 'stitchTiles', 'surfaceScale', 'systemLanguage', 'tableValues', 'targetX', 'targetY', 'textLength', 'viewBox', 'viewTarget', 'xChannelSelector', 'yChannelSelector', 'zoomAndPan']) __SVG_ATTR_CASE[n.toLowerCase()] = n;
+  const __foreignElem = (doc, ns, name) => {
+    const O = globalThis.__pt_orig || {};
+    const f = O.createElementNS || Document.prototype.createElementNS;
+    return f.call(doc, ns, name);
+  };
   function parseFragment(html) {
     const doc = globalThis.document;
     // Разбор идёт мимо имён, которые видит страница: в браузере присваивание
@@ -4409,7 +4458,7 @@
         if (!m) { put(top(), text('<')); i++; continue; }
         const tag = m[1].toLowerCase();
         if (close) {
-          for (let s = stack.length - 1; s > 0; s--) if (stack[s].localName === tag) { stack.length = s; break; }
+          for (let s = stack.length - 1; s > 0; s--) if (String(stack[s].localName).toLowerCase() === tag) { stack.length = s; break; }
         } else if (tag === 'html' || tag === 'head' || tag === 'body') {
           // Разбор куска разметки: браузер такие теги внутрь не вставляет —
           // их содержимое просто переезжает в текущего родителя. Мы делали
@@ -4435,16 +4484,28 @@
               const row = elem('tr'); put(top(), row); stack.push(row);
             }
           }
-          const el = elem(tag);
-          for (const am of m[2].matchAll(/([\w-]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g)) {
+          // Чужое содержимое, как у разбора HTML: внутри <svg> — элементы SVG
+          // (с регистром имён по таблице спецификации), внутри <math> — MathML,
+          // внутри foreignObject/desc/title у SVG — снова HTML. Раньше <svg> из
+          // innerHTML становился HTMLUnknownElement, а значки виджета — с ним.
+          const parentNS = (() => {
+            const t = top(); const pns = t && t.__ptNS;
+            if (pns === __SVG_NS && (t.__ptLocal === 'foreignObject' || t.__ptLocal === 'desc' || t.__ptLocal === 'title')) return null;
+            if (pns === __MATH_NS && t.__ptLocal === 'annotation-xml') return null;
+            return pns === __SVG_NS || pns === __MATH_NS ? pns : null;
+          })();
+          const ns = parentNS || (tag === 'svg' ? __SVG_NS : tag === 'math' ? __MATH_NS : null);
+          const el = ns ? __foreignElem(doc, ns, ns === __SVG_NS ? (__SVG_CASE[tag] || tag) : tag) : elem(tag);
+          for (const am of m[2].matchAll(/([\w:-]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g)) {
             let v = am[2] || '';
             if (v && (v[0] === '"' || v[0] === "'")) v = v.slice(1, -1);
             // Ссылки на знаки в значении разбираются, как и в тексте: `&quot;`
             // становится кавычкой, а при сериализации — снова `&quot;`, не `&amp;quot;`.
-            attr(el, am[1], unescapeEntities(v));
+            const an = am[1].toLowerCase();
+            attr(el, ns === __SVG_NS ? (__SVG_ATTR_CASE[an] || an) : an, unescapeEntities(v));
           }
           put(top(), el);
-          const selfClose = m[0].endsWith('/>') || VOID.has(tag);
+          const selfClose = m[0].endsWith('/>') && (ns || VOID.has(tag)) || VOID.has(tag) && !ns;
           if (!selfClose) stack.push(el);
         }
         i += m[0].length;
@@ -4489,7 +4550,7 @@
   function buildNode(doc, spec) {
     if (spec.k === 't') return doc.createTextNode(spec.v);
     if (spec.k === 'c') return doc.createComment(spec.v);
-    const el = doc.createElement(spec.tag);
+    const el = spec.ns ? __foreignElem(doc, spec.ns, spec.tag) : doc.createElement(spec.tag);
     // A parser-built script is "already started": the engine runs the document's
     // scripts itself, in document order, so connecting the tree must not run them
     // a second time. Only what a page inserts later goes through `__ptRunScript`.
