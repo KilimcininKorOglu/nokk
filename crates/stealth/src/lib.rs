@@ -5694,7 +5694,12 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       const gl = tex.gl;
       if (!gl) return;
       gl.viewport(0, 0, tex.w, tex.h);
-      const cv = pass.clear || { r: 0, g: 0, b: 0, a: 0 };
+      // GPUColor — словарь {r,g,b,a} или последовательность [r,g,b,a]; с
+      // массивом альфа читалась как «нет» и ставилась 1 — фон выходил
+      // непрозрачным чёрным, а у Chrome он прозрачный.
+      const c0 = pass.clear || { r: 0, g: 0, b: 0, a: 0 };
+      const cv = Array.isArray(c0) || (c0 && typeof c0 === 'object' && typeof c0[Symbol.iterator] === 'function')
+        ? (() => { const a = Array.from(c0); return { r: a[0], g: a[1], b: a[2], a: a[3] }; })() : c0;
       if (pass.loadOp === 'clear') {
         gl.clearColor(+cv.r || 0, +cv.g || 0, +cv.b || 0, cv.a === undefined ? 1 : +cv.a);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
@@ -5722,7 +5727,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         const h = (Array.isArray(size) ? (size[1] === undefined ? 1 : size[1]) : size.height) | 0;
         const o = mk('GPUTexture');
         ST.set(o, { w: Math.max(1, w), h: Math.max(1, h), gl: glFor(Math.max(1, w), Math.max(1, h)),
-          format: (desc && desc.format) || 'rgba8unorm' });
+          format: (desc && desc.format) || 'rgba8unorm', usage: (desc && desc.usage) >>> 0 });
         return o;
       });
       put(GPUDeviceP, 'createBuffer', function createBuffer(desc) {
@@ -5760,7 +5765,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       put(TexP, 'destroy', function destroy() {});
       for (const [k, f] of [['width', (s) => s.w], ['height', (s) => s.h], ['depthOrArrayLayers', () => 1],
         ['mipLevelCount', () => 1], ['sampleCount', () => 1], ['dimension', () => '2d'],
-        ['format', (s) => s.format || 'rgba8unorm'], ['usage', () => 0]]) {
+        ['format', (s) => s.format || 'rgba8unorm'], ['usage', (s) => s.usage || 0]]) {
         getter(TexP, k, function () { return f(st(this)); });
       }
 
@@ -5851,10 +5856,17 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         try { const bytes = st(buf).bytes; if (bytes) { const src = ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : new Uint8Array(data); bytes.set(src.subarray(dataOff | 0, size === undefined ? src.length : (dataOff | 0) + size), off | 0); } } catch (e) {}
       });
       put(GPUQueueP, 'writeTexture', function writeTexture() {});
-      put(GPUQueueP, 'onSubmittedWorkDone', function onSubmittedWorkDone() { return Promise.resolve(); });
+      // Работа GPU у Chrome завершается не сразу: обещание приходит через
+      // кадр-другой (3–14 мс на пробе). У нас оно решалось в ту же
+      // микрозадачу — ни одного кадра между отправкой и чтением.
+      const RAF = G.requestAnimationFrame, RA = Reflect.apply;
+      const afterFrame = () => new Promise((res) => {
+        try { RA(RAF, G, [() => res()]); } catch (e) { res(); }
+      });
+      put(GPUQueueP, 'onSubmittedWorkDone', function onSubmittedWorkDone() { return afterFrame(); });
 
       const BufP = iface('GPUBuffer');
-      put(BufP, 'mapAsync', function mapAsync() { return Promise.resolve(); });
+      put(BufP, 'mapAsync', function mapAsync() { return afterFrame(); });
       put(BufP, 'getMappedRange', function getMappedRange(offset, size) {
         glog('getMappedRange', { offset, size, nz: st(this).bytes && Array.from(st(this).bytes).map((b, i) => (b && (i & 3) !== 3) ? i + ':' + b : '').filter(Boolean).slice(0, 160).join(' ') });
         const s = st(this);
