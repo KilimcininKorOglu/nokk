@@ -1147,6 +1147,7 @@ pub fn fingerprint_script(profile: &StealthProfile) -> String {
     FINGERPRINT_TEMPLATE
         .replace("__RTC_CHROME__", RTC_CHROME)
         .replace("__GL_ARITY__", GL_ARITY)
+        .replace("__WEBGL_EXT_SHAPES__", WEBGL_EXT_SHAPES)
         .replace("__WEBGL_VENDOR__", &quoted(&profile.webgl_vendor))
         .replace("__WEBGL_RENDERER__", &quoted(&profile.webgl_renderer))
         .replace("__FP_SEED__", &identity_seed(profile).to_string())
@@ -8463,6 +8464,9 @@ const IFACE_STATICS: &str = r#"{"AbortSignal":{"f":{"any":1,"timeout":1}},"Audio
 /// How many arguments each WebGL call insists on, measured from Chrome 148.
 /// A call made with fewer is a refusal there, with the method named in the
 /// message; ours answered `undefined` and carried on.
+/// Прототипы расширений WebGL у Chrome 151: константы, методы, флаги
+/// (снято `scratchpad/extshape.js`).
+const WEBGL_EXT_SHAPES: &str = include_str!("webgl_ext_shapes.json");
 const GL_ARITY: &str = r#"{"activeTexture":1,"attachShader":2,"bindAttribLocation":3,"bindRenderbuffer":2,"blendColor":4,"blendEquation":1,"blendEquationSeparate":2,"blendFunc":2,"blendFuncSeparate":4,"bufferData":3,"bufferSubData":3,"checkFramebufferStatus":1,"compileShader":1,"compressedTexImage2D":7,"compressedTexSubImage2D":8,"copyTexImage2D":8,"copyTexSubImage2D":8,"createShader":1,"cullFace":1,"deleteBuffer":1,"deleteFramebuffer":1,"deleteProgram":1,"deleteRenderbuffer":1,"deleteShader":1,"deleteTexture":1,"depthFunc":1,"depthMask":1,"depthRange":2,"detachShader":2,"disable":1,"enable":1,"framebufferRenderbuffer":4,"framebufferTexture2D":5,"frontFace":1,"generateMipmap":1,"getActiveAttrib":2,"getActiveUniform":2,"getAttachedShaders":1,"getAttribLocation":2,"getBufferParameter":2,"getExtension":1,"getFramebufferAttachmentParameter":3,"getParameter":1,"getProgramInfoLog":1,"getProgramParameter":2,"getRenderbufferParameter":2,"getShaderInfoLog":1,"getShaderParameter":2,"getShaderPrecisionFormat":2,"getShaderSource":1,"getTexParameter":2,"getUniform":2,"getUniformLocation":2,"getVertexAttrib":2,"getVertexAttribOffset":2,"hint":2,"isBuffer":1,"isEnabled":1,"isFramebuffer":1,"isProgram":1,"isRenderbuffer":1,"isShader":1,"isTexture":1,"lineWidth":1,"linkProgram":1,"pixelStorei":2,"polygonOffset":2,"readPixels":7,"renderbufferStorage":4,"sampleCoverage":2,"shaderSource":2,"stencilFunc":3,"stencilFuncSeparate":4,"stencilMask":1,"stencilMaskSeparate":2,"stencilOp":3,"stencilOpSeparate":4,"texImage2D":6,"texParameterf":3,"texParameteri":3,"texSubImage2D":7,"useProgram":1,"validateProgram":1,"bindBuffer":2,"bindFramebuffer":2,"bindTexture":2,"clear":1,"clearColor":4,"clearDepth":1,"clearStencil":1,"colorMask":4,"disableVertexAttribArray":1,"drawArrays":3,"drawElements":4,"enableVertexAttribArray":1,"scissor":4,"uniform1f":2,"uniform1fv":2,"uniform1i":2,"uniform1iv":2,"uniform2f":3,"uniform2fv":2,"uniform2i":3,"uniform2iv":2,"uniform3f":4,"uniform3fv":2,"uniform3i":4,"uniform3iv":2,"uniform4f":5,"uniform4fv":2,"uniform4i":5,"uniform4iv":2,"uniformMatrix2fv":3,"uniformMatrix3fv":3,"uniformMatrix4fv":3,"vertexAttrib1f":2,"vertexAttrib1fv":2,"vertexAttrib2f":3,"vertexAttrib2fv":2,"vertexAttrib3f":4,"vertexAttrib3fv":2,"vertexAttrib4f":5,"vertexAttrib4fv":2,"vertexAttribPointer":6,"viewport":4,"drawingBufferStorage":3,"beginQuery":2,"beginTransformFeedback":1,"bindBufferBase":3,"bindBufferRange":5,"bindSampler":2,"bindTransformFeedback":2,"bindVertexArray":1,"blitFramebuffer":10,"clientWaitSync":3,"compressedTexImage3D":8,"compressedTexSubImage3D":10,"copyBufferSubData":5,"copyTexSubImage3D":9,"deleteQuery":1,"deleteSampler":1,"deleteSync":1,"deleteTransformFeedback":1,"deleteVertexArray":1,"drawArraysInstanced":4,"drawElementsInstanced":5,"drawRangeElements":6,"endQuery":1,"fenceSync":2,"framebufferTextureLayer":5,"getActiveUniformBlockName":2,"getActiveUniformBlockParameter":3,"getActiveUniforms":3,"getBufferSubData":3,"getFragDataLocation":2,"getIndexedParameter":2,"getInternalformatParameter":3,"getQuery":2,"getQueryParameter":2,"getSamplerParameter":2,"getSyncParameter":2,"getTransformFeedbackVarying":2,"getUniformBlockIndex":2,"getUniformIndices":2,"invalidateFramebuffer":2,"invalidateSubFramebuffer":6,"isQuery":1,"isSampler":1,"isSync":1,"isTransformFeedback":1,"isVertexArray":1,"readBuffer":1,"renderbufferStorageMultisample":5,"samplerParameterf":3,"samplerParameteri":3,"texImage3D":10,"texStorage2D":5,"texStorage3D":6,"texSubImage3D":11,"transformFeedbackVaryings":3,"uniform1ui":2,"uniform2ui":3,"uniform3ui":4,"uniform4ui":5,"uniformBlockBinding":3,"vertexAttribDivisor":2,"vertexAttribI4i":5,"vertexAttribI4ui":5,"vertexAttribIPointer":5,"waitSync":3,"clearBufferfi":4,"clearBufferfv":3,"clearBufferiv":3,"clearBufferuiv":3,"drawBuffers":1,"uniform1uiv":2,"uniform2uiv":2,"uniform3uiv":2,"uniform4uiv":2,"uniformMatrix2x3fv":3,"uniformMatrix2x4fv":3,"uniformMatrix3x2fv":3,"uniformMatrix3x4fv":3,"uniformMatrix4x2fv":3,"uniformMatrix4x3fv":3,"vertexAttribI4iv":2,"vertexAttribI4uiv":2}"#;
 
 /// Снятое у Chrome 151: разделы предложения WebRTC и getCapabilities.
@@ -10216,6 +10220,52 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     publishGL(null, globalThis.WebGL2RenderingContext, GL2_CONSTS, GL2_METHODS);
   } catch (e) {}
 
+  // Прототипы расширений WebGL — по снятой с Chrome форме
+  // (webgl_ext_shapes.json): имена, значения констант, длины методов, флаги.
+  const EXT_TABLE = __WEBGL_EXT_SHAPES__;
+  const EXT_CACHE = new WeakMap(), EXT_OWNER = new WeakMap(), EXT_PROTOS = new Map();
+  const EXT_METHODS = {
+    getSupportedProfiles() { return ['ldr']; },
+    isVertexArrayOES(v) { return typeof this.isVertexArray === 'function' ? !!this.isVertexArray(v) : !!(v && typeof v === 'object'); },
+    createVertexArrayOES() { return typeof this.createVertexArray === 'function' ? this.createVertexArray() : null; },
+    bindVertexArrayOES(v) { if (typeof this.bindVertexArray === 'function') this.bindVertexArray(v); },
+    deleteVertexArrayOES(v) { if (typeof this.deleteVertexArray === 'function') this.deleteVertexArray(v); },
+    drawArraysInstancedANGLE(m, f, c, n) { if (typeof this.drawArraysInstanced === 'function') this.drawArraysInstanced(m, f, c, n); },
+    drawElementsInstancedANGLE(m, c, t, o, n) { if (typeof this.drawElementsInstanced === 'function') this.drawElementsInstanced(m, c, t, o, n); },
+    vertexAttribDivisorANGLE(i, d) { if (typeof this.vertexAttribDivisor === 'function') this.vertexAttribDivisor(i, d); },
+    drawBuffersWEBGL(b) { if (typeof this.drawBuffers === 'function') this.drawBuffers(b); },
+    loseContext() { glLose(this); },
+    restoreContext() { glRestore(this); },
+  };
+  const extProto = (ver, name, shape) => {
+    const key = (ver === 2 ? 'webgl2:' : 'webgl:') + name;
+    if (EXT_PROTOS.has(key)) return EXT_PROTOS.get(key);
+    const P = {};
+    const row = EXT_TABLE[key];
+    const members = row ? row.members : (shape[1] || '').split(',').filter(Boolean).map((k) => {
+      const v = EXT_VALUES[k];
+      return typeof v === 'number' ? [k, 'n' + v, 'e--'] : [k, 'f0', 'ewc'];
+    }).concat([['Symbol(Symbol.toStringTag)', 's' + shape[0], '--c']]);
+    for (const [k, kind, fl] of members) {
+      const e = fl[0] === 'e', w = fl[1] === 'w', c = fl[2] === 'c';
+      try {
+        if (k === 'Symbol(Symbol.toStringTag)') { Object.defineProperty(P, Symbol.toStringTag, { value: kind.slice(1), writable: w, enumerable: e, configurable: c }); continue; }
+        if (kind[0] === 'n') { Object.defineProperty(P, k, { value: +kind.slice(1), writable: w, enumerable: e, configurable: c }); continue; }
+        if (kind[0] === 'f') {
+          const impl = EXT_METHODS[k];
+          const f = ({ [k](...a) {
+            const owner = EXT_OWNER.get(this);
+            if (!owner) throw new TypeError('Illegal invocation');
+            return impl ? Reflect.apply(impl, owner, a) : undefined;
+          } })[k];
+          try { Object.defineProperty(f, 'length', { value: +kind.slice(1) || 0, configurable: true }); } catch (x) {}
+          Object.defineProperty(P, k, { value: mask(f, k), writable: w, enumerable: e, configurable: c });
+        }
+      } catch (x) {}
+    }
+    EXT_PROTOS.set(key, P);
+    return P;
+  };
   const makeGL = (canvas, ver, want) => {
     // Что положили в uniform — то и вернёт getUniform: числа с плавающей
     // точкой уже в float32, как у браузера.
@@ -10320,33 +10370,17 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       getExtension(name){
         const shape = (ver === 2 ? GL2_EXT_SHAPE : GL1_EXT_SHAPE)[name];
         if (!shape) return null;
-        const selfImpl = this;
         asked.add(name);
-        const [iface, keys] = shape;
-        const C_ = globalThis[iface];
-        const o = C_ && C_.prototype ? Object.create(C_.prototype) : {};
-        try {
-          if (C_ && C_.prototype && !Object.getOwnPropertyDescriptor(C_.prototype, Symbol.toStringTag)) {
-            Object.defineProperty(C_.prototype, Symbol.toStringTag, { value: iface, configurable: true });
-          } else if (!C_) {
-            Object.defineProperty(o, Symbol.toStringTag, { value: iface, configurable: true });
-          }
-        } catch (e) {}
-        // Члены расширения: константы — числами, функции — функциями.
-        for (const k of (keys ? keys.split(',') : [])) {
-          if (!k) continue;
-          const known = EXT_VALUES[k];
-          if (typeof known === 'number') { try { Object.defineProperty(o, k, { value: known, enumerable: true }); } catch (e) {} }
-          else if (/^[a-z]/.test(k)) {
-            // Ответы, которые читают: профили ASTC у Chrome — ['ldr'],
-            // isVertexArrayOES без довода — false.
-            const EXT_IMPL = { getSupportedProfiles() { return ['ldr']; }, isVertexArrayOES(v) { return !!(v && typeof v === 'object'); },
-              loseContext() { glLose(selfImpl); }, restoreContext() { glRestore(selfImpl); } };
-            const f = EXT_IMPL[k] ? ({ [k]: EXT_IMPL[k] })[k] : ({ [k](){ } })[k];
-            try { Object.defineProperty(o, k, { value: mask(f, k), enumerable: true, writable: true, configurable: true }); } catch (e) {}
-          }
-          else { try { Object.defineProperty(o, k, { value: 0, enumerable: true }); } catch (e) {} }
-        }
+        // Как у Chrome: объект расширения один на контекст, собственных
+        // свойств у него нет — константы, методы и метка лежат на скрытом
+        // прототипе интерфейса (без собственного constructor). У нас члены
+        // висели на самом объекте, а getSupportedProfiles не было вовсе.
+        let cache = EXT_CACHE.get(this);
+        if (!cache) { cache = new Map(); EXT_CACHE.set(this, cache); }
+        if (cache.has(name)) return cache.get(name);
+        const o = Object.create(extProto(ver, name, shape));
+        EXT_OWNER.set(o, this);
+        cache.set(name, o);
         return o;
       },
       getSupportedExtensions(){ return (ver === 2 ? GL2_SUPPORTED : GL1_SUPPORTED).slice(); },
@@ -10536,17 +10570,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       });
       // WebGL 1 reaches vertex arrays through the extension object, not the
       // context — hand back a working one instead of the usual empty stub.
-      const getExt = gl.getExtension;
-      gl.getExtension = function getExtension(name) {
-        if (name === 'OES_vertex_array_object') return {
-          VERTEX_ARRAY_BINDING_OES: 0x85B5,
-          createVertexArrayOES: () => gl.createVertexArray(),
-          bindVertexArrayOES: (v) => gl.bindVertexArray(v),
-          deleteVertexArrayOES: (v) => gl.deleteVertexArray(v),
-          isVertexArrayOES: (v) => !!(v && v.__h),
-        };
-        return getExt.call(this, name);
-      };
+      // (Методы OES_vertex_array_object теперь идут через общий прототип
+      // расширения и зовут createVertexArray/bindVertexArray контекста.)
     } else {
       // Fallback synthesis (no `webgl` feature): back the readback with the shared
       // surface — clears are exact, draws stamp a pattern keyed by the op log.
