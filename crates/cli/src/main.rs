@@ -20,6 +20,15 @@ struct Cli {
     #[arg(long, env = "NOKK_PORT", default_value_t = 9222)]
     port: u16,
 
+    /// CDP server: solve a challenge transparently on every navigation that
+    /// lands on one, within this many seconds (default 30 when the value is
+    /// omitted), before `Page.navigate` reports the load. A page still showing
+    /// a gate afterwards is announced with a `Nokk.challenge` event; a client
+    /// can also ask on demand with `Nokk.solveChallenge` / `Nokk.challengeState`,
+    /// or per browser context with `createBrowserContext({ autoSolve: true })`.
+    #[arg(long, env = "NOKK_AUTO_SOLVE", value_name = "SECONDS", num_args = 0..=1, default_missing_value = "30")]
+    auto_solve: Option<u64>,
+
     /// Address the CDP server binds to. Defaults to loopback; set `0.0.0.0` to
     /// accept connections from other hosts (e.g. inside a Docker container).
     #[arg(long, env = "NOKK_HOST", default_value = "127.0.0.1")]
@@ -2434,123 +2443,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
         tracing::info!(elapsed_ms = t.elapsed().as_millis(), "page loaded");
 
         if let Some(seconds) = cli.solve_challenge {
-            let deadline = Instant::now() + Duration::from_secs(seconds);
-            /// A widget asks once or twice; more than this is a loop, not a user.
-            const MAX_PRESSES: usize = 3;
-            let mut pressed = 0usize;
-            let mut seen_controls = std::collections::HashSet::new();
-            loop {
-                let phase = Instant::now();
-                let worked = ctx.run_event_loop().await.unwrap_or(0);
-                let looped = phase.elapsed();
-                let cleared = ctx.cookies(&[]).iter().any(|c| c.name == "cf_clearance");
-                // Стендовый виджет (не застава) замка не ставит: его успех —
-                // токен в поле `cf-turnstile-response`.
-                let token = ctx
-                    .evaluate("typeof __pt_widgetToken === 'function' && __pt_widgetToken() !== ''")
-                    .await
-                    .map(|v| v.as_bool().unwrap_or(false) || v.as_str() == Some("true"))
-                    .unwrap_or(false);
-                if token && !cleared {
-                    tracing::info!(elapsed_ms = t.elapsed().as_millis(), presses = pressed, "challenge complete: widget token issued");
-                    break;
-                }
-                if cleared {
-                    tracing::info!(
-                        elapsed_ms = t.elapsed().as_millis(),
-                        presses = pressed,
-                        "challenge cleared"
-                    );
-                    // Застава («Just a moment…») после замка сама уходит на
-                    // исходный адрес — ей нужно дать это сделать, иначе итогом
-                    // остаётся страница заставы, а не сайт.
-                    let is_interstitial = |t: &serde_json::Value| matches!(t, serde_json::Value::String(s) if s.contains("Just a moment"));
-                    let until = Instant::now() + Duration::from_secs(15);
-                    while Instant::now() < until && is_interstitial(&ctx.evaluate("document.title").await.unwrap_or_default()) {
-                        let _ = ctx.run_event_loop().await;
-                    }
-                    if is_interstitial(&ctx.evaluate("document.title").await.unwrap_or_default()) {
-                        tracing::warn!("cleared, but the interstitial did not move on");
-                    } else {
-                        tracing::info!(elapsed_ms = t.elapsed().as_millis(), "interstitial moved on");
-                    }
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    tracing::warn!(presses = pressed, "challenge did not clear in time");
-                    break;
-                }
-                // Press only what is offered; a widget still verifying offers
-                // nothing, and pressing nothing is the correct thing to do.
-                // One press per control that appears. A widget that ignores it is
-                // not asking to be pressed again — a person would not keep
-                // clicking either, and a flurry of clicks is its own signature.
-                let before_press = Instant::now();
-                if pressed < MAX_PRESSES {
-                    if let Ok(Some(what)) = ctx.press_widget_control().await {
-                        if seen_controls.insert(what.clone()) {
-                            pressed += 1;
-                            tracing::info!(control = %what, "pressed the challenge widget");
-                            // Полторы секунды после нажатия — не сон, а работа:
-                            // спящий движок не качает ни страницу, ни кадры, а
-                            // виджет как раз в эти полторы секунды и считает.
-                            // Его собственные часы видели здесь провал, какого
-                            // у браузера не бывает.
-                            let until = Instant::now() + Duration::from_millis(1_500);
-                            while Instant::now() < until {
-                                let _ = ctx.run_event_loop().await;
-                                tokio::time::sleep(Duration::from_millis(1)).await;
-                            }
-                        }
-                    }
-                }
-                // Чей таймер держит паузу: страницы или кадра виджета.
-                let raw = ctx
-                    .evaluate("typeof __pt_nextTimerDelay === 'function' ? String(__pt_nextTimerDelay()) : 'nofn'")
-                    .await;
-                let pending = match &raw {
-                    Ok(v) => v.as_str().unwrap_or("notstr").to_string(),
-                    Err(e) => format!("err:{e}"),
-                };
-                let frame_pending = match ctx.frame_list().first() {
-                    Some(f) => match ctx
-                        .evaluate_in_frame(
-                            f.id,
-                            "typeof __pt_nextTimerDelay === 'function' ? String(__pt_nextTimerDelay()) : 'nofn'",
-                        )
-                        .await
-                    {
-                        Ok(v) => v.as_str().unwrap_or("notstr").to_string(),
-                        Err(e) => format!("err:{e}"),
-                    },
-                    None => "noframe".to_string(),
-                };
-                tracing::debug!(
-                    loop_ms = looped.as_millis(),
-                    press_ms = before_press.elapsed().as_millis(),
-                    worked,
-                    pending,
-                    frame_pending,
-                    "solve turn"
-                );
-                // Пока в странице или её воркерах идёт работа, ждать нечего:
-                // виток кончается по внутреннему пределу ожидания, а не потому
-                // что всё сделано. Сон в 400 мс на каждом витке отдавал сборщику
-                // отпечатка меньше трети реального времени, и он не поспевал за
-                // собственным таймаутом.
-                // Пауза здесь — это задержка для всякого таймера, который стал
-                // срочным внутри неё. Виджет разложен на цепочку из десятков
-                // шагов по таймеру, и четверть секунды на каждом растягивала
-                // четыре секунды работы в одиннадцать — ровно за его порог.
-                let idle = worked == 0;
-                // Работающей странице — миллисекунда между прокачками: на пяти
-                // таймеры опаздывают, и это видно по частоте кадров.
-                if idle {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                } else {
-                    tokio::time::sleep(Duration::from_micros(500)).await;
-                }
-            }
+            let outcome = ctx.solve_challenge(Duration::from_secs(seconds)).await;
+            tracing::debug!(status = outcome.status.as_str(), presses = outcome.presses, elapsed_ms = outcome.elapsed_ms, "solve finished");
         }
 
         // With the probe tracer on, say what the page asked us — in the page and
@@ -2922,7 +2816,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
         cli.port
     );
     println!("  Puppeteer: puppeteer.connect({{ browserWSEndpoint: 'ws://{advertise}:{}/devtools/browser/nokk' }})", cli.port);
-    nokk_cdp::serve(engine, nokk_cdp::ServerConfig { addr }).await?;
+    nokk_cdp::serve(engine, nokk_cdp::ServerConfig { addr, auto_solve: cli.auto_solve.map(Duration::from_secs) }).await?;
     Ok(())
 }
 

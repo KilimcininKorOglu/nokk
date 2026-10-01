@@ -10371,6 +10371,30 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     } catch (e) {}
     return out;
   };
+  // Что стоит на странице перед сайтом — для водителя, обходом дерева
+  // изнутри: ни один вызов страницы (селекторы, коллекции) не остаётся в
+  // её следах, которые челлендж записывает в отчёт.
+  globalThis.__pt_gateInfo = () => {
+    const out = { title: '', url: '', inter: false, widget: false, token: false, datadome: false, orchestrator: false };
+    try {
+      out.title = String((globalThis.document && document.title) || '');
+      out.url = String((globalThis.location && location.href) || '');
+      out.inter = /Just a moment/.test(out.title);
+      __walkTree(globalThis.document, (n) => {
+        if (!n || n.nodeType !== ELEMENT_NODE) return;
+        const t = n.__ptLocal;
+        if (t === 'iframe' && /challenges\.cloudflare\.com/.test(__ptGetA(n, 'src') || '')) out.widget = true;
+        if (t === 'script') {
+          const src = __ptGetA(n, 'src') || '';
+          if (/\/cdn-cgi\/challenge-platform\//.test(src)) out.orchestrator = true;
+          if (/captcha-delivery\.com|datadome/.test(src)) out.datadome = true;
+        }
+        if ((t === 'input' || t === 'textarea') && __ptGetA(n, 'name') === 'cf-turnstile-response' && n.value) out.token = true;
+      });
+      if (!out.inter && out.orchestrator && typeof globalThis._cf_chl_opt === 'object') out.inter = true;
+    } catch (e) {}
+    return __ptJSON.stringify(out);
+  };
   globalThis.__pt_frameRectById = (id) => {
     const walk = (n) => {
       for (let c = n.firstChild; c; c = c.nextSibling) {

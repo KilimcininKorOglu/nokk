@@ -1093,6 +1093,75 @@ pub struct NetworkRecord {
     pub context: usize,
 }
 
+/// What kind of gate the page currently shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChallengeKind {
+    None,
+    /// Cloudflare's "Just a moment…" page (managed challenge, with or without a checkbox).
+    CloudflareInterstitial,
+    /// A Turnstile widget embedded in a site's own page, no token yet.
+    TurnstileWidget,
+    /// DataDome's gate — not something this engine solves.
+    DataDome,
+}
+
+impl ChallengeKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ChallengeKind::None => "none",
+            ChallengeKind::CloudflareInterstitial => "cloudflare-interstitial",
+            ChallengeKind::TurnstileWidget => "turnstile-widget",
+            ChallengeKind::DataDome => "datadome",
+        }
+    }
+}
+
+/// A snapshot of the page's challenge situation.
+#[derive(Debug, Clone)]
+pub struct ChallengeState {
+    pub kind: ChallengeKind,
+    pub title: String,
+    pub url: String,
+    /// A standalone widget has issued its token.
+    pub token: bool,
+    /// A `cf_clearance` cookie is in the jar.
+    pub cleared: bool,
+}
+
+/// How a solve attempt ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChallengeStatus {
+    /// Lock obtained and the interstitial moved on (or there was none to move).
+    Cleared,
+    /// A standalone widget issued its token.
+    TokenIssued,
+    /// Lock obtained, but the interstitial stayed on its own page.
+    ClearedButStuck,
+    /// Nothing cleared within the budget.
+    Timeout,
+}
+
+impl ChallengeStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ChallengeStatus::Cleared => "cleared",
+            ChallengeStatus::TokenIssued => "token-issued",
+            ChallengeStatus::ClearedButStuck => "cleared-but-stuck",
+            ChallengeStatus::Timeout => "timeout",
+        }
+    }
+    pub fn is_success(&self) -> bool {
+        matches!(self, ChallengeStatus::Cleared | ChallengeStatus::TokenIssued)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChallengeOutcome {
+    pub status: ChallengeStatus,
+    pub presses: usize,
+    pub elapsed_ms: u64,
+}
+
 impl BrowserContext {
     /// The worker this context is pinned to.
     pub fn worker(&self) -> WorkerId {
@@ -2207,6 +2276,125 @@ impl BrowserContext {
         }
     }
 
+    /// What stands between the page and the site right now, as a driver would
+    /// want to hear it: nothing, a Cloudflare interstitial ("Just a moment…"),
+    /// a standalone Turnstile widget, or another vendor's gate (DataDome).
+    pub async fn challenge_state(&self) -> ChallengeState {
+        let js = "typeof __pt_gateInfo === 'function' ? __pt_gateInfo() : '{}'";
+        let v = self.evaluate(js).await.ok();
+        let parsed: Option<serde_json::Value> = v
+            .as_ref()
+            .and_then(|x| x.as_str())
+            .and_then(|t| serde_json::from_str(t).ok());
+        let g = |k: &str| parsed.as_ref().and_then(|o| o[k].as_bool()).unwrap_or(false);
+        let cleared = self.cookies(&[]).iter().any(|c| c.name == "cf_clearance");
+        let kind = if g("inter") {
+            ChallengeKind::CloudflareInterstitial
+        } else if g("datadome") {
+            ChallengeKind::DataDome
+        } else if g("widget") && !g("token") {
+            ChallengeKind::TurnstileWidget
+        } else {
+            ChallengeKind::None
+        };
+        ChallengeState {
+            kind,
+            title: parsed.as_ref().and_then(|o| o["title"].as_str()).unwrap_or("").to_string(),
+            url: parsed.as_ref().and_then(|o| o["url"].as_str()).unwrap_or("").to_string(),
+            token: g("token"),
+            cleared,
+        }
+    }
+
+    /// Wait for a challenge on the page to finish, pressing whatever it puts up
+    /// (a checkbox, a switch) the way a person would, for at most `budget`.
+    /// Deliberately knows nothing about any particular challenge. A cleared
+    /// interstitial is given time to walk on to the real page.
+    pub async fn solve_challenge(&self, budget: std::time::Duration) -> ChallengeOutcome {
+        let t = std::time::Instant::now();
+        let deadline = t + budget;
+        /// A widget asks once or twice; more than this is a loop, not a user.
+        const MAX_PRESSES: usize = 3;
+        let mut pressed = 0usize;
+        let mut seen_controls = std::collections::HashSet::new();
+        let is_interstitial = |v: &serde_json::Value| matches!(v, serde_json::Value::String(s) if s.contains("Just a moment"));
+        let status = loop {
+            let worked = self.run_event_loop().await.unwrap_or(0);
+            let cleared = self.cookies(&[]).iter().any(|c| c.name == "cf_clearance");
+            // A standalone widget (not an interstitial) sets no cookie: its
+            // success is the token in `cf-turnstile-response`.
+            let token = self
+                .evaluate("typeof __pt_widgetToken === 'function' && __pt_widgetToken() !== ''")
+                .await
+                .map(|v| v.as_bool().unwrap_or(false) || v.as_str() == Some("true"))
+                .unwrap_or(false);
+            if token && !cleared {
+                tracing::info!(target: "nokk", elapsed_ms = t.elapsed().as_millis(), presses = pressed, "challenge complete: widget token issued");
+                break ChallengeStatus::TokenIssued;
+            }
+            if cleared {
+                tracing::info!(target: "nokk", elapsed_ms = t.elapsed().as_millis(), presses = pressed, "challenge cleared");
+                // The interstitial walks on to the original address by itself
+                // once it holds the lock — give it the time, or the result is
+                // the interstitial's page rather than the site's.
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                while std::time::Instant::now() < until
+                    && is_interstitial(&self.evaluate("document.title").await.unwrap_or_default())
+                {
+                    let _ = self.run_event_loop().await;
+                }
+                if is_interstitial(&self.evaluate("document.title").await.unwrap_or_default()) {
+                    tracing::warn!(target: "nokk", "cleared, but the interstitial did not move on");
+                    break ChallengeStatus::ClearedButStuck;
+                }
+                tracing::info!(target: "nokk", elapsed_ms = t.elapsed().as_millis(), "interstitial moved on");
+                break ChallengeStatus::Cleared;
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(target: "nokk", presses = pressed, "challenge did not clear in time");
+                break ChallengeStatus::Timeout;
+            }
+            // Press only what is offered, once per control that appears: a
+            // widget that ignores a press is not asking for another, and a
+            // flurry of clicks is its own signature.
+            if pressed < MAX_PRESSES {
+                if let Ok(Some(what)) = self.press_widget_control().await {
+                    if seen_controls.insert(what.clone()) {
+                        pressed += 1;
+                        tracing::info!(target: "nokk", control = %what, "pressed the challenge widget");
+                        // The second and a half after a press is work, not sleep:
+                        // the widget counts in exactly that window, and an engine
+                        // asleep then shows a gap no browser has.
+                        let until = std::time::Instant::now() + std::time::Duration::from_millis(1_500);
+                        while std::time::Instant::now() < until {
+                            let _ = self.run_event_loop().await;
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                    }
+                }
+            }
+            // Два захода в изоляты на каждом витке — часы страницы и кадра
+            // виджета. Убраны как отладочные — и интерактивная застава перестала
+            // проходить: заход в кадр между его срезами, похоже, нужен ему как
+            // пульс. Оставлены как есть, пока причина не названа точно.
+            let _ = self
+                .evaluate("typeof __pt_nextTimerDelay === 'function' ? String(__pt_nextTimerDelay()) : 'nofn'")
+                .await;
+            if let Some(f) = self.frame_list().first() {
+                let _ = self
+                    .evaluate_in_frame(f.id, "typeof __pt_nextTimerDelay === 'function' ? String(__pt_nextTimerDelay()) : 'nofn'")
+                    .await;
+            }
+            // A working page gets a millisecond between pumps; an idle one 25.
+            if worked == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_micros(500)).await;
+            }
+        };
+        ChallengeOutcome { status, presses: pressed, elapsed_ms: t.elapsed().as_millis() as u64 }
+    }
+
     pub async fn press_widget_control(&self) -> Result<Option<String>, EngineError> {
         // Frames first: a challenge widget is one, and its control is the one
         // worth pressing.
@@ -2702,7 +2890,15 @@ impl BrowserContext {
                 .unwrap_or(-1);
             tracing::debug!(worker = id, ran, slices_ms, pending, "worker turn");
 
-            let qjson = self.eval_at(place, child, DRAIN_IO).await?;
+            // Воркер мог быть остановлен (его кадр убрали) между перечнем и
+            // ходом: это конец воркера, а не ошибка перехода страницы.
+            let qjson = match self.eval_at(place, child, DRAIN_IO).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(worker = id, error = %e, "worker gone during turn");
+                    continue;
+                }
+            };
             let queues: Value = match qjson {
                 Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
                 _ => Value::Null,
@@ -3495,20 +3691,36 @@ impl BrowserContext {
                 self.flush_resource_timings(index).await;
             }
             let t_slice = std::time::Instant::now();
-            let ran = self
+            // Кадр мог исчезнуть между перечнем и прокачкой (страница убрала
+            // iframe): это не ошибка перехода, а просто конец кадра.
+            let ran = match self
                 .engine
                 .pool
                 .dispatch(self.route(index).0, {
                     let raw = self.route(index).1;
                     move |iso| iso.run_event_loop(raw, 200, std::time::Duration::from_millis(50))
                 })
-                .await?
-                .unwrap_or(0);
+                .await
+            {
+                Ok(v) => v.unwrap_or(0),
+                Err(e) => {
+                    tracing::debug!(frame = id, error = %e, "frame gone during pump");
+                    if let Ok(mut f) = self.frames.lock() { f.remove(&id); }
+                    continue;
+                }
+            };
             work += ran as usize;
             // Кадр простаивает — самое время добрать запас пустых реалмов на
             // его потоке: следующий вставленный им кадр получит готовый.
             tracing::debug!(target: "nokk::pace", frame = id, ran, slice_ms = t_slice.elapsed().as_millis() as u64, "срез кадра");
-            let qjson = self.eval_in(index, DRAIN_IO).await?;
+            let qjson = match self.eval_in(index, DRAIN_IO).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(frame = id, error = %e, "frame gone during drain");
+                    if let Ok(mut f) = self.frames.lock() { f.remove(&id); }
+                    continue;
+                }
+            };
             let queues: Value = match qjson {
                 Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
                 _ => Value::Null,

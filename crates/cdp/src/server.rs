@@ -76,13 +76,21 @@ const AWAIT_PROMISE_POLL: std::time::Duration = std::time::Duration::from_millis
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub addr: SocketAddr,
+    /// Solve a challenge transparently on every `Page.navigate` that lands on
+    /// one, with this much time; `None` leaves navigation as it is (a context
+    /// created with `autoSolve: true` still solves).
+    pub auto_solve: Option<std::time::Duration>,
 }
+
+/// How long an automatic solve may take when the caller named no budget.
+const AUTO_SOLVE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Serve the CDP protocol until the listener errors. `engine` must be built with
 /// real networking for navigation to work.
 pub async fn serve(engine: Engine, config: ServerConfig) -> std::io::Result<()> {
     let listener = TcpListener::bind(config.addr).await?;
     let port = config.addr.port();
+    let auto_solve = config.auto_solve;
     let registry = TargetRegistry::default();
     tracing::info!(%config.addr, "CDP server listening — ws://{}/devtools/browser/nokk", config.addr);
     loop {
@@ -90,7 +98,7 @@ pub async fn serve(engine: Engine, config: ServerConfig) -> std::io::Result<()> 
         let engine = engine.clone();
         let registry = registry.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, engine, port, registry).await {
+            if let Err(e) = handle_conn(stream, engine, port, registry, auto_solve).await {
                 tracing::debug!(%peer, error = %e, "cdp connection ended");
             }
         });
@@ -125,6 +133,7 @@ async fn handle_conn(
     engine: Engine,
     port: u16,
     registry: TargetRegistry,
+    auto_solve: Option<std::time::Duration>,
 ) -> std::io::Result<()> {
     let head = read_head(&mut stream).await?;
     let request_line = head.lines().next().unwrap_or("");
@@ -153,7 +162,7 @@ async fn handle_conn(
     stream.write_all(response.as_bytes()).await?;
 
     let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
-    run_session(ws, engine, port, registry).await;
+    run_session(ws, engine, port, registry, auto_solve).await;
     Ok(())
 }
 
@@ -264,6 +273,8 @@ struct Conn {
     /// inherit it, giving per-identity (IP + cookie jar) isolation and, when a
     /// `sessionName` was supplied, a jar that persists across runs.
     browser_contexts: HashMap<String, BrowserContextCfg>,
+    /// Server-wide automatic solving (`--auto-solve`), with its budget.
+    auto_solve: Option<std::time::Duration>,
 }
 
 /// Per-browser-context configuration carried from `Target.createBrowserContext`
@@ -275,6 +286,9 @@ struct BrowserContextCfg {
     /// persistent session jar (warm up once, resume later) instead of a
     /// per-connection in-memory identity.
     session: Option<String>,
+    /// `autoSolve` (non-standard param): solve challenges on navigation for
+    /// pages of this context, regardless of the server-wide setting.
+    auto_solve: Option<bool>,
 }
 
 /// Parse a CDP `proxyServer` string (`scheme://[user:pass@]host:port`, scheme
@@ -344,6 +358,7 @@ async fn run_session<S>(
     engine: Engine,
     port: u16,
     registry: TargetRegistry,
+    auto_solve: Option<std::time::Duration>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -373,6 +388,7 @@ async fn run_session<S>(
         registry,
         port,
         browser_sessions: Vec::new(),
+        auto_solve,
     };
 
     // Delivers server-pushed WebSocket frames between commands (see the tick arm
@@ -714,12 +730,14 @@ impl Conn {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(String::from);
+                let auto_solve = params.get("autoSolve").and_then(|v| v.as_bool());
                 let bcid = next_id("BC");
                 self.browser_contexts.insert(
                     bcid.clone(),
                     BrowserContextCfg {
                         proxy,
                         session: session_name,
+                        auto_solve,
                     },
                 );
                 vec![ok(id, &session, json!({ "browserContextId": bcid }))]
@@ -1091,6 +1109,46 @@ impl Conn {
                     ]}),
                 )]
             }
+            // Non-standard, nokk's own: drive a challenge on demand, or ask
+            // what gate the page shows. Both answer asynchronously, like
+            // `Page.navigate`, since solving takes seconds.
+            "Nokk.solveChallenge" => {
+                let budget = params
+                    .get("timeoutMs")
+                    .and_then(|v| v.as_u64())
+                    .map(std::time::Duration::from_millis)
+                    .or(self.auto_solve)
+                    .unwrap_or(AUTO_SOLVE_DEFAULT);
+                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let outcome = ctx.solve_challenge(budget).await;
+                    let after = ctx.challenge_state().await;
+                    let m = ok(id, &session, json!({
+                        "status": outcome.status.as_str(),
+                        "solved": outcome.status.is_success(),
+                        "presses": outcome.presses,
+                        "elapsedMs": outcome.elapsed_ms,
+                        "remaining": after.kind.as_str(),
+                        "title": after.title, "url": after.url,
+                        "cleared": after.cleared, "token": after.token,
+                    }));
+                    let _ = tx.send(Message::Text(m.to_string()));
+                });
+                vec![]
+            }
+            "Nokk.challengeState" => {
+                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let st = ctx.challenge_state().await;
+                    let m = ok(id, &session, json!({
+                        "kind": st.kind.as_str(), "title": st.title, "url": st.url,
+                        "cleared": st.cleared, "token": st.token,
+                        "solvable": matches!(st.kind, nokk::ChallengeKind::CloudflareInterstitial | nokk::ChallengeKind::TurnstileWidget),
+                    }));
+                    let _ = tx.send(Message::Text(m.to_string()));
+                });
+                vec![]
+            }
             "Page.navigate" => {
                 let url = params
                     .get("url")
@@ -1123,12 +1181,50 @@ impl Conn {
                 let ctx = self.targets[idx].ctx.clone();
                 let session = session.clone();
                 let tx = tx.clone();
+                // Solve on arrival: server-wide (`--auto-solve`) or per browser
+                // context (`autoSolve`), the context's word winning.
+                let per_ctx = self.targets[idx]
+                    .browser_context_id
+                    .as_deref()
+                    .and_then(|bc| self.browser_contexts.get(bc))
+                    .and_then(|c| c.auto_solve);
+                let solve_budget = match per_ctx {
+                    Some(true) => Some(self.auto_solve.unwrap_or(AUTO_SOLVE_DEFAULT)),
+                    Some(false) => None,
+                    None => self.auto_solve,
+                };
                 tokio::spawn(async move {
                     // Drive the real navigation, then Puppeteer's init scripts.
                     let nav = ctx.navigate(&url).await;
                     let nav_error = nav.as_ref().err().map(|e| e.to_string());
                     if let Some(e) = &nav_error {
                         tracing::debug!(error = %e, "Page.navigate error");
+                    }
+                    // A gate on the page: solve it now if asked to, and in any
+                    // case tell the client what stands in the way — silently
+                    // handing over a "Just a moment…" page would look like an
+                    // ordinary load.
+                    let mut challenge_event = None;
+                    if nav_error.is_none() {
+                        let state = ctx.challenge_state().await;
+                        if state.kind != nokk::ChallengeKind::None {
+                            let outcome = match solve_budget {
+                                Some(budget) => Some(ctx.solve_challenge(budget).await),
+                                None => None,
+                            };
+                            let after = ctx.challenge_state().await;
+                            let solved = outcome.as_ref().map(|o| o.status.is_success()).unwrap_or(false);
+                            challenge_event = Some(json!({
+                                "kind": state.kind.as_str(),
+                                "title": after.title, "url": after.url,
+                                "solved": solved,
+                                "remaining": after.kind.as_str(),
+                                "attempted": outcome.is_some(),
+                                "status": outcome.as_ref().map(|o| o.status.as_str()),
+                                "presses": outcome.as_ref().map(|o| o.presses),
+                                "elapsedMs": outcome.as_ref().map(|o| o.elapsed_ms),
+                            }));
+                        }
                     }
                     // The init scripts already ran inside the navigation, ahead of
                     // the document's own; running them again here would double every
@@ -1172,6 +1268,9 @@ impl Conn {
                             "id": nid, "origin": url, "name": name, "uniqueId": format!("{nid}.1"),
                             "auxData": { "isDefault": false, "type": "isolated", "frameId": target_id }
                         }})));
+                    }
+                    if let Some(c) = challenge_event {
+                        out.push(ev("Nokk.challenge", c));
                     }
                     out.push(lifecycle("init"));
                     out.push(lifecycle("DOMContentLoaded"));
@@ -1910,6 +2009,7 @@ mod tests {
             registry: TargetRegistry::default(),
             port: 0,
             browser_sessions: Vec::new(),
+            auto_solve: None,
         }
     }
 
