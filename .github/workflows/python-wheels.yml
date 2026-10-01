@@ -47,6 +47,7 @@ jobs:
             # built from snapshot.debian.org, whose lines sit commented in sources.list —
             # those still have every package at the exact version the image expects.
             # (/etc/apt may not be writable under the runner's docker, so the list goes to /tmp.)
+            id; ls -ld / /etc/apt /var/lib/apt/lists /tmp; cat /proc/self/uid_map; mount | grep -E " / | /etc " | head -3
             grep "^# deb http://snapshot" /etc/apt/sources.list | sed "s/^# //" > /tmp/sources.list
             APT="apt-get -o Dir::Etc::SourceList=/tmp/sources.list -o Dir::Etc::SourceParts=/dev/null -o Acquire::Check-Valid-Until=false -o Acquire::Retries=3"
             $APT update -qq
