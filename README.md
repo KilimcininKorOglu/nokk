@@ -197,11 +197,59 @@ Every page opened in that context shares the named jar; it flushes to disk when 
 closes. Distinct session names are fully isolated. Without `--session-store`, sessions are
 in-memory only. From the Rust API this is `Engine::new_context_with_session(name, proxy)`.
 
-**Reusing a Cloudflare `cf_clearance`.** An interactive/managed Turnstile can't be solved by
-a no-render engine, but a clearance solved once in a real browser can be *replayed*. The
-cookie is bound to the exit IP **and to the TLS fingerprint of the browser that earned it**,
-so the two have to match: nokk emulates Chrome 151 and its JA4 is byte-identical to the real
-browser's, which is what makes the handoff work.
+### Cloudflare challenges solve themselves
+
+nokk clears Cloudflare's Turnstile on its own — the invisible kind, the managed
+interstitial ("Just a moment…"), and the interactive one with the *Verify you are human*
+checkbox. There is nothing to configure and nothing to point at: the engine knows no
+particular challenge. It waits while the page works, and if a widget puts up a control
+it presses it the way a person would, with the pointer moving in from a distance and the
+events a real click produces. The control sits in a closed shadow root inside a
+cross-origin frame, where page script (and a CSS selector from a driver) cannot reach —
+which is exactly why the press lives in the engine. A cleared interstitial then submits
+its form and walks on to the real page by itself.
+
+```bash
+# one-shot: load, solve whatever comes up, print the page
+nokk --load https://gated.example/ --solve-challenge 25 --fail-on-challenge
+```
+
+`--fail-on-challenge` turns the outcome into an exit code (`0` the site, `3` still the
+gate), and `--solve-challenge N` is the time budget. Measured on live sites (2026-10):
+`chess.com/login` (invisible widget, ~6 s), `scrapingcourse.com/cloudflare-challenge`
+(interstitial, ~9 s), `nopecha.com/demo/cloudflare` and `usvisascheduling.com`
+(interactive interstitial, ~10 s), the Turnstile test pages on `peet.ws` (standalone
+widget: the token lands in `cf-turnstile-response`, and that counts as success).
+
+**Over CDP / Puppeteer** it is the same engine with three ways in:
+
+```bash
+nokk --port 9222 --auto-solve        # every page.goto() that lands on a gate solves it first
+```
+
+```js
+// per browser context, regardless of the server flag
+const { browserContextId } = await cdp.send('Target.createBrowserContext', { autoSolve: true });
+
+// on demand, from a page session
+const state = await session.send('Nokk.challengeState');
+// → { kind: 'cloudflare-interstitial' | 'turnstile-widget' | 'datadome' | 'none',
+//     title, url, cleared, token, solvable }
+const out = await session.send('Nokk.solveChallenge', { timeoutMs: 30000 });
+// → { status: 'cleared' | 'token-issued' | 'cleared-but-stuck' | 'timeout', solved,
+//     presses, elapsedMs, remaining, title, url }
+```
+
+Whenever a navigation lands on a gate, the page session also gets a `Nokk.challenge`
+event — `{ kind, solved, attempted, status, remaining, title, url }` — so a page that
+still shows a gate never looks like an ordinary load. A gate nokk does not solve
+(DataDome, image puzzles) is reported by kind; the way through those is a session
+warmed in a real browser (below), not a selector.
+
+**Replaying a `cf_clearance` from a real browser.** A clearance earned elsewhere can be
+imported too. The cookie is bound to the exit IP **and to the TLS fingerprint of the
+browser that earned it**, so the two have to match: nokk emulates Chrome 151 and its JA4
+is byte-identical to the real browser's, which is what makes the handoff work.
 
 ```bash
 # 1. earn it in a real browser (visible window; nothing is injected into the page)
@@ -212,20 +260,10 @@ nokk --load https://gated.example/ \
      --session-store ./sessions --session cf --import-cookies cf_clearance.json
 ```
 
-Verified end-to-end against a plain Cloudflare interstitial
-(`scrapingcourse.com/cloudflare-challenge`): without the cookie nokk gets
-`Just a moment...`; with it, the page itself — the same document the real browser sees.
-
-A clearance expires, and a page that still shows the gate otherwise looks like an
-ordinary load. `--fail-on-challenge` makes that a question a script can ask: nokk says
-why the gate is still up and exits with code 3, which is the cue to re-harvest. (Don't
-trust the cookie's own `expires` — it reads a year out, while Cloudflare decides validity
-on its side, against the IP and the TLS fingerprint too.)
-
-See [examples/cf-harvester](examples/cf-harvester/) for a scriptable harvester (Python +
-`nodriver`, auto-clicks a managed widget) and the
-[research write-up](examples/cf-harvester/docs/RESEARCH.md) on why this hybrid — real
-browser solves, nokk replays at scale — is the honest approach.
+A clearance expires, and `--fail-on-challenge` says when it did (don't trust the
+cookie's own `expires` — Cloudflare decides validity on its side, against the IP and the
+TLS fingerprint too). See [examples/cf-harvester](examples/cf-harvester/) for a scriptable
+harvester and the [research write-up](examples/cf-harvester/docs/RESEARCH.md).
 
 ### Rotating fingerprints across contexts
 
@@ -333,18 +371,20 @@ surface a page sees is real JS objects, not native bindings a detector can trivi
 ## Project status
 
 **Alpha.** The engine is real and end-to-end: V8 executes page JS against a parsed DOM,
-the fingerprinted transport clears Cloudflare's TLS/HTTP checks and the "Just a moment…"
-JS challenge on live sites, and Puppeteer can connect over CDP to open a page, navigate,
-and evaluate.
+the fingerprinted transport clears Cloudflare's TLS/HTTP checks, the engine solves
+Turnstile on live sites — invisible, managed and interactive — and Puppeteer can connect
+over CDP to open a page, navigate, and evaluate.
 
 What is **not** done yet, and where the sharp edges are:
 
 - **JS-fingerprint hardening is ongoing.** Much of the hardening is in place — native
   `toString` masking, internals hidden from `Object.getOwnPropertyNames`, `navigator`/`screen`
   as real prototype instances, an IP-coherent timezone, and per-context coherent fingerprint
-  rotation — but tells remain (no Web Workers / `OffscreenCanvas`). nokk passes mainstream WAF
-  challenges today but is **not** yet a match for a dedicated fingerprinting suite like
-  CreepJS. See the [roadmap](ROADMAP.md).
+  rotation, Web Workers, canvas/WebGL/WebGPU/audio with Chrome's pixels and samples,
+  Trusted Types and CSP. nokk solves Cloudflare's challenges today, and the comparison
+  against Chrome section by section is how the remaining tells get found; it is **not**
+  yet a match for a dedicated fingerprinting suite like CreepJS. See the
+  [roadmap](ROADMAP.md).
 - **CDP coverage is the Puppeteer happy path**, not the whole protocol. `page.$` /
   `$eval` / `$$eval` and `page.evaluate()` work; Playwright and less-common CDP domains
   are not supported yet.
