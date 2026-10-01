@@ -1135,6 +1135,17 @@ impl BrowserContext {
         url: &str,
         referrer: Option<&str>,
     ) -> Result<(), EngineError> {
+        self.navigate_inner(url, referrer, None).await
+    }
+
+    /// Переход с телом — отправка формы методом POST (`form.submit()`): так
+    /// застава Cloudflare уносит замок на исходный адрес.
+    async fn navigate_inner(
+        &self,
+        url: &str,
+        referrer: Option<&str>,
+        post: Option<(&str, &str)>,
+    ) -> Result<(), EngineError> {
         // Follow client-side `<meta http-equiv="refresh">` redirects, not just the
         // HTTP ones the network layer already follows. Some gates (e.g. Google's
         // "enable JavaScript" handoff) bounce through a meta-refresh that also sets
@@ -1150,12 +1161,14 @@ impl BrowserContext {
                 .await;
         }
         let mut current = url.to_string();
+        let mut post = post;
         for _ in 0..MAX_META_HOPS {
             // Use the post-redirect URL as the document base, so `window.location`
             // and relative-URL resolution reflect where we actually landed.
-            let (final_url, html) = self
-                .fetch_text_from(&current, "document", referrer)
-                .await?;
+            let (final_url, html) = match post.take() {
+                Some((ctype, body)) => self.fetch_document_post(&current, referrer, ctype, body).await?,
+                None => self.fetch_text_from(&current, "document", referrer).await?,
+            };
             self.load_html(&final_url, &html).await?;
             match self.meta_refresh_target(&final_url).await {
                 Some(next) if next != final_url && next != current => current = next,
@@ -1686,7 +1699,12 @@ impl BrowserContext {
                         // is a recursive async call and needs an indirection.
                         let from = base.clone();
                         let from = (!from.is_empty() && from != "about:blank").then_some(from);
-                        if let Err(e) = Box::pin(self.navigate_from(&to, from.as_deref())).await {
+                        let post = (op["method"].as_str() == Some("POST")).then(|| (
+                            op["contentType"].as_str().unwrap_or("application/x-www-form-urlencoded").to_string(),
+                            op["body"].as_str().unwrap_or("").to_string(),
+                        ));
+                        let post_ref = post.as_ref().map(|(c, b)| (c.as_str(), b.as_str()));
+                        if let Err(e) = Box::pin(self.navigate_inner(&to, from.as_deref(), post_ref)).await {
                             tracing::debug!(url = %to, error = %e, "self-navigation failed");
                         }
                         return Ok(total_timers);
@@ -4017,6 +4035,23 @@ impl BrowserContext {
         referrer: Option<&str>,
     ) -> Result<(String, String), EngineError> {
         self.fetch_text_at(self.index, url, resource_type, referrer).await
+    }
+
+    /// Документ по POST: запрос документа с телом формы.
+    async fn fetch_document_post(
+        &self,
+        url: &str,
+        referrer: Option<&str>,
+        content_type: &str,
+        body: &str,
+    ) -> Result<(String, String), EngineError> {
+        let mut req = self.get_request(url, "document", referrer);
+        req.method = "POST".into();
+        req.body = Some(body.as_bytes().to_vec());
+        req.headers.insert("Content-Type".to_string(), content_type.to_string());
+        let started = std::time::Instant::now();
+        let sent = self.client.send(req).await;
+        self.finish_text(self.index, url, "document", started, sent)
     }
 
     #[allow(clippy::too_many_arguments)]

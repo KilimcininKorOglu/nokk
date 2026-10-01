@@ -1272,8 +1272,61 @@
       if (!u) return;
       try { u[part] = v; __ptSetA(this, 'href', u.href); } catch (e) {}
     }
-    get action() { return this.__ptUrlAttr('action'); }
+    get action() { return this.__ptUrlAttr('action') || ((this.ownerDocument || document).URL || ''); }
     set action(v) { __ptSetA(this, 'action', v); }
+    // Форма: `method`/`enctype` — перечисления, `elements` — её поля,
+    // `submit()` уходит на адрес действия без события, `requestSubmit()` —
+    // после события submit. У нас всё это было заглушками, и страница заставы
+    // Cloudflare, отправляющая форму с замком, стояла на месте.
+    get method() { const m = String(__ptGetA(this, 'method') || '').toLowerCase(); return m === 'post' ? 'post' : m === 'dialog' ? 'dialog' : 'get'; }
+    set method(v) { __ptSetA(this, 'method', v); }
+    get enctype() { const e = String(__ptGetA(this, 'enctype') || '').toLowerCase(); return e === 'multipart/form-data' || e === 'text/plain' ? e : 'application/x-www-form-urlencoded'; }
+    set enctype(v) { __ptSetA(this, 'enctype', v); }
+    get elements() {
+      const out = [];
+      __walkTree(this, (n) => { if (n && n.nodeType === ELEMENT_NODE && /^(input|select|textarea|button|fieldset|object|output)$/.test(n.__ptLocal || '') && !(n.__ptLocal === 'input' && __inputType(n) === 'image')) out.push(n); });
+      return __collection(out);
+    }
+    get length() { return this.__ptLocal === 'form' ? this.elements.length : undefined; }
+    __ptFormData(submitter) {
+      const pairs = [];
+      for (const el of this.elements) {
+        const tag = el.__ptLocal, name = __ptGetA(el, 'name');
+        if (!name || __ptHasA(el, 'disabled') || tag === 'fieldset' || tag === 'object' || tag === 'output') continue;
+        if (tag === 'input') {
+          const type = __inputType(el);
+          if (type === 'submit' || type === 'button' || type === 'reset' || type === 'image') { if (el === submitter) pairs.push([name, el.value || '']); continue; }
+          if ((type === 'checkbox' || type === 'radio') && !el.checked) continue;
+          if (type === 'file') continue;
+          pairs.push([name, String(el.value == null ? '' : el.value)]);
+        } else if (tag === 'button') { if (el === submitter) pairs.push([name, el.value || '']); }
+        else if (tag === 'select') { for (const o of el.options || []) if (o.selected) pairs.push([name, o.value]); }
+        else pairs.push([name, String(el.value == null ? '' : el.value)]);
+      }
+      return pairs;
+    }
+    __ptSubmit(submitter) {
+      if (this.__ptLocal !== 'form' || !this.isConnected) return;
+      const method = this.method;
+      if (method === 'dialog') return;
+      let action = this.action;
+      try { if (submitter && __ptHasA(submitter, 'formaction')) action = new URL(__ptGetA(submitter, 'formaction'), (this.ownerDocument || document).baseURI).href; } catch (e) {}
+      const pairs = this.__ptFormData(submitter);
+      const enc = (s) => encodeURIComponent(s).replace(/%20/g, '+').replace(/[!'()~]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+      const query = pairs.map(([k, v]) => enc(k) + '=' + enc(v)).join('&');
+      if (typeof globalThis.__pt_navSubmit !== 'function') return;
+      if (method === 'post') { __pt_navSubmit(action, 'POST', query, 'application/x-www-form-urlencoded'); return; }
+      let u; try { u = new URL(action); u.search = query ? '?' + query : ''; u.hash = ''; } catch (e) { return; }
+      __pt_navSubmit(u.href, 'GET', '', '');
+    }
+    submit() { this.__ptSubmit(null); }
+    requestSubmit(submitter) {
+      if (this.__ptLocal !== 'form') return;
+      if (submitter !== undefined && submitter !== null && !(submitter && submitter.nodeType === ELEMENT_NODE)) throw __pt_mkErr(TypeError, "Failed to execute 'requestSubmit' on 'HTMLFormElement': parameter 1 is not of type 'HTMLElement'.");
+      const ev = new (globalThis.SubmitEvent || Event)('submit', { bubbles: true, cancelable: true, submitter: submitter || null });
+      if (!this.dispatchEvent(ev)) return;
+      this.__ptSubmit(submitter || null);
+    }
     __ptUrlAttr(n) {
       const raw = __ptGetA(this, n);
       if (raw == null) return '';
@@ -1792,7 +1845,14 @@
     setSelectionRange() {}
     setRangeText() {}
     get isContentEditable() { const v = (__ptGetA(this, 'contenteditable') || '').toLowerCase(); return v === '' || v === 'true'; }
-    click() { this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+    click() {
+      const ok = this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      // Кнопка отправки: щелчок по ней отправляет форму (с событием submit).
+      if (ok && ((this.__ptLocal === 'button' && /^(submit|)$/.test(String(__ptGetA(this, 'type') || '').toLowerCase())) || (this.__ptLocal === 'input' && /^(submit|image)$/.test(__inputType(this))))) {
+        let f = this.parentNode; while (f && f.__ptLocal !== 'form') f = f.parentNode;
+        if (f && typeof f.requestSubmit === 'function') f.requestSubmit(this);
+      }
+    }
 
     __ptShallowClone() {
       const e = new Element(this.localName);

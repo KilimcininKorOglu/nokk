@@ -807,7 +807,7 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   // never happened. The request goes to the driver, which performs a real
   // navigation of this context.
   const navQueue = [];
-  const askNav = (raw, replace) => {
+  const askNav = (raw, replace, post) => {
     const url = String(raw);
     if (!url) return;
     let abs = url;
@@ -817,9 +817,13 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
     // сразу, поэтому едут вместе с запросом.
     let via = '';
     try { via = String(new Error().stack || '').split('\n').slice(1, 4).join(' | ').slice(0, 300); } catch (e) {}
-    navQueue.push({ url: abs, replace: !!replace, via });
+    const op = { url: abs, replace: !!replace, via };
+    if (post) { op.method = 'POST'; op.body = String(post.body); op.contentType = String(post.contentType); }
+    navQueue.push(op);
   };
   globalThis.__pt_drainNavQueue = () => navQueue.splice(0);
+  // Отправка формы (dom_runtime): GET — адрес с запросом, POST — тело.
+  Object.defineProperty(globalThis, '__pt_navSubmit', { value: (url, method, body, contentType) => askNav(url, false, method === 'POST' ? { body, contentType } : null), writable: true, enumerable: false, configurable: true });
 
   for (const k of Object.keys(locState)) {
     accessor(LocationProto, k, () => locState[k], (v) => {

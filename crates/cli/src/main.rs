@@ -2424,12 +2424,36 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                 let worked = ctx.run_event_loop().await.unwrap_or(0);
                 let looped = phase.elapsed();
                 let cleared = ctx.cookies(&[]).iter().any(|c| c.name == "cf_clearance");
+                // Стендовый виджет (не застава) замка не ставит: его успех —
+                // токен в поле `cf-turnstile-response`.
+                let token = ctx
+                    .evaluate("(() => { const i = document.querySelector('[name=cf-turnstile-response]'); return !!(i && i.value); })()")
+                    .await
+                    .map(|v| v.as_bool().unwrap_or(false) || v.as_str() == Some("true"))
+                    .unwrap_or(false);
+                if token && !cleared {
+                    tracing::info!(elapsed_ms = t.elapsed().as_millis(), presses = pressed, "challenge complete: widget token issued");
+                    break;
+                }
                 if cleared {
                     tracing::info!(
                         elapsed_ms = t.elapsed().as_millis(),
                         presses = pressed,
                         "challenge cleared"
                     );
+                    // Застава («Just a moment…») после замка сама уходит на
+                    // исходный адрес — ей нужно дать это сделать, иначе итогом
+                    // остаётся страница заставы, а не сайт.
+                    let is_interstitial = |t: &serde_json::Value| matches!(t, serde_json::Value::String(s) if s.contains("Just a moment"));
+                    let until = Instant::now() + Duration::from_secs(15);
+                    while Instant::now() < until && is_interstitial(&ctx.evaluate("document.title").await.unwrap_or_default()) {
+                        let _ = ctx.run_event_loop().await;
+                    }
+                    if is_interstitial(&ctx.evaluate("document.title").await.unwrap_or_default()) {
+                        tracing::warn!("cleared, but the interstitial did not move on");
+                    } else {
+                        tracing::info!(elapsed_ms = t.elapsed().as_millis(), "interstitial moved on");
+                    }
                     break;
                 }
                 if Instant::now() >= deadline {
