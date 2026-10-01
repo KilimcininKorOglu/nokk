@@ -433,7 +433,7 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
     // начале загрузчика, чтобы стоять в каждом реалме раньше любого кода
     // страницы: пробник, ставящий их позже, пропускает ранние вызовы.
     let mut flags = String::new();
-    for (env, name) in [("NOKK_TRACE_CANVAS", "__pt_canvasTrace"), ("NOKK_TRACE_GPU", "__pt_gpuTrace"), ("NOKK_TRACE_ENC", "__pt_encTrace"), ("NOKK_TRACE_SRCDOC", "__pt_srcdocTrace")] {
+    for (env, name) in [("NOKK_TRACE_CANVAS", "__pt_canvasTrace"), ("NOKK_TRACE_GRID", "__pt_gridTrace"), ("NOKK_TRACE_GPU", "__pt_gpuTrace"), ("NOKK_TRACE_ENC", "__pt_encTrace"), ("NOKK_TRACE_SRCDOC", "__pt_srcdocTrace")] {
         if let Some(v) = std::env::var_os(env) {
             // Значение флага доступно трассе: `NOKK_TRACE_ENC=9000-9300,8600-8700`
             // высыпает куски отчёта этих длин целиком.
@@ -1694,7 +1694,7 @@ impl BrowserContext {
                     if index == self.index {
                         let to = url.to_string();
                         let via = op["via"].as_str().unwrap_or("");
-                        tracing::debug!(url = %to, via, "page navigated itself");
+                        tracing::debug!(url = %to, via, method = op["method"].as_str().unwrap_or("GET"), body_len = op["body"].as_str().map(|b| b.len()).unwrap_or(0), "page navigated itself");
                         // Boxed: the loop is reached *from* `navigate`, so this
                         // is a recursive async call and needs an indirection.
                         let from = base.clone();
@@ -2096,6 +2096,7 @@ impl BrowserContext {
                         "duration": r.duration_ms,
                         "size": r.encoded_len + 300,
                         "decoded": r.body.len(),
+                        "tao": r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("timing-allow-origin")).map(|(_, v)| v.clone()),
                     "encoding": r.content_encoding,
                         "status": r.status,
                         "protocol": "h2",
@@ -2150,6 +2151,7 @@ impl BrowserContext {
                     "duration": r.duration_ms,
                     "size": r.encoded_len + 300,
                     "decoded": r.body.len(),
+                    "tao": r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("timing-allow-origin")).map(|(_, v)| v.clone()),
                     "encoding": r.content_encoding,
                     "redirect": r.redirect_ms,
                     "status": r.status,

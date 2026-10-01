@@ -6904,6 +6904,19 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
         const had = ENTRY_ORDER.get(o);
         ENTRY_ORDER.set(o, had ? had.concat(keys.filter((k) => had.indexOf(k) < 0)) : keys);
       };
+      // Чужой ресурс без `Timing-Allow-Origin` для нашего origin: браузер
+      // прячет размеры, статус, протокол и промежуточные отметки (TAO).
+      const taoPass = (() => {
+        try {
+          if (isNav) return true;
+          const u = new URL(String(r.name || ''), (globalThis.location && location.href) || undefined);
+          const mine = (globalThis.location && location.origin) || 'null';
+          if (u.origin === mine) return true;
+          const h = String(r.tao == null ? '' : r.tao).trim();
+          if (!h) return false;
+          return h.split(',').map((x) => x.trim()).some((x) => x === '*' || x.toLowerCase() === mine.toLowerCase());
+        } catch (e) { return true; }
+      })();
       put(e, {
         name: String(r.name || ''), entryType: r.entryType || 'resource',
         startTime: start, duration: Number(r.duration) || 0,
@@ -6924,6 +6937,14 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
         responseStatus: Number(r.status) || 200,
         serverTiming: [],
       });
+      if (!taoPass) {
+        put(e, {
+          nextHopProtocol: '', redirectStart: 0, redirectEnd: 0, domainLookupStart: 0, domainLookupEnd: 0,
+          connectStart: 0, secureConnectionStart: 0, connectEnd: 0, requestStart: 0, responseStart: 0,
+          firstInterimResponseStart: 0, finalResponseHeadersStart: 0,
+          transferSize: 0, encodedBodySize: 0, decodedBodySize: 0, responseStatus: 0,
+        });
+      }
       if (r.entryType === 'navigation') {
         // Отметки документа — нули, пока событие не случилось, как у браузера;
         // их ставит __pt_markNav. Длительность навигации — до конца `load`.

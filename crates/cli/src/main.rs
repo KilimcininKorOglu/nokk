@@ -1177,6 +1177,9 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                   };
                   const cf = () => {
                     if (globalThis.__ptВРеалме) return true;
+                    // И сама страница заставы (оркестратор на домене сайта): у неё
+                    // свои отчёты в /cdn-cgi/challenge-platform/.
+                    if (globalThis._cf_chl_opt) return true;
                     try { return /challenges\.cloudflare/.test(location.host); } catch (e) { return false; }
                   };
                   try {
@@ -1187,7 +1190,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           if (!globalThis.__ptСобрано) globalThis.__ptСериализуем = 1;
                           // Второе окно — отчёт: тот же сериализатор, те же
                           // строки знак за знаком, только тело за 50 К.
-                          else if (!globalThis.__ptОтчётСобран) globalThis.__ptСериализуем2 = 1;
+                          else globalThis.__ptСериализуем2 = 1;
                         }
                       } catch (e) {}
                       return XO.apply(this, arguments);
@@ -1200,6 +1203,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           const ряд = globalThis.__ptСтроки || [];
                           const s1 = JSON.stringify(ряд);
                           console.error('[поля] всего=' + ряд.length + ' тело=' + b.length);
+                          globalThis.__ptСтроки = [];
                           try {
                             const Ж = globalThis.__ptЧтения || [];
                             const s2 = JSON.stringify(Ж.slice(-200));
@@ -1209,12 +1213,26 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                             console.error('[поля ' + ряд.length + ':' + (q / 250) + '] ' + s1.slice(q, q + 250));
                           }
                         }
-                        if (globalThis.__ptСериализуем2 && b && b.length > 50000 && !globalThis.__ptОтчётСобран) {
+                        if (globalThis.__ptСериализуем2 && b && b.length > 1000 && b.length <= 50000) {
+                          // Малый отчёт после первого (финальный отчёт оркестратора заставы).
+                          const k = (globalThis.__ptМалыйK = (globalThis.__ptМалыйK || 0) + 1);
+                          globalThis.__ptСериализуем2 = 0;
+                          const ряд = globalThis.__ptСтроки2 || [];
+                          globalThis.__ptСтроки2 = [];
+                          const s1 = JSON.stringify(ряд);
+                          console.error('[поля#' + k + '] всего=' + ряд.length + ' тело=' + b.length + ' ломтей=' + Math.ceil(s1.length / 250));
+                          for (let q = 0; q * 250 < s1.length; q++) console.error('[поля#' + k + ' ' + q + '] ' + s1.slice(q * 250, (q + 1) * 250));
+                        }
+                        if (globalThis.__ptСериализуем2 && b && b.length > 50000) {
+                          // Отчётов может быть несколько (второй — после нажатия):
+                          // каждый — своей пачкой, строки сбрасываются.
+                          const k = (globalThis.__ptОтчётK = (globalThis.__ptОтчётK || 0) + 1);
                           globalThis.__ptОтчётСобран = 1;
                           globalThis.__ptСериализуем2 = 0;
                           const ряд = globalThis.__ptСтроки2 || [];
+                          globalThis.__ptСтроки2 = [];
                           const s1 = JSON.stringify(ряд);
-                          console.error('[отчёт] всего=' + ряд.length + ' тело=' + b.length + ' знаков=' + s1.length);
+                          console.error('[отчёт#' + k + '] всего=' + ряд.length + ' тело=' + b.length + ' знаков=' + s1.length + ' ломтей=' + Math.ceil(s1.length / 250));
                           // Консоль держит 256 строк между выемками — ломти
                           // уходят пачками по таймеру.
                           const всего = Math.ceil(s1.length / 250);
@@ -1298,6 +1316,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     if std::env::var("NOKK_TRACE_READS").is_ok() { "true" } else { "false" },
                 );
                 c.add_frame_init_script(spread_to_realms(&probe, "fields"));
+                // И на саму страницу: у заставы свои отчёты в /challenge-platform/.
+                c.add_init_script(spread_to_realms(&probe, "fields"));
             }
             if std::env::var("NOKK_TRACE_HOOKS").is_ok() {
                 let hook = r#"(() => {
@@ -2427,7 +2447,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                 // Стендовый виджет (не застава) замка не ставит: его успех —
                 // токен в поле `cf-turnstile-response`.
                 let token = ctx
-                    .evaluate("(() => { const i = document.querySelector('[name=cf-turnstile-response]'); return !!(i && i.value); })()")
+                    .evaluate("typeof __pt_widgetToken === 'function' && __pt_widgetToken() !== ''")
                     .await
                     .map(|v| v.as_bool().unwrap_or(false) || v.as_str() == Some("true"))
                     .unwrap_or(false);

@@ -1019,6 +1019,7 @@
     setAttribute(n, v) {
       __needArgs(arguments.length, 2, 'setAttribute', 'Element');
       const name = __attrName(this, n), old = this.__ptAttrs.get(name);
+      if (name === 'nonce') { this.__ptNonce = String(v); if (__csp.headerDelivered) v = ''; }
       if (name === 'src' && this.__ptLocal === 'script') v = __pt_ttSink('TrustedScriptURL', 'HTMLScriptElement src', v, "Failed to execute 'setAttribute' on 'Element'");
       else if (name === 'srcdoc' && this.__ptLocal === 'iframe') v = __pt_ttSink('TrustedHTML', 'HTMLIFrameElement srcdoc', v, "Failed to execute 'setAttribute' on 'Element'");
       this.__ptAttrs.set(name, String(v));
@@ -1345,8 +1346,28 @@
     set alt(v) { __ptSetA(this, 'alt', v); }
     get integrity() { return __ptGetA(this, 'integrity') || ''; }
     set integrity(v) { __ptSetA(this, 'integrity', v); }
-    get nonce() { return __ptGetA(this, 'nonce') || ''; }
-    set nonce(v) { __ptSetA(this, 'nonce', v); }
+    // Отражения HTMLElement, которые были заглушками: `dir` (перечисление),
+    // `lang`, `title`, `accessKey`. Оркестратор заставы Cloudflare ставит
+    // `document.documentElement.dir`, и слепок DOM это видит.
+    get dir() { const v = String(__ptGetA(this, 'dir') || '').toLowerCase(); return v === 'ltr' || v === 'rtl' || v === 'auto' ? v : ''; }
+    set dir(v) { __ptSetA(this, 'dir', v); }
+    get lang() { return __ptGetA(this, 'lang') || ''; }
+    set lang(v) { __ptSetA(this, 'lang', v); }
+    get title() { return __ptGetA(this, 'title') || ''; }
+    set title(v) { __ptSetA(this, 'title', v); }
+    get accessKey() { return __ptGetA(this, 'accesskey') || ''; }
+    set accessKey(v) { __ptSetA(this, 'accesskey', v); }
+    // Nonce под CSP из заголовка браузер прячет: атрибут отвечает пустой
+    // строкой, значение живёт только в свойстве `nonce`.
+    get nonce() { return this.__ptNonce !== undefined ? this.__ptNonce : (__ptGetA(this, 'nonce') || ''); }
+    set nonce(v) { this.__ptNonce = String(v); }
+    __ptHideNonce() {
+      if (!__csp.headerDelivered) return;
+      const v = __ptGetA(this, 'nonce');
+      if (v === null || v === '') return;
+      this.__ptNonce = v;
+      this.__ptAttrs.set('nonce', '');
+    }
     get crossOrigin() { return __ptHasA(this, 'crossorigin') ? (__ptGetA(this, 'crossorigin') || 'anonymous') : null; }
     set crossOrigin(v) { __ptSetA(this, 'crossorigin', v); }
     get referrerPolicy() { return __ptGetA(this, 'referrerpolicy') || ''; }
@@ -1893,6 +1914,9 @@
     // показано, и `visibilityState` в нём и в его пустых кадрах — hidden.
     get visibilityState() { return globalThis.__ptDetached || __ptHiddenFrame() ? 'hidden' : 'visible'; }
     get hidden() { return !!globalThis.__ptDetached || __ptHiddenFrame(); }
+    // `document.dir` отражает `dir` корневого элемента.
+    get dir() { const h = this.documentElement; return h ? h.dir : ''; }
+    set dir(v) { const h = this.documentElement; if (h) h.dir = v; }
     get documentElement() { return this.__ptDocEl; }
     // ParentNode у документа — своё, а не наследованное: у браузера
     // `children` лежит на `Document.prototype`, и без него поверхность
@@ -2261,6 +2285,8 @@
 
   evtAccessors(Event, ['type', 'bubbles', 'cancelable', 'composed', 'defaultPrevented', 'target',
     'currentTarget', 'eventPhase', 'timeStamp']);
+  // `srcElement` — то же, что `target` (у нас была заглушка с undefined).
+  try { const g = function () { return this.__ptE.target; }; Object.defineProperty(g, 'name', { value: 'get srcElement', configurable: true }); Object.defineProperty(Event.prototype, 'srcElement', { get: g, configurable: true, enumerable: false }); } catch (e) {}
 
   class CustomEvent extends Event {
     constructor(type, init) { super(type, init); this.__ptE.detail = (init && init.detail) || null; }
@@ -6446,6 +6472,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const t = one.trim();
       if (!t) continue;
       __csp.policies.push({ raw: t, dirs: __cspParse(t), source: source || 'meta' });
+      if ((source || 'meta') === 'header') __csp.headerDelivered = true;
     }
     __cspWrapEval();
   };
@@ -6453,6 +6480,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // Мета-политика документа: применяется, как только разметка разобрана.
   globalThis.__pt_cspFromMeta = (root) => {
     try {
+      if (__csp.headerDelivered) __walkTree(root, (n) => { try { if (n && n.nodeType === ELEMENT_NODE && typeof n.__ptHideNonce === 'function') n.__ptHideNonce(); } catch (e) {} });
       const metas = [];
       __walkTree(root, (n) => { if (n && n.nodeType === ELEMENT_NODE && String(n.__ptLocal || '').toLowerCase() === 'meta' && String(__ptGetA(n, 'http-equiv') || '').toLowerCase() === 'content-security-policy') metas.push(n); });
       for (const m of metas) { const c = __ptGetA(m, 'content'); if (c) __pt_applyCsp(c, 'meta'); }
@@ -7809,6 +7837,20 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   /// Дорожки сетки: `[{px}|{fr}|{auto}]`. Понимает длины, доли, `auto`,
   /// `minmax()`, `repeat()` (и с `auto-fill`/`auto-fit`), имена линий
   /// пропускает. Пусто — одна дорожка `auto`.
+  // Расстановка детей сетки: явные места (`grid-area: 1/1`, `grid-column: 2`)
+  // и авторасстановка по строкам в свободные ячейки; колонок столько,
+  // сколько нужно (неявные — auto). Общая для раскладки и для max-content.
+  function __gridPlacement(flow, nTracks) {
+    const lineOf = (c, prop) => { const v = String(__cascadeFor(c).get(prop) || 'auto').trim(); const m = /^(\d+)$/.exec(v); return m ? +m[1] : null; };
+    const want = flow.map((c) => ({ col: lineOf(c, 'grid-column-start'), row: lineOf(c, 'grid-row-start') }));
+    let n = Math.max(nTracks, ...want.map((w) => w.col || 0));
+    const taken = new Set(); const place = new Array(flow.length);
+    want.forEach((w, i) => { if (w.col && w.row) { place[i] = { k: w.col - 1, r: w.row - 1 }; taken.add((w.row - 1) + ':' + (w.col - 1)); } });
+    want.forEach((w, i) => { if (place[i] || !w.row) return; let k = 0; while (taken.has((w.row - 1) + ':' + k)) k++; if (k >= n) n = k + 1; place[i] = { k, r: w.row - 1 }; taken.add((w.row - 1) + ':' + k); });
+    want.forEach((w, i) => { if (place[i] || !w.col) return; let r = 0; while (taken.has(r + ':' + (w.col - 1))) r++; place[i] = { k: w.col - 1, r }; taken.add(r + ':' + (w.col - 1)); });
+    { let cur = 0; want.forEach((w, i) => { if (place[i]) return; while (taken.has(((cur / n) | 0) + ':' + (cur % n))) cur++; place[i] = { k: cur % n, r: (cur / n) | 0 }; taken.add(((cur / n) | 0) + ':' + (cur % n)); cur++; }); }
+    return { place, n, want };
+  }
   function __gridTracks(raw, avail, gap, fs, rows) {
     const v = raw == null ? 'none' : String(raw).trim();
     if (!v || /^(none|auto|subgrid|masonry)$/i.test(v)) return rows ? [] : [{ auto: true }];
@@ -8051,7 +8093,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   }
 
   function __textWidth(text, fs, family, bold, italic) {
-    return __textMetrics(text, fs, family, bold, italic)[0] || 0;
+    // Ширина текста в раскладке — вверх до 1/64 px, как LayoutUnit у Chrome:
+    // пол ниже на долю давал перенос слова в колонке, сжатой по тексту.
+    const w = __textMetrics(text, fs, family, bold, italic)[0] || 0;
+    return Math.ceil(w * 64 - 1e-6) / 64;
   }
 
   // Перенос по словам. Абзац в браузере занимает столько строк, сколько
@@ -8219,9 +8264,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (/flex$/.test(display) && !/^column/.test(String(cs.get('flex-direction') || 'row'))) {
       inner += kids.reduce((a, c) => a + outer(c), 0) + gap('column-gap') * Math.max(0, kids.length - 1);
     } else if (/grid$/.test(display)) {
-      const n = Math.max(1, __gridTracks(cs.get('grid-template-columns'), 0, 0, fs).length);
+      const { place, n } = __gridPlacement(kids, Math.max(1, __gridTracks(cs.get('grid-template-columns'), 0, 0, fs).length));
       const cols = new Array(n).fill(0);
-      kids.forEach((c, i) => { cols[i % n] = Math.max(cols[i % n], outer(c)); });
+      kids.forEach((c, i) => { const k = place[i].k; cols[k] = Math.max(cols[k], outer(c)); });
       inner += cols.reduce((a, x) => a + x, 0) + gap('column-gap') * (n - 1);
     } else {
       // Строчные — в одну строку, блочные — каждый своей.
@@ -8411,8 +8456,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     // Проценты высоты — от заданной высоты родителя; у корня это окно. Мы
     // считали их от ширины, и `height: 100%` давало высоту в ширину окна.
     const up = el.parentNode;
-    const baseH = up && up.nodeType === ELEMENT_NODE
-      ? (up.__ptDefH != null ? up.__ptDefH : null) : LAYOUT.H;
+    // Абсолютный ребёнок меряет проценты от содержащего блока, который
+    // передал родитель (его padding-box), а не от страницы.
+    const __cb = (position === 'absolute' || position === 'fixed') && forced && forced.cb ? forced.cb : null;
+    const baseH = __cb && __cb.h != null ? __cb.h : (up && up.nodeType === ELEMENT_NODE
+      ? (up.__ptDefH != null ? up.__ptDefH : null) : LAYOUT.H);
+    if (__cb && __cb.w != null) availW = __cb.w;
     const explicitW = inW(len('width', availW));
     const explicitH = inH(len('height', baseH));
     el.__ptDefH = explicitH;
@@ -8427,7 +8476,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
                       fs, family, bold, false)
         : ua.w;
     }
-    if (cw == null && !inlineish) cw = Math.max(0, availW - ml - mr - bl - br - pl - pr);
+    // Замер без доступной ширины (`availW` null — сжатие по содержимому
+    // для колонки сетки или гибкого ребёнка): блок меряется по детям, а не
+    // по NaN, который давал ноль.
+    const shrinkToFit = cw == null && !inlineish && availW == null;
+    if (cw == null && !inlineish && availW != null) cw = Math.max(0, availW - ml - mr - bl - br - pl - pr);
     // Пределы ширины: без них колонка с `max-width` растягивалась во всё
     // окно, а вместе с ней уезжала и вся геометрия под ней.
     if (cw != null) {
@@ -8461,9 +8514,16 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
     let boxX = originX + ml, boxY = originY + mt;
     if (position === 'absolute' || position === 'fixed') {
-      const left = len('left', availW), top = len('top', availW);
-      if (left != null) boxX = left;
-      if (top != null) boxY = top;
+      // Отсчёт — от содержащего блока (padding-box позиционированного
+      // предка), а не от начала страницы: `inset:0` в блоке с отступом
+      // давал (0,0) вместо его угла.
+      const ox = __cb ? __cb.x : originX, oy = __cb ? __cb.y : originY;
+      const cbw = __cb && __cb.w != null ? __cb.w : availW, cbh = __cb && __cb.h != null ? __cb.h : null;
+      const left = len('left', cbw), top = len('top', cbh), right = len('right', cbw), bottom = len('bottom', cbh);
+      if (left != null) boxX = ox + left + ml;
+      else if (right != null && cbw != null && explicitW != null) boxX = ox + cbw - right - mr - (explicitW + pl + pr + bl + br);
+      if (top != null) boxY = oy + top + mt;
+      else if (bottom != null && cbh != null && explicitH != null) boxY = oy + cbh - bottom - mb - (explicitH + pt_ + pb + bt + bb);
     }
 
     const kids = [];
@@ -8488,7 +8548,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (lh == null && typeof __inheritedValue === 'function') lh = __inheritedValue(el, 'line-height');
       const t = lh == null ? '' : String(lh).trim();
       if (t && t !== 'normal') {
-        lineH = /^[\d.]+$/.test(t) ? parseFloat(t) * fs : (__lengthPx(t, fs, availW) || fbox.line);
+        // Множитель и проценты — от кегля; у нас `125%` считался от ширины.
+        lineH = /^[\d.]+$/.test(t) ? parseFloat(t) * fs : /^[\d.]+%$/.test(t) ? parseFloat(t) / 100 * fs : (__lengthPx(t, fs, availW) || fbox.line);
       }
     }
     const contentX = boxX + bl + pl;
@@ -8517,8 +8578,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         const p = String(__cascadeFor(c).get('position') || 'static').toLowerCase();
         return p !== 'absolute' && p !== 'fixed';
       });
-      const cols = __gridTracks(cs.get('grid-template-columns'), cw, colGap, fs);
-      const n = cols.length;
+      // Без шаблона колонок все колонки — `auto` (по содержимому), в том
+      // числе неявные, заведённые `grid-column: 2`.
+      const tmplCols = String(cs.get('grid-template-columns') == null ? 'none' : cs.get('grid-template-columns')).trim().toLowerCase();
+      const cols = tmplCols === 'none' || tmplCols === 'auto' || tmplCols === '' ? [{ auto: true }] : __gridTracks(cs.get('grid-template-columns'), cw, colGap, fs);
+      // Явные места (`grid-area: 1/1`, `grid-column: 2`) и авторасстановка
+      // по строкам в свободные ячейки; неявные колонки — `auto`.
+      const { place, n, want } = __gridPlacement(flow, cols.length);
+      while (cols.length < n) cols.push({ auto: true });
       const marg = (c, a, b) => {
         const ccs = __cascadeFor(c), cfs = __usedFontSize(c);
         return (__lengthPx(ccs.get(a), cfs, cw) || 0) + (__lengthPx(ccs.get(b), cfs, cw) || 0);
@@ -8529,19 +8596,28 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const frTotal = cols.reduce((a, t) => a + (t.fr || 0), 0);
       const autos = [];
       cols.forEach((t, k) => { if (t.auto) autos.push(k); });
-      if (autos.length && frTotal) {
+      // Сетка без заданной ширины внутри гибкого или сеточного родителя (или
+      // строчная) ужимается по содержимому: auto-колонки — по самому
+      // широкому ребёнку, свободного места нет. У нас такая сетка брала
+      // ширину родителя и делила её между колонками — текст переносился.
+      const parentDisp = String((el.parentNode && el.parentNode.nodeType === ELEMENT_NODE ? __cascadeFor(el.parentNode).get('display') : '') || '').toLowerCase();
+      const shrinkGrid = !forcedW && explicitW == null && (inlineish || /flex|grid/.test(parentDisp));
+      if (autos.length) {
         flow.forEach((c, i) => {
-          const k = i % n;
+          const k = place[i].k;
           if (!cols[k].auto) return;
-          const b = __layoutOne(c, contentX, contentY, cw, fbox) || { w: 0 };
+          // Вклад ребёнка в auto-колонку — его max-content (замер без ширины),
+          // иначе блочный ребёнок занимал всю ширину контейнера.
+          const b = __layoutOne(c, contentX, contentY, null, fbox) || { w: 0 };
           widths[k] = Math.max(widths[k], b.w + marg(c, 'margin-left', 'margin-right'));
         });
       }
       const usedW = widths.reduce((a, w) => a + w, 0) + colGap * Math.max(0, n - 1);
-      let freeW = Math.max(0, cw - usedW);
+      let freeW = shrinkGrid ? 0 : Math.max(0, cw - usedW);
       if (frTotal) cols.forEach((t, k) => { if (t.fr) widths[k] = freeW * t.fr / frTotal; });
-      else if (autos.length) { for (const k of autos) widths[k] += freeW / autos.length; freeW = 0; }
+      else if (autos.length && !shrinkGrid) { for (const k of autos) widths[k] += freeW / autos.length; freeW = 0; }
       const totalW = widths.reduce((a, w) => a + w, 0) + colGap * Math.max(0, n - 1);
+      if (globalThis.__pt_gridTrace) { try { (globalThis.__pt_parentConsole || console).error('[grid] ' + __ptJSON.stringify({ tag: el.localName, id: el.id, availW, cw, shrinkGrid, forcedW: !!forcedW, explicitW, n, place, widths, totalW, want })); } catch (e) {} }
       const jc = String(cs.get('justify-content') || 'normal').toLowerCase();
       const slackW = Math.max(0, cw - totalW);
       const leadX = jc === 'center' ? slackW / 2 : (jc === 'end' || jc === 'flex-end' || jc === 'right') ? slackW : 0;
@@ -8556,10 +8632,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       };
       const stretchy = (v) => v === 'normal' || v === 'stretch' || v === 'legacy';
       // Первый проход — высоты строк.
-      const nRows = Math.ceil(flow.length / n);
+      const nRows = Math.max(1, ...place.map((p) => p.r + 1));
       const rowH = new Array(nRows).fill(0);
       flow.forEach((c, i) => {
-        const k = i % n, r = (i / n) | 0;
+        const { k, r } = place[i];
         const ccs = __cascadeFor(c);
         const js = selfOf(c, 'justify-self', ji);
         const fixedW = ccs.get('width') != null && !/^auto$/i.test(String(ccs.get('width')).trim());
@@ -8581,7 +8657,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const rowY = [];
       { let yy = contentY + leadY; for (let r = 0; r < nRows; r++) { rowY.push(yy); yy += rowH[r] + rowGap; } }
       flow.forEach((c, i) => {
-        const k = i % n, r = (i / n) | 0;
+        const { k, r } = place[i];
         const ccs = __cascadeFor(c);
         const js = selfOf(c, 'justify-self', ji), as = selfOf(c, 'align-self', ai);
         const fixedW = ccs.get('width') != null && !/^auto$/i.test(String(ccs.get('width')).trim());
@@ -8614,10 +8690,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         }
       });
       y = contentY + Math.max(totalH, 0);
-      if (inlineish && !forcedW && explicitW == null) cw = Math.min(cw || totalW, totalW) || totalW;
+      if ((inlineish || shrinkGrid) && !forcedW && explicitW == null) cw = Math.min(cw || totalW, totalW) || totalW;
       for (const c of boxedKids) {
         const p = String(__cascadeFor(c).get('position') || 'static').toLowerCase();
-        if (p === 'absolute' || p === 'fixed') __layoutOne(c, contentX, contentY, cw, fbox);
+        if (p === 'absolute' || p === 'fixed') __layoutOne(c, contentX, contentY, cw, fbox, { cb: { x: boxX + bl, y: boxY + bt, w: cw + pl + pr, h: (y - contentY) + pt_ + pb } });
       }
     } else if (flexish && boxedKids.length) {
       const dir = String(cs.get('flex-direction') || 'row').toLowerCase();
@@ -8633,7 +8709,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       // Первый проход — узнать естественные размеры.
       const items = flow.map((c) => {
         const ccs = __cascadeFor(c);
-        const cb = __layoutOne(c, contentX, contentY, cw, fbox) || { w: 0, h: 0 };
+        // Контейнер, сжатый по содержимому (замер без ширины), меряет детей
+        // так же — по их содержимому, а не в нулевую ширину.
+        const cb = __layoutOne(c, contentX, contentY, shrinkToFit ? null : cw, fbox) || { w: 0, h: 0 };
         const cfs = __usedFontSize(c);
         const mw = (__lengthPx(ccs.get('margin-left'), cfs, cw) || 0)
                  + (__lengthPx(ccs.get('margin-right'), cfs, cw) || 0);
@@ -8645,7 +8723,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
           ? null : __lengthPx(basis, cfs, cw);
         // Основа в ряду — ширина по содержимому, если ширина не задана.
         const autoW = ccs.get('width') == null || /^auto$/i.test(String(ccs.get('width')).trim());
-        const natural = row ? (autoW ? Math.min(cb.w, __maxContentW(c)) : cb.w) : cb.h;
+        const natural = row ? (autoW ? (shrinkToFit ? cb.w : Math.min(cb.w, __maxContentW(c))) : cb.w) : cb.h;
         return {
           el: c, box: cb,
           grow: num(ccs.get('flex-grow'), 0),
@@ -8656,6 +8734,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       });
       const gaps = gapMain * Math.max(0, items.length - 1);
       const used = items.reduce((a, it) => a + it.base + it.mMain, 0) + gaps;
+      if (row && shrinkToFit) cw = used;
       // Столбец без заданной высоты высок как его содержимое, но не ниже
       // `min-height` и не выше `max-height`. Мы брали ноль, и нехватка
       // сжимала всех детей в ничто.
@@ -8735,7 +8814,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       // Остальное — как у блока: абсолютные дети кладутся сами по себе.
       for (const c of boxedKids) {
         const p = String(__cascadeFor(c).get('position') || 'static').toLowerCase();
-        if (p === 'absolute' || p === 'fixed') __layoutOne(c, contentX, contentY, cw, fbox);
+        if (p === 'absolute' || p === 'fixed') __layoutOne(c, contentX, contentY, cw, fbox, { cb: { x: boxX + bl, y: boxY + bt, w: cw + pl + pr, h: (y - contentY) + pt_ + pb } });
       }
     } else {
       // Блоки ложатся друг под друга, строчные — в строку, и строка
@@ -8754,7 +8833,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         const c = boxedKids[i];
         const cpos = positionOf(c);
         if (cpos === 'absolute' || cpos === 'fixed') {
-          const cb = __layoutOne(c, contentX, y, cw, fbox);
+          const cb = __layoutOne(c, contentX, y, cw, fbox, { cb: { x: boxX + bl, y: boxY + bt, w: cw + pl + pr, h: explicitH != null ? explicitH + pt_ + pb : null } });
           if (cb) {
             widest = Math.max(widest, cb.x - contentX + cb.w);
             deepest = Math.max(deepest, cb.y - contentY + cb.h);
@@ -8815,7 +8894,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       mt = collapsedTop;
     }
     if (escapedBottom) mb = __collapseM(mb, escapedBottom);
-    if (inlineish && explicitW == null && !forcedW && boxedKids.length) cw = widest;
+    if ((inlineish || shrinkToFit) && explicitW == null && !forcedW && boxedKids.length) cw = widest;
 
     let ch;
     let lines = null;
@@ -9894,6 +9973,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
           : unit === 'vmin' ? Math.min(LAYOUT.W, LAYOUT.H) : Math.max(LAYOUT.W, LAYOUT.H);
         return (Math.round(x / 100 * base * 64) / 64) + 'px';
       }
+      // Межстрочное в процентах — от кегля, не от ширины.
+      if (prop === 'line-height') return (Math.round(x / 100 * fontSize * 64) / 64) + 'px';
       // Проценты по вертикали считаются тоже от ширины — так в спецификации.
       const base = __containingWidth(el);
       return base != null ? (Math.round(x / 100 * base * 64) / 64) + 'px' : m;
@@ -10277,6 +10358,19 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
 
   // Прямоугольник элемента кадра по его номеру — где бы он ни стоял, в том
   // числе в теневом дереве (кадр виджета живёт в закрытой тени).
+  // Токен стендового виджета (`cf-turnstile-response`) — обходом дерева
+  // изнутри, а не `querySelector` страницы: челлендж записывает, какие
+  // селекторы на странице спрашивали, и наш вопрос попадал в его отчёт.
+  globalThis.__pt_widgetToken = () => {
+    let out = '';
+    try {
+      __walkTree(globalThis.document, (n) => {
+        if (out || !n || n.nodeType !== ELEMENT_NODE) return;
+        if ((n.__ptLocal === 'input' || n.__ptLocal === 'textarea') && __ptGetA(n, 'name') === 'cf-turnstile-response') { const v = n.value; if (v) out = String(v); }
+      });
+    } catch (e) {}
+    return out;
+  };
   globalThis.__pt_frameRectById = (id) => {
     const walk = (n) => {
       for (let c = n.firstChild; c; c = c.nextSibling) {
