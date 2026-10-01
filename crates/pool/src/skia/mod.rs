@@ -594,8 +594,15 @@ pub fn draw_text(data: &mut [u8], w: u32, h: u32, fonts: &[&'static [u8]], glyph
     true
 }
 
+/// Без `render` таблицы шрифта не разбираем (ttf-parser — зависимость
+/// растеризатора): цветной знак просто не рисуется.
+#[cfg(not(feature = "render"))]
+#[allow(clippy::too_many_arguments)]
+fn draw_bitmap_glyph(_data: &mut [u8], _w: u32, _h: u32, _font: &[u8], _gid: u16, _x: f32, _y: f32, _size: f32, _alpha: f32) {}
+
 /// Растровый знак шрифта (PNG полосы CBDT/sbix) — в буфер premul RGBA:
 /// масштаб площадным усреднением, наложение source-over.
+#[cfg(feature = "render")]
 #[allow(clippy::too_many_arguments)]
 fn draw_bitmap_glyph(data: &mut [u8], w: u32, h: u32, font: &[u8], gid: u16, x: f32, y: f32, size: f32, alpha: f32) {
     let Ok(face) = ttf_parser::Face::parse(font, 0) else { return };

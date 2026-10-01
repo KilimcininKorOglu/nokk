@@ -4,12 +4,9 @@ name: python-wheels
 # prebuilt `nokk` binary, so `pip install nokk` needs no Rust toolchain, no
 # BoringSSL build, and no Docker on the user's machine.
 #
-# Built on a plain Ubuntu runner (same environment as release.yml, which builds
-# the binary green) rather than a manylinux container — maturin auditwheel-repairs
-# to a manylinux_2_XX tag automatically, matching a local `maturin build`. The
-# glibc floor is that of the runner (Ubuntu 22.04 → manylinux_2_35), which covers
-# current distros; a lower floor would need the BoringSSL build to work inside an
-# old manylinux image, which it doesn't yet.
+# Built in the same Debian bullseye image as the release binary
+# (.github/bullseye-build.Dockerfile); maturin auditwheel-repairs the wheel to a
+# manylinux_2_31 tag, which covers RHEL/Alma 9, Ubuntu 20.04+ and Debian 11+.
 
 on:
   push:
@@ -38,24 +35,14 @@ jobs:
 
       # Build in Debian 11 (bullseye, glibc 2.31) so the embedded binary runs on a
       # broad range of Linux (RHEL/Alma 9, Ubuntu 20.04+, Debian 11+) — matching the
-      # release binary. maturin auditwheel-repairs to a manylinux_2_31 tag.
+      # release binary. maturin auditwheel-repairs to a manylinux_2_31 tag. A
+      # `docker build` of .github/bullseye-build.Dockerfile, not a `docker run`: apt
+      # cannot take its locks inside a plain container under the runner's docker.
+      # The context carries the pyproject.toml edited above.
       - name: Build wheel (Debian bullseye — broad glibc floor ~2.30)
         run: |
-          docker run --rm -v "$PWD:/w" -w /w rust:1-bullseye bash -euo pipefail -c '
-            # bullseye is past its security support: deb.debian.org no longer serves its
-            # security pool, and clang pins libc6-i386 to the image's libc. The image is
-            # built from snapshot.debian.org, whose lines sit commented in sources.list —
-            # those still have every package at the exact version the image expects.
-            # (/etc/apt may not be writable under the runner's docker, so the list goes to /tmp.)
-            id; ls -ld / /etc/apt /var/lib/apt/lists /tmp; cat /proc/self/uid_map; mount | grep -E " / | /etc " | head -3
-            grep "^# deb http://snapshot" /etc/apt/sources.list | sed "s/^# //" > /tmp/sources.list
-            APT="apt-get -o Dir::Etc::SourceList=/tmp/sources.list -o Dir::Etc::SourceParts=/dev/null -o Acquire::Check-Valid-Until=false -o Acquire::Retries=3"
-            $APT update -qq
-            $APT install -y --no-install-recommends clang libclang-dev pkg-config python3 python3-pip patchelf
-            pip3 install --upgrade pip
-            pip3 install cmake maturin                            # apt cmake (3.18) < BoringSSL req (3.22)
-            export LIBCLANG_PATH="$(dirname "$(find /usr/lib -name "libclang.so*" | head -1)")"
-            cd python && maturin build --release --out dist'
+          docker build -f .github/bullseye-build.Dockerfile --target wheel-out \
+            --output type=local,dest=python/dist .
 
       - name: Sanity-check the wheel embeds the binary
         run: |

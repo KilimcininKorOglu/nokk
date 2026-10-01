@@ -39,48 +39,26 @@ jobs:
       # Build inside Debian 11 (bullseye, glibc 2.31) so the binary runs on a broad
       # range of Linux — RHEL/Alma 9 (2.34), Ubuntu 20.04+, Debian 11+ — instead of
       # the runner's glibc 2.39 (which would need 2.38+). checkout/release stay on
-      # the host (JS actions need node, which the minimal container lacks).
+      # the host (JS actions need node, which the minimal container lacks). It is a
+      # `docker build` of .github/bullseye-build.Dockerfile rather than a `docker run`:
+      # apt cannot take its locks inside a plain container under the runner's docker,
+      # while a build step installs fine (the image job builds the same way).
       - name: Build (Debian bullseye — broad glibc floor ~2.30)
         run: |
-          docker run --rm -v "$PWD:/w" -w /w rust:1-bullseye bash -euo pipefail -c '
-            # bullseye is past its security support: deb.debian.org no longer serves its
-            # security pool, and clang pins libc6-i386 to the image's libc. The image is
-            # built from snapshot.debian.org, whose lines sit commented in sources.list —
-            # those still have every package at the exact version the image expects.
-            # (/etc/apt may not be writable under the runner's docker, so the list goes to /tmp.)
-            grep "^# deb http://snapshot" /etc/apt/sources.list | sed "s/^# //" > /tmp/sources.list
-            APT="apt-get -o Dir::Etc::SourceList=/tmp/sources.list -o Dir::Etc::SourceParts=/dev/null -o Acquire::Check-Valid-Until=false -o Acquire::Retries=3"
-            $APT update -qq
-            $APT install -y --no-install-recommends clang libclang-dev pkg-config python3-pip
-            pip3 install cmake                                    # apt cmake (3.18) < BoringSSL req (3.22)
-            export LIBCLANG_PATH="$(dirname "$(find /usr/lib -name "libclang.so*" | head -1)")"
-            cargo build --release --bin nokk'
-
-      - name: Package
-        run: |
-          tar -czf "nokk-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" -C target/release nokk
+          docker build -f .github/bullseye-build.Dockerfile --target bin-out \
+            --output type=local,dest=out/bin .
+          tar -czf "nokk-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" -C out/bin nokk
 
       # Second artifact: the same binary with the opt-in rasterizers compiled in
       # (docs/rendering.md). `render` needs nothing extra at runtime; `webgl`
       # dlopen's libEGL, so it only lights up where Mesa is installed (and falls
-      # back to the JS synthesis where it isn't). Built in the same bullseye
-      # container for the same broad glibc floor.
+      # back to the JS synthesis where it isn't). The Dockerfile chains this stage
+      # after the first, so the build reuses that target dir.
       - name: Build render variant (--features render,webgl)
         run: |
-          docker run --rm -v "$PWD:/w" -w /w rust:1-bullseye bash -euo pipefail -c '
-            # bullseye is past its security support: deb.debian.org no longer serves its
-            # security pool, and clang pins libc6-i386 to the image's libc. The image is
-            # built from snapshot.debian.org, whose lines sit commented in sources.list —
-            # those still have every package at the exact version the image expects.
-            # (/etc/apt may not be writable under the runner's docker, so the list goes to /tmp.)
-            grep "^# deb http://snapshot" /etc/apt/sources.list | sed "s/^# //" > /tmp/sources.list
-            APT="apt-get -o Dir::Etc::SourceList=/tmp/sources.list -o Dir::Etc::SourceParts=/dev/null -o Acquire::Check-Valid-Until=false -o Acquire::Retries=3"
-            $APT update -qq
-            $APT install -y --no-install-recommends clang libclang-dev pkg-config python3-pip
-            pip3 install cmake
-            export LIBCLANG_PATH="$(dirname "$(find /usr/lib -name "libclang.so*" | head -1)")"
-            cargo build --release -p nokk-cli --features render,webgl --bin nokk'
-          tar -czf "nokk-render-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" -C target/release nokk
+          docker build -f .github/bullseye-build.Dockerfile --target bin-render-out \
+            --output type=local,dest=out/render .
+          tar -czf "nokk-render-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" -C out/render nokk
 
       - name: Publish to the Release
         uses: softprops/action-gh-release@v2
