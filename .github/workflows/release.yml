@@ -47,9 +47,11 @@ jobs:
             # security pool, and clang pins libc6-i386 to the image's libc. The image is
             # built from snapshot.debian.org, whose lines sit commented in sources.list —
             # those still have every package at the exact version the image expects.
-            sed -i -e "s|^# deb http://snapshot|deb http://snapshot|" -e "/deb.debian.org/d" /etc/apt/sources.list
-            apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=3 update -qq
-            apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends clang libclang-dev pkg-config python3-pip
+            # (/etc/apt may not be writable under the runner's docker, so the list goes to /tmp.)
+            grep "^# deb http://snapshot" /etc/apt/sources.list | sed "s/^# //" > /tmp/sources.list
+            APT="apt-get -o Dir::Etc::SourceList=/tmp/sources.list -o Dir::Etc::SourceParts=/dev/null -o Acquire::Check-Valid-Until=false -o Acquire::Retries=3"
+            $APT update -qq
+            $APT install -y --no-install-recommends clang libclang-dev pkg-config python3-pip
             pip3 install cmake                                    # apt cmake (3.18) < BoringSSL req (3.22)
             export LIBCLANG_PATH="$(dirname "$(find /usr/lib -name "libclang.so*" | head -1)")"
             cargo build --release --bin nokk'
@@ -70,9 +72,11 @@ jobs:
             # security pool, and clang pins libc6-i386 to the image's libc. The image is
             # built from snapshot.debian.org, whose lines sit commented in sources.list —
             # those still have every package at the exact version the image expects.
-            sed -i -e "s|^# deb http://snapshot|deb http://snapshot|" -e "/deb.debian.org/d" /etc/apt/sources.list
-            apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=3 update -qq
-            apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends clang libclang-dev pkg-config python3-pip
+            # (/etc/apt may not be writable under the runner's docker, so the list goes to /tmp.)
+            grep "^# deb http://snapshot" /etc/apt/sources.list | sed "s/^# //" > /tmp/sources.list
+            APT="apt-get -o Dir::Etc::SourceList=/tmp/sources.list -o Dir::Etc::SourceParts=/dev/null -o Acquire::Check-Valid-Until=false -o Acquire::Retries=3"
+            $APT update -qq
+            $APT install -y --no-install-recommends clang libclang-dev pkg-config python3-pip
             pip3 install cmake
             export LIBCLANG_PATH="$(dirname "$(find /usr/lib -name "libclang.so*" | head -1)")"
             cargo build --release -p nokk-cli --features render,webgl --bin nokk'
