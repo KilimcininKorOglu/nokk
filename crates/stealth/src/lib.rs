@@ -489,6 +489,28 @@ pub fn write_helper_script() -> String {
 
 const PT_WRITE_HELPER: &str = r#"(() => {
   if (globalThis.__pt_write) return;
+  // Ошибка, брошенная движком (TypeError привязки, DOMException), у браузера
+  // рождается в C++ и кадров в стеке не занимает. У нас её бросает JS, и
+  // пять-шесть своих кадров съедали `Error.stackTraceLimit`: странице
+  // доставалось четыре кадра из десяти. Захватываем с запасом; форматер
+  // (`__pt_formatStack`) прячет наши кадры и режет до лимита страницы.
+  {
+    const __Err = Error;
+    let depth = 0;
+    Object.defineProperty(globalThis, '__pt_mkErr', {
+      value: (C, ...args) => {
+        let lim; try { lim = __Err.stackTraceLimit; } catch (e) {}
+        const bump = typeof lim === 'number' && lim >= 0 && lim < Infinity;
+        if (bump) { try { __Err.stackTraceLimit = lim + 16; } catch (e) {} }
+        depth++;
+        try { return new C(...args); } finally { depth--; if (bump) { try { __Err.stackTraceLimit = lim; } catch (e) {} } }
+      },
+      writable: true, enumerable: false, configurable: true,
+    });
+    // Внутри ли движок сейчас строит ошибку: DOMException, созданный самой
+    // страницей, у браузера стека не несёт, а брошенный привязкой — несёт.
+    Object.defineProperty(globalThis, '__pt_errDepth', { value: () => depth, writable: true, enumerable: false, configurable: true });
+  }
   const writers = new WeakMap();
   globalThis.__pt_writers = writers;
   globalThis.__pt_write = (obj, name, value) => {
@@ -662,7 +684,7 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   // constructor» и на вызов без `new` — как настоящий интерфейс.
   globalThis.__ptIllegal = (function () {
     'use strict';
-    return function () { return function () { throw new TypeError('Illegal constructor'); }; };
+    return function () { return function () { throw __pt_mkErr(TypeError, 'Illegal constructor'); }; };
   })();
   globalThis.__ptName = (f, n) => {
     try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {}
@@ -825,9 +847,62 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
 
   // --- history ----------------------------------------------------------
   const HistoryProto = defClass("History");
+  // История у нас была вывеской: `pushState`/`replaceState` молчали на любой
+  // адрес, `state` всегда null, `length` не рос. Челлендж это знает и зовёт
+  // `replaceState({}, '', 'https://example.org/')` — браузер на чужой origin
+  // бросает SecurityError, и именно отсутствие броска он записывал в отчёт.
+  // Теперь по правилам History::CanChangeToUrl Chrome: клон состояния,
+  // адрес того же origin и схемы (about:/opaque — только другой фрагмент),
+  // при успехе адрес документа меняется без перехода.
   // Вкладка, открытая человеком, уже прошла новую вкладку: у Chrome длина 2.
-  staticProps(HistoryProto, { length: 2, scrollRestoration: "auto", state: null });
-  for (const m of ["back", "forward", "go", "pushState", "replaceState"]) protoMethod(HistoryProto, m, function(){});
+  const hist = { length: 2, scrollRestoration: 'auto', state: null };
+  accessor(HistoryProto, 'length', () => hist.length);
+  accessor(HistoryProto, 'scrollRestoration', () => hist.scrollRestoration, (v) => {
+    const s = String(v);
+    if (s === 'auto' || s === 'manual') hist.scrollRestoration = s;
+  });
+  accessor(HistoryProto, 'state', () => hist.state);
+  const stripHash = (u) => { const i = u.indexOf('#'); return i < 0 ? u : u.slice(0, i); };
+  const canChangeTo = (u) => {
+    const doc = locState.href;
+    const docUrl = (() => { try { return new URL(doc); } catch (e) { return null; } })();
+    // about:blank, about:srcdoc, data:, file:, непрозрачный origin — Chrome
+    // разрешает менять только фрагмент.
+    if (!docUrl || /^about:/.test(doc) || locState.origin === 'null' || docUrl.protocol === 'file:' || docUrl.protocol === 'data:') return stripHash(u.href) === stripHash(doc);
+    if (u.protocol !== docUrl.protocol || u.host !== docUrl.host) return false;
+    return u.origin !== 'null' && u.origin === docUrl.origin;
+  };
+  const stateObjectAdded = (method, args, push) => {
+    if (args.length < 2) throw __pt_mkErr(TypeError, "Failed to execute '" + method + "' on 'History': 2 arguments required, but only " + args.length + ' present.');
+    const data = args[0], url = args[2];
+    let state;
+    try { state = globalThis.structuredClone(data); } catch (e) {
+      const why = String(e && e.message || '').replace(/^Failed to execute 'structuredClone' on 'Window': /, '');
+      const err = __pt_mkErr(globalThis.DOMException || Error, "Failed to execute '" + method + "' on 'History': " + why, 'DataCloneError');
+      throw err;
+    }
+    if (url !== undefined && url !== null && String(url) !== '') {
+      const raw = String(url);
+      let u = null;
+      try { u = new URL(raw, locState.href); } catch (e) {}
+      if (!u || !canChangeTo(u)) {
+        // Origin документа, не `location.origin`: у пустого кадра он
+        // унаследован от родителя, а `location.origin` там «null».
+        let docOrigin = locState.origin;
+        try { if (docOrigin === 'null' && typeof globalThis.origin === 'string' && globalThis.origin !== 'null') docOrigin = globalThis.origin; } catch (e) {}
+        throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute '" + method + "' on 'History': A history state object with URL '" + (u ? u.href : raw) + "' cannot be created in a document with origin '" + docOrigin + "' and URL '" + locState.href + "'.", 'SecurityError');
+      }
+      locState.href = u.href; locState.protocol = u.protocol; locState.host = u.host; locState.hostname = u.hostname;
+      locState.port = u.port; locState.pathname = u.pathname; locState.search = u.search; locState.hash = u.hash;
+    }
+    if (push) hist.length += 1;
+    hist.state = state;
+  };
+  protoMethod(HistoryProto, 'pushState', function pushState(data, unused, url) { stateObjectAdded('pushState', arguments, true); });
+  protoMethod(HistoryProto, 'replaceState', function replaceState(data, unused, url) { stateObjectAdded('replaceState', arguments, false); });
+  protoMethod(HistoryProto, 'back', function back() {});
+  protoMethod(HistoryProto, 'forward', function forward() {});
+  protoMethod(HistoryProto, 'go', function go(delta) {});
   win.history = Object.create(HistoryProto);
 
   // Окно называет себя окном: тег ставим собственным свойством, а не на
@@ -909,7 +984,7 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
       } else if (LABELED[name] && args.length) {
         // Метка счётчика/таймера — ToString первого довода (Symbol бросает);
         // шаблонной строкой, чтобы в стеке не появился кадр `String`.
-        if (typeof args[0] === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
+        if (typeof args[0] === 'symbol') throw __pt_mkErr(TypeError, 'Cannot convert a Symbol value to a string');
         args[0] = `${args[0]}`;
       } else if (name === 'createTask') {
         if (typeof args[0] !== 'string' || !args[0]) throw new Error('First argument must be a non-empty string.');
@@ -1027,7 +1102,7 @@ const INTL_SHIM_TEMPLATE: &str = r#"(() => {
   };
 
   function Locale(tag, options) {
-    if (!(this instanceof Locale)) throw new TypeError("Constructor Intl.Locale requires 'new'");
+    if (!(this instanceof Locale)) throw __pt_mkErr(TypeError, "Constructor Intl.Locale requires 'new'");
     const parts = String(norm(tag) || 'en-US').split('-');
     const opts = options || {};
     const script = parts.find((p) => p.length === 4 && /^[A-Za-z]+$/.test(p));
@@ -1218,7 +1293,11 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   // both a tell and a way to starve every other context on the worker.
   let depth = 0;
 
-  const add = (fn, delay, interval, args) => {
+  // Задачи движка (`__pt_addTask`) нумеруются отдельно, отрицательными:
+  // первый `setTimeout` страницы отвечает 1, как в браузере, сколько бы
+  // работы движок ни поставил до него.
+  let iseq = -1;
+  const add = (fn, delay, interval, args, internal) => {
     // Строка вместо функции — законный, пусть и старый, способ поставить
     // таймер: браузер компилирует её как код глобальной области, когда время
     // придёт. Мы её молча выбрасывали, и назначенная работа просто не
@@ -1228,6 +1307,8 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
         globalThis.trustedTypes && globalThis.trustedTypes.isScript &&
         (() => { try { return trustedTypes.isScript(fn); } catch (e) { return false; } })())) {
       const code = String(fn);
+      // Пустая строка — не задача: браузер отвечает нулём и ничего не ставит.
+      if (code === '') return 0;
       fn = () => { try { (0, eval)(code); } catch (e) { if (globalThis.__pt_reportError) __pt_reportError(e, 'timer string'); else throw e; } };
       args = [];
     }
@@ -1235,7 +1316,7 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
     let d = Number(delay);
     if (!(d > 0)) d = 0; // negative, NaN and undefined all mean "as soon as possible"
     if (depth > 5 && d < 4) d = 4;
-    const id = seq++;
+    const id = internal ? iseq-- : seq++;
     q.set(id, { fn: () => fn.apply(globalThis, args), orig: fn, delay: d, interval,
                 due: clock() + d, cancelled: false, id, depth: depth + 1 });
     return id;
@@ -1251,7 +1332,7 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   // Задача вне таймеров (`scheduler.postTask` с высоким приоритетом): у
   // браузера она идёт раньше уже поставленных нулевых таймеров.
   Object.defineProperty(globalThis, '__pt_addTask', { value: (fn, delay, front) => {
-    const id = add(fn, delay, false, []);
+    const id = add(fn, delay, false, [], true);
     if (front) { const t = q.get(id); if (t) t.due = clock() - 1; }
     return id;
   }, configurable: true, enumerable: false });
@@ -1272,7 +1353,7 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   let frameSlot = null;
   globalThis.requestAnimationFrame = (fn) => {
     if (typeof fn !== 'function') {
-      throw new TypeError("Failed to execute 'requestAnimationFrame' on 'Window': " +
+      throw __pt_mkErr(TypeError, "Failed to execute 'requestAnimationFrame' on 'Window': " +
         "parameter 1 is not of type 'Function'.");
     }
     const rid = ++rafSeq;
@@ -1932,7 +2013,7 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
       let who = ''; try { who = t === null ? 'null' : typeof t !== 'object' && typeof t !== 'function' ? typeof t : (Object.prototype.toString.call(t) + ' ' + Object.getOwnPropertyNames(t).slice(0, 5).join(',')); } catch (e) {}
       trace(label + ' this=' + who);
     }
-    return new TypeError('Illegal invocation');
+    return __pt_mkErr(TypeError, 'Illegal invocation');
   };
   // Сам прототип интерфейса — не экземпляр: у него собственный `constructor`,
   // и обход графа зовёт на нём каждый геттер, ожидая «Illegal invocation».
@@ -1979,7 +2060,7 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
   // проверкой бренда, если она положена. `guard` — конструктор интерфейса или
   // null, когда владелец не прототип интерфейса.
   const LENGTHS = __METHOD_LENGTHS__;
-  const fewArgs = (what, need, got) => (TRACE && trace('доводы ' + what + ' нужно ' + need + ' дано ' + got), new TypeError('Failed to execute \'' + what.slice(what.indexOf('.') + 1) + '\' on \'' + what.slice(0, what.indexOf('.')) + '\': ' + need + ' argument' + (need === 1 ? '' : 's') + ' required, but only ' + got + ' present.'));
+  const fewArgs = (what, need, got) => (TRACE && trace('доводы ' + what + ' нужно ' + need + ' дано ' + got), __pt_mkErr(TypeError, 'Failed to execute \'' + what.slice(what.indexOf('.') + 1) + '\' on \'' + what.slice(0, what.indexOf('.')) + '\': ' + need + ' argument' + (need === 1 ? '' : 's') + ' required, but only ' + got + ' present.'));
   const asMethod = (fn, key, guard) => {
     const name = keyName(key);
     const P = guard && guard.prototype;
@@ -2106,7 +2187,7 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     if (req) {
       const i0 = args.length > 1 ? args[1] : undefined;
       if (!i0 || typeof i0 !== 'object' || i0[req[0]] === undefined) {
-        throw new TypeError("Failed to construct '" + name + "': Failed to read the '" + req[0] + "' property from '" + req[1] + "': Required member is undefined.");
+        throw __pt_mkErr(TypeError, "Failed to construct '" + name + "': Failed to read the '" + req[0] + "' property from '" + req[1] + "': Required member is undefined.");
       }
     }
     let base = null, stopAt = null;
@@ -2161,16 +2242,16 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     const F = { [name]: function () {
       if (TRACE && (new.target === undefined || (new.target === F && row.n !== 'ok'))) trace('конструктор ' + name + ' new=' + (new.target !== undefined) + ' доводов=' + arguments.length + ' правило=' + row.n + '/' + row.c);
       if (new.target === undefined) {
-        throw new TypeError(row.c === 'illegal' ? 'Illegal constructor'
+        throw __pt_mkErr(TypeError, row.c === 'illegal' ? 'Illegal constructor'
           : 'Failed to construct \'' + name + '\': Please use the \'new\' operator, this DOM object constructor cannot be called as a function.');
       }
       // Наследник (`class X extends HTMLElement` через `super()`) строится
       // всегда: отказ и счёт доводов — только у самого интерфейса.
       const own = new.target === F;
-      if (own && row.n === 'illegal') throw new TypeError('Failed to construct \'' + name + '\': Illegal constructor');
+      if (own && row.n === 'illegal') throw __pt_mkErr(TypeError, 'Failed to construct \'' + name + '\': Illegal constructor');
       const m = own ? /^args:(\d+)$/.exec(row.n) : null;
       if (m && arguments.length < +m[1]) {
-        throw new TypeError('Failed to construct \'' + name + '\': ' + m[1] + ' argument' + (m[1] === '1' ? '' : 's') + ' required, but only ' + arguments.length + ' present.');
+        throw __pt_mkErr(TypeError, 'Failed to construct \'' + name + '\': ' + m[1] + ' argument' + (m[1] === '1' ? '' : 's') + ' required, but only ' + arguments.length + ' present.');
       }
       const nt = new.target === F ? C : new.target;
       const made = RC(C, arguments, nt);
@@ -2256,15 +2337,15 @@ pub fn late_interfaces_script() -> String {
     ['variationSettings', 'normal'], ['display', 'auto'], ['ascentOverride', 'normal'],
     ['descentOverride', 'normal'], ['lineGapOverride', 'normal'], ['sizeAdjust', 'normal']];
   const state = new WeakMap();
-  const netError = () => new (globalThis.DOMException || Error)(
+  const netError = () => __pt_mkErr(globalThis.DOMException || Error, 
     'A network error occurred.', 'NetworkError');
   const FontFace = function FontFace(family, source, descriptors) {
     if (!new.target) {
-      throw new TypeError("Failed to construct 'FontFace': Please use the 'new' operator, " +
+      throw __pt_mkErr(TypeError, "Failed to construct 'FontFace': Please use the 'new' operator, " +
         'this DOM object constructor cannot be called as a function.');
     }
     if (arguments.length < 2) {
-      throw new TypeError("Failed to construct 'FontFace': 2 arguments required, but only " +
+      throw __pt_mkErr(TypeError, "Failed to construct 'FontFace': 2 arguments required, but only " +
         arguments.length + ' present.');
     }
     const own = { family: String(family), source: String(source), status: 'unloaded', promise: null };
@@ -2282,7 +2363,7 @@ pub fn late_interfaces_script() -> String {
   defg(P, 'status', function () { return at(this).status; });
   const start = (face) => {
     const o = state.get(face);
-    if (!o) return Promise.reject(new TypeError('Illegal invocation'));
+    if (!o) return Promise.reject(__pt_mkErr(TypeError, 'Illegal invocation'));
     if (o.promise) return o.promise;
     // `local(Имя)` — единственный источник, который разрешается не выходя в
     // сеть; всё прочее отвечает сетевой ошибкой, как у браузера с недоступным
@@ -2318,12 +2399,12 @@ pub fn late_interfaces_script() -> String {
     const DOMParser = function DOMParser() {};
     meth(DOMParser.prototype, 'parseFromString', function parseFromString(markup, type) {
       if (arguments.length < 2) {
-        throw new TypeError("Failed to execute 'parseFromString' on 'DOMParser': " +
+        throw __pt_mkErr(TypeError, "Failed to execute 'parseFromString' on 'DOMParser': " +
           '2 arguments required, but only ' + arguments.length + ' present.');
       }
       const kind = String(type).toLowerCase();
       if (!/^(text\/html|text\/xml|application\/xml|application\/xhtml\+xml|image\/svg\+xml)$/.test(kind)) {
-        throw new TypeError("Failed to execute 'parseFromString' on 'DOMParser': " +
+        throw __pt_mkErr(TypeError, "Failed to execute 'parseFromString' on 'DOMParser': " +
           "The provided value '" + type + "' is not a valid enum value of type SupportedType.");
       }
       return late.parseDocument(markup, kind);
@@ -2332,7 +2413,7 @@ pub fn late_interfaces_script() -> String {
     const XMLSerializer = function XMLSerializer() {};
     meth(XMLSerializer.prototype, 'serializeToString', function serializeToString(node) {
       if (!arguments.length) {
-        throw new TypeError("Failed to execute 'serializeToString' on 'XMLSerializer': " +
+        throw __pt_mkErr(TypeError, "Failed to execute 'serializeToString' on 'XMLSerializer': " +
           '1 argument required, but only 0 present.');
       }
       return late.serializeXml(node);
@@ -2378,7 +2459,7 @@ pub fn late_interfaces_script() -> String {
     const интерфейс = (имя, предок) => {
       const C = named(имя, (function () {
         'use strict';
-        return function () { throw new TypeError('Illegal constructor'); };
+        return function () { throw __pt_mkErr(TypeError, 'Illegal constructor'); };
       })());
       const P = Object.create(предок || Object.prototype);
       try { Object.defineProperty(P, Symbol.toStringTag, { value: имя, configurable: true }); } catch (e) {}
@@ -2403,7 +2484,7 @@ pub fn late_interfaces_script() -> String {
       if (P && typeof globalThis.FontFaceSet !== 'function') {
         const C = P.constructor && P.constructor.name === 'FontFaceSet'
           ? P.constructor
-          : named('FontFaceSet', (function () { 'use strict'; return function () { throw new TypeError('Illegal constructor'); }; })());
+          : named('FontFaceSet', (function () { 'use strict'; return function () { throw __pt_mkErr(TypeError, 'Illegal constructor'); }; })());
         try { Object.defineProperty(C, 'prototype', { value: P, writable: false, configurable: false }); } catch (e) {}
         try { Object.defineProperty(C, 'length', { value: 0, configurable: true }); } catch (e) {}
         // Порядок у браузера: обработчики, чтения, методы, `constructor`.
@@ -2548,17 +2629,17 @@ const SHAPE_FIXES: &str = r#"(() => {
         const NV = globalThis.CSSNumericValue;
         const STATE = new WeakMap();
         const CU = function CSSUnitValue(value, unit) {
-          if (!new.target) throw new TypeError("Failed to construct 'CSSUnitValue': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
-          if (arguments.length < 2) throw new TypeError("Failed to construct 'CSSUnitValue': 2 arguments required, but only " + arguments.length + ' present.');
+          if (!new.target) throw __pt_mkErr(TypeError, "Failed to construct 'CSSUnitValue': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+          if (arguments.length < 2) throw __pt_mkErr(TypeError, "Failed to construct 'CSSUnitValue': 2 arguments required, but only " + arguments.length + ' present.');
           const v = Number(value); const u = String(unit);
-          if (!isFinite(v)) throw new TypeError("Failed to construct 'CSSUnitValue': The provided double value is non-finite.");
-          if (!UNITS.includes(u)) throw new TypeError("Failed to construct 'CSSUnitValue': Invalid unit: " + u);
+          if (!isFinite(v)) throw __pt_mkErr(TypeError, "Failed to construct 'CSSUnitValue': The provided double value is non-finite.");
+          if (!UNITS.includes(u)) throw __pt_mkErr(TypeError, "Failed to construct 'CSSUnitValue': Invalid unit: " + u);
           STATE.set(this, { value: v, unit: u });
         };
         const oldP = U && U.prototype;
         CU.prototype = oldP && typeof oldP === 'object' ? oldP : Object.create(NV ? NV.prototype : Object.prototype);
         try { Object.defineProperty(CU.prototype, 'constructor', { value: CU, writable: true, configurable: true }); } catch (e) {}
-        const st = (o) => { const x = STATE.get(o); if (!x) throw new TypeError('Illegal invocation'); return x; };
+        const st = (o) => { const x = STATE.get(o); if (!x) throw __pt_mkErr(TypeError, 'Illegal invocation'); return x; };
         Object.defineProperty(CU.prototype, 'value', { get: nat(function () { return st(this).value; }, 'get value'), set: nat(function (v) { st(this).value = Number(v); }, 'set value'), enumerable: true, configurable: true });
         Object.defineProperty(CU.prototype, 'unit', { get: nat(function () { return st(this).unit; }, 'get unit'), enumerable: true, configurable: true });
         const suffix = (u) => (u === 'number' ? '' : u === 'percent' ? '%' : u);
@@ -2570,12 +2651,12 @@ const SHAPE_FIXES: &str = r#"(() => {
       }
       for (const u of UNITS) {
         if (typeof CSS[u] === 'function') continue;
-        const f = ({ [u](value) { if (arguments.length < 1) throw new TypeError("Failed to execute '" + u + "' on 'CSS': 1 argument required, but only 0 present."); return new U(value, u); } })[u];
+        const f = ({ [u](value) { if (arguments.length < 1) throw __pt_mkErr(TypeError, "Failed to execute '" + u + "' on 'CSS': 1 argument required, but only 0 present."); return new U(value, u); } })[u];
         Object.defineProperty(CSS, u, { value: nat(f, u), writable: true, enumerable: true, configurable: true });
       }
       if (!('highlights' in CSS)) { const HR = globalThis.HighlightRegistry; const h = HR && HR.prototype ? Object.create(HR.prototype) : new Map(); Object.defineProperty(CSS, 'highlights', { get: nat(function () { return h; }, 'get highlights'), enumerable: true, configurable: true }); }
       if (!('paintWorklet' in CSS)) { const W = globalThis.Worklet; const w = W && W.prototype ? Object.create(W.prototype) : {}; Object.defineProperty(CSS, 'paintWorklet', { get: nat(function () { return w; }, 'get paintWorklet'), enumerable: true, configurable: true }); }
-      if (typeof CSS.registerProperty !== 'function') { Object.defineProperty(CSS, 'registerProperty', { value: nat(({ registerProperty(d) { if (arguments.length < 1) throw new TypeError("Failed to execute 'registerProperty' on 'CSS': 1 argument required, but only 0 present."); } }).registerProperty, 'registerProperty'), writable: true, enumerable: true, configurable: true }); }
+      if (typeof CSS.registerProperty !== 'function') { Object.defineProperty(CSS, 'registerProperty', { value: nat(({ registerProperty(d) { if (arguments.length < 1) throw __pt_mkErr(TypeError, "Failed to execute 'registerProperty' on 'CSS': 1 argument required, but only 0 present."); } }).registerProperty, 'registerProperty'), writable: true, enumerable: true, configurable: true }); }
       for (const k of ['escape', 'supports']) methodize(CSS, k);
     }
     // Замороженные статические списки.
@@ -2588,10 +2669,10 @@ const SHAPE_FIXES: &str = r#"(() => {
     try {
       if (globalThis.styleMedia && typeof styleMedia === 'object' && Object.getPrototypeOf(styleMedia) === Object.prototype) {
         // Конструктор скрыт (у Chrome глобального StyleMedia нет), прототип — свой.
-        const SM = nat(function StyleMedia() { throw new TypeError('Illegal constructor'); }, 'StyleMedia');
+        const SM = nat(function StyleMedia() { throw __pt_mkErr(TypeError, 'Illegal constructor'); }, 'StyleMedia');
         const P = SM.prototype;
-        Object.defineProperty(P, 'type', { get: nat(function () { if (this !== styleMedia) throw new TypeError('Illegal invocation'); return 'screen'; }, 'get type'), enumerable: true, configurable: true });
-        Object.defineProperty(P, 'matchMedium', { value: nat(({ matchMedium(q) { if (this !== styleMedia) throw new TypeError('Illegal invocation'); try { return !!matchMedia(String(q)).matches; } catch (e) { return false; } } }).matchMedium, 'matchMedium'), writable: true, enumerable: true, configurable: true });
+        Object.defineProperty(P, 'type', { get: nat(function () { if (this !== styleMedia) throw __pt_mkErr(TypeError, 'Illegal invocation'); return 'screen'; }, 'get type'), enumerable: true, configurable: true });
+        Object.defineProperty(P, 'matchMedium', { value: nat(({ matchMedium(q) { if (this !== styleMedia) throw __pt_mkErr(TypeError, 'Illegal invocation'); try { return !!matchMedia(String(q)).matches; } catch (e) { return false; } } }).matchMedium, 'matchMedium'), writable: true, enumerable: true, configurable: true });
         try { Object.defineProperty(P, Symbol.toStringTag, { value: 'StyleMedia', configurable: true }); } catch (e) {}
         try { delete P.constructor; } catch (e) {}
         for (const k of Object.getOwnPropertyNames(styleMedia)) { try { delete styleMedia[k]; } catch (e) {} }
@@ -2603,7 +2684,7 @@ const SHAPE_FIXES: &str = r#"(() => {
       if (globalThis.Option && globalThis.HTMLOptionElement && Option.prototype !== HTMLOptionElement.prototype) {
         const d = Object.getOwnPropertyDescriptor(globalThis, 'Option');
         const O = function Option(text, value, defaultSelected, selected) {
-          if (!new.target) throw new TypeError("Failed to construct 'Option': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+          if (!new.target) throw __pt_mkErr(TypeError, "Failed to construct 'Option': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
           const o = document.createElement('option');
           if (text !== undefined) o.text = String(text);
           if (value !== undefined) o.value = String(value);
@@ -2698,9 +2779,9 @@ const SHAPE_FIXES: &str = r#"(() => {
         const vals = { url: String(globalThis.location && location.href || ''), key, id, index: 0, sameDocument: true };
         if (EP) {
           for (const k of Object.keys(vals)) {
-            try { Object.defineProperty(EP, k, { get: natn(function () { const st = ENTRY_STATE.get(this); if (!st) throw new TypeError('Illegal invocation'); return st[k]; }, 'get ' + k), enumerable: true, configurable: true }); } catch (x) {}
+            try { Object.defineProperty(EP, k, { get: natn(function () { const st = ENTRY_STATE.get(this); if (!st) throw __pt_mkErr(TypeError, 'Illegal invocation'); return st[k]; }, 'get ' + k), enumerable: true, configurable: true }); } catch (x) {}
           }
-          try { Object.defineProperty(EP, 'getState', { value: natn(function getState() { if (!ENTRY_STATE.has(this)) throw new TypeError('Illegal invocation'); return undefined; }, 'getState'), writable: true, enumerable: true, configurable: true }); } catch (x) {}
+          try { Object.defineProperty(EP, 'getState', { value: natn(function getState() { if (!ENTRY_STATE.has(this)) throw __pt_mkErr(TypeError, 'Illegal invocation'); return undefined; }, 'getState'), writable: true, enumerable: true, configurable: true }); } catch (x) {}
         }
         ENTRY_STATE.set(e, vals);
         return e;
@@ -2715,18 +2796,18 @@ const SHAPE_FIXES: &str = r#"(() => {
         activation = Object.create(AP || Object.prototype);
         const vals = { entry: cur(), from: null, navigationType: 'push' };
         if (AP) for (const k of Object.keys(vals)) {
-          try { Object.defineProperty(AP, k, { get: natn(function () { if (this !== activation) throw new TypeError('Illegal invocation'); return vals[k]; }, 'get ' + k), enumerable: true, configurable: true }); } catch (x) {}
+          try { Object.defineProperty(AP, k, { get: natn(function () { if (this !== activation) throw __pt_mkErr(TypeError, 'Illegal invocation'); return vals[k]; }, 'get ' + k), enumerable: true, configurable: true }); } catch (x) {}
         }
         return activation;
       };
       const P = N.prototype;
-      const acc = (k, get) => { try { Object.defineProperty(P, k, { get: natn(function () { if (this !== nav) throw new TypeError('Illegal invocation'); return get.call(this); }, 'get ' + k), enumerable: true, configurable: true }); } catch (e) {} };
+      const acc = (k, get) => { try { Object.defineProperty(P, k, { get: natn(function () { if (this !== nav) throw __pt_mkErr(TypeError, 'Illegal invocation'); return get.call(this); }, 'get ' + k), enumerable: true, configurable: true }); } catch (e) {} };
       acc('currentEntry', function () { return cur(); });
       acc('activation', function () { return act(); });
       acc('transition', function () { return null; });
       acc('canGoBack', function () { return false; });
       acc('canGoForward', function () { return false; });
-      try { Object.defineProperty(P, 'entries', { value: natn(({ entries() { if (this !== nav) throw new TypeError('Illegal invocation'); return [cur()]; } }).entries, 'entries'), writable: true, enumerable: true, configurable: true }); } catch (e) {}
+      try { Object.defineProperty(P, 'entries', { value: natn(({ entries() { if (this !== nav) throw __pt_mkErr(TypeError, 'Illegal invocation'); return [cur()]; } }).entries, 'entries'), writable: true, enumerable: true, configurable: true }); } catch (e) {}
     }
   } catch (e) {}
   try { for (const k of ['permission', 'maxActions', 'requestPermission']) redo(globalThis.Notification, k); } catch (e) {}
@@ -2755,7 +2836,7 @@ const SHAPE_FIXES: &str = r#"(() => {
   try {
     const natp = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
     const pm = function postMessage(message, targetOrigin) {
-      if (arguments.length < 1) throw new TypeError("Failed to execute 'postMessage' on 'Window': 1 argument required, but only 0 present.");
+      if (arguments.length < 1) throw __pt_mkErr(TypeError, "Failed to execute 'postMessage' on 'Window': 1 argument required, but only 0 present.");
       let origin = '*';
       if (targetOrigin && typeof targetOrigin === 'object') { if (targetOrigin.targetOrigin !== undefined) origin = String(targetOrigin.targetOrigin); }
       else if (targetOrigin !== undefined) origin = String(targetOrigin);
@@ -2763,7 +2844,7 @@ const SHAPE_FIXES: &str = r#"(() => {
       if (origin !== '*' && origin !== '/') {
         let ok = false;
         try { ok = new URL(origin).origin === mine; } catch (e) {
-          throw new (globalThis.DOMException || Error)("Failed to execute 'postMessage' on 'Window': Invalid target origin '" + origin + "' in a call to 'postMessage'.", 'SyntaxError');
+          throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'postMessage' on 'Window': Invalid target origin '" + origin + "' in a call to 'postMessage'.", 'SyntaxError');
         }
         if (!ok) return;
       }
@@ -3042,7 +3123,7 @@ const SHAPE_FIXES: &str = r#"(() => {
     const nat = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
     // Флаг стороннего кадра ставится после загрузчика — читаем при вызове.
     const isCross = () => !!globalThis.__pt_crossSite;
-    const dom = (msg, name) => (typeof DOMException === 'function' ? new DOMException(msg, name) : new Error(msg));
+    const dom = (msg, name) => (typeof DOMException === 'function' ? __pt_mkErr(DOMException, msg, name) : new Error(msg));
     const GESTURE = 'Requires a user gesture when availability is "downloading" or "downloadable".';
     const POLICY = 'Access denied because the Permission Policy is not enabled.';
     const spec = { LanguageModel: 'downloadable', Summarizer: 'downloadable', Translator: 'downloadable', LanguageDetector: 'available' };
@@ -3050,7 +3131,7 @@ const SHAPE_FIXES: &str = r#"(() => {
       const C = globalThis[n]; if (typeof C !== 'function') continue;
       const needsArg = n === 'Translator';
       const stateNow = () => (isCross() ? 'unavailable' : spec[n]);
-      const few = (m) => new TypeError("Failed to execute '" + m + "' on '" + n + "': 1 argument required, but only 0 present.");
+      const few = (m) => __pt_mkErr(TypeError, "Failed to execute '" + m + "' on '" + n + "': 1 argument required, but only 0 present.");
       const lenA = typeof C.availability === 'function' ? C.availability.length : (needsArg ? 1 : 0);
       const lenC = typeof C.create === 'function' ? C.create.length : (needsArg ? 1 : 0);
       const av = ({ availability(o) { if (needsArg && arguments.length < 1) return Promise.reject(few('availability')); return Promise.resolve(stateNow()); } }).availability;
@@ -3218,7 +3299,7 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
   // constructor» и на вызов без `new` — как настоящий интерфейс.
   const __ptIllegal = (function () {{
     'use strict';
-    return function () {{ return function () {{ throw new TypeError('Illegal constructor'); }}; }};
+    return function () {{ return function () {{ throw __pt_mkErr(TypeError, 'Illegal constructor'); }}; }};
   }})();
   const __ptName = (f, n) => {{
     try {{ Object.defineProperty(f, 'name', {{ value: n, configurable: true }}); }} catch (e) {{}}
@@ -3871,7 +3952,7 @@ const CLONE_TEMPLATE: &str = r##"  // ── Структурное клонир
       if (t === 'number') return Number.isFinite(v) ? v : { $: 'nf', v: String(v) };
       if (t === 'bigint') return { $: 'big', v: String(v) };
       if (t === 'function' || t === 'symbol') {
-        const e = new (globalThis.DOMException || Error)(
+        const e = __pt_mkErr(globalThis.DOMException || Error, 
           'Failed to execute \'postMessage\': ' + String(v) + ' could not be cloned.', 'DataCloneError');
         e.name = 'DataCloneError';
         throw e;
@@ -4139,7 +4220,7 @@ const OPFS_TEMPLATE: &str = r##"  // ── Origin Private File System ───
     });
 
     const notFound = (name) => {
-      const e = new (globalThis.DOMException || Error)(
+      const e = __pt_mkErr(globalThis.DOMException || Error, 
         'A requested file or directory could not be found at the time an operation was processed.', 'NotFoundError');
       e.name = 'NotFoundError';
       return e;
@@ -4396,10 +4477,11 @@ __OPFS__
     const p = POL.get(this);
     const rule = p && p.rules && p.rules[member];
     if (typeof rule !== 'function') {
-      throw new TypeError("Failed to execute '" + member + "' on 'TrustedTypePolicy': Policy " +
+      throw __pt_mkErr(TypeError, "Failed to execute '" + member + "' on 'TrustedTypePolicy': Policy " +
                           (p ? p.name : '') + "'s TrustedTypePolicyOptions did not specify a '" + member + "' member.");
     }
-    return wrapped(C, rule.apply(p.rules, arguments));
+    // Правило зовётся без `this`, как всякий IDL-обратный вызов.
+    return wrapped(C, rule.apply(undefined, arguments));
   };
   meth(TrustedTypePolicy.prototype, 'createHTML', creator('createHTML', TrustedHTML));
   meth(TrustedTypePolicy.prototype, 'createScript', creator('createScript', TrustedScript));
@@ -4410,10 +4492,25 @@ __OPFS__
   const emptyHTML = wrapped(TrustedHTML, '');
   const emptyScript = wrapped(TrustedScript, '');
   let defaultPolicy = null;
+  const createdNames = new Set();
   meth(TTF, 'createPolicy', function (name, rules) {
+    const n = String(name);
+    // Директива `trusted-types a b default`: чужое имя — отказ, повтор имени
+    // без 'allow-duplicates' — тоже; без директивы — любое имя, но второй
+    // 'default' всё равно отказ.
+    let names = null;
+    try { names = typeof globalThis.__pt_ttNames === 'function' ? __pt_ttNames() : null; } catch (e) {}
+    if (names) {
+      const low = names.map((x) => x.toLowerCase());
+      if (!low.includes(n.toLowerCase()) && !low.includes('*')) throw __pt_mkErr(TypeError, "Failed to execute 'createPolicy' on 'TrustedTypePolicyFactory': Policy \"" + n + "\" disallowed.");
+      if (createdNames.has(n) && !low.includes("'allow-duplicates'")) throw __pt_mkErr(TypeError, "Failed to execute 'createPolicy' on 'TrustedTypePolicyFactory': Policy with name \"" + n + "\" already exists.");
+    } else if (n === 'default' && defaultPolicy) {
+      throw __pt_mkErr(TypeError, "Failed to execute 'createPolicy' on 'TrustedTypePolicyFactory': Policy with name \"default\" already exists.");
+    }
+    createdNames.add(n);
     const p = Object.create(TrustedTypePolicy.prototype);
-    POL.set(p, { name: String(name), rules: rules || {} });
-    if (String(name) === 'default') defaultPolicy = p;
+    POL.set(p, { name: n, rules: rules || {} });
+    if (n === 'default') defaultPolicy = p;
     // Ворота для кода открываются только теперь: пока политики нет, ни один
     // TrustedScript существовать не может, а `eval` остаётся тем самым
     // интринсиком — со своей областью видимости у прямого вызова. Страница,
@@ -4424,6 +4521,8 @@ __OPFS__
   defg(TTF, 'emptyHTML', function () { return emptyHTML; });
   defg(TTF, 'emptyScript', function () { return emptyScript; });
   defg(TTF, 'defaultPolicy', function () { return defaultPolicy; });
+  // Стокам (dom_runtime) нужна политика по умолчанию с её правилами.
+  try { Object.defineProperty(globalThis, '__pt_ttDefault', { value: () => (defaultPolicy ? POL.get(defaultPolicy) : null), writable: true, enumerable: false, configurable: true }); } catch (e) {}
   // Where Chrome demands a trusted value — measured, not guessed.
   const ATTR = {
     'script:src': 'TrustedScriptURL', 'script:text': 'TrustedScript',
@@ -4494,22 +4593,22 @@ __OPFS__
     const USB_ = rebrand(nav.usb, 'USB', ET);
     if (USB_) {
       meth(USB_.prototype, 'getDevices', function getDevices() { return Promise.resolve([]); });
-      meth(USB_.prototype, 'requestDevice', function requestDevice() { return Promise.reject(new (globalThis.DOMException || Error)("Failed to execute 'requestDevice' on 'USB': Must be handling a user gesture to show a permission request.", 'SecurityError')); });
+      meth(USB_.prototype, 'requestDevice', function requestDevice() { return Promise.reject(__pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'requestDevice' on 'USB': Must be handling a user gesture to show a permission request.", 'SecurityError')); });
     }
     const HID_ = rebrand(nav.hid, 'HID', ET);
     if (HID_) {
       meth(HID_.prototype, 'getDevices', function getDevices() { return Promise.resolve([]); });
-      meth(HID_.prototype, 'requestDevice', function requestDevice() { return Promise.reject(new (globalThis.DOMException || Error)("Failed to execute 'requestDevice' on 'HID': Must be handling a user gesture to show a permission request.", 'SecurityError')); });
+      meth(HID_.prototype, 'requestDevice', function requestDevice() { return Promise.reject(__pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'requestDevice' on 'HID': Must be handling a user gesture to show a permission request.", 'SecurityError')); });
     }
     const Serial_ = rebrand(nav.serial, 'Serial', ET);
     if (Serial_) {
       meth(Serial_.prototype, 'getPorts', function getPorts() { return Promise.resolve([]); });
-      meth(Serial_.prototype, 'requestPort', function requestPort() { return Promise.reject(new (globalThis.DOMException || Error)("Failed to execute 'requestPort' on 'Serial': Must be handling a user gesture to show a permission request.", 'SecurityError')); });
+      meth(Serial_.prototype, 'requestPort', function requestPort() { return Promise.reject(__pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'requestPort' on 'Serial': Must be handling a user gesture to show a permission request.", 'SecurityError')); });
     }
     const XR_ = rebrand(nav.xr, 'XRSystem', ET);
     if (XR_) {
       meth(XR_.prototype, 'isSessionSupported', function isSessionSupported() { return Promise.resolve(false); });
-      meth(XR_.prototype, 'requestSession', function requestSession() { return Promise.reject(new (globalThis.DOMException || Error)('The specified session configuration is not supported.', 'NotSupportedError')); });
+      meth(XR_.prototype, 'requestSession', function requestSession() { return Promise.reject(__pt_mkErr(globalThis.DOMException || Error, 'The specified session configuration is not supported.', 'NotSupportedError')); });
     }
     const WL_ = rebrand(nav.wakeLock, 'WakeLock');
     if (WL_) {
@@ -4548,7 +4647,7 @@ __OPFS__
     const crossSite = () => !!globalThis.__pt_crossSite;
     // Переопределение поверх заглушки любого вида: сначала снять, потом положить.
     const setm = (o, k, f) => { try { const d = Object.getOwnPropertyDescriptor(o, k); if (d && d.configurable) delete o[k]; } catch (e) {} return meth(o, k, f); };
-    const dx = (msg, name) => new (globalThis.DOMException || Error)(msg, name);
+    const dx = (msg, name) => __pt_mkErr(globalThis.DOMException || Error, msg, name);
     const rejectDx = (msg, name) => Promise.reject(dx(msg, name));
     const policy = (feature, what, iface) => rejectDx("Failed to execute '" + what + "' on '" + iface + "': Access to the feature \"" + feature + "\" is disallowed by permissions policy.", 'SecurityError');
     setm(Object.getPrototypeOf(nav), 'getInstalledRelatedApps', function getInstalledRelatedApps() {
@@ -4646,7 +4745,7 @@ __OPFS__
       }
       const EP = globalThis.Element && Element.prototype;
       if (EP) {
-        setm(EP, 'requestFullscreen', function requestFullscreen() { return Promise.reject(new TypeError('Permissions check failed')); });
+        setm(EP, 'requestFullscreen', function requestFullscreen() { return Promise.reject(__pt_mkErr(TypeError, 'Permissions check failed')); });
         setm(EP, 'requestPointerLock', function requestPointerLock() { if (crossSite()) return rejectDx("Failed to execute 'requestPointerLock' on 'Element': Blocked pointer lock on an element because the element's frame is sandboxed and the 'allow-pointer-lock' permission is not set.", 'SecurityError'); return Promise.resolve(undefined); });
       }
     } catch (e) {}
@@ -4902,7 +5001,7 @@ __OPFS__
       const parses = (font) => /(^|\s)(\d+(\.\d+)?(px|pt|em|rem|%)|x?x-(small|large)|small|medium|large|larger|smaller)(\s|\/)/.test(' ' + String(font) + ' ');
       meth(P, 'check', function (font) {
         if (!parses(font)) {
-          throw new (globalThis.DOMException || Error)("Failed to execute 'check' on 'FontFaceSet': Could not resolve '" + font + "' as a font.", 'SyntaxError');
+          throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'check' on 'FontFaceSet': Could not resolve '" + font + "' as a font.", 'SyntaxError');
         }
         return true;
       });
@@ -4916,7 +5015,7 @@ __OPFS__
       };
       meth(P, 'load', function (font) {
         if (!parses(font)) {
-          return Promise.reject(new (globalThis.DOMException || Error)("Failed to execute 'load' on 'FontFaceSet': Could not resolve '" + font + "' as a font.", 'SyntaxError'));
+          return Promise.reject(__pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'load' on 'FontFaceSet': Could not resolve '" + font + "' as a font.", 'SyntaxError'));
         }
         const want = familyOf(font);
         const mine = [...faces].filter((f) => {
@@ -5267,12 +5366,12 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         // узнаём его по форме, а не по instanceof.
         const looksResponse = r && typeof r === 'object' && typeof r.arrayBuffer === 'function' && r.headers && typeof r.headers.get === 'function';
         if (!looksResponse) {
-          throw new TypeError(head + "An argument must be provided, which must be a Response or Promise<Response> object");
+          throw __pt_mkErr(TypeError, head + "An argument must be provided, which must be a Response or Promise<Response> object");
         }
         const mime = String((r.headers && r.headers.get('content-type')) || '').split(';')[0].trim().toLowerCase();
-        if (mime !== 'application/wasm') throw new TypeError(head + "Incorrect response MIME type. Expected 'application/wasm'.");
-        if (!r.ok) throw new TypeError(head + 'HTTP status code is not ok');
-        if (r.bodyUsed) throw new TypeError(head + 'Response already read');
+        if (mime !== 'application/wasm') throw __pt_mkErr(TypeError, head + "Incorrect response MIME type. Expected 'application/wasm'.");
+        if (!r.ok) throw __pt_mkErr(TypeError, head + 'HTTP status code is not ok');
+        if (r.bodyUsed) throw __pt_mkErr(TypeError, head + 'Response already read');
         return r.arrayBuffer();
       });
       const traceRej = (what) => (e) => { if (globalThis.__pt_encTrace) { try { (globalThis.__pt_parentConsole || console).error('[wasm] ' + what + ' rejected: ' + String(e && e.message).slice(0, 120)); } catch (x) {} } throw e; };
@@ -5366,7 +5465,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     if (CP && globalThis.__pt_makeTransferred) {
       const fn = function transferControlToOffscreen() {
         if (this.__ptTransferred) {
-          const e = new (globalThis.DOMException || Error)(
+          const e = __pt_mkErr(globalThis.DOMException || Error, 
             "Failed to execute 'transferControlToOffscreen' on 'HTMLCanvasElement': Cannot transfer control from a canvas for more than one time.",
             'InvalidStateError');
           e.name = 'InvalidStateError';
@@ -5388,7 +5487,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     const P0 = globalThis.ImageData && globalThis.ImageData.prototype;
     if (P0 && !globalThis.__pt_imageDataReal) {
       const err = (why) => {
-        const e = new (globalThis.DOMException || Error)(
+        const e = __pt_mkErr(globalThis.DOMException || Error, 
           "Failed to construct 'ImageData': " + why, 'InvalidStateError');
         e.name = 'InvalidStateError';
         return e;
@@ -5397,11 +5496,11 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         const settings = [].slice.call(arguments).filter(
           (x) => x && typeof x === 'object' && !ArrayBuffer.isView(x)).pop() || null;
         if (!(this instanceof ctor)) {
-          throw new TypeError("Failed to construct 'ImageData': " +
+          throw __pt_mkErr(TypeError, "Failed to construct 'ImageData': " +
             'Please use the \'new\' operator, this DOM object constructor cannot be called as a function.');
         }
         if (arguments.length < 2) {
-          throw new TypeError("Failed to construct 'ImageData': " +
+          throw __pt_mkErr(TypeError, "Failed to construct 'ImageData': " +
             '2 arguments required, but only ' + arguments.length + ' present.');
         }
         let data = null, w = 0, h = 0;
@@ -5413,7 +5512,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         } else {
           const f16 = globalThis.Float16Array && a instanceof globalThis.Float16Array;
           if (!(a instanceof Uint8ClampedArray) && !f16) {
-            throw new TypeError("Failed to construct 'ImageData': " +
+            throw __pt_mkErr(TypeError, "Failed to construct 'ImageData': " +
               "The provided value is not of type '(Uint8ClampedArray or Float16Array)'.");
           }
           // Половинная точность допустима только вместе с явным форматом
@@ -5471,7 +5570,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         if (typeof init === 'string') {
           // Строка вида `matrix(a, b, c, d, e, f)` или `matrix3d(...)`.
           const m = /^\s*matrix(3d)?\(([^)]*)\)\s*$/.exec(init);
-          if (!m) { if (String(init).trim()) throw new (globalThis.DOMException || Error)(
+          if (!m) { if (String(init).trim()) throw __pt_mkErr(globalThis.DOMException || Error, 
             "Failed to construct 'DOMMatrix': Failed to parse '" + init + "'.", 'SyntaxError'); return o; }
           const n = m[2].split(',').map((x) => parseFloat(x) || 0);
           if (m[1]) { st.m = n.slice(0, 16); st.d2 = false; }
@@ -5486,7 +5585,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         } else if (arr.length === 16) {
           st.m = arr.map((x) => +x || 0); st.d2 = false;
         } else {
-          const e = new TypeError("Failed to construct 'DOMMatrix': " +
+          const e = __pt_mkErr(TypeError, "Failed to construct 'DOMMatrix': " +
             'Failed to construct matrix: The sequence must contain 6 elements for a 2D matrix or 16 elements for a 3D matrix.');
           throw e;
         }
@@ -5608,7 +5707,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         const orig = Cls;
         const ctor = function (init) {
           if (!(this instanceof ctor)) {
-            throw new TypeError("Failed to construct '" + orig.name + "': " +
+            throw __pt_mkErr(TypeError, "Failed to construct '" + orig.name + "': " +
               'Please use the \'new\' operator, this DOM object constructor cannot be called as a function.');
           }
           const o = Object.create(new.target && new.target.prototype ? new.target.prototype : orig.prototype);
@@ -6114,12 +6213,12 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     const fn = function createImageBitmap(image) {
       const n = arguments.length;
       if (n < 1) {
-        return Promise.reject(new TypeError(
+        return Promise.reject(__pt_mkErr(TypeError, 
           "Failed to execute 'createImageBitmap' on 'Window': " +
           '1 argument required, but only 0 present.'));
       }
       if (!accepted(image)) {
-        return Promise.reject(new TypeError(
+        return Promise.reject(__pt_mkErr(TypeError, 
           "Failed to execute 'createImageBitmap' on 'Window': " +
           "The provided value is not of type '(Blob or CSSImageValue or HTMLCanvasElement or " +
           "HTMLImageElement or HTMLVideoElement or ImageBitmap or ImageData or OffscreenCanvas " +
@@ -6132,7 +6231,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         opts = arguments[5] || null;
         cropped = true;
         if (sw === 0 || sh === 0) {
-          const e = new (globalThis.DOMException || Error)(
+          const e = __pt_mkErr(globalThis.DOMException || Error, 
             "Failed to execute 'createImageBitmap' on 'Window': The crop rect width is 0.",
             'RangeError');
           e.name = 'RangeError';
@@ -6144,7 +6243,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       if (globalThis.Blob && image instanceof globalThis.Blob) {
         const shim = fromBlob(image);
         if (!shim) {
-          const e = new (globalThis.DOMException || Error)(
+          const e = __pt_mkErr(globalThis.DOMException || Error, 
             "Failed to execute 'createImageBitmap' on 'Window': " +
             'The source image could not be decoded.', 'InvalidStateError');
           e.name = 'InvalidStateError';
@@ -6154,7 +6253,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       }
       const size = intrinsic(image);
       if (!size || size[0] <= 0 || size[1] <= 0) {
-        const e = new (globalThis.DOMException || Error)(
+        const e = __pt_mkErr(globalThis.DOMException || Error, 
           "Failed to execute 'createImageBitmap' on 'Window': The source image " +
           'width is 0.', 'InvalidStateError');
         e.name = 'InvalidStateError';
@@ -6460,7 +6559,7 @@ const STACK_TEMPLATE: &str = r##"(() => {
       const px = new __pxProxy(target, handler);
       handler.setPrototypeOf = (t, proto) => {
         for (let q = proto, i = 0; q !== null && q !== undefined && i < 100000; i++) {
-          if (q === t || q === px) throw new TypeError('Cyclic __proto__ value');
+          if (q === t || q === px) throw __pt_mkErr(TypeError, 'Cyclic __proto__ value');
           q = __pxGPO(q);
         }
         return __pxSPO(t, proto);
@@ -6509,6 +6608,8 @@ const STACK_TEMPLATE: &str = r##"(() => {
         }
         keep = [];
         for (let i = 0; i < sites.length; i++) if (!hidden[i]) keep.push(swap[i] || sites[i]);
+        // Захвачено с запасом (`__pt_mkErr`): наружу — не больше лимита страницы.
+        try { const lim = Error.stackTraceLimit; if (typeof lim === 'number' && keep.length > lim) keep = keep.slice(0, Math.max(0, Math.floor(lim))); } catch (e) {}
       } catch (e) {}
     }
     try {
@@ -6894,7 +6995,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   tag(PerformanceObserverEntryList.prototype, 'PerformanceObserverEntryList');
   class PerformanceObserver {
     constructor(cb) {
-      if (typeof cb !== 'function') throw new TypeError("Failed to construct 'PerformanceObserver': parameter 1 is not of type 'Function'.");
+      if (typeof cb !== 'function') throw __pt_mkErr(TypeError, "Failed to construct 'PerformanceObserver': parameter 1 is not of type 'Function'.");
       for (const [k, v] of [['__ptCb', cb], ['__ptTypes', []], ['__ptQueue', []], ['__ptOn', false]]) {
         Object.defineProperty(this, k, { value: v, writable: true, enumerable: false });
       }
@@ -7394,7 +7495,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     // uri" would have travelled to them as our signature. The detail stays
     // here, for a debugger to read.
     globalThis.__pt_lastFetchError = msg;
-    p.reject(new TypeError('Failed to fetch'));
+    p.reject(__pt_mkErr(TypeError, 'Failed to fetch'));
   };
 
   // XMLHttpRequest layered on the same queue -------------------------------
@@ -7462,7 +7563,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       const F = (function () {
         'use strict';
         return function EventTarget() {
-          if (new.target === undefined) throw new TypeError("Failed to construct 'EventTarget': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+          if (new.target === undefined) throw __pt_mkErr(TypeError, "Failed to construct 'EventTarget': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
           return Reflect.construct(C, [], new.target);
         };
       })();
@@ -7515,7 +7616,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     const XHR = (function () {
     'use strict';
     return function XMLHttpRequest() {
-      if (!new.target) throw new TypeError("Failed to construct 'XMLHttpRequest': Please use the 'new' operator.");
+      if (!new.target) throw __pt_mkErr(TypeError, "Failed to construct 'XMLHttpRequest': Please use the 'new' operator.");
       seedTarget(this);
       const up = seedTarget(Object.create(XHRUpload.prototype));
       Object.defineProperty(up, '__ptX', { value: {}, enumerable: false });
@@ -7681,7 +7782,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       }
       encodeInto(input, target) {
         if (!(target instanceof Uint8Array)) {
-          throw new TypeError("Failed to execute 'encodeInto' on 'TextEncoder': parameter 2 is not of type 'Uint8Array'.");
+          throw __pt_mkErr(TypeError, "Failed to execute 'encodeInto' on 'TextEncoder': parameter 2 is not of type 'Uint8Array'.");
         }
         const s = input === undefined ? '' : String(input);
         const bytes = this.encode(s);
@@ -7713,14 +7814,14 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       if (typeof NATIVE_ATOB === 'function') {
         const out = NATIVE_ATOB(String(input));
         if (out === null) {
-          throw new (globalThis.DOMException || Error)("Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.", 'InvalidCharacterError');
+          throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.", 'InvalidCharacterError');
         }
         return out;
       }
       const s = String(input).replace(/[ \t\n\f\r]/g, '');
       const body = s.replace(/=+$/, '');
       if (body.length % 4 === 1 || /[^A-Za-z0-9+/]/.test(body)) {
-        throw new (globalThis.DOMException || Error)("Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.", 'InvalidCharacterError');
+        throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.", 'InvalidCharacterError');
       }
       let out = '', bits = 0, acc = 0;
       for (const ch of body) {
@@ -7738,7 +7839,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       for (let i = 0; i < s.length; i += 3) {
         const c0 = s.charCodeAt(i), c1 = s.charCodeAt(i + 1), c2 = s.charCodeAt(i + 2);
         if (c0 > 255 || c1 > 255 || c2 > 255) {
-          throw new (globalThis.DOMException || Error)("Failed to execute 'btoa' on 'Window': The string to be encoded contains characters outside of the Latin1 range.", 'InvalidCharacterError');
+          throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'btoa' on 'Window': The string to be encoded contains characters outside of the Latin1 range.", 'InvalidCharacterError');
         }
         const n = (c0 << 16) | ((c1 || 0) << 8) | (c2 || 0);
         out += B64[(n >> 18) & 63] + B64[(n >> 12) & 63]
@@ -7761,11 +7862,11 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     const tagOf = (x) => { try { return Object.prototype.toString.call(x).slice(8, -1); } catch (e) { return 'Object'; } };
     const cloneErr = (what) => {
       const m = "Failed to execute 'structuredClone' on 'Window': " + what + ' could not be cloned.';
-      return typeof DOMException === 'function' ? new DOMException(m, 'DataCloneError') : new Error(m);
+      return typeof DOMException === 'function' ? __pt_mkErr(DOMException, m, 'DataCloneError') : new Error(m);
     };
     const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
     globalThis.structuredClone = function structuredClone(v) {
-      if (arguments.length < 1) throw new TypeError("Failed to execute 'structuredClone' on 'Window': 1 argument required, but only 0 present.");
+      if (arguments.length < 1) throw __pt_mkErr(TypeError, "Failed to execute 'structuredClone' on 'Window': 1 argument required, but only 0 present.");
       const opts = arguments[1];
       const seen = new Map();
       // Перенос — это отцепление: у браузера исходный буфер после него
@@ -7816,7 +7917,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         if (tag === 'Blob' && typeof x.slice === 'function') return keep(x.slice(0, x.size, x.type));
         if (tag === 'File' && typeof File === 'function') return keep(new File([x], x.name, { type: x.type, lastModified: x.lastModified }));
         if (tag === 'ImageData' && typeof ImageData === 'function') return keep(new ImageData(new Uint8ClampedArray(x.data), x.width, x.height));
-        if (tag === 'DOMException' && typeof DOMException === 'function') return keep(new DOMException(x.message, x.name));
+        if (tag === 'DOMException' && typeof DOMException === 'function') return keep(__pt_mkErr(DOMException, x.message, x.name));
         if (JS_UNCLONEABLE.has(tag)) throw cloneErr('#<' + tag + '>');
         if (tag !== 'Object' && tag !== 'Arguments') throw cloneErr(tag + ' object');
         const o = keep({});
@@ -7863,10 +7964,19 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     // читаются с прототипа, как в браузере (у нас они были собственными, и
     // `getOwnPropertyNames` это показывал).
     const __dx = new WeakMap();
+    const __ErrC = Error;
     globalThis.DOMException = class DOMException extends Error {
       constructor(message, name) {
-        super();
+        // Стек захватывается здесь, в `super()`: с запасом на свои кадры
+        // (см. `__pt_mkErr`), иначе странице не хватает лимита.
+        let lim; try { lim = __ErrC.stackTraceLimit; } catch (e) {}
+        const bump = typeof lim === 'number' && lim >= 0 && lim < Infinity;
+        if (bump) { try { __ErrC.stackTraceLimit = lim + 16; } catch (e) {} }
+        try { super(); } finally { if (bump) { try { __ErrC.stackTraceLimit = lim; } catch (e) {} } }
         __dx.set(this, { message: message === undefined ? '' : String(message), name: name === undefined ? 'Error' : String(name) });
+        // `new DOMException(…)` из скрипта страницы у Chrome без `stack`:
+        // собственное свойство появляется только у брошенного привязкой.
+        try { if (!(typeof globalThis.__pt_errDepth === 'function' && globalThis.__pt_errDepth() > 0)) delete this.stack; } catch (e) {}
       }
       get message() { const st = __dx.get(this); return st ? st.message : ''; }
       get name() { const st = __dx.get(this); return st ? st.name : 'Error'; }
@@ -8067,7 +8177,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       get locked() { return this.__pt.locked; }
       getReader() {
         const st = this.__pt;
-        if (st.locked) throw new TypeError('ReadableStream is locked');
+        if (st.locked) throw __pt_mkErr(TypeError, 'ReadableStream is locked');
         st.locked = true;
         return {
           read: () => {
@@ -8106,7 +8216,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         return pump();
       }
       pipeThrough(pair, opts) {
-        if (!pair || !pair.writable || !pair.readable) throw new TypeError('pipeThrough needs a { writable, readable }');
+        if (!pair || !pair.writable || !pair.readable) throw __pt_mkErr(TypeError, 'pipeThrough needs a { writable, readable }');
         this.pipeTo(pair.writable, opts);
         return pair.readable;
       }
@@ -8132,7 +8242,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       get locked() { return this.__pt.locked; }
       getWriter() {
         const st = this.__pt;
-        if (st.locked) throw new TypeError('WritableStream is locked');
+        if (st.locked) throw __pt_mkErr(TypeError, 'WritableStream is locked');
         st.locked = true;
         const call = (name, arg) => {
           const f = st.sink[name];
@@ -8188,7 +8298,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         __bcRooms.get(this.name).add(this);
       }
       postMessage(data) {
-        if (this.__pt.closed) throw new (globalThis.DOMException || Error)('channel is closed', 'InvalidStateError');
+        if (this.__pt.closed) throw __pt_mkErr(globalThis.DOMException || Error, 'channel is closed', 'InvalidStateError');
         const peers = __bcRooms.get(this.name);
         if (!peers) return;
         for (const p of peers) {
@@ -8374,7 +8484,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
 
   globalThis.WebSocket = class WebSocket {
     constructor(url, protocols) {
-      if (arguments.length < 1) throw new TypeError("Failed to construct 'WebSocket': 1 argument required, but only 0 present.");
+      if (arguments.length < 1) throw __pt_mkErr(TypeError, "Failed to construct 'WebSocket': 1 argument required, but only 0 present.");
       // ws:/wss: only. http(s) is upgraded as the URL parser does; anything else
       // is a SyntaxError, exactly as in a browser.
       const base = globalThis.location ? String(location.href) : 'https://localhost/';
@@ -8401,7 +8511,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       const st = wsState.get(this);
       if (st.readyState === 0) {
         const msg = "Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.";
-        throw (typeof DOMException === 'function' ? new DOMException(msg, 'InvalidStateError')
+        throw (typeof DOMException === 'function' ? __pt_mkErr(DOMException, msg, 'InvalidStateError')
           : Object.assign(new Error(msg), { name: 'InvalidStateError' }));
       }
       if (st.readyState !== 1) return;                       // closing/closed: dropped
@@ -8480,7 +8590,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // constructor» и на вызов без `new` — как настоящий интерфейс.
   const __ptIllegal = (function () {
     'use strict';
-    return function () { return function () { throw new TypeError('Illegal constructor'); }; };
+    return function () { return function () { throw __pt_mkErr(TypeError, 'Illegal constructor'); }; };
   })();
   const __ptName = (f, n) => {
     try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {}
@@ -9077,14 +9187,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const t = CTX_IMPL.get(self);
     if (t) return t;
     if (self === P || self === null || (typeof self !== 'object' && typeof self !== 'function')) {
-      throw new TypeError('Illegal invocation');
+      throw __pt_mkErr(TypeError, 'Illegal invocation');
     }
     const own = Object.getOwnPropertyDescriptor(self, name);
     // Прототип (свой `constructor`, а член — сам переходник) — не контекст.
     if (!own || Object.prototype.hasOwnProperty.call(self, 'constructor') ||
         (own.get && CTX_STUBS.has(own.get)) || (own.set && CTX_STUBS.has(own.set)) ||
         (own.value && CTX_STUBS.has(own.value))) {
-      throw new TypeError('Illegal invocation');
+      throw __pt_mkErr(TypeError, 'Illegal invocation');
     }
     return self;
   };
@@ -9142,18 +9252,18 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // челлендже (секция oebe1) зовёт методы холста именно так.
   const IDL = (() => {
     const symMsg = (e) => e && (e.message === 'Cannot convert a Symbol value to a number' || e.message === 'Cannot convert a BigInt value to a number' || e.message === 'Cannot convert a Symbol value to a string');
-    const num = (x, pre) => { try { return +x; } catch (e) { if (e instanceof TypeError && symMsg(e)) throw new TypeError(pre + e.message); throw e; } };
-    const str = (x, pre) => { if (typeof x === 'symbol') throw new TypeError(pre + 'Cannot convert a Symbol value to a string'); try { return String(x); } catch (e) { if (e instanceof TypeError && symMsg(e)) throw new TypeError(pre + e.message); throw e; } };
-    const dbl = (x, pre) => { const v = num(x, pre); if (!Number.isFinite(v)) throw new TypeError(pre + 'The provided double value is non-finite.'); return v; };
+    const num = (x, pre) => { try { return +x; } catch (e) { if (e instanceof TypeError && symMsg(e)) throw __pt_mkErr(TypeError, pre + e.message); throw e; } };
+    const str = (x, pre) => { if (typeof x === 'symbol') throw __pt_mkErr(TypeError, pre + 'Cannot convert a Symbol value to a string'); try { return String(x); } catch (e) { if (e instanceof TypeError && symMsg(e)) throw __pt_mkErr(TypeError, pre + e.message); throw e; } };
+    const dbl = (x, pre) => { const v = num(x, pre); if (!Number.isFinite(v)) throw __pt_mkErr(TypeError, pre + 'The provided double value is non-finite.'); return v; };
     const lng = (x, pre) => {
       const v = num(x, pre);
-      if (Number.isNaN(v)) throw new TypeError(pre + "Value is not of type 'long'.");
-      if (!Number.isFinite(v)) throw new TypeError(pre + "Value is infinite and not of type 'long'.");
+      if (Number.isNaN(v)) throw __pt_mkErr(TypeError, pre + "Value is not of type 'long'.");
+      if (!Number.isFinite(v)) throw __pt_mkErr(TypeError, pre + "Value is infinite and not of type 'long'.");
       const t = Math.trunc(v);
-      if (t < -2147483648 || t > 2147483647) throw new TypeError(pre + "Value is outside the 'long' value range.");
+      if (t < -2147483648 || t > 2147483647) throw __pt_mkErr(TypeError, pre + "Value is outside the 'long' value range.");
       return t === 0 ? 0 : t;
     };
-    const rule = (x, pre) => { const v = str(x, pre); if (v !== 'nonzero' && v !== 'evenodd') throw new TypeError(pre + "The provided value '" + v + "' is not a valid enum value of type CanvasFillRule."); return v; };
+    const rule = (x, pre) => { const v = str(x, pre); if (v !== 'nonzero' && v !== 'evenodd') throw __pt_mkErr(TypeError, pre + "The provided value '" + v + "' is not a valid enum value of type CanvasFillRule."); return v; };
     const T = { u: num, d: dbl, L: lng, s: str, b: (x) => !!x, r: rule, a: (x) => x };
     // Копия без Array.prototype.slice — его страница может обернуть.
     const copy = (a) => { const o = []; for (let i = 0; i < a.length; i++) o[i] = a[i]; return o; };
@@ -9176,14 +9286,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
     const oneOf = (v, list) => { for (let i = 0; i < list.length; i++) if (list[i] === v) return true; return false; };
     const IMG = ['HTMLCanvasElement', 'HTMLImageElement', 'HTMLVideoElement', 'ImageBitmap', 'OffscreenCanvas', 'SVGImageElement', 'VideoFrame', 'CSSImageValue'];
-    const imgCheck = (v, pre) => { if (!isA(v, IMG)) throw new TypeError(pre + "The provided value is not of type '(CSSImageValue or HTMLCanvasElement or HTMLImageElement or HTMLVideoElement or ImageBitmap or OffscreenCanvas or SVGImageElement or VideoFrame)'."); };
+    const imgCheck = (v, pre) => { if (!isA(v, IMG)) throw __pt_mkErr(TypeError, pre + "The provided value is not of type '(CSSImageValue or HTMLCanvasElement or HTMLImageElement or HTMLVideoElement or ImageBitmap or OffscreenCanvas or SVGImageElement or VideoFrame)'."); };
     const isPath = (v) => isA(v, ['Path2D']);
     const isImageData = (v) => isA(v, ['ImageData']);
-    const idx = (msg) => new DOMException(msg, 'IndexSizeError');
+    const idx = (msg) => __pt_mkErr(DOMException, msg, 'IndexSizeError');
     // fill/clip: при двух доводах и больше перегрузка одна — (Path2D, правило).
     const fillLike = (a, pre) => {
       if (a.length >= 2) {
-        if (!isPath(a[0])) throw new TypeError(pre + "parameter 1 is not of type 'Path2D'.");
+        if (!isPath(a[0])) throw __pt_mkErr(TypeError, pre + "parameter 1 is not of type 'Path2D'.");
         return run('ar?', a, pre);
       }
       return a.length && isPath(a[0]) ? a : run('r?', a, pre);
@@ -9211,32 +9321,32 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       },
       fill: (a, pre) => fillLike(a, pre),
       clip: (a, pre) => fillLike(a, pre),
-      stroke: (a, pre) => { if (a.length && !isPath(a[0])) throw new TypeError(pre + "parameter 1 is not of type 'Path2D'."); return a; },
+      stroke: (a, pre) => { if (a.length && !isPath(a[0])) throw __pt_mkErr(TypeError, pre + "parameter 1 is not of type 'Path2D'."); return a; },
       isPointInPath: (a, pre) => {
-        if (a.length >= 4 && !isPath(a[0])) throw new TypeError(pre + "parameter 1 is not of type 'Path2D'.");
+        if (a.length >= 4 && !isPath(a[0])) throw __pt_mkErr(TypeError, pre + "parameter 1 is not of type 'Path2D'.");
         return isPath(a[0]) && a.length >= 3 ? run('auur?', a, pre) : run('uur?', a, pre);
       },
       isPointInStroke: (a, pre) => (isPath(a[0]) ? run('auu', a, pre) : run('uu', a, pre)),
       setTransform: (a, pre) => {
         if (a.length >= 6) return run('uuuuuu', a, pre);
         const m = a[0];
-        if (m !== undefined && m !== null && typeof m !== 'object' && typeof m !== 'function') throw new TypeError(pre + "The provided value is not of type 'DOMMatrixInit'.");
-        if (a.length > 1) throw new TypeError(pre + "The provided value is not of type 'DOMMatrixInit'.");
+        if (m !== undefined && m !== null && typeof m !== 'object' && typeof m !== 'function') throw __pt_mkErr(TypeError, pre + "The provided value is not of type 'DOMMatrixInit'.");
+        if (a.length > 1) throw __pt_mkErr(TypeError, pre + "The provided value is not of type 'DOMMatrixInit'.");
         return a;
       },
       getImageData: (a, pre) => { const o = run('LLLL', a, pre); return o; },
       createImageData: (a, pre) => {
-        if (a.length === 1) { if (!isImageData(a[0])) throw new TypeError(pre + "parameter 1 is not of type 'ImageData'."); return a; }
+        if (a.length === 1) { if (!isImageData(a[0])) throw __pt_mkErr(TypeError, pre + "parameter 1 is not of type 'ImageData'."); return a; }
         return run('LL', a, pre);
       },
       putImageData: (a, pre) => {
-        if (!isImageData(a[0])) throw new TypeError(pre + "parameter 1 is not of type 'ImageData'.");
-        if (a.length > 3 && a.length < 7) throw new TypeError(pre + 'Overload resolution failed.');
+        if (!isImageData(a[0])) throw __pt_mkErr(TypeError, pre + "parameter 1 is not of type 'ImageData'.");
+        if (a.length > 3 && a.length < 7) throw __pt_mkErr(TypeError, pre + 'Overload resolution failed.');
         return run(a.length >= 7 ? 'aLLLLLL' : 'aLL', a, pre);
       },
       drawImage: (a, pre) => {
         const n = a.length;
-        if (n === 4 || (n > 5 && n < 9)) throw new TypeError(pre + 'Overload resolution failed.');
+        if (n === 4 || (n > 5 && n < 9)) throw __pt_mkErr(TypeError, pre + 'Overload resolution failed.');
         imgCheck(a[0], pre);
         return run(n >= 9 ? 'auuuuuuuu' : n >= 5 ? 'auuuu' : 'auu', a, pre);
       },
@@ -9245,13 +9355,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const o = copy(a);
         o[1] = a[1] === null ? '' : str(a[1], pre);
         if (!oneOf(o[1], ['', 'repeat', 'no-repeat', 'repeat-x', 'repeat-y'])) {
-          throw new DOMException(pre + "The provided type ('" + o[1] + "') is not one of 'repeat', 'no-repeat', 'repeat-x', or 'repeat-y'.", 'SyntaxError');
+          throw __pt_mkErr(DOMException, pre + "The provided type ('" + o[1] + "') is not one of 'repeat', 'no-repeat', 'repeat-x', or 'repeat-y'.", 'SyntaxError');
         }
         return o;
       },
       setLineDash: (a, pre) => {
         const v = a[0];
-        if (v === null || (typeof v !== 'object' && typeof v !== 'function') || typeof v[Symbol.iterator] !== 'function') throw new TypeError(pre + 'The provided value cannot be converted to a sequence.');
+        if (v === null || (typeof v !== 'object' && typeof v !== 'function') || typeof v[Symbol.iterator] !== 'function') throw __pt_mkErr(TypeError, pre + 'The provided value cannot be converted to a sequence.');
         const list = []; for (const x of v) list[list.length] = num(x, pre);
         const o = copy(a); o[0] = list; return o;
       },
@@ -9262,12 +9372,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           const one = (x) => {
             if (x !== null && typeof x === 'object') return x;
             const v = num(x, pre);
-            if (v < 0) throw new RangeError(pre + 'Radius value ' + v + ' is negative.');
+            if (v < 0) throw __pt_mkErr(RangeError, pre + 'Radius value ' + v + ' is negative.');
             return v;
           };
           if (r !== null && typeof r === 'object' && typeof r[Symbol.iterator] === 'function') {
             const list = []; for (const x of r) list[list.length] = one(x);
-            if (list.length < 1 || list.length > 4) throw new RangeError(pre + list.length + ' radii provided. Between one and four radii are necessary.');
+            if (list.length < 1 || list.length > 4) throw __pt_mkErr(RangeError, pre + list.length + ' radii provided. Between one and four radii are necessary.');
             o[4] = list;
           } else o[4] = one(r);
         }
@@ -9394,7 +9504,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // ask for the data, expect a throw) that we failed in the loudest direction,
   // by answering where a browser refuses.
   const securityError = (method, iface, why) => {
-    const e = new (globalThis.DOMException || Error)(
+    const e = __pt_mkErr(globalThis.DOMException || Error, 
       "Failed to execute '" + method + "' on '" + iface + "': " + why, 'SecurityError');
     return e;
   };
@@ -9420,12 +9530,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // это TypeError с точным текстом, у нас выходил пустой набор пикселей.
   const needArgs = (got, want, method, iface) => {
     if (got >= want) return;
-    throw new TypeError("Failed to execute '" + method + "' on '" + iface + "': " +
+    throw __pt_mkErr(TypeError, "Failed to execute '" + method + "' on '" + iface + "': " +
       want + " argument" + (want === 1 ? '' : 's') + " required, but only " + got + " present.");
   };
   const sizeError = (method, why) => {
     const msg = "Failed to execute '" + method + "' on 'CanvasRenderingContext2D': " + why;
-    return new (globalThis.DOMException || Error)(msg, 'IndexSizeError');
+    return __pt_mkErr(globalThis.DOMException || Error, msg, 'IndexSizeError');
   };
 
   const make2DContext = (canvas, attrs) => {
@@ -9629,10 +9739,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         // Проверки Chrome, в его порядке: число, диапазон, потом цвет.
         const head = "Failed to execute 'addColorStop' on 'CanvasGradient': ";
         const at = Number(pos);
-        if (!Number.isFinite(at)) throw new TypeError(head + 'The provided double value is non-finite.');
+        if (!Number.isFinite(at)) throw __pt_mkErr(TypeError, head + 'The provided double value is non-finite.');
         const cs = String(color);
-        if (at < 0 || at > 1) throw new DOMException(head + 'The provided value (' + at + ') is outside the range (0.0, 1.0).', 'IndexSizeError');
-        if (!parseColorRaw(cs)) throw new DOMException(head + "The value provided ('" + cs + "') could not be parsed as a color.", 'SyntaxError');
+        if (at < 0 || at > 1) throw __pt_mkErr(DOMException, head + 'The provided value (' + at + ') is outside the range (0.0, 1.0).', 'IndexSizeError');
+        if (!parseColorRaw(cs)) throw __pt_mkErr(DOMException, head + "The value provided ('" + cs + "') could not be parsed as a color.", 'SyntaxError');
         note('stop|' + __ptJ(pos, color));
         if (globalThis.__pt_canvasTrace) ctrace(impl, 'gradient.addColorStop(' + cshow(pos) + ', ' + cshow(color) + ')');
         state.stops.push([+pos || 0, parseColor(color)]);
@@ -9850,7 +9960,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           img.localName === 'video' || img.__ptC2d || img.__ptGl1 || img.__ptGl2 ||
           typeof img.src === 'string' || img.__ptImageBitmap || img.__ptO || img.__ptSurf);
         if (!drawable) {
-          throw new TypeError("Failed to execute 'drawImage' on 'CanvasRenderingContext2D': " +
+          throw __pt_mkErr(TypeError, "Failed to execute 'drawImage' on 'CanvasRenderingContext2D': " +
             "The provided value is not of type '(CSSImageValue or HTMLCanvasElement or " +
             "HTMLImageElement or HTMLVideoElement or ImageBitmap or OffscreenCanvas or " +
             "SVGImageElement or VideoFrame)'.");
@@ -9916,7 +10026,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           const st = arguments[4];
           const head = "Failed to execute 'getImageData' on 'CanvasRenderingContext2D': ";
           if (st !== undefined && st !== null && typeof st !== 'object' && typeof st !== 'function') {
-            throw new TypeError(head + "The provided value is not of type 'ImageDataSettings'.");
+            throw __pt_mkErr(TypeError, head + "The provided value is not of type 'ImageDataSettings'.");
           }
           if (st) {
             for (const [k, T, ok] of [['colorSpace', 'PredefinedColorSpace', ['srgb', 'display-p3']],
@@ -9924,7 +10034,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
               const v = st[k];
               if (v === undefined) continue;
               const sv = String(v);
-              if (ok.indexOf(sv) < 0) throw new TypeError(head + "Failed to read the '" + k + "' property from 'ImageDataSettings': The provided value '" + sv + "' is not a valid enum value of type " + T + '.');
+              if (ok.indexOf(sv) < 0) throw __pt_mkErr(TypeError, head + "Failed to read the '" + k + "' property from 'ImageDataSettings': The provided value '" + sv + "' is not a valid enum value of type " + T + '.');
             }
           }
         }
@@ -10169,7 +10279,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const f = ({
           [name](...args) {
             if (need && args.length < need) {
-              throw new TypeError("Failed to execute '" + name + "' on '" +
+              throw __pt_mkErr(TypeError, "Failed to execute '" + name + "' on '" +
                 (this instanceof globalThis.WebGL2RenderingContext ? 'WebGL2RenderingContext' : 'WebGLRenderingContext') +
                 "': " + need + ' argument' + (need === 1 ? '' : 's') +
                 ' required, but only ' + args.length + ' present.');
@@ -10255,7 +10365,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           const impl = EXT_METHODS[k];
           const f = ({ [k](...a) {
             const owner = EXT_OWNER.get(this);
-            if (!owner) throw new TypeError('Illegal invocation');
+            if (!owner) throw __pt_mkErr(TypeError, 'Illegal invocation');
             return impl ? Reflect.apply(impl, owner, a) : undefined;
           } })[k];
           try { Object.defineProperty(f, 'length', { value: +kind.slice(1) || 0, configurable: true }); } catch (x) {}
@@ -10859,7 +10969,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     }
     proto.toBlob = mask(function toBlob(cb, type, quality) {
       if (arguments.length < 1) {
-        throw new TypeError("Failed to execute 'toBlob' on 'HTMLCanvasElement': " +
+        throw __pt_mkErr(TypeError, "Failed to execute 'toBlob' on 'HTMLCanvasElement': " +
           '1 argument required, but only 0 present.');
       }
       if (typeof cb !== 'function') return;
@@ -11364,16 +11474,16 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     createPanner() { return makeNode(this, 'panner', { positionX: audioParam(0), positionY: audioParam(0), positionZ: audioParam(0), setPosition() {} }); }
     createBuffer(ch, len, rate) {
       if (arguments.length < 3) {
-        throw new TypeError("Failed to execute 'createBuffer' on 'BaseAudioContext': 3 arguments required, but only " +
+        throw __pt_mkErr(TypeError, "Failed to execute 'createBuffer' on 'BaseAudioContext': 3 arguments required, but only " +
           arguments.length + ' present.');
       }
       if (!(ch >= 1)) {
-        throw new (globalThis.DOMException || Error)(
+        throw __pt_mkErr(globalThis.DOMException || Error, 
           "Failed to execute 'createBuffer' on 'BaseAudioContext': The number of channels provided (" +
           (ch | 0) + ') is outside the range [1, 32].', 'NotSupportedError');
       }
       if (!(len >= 1)) {
-        throw new (globalThis.DOMException || Error)(
+        throw __pt_mkErr(globalThis.DOMException || Error, 
           "Failed to execute 'createBuffer' on 'BaseAudioContext': The number of frames provided (" +
           (len | 0) + ') is less than or equal to the minimum bound (0).', 'NotSupportedError');
       } return bufferOf(new Float32Array(len), ch, len, rate || this.sampleRate); }
@@ -11813,12 +11923,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const known = PERM_ERRORS[name];
     if (known) {
       const [kind, text] = known;
-      return Promise.reject(kind === 'TypeError' ? new TypeError(head + text)
-        : new (globalThis.DOMException || Error)(head + text, kind));
+      return Promise.reject(kind === 'TypeError' ? __pt_mkErr(TypeError, head + text)
+        : __pt_mkErr(globalThis.DOMException || Error, head + text, kind));
     }
     const row = PERMS[name];
     if (!row) {
-      return Promise.reject(new TypeError(head + "Failed to read the 'name' property from " +
+      return Promise.reject(__pt_mkErr(TypeError, head + "Failed to read the 'name' property from " +
         "'PermissionDescriptor': The provided value '" + name +
         "' is not a valid enum value of type PermissionName."));
     }
@@ -12131,7 +12241,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     }
     createDataChannel(label, opts) {
       const st = this.__pt;
-      if (st.closed) throw (typeof DOMException === 'function' ? new DOMException("Failed to execute 'createDataChannel' on 'RTCPeerConnection': The RTCPeerConnection's signalingState is 'closed'.", 'InvalidStateError') : new Error('closed'));
+      if (st.closed) throw (typeof DOMException === 'function' ? __pt_mkErr(DOMException, "Failed to execute 'createDataChannel' on 'RTCPeerConnection': The RTCPeerConnection's signalingState is 'closed'.", 'InvalidStateError') : new Error('closed'));
       const first = !st.data;
       st.data = true;
       const C = globalThis.RTCDataChannel;
@@ -12152,7 +12262,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     }
     async createOffer(opts) {
       const st = this.__pt;
-      if (st.closed) throw (typeof DOMException === 'function' ? new DOMException("Failed to execute 'createOffer' on 'RTCPeerConnection': The RTCPeerConnection's signalingState is 'closed'.", 'InvalidStateError') : new Error('closed'));
+      if (st.closed) throw (typeof DOMException === 'function' ? __pt_mkErr(DOMException, "Failed to execute 'createOffer' on 'RTCPeerConnection': The RTCPeerConnection's signalingState is 'closed'.", 'InvalidStateError') : new Error('closed'));
       if (opts && typeof opts === 'object') {
         for (const [key, kind] of [['offerToReceiveAudio', 'audio'], ['offerToReceiveVideo', 'video']]) {
           if (opts[key] && !st.tx.some((t) => t.receiver.track.kind === kind)) st.tx.push(rtcTransceiver(kind));
@@ -12283,7 +12393,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const C = globalThis[n];
     if (typeof C !== 'function') continue;
     const f = ({ getCapabilities(kind) {
-      if (arguments.length < 1) throw new TypeError("Failed to execute 'getCapabilities' on '" + n + "': 1 argument required, but only 0 present.");
+      if (arguments.length < 1) throw __pt_mkErr(TypeError, "Failed to execute 'getCapabilities' on '" + n + "': 1 argument required, but only 0 present.");
       const v = RTC_CHROME.caps[n + '.' + String(kind)];
       return v ? JSON.parse(JSON.stringify(v)) : null;
     } }).getCapabilities;
@@ -12310,7 +12420,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // точным текстом, а не тихое ничего.
     const need = (got, want, method) => {
       if (got >= want) return;
-      throw new TypeError("Failed to execute '" + method + "' on 'Storage': " + want +
+      throw __pt_mkErr(TypeError, "Failed to execute '" + method + "' on 'Storage': " + want +
         ' argument' + (want === 1 ? '' : 's') + ' required, but only ' + got + ' present.');
     };
     put('getItem', function (k) {
@@ -12550,7 +12660,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       constructor(label, opts) {
         const want = String(label === undefined ? 'utf-8' : label).trim().toLowerCase();
         const enc = LABELS[want];
-        if (!enc) throw new RangeError("Failed to construct 'TextDecoder': The encoding label provided ('" + label + "') is invalid.");
+        if (!enc) throw __pt_mkErr(RangeError, "Failed to construct 'TextDecoder': The encoding label provided ('" + label + "') is invalid.");
         Object.defineProperty(this, '__ptEnc', { value: enc, enumerable: false });
         Object.defineProperty(this, '__ptFatal', { value: !!(opts && opts.fatal), enumerable: false });
         Object.defineProperty(this, '__ptBOM', { value: !!(opts && opts.ignoreBOM), enumerable: false });
@@ -12585,7 +12695,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         // utf-8, с заменой на U+FFFD там же, где её ставит браузер.
         let i = 0;
         if (!this.__ptBOM && a.length >= 3 && a[0] === 0xef && a[1] === 0xbb && a[2] === 0xbf) i = 3;
-        const bad = () => { if (this.__ptFatal) throw new TypeError('Failed to execute \'decode\' on \'TextDecoder\': The encoded data was not valid.'); return '\ufffd'; };
+        const bad = () => { if (this.__ptFatal) throw __pt_mkErr(TypeError, 'Failed to execute \'decode\' on \'TextDecoder\': The encoded data was not valid.'); return '\ufffd'; };
         while (i < a.length) {
           const b = a[i];
           if (b < 0x80) { s += String.fromCharCode(b); i += 1; continue; }
@@ -12693,6 +12803,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     globalThis.FormData = class FormData { constructor() { this.__ptD = []; } append(k, v) { this.__ptD.push([String(k), v]); } set(k, v) { this.delete(k); this.append(k, v); } get(k) { const e = this.__ptD.find((x) => x[0] === k); return e ? e[1] : null; } getAll(k) { return this.__ptD.filter((x) => x[0] === k).map((x) => x[1]); } has(k) { return this.__ptD.some((x) => x[0] === k); } delete(k) { this.__ptD = this.__ptD.filter((x) => x[0] !== k); } forEach(f) { for (const [k, v] of this.__ptD) f(v, k, this); } keys() { return this.__ptD.map((x) => x[0])[Symbol.iterator](); } values() { return this.__ptD.map((x) => x[1])[Symbol.iterator](); } entries() { return this.__ptD.map((x) => [x[0], x[1]])[Symbol.iterator](); } [Symbol.iterator]() { return this.entries(); } toString() { return this.__ptD.map(([k, v]) => k + '=' + v).join('&'); } };
   }
 
+  // Параметры, принадлежащие адресу (`url.searchParams`), после правки
+  // переписывают его запрос — связь скрытая, не свойством на объекте.
+  const PARAMS_OWNER = new WeakMap();
+  const syncOwner = (p) => { const st = PARAMS_OWNER.get(p); if (!st) return; const q = p.toString(); st.query = q ? '?' + q : ''; };
   if (!globalThis.URLSearchParams) {
     globalThis.URLSearchParams = class URLSearchParams {
       constructor(init) { this.__ptD = [];
@@ -12701,9 +12815,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       get(k) { const e = this.__ptD.find((x) => x[0] === k); return e ? e[1] : null; }
       getAll(k) { return this.__ptD.filter((x) => x[0] === k).map((x) => x[1]); }
       has(k) { return this.__ptD.some((x) => x[0] === k); }
-      set(k, v) { const e = this.__ptD.find((x) => x[0] === k); if (e) e[1] = String(v); else this.__ptD.push([k, String(v)]); }
-      append(k, v) { this.__ptD.push([k, String(v)]); }
-      delete(k) { this.__ptD = this.__ptD.filter((x) => x[0] !== k); }
+      set(k, v) { const e = this.__ptD.find((x) => x[0] === k); if (e) e[1] = String(v); else this.__ptD.push([k, String(v)]); syncOwner(this); }
+      append(k, v) { this.__ptD.push([k, String(v)]); syncOwner(this); }
+      delete(k) { this.__ptD = this.__ptD.filter((x) => x[0] !== k); syncOwner(this); }
       forEach(f) { for (const [k, v] of this.__ptD) f(v, k, this); }
       keys() { return this.__ptD.map((x) => x[0])[Symbol.iterator](); }
       values() { return this.__ptD.map((x) => x[1])[Symbol.iterator](); }
@@ -12713,7 +12827,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // бросала, второй не было вовсе.
       [Symbol.iterator]() { return this.entries(); }
       get size() { return this.__ptD.length; }
-      sort() { this.__ptD.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); }
+      sort() { this.__ptD.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); syncOwner(this); }
       toString() { return this.__ptD.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&'); }
     };
   }
@@ -12789,6 +12903,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // не трогает.
     const encPath = (p) => p.replace(/[^\x21-\x7e]|[\\"<>^`{|}]/g, (c) =>
       Array.from(new TextEncoder().encode(c)).map((b) => '%' + b.toString(16).toUpperCase().padStart(2, '0')).join(''));
+    // Запрос и фрагмент браузер тоже записывает процентами: пробел, кавычка,
+    // угловые скобки, не-ASCII; у фрагмента ещё обратный апостроф.
+    const pct = (c) => Array.from(new TextEncoder().encode(c)).map((b) => '%' + b.toString(16).toUpperCase().padStart(2, '0')).join('');
+    const encQuery = (q, special) => q.replace(special ? /[^\x21-\x7e]|[#"<>']/g : /[^\x21-\x7e]|[#"<>]/g, pct);
+    const encFrag = (f) => f.replace(/[^\x21-\x7e]|["<>`]/g, pct);
     const normPath = (p) => {
       const abs = p.startsWith('/');
       const out = [];
@@ -12803,6 +12922,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       return r || (abs ? '/' : '');
     };
     const URL_STATE = new WeakMap();
+    // Параметры адреса: их правка (`append`, `set`, `delete`, `sort`) меняет
+    // строку запроса самого адреса — так связаны URL и URLSearchParams у браузера.
+    const linkParams = (st) => {
+      const p = new globalThis.URLSearchParams(st.query);
+      PARAMS_OWNER.set(p, st);
+      return p;
+    };
     const parseInto = (st, raw, base) => {
       let s = String(raw).trim();
       const m = /^([a-zA-Z][a-zA-Z0-9+.\-]*):/.exec(s);
@@ -12822,9 +12948,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           st.host = b.host; __pt_write(st, 'port', b.port);
           st.opaque = false;
           let rest = s;
-          const hi = rest.indexOf('#'); st.fragment = hi >= 0 ? rest.slice(hi) : '';
+          const hi = rest.indexOf('#'); st.fragment = hi >= 0 ? encFrag(rest.slice(hi)) : '';
           if (hi >= 0) rest = rest.slice(0, hi);
-          const qi = rest.indexOf('?'); st.query = qi >= 0 ? rest.slice(qi) : '';
+          const qi = rest.indexOf('?'); st.query = qi >= 0 ? encQuery(rest.slice(qi), true) : '';
           if (qi >= 0) rest = rest.slice(0, qi);
           let path;
           if (!rest) path = b.path;
@@ -12848,8 +12974,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         st.path = s; st.query = q; st.fragment = frag;
         return true;
       }
-      if (s.startsWith('//')) s = s.slice(2);
-      const cut = s.search(/[/?#]/);
+      // Особая схема терпит любое число косых после двоеточия (`http:/a`,
+      // `http:///a`) — всё это `http://a/`.
+      if (special && scheme !== 'file:') s = s.replace(/^[\/\\]*/, '');
+      else if (s.startsWith('//')) s = s.slice(2);
+      const cut = s.search(/[/?#\\]/);
       let auth = cut < 0 ? s : s.slice(0, cut);
       let rest = cut < 0 ? '' : s.slice(cut);
       const at = auth.lastIndexOf('@');
@@ -12863,6 +12992,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       let hostPart = auth, portPart = '';
       if (auth.startsWith('[')) {
         const close = auth.indexOf(']');
+        if (close < 0) return false;
         hostPart = auth.slice(0, close + 1);
         const after = auth.slice(close + 1);
         if (after.startsWith(':')) portPart = after.slice(1);
@@ -12870,34 +13000,39 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const ci = auth.lastIndexOf(':');
         if (ci >= 0) { hostPart = auth.slice(0, ci); portPart = auth.slice(ci + 1); }
       }
-      st.host = hostPart.startsWith('[') ? hostPart.toLowerCase() : encHost(hostPart.toLowerCase());
+      // Особая схема без хоста (`http://`), запрещённые знаки в хосте и
+      // нечисловой порт у браузера — не адрес вовсе.
+      if (special && scheme !== 'file:' && !hostPart) return false;
+      if (special && /[\x00-\x1f#/<>?@\\^|]/.test(hostPart.replace(/^\[.*\]$/, ''))) return false;
+      if (portPart && (!/^\d+$/.test(portPart) || +portPart > 65535)) return false;
+      st.host = hostPart.startsWith('[') ? hostPart.toLowerCase() : encHost(hostPart.toLowerCase()).replace(/ /g, '%20');
       __pt_write(st, 'port', portPart === SPECIAL[scheme] ? '' : portPart);
-      const hi = rest.indexOf('#'); st.fragment = hi >= 0 ? rest.slice(hi) : '';
+      const hi = rest.indexOf('#'); st.fragment = hi >= 0 ? encFrag(rest.slice(hi)) : '';
       if (hi >= 0) rest = rest.slice(0, hi);
-      const qi = rest.indexOf('?'); st.query = qi >= 0 ? rest.slice(qi) : '';
+      const qi = rest.indexOf('?'); st.query = qi >= 0 ? encQuery(rest.slice(qi), special) : '';
       if (qi >= 0) rest = rest.slice(0, qi);
-      st.path = encPath(normPath(rest || '/'));
+      st.path = encPath(normPath(rest.replace(/\\/g, '/') || '/'));
       return true;
     };
     class URL {
       constructor(url, base) {
         if (arguments.length < 1) {
-          throw new TypeError("Failed to construct 'URL': 1 argument required, but only 0 present.");
+          throw __pt_mkErr(TypeError, "Failed to construct 'URL': 1 argument required, but only 0 present.");
         }
         const st = { scheme: '', username: '', password: '', host: '', port: '', path: '', query: '', fragment: '', opaque: false };
         let baseState = null;
         if (base !== undefined) {
           const bs = { scheme: '', username: '', password: '', host: '', port: '', path: '', query: '', fragment: '', opaque: false };
           if (!parseInto(bs, base, null)) {
-            throw new TypeError("Failed to construct 'URL': Invalid base URL");
+            throw __pt_mkErr(TypeError, "Failed to construct 'URL': Invalid base URL");
           }
           baseState = bs;
         }
         if (!parseInto(st, url, baseState)) {
-          throw new TypeError("Failed to construct 'URL': Invalid URL");
+          throw __pt_mkErr(TypeError, "Failed to construct 'URL': Invalid URL");
         }
         URL_STATE.set(this, st);
-        st.params = new globalThis.URLSearchParams(st.query);
+        st.params = linkParams(st);
       }
       get protocol() { return URL_STATE.get(this).scheme; }
       set protocol(v) { const st = URL_STATE.get(this); const t = String(v).replace(/:*$/, '') + ':'; if (/^[a-z][a-z0-9+.\-]*:$/i.test(t)) st.scheme = t.toLowerCase(); }
@@ -12918,11 +13053,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       }
       get pathname() { return URL_STATE.get(this).path; }
       set pathname(v) { const st = URL_STATE.get(this); if (!st.opaque) st.path = encPath(normPath(String(v) || '/')); }
-      get search() { const st = URL_STATE.get(this); const s = st.params ? st.params.toString() : ''; return s ? '?' + s : ''; }
-      set search(v) { const st = URL_STATE.get(this); const t = String(v); st.query = t && t[0] !== '?' ? '?' + t : t; st.params = new globalThis.URLSearchParams(st.query); }
+      // `search` — строка запроса как записана (`?x` остаётся `?x`), а не
+      // пересборка через URLSearchParams, которая дописывала `=` к каждому
+      // ключу. Правки через `searchParams` пишут обратно в адрес.
+      get search() { const st = URL_STATE.get(this); return st.query === '?' ? '' : st.query; }
+      set search(v) { const st = URL_STATE.get(this); const t = encQuery(String(v), Object.prototype.hasOwnProperty.call(SPECIAL, st.scheme)); st.query = t && t[0] !== '?' ? '?' + t : t; st.params = linkParams(st); }
       get searchParams() { return URL_STATE.get(this).params; }
       get hash() { const st = URL_STATE.get(this); return st.fragment; }
-      set hash(v) { const st = URL_STATE.get(this); const t = String(v); st.fragment = t ? (t[0] === '#' ? t : '#' + t) : ''; }
+      set hash(v) { const st = URL_STATE.get(this); const t = encFrag(String(v)); st.fragment = t ? (t[0] === '#' ? t : '#' + t) : ''; }
       get origin() {
         const st = URL_STATE.get(this);
         if (st.scheme === 'blob:') {
@@ -12942,9 +13080,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       set href(v) {
         const st = URL_STATE.get(this);
         const fresh = { scheme: '', username: '', password: '', host: '', port: '', path: '', query: '', fragment: '', opaque: false };
-        if (!parseInto(fresh, v, null)) throw new TypeError("Failed to set the 'href' property on 'URL': Invalid URL");
+        if (!parseInto(fresh, v, null)) throw __pt_mkErr(TypeError, "Failed to set the 'href' property on 'URL': Invalid URL");
         Object.assign(st, fresh);
-        st.params = new globalThis.URLSearchParams(st.query);
+        st.params = linkParams(st);
       }
       toString() { return this.href; }
       toJSON() { return this.href; }
@@ -13021,7 +13159,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // только держит константы обхода, инстанцировать нечего. `prototype`
       // функции не удаляется, поэтому берём краткую запись метода: у неё его
       // нет вовсе, а имя и бросок — те же.
-      const ctor = ({ NodeFilter() { throw new TypeError('Illegal constructor'); } }).NodeFilter;
+      const ctor = ({ NodeFilter() { throw __pt_mkErr(TypeError, 'Illegal constructor'); } }).NodeFilter;
       for (const k of Object.keys(F)) {
         Object.defineProperty(ctor, k, { value: F[k], enumerable: true, configurable: true });
       }

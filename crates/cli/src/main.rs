@@ -1158,8 +1158,10 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
             if let Ok(path) = std::env::var("NOKK_FRAME_INIT") {
                 match std::fs::read_to_string(&path) {
                     Ok(js) => {
-                        c.add_frame_init_script(js.clone());
-                        c.add_init_script(js);
+                        // И в реалмы пустых кадров: челлендж держит там свою
+                        // песочницу, и без пробника в ней половина вызовов не видна.
+                        c.add_frame_init_script(spread_to_realms(&js, "frame_init"));
+                        c.add_init_script(spread_to_realms(&js, "frame_init"));
                     }
                     Err(e) => eprintln!("# NOKK_FRAME_INIT: {path}: {e}"),
                 }

@@ -19,6 +19,9 @@
         DOCUMENT_NODE = 9, DOCUMENT_FRAGMENT_NODE = 11;
 
   const __pt_soon = (f) => { try { queueMicrotask(f); } catch (e) { setTimeout(f, 0); } };
+  // Задача движка (load по готовности, нарушение CSP, ошибка скрипта) — не
+  // таймер страницы: у браузера она не занимает номер в её счёте setTimeout.
+  const __ptLater = (f, d) => (typeof globalThis.__pt_addTask === 'function' ? __pt_addTask(f, d || 0) : setTimeout(f, d || 0));
   const VOID = new Set(['area','base','br','col','embed','hr','img','input',
     'link','meta','param','source','track','wbr']);
 
@@ -118,7 +121,7 @@
     const px = new Proxy(target, handler);
     handler.setPrototypeOf = (t, proto) => {
       for (let q = proto, i = 0; q !== null && q !== undefined && i < 100000; i++) {
-        if (q === t || q === px) throw new TypeError('Cyclic __proto__ value');
+        if (q === t || q === px) throw __pt_mkErr(TypeError, 'Cyclic __proto__ value');
         q = Object.getPrototypeOf(q);
       }
       return Reflect.setPrototypeOf(t, proto);
@@ -285,7 +288,7 @@
     replace(from, to) { const t = this.__ptTokens(), i = t.indexOf(String(from));
       if (i < 0) return false;
       t[i] = String(to); __ptSetA(this.__ptEl, 'class', t.join(' ')); return true; },
-    supports() { throw new TypeError("Failed to execute 'supports' on 'DOMTokenList': DOMTokenList has no supported tokens."); },
+    supports() { throw __pt_mkErr(TypeError, "Failed to execute 'supports' on 'DOMTokenList': DOMTokenList has no supported tokens."); },
     forEach(fn, thisArg) { this.__ptTokens().forEach((v, i) => fn.call(thisArg, v, i, this)); },
     *entries() { const t = this.__ptTokens(); for (let i = 0; i < t.length; i++) yield [i, t[i]]; },
     *keys() { const t = this.__ptTokens(); for (let i = 0; i < t.length; i++) yield i; },
@@ -343,7 +346,9 @@
     // Базовый адрес — у документа: у `about:blank` он от создателя.
     get baseURI() {
       const d = this.nodeType === 9 ? this : (this.ownerDocument || null);
-      return d && typeof d.__ptBaseURI === 'function' ? d.__ptBaseURI() : ((globalThis.location && globalThis.location.href) || 'about:blank');
+      if (d && typeof d.__ptBaseURI === 'function') return d.__ptBaseURI();
+      const href = (globalThis.location && globalThis.location.href) || 'about:blank';
+      return href === 'about:blank' && typeof globalThis.__pt_inheritedBase === 'string' ? globalThis.__pt_inheritedBase : href;
     }
     get isConnected() {
       for (let n = this; n; n = n.parentNode || n.__ptHost) {
@@ -363,7 +368,7 @@
       // Узел не может содержать сам себя — и своего предка тоже.
       for (let p = this; p; p = p.parentNode) {
         if (p === child) {
-          throw new (globalThis.DOMException || Error)(
+          throw __pt_mkErr(globalThis.DOMException || Error, 
             "Failed to execute 'appendChild' on 'Node': The new child element contains the parent.",
             'HierarchyRequestError');
         }
@@ -410,7 +415,7 @@
       __needNode(child, 1, 'removeChild');
       const i = this.__ptKids.indexOf(child);
       if (i < 0) {
-        throw new (globalThis.DOMException || Error)(
+        throw __pt_mkErr(globalThis.DOMException || Error, 
           "Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node.",
           'NotFoundError');
       }
@@ -473,6 +478,7 @@
     set textContent(v) {
       if (this.nodeType === 9 || this.nodeType === 10) return;
       if (this.nodeType === 3 || this.nodeType === 4 || this.nodeType === 7 || this.nodeType === 8) { this.data = String(v); return; }
+      if (this.__ptLocal === 'script') v = __pt_ttSink('TrustedScript', 'HTMLScriptElement textContent', v, "Failed to set the 'textContent' property on 'HTMLScriptElement'");
       this.__ptKids = [];
       if (v !== '') __ptAdd.call(this, new Text(String(v)));
     }
@@ -853,6 +859,7 @@
       return host.__ptKids.map(serializeNode).join('');
     }
     set innerHTML(html) {
+      html = __pt_ttSink('TrustedHTML', 'ShadowRoot innerHTML', html, "Failed to set the 'innerHTML' property on 'ShadowRoot'");
       // Разметка шаблона разбирается в его содержимое — таков разбор у него.
       const host = this.__ptLocal === 'template' ? __templateContent(this) : this;
       host.__ptKids = [];
@@ -938,12 +945,12 @@
     define(name, ctor, options) {
       name = String(name);
       if (!/^[a-z][a-z0-9._]*-[a-z0-9._-]*$/.test(name)) {
-        throw new (globalThis.DOMException || Error)(`"${name}" is not a valid custom element name`, 'SyntaxError');
+        throw __pt_mkErr(globalThis.DOMException || Error, `"${name}" is not a valid custom element name`, 'SyntaxError');
       }
       if (__customs.has(name)) {
-        throw new (globalThis.DOMException || Error)(`"${name}" has already been defined`, 'NotSupportedError');
+        throw __pt_mkErr(globalThis.DOMException || Error, `"${name}" has already been defined`, 'NotSupportedError');
       }
-      if (typeof ctor !== 'function') throw new TypeError('constructor is not a constructor');
+      if (typeof ctor !== 'function') throw __pt_mkErr(TypeError, 'constructor is not a constructor');
       __customs.set(name, ctor);
       const doc = globalThis.document;
       if (doc && doc.documentElement) {
@@ -1012,6 +1019,8 @@
     setAttribute(n, v) {
       __needArgs(arguments.length, 2, 'setAttribute', 'Element');
       const name = __attrName(this, n), old = this.__ptAttrs.get(name);
+      if (name === 'src' && this.__ptLocal === 'script') v = __pt_ttSink('TrustedScriptURL', 'HTMLScriptElement src', v, "Failed to execute 'setAttribute' on 'Element'");
+      else if (name === 'srcdoc' && this.__ptLocal === 'iframe') v = __pt_ttSink('TrustedHTML', 'HTMLIFrameElement srcdoc', v, "Failed to execute 'setAttribute' on 'Element'");
       this.__ptAttrs.set(name, String(v));
       if (this.__ptUpgraded) {
         const watched = this.constructor && this.constructor.observedAttributes;
@@ -1050,7 +1059,9 @@
     // widget refused to initialise ("Could not find Turnstile valid script tag").
     get src() { return this.__ptUrlAttr('src'); }
     set src(v) {
-      __ptSetA(this, 'src', v);
+      if (this.__ptLocal === 'script') v = __pt_ttSink('TrustedScriptURL', 'HTMLScriptElement src', v, "Failed to set the 'src' property on 'HTMLScriptElement'");
+      __csp.ttSkip = true;
+      try { __ptSetA(this, 'src', v); } finally { __csp.ttSkip = false; }
       // Картинка идёт в сеть от одного присваивания, без всякого документа:
       // `new Image().src = …` — обычный способ послать GET, и у нас он не
       // посылал ничего. Запрос делает браузер сам, поэтому мимо страничного
@@ -1094,7 +1105,7 @@
         } catch (e) {}
         // Итог декодирования — задача после уже поставленных сообщений, как в
         // браузере (декодер отвечает из другого потока).
-        setTimeout(() => this.__ptFireLoad(isImage), 0);
+        __ptLater(() => this.__ptFireLoad(isImage), 0);
         return;
       }
       if (typeof globalThis.__pt_subresource !== 'function') return;
@@ -1125,7 +1136,9 @@
       return __ptGetA(this, 'text');
     }
     set text(v) {
-      this.textContent = String(v);
+      if (this.__ptLocal === 'script') v = __pt_ttSink('TrustedScript', 'HTMLScriptElement text', v, "Failed to set the 'text' property on 'HTMLScriptElement'");
+      __csp.ttSkip = true;
+      try { this.textContent = String(v); } finally { __csp.ttSkip = false; }
       if (this.__ptLocal === 'script' && this.isConnected && this.__ptRunScript) this.__ptRunScript();
     }
     // `srcdoc` — документ, написанный прямо в атрибуте: у него нет адреса, и
@@ -1133,7 +1146,9 @@
     // новый документ в этом окне, как навигация.
     get srcdoc() { const v = __ptGetA(this, 'srcdoc'); return v === null ? '' : v; }
     set srcdoc(v) {
-      __ptSetA(this, 'srcdoc', v);
+      if (this.__ptLocal === 'iframe') v = __pt_ttSink('TrustedHTML', 'HTMLIFrameElement srcdoc', v, "Failed to set the 'srcdoc' property on 'HTMLIFrameElement'");
+      __csp.ttSkip = true;
+      try { __ptSetA(this, 'srcdoc', v); } finally { __csp.ttSkip = false; }
       if (this.__ptLocal !== 'iframe') return;
       try {
         const w = this.__ptRealm || (this.isConnected ? this.__ptRealmWindow() : null);
@@ -1262,7 +1277,9 @@
     __ptUrlAttr(n) {
       const raw = __ptGetA(this, n);
       if (raw == null) return '';
-      const base = (globalThis.location && location.href) || 'about:blank';
+      // Пустой кадр берёт основу адреса у создателя: `s.src = 'x.js'` в нём
+      // отвечает адресом родителя, а не `about://x.js`.
+      const base = (this.ownerDocument || document).baseURI || (globalThis.location && location.href) || 'about:blank';
       try { return new URL(raw, base).href; } catch (e) { return raw; }
     }
 
@@ -1416,6 +1433,10 @@
       // Песочница наследует стороннесть кадра: разрешения и Notification в ней
       // отвечают как в нём.
       try { Object.defineProperty(w, '__pt_crossSite', { value: !!globalThis.__pt_crossSite, configurable: true }); } catch (e) {}
+      // И политику безопасности: about:blank и about:srcdoc наследуют CSP
+      // создателя (nonce, 'unsafe-eval', Trusted Types) — eval в таком кадре
+      // отвечает тем же, чем в родителе.
+      try { if (typeof w.__pt_applyCsp === 'function') for (const p of __csp.policies) w.__pt_applyCsp(p.raw, 'inherited'); } catch (e) {}
       // Окно пустого кадра внутри стороннего кадра у Chrome не знает ни
       // внешнего размера, ни положения на экране: outerWidth/outerHeight и
       // screenX/screenY там нули (так отвечает отчёт челленджа).
@@ -1431,6 +1452,7 @@
       // отвечают его словами, адрес остаётся about:blank.
       try {
         Object.defineProperty(w, '__pt_inheritedOrigin', { value: (globalThis.location && location.origin) || 'null', configurable: true });
+        Object.defineProperty(w, '__pt_inheritedBase', { value: (globalThis.document && document.baseURI) || (globalThis.location && location.href) || 'about:blank', configurable: true });
         Object.defineProperty(w, '__pt_inheritedHost', { value: (globalThis.location && location.hostname) || '', configurable: true });
       } catch (e) {}
       Object.defineProperty(this, '__ptRealm', { value: w, configurable: true, enumerable: false });
@@ -1592,9 +1614,9 @@
     attachShadow(init) {
       const m = init && init.mode;
       if (m !== 'open' && m !== 'closed') {
-        throw new TypeError("Failed to execute 'attachShadow' on 'Element': Failed to read the 'mode' property from 'ShadowRootInit': The provided value '" + m + "' is not a valid enum value of type ShadowRootMode.");
+        throw __pt_mkErr(TypeError, "Failed to execute 'attachShadow' on 'Element': Failed to read the 'mode' property from 'ShadowRootInit': The provided value '" + m + "' is not a valid enum value of type ShadowRootMode.");
       }
-      if (this.__ptShadow) throw new (globalThis.DOMException || Error)("Failed to execute 'attachShadow' on 'Element': Shadow root cannot be created on a host which already hosts a shadow tree.", 'NotSupportedError');
+      if (this.__ptShadow) throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'attachShadow' on 'Element': Shadow root cannot be created on a host which already hosts a shadow tree.", 'NotSupportedError');
       const sr = new ShadowRoot(this, m);
       sr.__ptDelegatesFocus = !!init.delegatesFocus;
       sr.__ptClonable = !!init.clonable;
@@ -1621,6 +1643,7 @@
       return host.__ptKids.map(serializeNode).join('');
     }
     set innerHTML(html) {
+      html = __pt_ttSink('TrustedHTML', 'Element innerHTML', html, "Failed to set the 'innerHTML' property on 'Element'");
       // Разметка шаблона разбирается в его содержимое — таков разбор у него.
       const host = this.__ptLocal === 'template' ? __templateContent(this) : this;
       host.__ptKids = [];
@@ -1630,16 +1653,17 @@
     // Rendered text (hidden subtrees excluded, whitespace collapsed) — an
     // approximation of `innerText` good enough for tools that read it.
     get innerText() { return __innerText(this); }
-    set innerText(v) { this.textContent = String(v); }
+    set innerText(v) { if (this.__ptLocal === 'script') v = __pt_ttSink('TrustedScript', 'HTMLScriptElement innerText', v, "Failed to set the 'innerText' property on 'HTMLScriptElement'"); __csp.ttSkip = true; try { this.textContent = String(v); } finally { __csp.ttSkip = false; } }
     get outerText() { return __innerText(this); }
     insertAdjacentHTML(pos, html) {
       __needArgs(arguments.length, 2, 'insertAdjacentHTML', 'Element');
       if (!/^(beforebegin|afterbegin|beforeend|afterend)$/i.test(String(pos))) {
-        throw new (globalThis.DOMException || Error)(
+        throw __pt_mkErr(globalThis.DOMException || Error, 
           "Failed to execute 'insertAdjacentHTML' on 'Element': The value provided ('" + pos +
           "') is not one of 'beforeBegin', 'afterBegin', 'beforeEnd', or 'afterEnd'.",
           'SyntaxError');
       }
+      html = __pt_ttSink('TrustedHTML', 'Element insertAdjacentHTML', html, "Failed to execute 'insertAdjacentHTML' on 'Element'");
       const nodes = parseFragment(String(html));
       if (pos === 'beforeend') for (const n of nodes) __ptAdd.call(this, n);
       else if (pos === 'afterbegin') for (const n of nodes.reverse()) __ptInsert.call(this, n, this.firstChild);
@@ -1982,7 +2006,7 @@
       // InvalidCharacterError, а мы строили элемент с любым именем.
       const raw = String(tag);
       if (!/^[A-Za-z_:\u00C0-\u{10FFFF}][A-Za-z0-9_:.\-\u00B7\u00C0-\u{10FFFF}]*$/u.test(raw)) {
-        throw new (globalThis.DOMException || Error)("Failed to execute 'createElement' on 'Document': The tag name provided ('" + raw + "') is not a valid name.", 'InvalidCharacterError');
+        throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'createElement' on 'Document': The tag name provided ('" + raw + "') is not a valid name.", 'InvalidCharacterError');
       }
       // В XML-документе имя хранится как есть, а элемент — просто Element.
       if (this.__ptXml) {
@@ -2037,7 +2061,7 @@
       __needArgs(arguments.length, 1, 'importNode', 'Document');
       __needNode(node, 1, 'importNode', 'Document');
       if (node.nodeType === DOCUMENT_NODE) {
-        throw new (globalThis.DOMException || Error)(
+        throw __pt_mkErr(globalThis.DOMException || Error, 
           "Failed to execute 'importNode' on 'Document': The node provided is a document, " +
           "which may not be imported.", 'NotSupportedError');
       }
@@ -2050,7 +2074,7 @@
       __needArgs(arguments.length, 1, 'adoptNode', 'Document');
       __needNode(node, 1, 'adoptNode', 'Document');
       if (node.nodeType === DOCUMENT_NODE) {
-        throw new (globalThis.DOMException || Error)(
+        throw __pt_mkErr(globalThis.DOMException || Error, 
           "Failed to execute 'adoptNode' on 'Document': The node provided is a document, " +
           "which may not be adopted.", 'NotSupportedError');
       }
@@ -2093,7 +2117,7 @@
     // (e.g. async), it appends to <body>. Dynamically written <script> tags are
     // inserted but not executed (our script list is fixed at parse time).
     write(...args) {
-      const nodes = parseFragment(args.join(''));
+      const nodes = parseFragment(args.map((a) => String(__pt_ttSink('TrustedHTML', 'Document write', a, "Failed to execute 'write' on 'Document'"))).join(''));
       const cur = this.currentScript;
       if (cur && cur.parentNode) {
         const ref = cur.nextSibling;
@@ -2379,6 +2403,15 @@
       let body = null;
       if (src.slice(0, 5) === 'blob:' || src.slice(0, 5) === 'data:') {
         try { body = globalThis.__pt_localSource ? __pt_localSource(src) : null; } catch (e) {}
+        // Blob-адрес, за которым ничего нет, — чужой: браузер отказывает ещё
+        // в конструкторе.
+        // Blob-адрес чужого (или никакого) происхождения — отказ ещё в
+        // конструкторе; свой, но пустой, падает позже событием error.
+        if (src.slice(0, 5) === 'blob:') {
+          let o = 'null'; try { o = new URL(src).origin; } catch (e) {}
+          const mine = (globalThis.location && location.origin) || 'null';
+          if (o === 'null' || o !== mine) throw __pt_mkErr(globalThis.DOMException || Error, "Failed to construct 'Worker': Script at '" + src + "' cannot be accessed from origin '" + mine + "'.", 'SecurityError');
+        }
       }
       __workerOps.push({ op: 'open', id, src, body, name: (options && options.name) || '' });
     }
@@ -2466,7 +2499,7 @@
       // не принимает вовсе, а отвечает отказом.
       const t = String(type);
       if (t !== '2d' && t !== 'webgl' && t !== 'webgl2' && t !== 'bitmaprenderer' && t !== 'webgpu') {
-        throw new TypeError("Failed to execute 'getContext' on 'OffscreenCanvas': The provided value '"
+        throw __pt_mkErr(TypeError, "Failed to execute 'getContext' on 'OffscreenCanvas': The provided value '"
           + t + "' is not a valid enum value of type OffscreenRenderingContextType.");
       }
       const c = this.__ptO.c;
@@ -3617,7 +3650,7 @@
     });
     def('setProperty', function setProperty(p, v, prio) {
       const s = st(this); if (!s) return;
-      if (s.computed) throw new TypeError('Cannot modify computed style');
+      if (s.computed) throw __pt_mkErr(TypeError, 'Cannot modify computed style');
       // Приоритет — либо пусто, либо `important`; иное браузер молча
       // отвергает вместе со всем вызовом. И `!important` внутри значения —
       // тоже отказ.
@@ -3634,7 +3667,7 @@
     });
     def('removeProperty', function removeProperty(p) {
       const s = st(this); if (!s) return '';
-      if (s.computed) throw new TypeError('Cannot modify computed style');
+      if (s.computed) throw __pt_mkErr(TypeError, 'Cannot modify computed style');
       const m = s.read(), k = __cssKey(p), had = m.get(k) || '';
       __cssDrop(m, k); s.write(m); return had;
     });
@@ -4327,40 +4360,169 @@
   // ответ: `document.querySelector('<<<')` бросает SyntaxError с точным текстом.
   // У нас же он что-то находил — движок молча пропускал непонятное, и `<<<`
   // отвечал первым элементом, а `matches('###')` отвечал «да».
-  const __selectorOk = (sel) => {
-    const s = String(sel);
-    if (!s.trim()) return false;
-    // Части через запятую проверяются по отдельности, как в браузере.
-    for (const part of __selSplit(s)) {
-      const t = part.trim();
-      if (!t) return false;
-      if (/[<>~+]$/.test(t) || /^[>~+]/.test(t)) return false;
-      // Скобки должны сходиться.
-      let depth = 0, square = 0;
-      for (const ch of t) {
-        if (ch === '(') depth++;
-        else if (ch === ')') { if (--depth < 0) return false; }
-        else if (ch === '[') square++;
-        else if (ch === ']') { if (--square < 0) return false; }
-        else if (ch === '<') return false;              // в селекторе не бывает
-      }
-      if (depth || square) return false;
-      // `#`, `.` и `:` обязаны вести к имени.
-      if (/[#.](?![-\w\\])/.test(t)) return false;
-      if (/:(?![-\w:(])/.test(t)) return false;
+  // Разбор по грамматике селекторов, как у браузера: имя после `#`/`.` —
+  // идентификатор (не цифра), псевдокласс и псевдоэлемент — из известных
+  // браузеру, `:nth-*` — an+b, `:has()` не пустой, два комбинатора подряд
+  // и неизвестная приставка пространства имён — отказ; незакрытый `[` в
+  // конце строки браузер закрывает сам.
+  const __SEL_IDENT = /^(?:-?(?:[_a-zA-Z\u00A0-\uFFFF]|\\[^\n]|\\$)(?:[-_a-zA-Z0-9\u00A0-\uFFFF]|\\[^\n]|\\$)*|--(?:[-_a-zA-Z0-9\u00A0-\uFFFF]|\\[^\n]|\\$)*)/;
+  const __SEL_PC_PLAIN = new Set(['-webkit-any-link', '-webkit-autofill', '-webkit-drag', '-webkit-full-page-media', '-webkit-full-screen', '-webkit-full-screen-ancestor', '-webkit-scrollbar', 'active', 'active-view-transition', 'any-link', 'autofill', 'checked', 'corner-present', 'current', 'decrement', 'default', 'defined', 'disabled', 'double-button', 'empty', 'enabled', 'end', 'first-child', 'first-of-type', 'focus', 'focus-visible', 'focus-within', 'fullscreen', 'future', 'horizontal', 'host', 'hover', 'in-range', 'increment', 'indeterminate', 'interest-source', 'interest-target', 'invalid', 'last-child', 'last-of-type', 'link', 'modal', 'no-button', 'only-child', 'only-of-type', 'open', 'optional', 'out-of-range', 'past', 'picture-in-picture', 'placeholder-shown', 'popover-open', 'read-only', 'read-write', 'required', 'root', 'scope', 'single-button', 'start', 'target', 'target-current', 'user-invalid', 'user-valid', 'valid', 'vertical', 'visited', 'window-inactive', 'xr-overlay']);
+  const __SEL_PC_FUNC = new Set(['active-view-transition-type', 'dir', 'has', 'host', 'host-context', 'is', 'lang', 'not', 'nth-child', 'nth-last-child', 'nth-last-of-type', 'nth-of-type', 'state', 'where', '-webkit-any']);
+  const __SEL_PE_PLAIN = new Set(['after', 'backdrop', 'before', 'checkmark', 'column', 'cue', 'details-content', 'file-selector-button', 'first-letter', 'first-line', 'grammar-error', 'marker', 'picker-icon', 'placeholder', 'scroll-marker', 'scroll-marker-group', 'search-text', 'selection', 'spelling-error', 'target-text', 'view-transition', '-webkit-calendar-picker-indicator', '-webkit-color-swatch', '-webkit-color-swatch-wrapper', '-webkit-date-and-time-value', '-webkit-datetime-edit', '-webkit-datetime-edit-ampm-field', '-webkit-datetime-edit-day-field', '-webkit-datetime-edit-fields-wrapper', '-webkit-datetime-edit-hour-field', '-webkit-datetime-edit-millisecond-field', '-webkit-datetime-edit-minute-field', '-webkit-datetime-edit-month-field', '-webkit-datetime-edit-second-field', '-webkit-datetime-edit-text', '-webkit-datetime-edit-week-field', '-webkit-datetime-edit-year-field', '-webkit-details-marker', '-webkit-file-upload-button', '-webkit-inner-spin-button', '-webkit-input-placeholder', '-webkit-media-controls', '-webkit-media-controls-current-time-display', '-webkit-media-controls-enclosure', '-webkit-media-controls-fullscreen-button', '-webkit-media-controls-mute-button', '-webkit-media-controls-overlay-enclosure', '-webkit-media-controls-overlay-play-button', '-webkit-media-controls-panel', '-webkit-media-controls-play-button', '-webkit-media-controls-time-remaining-display', '-webkit-media-controls-timeline', '-webkit-media-controls-toggle-closed-captions-button', '-webkit-media-controls-volume-slider', '-webkit-media-slider-container', '-webkit-media-slider-thumb', '-webkit-media-text-track-container', '-webkit-media-text-track-display', '-webkit-media-text-track-region', '-webkit-media-text-track-region-container', '-webkit-meter-bar', '-webkit-meter-even-less-good-value', '-webkit-meter-inner-element', '-webkit-meter-optimum-value', '-webkit-meter-suboptimum-value', '-webkit-progress-bar', '-webkit-progress-inner-element', '-webkit-progress-value', '-webkit-resizer', '-webkit-scrollbar', '-webkit-scrollbar-button', '-webkit-scrollbar-corner', '-webkit-scrollbar-thumb', '-webkit-scrollbar-track', '-webkit-scrollbar-track-piece', '-webkit-search-cancel-button', '-webkit-search-decoration', '-webkit-slider-container', '-webkit-slider-runnable-track', '-webkit-slider-thumb', '-webkit-textfield-decoration-container']);
+  const __SEL_PE_FUNC = new Set(['cue', 'highlight', 'part', 'picker', 'scroll-button', 'slotted', 'view-transition-group', 'view-transition-image-pair', 'view-transition-new', 'view-transition-old']);
+  const __SEL_LEGACY_PE = new Set(['before', 'after', 'first-line', 'first-letter']);
+  // Доводы в скобках — до парной закрывающей (строки и вложенные скобки
+  // учитываются); null, если скобка не закрыта.
+  const __selArg = (t, i) => {
+    let depth = 0, q = null;
+    for (let k = i; k < t.length; k++) {
+      const ch = t[k];
+      if (q) { if (ch === '\\') k++; else if (ch === q) q = null; continue; }
+      if (ch === '"' || ch === "'") { q = ch; continue; }
+      if (ch === '(') depth++;
+      else if (ch === ')') { if (--depth === 0) return { arg: t.slice(i + 1, k), end: k + 1 }; }
     }
+    // Незакрытая скобка в конце строки: браузер закрывает её сам.
+    return { arg: t.slice(i + 1), end: t.length };
+  };
+  const __selAnb = (a, allowOf) => {
+    const m = /^\s*(even|odd|[+-]?\d*n(?:\s*[+-]\s*\d+)?|[+-]?\d+)(?:\s+(of)\s+([\s\S]+))?\s*$/i.exec(a);
+    if (!m) return false;
+    if (m[2]) return allowOf && __selValid(m[3], false);
     return true;
   };
+  const __selStringOrIdent = (x) => /^\s*(?:"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|(?:-?(?:[_a-zA-Z\u00A0-\uFFFF]|\\.)(?:[-_a-zA-Z0-9\u00A0-\uFFFF]|\\.)*|--[-_a-zA-Z0-9\u00A0-\uFFFF\\]*))\s*$/.test(x);
+  // Один сложный селектор (без запятых); `relative` — допускает ведущий комбинатор.
+  const __selValidOne = (t, relative, ctx) => {
+    ctx = ctx || {};
+    let i = 0; const n = t.length;
+    const ws = () => { while (i < n && /\s/.test(t[i])) i++; };
+    const ident = () => { const m = __SEL_IDENT.exec(t.slice(i)); if (!m) return null; i += m[0].length; return m[0]; };
+    ws();
+    if (i >= n) return false;
+    let expectCompound = true;
+    if (/^[>+~]/.test(t.slice(i))) { if (!relative) return false; i += 1; ws(); }
+    while (i < n) {
+      // Составной селектор.
+      let any = false;
+      // Тип с возможным пространством имён: `*`, `ident`, `*|x`, `|x`; чужая приставка — отказ.
+      const save = i;
+      let nsPrefix = null;
+      if (t[i] === '&') { i++; any = true; }
+      else if (t[i] === '*' || t[i] === '|' || __SEL_IDENT.test(t.slice(i))) {
+        let first = t[i] === '*' ? (i++, '*') : (t[i] === '|' ? '' : ident());
+        if (first === null) return false;
+        if (t[i] === '|' && t[i + 1] !== '=') { nsPrefix = first; i++; const el = t[i] === '*' ? (i++, '*') : ident(); if (el === null) return false; if (nsPrefix !== '*' && nsPrefix !== '') return false; }
+        any = true;
+      }
+      void save;
+      let afterPE = false;
+      for (;;) {
+        const ch = t[i];
+        if (afterPE && (ch === '#' || ch === '.' || ch === '[' || ch === ':' || ch === '&')) return false;
+        if (ch === '&') { i++; any = true; continue; }
+        if (ch === '#') { i++; if (ident() === null) return false; any = true; continue; }
+        if (ch === '.') { i++; if (ident() === null) return false; any = true; continue; }
+        if (ch === '[') {
+          i++; ws();
+          if (t[i] === '*' && t[i + 1] === '|') i += 2; else if (t[i] === '|') i++;
+          if (ident() === null) return false;
+          if (t[i] === '|' && t[i + 1] !== '=') return false;   // чужая приставка пространства имён
+          ws();
+          if (i >= n) return true;            // `a[b` — браузер закрывает сам
+          if (t[i] !== ']') {
+            if (!/^[~|^$*]?=/.test(t.slice(i))) return false;
+            i += t[i] === '=' ? 1 : 2; ws();
+            if (i >= n) return false;
+            const vm = /^(?:"(?:[^"\\\n]|\\[\s\S])*"|'(?:[^'\\\n]|\\[\s\S])*'|"(?:[^"\\\n]|\\[\s\S])*$|'(?:[^'\\\n]|\\[\s\S])*$)/.exec(t.slice(i));
+            if (vm) i += vm[0].length; else if (ident() === null) return false;
+            ws();
+            if (i >= n) return true;
+            if (/^[iI](?=\s*(\]|$))/.test(t.slice(i))) { i++; ws(); }
+            if (i >= n) return true;
+          }
+          if (t[i] !== ']') return false;
+          i++; any = true; continue;
+        }
+        if (ch === ':') {
+          i++;
+          const pe = t[i] === ':'; if (pe) i++;
+          const name = ident(); if (name === null) return false;
+          const low = name.toLowerCase();
+          if (t[i] === '(') {
+            const a = __selArg(t, i); if (!a) return false;
+            i = a.end;
+            const arg = a.arg;
+            const inner = { logical: true, noHas: ctx.noHas || low === 'has' };
+            if (pe) {
+              if (ctx.logical) return false;
+              if (!__SEL_PE_FUNC.has(low) && !low.startsWith('-webkit-')) return false;
+              if (low === 'part') { if (!arg.trim() || !arg.trim().split(/\s+/).every((x) => __SEL_IDENT.test(x) && __SEL_IDENT.exec(x)[0] === x)) return false; }
+              else if (low === 'slotted') { if (!__selCompoundOnly(arg)) return false; }
+              else if (low === 'cue') { if (!__selValid(arg, false, inner)) return false; }
+              else if (!arg.trim()) return false;
+              afterPE = true;
+            } else {
+              if (!__SEL_PC_FUNC.has(low)) return false;
+              // :is/:where — прощающий список: негодные части отбрасываются, пустой допустим.
+              if (low === 'is' || low === 'where') { for (const p of __selSplit(arg)) { if (!p.trim()) continue; try { if (!__selValidOne(p, false, inner)) { if (/::|\bhas\(/.test(p)) {} } } catch (e) {} } }
+              else if (low === 'not' || low === '-webkit-any') { if (!__selValid(arg, false, inner)) return false; }
+              else if (low === 'has') { if (ctx.noHas || !arg.trim() || !__selValid(arg, true, inner)) return false; }
+              else if (low === 'nth-child' || low === 'nth-last-child') { if (!__selAnb(arg, true)) return false; }
+              else if (low === 'nth-of-type' || low === 'nth-last-of-type') { if (!__selAnb(arg, false)) return false; }
+              else if (low === 'host' || low === 'host-context') { if (!__selCompoundOnly(arg)) return false; }
+              else if (low === 'lang') { if (!__selStringOrIdent(arg) || /["']/.test(arg)) return false; }
+              else if (low === 'active-view-transition-type') { if (!arg.trim() || !arg.split(',').every((x) => __selStringOrIdent(x) && !/["']/.test(x))) return false; }
+              else if (low === 'dir' || low === 'state') { if (!__selStringOrIdent(arg) || /["']/.test(arg)) return false; }
+              else if (!arg.trim()) return false;
+            }
+          } else if (pe) {
+            if (ctx.logical) return false;
+            if (!__SEL_PE_PLAIN.has(low) && !low.startsWith('-webkit-')) return false;
+            afterPE = true;
+          } else if (__SEL_LEGACY_PE.has(low)) { if (ctx.logical) return false; afterPE = true; }
+          else if (!__SEL_PC_PLAIN.has(low)) return false;
+          any = true; continue;
+        }
+        break;
+      }
+      if (!any) return false;
+      expectCompound = false;
+      // Комбинатор.
+      const before = i; ws();
+      if (i >= n) return true;
+      if (afterPE) return false;               // после псевдоэлемента ничего не бывает
+      if (t[i] === '>' || t[i] === '+' || t[i] === '~') { i++; ws(); expectCompound = true; }
+      else if (i === before) return false;     // символ, которого в селекторе не бывает
+      else expectCompound = true;              // потомок через пробел
+      if (i >= n) return false;                // комбинатор в конце
+      if (/^[>+~]/.test(t.slice(i))) return false; // два подряд
+    }
+    return !expectCompound;
+  };
+  const __selValid = (sel, relative, ctx) => {
+    const s = String(sel);
+    if (!s.trim()) return false;
+    for (const part of __selSplit(s)) { if (!__selValidOne(part, !!relative, ctx)) return false; }
+    return true;
+  };
+  // Только составной селектор (без комбинаторов): :host(), ::slotted().
+  const __selCompoundOnly = (sel) => {
+    const t = String(sel).trim();
+    if (!t || /[>+~]|\s/.test(t.replace(/\[[^\]]*\]|\([^)]*\)/g, ''))) return false;
+    return __selValid(t, false, { logical: true });
+  };
+  const __selectorOk = (sel) => { try { return __selValid(sel, false); } catch (e) { return false; } };
   const __checkSelector = (sel, method, iface) => {
     if (__selectorOk(sel)) return String(sel);
     const msg = "Failed to execute '" + method + "' on '" + iface + "': '" +
       String(sel) + "' is not a valid selector.";
-    throw new (globalThis.DOMException || Error)(msg, 'SyntaxError');
+    throw __pt_mkErr(globalThis.DOMException || Error, msg, 'SyntaxError');
   };
   // Столько же доводов, сколько требует браузер, и тот же текст отказа.
   const __needArgs = (got, want, method, iface) => {
     if (got >= want) return;
-    throw new TypeError("Failed to execute '" + method + "' on '" + iface + "': " +
+    throw __pt_mkErr(TypeError, "Failed to execute '" + method + "' on '" + iface + "': " +
       want + " argument" + (want === 1 ? '' : 's') + " required, but only " + got + " present.");
   };
 
@@ -4371,7 +4533,7 @@
   // `replaceChild` не тем и сверяет, что ему ответили.
   const __needNode = (v, n, method, iface) => {
     if (v !== null && typeof v === 'object' && typeof v.nodeType === 'number') return;
-    throw new TypeError("Failed to execute '" + method + "' on '" + (iface || 'Node') + "': " +
+    throw __pt_mkErr(TypeError, "Failed to execute '" + method + "' on '" + (iface || 'Node') + "': " +
       "parameter " + n + " is not of type 'Node'.");
   };
 
@@ -4379,7 +4541,7 @@
   // ребёнком. Браузер на чужом узле бросает `NotFoundError` своими словами.
   const __needChild = (parent, ref, method, what) => {
     if (parent.__ptKids.indexOf(ref) >= 0) return;
-    throw new (globalThis.DOMException || Error)(
+    throw __pt_mkErr(globalThis.DOMException || Error, 
       "Failed to execute '" + method + "' on 'Node': " + what, 'NotFoundError');
   };
 
@@ -4712,7 +4874,7 @@
       // `new HTMLElement()` в браузере бросает, но `super()` из класса
       // кастомного элемента обязан работать — это его штатный путь.
       if (new.target && new.target !== C) return Reflect.construct(Element, [__pendingTag], new.target);
-      throw new TypeError("Illegal constructor");
+      throw __pt_mkErr(TypeError, "Illegal constructor");
     };
     try { Object.defineProperty(C, 'name', { value: name, configurable: true }); } catch (e) {}
     C.prototype = Object.create(parentProto);
@@ -4801,7 +4963,7 @@
     defGet(T, 'tBodies', function () { return __collection(kids(this).filter((k) => isTag(k, 'tbody'))); });
     const defAcc = (P, k, get, set) => { try { Object.defineProperty(P, k, { get, set, enumerable: true, configurable: true }); } catch (e) {} };
     const tableSet = (t, tag, v, where) => {
-      if (v !== null && !(v && isTag(v, tag))) throw new TypeError("Failed to set the '" + (tag === 'thead' ? 'tHead' : tag === 'tfoot' ? 'tFoot' : tag) + "' property on 'HTMLTableElement': The provided value is not of type '" + (tag === 'caption' ? 'HTMLTableCaptionElement' : 'HTMLTableSectionElement') + "'.");
+      if (v !== null && !(v && isTag(v, tag))) throw __pt_mkErr(TypeError, "Failed to set the '" + (tag === 'thead' ? 'tHead' : tag === 'tfoot' ? 'tFoot' : tag) + "' property on 'HTMLTableElement': The provided value is not of type '" + (tag === 'caption' ? 'HTMLTableCaptionElement' : 'HTMLTableSectionElement') + "'.");
       const old = kids(t).find((k) => isTag(k, tag)); if (old) t.removeChild(old);
       if (!v) return;
       const ref = where(t); ref ? t.insertBefore(v, ref) : t.appendChild(v);
@@ -5387,7 +5549,7 @@
       const full = __svgText(this);
       let idx = Number(i); if (!isFinite(idx) || idx < 0) idx = 0; idx = Math.floor(idx);
       if (!full || idx >= full.length) {
-        throw new (globalThis.DOMException || Error)("Failed to execute 'getExtentOfChar' on 'SVGTextContentElement': The index provided (" + idx + ") is outside the range of characters.", 'IndexSizeError');
+        throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'getExtentOfChar' on 'SVGTextContentElement': The index provided (" + idx + ") is outside the range of characters.", 'IndexSizeError');
       }
       // Знак — вместе с парным суррогатом и модификаторами: у эмодзи одно
       // продвижение на всю последовательность.
@@ -5931,8 +6093,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const nat = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
     const oldProto = E && E.prototype && typeof E.prototype === 'object' ? E.prototype : null;
     const C = function SecurityPolicyViolationEvent(type, init) {
-      if (!new.target) throw new TypeError("Failed to construct 'SecurityPolicyViolationEvent': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
-      if (arguments.length < 1) throw new TypeError("Failed to construct 'SecurityPolicyViolationEvent': 1 argument required, but only 0 present.");
+      if (!new.target) throw __pt_mkErr(TypeError, "Failed to construct 'SecurityPolicyViolationEvent': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+      if (arguments.length < 1) throw __pt_mkErr(TypeError, "Failed to construct 'SecurityPolicyViolationEvent': 1 argument required, but only 0 present.");
       const ev = Reflect.construct(Ev, [type, init], new.target);
       const st = {};
       for (const [k, dflt] of __SPVE_FIELDS) { const v = init && init[k]; st[k] = v === undefined ? dflt : (typeof dflt === 'number' ? (Number(v) | 0) : String(v)); }
@@ -5944,7 +6106,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     try { Object.setPrototypeOf(C, Ev); } catch (e) {}
     try { Object.defineProperty(C.prototype, 'constructor', { value: C, writable: true, configurable: true }); } catch (e) {}
     for (const [k] of __SPVE_FIELDS) {
-      try { Object.defineProperty(C.prototype, k, { get: nat(function () { const st = __spveState.get(this); if (!st) throw new TypeError('Illegal invocation'); return st[k]; }, 'get ' + k), enumerable: true, configurable: true }); } catch (e) {}
+      try { Object.defineProperty(C.prototype, k, { get: nat(function () { const st = __spveState.get(this); if (!st) throw __pt_mkErr(TypeError, 'Illegal invocation'); return st[k]; }, 'get ' + k), enumerable: true, configurable: true }); } catch (e) {}
     }
     try { Object.defineProperty(C.prototype, Symbol.toStringTag, { value: 'SecurityPolicyViolationEvent', configurable: true }); } catch (e) {}
     try { Object.defineProperty(C, 'length', { value: 1, configurable: true }); } catch (e) {}
@@ -5969,7 +6131,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       }, extra || {});
       delete init.noSite;
       const ev = typeof E === 'function' ? new E('securitypolicyviolation', Object.assign({ bubbles: true, composed: true }, init)) : new Event('securitypolicyviolation', { bubbles: true });
-      setTimeout(() => { try { document.dispatchEvent(ev); } catch (e) {} }, 0);
+      __ptLater(() => { try { document.dispatchEvent(ev); } catch (e) {} }, 0);
     } catch (e) {}
   };
   const __cspEvalMessage = () => {
@@ -5980,6 +6142,49 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       return { name: d[0], list: d[1], msg: "Evaluating a string as JavaScript violates the following Content Security Policy directive because 'unsafe-eval' is not an allowed source of script: " + __cspDirectiveText(d[0], d[1]) + "\".\n" };
     }
     return null;
+  };
+  // ---- Trusted Types ---------------------------------------------------
+  // `require-trusted-types-for 'script'`: строка в стоке кода (eval, Function,
+  // таймер со строкой, text у <script>, innerHTML, srcdoc, document.write)
+  // идёт через политику по умолчанию, а без неё — отказ словами Chrome и
+  // нарушение `trusted-types-sink`. Проверка TT идёт раньше CSP-проверки
+  // 'unsafe-eval': у Chrome в документе с обеими eval отвечает ошибкой TT.
+  const __ttRequired = () => __csp.policies.some((p) => (p.dirs['require-trusted-types-for'] || []).some((t) => t.replace(/'/g, '').toLowerCase() === 'script'));
+  globalThis.__pt_ttRequired = __ttRequired;
+  globalThis.__pt_ttNames = () => { for (const p of __csp.policies) { const l = p.dirs['trusted-types']; if (l) return l.slice(); } return null; };
+  const __ttViolation = (sink, value) => __cspViolation('require-trusted-types-for', ["'script'"], 'trusted-types-sink', sink + '|' + String(value), {});
+  const __TT_MEMBER = { TrustedHTML: 'createHTML', TrustedScript: 'createScript', TrustedScriptURL: 'createScriptURL' };
+  // Доверенное значение узнаётся и из другого реалма (у Chrome проверка по
+  // типу обёртки, не по прототипу этого окна): по бренду toStringTag.
+  const __ttIs = (kind, v) => { try { if (!v || typeof v !== 'object') return false; const tt = globalThis.trustedTypes; if (tt && (kind === 'TrustedHTML' ? tt.isHTML(v) : kind === 'TrustedScript' ? tt.isScript(v) : tt.isScriptURL(v))) return true; return Object.prototype.toString.call(v) === '[object ' + kind + ']'; } catch (e) { return false; } };
+  // Строка, пригодная для стока: Trusted-объект — его текст; без требования
+  // TT — значение как есть (сток сам приводит к строке); иначе — через
+  // политику по умолчанию, с отказом по правилам Chrome.
+  globalThis.__pt_ttSink = (kind, sink, value, prefix, strict) => {
+    if (__ttIs(kind, value)) return String(value);
+    if (!__ttRequired() || __csp.ttSkip) return value;
+    const def = typeof globalThis.__pt_ttDefault === 'function' ? __pt_ttDefault() : null;
+    const fail = (why) => { __ttViolation(sink, value); return __pt_mkErr(TypeError, prefix + ": This document requires '" + kind + "' assignment" + why + '.'); };
+    if (!def) throw fail('');
+    const rule = def.rules && def.rules[__TT_MEMBER[kind]];
+    if (typeof rule !== 'function') throw fail(" and no 'default' policy for '" + kind + "' has been defined");
+    const r = rule.call(undefined, String(value), kind, sink);
+    if (r === null || r === undefined) throw fail(" and the 'default' policy failed to execute");
+    // Ответ политики приводится к строке (Symbol — отказ привязки); для
+    // eval он обязан совпасть с исходной строкой — политика там может
+    // только разрешить, не переписать.
+    if (typeof r === 'symbol') throw __pt_mkErr(TypeError, "Failed to execute 'invoke' on '" + __TT_MEMBER[kind].replace('create', 'Create') + "Callback': Failed to convert value to 'String'.");
+    const out = String(r);
+    if (strict && out !== String(value)) throw fail(" and the 'default' policy failed to execute");
+    return out;
+  };
+  // eval / new Function: зовётся из крючка порождения кода (modify_codegen в
+  // pool) — строка кода после политики по умолчанию или null (EvalError).
+  globalThis.__pt_ttEval = (source) => {
+    const src = String(source);
+    if (!__ttRequired() || __csp.ttBypass) return src;
+    const sink = /^\(function anonymous\(/.test(src) || /^\(async function anonymous\(/.test(src) || /^\(function\* anonymous\(/.test(src) || /^\(async function\* anonymous\(/.test(src) ? 'Function' : 'eval';
+    try { return __pt_ttSink('TrustedScript', sink, src, '', true); } catch (e) { return null; }
   };
   const __cspWasmMessage = () => {
     for (const p of __csp.policies) {
@@ -6067,21 +6272,36 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   try { Object.defineProperty(globalThis, '__pt_cspEvalViolation', { value: () => { const e = __cspEvalMessage(); if (e) __cspViolation(e.name, e.list, 'eval'); }, writable: true, enumerable: false, configurable: true }); } catch (e) {}
   const __cspWrapEval = () => {
     const ev = __cspEvalMessage();
+    const tt = __ttRequired();
     try { Object.defineProperty(globalThis, '__pt_cspEval', { value: ev ? ev.msg : '', writable: true, enumerable: false, configurable: true }); } catch (e) {}
-    try { if (typeof globalThis.__pt_setCodegen === 'function') __pt_setCodegen(!ev); } catch (e) {}
-    if (!ev || __csp.wrapped) return;
+    try { Object.defineProperty(globalThis, '__pt_ttOn', { value: tt, writable: true, enumerable: false, configurable: true }); } catch (e) {}
+    try { if (typeof globalThis.__pt_setCodegen === 'function') __pt_setCodegen(!ev && !tt); } catch (e) {}
+    if ((!ev && !tt) || __csp.wrapped) return;
     __csp.wrapped = true;
     const nat = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
     // Конструкторы функций из строки: Function и его async/generator-родня,
     // в том числе через `.constructor` у прототипов.
     try {
       const evalErr = () => { const e = __cspEvalMessage(); __cspViolation(e.name, e.list, 'eval'); return new EvalError(e.msg); };
+      // Под Trusted Types строку конструктора собирает сам V8:
+      // `(function anonymous(a\n) {\nbody\n})` — так её и видит политика.
+      const ttFn = (real, a) => {
+        const kind = real.name === 'AsyncGeneratorFunction' ? 'async function*' : real.name === 'GeneratorFunction' ? 'function*' : real.name === 'AsyncFunction' ? 'async function' : 'function';
+        const params = a.length > 1 ? a.slice(0, -1).map(String).join(',') : '';
+        const body = a.length ? String(a[a.length - 1]) : '';
+        const src = '(' + kind + ' anonymous(' + params + '\n) {\n' + body + '\n})';
+        const code = __pt_ttEval(src);
+        if (code === null) throw new EvalError("Evaluating a string as JavaScript violates this document's Trusted Type assignment requirements.");
+        __csp.ttBypass = true;
+        try { return code === src ? real.apply(this, a) : (0, eval)(code); } finally { __csp.ttBypass = false; }
+      };
       const seen = [];
       const ctors = [globalThis.Function];
       for (const mk of [() => Object.getPrototypeOf(async function () {}).constructor, () => Object.getPrototypeOf(function* () {}).constructor, () => Object.getPrototypeOf(async function* () {}).constructor]) { try { ctors.push(mk()); } catch (e) {} }
       for (const real of ctors) {
         if (typeof real !== 'function' || seen.includes(real)) continue;
         seen.push(real);
+        if (!ev) continue;
         const w = function (...a) { throw evalErr(); };
         w.prototype = real.prototype;
         try { Object.defineProperty(w, 'name', { value: real.name, configurable: true }); Object.defineProperty(w, 'length', { value: real.length, configurable: true }); } catch (e) {}
@@ -6095,13 +6315,13 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     for (const name of ['setTimeout', 'setInterval']) {
       try {
         const real = globalThis[name]; if (typeof real !== 'function') continue;
-        const w = ({ [name](handler, ...rest) { if (typeof handler !== 'function') { const e = __cspEvalMessage(); if (e) { __cspViolation(e.name, e.list, 'eval'); return 0; } } return real.call(this, handler, ...rest); } })[name];
+        const w = ({ [name](handler, ...rest) { if (typeof handler !== 'function') { handler = __pt_ttSink('TrustedScript', 'Window ' + name, handler, "Failed to execute '" + name + "' on 'Window'"); const e = __cspEvalMessage(); if (e) { __cspViolation(e.name, e.list, 'eval'); return 0; } } return real.call(this, handler, ...rest); } })[name];
         try { Object.defineProperty(w, 'length', { value: real.length, configurable: true }); } catch (e) {}
         Object.defineProperty(globalThis, name, { value: nat(w, name), writable: true, enumerable: true, configurable: true });
       } catch (e) {}
     }
     // WebAssembly: компиляция и инстанцирование.
-    try {
+    if (ev) try {
       const W = globalThis.WebAssembly;
       if (W) {
         const CE = W.CompileError || Error;
@@ -6114,7 +6334,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         }
         for (const k of ['Module', 'Instance']) {
           const real = W[k]; if (typeof real !== 'function') continue;
-          const w = function (...a) { if (!new.target) throw new TypeError("WebAssembly." + k + " must be invoked with 'new'"); const e = wasmErr(k); if (e) throw e; return Reflect.construct(real, a, new.target); };
+          const w = function (...a) { if (!new.target) throw __pt_mkErr(TypeError, "WebAssembly." + k + " must be invoked with 'new'"); const e = wasmErr(k); if (e) throw e; return Reflect.construct(real, a, new.target); };
           w.prototype = real.prototype;
           for (const sk of Object.getOwnPropertyNames(real)) { if (['length', 'name', 'prototype'].includes(sk)) continue; try { Object.defineProperty(w, sk, Object.getOwnPropertyDescriptor(real, sk)); } catch (e) {} }
           try { Object.defineProperty(w, 'length', { value: real.length, configurable: true }); } catch (e) {}
@@ -6127,21 +6347,28 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       try {
         const real = globalThis[name]; if (typeof real !== 'function') continue;
         const w = function (url, opts) {
-          if (!new.target) throw new TypeError("Failed to construct '" + name + "': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+          if (!new.target) throw __pt_mkErr(TypeError, "Failed to construct '" + name + "': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
           const u = String(url);
+          // Происхождение раньше политики: чужой blob-адрес — SecurityError.
+          if (u.slice(0, 5) === 'blob:') {
+            let o = 'null'; try { o = new URL(u).origin; } catch (e) {}
+            const mine = (globalThis.location && location.origin) || 'null';
+            if (o === 'null' || o !== mine) throw __pt_mkErr(globalThis.DOMException || Error, "Failed to construct '" + name + "': Script at '" + u + "' cannot be accessed from origin '" + mine + "'.", 'SecurityError');
+          }
           for (const p of __csp.policies) {
-            const d = __cspScriptDirective(p);
+            // Для воркера: worker-src, иначе child-src, иначе script-src/default-src.
+            const d = p.dirs['worker-src'] ? ['worker-src', p.dirs['worker-src']] : (p.dirs['child-src'] ? ['child-src', p.dirs['child-src']] : __cspScriptDirective(p));
             if (!d) continue;
             if (__cspAllowsUrl(d[1], u, '')) continue;
             const text = __cspDirectiveText(d[0], d[1]);
-            __cspReport("Refused to create a worker from '" + u + "' because it violates the following Content Security Policy directive: \"" + text + "\". Note that 'worker-src' was not explicitly set, so 'script-src' is used as a fallback.\n");
+            __cspReport("Refused to create a worker from '" + u + "' because it violates the following Content Security Policy directive: \"" + text + "\"." + (d[0] === 'worker-src' ? '\n' : " Note that 'worker-src' was not explicitly set, so '" + d[0] + "' is used as a fallback.\n"));
             const scheme = (u.match(/^([a-z][a-z0-9+.-]*):/i) || [])[1];
             __cspViolation(d[0], d[1], /^(blob|data|filesystem)$/i.test(scheme || '') ? scheme.toLowerCase() : u, '', { violatedDirective: 'worker-src', effectiveDirective: 'worker-src' });
             // У браузера конструктор отвечает объектом, а скрипт не грузится:
             // воркер получает событие error.
             const dead = Reflect.construct(real, ['data:text/javascript,', opts], new.target);
             try { dead.terminate(); } catch (e) {}
-            setTimeout(() => { try { dead.dispatchEvent(new ErrorEvent('error', { message: 'Failed to load worker script' })); } catch (e) {} }, 0);
+            __ptLater(() => { try { dead.dispatchEvent(new ErrorEvent('error', { message: 'Failed to load worker script' })); } catch (e) {} }, 0);
             return dead;
           }
           return Reflect.construct(real, [url, opts], new.target);
@@ -6537,7 +6764,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   class MutationObserver {
     constructor(cb) {
-      if (typeof cb !== 'function') throw new TypeError("Failed to construct 'MutationObserver': parameter 1 is not of type 'Function'.");
+      if (typeof cb !== 'function') throw __pt_mkErr(TypeError, "Failed to construct 'MutationObserver': parameter 1 is not of type 'Function'.");
       const state = { cb, entries: [], records: [], api: this };
       __observers.push(state);
       Object.defineProperty(this, '__ptState', { value: state, enumerable: false });
@@ -6547,7 +6774,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       // The spec default: with neither childList nor attributes nor
       // characterData asked for, this is a TypeError, not a silent no-op.
       if (!opts.childList && !opts.attributes && !opts.characterData && !opts.attributeFilter) {
-        throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
+        throw __pt_mkErr(TypeError, "Failed to execute 'observe' on 'MutationObserver': The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
       }
       if (opts.attributeFilter) opts.attributes = true;
       this.__ptState.entries.push({ target, opts });
@@ -9801,7 +10028,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     setTransform(m) { const p = __patVals.get(this); if (p) p.transform = m || null; }
   }
   class Selection {
-    getRangeAt() { throw new (globalThis.DOMException || Error)("Failed to execute 'getRangeAt' on 'Selection': 0 is not a valid index.", 'IndexSizeError'); }
+    getRangeAt() { throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'getRangeAt' on 'Selection': 0 is not a valid index.", 'IndexSizeError'); }
     removeAllRanges() {} addRange() {} removeRange() {} empty() {} collapse() {}
     collapseToStart() {} collapseToEnd() {} extend() {} modify() {}
     selectAllChildren() {} setBaseAndExtent() {} setPosition() {}

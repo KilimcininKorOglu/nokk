@@ -1162,6 +1162,40 @@ fn modify_codegen<'s, 'i>(
 ) -> v8::ModifyCodeGenerationFromStringsResult<'s> {
     let context = scope.get_current_context();
     let global = context.global(scope);
+    // Trusted Types раньше CSP: при `require-trusted-types-for 'script'`
+    // строка идёт через политику по умолчанию (`__pt_ttEval`), и без неё
+    // eval отвечает EvalError словами Chrome. TrustedScript — доверен и так.
+    let mut tt_source: Option<v8::Local<'s, v8::String>> = None;
+    let tt_on = v8::String::new(scope, "__pt_ttOn")
+        .and_then(|k| global.get(scope, k.into()))
+        .map(|v| v.is_true())
+        .unwrap_or(false);
+    if tt_on && source.is_string() {
+        let f = v8::String::new(scope, "__pt_ttEval")
+            .and_then(|k| global.get(scope, k.into()))
+            .and_then(|v| v8::Local::<v8::Function>::try_from(v).ok());
+        if let Some(f) = f {
+            let r = f.call(scope, global.into(), &[source]);
+            match r.filter(|v| v.is_string()).and_then(|v| v.to_string(scope)) {
+                Some(code) => tt_source = Some(code),
+                None => {
+                    // `new Function(...)`: V8 разбирает подмену как текст функции,
+                    // поэтому бросок кладётся в её тело (сработает при вызове);
+                    // прямой eval бросает сразу.
+                    let src = source.to_rust_string_lossy(scope);
+                    let throw = "throw new EvalError(\"Evaluating a string as JavaScript violates this document's Trusted Type assignment requirements.\");";
+                    let js = if src.starts_with("(function anonymous(") || src.starts_with("(async function anonymous(") || src.starts_with("(function* anonymous(") || src.starts_with("(async function* anonymous(") {
+                        let head = src.find("\n) {\n").map(|i| &src[..i + 5]).unwrap_or("(function anonymous(\n) {\n");
+                        format!("{head}{throw}\n}})")
+                    } else {
+                        format!("(function () {{ {throw} }})()")
+                    };
+                    let modified = v8::String::new(scope, &js);
+                    return v8::ModifyCodeGenerationFromStringsResult { codegen_allowed: true, modified_source: modified };
+                }
+            }
+        }
+    }
     let msg = v8::String::new(scope, "__pt_cspEval")
         .and_then(|k| global.get(scope, k.into()))
         .filter(|v| v.is_string())
@@ -1171,7 +1205,7 @@ fn modify_codegen<'s, 'i>(
         // TrustedScript исполняется своим текстом (скрытое поле, см.
         // natives::TRUSTED_SCRIPT_KEY); прочие объекты eval возвращает как есть.
         let _ = is_code_like;
-        let modified = trusted_script_text(scope, source);
+        let modified = tt_source.or_else(|| trusted_script_text(scope, source));
         return v8::ModifyCodeGenerationFromStringsResult { codegen_allowed: true, modified_source: modified };
     };
     let mut quoted = String::with_capacity(msg.len() + 2);
@@ -1188,6 +1222,9 @@ fn modify_codegen<'s, 'i>(
         }
     }
     quoted.push('"');
+    // Под Trusted Types текст EvalError — всегда их: Blink ставит сообщение
+    // для порождения кода один раз на документ, и TT переписывает его.
+    let quoted = if tt_on { "\"Evaluating a string as JavaScript violates this document's Trusted Type assignment requirements.\"".to_string() } else { quoted };
     let js = format!("(function () {{ try {{ if (typeof __pt_cspEvalViolation === 'function') __pt_cspEvalViolation(); }} catch (e) {{}} throw new EvalError({quoted}); }})()");
     let modified = v8::String::new(scope, &js);
     v8::ModifyCodeGenerationFromStringsResult { codegen_allowed: true, modified_source: modified }
