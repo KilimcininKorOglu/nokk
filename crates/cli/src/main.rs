@@ -34,7 +34,9 @@ struct Cli {
     #[arg(long, env = "NOKK_HOST", default_value = "127.0.0.1")]
     host: std::net::IpAddr,
 
-    /// Number of isolate worker threads. Defaults to available parallelism.
+    /// Number of isolate worker threads. Defaults to available parallelism for the
+    /// CDP server, and to 1 for a one-shot `--load`/`--eval`: one page needs no
+    /// pool, and every extra isolate costs ~150 MB at the peak of a challenge.
     #[arg(long, env = "NOKK_WORKERS")]
     workers: Option<usize>,
 
@@ -270,6 +272,11 @@ impl Cli {
         let mut pool = PoolConfig::default();
         if let Some(w) = self.workers {
             pool.workers = w.max(1);
+        } else if self.load.is_some() || self.eval.is_some() {
+            // One page, one isolate: a Cloudflare interstitial solve peaks at
+            // ~0.6 GB on one thread against ~1.05 GB on eight, in the same time
+            // and with the same verdict on every target we test.
+            pool.workers = 1;
         }
         if let Some(m) = self.max_contexts {
             pool.max_live_contexts = m.max(1);

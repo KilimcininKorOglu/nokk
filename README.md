@@ -45,8 +45,9 @@ the ground up, and skip the rendering engine entirely.**
   snapshot is cached in `~/.cache/nokk` after the first run), **~115 MB** idle with the
   default 8 isolate threads (**~65 MB** with `--workers 1`), and **~9 MB per page
   context** — the Chrome-shaped window every page gets is not small. Clearing a Cloudflare
-  interstitial peaks at **~0.6 GB** with `--workers 1` and **~1.05 GB** with 8 threads:
-  the challenge itself opens dozens of frames, sandboxes and workers, each a context.
+  interstitial peaks at **~0.6 GB** in a one-shot `--load` (one isolate thread, the
+  default there) and **~1.05 GB** on a server with 8 threads: the challenge itself opens
+  dozens of frames, sandboxes and workers, each a context.
 - 🧩 **Drop-in for Puppeteer.** nokk speaks CDP over WebSocket. Point
   `puppeteer.connect()` at it and drive pages, navigate, and `evaluate()` as usual.
 - 🔬 **Real JS, real DOM.** Google's V8 runs page scripts against an HTML-parsed DOM,
