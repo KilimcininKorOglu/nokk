@@ -21,6 +21,31 @@ Legend: ✅ done · 🟡 partial / in progress · ⬜ planned
 | 8 | Testing, benchmarks, fingerprint regression suite | 🟡 |
 | 9 | Packaging & release (crates.io, Docker, prebuilt binaries) | ⬜ |
 
+## Cloudflare challenges ✅
+
+As of v0.1.28-alpha nokk clears Cloudflare on its own, headless, with no
+selectors from the user: the managed "Just a moment…" interstitial (with or
+without the checkbox), the interactive interstitial that wants a press, and
+Turnstile widgets embedded in a site's own page (interaction-only, managed and
+non-interactive). The six public targets in [`tools/cf-check.sh`](tools/cf-check.sh)
+pass on every run.
+
+- ✅ **Solver in the core** (`BrowserContext::solve_challenge`, `challenge_state`):
+  it finds the widget inside its closed shadow root in a cross-origin frame and
+  presses it the way a person would; a driver only gives a time budget.
+- ✅ **Every entry point uses it.** CLI `--solve-challenge`; CDP server
+  `--auto-solve` (or `autoSolve` per browser context) so `page.goto()` returns the
+  page behind the challenge; `Nokk.solveChallenge` / `Nokk.challengeState` on
+  demand and a `Nokk.challenge` event; npm `launch({ autoSolve })` +
+  `solveChallenge(page)`; Python `launch(auto_solve=…)` + `solve_challenge(page)`;
+  the MCP server solves during `open` by default.
+- ✅ **What it took**, in short: the challenge's report had to match Chrome field by
+  field — Trusted Types in the challenge's sandbox, `history.replaceState`
+  rules, error stacks, the widget's layout and the click's coordinates, and
+  resource timing that hides cross-origin detail without `Timing-Allow-Origin`.
+- ⬜ Other vendors: DataDome is recognised (`challengeState` names it) but not
+  solved; hCaptcha / reCAPTCHA are out of scope.
+
 ## Near-term: fingerprint hardening (Phase 6)
 
 These are the concrete tells a dedicated fingerprinting suite (CreepJS, FingerprintJS)
@@ -212,8 +237,9 @@ Move to native (Rust):
   `drawImage` still stamps. `webgl` (done): a real headless GL context (surfaceless EGL +
   Mesa) behind `getContext('webgl')` — shaders, buffers, uniforms, draws, textures,
   render-to-texture framebuffers, `readPixels`; `getParameter`/extensions stay synthesized so
-  the reported GPU string never contradicts llvmpipe's pixels. Necessary-but-not-sufficient
-  for interactive Turnstile (still needs Workers + iframe execution). Full spec:
+  the reported GPU string never contradicts llvmpipe's pixels. On by default in the
+  release binary; Cloudflare reads the canvas blocks and they match Chrome byte for
+  byte. Full spec:
   [docs/rendering.md](docs/rendering.md).
 
 Keep in JS (the advantage is real):
@@ -222,6 +248,20 @@ Keep in JS (the advantage is real):
   rewrite, and none of it is a `[native code]` tell in the same way.
 
 ## Near-term: protocol & DOM completeness (Phase 5)
+
+- ✅ **A fresh global per document.** Every navigation builds a new V8 context, so
+  one page's `var`s and patched built-ins no longer show through on the next.
+  `localStorage`, `sessionStorage` and IndexedDB are carried per origin, as Chrome
+  keeps them (they had been one store shared by every site a tab visited), along
+  with the tab's history length.
+- ✅ **Documents the page moves to by itself reach the client.** A form the page
+  submits, a challenge that clears, a script that sets `location`: the CDP server
+  announces the new document (`frameNavigated`, fresh contexts), so Playwright's
+  `page.url()` / `page.title()` and Puppeteer's handles follow it. Handles into a
+  document the page has left are refused as Chrome refuses them.
+- ✅ **Current clients connect.** Puppeteer 25 (`Audits.enable`, a CDP session looked
+  up the moment `attachToTarget` replies) and Playwright 1.58–1.63
+  (`Browser.getWindowForTarget`).
 
 All four entries below came from a field report against a live Akamai-protected,
 WebSocket-driven app — the run where nokk *cleared a challenge headless Chrome
@@ -354,6 +394,8 @@ ceiling.
 - 🟡 Start-time and per-context memory measured (8-core Linux): ~4 ms engine start, ~20 MB
   idle, ~0.5 MB/context (100 contexts ≈ 65 MB) — well past the < 100 ms / 30–50 MB targets.
   A committed, repeatable benchmark harness is still to come.
+- 🟡 Live challenge check: [`tools/cf-check.sh`](tools/cf-check.sh) runs the six public
+  Cloudflare targets and prints a verdict, time and final title for each.
 - ⬜ A fixture-based WAF-challenge test suite (offline replay of real challenge pages).
 - ⬜ Load test: sustained thousand-context throughput and tail latency.
 
@@ -368,7 +410,9 @@ Already shipping:
 > `wreq-util = "3.0.0-rc.14"` (wreq-util 2.x capped at Chrome 137). Prebuilt-binary/Docker
 > releases are fine (they bundle the locked versions), but **move to wreq 6.0 stable before a
 > crates.io publish or a stable release tag** — then re-run build/test/clippy for any final
-> API drift.
+> API drift. Checked 2026-10-02: no stable 6.0 yet (latest `6.0.0-rc.31`, wreq-util
+> `3.0.0-rc.14`); a move to another RC would gain nothing and risks the TLS fingerprint,
+> which matches Chrome 151 today.
 
 ### Distribution channels
 
@@ -392,7 +436,8 @@ value-to-effort:
   tag. The package **downloads the prebuilt binary on install** (postinstall pulls the
   matching GitHub Release asset) and exposes `launch(opts)` → `server.wsEndpoint` for
   `puppeteer.connect` / `chromium.connectOverCDP`, plus `npx nokk` to run the server and a
-  `.d.ts`. Remaining: macOS/Windows binaries for those platforms (Linux x64 only today).
+  `.d.ts`. `launch({ autoSolve })` and `solveChallenge(page)` / `challengeState(page)` take
+  Cloudflare challenges on (Puppeteer page, Playwright page or a raw CDP session). Remaining: macOS/Windows binaries for those platforms (Linux x64 only today).
 - 🟡 **PyPI** (`pip`) — **published**: [`pip install nokk`](https://pypi.org/project/nokk/)
   works (name claimed, published on every `v*` tag by
   [`python-wheels.yml`](.github/workflows/python-wheels.yml), which syncs the PEP 440 version
@@ -402,8 +447,10 @@ value-to-effort:
   BoringSSL build, no Docker. `nokk.launch(…)` / async `nokk.launch_async(…)` spawn the CDP
   server, wait on `/json/version`, and return a self-cleaning server whose `ws_endpoint` goes
   to `playwright`/`pyppeteer` `connect_over_cdp`. Also ships an **MCP server** — see below.
-  The wheel CI builds manylinux_2_28 (BoringSSL + prebuilt V8 — see
-  [BUILD.md](docs/BUILD.md)) and publishes on tag; only the very first release went out as a
+  `launch(auto_solve=…)` and `solve_challenge(page)` / `challenge_state(page)` (+ `_async`)
+  take Cloudflare challenges on. The wheel and the release binary are built in Debian
+  bullseye ([`.github/bullseye-build.Dockerfile`](.github/bullseye-build.Dockerfile)) —
+  manylinux_2_31, glibc floor 2.30 — and published on tag; only the very first release went out as a
   manual `twine upload`. Native PyO3 bindings are
   a heavier follow-up with unclear benefit (the interface is CDP). macOS/Windows wheels wait
   on those binaries.
@@ -411,8 +458,9 @@ value-to-effort:
   stdio server (`python -m nokk.mcp`), so an AI agent (Claude Desktop/Code, …)
   browses through the stealth engine instead of a headful browser anti-bots flag. A minimal
   async CDP client ([`python/nokk/_cdp.py`](python/nokk/_cdp.py)) — no Playwright dependency —
-  backs `open`/`read_text`/`read_html`/`click`/`fill`/`evaluate`/`links`/`reset` over stdio;
-  built on `launch_async`. Validated end-to-end against a local binary (SDK v2 `MCPServer`
+  backs `open`/`read_text`/`read_html`/`click`/`fill`/`evaluate`/`links`/`solve_challenge`/
+  `challenge_state`/`reset` over stdio; built on `launch_async`. Cloudflare challenges are
+  solved during `open` by default (`--no-auto-solve` turns that off). Validated end-to-end against a local binary (SDK v2 `MCPServer`
   with a v1 `FastMCP` fallback). Follow-up: richer tools (wait-for, screenshots are N/A
   without rendering), and `click`/`fill` via the CDP `Input` domain for `isTrusted` events
   (currently JS-dispatched).
