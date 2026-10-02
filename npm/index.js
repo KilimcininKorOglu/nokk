@@ -2,9 +2,11 @@
 //
 //   const nokk = require("nokk");
 //   const puppeteer = require("puppeteer");
-//   const server = await nokk.launch({ rotateFingerprint: true });
+//   const server = await nokk.launch({ autoSolve: true });
 //   const browser = await puppeteer.connect({ browserWSEndpoint: server.wsEndpoint });
-//   ...
+//   const page = await browser.newPage();
+//   await page.goto("https://www.scrapingcourse.com/cloudflare-challenge");
+//   // a Cloudflare challenge on the way was solved before goto resolved
 //   await server.close();
 "use strict";
 
@@ -109,6 +111,9 @@ class NokkServer {
  * @param {boolean} [opts.geoipTimezone]
  * @param {boolean} [opts.allowTrackers]
  * @param {number}  [opts.chromeVersion]          e.g. 148
+ * @param {boolean|number} [opts.autoSolve]       solve Cloudflare challenges on every
+ *                                                 navigation before it reports the load;
+ *                                                 `true` = 30 s budget, a number = seconds
  * @param {string[]}[opts.args]                    extra raw CLI args
  * @param {object}  [opts.env]
  * @param {number}  [opts.timeout=30000]          ms to wait for readiness
@@ -125,6 +130,8 @@ async function launch(opts = {}) {
   if (opts.geoipTimezone) args.push("--geoip-timezone");
   if (opts.allowTrackers) args.push("--allow-trackers");
   if (opts.chromeVersion != null) args.push("--chrome-version", String(opts.chromeVersion));
+  if (opts.autoSolve === true) args.push("--auto-solve");
+  else if (typeof opts.autoSolve === "number") args.push("--auto-solve", String(opts.autoSolve));
   if (opts.args) args.push(...opts.args);
 
   const proc = spawn(binaryPath(), args, {
@@ -154,4 +161,55 @@ async function launch(opts = {}) {
   throw new Error(`nokk did not become ready within ${timeout}ms`);
 }
 
-module.exports = { launch, binaryPath, NokkServer };
+// ---------------------------------------------------------------------------
+// Challenges. nokk answers two non-standard CDP commands on a page's session —
+// `Nokk.solveChallenge` and `Nokk.challengeState` — and sends a `Nokk.challenge`
+// event when a navigation lands on a gate. These helpers take whatever the
+// caller has: a Puppeteer Page, a Playwright Page, or a raw CDP session.
+
+const _sessions = new WeakMap();
+
+/** A CDP session bound to `target`'s page (cached per page). */
+async function _session(target) {
+  if (!target) throw new TypeError("expected a Puppeteer/Playwright Page or a CDP session");
+  if (_sessions.has(target)) return _sessions.get(target);
+  let s;
+  if (typeof target.createCDPSession === "function") {
+    s = await target.createCDPSession(); // Puppeteer Page
+  } else if (typeof target.context === "function" && typeof target.context().newCDPSession === "function") {
+    s = await target.context().newCDPSession(target); // Playwright Page
+  } else if (typeof target.send === "function") {
+    s = target; // already a CDP session
+  } else {
+    throw new TypeError("expected a Puppeteer/Playwright Page or a CDP session");
+  }
+  _sessions.set(target, s);
+  return s;
+}
+
+/**
+ * Solve the challenge the page shows now — a Cloudflare interstitial or a
+ * Turnstile widget — pressing its checkbox if it puts one up. Resolves to
+ * `{ status, solved, presses, elapsedMs, remaining, title, url, cleared, token }`.
+ *
+ * @param {object} page              Puppeteer Page, Playwright Page or CDP session
+ * @param {object} [opts]
+ * @param {number} [opts.timeout]    budget in ms (default: the server's, else 30000)
+ */
+async function solveChallenge(page, opts = {}) {
+  const s = await _session(page);
+  const params = opts.timeout != null ? { timeoutMs: opts.timeout } : {};
+  return s.send("Nokk.solveChallenge", params);
+}
+
+/**
+ * What gate the page shows: `{ kind, title, url, cleared, token, solvable }`, where
+ * `kind` is "none", "cloudflare-interstitial", "turnstile-widget" or another
+ * vendor's gate that nokk recognises but does not solve.
+ */
+async function challengeState(page) {
+  const s = await _session(page);
+  return s.send("Nokk.challengeState");
+}
+
+module.exports = { launch, binaryPath, NokkServer, solveChallenge, challengeState };

@@ -1,7 +1,8 @@
 """A minimal async Chrome DevTools Protocol client for driving nokk.
 
 Just enough CDP to open a page, navigate, and run JavaScript against it — the
-handful of methods nokk implements (Target / Page / Runtime). It exists so the
+handful of methods nokk implements (Target / Page / Runtime), plus nokk's own
+``Nokk.solveChallenge`` / ``Nokk.challengeState`` and ``Nokk.challenge`` event. It exists so the
 MCP server (and any Python caller) can drive nokk without pulling in a full
 browser-automation stack; nokk *is* the browser, this is a thin wire client.
 
@@ -41,6 +42,9 @@ class CDP:
         self._ids = itertools.count(1)
         self._pending: Dict[int, "asyncio.Future[dict]"] = {}
         self._event_waiters: List[tuple] = []  # (predicate, Future)
+        # The last `Nokk.challenge` event per session: a navigation that met a
+        # gate reports it just ahead of its load event.
+        self.challenges: Dict[Optional[str], dict] = {}
         self._reader: Optional["asyncio.Task[None]"] = None
 
     @classmethod
@@ -62,6 +66,8 @@ class CDP:
                         else:
                             fut.set_result(msg.get("result", {}))
                 else:  # a protocol event
+                    if msg.get("method") == "Nokk.challenge":
+                        self.challenges[msg.get("sessionId")] = msg.get("params", {})
                     for pred, fut in list(self._event_waiters):
                         if not fut.done() and pred(msg):
                             fut.set_result(msg)
@@ -145,8 +151,12 @@ class Page:
         await cdp.send("Runtime.enable", session_id=session_id)
         return cls(cdp, session_id, target_id)
 
-    async def navigate(self, url: str, *, timeout: float = 30.0) -> Dict[str, str]:
-        """Go to ``url`` and wait for the load event. Returns ``{url, title}``."""
+    async def navigate(self, url: str, *, timeout: float = 30.0) -> Dict[str, Any]:
+        """Go to ``url`` and wait for the load event. Returns ``{url, title}``,
+        plus ``challenge`` when the navigation met a Cloudflare gate: the
+        server's ``Nokk.challenge`` report (``kind``, ``solved``, ``remaining``,
+        ``status``, ``presses``, ``elapsedMs``…)."""
+        self._cdp.challenges.pop(self._session, None)
         # Arm the waiter before navigating so a fast load can't race past it.
         waiter = asyncio.ensure_future(
             self._cdp.wait_event(
@@ -162,7 +172,24 @@ class Page:
         finally:
             if not waiter.done():
                 waiter.cancel()
-        return await self.evaluate("({url: location.href, title: document.title})")
+        out = await self.evaluate("({url: location.href, title: document.title})")
+        challenge = self._cdp.challenges.pop(self._session, None)
+        if challenge is not None:
+            out["challenge"] = challenge
+        return out
+
+    async def solve_challenge(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Solve the challenge the page shows now, pressing its checkbox if it
+        puts one up. ``timeout`` is the budget in seconds."""
+        params = {} if timeout is None else {"timeoutMs": int(timeout * 1000)}
+        budget = (timeout or 30.0) + 15.0
+        return await self._cdp.send(
+            "Nokk.solveChallenge", params, session_id=self._session, timeout=budget
+        )
+
+    async def challenge_state(self) -> Dict[str, Any]:
+        """What gate the page shows: ``{kind, title, url, cleared, token, solvable}``."""
+        return await self._cdp.send("Nokk.challengeState", session_id=self._session)
 
     async def evaluate(self, expression: str, *, timeout: float = 30.0) -> Any:
         """Evaluate a JS expression in the page and return its value.

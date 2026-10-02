@@ -86,9 +86,38 @@ pip install "nokk[mcp]"
 
 Use the `python` from the environment where you installed `nokk[mcp]` (its full
 path if the client doesn't share your shell). Tools: `open`, `read_text`,
-`read_html`, `click`, `fill`, `evaluate`, `links`, `reset`. Run it directly with
-`python -m nokk.mcp`; it accepts `--proxy`, `--rotate-fingerprint`,
-`--geoip-timezone`, `--session-store`, `--workers`.
+`read_html`, `click`, `fill`, `evaluate`, `links`, `solve_challenge`,
+`challenge_state`, `reset`. Run it directly with `python -m nokk.mcp`; it
+accepts `--proxy`, `--rotate-fingerprint`, `--geoip-timezone`,
+`--session-store`, `--workers`, `--no-auto-solve`.
+
+Cloudflare challenges are solved on the way by default: `open` returns the page
+behind "Just a moment…", and its `challenge` field says what it met.
+
+## Cloudflare challenges
+
+With `auto_solve=True`, a navigation that lands on Cloudflare's "Just a
+moment…" page or a Turnstile widget returns only once it is through.
+
+```python
+with nokk.launch(auto_solve=True) as server, sync_playwright() as pw:
+    page = pw.chromium.connect_over_cdp(server.ws_endpoint).new_page()
+    page.goto("https://www.scrapingcourse.com/cloudflare-challenge")
+    print(page.title())  # the page behind the challenge
+```
+
+Or on demand, for a Playwright page (`solve_challenge_async` /
+`challenge_state_async` for the async API):
+
+```python
+state = nokk.challenge_state(page)
+# {"kind": "cloudflare-interstitial" | "turnstile-widget" | "datadome" | "none", "solvable": …}
+if state["solvable"]:
+    r = nokk.solve_challenge(page, timeout=30)
+    # {"status": "cleared" | "token-issued" | "cleared-but-stuck" | "timeout", "solved": …, "presses": …}
+```
+
+Nobody passes selectors: the engine finds and presses the checkbox itself.
 
 ## `launch()` options
 
@@ -106,6 +135,7 @@ path if the client doesn't share your shell). Tools: `open`, `read_text`,
 | `rotate_fingerprint` | `False` | Give each browser context its own coherent fingerprint (OS/UA/screen/WebGL + matching TLS). |
 | `geoip_timezone` | `False` | Derive each context's timezone/locale from its proxy's exit IP. |
 | `allow_trackers` | `False` | Load ad/analytics/tracker subresources (blocked by default). |
+| `auto_solve` | `None` | Solve Cloudflare challenges on every navigation; `True` = 30 s budget, a number = seconds. |
 | `args` | `None` | Extra raw CLI arguments passed to the binary. |
 | `timeout` | `30.0` | Seconds to wait for the server to accept connections. |
 

@@ -4,6 +4,11 @@ Exposes nokk over the Model Context Protocol (stdio), so an MCP client (Claude
 Desktop, Claude Code, …) can navigate and scrape the web through nokk's
 Chrome-fingerprinted engine instead of a headful browser that anti-bots flag.
 
+Cloudflare challenges are solved on the way by default: ``open`` returns once
+the page behind "Just a moment…" (or a Turnstile widget's token) is there, and
+says what it met. ``--no-auto-solve`` turns that off; the ``solve_challenge``
+tool still works on demand.
+
 Run it::
 
     python -m nokk.mcp
@@ -26,7 +31,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import nokk
 from nokk._cdp import CDP, Page
@@ -51,6 +56,9 @@ mcp = _Server("nokk")
 # so the agent can navigate, then click, then read within one session. A lock
 # serialises tool calls so overlapping navigate/read can't interleave.
 _launch_kwargs: Dict[str, object] = {}
+# A navigation that meets a challenge returns only once it is solved, so give
+# it the solve budget on top of an ordinary load.
+_NAV_TIMEOUT = 90.0
 _state: Dict[str, object] = {}
 _lock: Optional[asyncio.Lock] = None
 
@@ -69,10 +77,33 @@ async def _get_page() -> Page:
 
 
 @mcp.tool()
-async def open(url: str) -> Dict[str, str]:
-    """Navigate the stealth browser to ``url``. Returns the final ``{url, title}``."""
+async def open(url: str) -> Dict[str, Any]:
+    """Navigate the stealth browser to ``url``. Returns the final ``{url, title}``.
+
+    A Cloudflare challenge on the way is solved before this returns (unless the
+    server runs with ``--no-auto-solve``); ``challenge`` then reports what was
+    met: ``kind``, ``solved``, and ``remaining`` (``"none"`` when through)."""
     page = await _get_page()
-    return await page.navigate(url)
+    return await page.navigate(url, timeout=_NAV_TIMEOUT)
+
+
+@mcp.tool()
+async def solve_challenge(timeout_seconds: float = 30) -> Dict[str, Any]:
+    """Solve the Cloudflare challenge the current page shows — the "Just a
+    moment…" interstitial or a Turnstile widget — pressing its checkbox if it
+    puts one up. Returns ``status``, ``solved``, ``remaining``, ``title``, ``url``."""
+    page = await _get_page()
+    return await page.solve_challenge(timeout_seconds)
+
+
+@mcp.tool()
+async def challenge_state() -> Dict[str, Any]:
+    """Which gate the current page shows: ``kind`` is ``"none"``,
+    ``"cloudflare-interstitial"``, ``"turnstile-widget"`` or ``"datadome"``
+    (recognised, not solvable); ``solvable`` says whether ``solve_challenge``
+    can take it on."""
+    page = await _get_page()
+    return await page.challenge_state()
 
 
 @mcp.tool()
@@ -170,6 +201,13 @@ def main() -> None:
         help="directory for persistent named-session cookie jars",
     )
     parser.add_argument(
+        "--no-auto-solve",
+        action="store_true",
+        default=_env_bool("NOKK_NO_AUTO_SOLVE"),
+        help="do not solve Cloudflare challenges during navigation "
+        "(the solve_challenge tool still works)",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=_env_int("NOKK_WORKERS"),
@@ -183,6 +221,7 @@ def main() -> None:
         geoip_timezone=args.geoip_timezone,
         session_store=args.session_store,
         workers=args.workers,
+        auto_solve=None if args.no_auto_solve else True,
     )
     mcp.run()
 

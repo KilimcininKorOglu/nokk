@@ -5,6 +5,10 @@ over the Chrome DevTools Protocol. This package embeds the prebuilt ``nokk``
 binary, so there is nothing to build and no browser to download — ``pip install
 nokk`` and go.
 
+Cloudflare challenges solve themselves with ``auto_solve=True``: a navigation
+that lands on "Just a moment…" or a Turnstile widget returns once it is through.
+:func:`solve_challenge` and :func:`challenge_state` do the same on demand.
+
 Synchronous::
 
     import nokk
@@ -45,7 +49,7 @@ import sysconfig
 import time
 import urllib.request
 from pathlib import Path
-from typing import List, Mapping, Optional, Sequence, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 __all__ = [
     "launch",
@@ -53,6 +57,10 @@ __all__ = [
     "NokkServer",
     "AsyncNokkServer",
     "binary_path",
+    "solve_challenge",
+    "solve_challenge_async",
+    "challenge_state",
+    "challenge_state_async",
     "__version__",
 ]
 
@@ -130,6 +138,7 @@ def _build_command(
     rotate_fingerprint: bool,
     geoip_timezone: bool,
     allow_trackers: bool,
+    auto_solve: Union[bool, float, None],
     args: Optional[Sequence[str]],
 ) -> List[str]:
     cmd = [binary_path(), "--host", host, "--port", str(port)]
@@ -147,6 +156,10 @@ def _build_command(
         cmd.append("--geoip-timezone")
     if allow_trackers:
         cmd.append("--allow-trackers")
+    if auto_solve is True:
+        cmd.append("--auto-solve")
+    elif auto_solve not in (None, False):
+        cmd += ["--auto-solve", str(int(auto_solve))]
     if args:
         cmd += list(args)
     return cmd
@@ -256,6 +269,7 @@ def launch(
     rotate_fingerprint: bool = False,
     geoip_timezone: bool = False,
     allow_trackers: bool = False,
+    auto_solve: Union[bool, float, None] = None,
     args: Optional[Sequence[str]] = None,
     env: Optional[Mapping[str, str]] = None,
     timeout: float = 30.0,
@@ -277,6 +291,9 @@ def launch(
         proxy's exit IP.
     :param allow_trackers: load ad/analytics/tracker subresources (blocked by
         default).
+    :param auto_solve: solve Cloudflare challenges (an interstitial or a
+        Turnstile widget) on every navigation before it reports the load.
+        ``True`` gives each a 30 s budget; a number is the budget in seconds.
     :param args: extra raw CLI arguments passed through to the binary.
     :param env: extra environment variables for the server process.
     :param timeout: seconds to wait for the server to accept connections.
@@ -293,6 +310,7 @@ def launch(
         rotate_fingerprint=rotate_fingerprint,
         geoip_timezone=geoip_timezone,
         allow_trackers=allow_trackers,
+        auto_solve=auto_solve,
         args=args,
     )
     process = subprocess.Popen(cmd, env=_merged_env(env))
@@ -408,6 +426,7 @@ async def launch_async(
     rotate_fingerprint: bool = False,
     geoip_timezone: bool = False,
     allow_trackers: bool = False,
+    auto_solve: Union[bool, float, None] = None,
     args: Optional[Sequence[str]] = None,
     env: Optional[Mapping[str, str]] = None,
     timeout: float = 30.0,
@@ -426,6 +445,7 @@ async def launch_async(
         rotate_fingerprint=rotate_fingerprint,
         geoip_timezone=geoip_timezone,
         allow_trackers=allow_trackers,
+        auto_solve=auto_solve,
         args=args,
     )
     process = await asyncio.create_subprocess_exec(*cmd, env=_merged_env(env))
@@ -437,3 +457,68 @@ async def launch_async(
         raise
     atexit.register(_terminate_quiet, process)
     return server
+
+
+# --------------------------------------------------------------------------- #
+# Challenges
+# --------------------------------------------------------------------------- #
+# nokk answers two non-standard CDP commands on a page's session:
+# ``Nokk.solveChallenge`` and ``Nokk.challengeState``. These helpers take a
+# Playwright page (sync or async API) and send them over a CDP session of its
+# own; the result is the server's reply as a dict.
+
+
+def _solve_params(timeout: Optional[float]) -> Dict[str, Any]:
+    return {} if timeout is None else {"timeoutMs": int(timeout * 1000)}
+
+
+def solve_challenge(page: Any, timeout: Optional[float] = None) -> Dict[str, Any]:
+    """Solve the challenge a (sync Playwright) page shows now — a Cloudflare
+    interstitial or a Turnstile widget — pressing its checkbox if it puts one up.
+
+    Returns ``{status, solved, presses, elapsedMs, remaining, title, url,
+    cleared, token}``; ``solved`` is true for status ``"cleared"`` or
+    ``"token-issued"``, and ``remaining`` names the gate left on the page
+    (``"none"`` when through).
+
+    :param timeout: budget in seconds (default: the server's ``--auto-solve``
+        value, else 30).
+    """
+    session = page.context.new_cdp_session(page)
+    try:
+        return session.send("Nokk.solveChallenge", _solve_params(timeout))
+    finally:
+        with contextlib.suppress(Exception):
+            session.detach()
+
+
+def challenge_state(page: Any) -> Dict[str, Any]:
+    """What gate a (sync Playwright) page shows: ``{kind, title, url, cleared,
+    token, solvable}``. ``kind`` is ``"none"``, ``"cloudflare-interstitial"``,
+    ``"turnstile-widget"`` or ``"datadome"`` (recognised, not solved)."""
+    session = page.context.new_cdp_session(page)
+    try:
+        return session.send("Nokk.challengeState")
+    finally:
+        with contextlib.suppress(Exception):
+            session.detach()
+
+
+async def solve_challenge_async(page: Any, timeout: Optional[float] = None) -> Dict[str, Any]:
+    """:func:`solve_challenge` for an async Playwright page."""
+    session = await page.context.new_cdp_session(page)
+    try:
+        return await session.send("Nokk.solveChallenge", _solve_params(timeout))
+    finally:
+        with contextlib.suppress(Exception):
+            await session.detach()
+
+
+async def challenge_state_async(page: Any) -> Dict[str, Any]:
+    """:func:`challenge_state` for an async Playwright page."""
+    session = await page.context.new_cdp_session(page)
+    try:
+        return await session.send("Nokk.challengeState")
+    finally:
+        with contextlib.suppress(Exception):
+            await session.detach()

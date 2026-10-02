@@ -248,6 +248,15 @@ struct Target {
     /// builds it), so the tick compares this against the live set rather than
     /// waiting for a command to notice.
     known_frames: std::collections::HashSet<u32>,
+    /// Set while a `Page.navigate` is in flight: it announces its own document.
+    navigating: Arc<AtomicBool>,
+    /// The engine's document count (`document_seq`) as last announced. When the
+    /// page moves on by itself — a form it submitted, a challenge that cleared,
+    /// a script that set `location` — the tick sees the count change and tells
+    /// the client, as Chrome would. A client never told keeps the old document
+    /// in mind: Playwright then holds the new one's request as "pending" and
+    /// answers `page.title()` with "Loading <url>", `page.url()` with the old one.
+    announced_seq: Arc<std::sync::atomic::AtomicU64>,
     /// Extra sessions attached to this same page. Chrome mints a *fresh* session
     /// for every `Target.attachToTarget`, and a client that gets its existing one
     /// back sees an attach event for a session it already knows — which is what
@@ -471,6 +480,24 @@ impl Conn {
                 });
             }
 
+            // A document the page moved to by itself: announce it before its frames.
+            if !t.navigating.load(Ordering::Acquire) {
+                let seq = t.ctx.document_seq();
+                if seq != t.announced_seq.load(Ordering::Acquire) {
+                    for m in announce_document(t) {
+                        let _ = tx.send(Message::Text(m.to_string()));
+                    }
+                    t.announced_seq.store(seq, Ordering::Release);
+                } else if t.url != "about:blank" || seq > 1 {
+                    // `Page.navigate` keeps what was asked for; the frame tree
+                    // and target info should show where the page landed.
+                    let landed = t.ctx.document_url();
+                    if !landed.is_empty() && t.url != landed {
+                        t.url = landed;
+                    }
+                }
+            }
+
             // Announce frames as they appear and disappear. Without this a client
             // never learns a page has any: `page.frames()` shows one, and there is
             // no execution context to evaluate inside.
@@ -567,7 +594,10 @@ impl Conn {
                     loader_id: Arc::new(std::sync::Mutex::new(String::new())),
                     extra_sessions: Vec::new(),
                     known_frames: std::collections::HashSet::new(),
+                    navigating: Arc::new(AtomicBool::new(false)),
+                    announced_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 };
+                t.announced_seq.store(t.ctx.document_seq(), Ordering::Relaxed);
                 let info = target_info(&t);
                 self.registry.add(json!({
                     "id": t.target_id,
@@ -687,6 +717,38 @@ impl Conn {
                 }
                 vec![ok(id, &session, json!({ "cookies": cookies }))]
             }
+            // The window a page lives in. Playwright asks for it on every page of
+            // a browser it takes for headful; the bounds are the ones the page
+            // itself reports (`screenX`/`outerWidth`…), so client and site agree.
+            "Browser.getWindowForTarget" => {
+                let by_id = params.get("targetId").and_then(|v| v.as_str());
+                let t = self.targets.iter().find(|t| match (by_id, session.as_deref()) {
+                    (Some(tid), _) => t.target_id == tid,
+                    (None, Some(s)) => t.session_id == s || t.extra_sessions.iter().any(|e| e == s),
+                    (None, None) => false,
+                });
+                let Some(t) = t else {
+                    return vec![err(id, &session, -32000, "No target with given id found")];
+                };
+                let (ctx, session, tx) = (t.ctx.clone(), session.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let dims = ctx
+                        .evaluate("JSON.stringify([screenX, screenY, outerWidth, outerHeight])")
+                        .await
+                        .ok()
+                        .and_then(|v| v.as_str().and_then(|s| serde_json::from_str::<Vec<i64>>(s).ok()))
+                        .filter(|d| d.len() == 4)
+                        .unwrap_or_else(|| vec![0, 0, 1280, 720]);
+                    let m = ok(id, &session, json!({
+                        "windowId": 1,
+                        "bounds": { "left": dims[0], "top": dims[1], "width": dims[2],
+                                    "height": dims[3], "windowState": "normal" },
+                    }));
+                    let _ = tx.send(Message::Text(m.to_string()));
+                });
+                vec![]
+            }
+            "Browser.setWindowBounds" => vec![ok(id, &session, json!({}))],
             "Browser.getVersion" => vec![ok(
                 id,
                 &session,
@@ -841,17 +903,19 @@ impl Conn {
                     };
                     let info = target_info(t);
                     vec![
-                        ok(id, &session, json!({ "sessionId": sid })),
                         // On the session that asked, not the root: in the flatten
                         // model the attach event belongs to the parent session, and
                         // a client that receives it on the root builds a *second*
                         // session object for the same id — after which replies land
-                        // on the wrong one and its assertions fire.
+                        // on the wrong one and its assertions fire. And ahead of the
+                        // reply, as Chrome sends it: Puppeteer's `createCDPSession`
+                        // looks the session up the moment the reply arrives.
                         event(
                             "Target.attachedToTarget",
                             &session,
                             json!({ "sessionId": sid, "targetInfo": info, "waitingForDebugger": false }),
                         ),
+                        ok(id, &session, json!({ "sessionId": sid })),
                     ]
                 } else {
                     vec![err(id, &session, -32000, "no such target")]
@@ -1010,6 +1074,9 @@ impl Conn {
             | "DOM.enable"
             | "Log.enable"
             | "Performance.enable"
+            // Puppeteer 25 turns issue reporting on for every page it opens.
+            | "Audits.enable"
+            | "Audits.disable"
             | "Runtime.runIfWaitingForDebugger"
             | "Page.setLifecycleEventsEnabled"
             | "Emulation.setDeviceMetricsOverride"
@@ -1120,9 +1187,19 @@ impl Conn {
                     .or(self.auto_solve)
                     .unwrap_or(AUTO_SOLVE_DEFAULT);
                 let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                let announced = self.targets[idx].announced_seq.clone();
                 tokio::spawn(async move {
                     let outcome = ctx.solve_challenge(budget).await;
                     let after = ctx.challenge_state().await;
+                    // A challenge that cleared moved the page to a new document;
+                    // let the tick announce it before the reply, so a client acting
+                    // on the reply already sees that document.
+                    for _ in 0..40 {
+                        if announced.load(Ordering::Acquire) == ctx.document_seq() {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
                     let m = ok(id, &session, json!({
                         "status": outcome.status.as_str(),
                         "solved": outcome.status.is_success(),
@@ -1181,6 +1258,11 @@ impl Conn {
                 let ctx = self.targets[idx].ctx.clone();
                 let session = session.clone();
                 let tx = tx.clone();
+                let (navigating, announced) = (
+                    self.targets[idx].navigating.clone(),
+                    self.targets[idx].announced_seq.clone(),
+                );
+                navigating.store(true, Ordering::Release);
                 // Solve on arrival: server-wide (`--auto-solve`) or per browser
                 // context (`autoSolve`), the context's word winning.
                 let per_ctx = self.targets[idx]
@@ -1243,8 +1325,11 @@ impl Conn {
                         }
                         None => json!({ "frameId": target_id, "loaderId": loader }),
                     };
+                    // Where the page landed, after redirects and a challenge that
+                    // moved on — what Chrome reports, not what was asked for.
+                    let landed = if nav_error.is_none() { ctx.document_url() } else { url.clone() };
                     let frame = json!({
-                        "id": target_id, "loaderId": loader, "url": url,
+                        "id": target_id, "loaderId": loader, "url": landed,
                         "domainAndRegistry": "", "securityOrigin": "://", "mimeType": "text/html"
                     });
                     let mut out = vec![
@@ -1284,6 +1369,8 @@ impl Conn {
                     for m in out {
                         let _ = tx.send(Message::Text(m.to_string()));
                     }
+                    announced.store(ctx.document_seq(), Ordering::Release);
+                    navigating.store(false, Ordering::Release);
                 });
                 vec![]
             }
@@ -1901,6 +1988,67 @@ fn js_str(s: &str) -> String {
 /// obviously related, which is what a client shows in its frame tree.
 fn child_frame_id(target_id: &str, frame_id: u32) -> String {
     format!("{target_id}-F{frame_id}")
+}
+
+/// Tell the client the page is on a new document it did not navigate to: the
+/// same events `Page.navigate` sends after a load, with fresh context ids for
+/// the main world and every isolated world, so handles into the old document
+/// are dropped and evaluates reach the new one.
+fn announce_document(t: &mut Target) -> Vec<Value> {
+    let session = Some(t.session_id.clone());
+    let url = t.ctx.document_url();
+    // The loader id its document request went out under: a client pairs the
+    // request with the commit by it (Playwright keeps a request it cannot pair
+    // as a navigation still pending, and its evaluates wait on that forever).
+    let loader = t
+        .loader_id
+        .lock()
+        .map(|l| l.clone())
+        .unwrap_or_default();
+    t.url = url.clone();
+    t.exec_ctx_id = IDS.fetch_add(1, Ordering::Relaxed) as i64;
+    for w in t.iso_worlds.iter_mut() {
+        w.1 = IDS.fetch_add(1, Ordering::Relaxed) as i64;
+    }
+    let target_id = t.target_id.clone();
+    let ev = |name: &str, params: Value| event(name, &session, params);
+    let lifecycle = |name: &str| {
+        ev(
+            "Page.lifecycleEvent",
+            json!({ "frameId": target_id, "loaderId": loader, "name": name, "timestamp": 0.0 }),
+        )
+    };
+    let mut out = vec![
+        ev("Page.frameStartedLoading", json!({ "frameId": target_id })),
+        ev(
+            "Page.frameNavigated",
+            json!({ "type": "Navigation", "frame": {
+                "id": target_id, "loaderId": loader, "url": url,
+                "domainAndRegistry": "", "securityOrigin": "://", "mimeType": "text/html"
+            }}),
+        ),
+        ev("Runtime.executionContextsCleared", json!({})),
+        ev(
+            "Runtime.executionContextCreated",
+            json!({ "context": {
+                "id": t.exec_ctx_id, "origin": url, "name": "", "uniqueId": format!("{}.1", t.exec_ctx_id),
+                "auxData": { "isDefault": true, "type": "default", "frameId": target_id }
+            }}),
+        ),
+    ];
+    for (name, nid) in &t.iso_worlds {
+        out.push(ev("Runtime.executionContextCreated", json!({ "context": {
+            "id": nid, "origin": url, "name": name, "uniqueId": format!("{nid}.1"),
+            "auxData": { "isDefault": false, "type": "isolated", "frameId": target_id }
+        }})));
+    }
+    out.push(lifecycle("init"));
+    out.push(lifecycle("DOMContentLoaded"));
+    out.push(ev("Page.domContentEventFired", json!({ "timestamp": 0.0 })));
+    out.push(lifecycle("load"));
+    out.push(ev("Page.loadEventFired", json!({ "timestamp": 0.0 })));
+    out.push(ev("Page.frameStoppedLoading", json!({ "frameId": target_id })));
+    out
 }
 
 /// The frame behind an execution context id, if it names one.

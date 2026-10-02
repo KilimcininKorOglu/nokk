@@ -731,6 +731,7 @@ impl Engine {
             worker,
             index,
             base_url: std::sync::Mutex::new("about:blank".to_string()),
+            doc_seq: std::sync::atomic::AtomicU64::new(0),
             requests: std::sync::Mutex::new(Vec::new()),
             started: std::time::Instant::now(),
             timings_sent: std::sync::Mutex::new(HashMap::new()),
@@ -884,6 +885,10 @@ pub struct BrowserContext {
     /// Document URL of the last `load_html`/`navigate`, used to resolve relative
     /// `fetch`/`XHR` URLs. `about:blank` until the first navigation.
     base_url: std::sync::Mutex<String>,
+    /// How many documents this page has loaded. A driver that did not start a
+    /// navigation itself — a form the page submitted, a challenge that moved on,
+    /// a link a script followed — learns of the new document by this changing.
+    doc_seq: std::sync::atomic::AtomicU64,
     /// Every network request the engine made for this context, in order — the
     /// built-in interception log (document + external scripts + page fetch/XHR).
     requests: std::sync::Mutex<Vec<NetworkRecord>>,
@@ -1344,11 +1349,22 @@ impl BrowserContext {
             *b = base_url.to_string();
         }
         self.load_html_into(self.index, base_url, html).await?;
+        self.doc_seq.fetch_add(1, std::sync::atomic::Ordering::Release);
         // Timers and async continuations scheduled during load (and by the load
         // handlers) get their turn now — with the load-time patience for delays
         // the page actually asked for.
         self.run_event_loop_for_load().await?;
         Ok(())
+    }
+
+    /// The number of documents this page has loaded so far (see `doc_seq`).
+    pub fn document_seq(&self) -> u64 {
+        self.doc_seq.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The address of the document on the page now, after redirects.
+    pub fn document_url(&self) -> String {
+        self.base_url.lock().map(|b| b.clone()).unwrap_or_default()
     }
 
     /// Кодировка, объявленная заголовком `Content-Type` ответа на документ
@@ -2917,13 +2933,23 @@ impl BrowserContext {
             // What it posted home, and whether it hung up: `close()` inside a
             // worker ends it, and a context nobody will ever pump again should
             // not stay on the isolate.
-            let out = self
+            // The fetches above were awaited, and the page may have ended the
+            // worker meanwhile — the same end of a worker as above, not a
+            // failed navigation.
+            let out = match self
                 .eval_at(
                     place,
                     child,
                     "__ptJSON.stringify({out: __pt_drainWorkerOut(), closed: !!globalThis.__ptClosed})",
                 )
-                .await?;
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(worker = id, error = %e, "worker gone after its fetches");
+                    continue;
+                }
+            };
             let drained: Value = out
                 .as_str()
                 .and_then(|t| serde_json::from_str(t).ok())

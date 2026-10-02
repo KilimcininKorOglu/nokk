@@ -19,6 +19,12 @@ export interface LaunchOptions {
   allowTrackers?: boolean;
   /** Chrome major version to emulate (TLS + JS together), e.g. 148. */
   chromeVersion?: number;
+  /**
+   * Solve Cloudflare challenges (interstitial or Turnstile widget) on every
+   * navigation before it reports the load. `true` = 30 s budget; a number =
+   * seconds. A browser context created with `autoSolve: false` opts out.
+   */
+  autoSolve?: boolean | number;
   /** Extra raw CLI arguments passed to the binary. */
   args?: string[];
   /** Extra environment variables for the server process. */
@@ -45,3 +51,56 @@ export declare function launch(options?: LaunchOptions): Promise<NokkServer>;
 
 /** Absolute path to the bundled `nokk` binary (override with NOKK_BINARY). */
 export declare function binaryPath(): string;
+
+/** The gate a page shows. Only the Cloudflare kinds are solvable. */
+export type ChallengeKind =
+  | "none"
+  | "cloudflare-interstitial"
+  | "turnstile-widget"
+  | "datadome";
+
+export type ChallengeStatus = "cleared" | "token-issued" | "cleared-but-stuck" | "timeout";
+
+export interface ChallengeState {
+  kind: ChallengeKind;
+  title: string;
+  url: string;
+  /** A `cf_clearance` cookie is in the jar for this site. */
+  cleared: boolean;
+  /** A Turnstile widget on the page has issued its token. */
+  token: boolean;
+  solvable: boolean;
+}
+
+export interface ChallengeOutcome {
+  status: ChallengeStatus;
+  /** `status` is "cleared" or "token-issued". */
+  solved: boolean;
+  /** Checkbox presses it took (0 for a non-interactive challenge). */
+  presses: number;
+  elapsedMs: number;
+  /** The gate still on the page afterwards ("none" when through). */
+  remaining: ChallengeKind;
+  title: string;
+  url: string;
+  cleared: boolean;
+  token: boolean;
+}
+
+/** Anything the helpers can reach a page's CDP session through. */
+export type PageLike =
+  | { createCDPSession(): Promise<{ send(method: string, params?: object): Promise<any> }> }
+  | { context(): { newCDPSession(page: any): Promise<{ send(method: string, params?: object): Promise<any> }> } }
+  | { send(method: string, params?: object): Promise<any> };
+
+/**
+ * Solve the challenge the page shows now, pressing its checkbox if it puts
+ * one up. Accepts a Puppeteer Page, a Playwright Page or a raw CDP session.
+ */
+export declare function solveChallenge(
+  page: PageLike,
+  options?: { /** Budget in ms (default: the server's, else 30000). */ timeout?: number }
+): Promise<ChallengeOutcome>;
+
+/** What gate the page shows right now. */
+export declare function challengeState(page: PageLike): Promise<ChallengeState>;
