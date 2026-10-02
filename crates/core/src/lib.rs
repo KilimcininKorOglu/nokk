@@ -729,9 +729,12 @@ impl Engine {
             engine: self.inner.clone(),
             client,
             worker,
-            index,
+            index: std::sync::atomic::AtomicUsize::new(index),
             base_url: std::sync::Mutex::new("about:blank".to_string()),
             doc_seq: std::sync::atomic::AtomicU64::new(0),
+            carry: std::sync::Mutex::new(HashMap::new()),
+            nav_started: std::sync::Mutex::new(None),
+            loading: std::sync::atomic::AtomicUsize::new(0),
             requests: std::sync::Mutex::new(Vec::new()),
             started: std::time::Instant::now(),
             timings_sent: std::sync::Mutex::new(HashMap::new()),
@@ -881,7 +884,9 @@ pub struct BrowserContext {
     /// [`Engine::new_context_with_proxy`], else the engine default.
     client: Client,
     worker: WorkerId,
-    index: usize,
+    /// The page's context on its isolate. A new document gets a new context
+    /// (see `load_html`), so this changes with every navigation.
+    index: std::sync::atomic::AtomicUsize,
     /// Document URL of the last `load_html`/`navigate`, used to resolve relative
     /// `fetch`/`XHR` URLs. `about:blank` until the first navigation.
     base_url: std::sync::Mutex<String>,
@@ -889,6 +894,19 @@ pub struct BrowserContext {
     /// navigation itself — a form the page submitted, a challenge that moved on,
     /// a link a script followed — learns of the new document by this changing.
     doc_seq: std::sync::atomic::AtomicU64,
+    /// What outlives a document but not the tab, carried from one document's
+    /// context to the next: per origin its `localStorage`, `sessionStorage` and
+    /// IndexedDB (`{local, session, idb}`), and under `""` the tab's history
+    /// length. Taken out of the outgoing context by `__pt_carryOut`, handed to the
+    /// incoming one by `__pt_carryIn` before its first script.
+    carry: std::sync::Mutex<HashMap<String, Value>>,
+    /// When the navigation in flight started: a document's clock starts there,
+    /// not when its context was built after the response arrived.
+    nav_started: std::sync::Mutex<Option<std::time::Instant>>,
+    /// How many top-level documents are being loaded right now. The address
+    /// changes when a load starts, the document count when it ends; in between
+    /// the page is neither the old document nor yet the new one.
+    loading: std::sync::atomic::AtomicUsize,
     /// Every network request the engine made for this context, in order — the
     /// built-in interception log (document + external scripts + page fetch/XHR).
     requests: std::sync::Mutex<Vec<NetworkRecord>>,
@@ -1038,7 +1056,7 @@ impl Drop for BrowserContext {
         // The page's frames and workers are contexts on the same isolate, and
         // nothing else will ever reach them once the page is gone — a page that
         // opened either would otherwise leak them on every close.
-        let mut indices = vec![self.index];
+        let mut indices = vec![self.idx()];
         if let Ok(frames) = self.frames.lock() {
             indices.extend(frames.values().map(|s| s.index));
         }
@@ -1175,14 +1193,19 @@ impl BrowserContext {
 
     /// The context's index within its isolate.
     pub fn index(&self) -> usize {
-        self.index
+        self.idx()
+    }
+
+    /// The current document's context index.
+    fn idx(&self) -> usize {
+        self.index.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Evaluate JavaScript in this context and return the result stringified.
     /// The call is dispatched onto the owning isolate thread, so V8 state is
     /// only ever touched from its home thread.
     pub async fn evaluate(&self, script: &str) -> Result<Value, EngineError> {
-        let index = self.index;
+        let index = self.idx();
         let source = script.to_string();
         let result = self
             .engine
@@ -1234,6 +1257,9 @@ impl BrowserContext {
                 .load_html("about:blank", "<html><head></head><body></body></html>")
                 .await;
         }
+        if let Ok(mut n) = self.nav_started.lock() {
+            *n = Some(std::time::Instant::now());
+        }
         let mut current = url.to_string();
         let mut post = post;
         for _ in 0..MAX_META_HOPS {
@@ -1276,7 +1302,7 @@ impl BrowserContext {
 
     /// Evaluate in one of this context's *sibling* V8 contexts on the same worker
     /// — an iframe's document lives in one of these (see [`Self::frames`]). The
-    /// page's own context is [`Self::index`], so `eval_in(self.index, …)` is
+    /// page's own context is [`Self::index`], so `eval_in(self.idx(), …)` is
     /// exactly [`Self::evaluate`].
     async fn eval_in(&self, index: usize, source: &str) -> Result<Value, EngineError> {
         let (worker, raw) = self.route(index);
@@ -1343,18 +1369,128 @@ impl BrowserContext {
     /// `src`s. Page scripts that throw are logged and skipped — a broken page
     /// script must not fail the load, matching browser behaviour.
     pub async fn load_html(&self, base_url: &str, html: &str) -> Result<(), EngineError> {
+        self.loading.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let r = self.load_html_now(base_url, html).await;
+        self.loading.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        r
+    }
+
+    /// Whether a top-level document is being loaded right now.
+    pub fn is_loading(&self) -> bool {
+        self.loading.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+
+    async fn load_html_now(&self, base_url: &str, html: &str) -> Result<(), EngineError> {
         // The outgoing document takes its workers with it.
         self.terminate_workers_of(None).await;
+        // And its realm: a browser gives every document a fresh global, so
+        // nothing the last page left on `window` (its `var`s, its patches to
+        // built-ins) is visible to the next. Only the first document reuses
+        // the context the page was created with, which nothing has run in yet.
+        if self.doc_seq.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            self.fresh_realm().await?;
+        }
         if let Ok(mut b) = self.base_url.lock() {
             *b = base_url.to_string();
         }
-        self.load_html_into(self.index, base_url, html).await?;
+        self.carry_in(base_url).await;
+        self.load_html_into(self.idx(), base_url, html).await?;
         self.doc_seq.fetch_add(1, std::sync::atomic::Ordering::Release);
         // Timers and async continuations scheduled during load (and by the load
         // handlers) get their turn now — with the load-time patience for delays
         // the page actually asked for.
         self.run_event_loop_for_load().await?;
         Ok(())
+    }
+
+    /// Swap the page's context for a new one built from the same bootstrap:
+    /// first take out what outlives a document (`carry`), end the outgoing
+    /// document's frames, then dispose its context.
+    async fn fresh_realm(&self) -> Result<(), EngineError> {
+        let old = self.idx();
+        let out = self
+            .eval_in(old, "typeof __pt_carryOut === 'function' ? __pt_carryOut() : ''")
+            .await
+            .ok()
+            .and_then(|v| v.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()));
+        if let Some(out) = out {
+            let origin = origin_of(&self.document_url());
+            if let Ok(mut c) = self.carry.lock() {
+                if !origin.is_empty() {
+                    c.insert(
+                        origin,
+                        serde_json::json!({ "storage": out["storage"], "idb": out["idb"] }),
+                    );
+                }
+                if out["hist"].is_number() {
+                    c.insert(String::new(), out["hist"].clone());
+                }
+            }
+        }
+        // The outgoing document's frames end with it.
+        let frames: Vec<FrameState> = self
+            .frames
+            .lock()
+            .map(|mut f| f.drain().map(|(_, s)| s).collect())
+            .unwrap_or_default();
+        for f in frames {
+            self.terminate_workers_of(Some(f.index)).await;
+            let (w, raw) = self.route(f.index);
+            let _ = self
+                .engine
+                .pool
+                .dispatch(w, move |iso| iso.dispose_context(raw))
+                .await;
+        }
+        let boot = self.bootstrap.clone();
+        let fresh = self
+            .engine
+            .pool
+            .dispatch(self.worker, move |iso| iso.create_context(&boot))
+            .await?
+            .map_err(EngineError::Js)?;
+        self.index.store(fresh, std::sync::atomic::Ordering::Release);
+        // Its clock runs from the start of the navigation, as a frame's does.
+        let started = self.nav_started.lock().ok().and_then(|mut n| n.take());
+        if let Some(t) = started {
+            let ago = t.elapsed().as_secs_f64() * 1000.0;
+            let _ = self
+                .eval_in(fresh, &format!("globalThis.__pt_shiftOrigin && __pt_shiftOrigin({ago:.3});"))
+                .await;
+        }
+        let _ = self
+            .engine
+            .pool
+            .dispatch(self.worker, move |iso| iso.dispose_context(old))
+            .await;
+        if let Ok(mut t) = self.timings_sent.lock() {
+            t.remove(&old);
+        }
+        if let Ok(mut n) = self.nav_sent.lock() {
+            n.remove(&old);
+        }
+        tracing::debug!(old, fresh, "new document, new realm");
+        Ok(())
+    }
+
+    /// Hand the incoming document what its origin and its tab kept.
+    async fn carry_in(&self, base_url: &str) {
+        let v = {
+            let Ok(c) = self.carry.lock() else { return };
+            let mut v = c.get(&origin_of(base_url)).cloned().unwrap_or_else(|| serde_json::json!({}));
+            if let Some(h) = c.get("") {
+                v["hist"] = h.clone();
+            }
+            v
+        };
+        if v.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            return;
+        }
+        let js = format!(
+            "typeof __pt_carryIn === 'function' && __pt_carryIn({})",
+            js_str(&v.to_string())
+        );
+        let _ = self.eval_in(self.idx(), &js).await;
     }
 
     /// The number of documents this page has loaded so far (see `doc_seq`).
@@ -1408,7 +1544,7 @@ impl BrowserContext {
         // Then the client's own "on new document" scripts, still before the
         // document exists — a frame gets its set from `apply_frame_ops`, the page
         // gets its own here. After the page's scripts would be too late to matter.
-        if index == self.index {
+        if index == self.idx() {
             let init = self
                 .init_scripts
                 .lock()
@@ -1469,7 +1605,7 @@ impl BrowserContext {
         // виджета проходила секунда против двухсот-трёхсот миллисекунд у
         // Chrome, и это число уходит в тело первого POST.
         let mut preload: HashMap<String, Preloaded> = HashMap::new();
-        if index == self.index && std::env::var_os("NOKK_NO_PRELOAD").is_none() {
+        if index == self.idx() && std::env::var_os("NOKK_NO_PRELOAD").is_none() {
             for script in &page.scripts {
                 let (nokk_dom::Script::External(src) | nokk_dom::Script::ExternalModule(src)) = script else {
                     continue;
@@ -1496,7 +1632,7 @@ impl BrowserContext {
             // Ход кадрам перед каждым скриптом документа, каким бы он ни был.
             // Страница вроде chess.com грузит их десятками — и модулями тоже,
             // а модуль уходит из этого цикла раньше, чем доходит до конца.
-            if index == self.index {
+            if index == self.idx() {
                 self.frames_take_a_turn().await;
                 self.wait_for_blocking_sheets(index).await;
             }
@@ -1601,7 +1737,7 @@ impl BrowserContext {
             let _ = self
                 .eval_in(index, &format!("__pt_beginScript({idx})"))
                 .await;
-            let ran = if index == self.index {
+            let ran = if index == self.idx() {
                 self.with_frames_live(self.eval_named_in(index, &code, &whose)).await
             } else {
                 self.eval_named_in(index, &code, &whose).await
@@ -1623,7 +1759,7 @@ impl BrowserContext {
         // обязана увидеть уже полный список. Только своя страница: журнал
         // запросов один на контекст, и отдать его фрейму — значит и фрейму
         // солгать, и странице ничего не оставить.
-        if index == self.index {
+        if index == self.idx() {
             self.flush_resource_timings(index).await;
         }
         self.eval_in(index, "__pt_finishLoad();").await?;
@@ -1680,7 +1816,7 @@ impl BrowserContext {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(3_000);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
-        let index = self.index;
+        let index = self.idx();
         let base = self.base_url.lock().map(|b| b.clone()).unwrap_or_default();
 
         let mut total_timers = 0u32;
@@ -1702,7 +1838,7 @@ impl BrowserContext {
             //    into the config it posts to the widget — and flushing after the
             //    round meant the entry appeared one round too late: the key was
             //    simply absent from the message, where a browser always has it.
-            if index == self.index {
+            if index == self.idx() {
                 self.flush_resource_timings(index).await;
             }
 
@@ -1776,7 +1912,7 @@ impl BrowserContext {
             //    exists. The caller's next pump drives the new one.
             if let Some(op) = nav_ops.last() {
                 if let Some(url) = op["url"].as_str() {
-                    if index == self.index {
+                    if index == self.idx() {
                         let to = url.to_string();
                         let via = op["via"].as_str().unwrap_or("");
                         tracing::debug!(url = %to, via, method = op["method"].as_str().unwrap_or("GET"), body_len = op["body"].as_str().map(|b| b.len()).unwrap_or(0), "page navigated itself");
@@ -1797,7 +1933,7 @@ impl BrowserContext {
                 }
             }
 
-            if index == self.index {
+            if index == self.idx() {
                 self.flush_resource_timings(index).await;
             }
 
@@ -2008,7 +2144,12 @@ impl BrowserContext {
     /// Whether this page is holding any socket open. The event loop treats that
     /// as "not finished" and the CDP server as "keep pumping".
     pub async fn has_open_sockets(&self) -> bool {
-        !self.sockets.lock().await.open.is_empty()
+        // Held means the page's loop is working its sockets right now: that is
+        // a yes, and waiting for it would stall whoever asked (the cdp tick).
+        match self.sockets.try_lock() {
+            Ok(s) => !s.open.is_empty(),
+            Err(_) => true,
+        }
     }
 
     /// Register a script to run in every frame this page opens from now on,
@@ -2154,7 +2295,7 @@ impl BrowserContext {
         // Документ кадра браузер показывает дважды: у родителя это ресурс с
         // `initiatorType: "iframe"`, а внутри самого кадра — его навигация.
         // Запись о нём одна, поэтому кадру она отдаётся отдельно, первой.
-        let nav_due = index != self.index
+        let nav_due = index != self.idx()
             && self
                 .nav_sent
                 .lock()
@@ -2251,7 +2392,7 @@ impl BrowserContext {
         // Времена записей — по часам страницы; у кадра свои часы (его
         // timeOrigin позже), поэтому кадру передаём начало часов страницы в
         // миллисекундах эпохи, и запись переводится на его время.
-        let page_epoch = if index != self.index {
+        let page_epoch = if index != self.idx() {
             let since = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs_f64() * 1000.0)
@@ -2408,6 +2549,12 @@ impl BrowserContext {
                 tokio::time::sleep(std::time::Duration::from_micros(500)).await;
             }
         };
+        // A challenge that moved on is loading the page behind it: hand that
+        // page over whole, not the moment its address changed.
+        let settle = std::time::Instant::now();
+        while self.is_loading() && settle.elapsed() < std::time::Duration::from_secs(15) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         ChallengeOutcome { status, presses: pressed, elapsed_ms: t.elapsed().as_millis() as u64 }
     }
 
@@ -3238,7 +3385,7 @@ impl BrowserContext {
                     );
                     // Элемент мог получить размер уже после вставки (стили
                     // разбираются позже) — спрашиваем родителя ещё раз, сейчас.
-                    let raw = self.eval_in(self.index, &format!("__pt_frameBox({id})")).await;
+                    let raw = self.eval_in(self.idx(), &format!("__pt_frameBox({id})")).await;
                     tracing::debug!(?raw, "frame box from parent");
                     if let Ok(Value::String(box_)) = raw {
                         if let Ok(v) = serde_json::from_str::<Vec<f64>>(&box_) {
@@ -3325,7 +3472,7 @@ impl BrowserContext {
                     let target = self.frames.lock().ok().and_then(|f| f.get(&id).cloned());
                     let Some(frame) = target else { continue };
                     let (index, origin) = if to_parent {
-                        (self.index, frame.origin.clone())
+                        (self.idx(), frame.origin.clone())
                     } else {
                         (frame.index, origin_of(base))
                     };
@@ -3438,7 +3585,7 @@ impl BrowserContext {
             .pool
             .dispatch(mw, move |iso| iso.eval_module(i, &u));
         let run = async move { run.await };
-        let out = if index == self.index { self.with_frames_live(run).await } else { run.await };
+        let out = if index == self.idx() { self.with_frames_live(run).await } else { run.await };
         out?.map_err(EngineError::Js)
     }
 
@@ -3570,7 +3717,7 @@ impl BrowserContext {
                     // Скрипт читает тайминг собственного <script> первой же
                     // строкой — запись должна быть на месте до того, как он
                     // начнёт, а не в конце круга.
-                    if index == self.index {
+                    if index == self.idx() {
                         self.flush_resource_timings(index).await;
                     }
                     if op["module"].as_bool().unwrap_or(false) {
@@ -3769,7 +3916,7 @@ impl BrowserContext {
             // и элемент может измениться. Браузер в этом случае меняет окно
             // кадра — делаем то же, пока размер не устоится.
             let boxed = if full {
-                self.eval_in(self.index, &format!("__pt_frameBox({id})")).await
+                self.eval_in(self.idx(), &format!("__pt_frameBox({id})")).await
             } else {
                 Ok(Value::Null)
             };
@@ -4274,7 +4421,7 @@ impl BrowserContext {
         resource_type: &str,
         referrer: Option<&str>,
     ) -> Result<(String, String), EngineError> {
-        self.fetch_text_at(self.index, url, resource_type, referrer).await
+        self.fetch_text_at(self.idx(), url, resource_type, referrer).await
     }
 
     /// Документ по POST: запрос документа с телом формы.
@@ -4291,7 +4438,7 @@ impl BrowserContext {
         req.headers.insert("Content-Type".to_string(), content_type.to_string());
         let started = std::time::Instant::now();
         let sent = self.client.send(req).await;
-        self.finish_text(self.index, url, "document", started, sent)
+        self.finish_text(self.idx(), url, "document", started, sent)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4317,7 +4464,7 @@ impl BrowserContext {
     ) -> Result<(String, String), EngineError> {
         match pre {
             Some((started, handle)) => match handle.await {
-                Ok(sent) => self.finish_text(self.index, url, "script", started, sent),
+                Ok(sent) => self.finish_text(self.idx(), url, "script", started, sent),
                 Err(_) => self.fetch_text(url, "script").await,
             },
             None => self.fetch_text(url, "script").await,
@@ -4429,7 +4576,7 @@ impl BrowserContext {
 
     /// Append a request to this context's interception log.
     fn record(&self, method: &str, url: &str, resource_type: &str, status: u16, body: &[u8]) {
-        self.record_in(self.index, method, url, resource_type, status, body)
+        self.record_in(self.idx(), method, url, resource_type, status, body)
     }
 
     /// То же, но от имени кадра или воркера, который этот запрос заказал.
@@ -5022,6 +5169,48 @@ mod tests {
     /// двоичными, `Map` остаётся `Map`, дата — датой. Мы возим их через JSON,
     /// и всё это по дороге превращается в что-то другое — а код на той стороне
     /// ждёт своего типа.
+    /// Every document gets its own global: what one page left on `window` or
+    /// patched into a built-in is gone on the next. What outlives a document —
+    /// its origin's storage, the tab's history length — comes along, and only
+    /// to a document of the same origin.
+    #[tokio::test]
+    async fn a_new_document_gets_a_fresh_global_but_keeps_its_storage() {
+        let _serial = serial().await;
+        let engine = engine(4, 6);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://a.example/", "<html><body></body></html>")
+            .await
+            .unwrap();
+        ctx.evaluate(
+            "var leaked = 1; Array.prototype.patched = 1; \
+             localStorage.setItem('k', 'v'); sessionStorage.setItem('s', 'w'); \
+             history.pushState({}, '', '#x');",
+        )
+        .await
+        .unwrap();
+
+        ctx.load_html("https://a.example/next", "<html><body></body></html>")
+            .await
+            .unwrap();
+        let same = ctx
+            .evaluate(
+                "JSON.stringify([typeof leaked, [].patched === undefined, \
+                 localStorage.getItem('k'), sessionStorage.getItem('s'), history.length])",
+            )
+            .await
+            .unwrap();
+        assert_eq!(same, Value::String(r#"["undefined",true,"v","w",3]"#.into()));
+
+        ctx.load_html("https://b.example/", "<html><body></body></html>")
+            .await
+            .unwrap();
+        let other = ctx
+            .evaluate("JSON.stringify([localStorage.getItem('k'), sessionStorage.getItem('s')])")
+            .await
+            .unwrap();
+        assert_eq!(other, Value::String("[null,null]".into()));
+    }
+
     #[tokio::test]
     async fn a_message_to_a_worker_keeps_its_shape() {
         let _serial = serial().await;

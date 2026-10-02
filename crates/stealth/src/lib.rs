@@ -860,6 +860,12 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   // при успехе адрес документа меняется без перехода.
   // Вкладка, открытая человеком, уже прошла новую вкладку: у Chrome длина 2.
   const hist = { length: 2, scrollRestoration: 'auto', state: null };
+  // Длина истории — у вкладки, не у документа: новый документ получает её от
+  // прежнего (`__pt_carryOut`/`__pt_carryIn`, движок переносит при переходе).
+  (globalThis.__pt_carryParts || (globalThis.__pt_carryParts = {})).hist = {
+    out: () => hist.length,
+    in: (n) => { if (typeof n === 'number' && n > 0) hist.length = n; },
+  };
   accessor(HistoryProto, 'length', () => hist.length);
   accessor(HistoryProto, 'scrollRestoration', () => hist.scrollRestoration, (v) => {
     const s = String(v);
@@ -8366,6 +8372,22 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   // for storage at all, and `undefined` is the loudest possible answer.
   if (!globalThis.indexedDB) {
     const __idbData = new Map();   // dbName -> { version, stores: Map<name, Map> }
+    // Базы живут у origin, а не у документа: при переходе движок забирает их
+    // у уходящего документа и отдаёт следующему того же origin. Значения — через
+    // JSON: строки, числа и простые объекты переезжают как есть.
+    (globalThis.__pt_carryParts || (globalThis.__pt_carryParts = {})).idb = {
+      out: () => [...__idbData].map(([name, e]) => [name, e.version,
+        [...e.stores].map(([sn, m]) => [sn, [...m].filter(([, v]) => {
+          try { __ptJSON.stringify(v); return true; } catch (x) { return false; }
+        })])]),
+      in: (dbs) => {
+        if (!Array.isArray(dbs)) return;
+        for (const [name, version, stores] of dbs) {
+          __idbData.set(String(name), { version: version | 0,
+            stores: new Map((stores || []).map(([sn, rows]) => [String(sn), new Map(rows || [])])) });
+        }
+      },
+    };
     const req = (run) => {
       const r = { readyState: 'pending', result: undefined, error: null,
         onsuccess: null, onerror: null, onupgradeneeded: null, onblocked: null,
@@ -12500,6 +12522,29 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   };
   if (!globalThis.localStorage) globalThis.localStorage = makeStorage();
   if (!globalThis.sessionStorage) globalThis.sessionStorage = makeStorage();
+  {
+    // Хранилища — у origin (localStorage) и у вкладки с origin (sessionStorage),
+    // а контекст у каждого документа свой: движок забирает их при уходе со
+    // страницы и отдаёт следующему документу того же origin.
+    const local = StorageData.get(globalThis.localStorage), session = StorageData.get(globalThis.sessionStorage);
+    const fill = (m, o) => { if (m && o && typeof o === 'object') for (const k of Object.keys(o)) m.set(k, String(o[k])); };
+    (globalThis.__pt_carryParts || (globalThis.__pt_carryParts = {})).storage = {
+      out: () => ({ local: local ? Object.fromEntries(local) : {}, session: session ? Object.fromEntries(session) : {} }),
+      in: (v) => { if (v) { fill(local, v.local); fill(session, v.session); } },
+    };
+    const parts = globalThis.__pt_carryParts;
+    // Что уходящий документ передаёт следующему: строка JSON для движка.
+    globalThis.__pt_carryOut = () => {
+      const out = {};
+      for (const k of Object.keys(parts)) { try { out[k] = parts[k].out(); } catch (e) {} }
+      return __ptJSON.stringify(out);
+    };
+    // До первого скрипта нового документа: что движок сохранил для его origin.
+    globalThis.__pt_carryIn = (json) => {
+      let v; try { v = __ptJSON.parse(json); } catch (e) { return; }
+      for (const k of Object.keys(parts)) { try { if (k in v) parts[k].in(v[k]); } catch (e) {} }
+    };
+  }
 
   // Не `||`: таблица имён уже положила сюда пустую функцию, и настоящая
   // реализация до глобали не доезжала — `observe()` молча не звал колбэк

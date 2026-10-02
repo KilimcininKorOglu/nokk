@@ -6690,7 +6690,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       try { return { type: t === 'function' ? 'object' : t, value: __ptJSON.parse(__ptJSON.stringify(v)) }; }
       catch (e) { return { type: 'object', value: null }; }
     }
-    const id = 'obj-' + (__ptSeq++);
+    // The context's own index in the id: a handle outlives the document it
+    // came from, and the next document's registry must not answer for it.
+    const id = 'obj-' + (globalThis.__pt_ctxIndex | 0) + '.' + (__ptSeq++);
     __ptObjs.set(id, v);
     if (t === 'function') return { type: 'function', objectId: id, className: 'Function', description: (v.name ? 'function ' + v.name : 'function') + '() { [native code] }' };
     let subtype, className = (v.constructor && v.constructor.name) || 'Object', description = className;

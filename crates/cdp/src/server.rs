@@ -462,6 +462,26 @@ impl Conn {
     /// loop; pages with neither cost one atomic read.
     async fn pump_live_pages(&mut self, tx: &UnboundedSender<Message>) {
         for t in &mut self.targets {
+            // A document the page moved to by itself: announce it before its frames,
+            // and before anything below that may wait on a lock the page holds.
+            if !t.navigating.load(Ordering::Acquire) {
+                let seq = t.ctx.document_seq();
+                if seq != t.announced_seq.load(Ordering::Acquire) {
+                    tracing::debug!(seq, url = %t.ctx.document_url(), "announcing a document the page moved to");
+                    for m in announce_document(t) {
+                        let _ = tx.send(Message::Text(m.to_string()));
+                    }
+                    t.announced_seq.store(seq, Ordering::Release);
+                } else if t.url != "about:blank" || seq > 1 {
+                    // `Page.navigate` keeps what was asked for; the frame tree
+                    // and target info should show where the page landed.
+                    let landed = t.ctx.document_url();
+                    if !landed.is_empty() && t.url != landed {
+                        t.url = landed;
+                    }
+                }
+            }
+
             // A page whose timer has come due is doing something, even with no
             // socket and no frame: delays are real now, so an interval only ticks
             // while someone drives the loop. Asking the context costs an atomic
@@ -478,24 +498,6 @@ impl Conn {
                     let _ = ctx.run_event_loop().await;
                     pumping.store(false, Ordering::Relaxed);
                 });
-            }
-
-            // A document the page moved to by itself: announce it before its frames.
-            if !t.navigating.load(Ordering::Acquire) {
-                let seq = t.ctx.document_seq();
-                if seq != t.announced_seq.load(Ordering::Acquire) {
-                    for m in announce_document(t) {
-                        let _ = tx.send(Message::Text(m.to_string()));
-                    }
-                    t.announced_seq.store(seq, Ordering::Release);
-                } else if t.url != "about:blank" || seq > 1 {
-                    // `Page.navigate` keeps what was asked for; the frame tree
-                    // and target info should show where the page landed.
-                    let landed = t.ctx.document_url();
-                    if !landed.is_empty() && t.url != landed {
-                        t.url = landed;
-                    }
-                }
             }
 
             // Announce frames as they appear and disappear. Without this a client
@@ -1190,16 +1192,16 @@ impl Conn {
                 let announced = self.targets[idx].announced_seq.clone();
                 tokio::spawn(async move {
                     let outcome = ctx.solve_challenge(budget).await;
-                    let after = ctx.challenge_state().await;
                     // A challenge that cleared moved the page to a new document;
                     // let the tick announce it before the reply, so a client acting
                     // on the reply already sees that document.
-                    for _ in 0..40 {
-                        if announced.load(Ordering::Acquire) == ctx.document_seq() {
+                    for _ in 0..200 {
+                        if !ctx.is_loading() && announced.load(Ordering::Acquire) == ctx.document_seq() {
                             break;
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                     }
+                    let after = ctx.challenge_state().await;
                     let m = ok(id, &session, json!({
                         "status": outcome.status.as_str(),
                         "solved": outcome.status.is_success(),
@@ -1456,6 +1458,22 @@ impl Conn {
                     .get("executionContextId")
                     .and_then(|v| v.as_i64())
                     .and_then(frame_of_ctx_id);
+                // A handle from a document the page has since left: Chrome's
+                // answer, which clients take as "re-resolve", not a value.
+                if frame.is_none() {
+                    let mut ids = params.get("objectId").and_then(|v| v.as_str()).into_iter().chain(
+                        params
+                            .get("arguments")
+                            .and_then(|v| v.as_array())
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|o| o.get("objectId").and_then(|v| v.as_str())),
+                    );
+                    let page = self.targets[idx].ctx.index();
+                    if ids.any(|oid| object_is_stale(oid, page)) {
+                        return vec![err(id, &session, -32000, "Could not find object with given id")];
+                    }
+                }
                 let (ctx, session, tx) =
                     (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 // Whatever this evaluate queued (a fetch, a socket) gets pumped by
@@ -2049,6 +2067,16 @@ fn announce_document(t: &mut Target) -> Vec<Value> {
     out.push(ev("Page.loadEventFired", json!({ "timestamp": 0.0 })));
     out.push(ev("Page.frameStoppedLoading", json!({ "frameId": target_id })));
     out
+}
+
+/// Whether a remote object id (`obj-<context>.<n>`) belongs to a context other
+/// than the page's current one — a document the page has left.
+fn object_is_stale(oid: &str, page_ctx: usize) -> bool {
+    oid.strip_prefix("obj-")
+        .and_then(|r| r.split_once('.'))
+        .and_then(|(c, _)| c.parse::<usize>().ok())
+        .map(|c| c != page_ctx)
+        .unwrap_or(false)
 }
 
 /// The frame behind an execution context id, if it names one.
