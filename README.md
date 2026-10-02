@@ -40,10 +40,13 @@ the ground up, and skip the rendering engine entirely.**
   (`navigator`, `screen`, canvas/WebGL/audio, `window.chrome`) is spoofed from the *same*
   profile — so the wire fingerprint and the JS one agree (UA, platform, versions all line
   up). Closing the remaining JS-level tells is active work; see the [roadmap](ROADMAP.md).
-- ⚡ **Lightweight by construction.** No Chromium, no compositor, no rendering — just V8
-  and a DOM. Measured on an 8-core Linux box: **~4 ms** engine start, **~20 MB** idle, and
-  **~0.5 MB per context** (contexts share an isolate) — 100 live contexts fit in ~65 MB,
-  versus 30–50 MB for a *single* real Chrome tab.
+- ⚡ **No Chromium.** No browser process tree, no compositor — V8 and a DOM in one
+  binary. Measured on an 8-core Linux box (October 2026): **~0.2 s** cold start (the V8
+  snapshot is cached in `~/.cache/nokk` after the first run), **~115 MB** idle with the
+  default 8 isolate threads (**~65 MB** with `--workers 1`), and **~9 MB per page
+  context** — the Chrome-shaped window every page gets is not small. Clearing a Cloudflare
+  interstitial peaks at **~0.6 GB** with `--workers 1` and **~1.05 GB** with 8 threads:
+  the challenge itself opens dozens of frames, sandboxes and workers, each a context.
 - 🧩 **Drop-in for Puppeteer.** nokk speaks CDP over WebSocket. Point
   `puppeteer.connect()` at it and drive pages, navigate, and `evaluate()` as usual.
 - 🔬 **Real JS, real DOM.** Google's V8 runs page scripts against an HTML-parsed DOM,
@@ -54,8 +57,8 @@ the ground up, and skip the rendering engine entirely.**
   a site's internal JSON API needs no proxy plumbing.
 - 🚀 **Built around concurrency.** The core is a pool of V8 isolates (one per thread,
   each multiplexing several contexts) with semaphore backpressure on live contexts, so
-  memory stays bounded. At ~0.5 MB/context the memory headroom for hundreds of contexts is
-  real; hardening *sustained* thousand-context churn is still on the [roadmap](ROADMAP.md).
+  memory stays bounded (`--max-contexts`). Cutting the per-context cost further and
+  hardening *sustained* thousand-context churn are on the [roadmap](ROADMAP.md).
 
 > **Keywords:** undetectable headless browser · anti-bot bypass · Cloudflare bypass ·
 > JA3/JA4 TLS fingerprint · browser fingerprint spoofing · stealth web scraping ·

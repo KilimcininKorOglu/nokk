@@ -173,6 +173,21 @@ pub fn build_snapshot(bootstrap: &str) -> Result<usize, String> {
         }
         Err(_) => bootstrap,
     };
+    // Снимок зависит только от загрузчика, флагов V8 и самого бинарника — и
+    // собирается 700+ мс. Процесс, запускаемый на каждый сайт, платил их каждый
+    // раз; теперь готовый снимок лежит на диске и читается за миллисекунды.
+    let cache = snapshot_cache_path(bootstrap);
+    if let Some(path) = &cache {
+        if let Ok(bytes) = std::fs::read(path) {
+            if bytes.len() > 1024 {
+                let data: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+                let size = data.len();
+                let _ = SNAPSHOT.set(Snapshot { bootstrap: bootstrap.to_string(), data });
+                tracing::info!(bytes = size, ms = t0.elapsed().as_millis() as u64, path = %path.display(), "v8 snapshot loaded from cache");
+                return Ok(size);
+            }
+        }
+    }
     let blob = {
         let _guard = CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut iso = v8::Isolate::snapshot_creator(Some(refs), None);
@@ -213,7 +228,41 @@ pub fn build_snapshot(bootstrap: &str) -> Result<usize, String> {
     let size = data.len();
     let _ = SNAPSHOT.set(Snapshot { bootstrap: bootstrap.to_string(), data });
     tracing::info!(bytes = size, ms = t0.elapsed().as_millis() as u64, "v8 snapshot built");
+    if let Some(path) = cache {
+        // Атомарно: соседний процесс, стартующий в тот же миг, прочтёт или
+        // целый файл, или никакого.
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        if path.parent().map(std::fs::create_dir_all).is_some()
+            && std::fs::write(&tmp, data).is_ok()
+        {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
     Ok(size)
+}
+
+/// Где лежит снимок для этого загрузчика: `$NOKK_CACHE_DIR`, иначе
+/// `$XDG_CACHE_HOME/nokk`, иначе `~/.cache/nokk`. Имя — хэш загрузчика, флагов
+/// V8 и бинарника (размер и время изменения: пересобранный движок снимок
+/// старого не прочтёт). `NOKK_NO_SNAPSHOT_CACHE=1` — без диска.
+fn snapshot_cache_path(bootstrap: &str) -> Option<std::path::PathBuf> {
+    use sha2::{Digest, Sha256};
+    if std::env::var_os("NOKK_NO_SNAPSHOT_CACHE").is_some() {
+        return None;
+    }
+    let dir = std::env::var_os("NOKK_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_CACHE_HOME").map(|d| std::path::PathBuf::from(d).join("nokk")))
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache").join("nokk")))?;
+    let exe = std::env::current_exe().ok()?;
+    let meta = std::fs::metadata(&exe).ok()?;
+    let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    let mut h = Sha256::new();
+    h.update(bootstrap.as_bytes());
+    h.update(std::env::var("NOKK_V8_FLAGS").unwrap_or_default().as_bytes());
+    h.update(format!("{}|{}|{}", exe.display(), meta.len(), mtime).as_bytes());
+    let hex: String = h.finalize().iter().take(12).map(|b| format!("{b:02x}")).collect();
+    Some(dir.join(format!("snapshot-{hex}.bin")))
 }
 
 /// Контекст из снимка (если загрузчик тот же) — уже с нативами и загрузчиком.
@@ -689,6 +738,16 @@ impl Isolate {
             global
         };
         self.contexts.push(Some(global));
+        // Отладка памяти: NOKK_HEAP_SNAPSHOT_AT=<n> — снимок кучи изолята в
+        // файл `nokk-heap-<n>.heapsnapshot`, когда у него становится n контекстов.
+        if let Ok(at) = std::env::var("NOKK_HEAP_SNAPSHOT_AT") {
+            if at.parse::<usize>().ok() == Some(self.contexts.len()) {
+                let mut out = Vec::new();
+                self.isolate.take_heap_snapshot(|chunk| { out.extend_from_slice(chunk); true });
+                let _ = std::fs::write(format!("nokk-heap-{at}.heapsnapshot"), out);
+            }
+        }
+        self.log_heap("create");
         Ok(self.contexts.len() - 1)
     }
 
@@ -1031,9 +1090,30 @@ impl Isolate {
     /// reclaim the memory on the next GC. Leaves a `None` tombstone so the
     /// indices of other contexts are preserved (the slot is emptied, not
     /// removed) — otherwise every later context's pinned index would shift.
+    /// Отладка памяти (`RUST_LOG=nokk::heap=debug`): куча изолята и число живых
+    /// контекстов в нём.
+    fn log_heap(&mut self, what: &'static str) {
+        if tracing::enabled!(target: "nokk::heap", tracing::Level::DEBUG) {
+            let st = self.isolate.get_heap_statistics();
+            let live = self.contexts.iter().filter(|c| c.is_some()).count();
+            tracing::debug!(target: "nokk::heap", what, live,
+                used_mb = st.used_heap_size() / 1_048_576, total_mb = st.total_heap_size() / 1_048_576,
+                thread = ?std::thread::current().name(), "heap");
+        }
+    }
+
     pub fn dispose_context(&mut self, index: usize) {
+        self.log_heap("dispose");
         if let Some(slot) = self.contexts.get_mut(index) {
-            *slot = None;
+            if slot.take().is_some() && std::env::var_os("NOKK_NO_GC_HINT").is_none() {
+                // Контекст — это мегабайты кучи, и освободит их только сборка.
+                // Под потолком в несколько гигабайт V8 собирает лениво, и за одно
+                // решение заставы (полсотни контекстов: кадры, песочницы,
+                // воркеры) мёртвые копились до пика. Умеренное давление — это
+                // постепенная сборка, без остановки страницы.
+                self.isolate
+                    .memory_pressure_notification(v8::MemoryPressureLevel::Moderate);
+            }
         }
     }
 

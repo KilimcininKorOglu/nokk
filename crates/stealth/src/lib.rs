@@ -1868,11 +1868,20 @@ const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
   const mark = (f) => { if (stubs) try { stubs.add(f); } catch (e) {} return f; };
   const named = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return f; };
   const writers = globalThis.__pt_writers;
+  // Имя и число доводов — от рождения, а не правкой `name`/`length`: правка
+  // переводит функцию в словарный режим и даёт ей свой склад свойств (~290 байт),
+  // а заглушек в каждом контексте тысячи — половина цены контекста была в этом.
+  // Геттер из литерала зовётся `get x` сам, метод из литерала — без `prototype`,
+  // как у браузера.
   const stubAccessor = (P, name, kind) => {
     const slots = new WeakMap();
-    const get = mark(named(function () { const s = slots.get(this); return s ? s.v : undefined; }, 'get ' + name));
-    const write = function (v) { let s = slots.get(this); if (!s) { s = {}; try { slots.set(this, s); } catch (e) { return; } } s.v = v; };
-    let set = kind.indexOf('s') >= 0 ? mark(named(write, 'set ' + name)) : undefined;
+    const pair = Object.getOwnPropertyDescriptor({
+      get [name]() { const s = slots.get(this); return s ? s.v : undefined; },
+      set [name](v) { let s = slots.get(this); if (!s) { s = {}; try { slots.set(this, s); } catch (e) { return; } } s.v = v; },
+    }, name);
+    const get = mark(pair.get);
+    const write = pair.set;
+    let set = kind.indexOf('s') >= 0 ? mark(write) : undefined;
     // Только чтение снаружи — но движок пишет через `__pt_write`.
     if (!set && writers) { let w = writers.get(P); if (!w) { w = Object.create(null); writers.set(P, w); } w[name] = write; }
     // Под трассой запись в только-чтение видна с местом: кто и куда писал.
@@ -1884,9 +1893,20 @@ const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
     };
     return { get, set };
   };
+  const STUB_ARITY = [
+    (n) => ({ [n]() { return undefined; } })[n],
+    (n) => ({ [n](a) { return undefined; } })[n],
+    (n) => ({ [n](a, b) { return undefined; } })[n],
+    (n) => ({ [n](a, b, c) { return undefined; } })[n],
+    (n) => ({ [n](a, b, c, d) { return undefined; } })[n],
+    (n) => ({ [n](a, b, c, d, e) { return undefined; } })[n],
+    (n) => ({ [n](a, b, c, d, e, f) { return undefined; } })[n],
+  ];
   const stubMethod = (name, len) => {
-    const f = mark(named(function () { return undefined; }, name));
-    try { Object.defineProperty(f, 'length', { value: len | 0, configurable: true }); } catch (e) {}
+    const l = len | 0;
+    if (l < STUB_ARITY.length) return mark(STUB_ARITY[l](name));
+    const f = mark(STUB_ARITY[0](name));
+    try { Object.defineProperty(f, 'length', { value: l, configurable: true }); } catch (e) {}
     return f;
   };
   const protoOf = (name) => { try { const C = globalThis[name]; return C && typeof C === 'function' ? C.prototype : null; } catch (e) { return null; } };
@@ -2055,6 +2075,13 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
   const desc = (o, k) => { try { return Object.getOwnPropertyDescriptor(o, k); } catch (e) { return undefined; } };
   const def = (o, k, d) => { try { Object.defineProperty(o, k, d); return true; } catch (e) { return false; } };
   const keyName = (k) => (typeof k === 'symbol' ? '[' + (k.description || '') + ']' : String(k));
+  // `name`/`length` правим, только если они не те: правка переводит функцию в
+  // словарный режим (свой склад свойств, ~290 байт), а функций тут тысячи.
+  const setNL = (f, name, len) => {
+    if (len !== undefined && f.length !== len) def(f, 'length', { value: len, configurable: true });
+    if (name !== undefined && f.name !== name) def(f, 'name', { value: name, configurable: true });
+    return f;
+  };
   // Конструктор (или его алиас вроде webkitURL) прототип носит по праву;
   // метод — нет. Отличаем по составу прототипа и по имени.
   const ctorLike = (f, key) => {
@@ -2085,9 +2112,7 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
         } }
       : { [name]() { return fn.apply(this, arguments); } };
     const m = holder[name];
-    def(m, 'length', { value: need, configurable: true });
-    def(m, 'name', { value: typeof key === 'symbol' ? name : key, configurable: true });
-    return m;
+    return setNL(m, typeof key === 'symbol' ? name : key, need);
   };
   // Геттеры-обещания (`closed`, `ready`, `finished`…) на чужом `this` у
   // браузера не бросают, а отдают отклонённое обещание с тем же TypeError.
@@ -2100,14 +2125,15 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     const P = guard && guard.prototype;
     const rejects = !!guard && PROMISE_GETTERS.has(guard.name + '.' + keyName(key));
     // Синтаксис метода: у переходника, как у родного геттера, нет `.prototype`.
+    // Литерал с вычисляемым ключом: имя `get x`/`set x` и длина 0/1 — от
+    // рождения, без правки.
+    const k = typeof key === 'symbol' ? key : String(key);
     const g = kind === 'get '
-      ? (guard ? ({ g() { if (!ownerOk(guard, P, this)) { const err = illegal(guard.name + '.' + keyName(key) + '#get', this); if (rejects) return Promise.reject(err); throw err; } return fn.call(asThis(P, this)); } }).g
-               : ({ g() { return fn.call(this); } }).g)
-      : (guard ? ({ s(v) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + keyName(key) + '#set', this); return fn.call(asThis(P, this), v); } }).s
-               : ({ s(v) { return fn.call(this, v); } }).s);
-    def(g, 'name', { value: kind + keyName(key), configurable: true });
-    def(g, 'length', { value: kind === 'get ' ? 0 : 1, configurable: true });
-    return g;
+      ? (guard ? Object.getOwnPropertyDescriptor({ get [k]() { if (!ownerOk(guard, P, this)) { const err = illegal(guard.name + '.' + keyName(key) + '#get', this); if (rejects) return Promise.reject(err); throw err; } return fn.call(asThis(P, this)); } }, k).get
+               : Object.getOwnPropertyDescriptor({ get [k]() { return fn.call(this); } }, k).get)
+      : (guard ? Object.getOwnPropertyDescriptor({ set [k](v) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + keyName(key) + '#set', this); return fn.call(asThis(P, this), v); } }, k).set
+               : Object.getOwnPropertyDescriptor({ set [k](v) { return fn.call(this, v); } }, k).set);
+    return setNL(g, kind + keyName(key), kind === 'get ' ? 0 : 1);
   };
   // Строгая ли функция: у строгой (и у родной) чтение `.caller` бросает.
   const isStrict = (f) => { try { void f.caller; return false; } catch (e) { return true; } };
@@ -2961,8 +2987,9 @@ const SHAPE_FIXES: &str = r#"(() => {
       let g = f;
       if ((wantNoProto && Object.prototype.hasOwnProperty.call(g, 'prototype')) || (wantStrict && !isStrictF(g))) {
         const orig = g;
-        g = kindName === 'get' ? ({ g() { return orig.call(this); } }).g
-          : kindName === 'set' ? ({ s(v) { return orig.call(this, v); } }).s
+        const nk = String(name).replace(/^[gs]et /, '');
+        g = kindName === 'get' ? Object.getOwnPropertyDescriptor({ get [nk]() { return orig.call(this); } }, nk).get
+          : kindName === 'set' ? Object.getOwnPropertyDescriptor({ set [nk](v) { return orig.call(this, v); } }, nk).set
           : ({ [key](...a) { return orig.apply(this, a); } })[key];
       }
       try { if (g.length !== len) Object.defineProperty(g, 'length', { value: len, configurable: true }); } catch (e) {}

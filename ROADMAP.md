@@ -391,8 +391,13 @@ ceiling.
 
 ## Testing & benchmarks (Phase 8)
 
-- 🟡 Start-time and per-context memory measured (8-core Linux): ~4 ms engine start, ~20 MB
-  idle, ~0.5 MB/context (100 contexts ≈ 65 MB) — well past the < 100 ms / 30–50 MB targets.
+- 🟡 Memory and start time, remeasured October 2026 (8-core Linux): ~0.2 s cold start with
+  the cached V8 snapshot (0.95 s before), ~115 MB idle (~65 MB with `--workers 1`), ~9 MB per
+  page context (12.3 MB before; the earlier "0.5 MB/context, 20 MB idle" predates the
+  Chrome-shaped window), and a Cloudflare interstitial solve peaking at ~1.05 GB (~0.6 GB
+  with one worker). Open levers: the ~1500 interface objects the snapshot has to keep in
+  dictionary mode (a V8 deserializer check fails otherwise), ~5000 hand-masked functions
+  that still carry their own property store, and one isolate per thread in one-shot runs.
   A committed, repeatable benchmark harness is still to come.
 - 🟡 Live challenge check: [`tools/cf-check.sh`](tools/cf-check.sh) runs the five public
   Cloudflare targets and prints a verdict, time and final title for each.
