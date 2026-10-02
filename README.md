@@ -217,7 +217,7 @@ nokk --load https://gated.example/ --solve-challenge 25 --fail-on-challenge
 `--fail-on-challenge` turns the outcome into an exit code (`0` the site, `3` still the
 gate), and `--solve-challenge N` is the time budget. Measured on live sites (2026-10):
 `chess.com/login` (invisible widget, ~6 s), `scrapingcourse.com/cloudflare-challenge`
-(interstitial, ~9 s), `nopecha.com/demo/cloudflare` and `usvisascheduling.com`
+(interstitial, ~9 s), `nopecha.com/demo/cloudflare`
 (interactive interstitial, ~10 s), the Turnstile test pages on `peet.ws` (standalone
 widget: the token lands in `cf-turnstile-response`, and that counts as success).
 

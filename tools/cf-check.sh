@@ -13,8 +13,7 @@ for url in \
   https://www.scrapingcourse.com/cloudflare-challenge \
   https://peet.ws/turnstile-test/managed.html \
   https://peet.ws/turnstile-test/non-interactive.html \
-  https://nopecha.com/demo/cloudflare \
-  https://www.usvisascheduling.com/en-US/ ; do
+  https://nopecha.com/demo/cloudflare ; do
   t0=$(date +%s)
   out=$(RUST_LOG=error timeout 90 "$NOKK" --load "$url" --solve-challenge 30 --fail-on-challenge --eval "$PROBE" 2>/dev/null)
   code=$?

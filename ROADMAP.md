@@ -27,7 +27,7 @@ As of v0.1.28-alpha nokk clears Cloudflare on its own, headless, with no
 selectors from the user: the managed "Just a moment…" interstitial (with or
 without the checkbox), the interactive interstitial that wants a press, and
 Turnstile widgets embedded in a site's own page (interaction-only, managed and
-non-interactive). The six public targets in [`tools/cf-check.sh`](tools/cf-check.sh)
+non-interactive). The five public targets in [`tools/cf-check.sh`](tools/cf-check.sh)
 pass on every run.
 
 - ✅ **Solver in the core** (`BrowserContext::solve_challenge`, `challenge_state`):
@@ -394,7 +394,7 @@ ceiling.
 - 🟡 Start-time and per-context memory measured (8-core Linux): ~4 ms engine start, ~20 MB
   idle, ~0.5 MB/context (100 contexts ≈ 65 MB) — well past the < 100 ms / 30–50 MB targets.
   A committed, repeatable benchmark harness is still to come.
-- 🟡 Live challenge check: [`tools/cf-check.sh`](tools/cf-check.sh) runs the six public
+- 🟡 Live challenge check: [`tools/cf-check.sh`](tools/cf-check.sh) runs the five public
   Cloudflare targets and prints a verdict, time and final title for each.
 - ⬜ A fixture-based WAF-challenge test suite (offline replay of real challenge pages).
 - ⬜ Load test: sustained thousand-context throughput and tail latency.
