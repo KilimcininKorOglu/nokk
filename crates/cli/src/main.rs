@@ -154,6 +154,29 @@ struct Cli {
     /// whose URL contains this substring (e.g. an `/api/...` JSON call).
     #[arg(long, value_name = "URL_SUBSTR")]
     dump_request: Option<String>,
+
+    /// For `--load`: fill a form field, `SELECTOR=VALUE`. Repeatable, applied
+    /// in order before `--click`. Sets the value and fires the input/change
+    /// events a real keystroke sequence produces.
+    #[arg(long, value_name = "SELECTOR=VALUE")]
+    fill: Vec<String>,
+
+    /// For `--load`: click an element by selector, with real (trusted) pointer
+    /// events. Repeatable, applied in order after `--fill`. A stale modal
+    /// backdrop is cleared first — an orphaned `.modal-backdrop` swallows the
+    /// pointer and the click silently does nothing.
+    #[arg(long, value_name = "SELECTOR")]
+    click: Vec<String>,
+
+    /// For `--load`: after the steps above, wait for a captured response whose
+    /// URL contains this substring, print its body to stdout, and exit. The
+    /// event loop is pumped while waiting so the page's own callbacks run.
+    #[arg(long, value_name = "URL_SUBSTR", requires = "load")]
+    wait_response: Option<String>,
+
+    /// Seconds to wait for `--wait-response` (default 45).
+    #[arg(long, default_value_t = 45)]
+    response_timeout: u64,
 }
 
 /// Parse a `scheme://[user:pass@]host:port` proxy URL into a `ProxyConfig`.
@@ -215,6 +238,86 @@ fn render(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
+    }
+}
+
+/// Fill one `--fill SELECTOR=VALUE` step: set the field's value and fire the
+/// events a real keystroke sequence produces. Fails when nothing matches, so a
+/// renamed form stops the run instead of submitting an empty field. The value
+/// itself is never logged.
+async fn fill_input(ctx: &BrowserContext, spec: &str) -> Result<()> {
+    let (selector, value) = spec
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("--fill needs SELECTOR=VALUE, got {spec:?}"))?;
+    let js = format!(
+        "((sel, val) => {{ const el = document.querySelector(sel); \
+           if (!el) return 'missing'; el.focus(); el.value = val; \
+           el.dispatchEvent(new Event('input', {{ bubbles: true }})); \
+           el.dispatchEvent(new Event('change', {{ bubbles: true }})); \
+           return 'ok'; }})({}, {})",
+        serde_json::to_string(selector).unwrap_or_default(),
+        serde_json::to_string(value).unwrap_or_default()
+    );
+    match ctx.evaluate(&js).await {
+        Ok(serde_json::Value::String(s)) if s == "ok" => Ok(()),
+        _ => anyhow::bail!("--fill: no element matches {selector:?}"),
+    }
+}
+
+/// Click one `--click SELECTOR` step with trusted pointer events: clear a stale
+/// modal backdrop, scroll the element into view, hit its centre. Fails when
+/// nothing matches.
+async fn click_selector(ctx: &BrowserContext, selector: &str) -> Result<()> {
+    let js = format!(
+        "(sel => {{ const open = [...document.querySelectorAll('.modal.show')]; \
+           if (!open.length) {{ document.querySelectorAll('.modal-backdrop') \
+             .forEach(el => el.remove()); \
+             document.body.classList.remove('modal-open'); }} \
+           const el = document.querySelector(sel); if (!el) return 'missing'; \
+           el.scrollIntoView({{ block: 'center' }}); \
+           const r = el.getBoundingClientRect(); \
+           return JSON.stringify({{ x: r.left + r.width / 2, y: r.top + r.height / 2 }}); \
+         }})({})",
+        serde_json::to_string(selector).unwrap_or_default()
+    );
+    let out = ctx.evaluate(&js).await?;
+    let coords: serde_json::Value = match &out {
+        serde_json::Value::String(s) => serde_json::from_str(s).unwrap_or_default(),
+        v => v.clone(),
+    };
+    let (x, y) = match (
+        coords.get("x").and_then(|v| v.as_f64()),
+        coords.get("y").and_then(|v| v.as_f64()),
+    ) {
+        (Some(x), Some(y)) => (x, y),
+        _ => anyhow::bail!("--click: no element matches {selector:?}"),
+    };
+    for kind in ["mouseMoved", "mousePressed", "mouseReleased"] {
+        ctx.dispatch_mouse(kind, x, y, "left", 1).await?;
+    }
+    ctx.run_event_loop().await.ok();
+    Ok(())
+}
+
+/// Wait for the page's own request whose URL contains `needle`, then print its
+/// body. The engine records every request with its body, so no in-page hook is
+/// needed; the event loop is pumped while waiting so the page's callbacks run.
+async fn wait_response(ctx: &BrowserContext, needle: &str, timeout_secs: u64) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        ctx.run_event_loop().await.ok();
+        if let Some(r) = ctx
+            .requests()
+            .into_iter()
+            .find(|r| r.url.contains(needle) && r.status != 0)
+        {
+            println!("{}", String::from_utf8_lossy(&r.body));
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("no response matching {needle:?} within {timeout_secs}s");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -2712,10 +2815,26 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
             }
         }
 
+        // Drive a form: fills, then trusted clicks, in order. Runs before
+        // `--eval` so a probe sees the page the steps left behind.
+        for spec in &cli.fill {
+            fill_input(&ctx, spec).await?;
+        }
+        for selector in &cli.click {
+            click_selector(&ctx, selector).await?;
+        }
+
         // Run `--eval` first — it may trigger further requests (fetch/beacon/img)
         // that should then appear in the interception log.
         if let Some(js) = &cli.eval {
             eval_and_print(&ctx, js).await?;
+        }
+
+        // Wait for the page's own answer (e.g. a bill query's XHR), print its
+        // body, and exit.
+        if let Some(needle) = &cli.wait_response {
+            wait_response(&ctx, needle, cli.response_timeout).await?;
+            return Ok(());
         }
 
         // Print the response body of a specific captured request (e.g. an API).
