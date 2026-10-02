@@ -5211,6 +5211,51 @@ mod tests {
         assert_eq!(other, Value::String("[null,null]".into()));
     }
 
+    /// Three DOM rules a sign-in page's jQuery leans on: an `<html>` element's
+    /// `innerHTML` parses into a `<head>` and a `<body>`; emptying a node leaves
+    /// its old children parentless (jQuery's `buildFragment` empties a scratch
+    /// `<div>`, then moves them); and `after`/`before`/`replaceWith`/
+    /// `replaceChildren` move nodes on elements too.
+    #[tokio::test]
+    async fn dom_moves_nodes_as_a_browser_does() {
+        let _serial = serial().await;
+        let engine = engine(4, 6);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+        let got = ctx
+            .evaluate(
+                r#"(() => {
+                const r = [];
+                const e = document.createElement('html');
+                e.innerHTML = '<!DOCTYPE html><html><head><title>t</title></head><body><div id=api></div></body></html>';
+                r.push([...e.children].map(c => c.tagName).join(','), e.querySelector('body #api') ? 'api' : 'none');
+                const d = document.createElement('div');
+                d.innerHTML = '<p>a</p>';
+                const p = d.firstChild;
+                d.textContent = '';
+                r.push(String(p.parentNode));
+                document.createDocumentFragment().appendChild(p);
+                const m = () => { const x = document.createElement('div'); x.innerHTML = '<b>1</b><i>2</i>'; return x; };
+                let x = m(); x.firstChild.after('x'); r.push(x.innerHTML);
+                x = m(); x.lastChild.before('x'); r.push(x.innerHTML);
+                x = m(); x.firstChild.replaceWith('x'); r.push(x.innerHTML);
+                x = m(); x.replaceChildren('x'); r.push(x.innerHTML);
+                return JSON.stringify(r);
+            })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            Value::String(
+                r#"["HEAD,BODY","api","null","<b>1</b>x<i>2</i>","<b>1</b>x<i>2</i>","x<i>2</i>","x"]"#
+                    .into()
+            )
+        );
+    }
+
     #[tokio::test]
     async fn a_message_to_a_worker_keeps_its_shape() {
         let _serial = serial().await;

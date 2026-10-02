@@ -479,7 +479,7 @@
       if (this.nodeType === 9 || this.nodeType === 10) return;
       if (this.nodeType === 3 || this.nodeType === 4 || this.nodeType === 7 || this.nodeType === 8) { this.data = String(v); return; }
       if (this.__ptLocal === 'script') v = __pt_ttSink('TrustedScript', 'HTMLScriptElement textContent', v, "Failed to set the 'textContent' property on 'HTMLScriptElement'");
-      this.__ptKids = [];
+      __ptDropKids(this);
       if (v !== '') __ptAdd.call(this, new Text(String(v)));
     }
 
@@ -829,7 +829,7 @@
       for (const n of nodes) this.insertBefore(typeof n === 'string' ? new Text(n) : n, first);
     }
     replaceChildren(...nodes) {
-      this.__ptKids = [];
+      __ptDropKids(this);
       for (const n of nodes) this.appendChild(typeof n === 'string' ? new Text(n) : n);
     }
     moveBefore(node, child) { return this.insertBefore(node, child); }
@@ -853,7 +853,7 @@
     get nodeName() { return '#document-fragment'; }
     get nodeValue() { return null; }
     get textContent() { return this.__ptKids.map(n => n.textContent).join(''); }
-    set textContent(v) { this.__ptKids = []; if (v !== '') this.appendChild(new Text(String(v))); }
+    set textContent(v) { __ptDropKids(this); if (v !== '') this.appendChild(new Text(String(v))); }
     get innerHTML() {
       const host = this.__ptLocal === 'template' ? __templateContent(this) : this;
       return host.__ptKids.map(serializeNode).join('');
@@ -862,7 +862,7 @@
       html = __pt_ttSink('TrustedHTML', 'ShadowRoot innerHTML', html, "Failed to set the 'innerHTML' property on 'ShadowRoot'");
       // Разметка шаблона разбирается в его содержимое — таков разбор у него.
       const host = this.__ptLocal === 'template' ? __templateContent(this) : this;
-      host.__ptKids = [];
+      __ptDropKids(host);
       for (const n of parseFragment(String(html))) __ptAdd.call(host, n);
     }
     // Коллекция, а не массив: `document.children` у браузера — HTMLCollection,
@@ -1419,6 +1419,12 @@
 
     append(...ns) { for (const n of ns) this.appendChild(typeof n === 'string' ? new Text(n) : n); }
     prepend(...ns) { for (const n of ns.reverse()) this.insertBefore(typeof n === 'string' ? new Text(n) : n, this.firstChild); }
+    replaceChildren(...ns) {
+      const nodes = ns.map((n) => (typeof n === 'string' ? new Text(n) : n));
+      for (const n of nodes) if (n && n.__ptParent === this) this.removeChild(n);
+      __ptDropKids(this);
+      for (const n of nodes) this.appendChild(n);
+    }
 
     // Queries (scoped to this subtree)
     // getElementById у Element браузер не имеет — только у документа и фрагмента.
@@ -1720,8 +1726,31 @@
       html = __pt_ttSink('TrustedHTML', 'Element innerHTML', html, "Failed to set the 'innerHTML' property on 'Element'");
       // Разметка шаблона разбирается в его содержимое — таков разбор у него.
       const host = this.__ptLocal === 'template' ? __templateContent(this) : this;
-      host.__ptKids = [];
-      for (const n of parseFragment(String(html))) __ptAdd.call(host, n);
+      __ptDropKids(host);
+      const nodes = parseFragment(String(html));
+      // With an <html> element as the context the parser starts "before head":
+      // the result is always a <head> and a <body>, head-only elements up front
+      // in the first. Pages build a whole template this way
+      // (`createElement('html').innerHTML = page`) and then look for its body.
+      if (this.__ptLocal === 'html') {
+        const O = globalThis.__pt_orig || {};
+        const mk = (t) => (O.createElement ? O.createElement.call(document, t) : document.createElement(t));
+        const head = mk('head'), body = mk('body');
+        const HEADISH = new Set(['title', 'meta', 'link', 'style', 'script', 'base', 'noscript', 'template', 'basefont', 'bgsound']);
+        let inHead = true;
+        for (const n of nodes) {
+          if (inHead) {
+            if (n.nodeType === 3 && !/\S/.test(n.data)) continue;
+            if (n.nodeType === 8 || (n.nodeType === 1 && HEADISH.has(n.localName))) { __ptAdd.call(head, n); continue; }
+            inHead = false;
+          }
+          __ptAdd.call(body, n);
+        }
+        __ptAdd.call(host, head);
+        __ptAdd.call(host, body);
+        return;
+      }
+      for (const n of nodes) __ptAdd.call(host, n);
     }
     get outerHTML() { return serializeNode(this); }
     // Rendered text (hidden subtrees excluded, whitespace collapsed) — an
@@ -4673,6 +4702,25 @@
     return `<${tag}${attrs}>${inner}</${tag}>`;
   }
 
+  // Emptying a node (`textContent = ''`, `innerHTML = …`, `replaceChildren()`)
+  // removes its children the way `removeChild` does: they no longer have a
+  // parent, observers see them go, and frames among them close. jQuery's
+  // `buildFragment` empties its scratch <div> this way and then moves the
+  // children into a fragment — with a stale parent that move threw.
+  function __ptDropKids(node) {
+    const old = node.__ptKids;
+    if (!old || !old.length) return;
+    node.__ptKids = [];
+    for (const c of old) c.__ptParent = null;
+    __markDirty();
+    __mutation(__childListRecord(node, [], old, null, null));
+    for (const c of old) __walkTree(c, (f) => {
+      if (f.__ptFrameId) __ptDisconnectFrame(f);
+      if (f.__ptRealm) { try { if (typeof f.__ptRealm.__pt_detach === 'function') f.__ptRealm.__pt_detach(); } catch (e) {} try { __realmFrames.delete(f); } catch (e) {} }
+      if (f.__ptUpgraded) __customCallback(f, 'disconnectedCallback');
+    });
+  }
+
   // ---- HTML fragment parser (innerHTML setter) ------------------------------
   // A forgiving tokenizer: handles tags, attributes (quoted/unquoted/bare),
   // text, comments, and void/self-closing elements. Not spec-perfect, but
@@ -4713,6 +4761,12 @@
           const stop = end < 0 ? html.length : end;
           put(top(), note(html.slice(i + 4, stop)));
           i = end < 0 ? html.length : end + 3; continue;
+        }
+        // A DOCTYPE inside a fragment is a parse error the parser ignores —
+        // it never becomes text.
+        if (/^<!doctype/i.test(html.slice(i, i + 9))) {
+          const end = html.indexOf('>', i);
+          i = end < 0 ? html.length : end + 1; continue;
         }
         const close = html[i + 1] === '/';
         const m = /^<\/?([a-zA-Z][\w-]*)((?:[^>"']|"[^"]*"|'[^']*')*)\/?>/.exec(html.slice(i));
@@ -7387,8 +7441,35 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     } catch (e) {}
   }
 
+  // ChildNode: `after`, `before`, `replaceWith` — on elements they were
+  // name-only stubs that did nothing, so a page that moved nodes with them
+  // (jQuery's `replaceWith` falls through to them in places) kept its DOM as is.
+  // Strings become text nodes; the anchor is the nearest sibling not among the
+  // nodes being inserted, as the DOM standard's "viable sibling" rule says.
+  const __asNodes = (ns) => ns.map((n) => (typeof n === 'string' ? new Text(n) : n));
+  const __afterSelf = function after(...ns) {
+    const p = this.parentNode; if (!p) return;
+    let ref = this.nextSibling; while (ref && ns.includes(ref)) ref = ref.nextSibling;
+    for (const n of __asNodes(ns)) p.insertBefore(n, ref);
+  };
+  const __beforeSelf = function before(...ns) {
+    const p = this.parentNode; if (!p) return;
+    let prev = this.previousSibling; while (prev && ns.includes(prev)) prev = prev.previousSibling;
+    const ref = prev ? prev.nextSibling : p.firstChild;
+    for (const n of __asNodes(ns)) p.insertBefore(n, ref);
+  };
+  const __replaceSelf = function replaceWith(...ns) {
+    const p = this.parentNode; if (!p) return;
+    let ref = this.nextSibling; while (ref && ns.includes(ref)) ref = ref.nextSibling;
+    const nodes = __asNodes(ns);
+    if (this.parentNode === p && !nodes.includes(this)) p.removeChild(this);
+    for (const n of nodes) p.insertBefore(n, ref);
+  };
   for (const C of [Element, Text, Comment]) {
     Object.defineProperty(C.prototype, 'remove', { value: __removeSelf, writable: true, configurable: true });
+    Object.defineProperty(C.prototype, 'after', { value: __afterSelf, writable: true, configurable: true });
+    Object.defineProperty(C.prototype, 'before', { value: __beforeSelf, writable: true, configurable: true });
+    Object.defineProperty(C.prototype, 'replaceWith', { value: __replaceSelf, writable: true, configurable: true });
   }
 
   // Now that every interface exists, publish their members the way the platform
