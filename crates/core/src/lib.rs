@@ -1166,6 +1166,8 @@ pub enum ChallengeStatus {
     ClearedButStuck,
     /// Nothing cleared within the budget.
     Timeout,
+    /// The page showed no gate at all: nothing to solve.
+    NoChallenge,
 }
 
 impl ChallengeStatus {
@@ -1175,10 +1177,11 @@ impl ChallengeStatus {
             ChallengeStatus::TokenIssued => "token-issued",
             ChallengeStatus::ClearedButStuck => "cleared-but-stuck",
             ChallengeStatus::Timeout => "timeout",
+            ChallengeStatus::NoChallenge => "none",
         }
     }
     pub fn is_success(&self) -> bool {
-        matches!(self, ChallengeStatus::Cleared | ChallengeStatus::TokenIssued)
+        matches!(self, ChallengeStatus::Cleared | ChallengeStatus::TokenIssued | ChallengeStatus::NoChallenge)
     }
 }
 
@@ -2498,6 +2501,12 @@ impl BrowserContext {
         let mut pressed = 0usize;
         let mut seen_controls = std::collections::HashSet::new();
         let is_interstitial = |v: &serde_json::Value| matches!(v, serde_json::Value::String(s) if s.contains("Just a moment"));
+        // A page with no gate has nothing to solve: waiting out the whole budget
+        // there cost every unprotected site the full 30 s. Some grace first —
+        // a widget can be inserted by script a moment after the load.
+        const NO_GATE_GRACE: std::time::Duration = std::time::Duration::from_secs(4);
+        let mut gate_last_seen = t;
+        let mut gate_checked = t - std::time::Duration::from_secs(1);
         let status = loop {
             let worked = self.run_event_loop().await.unwrap_or(0);
             let cleared = self.cookies(&[]).iter().any(|c| c.name == "cf_clearance");
@@ -2529,6 +2538,15 @@ impl BrowserContext {
                 }
                 tracing::info!(target: "nokk", elapsed_ms = t.elapsed().as_millis(), "interstitial moved on");
                 break ChallengeStatus::Cleared;
+            }
+            if pressed == 0 && gate_checked.elapsed() >= std::time::Duration::from_millis(500) {
+                gate_checked = std::time::Instant::now();
+                if self.challenge_state().await.kind != ChallengeKind::None {
+                    gate_last_seen = gate_checked;
+                } else if gate_last_seen.elapsed() >= NO_GATE_GRACE {
+                    tracing::info!(target: "nokk", elapsed_ms = t.elapsed().as_millis(), "no challenge on the page");
+                    break ChallengeStatus::NoChallenge;
+                }
             }
             if std::time::Instant::now() >= deadline {
                 tracing::warn!(target: "nokk", presses = pressed, "challenge did not clear in time");
