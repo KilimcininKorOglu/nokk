@@ -1901,11 +1901,7 @@
     get isContentEditable() { const v = (__ptGetA(this, 'contenteditable') || '').toLowerCase(); return v === '' || v === 'true'; }
     click() {
       const ok = this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-      // Кнопка отправки: щелчок по ней отправляет форму (с событием submit).
-      if (ok && ((this.__ptLocal === 'button' && /^(submit|)$/.test(String(__ptGetA(this, 'type') || '').toLowerCase())) || (this.__ptLocal === 'input' && /^(submit|image)$/.test(__inputType(this))))) {
-        let f = this.parentNode; while (f && f.__ptLocal !== 'form') f = f.parentNode;
-        if (f && typeof f.requestSubmit === 'function') f.requestSubmit(this);
-      }
+      if (ok) __ptActivate(this);
     }
 
     __ptShallowClone() {
@@ -4740,6 +4736,45 @@
       __ptClassCache.set(e, c);
     }
     return c.set;
+  }
+
+  // Действие по умолчанию у неотменённого щелчка (activation behavior): его
+  // несёт ближайший к цели предок, у которого оно есть. Кнопка отправки
+  // отправляет форму, кнопка сброса сбрасывает, ссылка ведёт по адресу. У нас
+  // это делал только `button.click()`, а щелчок мышью (доверенный, тот, что
+  // жмёт решатель и `--click`) не отправлял форм и не открывал ссылок вовсе.
+  function __ptActivate(target) {
+    for (let el = target; el && el.nodeType === 1; el = el.parentNode) {
+      const tag = el.__ptLocal;
+      if ((tag === 'button' || tag === 'input') && __ptHasA(el, 'disabled')) return;
+      const btype = tag === 'button' ? String(__ptGetA(el, 'type') || 'submit').toLowerCase()
+        : tag === 'input' ? __inputType(el) : null;
+      if (btype === 'submit' || btype === 'image' || btype === 'reset') {
+        if (tag === 'button' && btype !== 'submit' && btype !== 'reset') return;
+        let f = el.parentNode; while (f && f.__ptLocal !== 'form') f = f.parentNode;
+        const formId = __ptGetA(el, 'form');
+        if (formId && globalThis.document) f = document.getElementById(formId) || f;
+        if (!f) return;
+        if (btype === 'reset') { if (typeof f.reset === 'function') f.reset(); }
+        else if (typeof f.requestSubmit === 'function') f.requestSubmit(el);
+        return;
+      }
+      if (tag === 'button') return;
+      if ((tag === 'a' || tag === 'area') && __ptHasA(el, 'href')) {
+        const t = String(__ptGetA(el, 'target') || '').toLowerCase();
+        if (t && t !== '_self' && t !== '_top' && t !== '_parent') return;
+        if (__ptHasA(el, 'download')) return;
+        const raw = String(__ptGetA(el, 'href'));
+        if (/^\s*javascript:/i.test(raw)) return;
+        let url;
+        try { url = new URL(raw, document.baseURI || location.href); } catch (e) { return; }
+        const here = String(location.href);
+        // Только фрагмент — прокрутка и hashchange, не переход.
+        if (url.href.split('#')[0] === here.split('#')[0] && url.hash) { location.hash = url.hash; return; }
+        location.assign(url.href);
+        return;
+      }
+    }
   }
 
   // ---- HTML fragment parser (innerHTML setter) ------------------------------
@@ -10659,6 +10694,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
           const ev = new PointerEvent('click', ptrInit({ button: b, buttons: 0, pressure: 0, detail: clicks, isPrimary: false }));
           finish(ev, true, { which: b + 1, detail: clicks, isPrimary: false });
           const ok = send(target, ev);
+          if (ok && !box) __ptActivate(target);
           if (box) {
             if (!ok) box.checked = was;
             else if (box.checked !== was) {
