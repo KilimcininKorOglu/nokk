@@ -236,9 +236,34 @@ pub fn build_snapshot(bootstrap: &str) -> Result<usize, String> {
             && std::fs::write(&tmp, data).is_ok()
         {
             let _ = std::fs::rename(&tmp, &path);
+            prune_snapshot_cache(&path, 3);
         }
     }
     Ok(size)
+}
+
+/// Ключ снимка меняется с каждой сборкой движка, и без уборки каталог рос на
+/// 10 МБ за обновление. Оставляем `keep` самых свежих, включая только что
+/// записанный.
+fn prune_snapshot_cache(current: &std::path::Path, keep: usize) {
+    let Some(dir) = current.parent() else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("snapshot-") && (n.ends_with(".bin") || n.contains(".tmp")))
+        })
+        .filter_map(|p| std::fs::metadata(&p).and_then(|m| m.modified()).ok().map(|t| (t, p)))
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, p) in files.into_iter().skip(keep) {
+        if p != current {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 /// Где лежит снимок для этого загрузчика: `$NOKK_CACHE_DIR`, иначе
