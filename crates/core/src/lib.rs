@@ -1909,6 +1909,12 @@ impl BrowserContext {
             if std::time::Instant::now() >= deadline {
                 break;
             }
+            // Stopped at a fresh clearance: the gate's page has nothing more to
+            // give, and running its timers out only delayed the solver's answer
+            // by a second and a half.
+            if self.stopped_at_clearance.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
 
             // 0. Timings first, before anything the page runs this round. A script
             //    that has just loaded reads the timing of its own <script> the
@@ -2623,7 +2629,7 @@ impl BrowserContext {
             // Press only what is offered, once per control that appears: a
             // widget that ignores a press is not asking for another, and a
             // flurry of clicks is its own signature.
-            if pressed < MAX_PRESSES {
+            if pressed < MAX_PRESSES && !self.stopped_at_clearance.load(std::sync::atomic::Ordering::Acquire) {
                 if let Ok(Some(what)) = self.press_widget_control().await {
                     if seen_controls.insert(what.clone()) {
                         pressed += 1;
@@ -2632,7 +2638,9 @@ impl BrowserContext {
                         // the widget counts in exactly that window, and an engine
                         // asleep then shows a gap no browser has.
                         let until = std::time::Instant::now() + std::time::Duration::from_millis(1_500);
-                        while std::time::Instant::now() < until {
+                        while std::time::Instant::now() < until
+                            && !self.stopped_at_clearance.load(std::sync::atomic::Ordering::Acquire)
+                        {
                             let _ = self.run_event_loop().await;
                             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                         }
