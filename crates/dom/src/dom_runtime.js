@@ -1207,12 +1207,16 @@
       // отдавал виджету место обёртки у правого края окна вместо центра.
       const blocking = rel === 'stylesheet' && !document.__ptCurScript
         && this.ownerDocument === document && document.__ptReady === 'loading';
-      if (blocking) globalThis.__ptBlockingSheets = (globalThis.__ptBlockingSheets | 0) + 1;
+      if (blocking) {
+        globalThis.__ptBlockingSheets = (globalThis.__ptBlockingSheets | 0) + 1;
+        (globalThis.__ptBlockingSheetUrls || (globalThis.__ptBlockingSheetUrls = new Set())).add(url);
+      }
       let released = false;
       const release = () => {
         if (!blocking || released) return;
         released = true;
         globalThis.__ptBlockingSheets = Math.max(0, (globalThis.__ptBlockingSheets | 0) - 1);
+        try { globalThis.__ptBlockingSheetUrls.delete(url); } catch (e) {}
       };
       __pt_subresource(url, kind).then(
         (res) => {
@@ -4110,7 +4114,7 @@
         if (c === '#') { i++; const n = ident(); if (!n) fail(); spec[0]++; tests.push((e) => e.id === n); any = true; continue; }
         if (c === '.') {
           i++; const n = ident(); if (!n) fail(); spec[1]++;
-          tests.push((e) => { const v = __ptGetA(e, 'class'); return v != null && (' ' + v.replace(/[\t\n\f\r ]+/g, ' ') + ' ').indexOf(' ' + n + ' ') >= 0; });
+          tests.push((e) => { const set = __ptClassSet(e); return set !== null && set.has(n); });
           any = true; continue;
         }
         if (c === '[') {
@@ -4252,7 +4256,7 @@
     let hit = __selCache.get(key);
     if (hit !== undefined) return hit;
     try { hit = __selParse(key); } catch (e) { hit = null; }
-    if (__selCache.size > 5000) __selCache.clear();
+    if (__selCache.size > 50000) __selCache.clear();
     __selCache.set(key, hit);
     return hit;
   }
@@ -4719,6 +4723,23 @@
       if (f.__ptRealm) { try { if (typeof f.__ptRealm.__pt_detach === 'function') f.__ptRealm.__pt_detach(); } catch (e) {} try { __realmFrames.delete(f); } catch (e) {} }
       if (f.__ptUpgraded) __customCallback(f, 'disconnectedCallback');
     });
+  }
+
+  // Классы элемента — множеством, разобранным один раз на значение атрибута.
+  // Проверка `.x` в селекторе прогоняла строку `class` через replace с
+  // регуляркой при каждом вызове, а каскад раскладки зовёт её на каждое
+  // правило для каждого элемента: на тяжёлой заставе это было две трети всего
+  // времени процессора.
+  const __ptClassCache = new WeakMap();
+  function __ptClassSet(e) {
+    const v = __ptGetA(e, 'class');
+    if (v == null) return null;
+    let c = __ptClassCache.get(e);
+    if (c === undefined || c.raw !== v) {
+      c = { raw: v, set: new Set(v.split(/[\t\n\f\r ]+/)) };
+      __ptClassCache.set(e, c);
+    }
+    return c.set;
   }
 
   // ---- HTML fragment parser (innerHTML setter) ------------------------------
@@ -7775,7 +7796,13 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const won = [];
     for (const r of __candidateRules(el)) {
       let ok = false;
-      try { ok = matchesSelector(el, r.sel); } catch (e) {}
+      // Селектор правила разбирается один раз и живёт на самом правиле. Через
+      // общий кэш (5000 записей, сброс целиком) страница со 128 таблицами
+      // разбирала свои селекторы заново на каждом элементе каждой раскладки.
+      try {
+        if (r.__ptSel === undefined) r.__ptSel = __selCompiled(r.sel) || null;
+        ok = !!r.__ptSel && __selAny(r.__ptSel, el, { scope: null });
+      } catch (e) {}
       if (ok) won.push(r);
     }
     won.sort((a, b) => (a.spec - b.spec) || (a.order - b.order));

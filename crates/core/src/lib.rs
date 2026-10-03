@@ -735,6 +735,7 @@ impl Engine {
             carry: std::sync::Mutex::new(HashMap::new()),
             nav_started: std::sync::Mutex::new(None),
             loading: std::sync::atomic::AtomicUsize::new(0),
+            sheets_gave_up: std::sync::atomic::AtomicU64::new(0),
             requests: std::sync::Mutex::new(Vec::new()),
             started: std::time::Instant::now(),
             timings_sent: std::sync::Mutex::new(HashMap::new()),
@@ -907,6 +908,9 @@ pub struct BrowserContext {
     /// changes when a load starts, the document count when it ends; in between
     /// the page is neither the old document nor yet the new one.
     loading: std::sync::atomic::AtomicUsize,
+    /// The document (`doc_seq + 1`) whose blocking stylesheets timed out once:
+    /// its later scripts do not wait for them again.
+    sheets_gave_up: std::sync::atomic::AtomicU64,
     /// Every network request the engine made for this context, in order — the
     /// built-in interception log (document + external scripts + page fetch/XHR).
     requests: std::sync::Mutex<Vec<NetworkRecord>>,
@@ -1556,10 +1560,16 @@ impl BrowserContext {
                 }
             }
         }
+        let t_parse = std::time::Instant::now();
+        tracing::debug!(target: "nokk::load", bytes = html.len(), "parse start");
         let page = nokk_dom::parse(html);
+        tracing::debug!(target: "nokk::load", ms = t_parse.elapsed().as_millis() as u64, "parsed");
+        let install = page.install_script();
+        tracing::debug!(target: "nokk::load", bytes = install.len(), ms = t_parse.elapsed().as_millis() as u64, "install script built");
 
         // Install the parsed tree as `document`.
-        self.eval_in(index, &page.install_script()).await?;
+        self.eval_in(index, &install).await?;
+        tracing::debug!(target: "nokk::load", ms = t_parse.elapsed().as_millis() as u64, "document installed");
         if let Some(csp) = self.document_csp(base_url) {
             let js = format!("try {{ if (typeof __pt_applyCsp === 'function') __pt_applyCsp({}, 'header'); }} catch (e) {{}}", js_str(&csp));
             let _ = self.eval_in(index, &js).await;
@@ -1629,6 +1639,12 @@ impl BrowserContext {
                 continue;
             };
             let script = &page.scripts[idx];
+            tracing::debug!(target: "nokk::load", idx, kind = match script {
+                nokk_dom::Script::InlineModule(_) => "inline module",
+                nokk_dom::Script::ExternalModule(_) => "module",
+                nokk_dom::Script::Skipped => "skipped",
+                _ => "script",
+            }, "script step");
             // Ход кадрам перед каждым скриптом документа, каким бы он ни был.
             // Страница вроде chess.com грузит их десятками — и модулями тоже,
             // а модуль уходит из этого цикла раньше, чем доходит до конца.
@@ -1672,6 +1688,7 @@ impl BrowserContext {
                         None => Err(EngineError::Js(format!("cannot resolve {code}"))),
                     }
                 };
+                tracing::debug!(target: "nokk::load", idx, ok = outcome.is_ok(), "module done");
                 if let Err(e) = outcome {
                     tracing::debug!(error = %e, "page module threw");
                 }
@@ -1951,14 +1968,20 @@ impl BrowserContext {
             // чтобы попросить таблицу стилей. У нас они шли по одному, по
             // полсотни миллисекунд каждый, и страница с десятком ссылок в
             // заголовке теряла на этом полсекунды до первого скрипта.
-            let room = MAX_FETCHES.saturating_sub(fetches_done);
-            let batch: Vec<Value> = reqs.into_iter().take(room).collect();
-            fetches_done += batch.len();
-            let settles = self
-                .with_frames_live(futures_util::future::join_all(
-                    batch.iter().map(|r| self.perform_fetch(index, &base, r)),
-                ))
-                .await;
+            // Очередь уже забрана целиком: что не выполнено здесь, не выполнится
+            // никогда — обещание повиснет. Раньше брались первые 200, а хвост
+            // пропадал: у stake.com за 389 предзагрузками модулей стояли все
+            // 128 таблиц стилей, и страница ждала их вечно. Теперь всё, пачками.
+            let mut settles = Vec::with_capacity(reqs.len());
+            for batch in reqs.chunks(MAX_FETCHES) {
+                fetches_done += batch.len();
+                settles.extend(
+                    self.with_frames_live(futures_util::future::join_all(
+                        batch.iter().map(|r| self.perform_fetch(index, &base, r)),
+                    ))
+                    .await,
+                );
+            }
             for settle in settles {
                 let (w, raw) = self.route(index);
                 self.engine
@@ -3780,6 +3803,13 @@ impl BrowserContext {
     /// скрипт, — как браузер. Ожидание не простой: страница живёт, её
     /// таймеры идут, а запросы за таблицами обслуживаются тем же циклом.
     async fn wait_for_blocking_sheets(&self, index: usize) {
+        // Один срок на документ, а не на каждый скрипт: таблица, что не пришла
+        // за 15 с, не придёт и к следующему скрипту, а страница на SvelteKit
+        // несёт их десятки — stake.com стоял так полчаса на 100% процессора.
+        let doc = self.doc_seq.load(std::sync::atomic::Ordering::Acquire);
+        if self.sheets_gave_up.load(std::sync::atomic::Ordering::Acquire) == doc + 1 {
+            return;
+        }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
             let pending = self
@@ -3788,12 +3818,28 @@ impl BrowserContext {
                 .ok()
                 .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
                 .unwrap_or(0);
-            if pending == 0 || std::time::Instant::now() >= deadline {
+            if pending == 0 {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let urls = self
+                    .eval_in(index, "JSON.stringify([...(globalThis.__ptBlockingSheetUrls || [])])")
+                    .await
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                tracing::warn!(pending, %urls, "stylesheets never arrived; running the page's scripts without them");
+                self.sheets_gave_up.store(doc + 1, std::sync::atomic::Ordering::Release);
                 return;
             }
             // Цикл может сам загрузить документ, а тот — снова ждать таблиц.
-            if Box::pin(self.run_event_loop_waiting(std::time::Duration::ZERO, true)).await.is_err() {
-                return;
+            let worked = match Box::pin(self.run_event_loop_waiting(std::time::Duration::ZERO, true)).await {
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            // Ждём сеть, а не крутимся: без паузы этот цикл съедал ядро целиком.
+            if worked == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         }
     }
