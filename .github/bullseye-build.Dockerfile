@@ -23,7 +23,8 @@ WORKDIR /w
 # fetched from the rusty_v8 release like in any fresh checkout.
 COPY . .
 
-# The release binary, as `cargo build --release` makes it.
+# The release binary, as `cargo build --release` makes it: the light build
+# (no rasterizers; the default features are empty).
 FROM base AS bin
 RUN cargo build --release --bin nokk
 FROM scratch AS bin-out

@@ -10,11 +10,12 @@ keywords = ["headless-browser", "stealth", "scraping", "cli", "puppeteer"]
 categories = ["command-line-utilities", "web-programming"]
 
 [features]
-# Real pixels are on by default: a synthesized canvas is a fingerprint of its
-# own — it draws nothing a font engine would draw, and it carries per-session
-# noise, which is itself what anti-bot scoring looks for. `cargo build
-# --no-default-features` gives the light build back (docs/rendering.md).
-default = ["render", "webgl"]
+# Light by default: no rasterizer, no GL stack. A Cloudflare solve peaks ~100 MB
+# lower without them (WebGL alone maps Mesa and LLVM), and every challenge we
+# test clears either way. `--features render,webgl` builds the binary with real
+# canvas/WebGL pixels — the `nokk-render` release archive and the `:render`
+# image (docs/rendering.md).
+default = []
 # Real off-screen canvas rasterization: tiny-skia + ab_glyph, pure Rust.
 render = ["nokk/render"]
 # Real headless WebGL. Loads libEGL at run time and falls back to the drawn

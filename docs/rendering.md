@@ -2,8 +2,9 @@
 
 Status: **Phase 1 landed (canvas 2D); Phase 2 landed (WebGL: shaders, draws,
 textures, framebuffers).** Giving nokk *real*
-off-screen canvas-2D and WebGL rasterization, **on by default in the binary**;
-`--no-default-features` gives the light synthesis build back.
+off-screen canvas-2D and WebGL rasterization. Since v0.1.31 they are **opt-in
+again**: the default build is light, and `--features render,webgl` (the
+`nokk-render` release archive, the `:render` image) carries the real backends.
 
 Implemented today under `render`: 2D fills, **real glyph text**
 (`fillText`/`strokeText`/`measureText` via a bundled Liberation Sans),
@@ -28,10 +29,22 @@ more. It is **necessary but not sufficient** for interactive Turnstile (which al
 needs Web Workers, cross-origin iframe execution, and full environment coherence
 — see [examples/cf-harvester](../examples/cf-harvester) for the real-browser path).
 
-## Why they are on by default
+## Why light is the default again
 
-They started opt-in, to keep the default build thin. Measurement against Chrome
-148 on the same machine settled it the other way:
+From v0.1.18 to v0.1.30 the binary carried both by default. In October 2026 we
+measured the cost on Cloudflare interstitials, one-shot `--load`, one worker:
+
+|                          | light   | `render`/`webgl` |
+|--------------------------|---------|------------------|
+| example.com, peak PSS    | 126 MB  | 199 MB           |
+| scrapingcourse, peak PSS | 424 MB  | 528 MB           |
+| nopecha, peak PSS        | 485 MB  | 594 MB           |
+| six CF targets cleared   | 6/6     | 6/6              |
+
+WebGL alone maps Mesa and LLVM into the process the moment a page asks for a
+context, which every challenge does. With no target telling the two apart, the
+light build is the default and the real backends stay one flag away for sites
+that do compare pixels. The case for them, measured against Chrome 148 earlier:
 
 |                        | synthesis | `render`/`webgl` | Chrome |
 |------------------------|-----------|------------------|--------|
@@ -45,8 +58,8 @@ engine draws, and it used to carry per-session noise, which is precisely the
 signal anti-bot scoring hunts for. The real backend's WebGL draw is
 *bit-identical* to Chrome's on the same GPU. So the binary carries both:
 
-- `cargo build --release --bin nokk` → real canvas/WebGL rasterization
-- `cargo build --release --bin nokk --no-default-features` → light (synthesis)
+- `cargo build --release --bin nokk` → light (synthesis)
+- `cargo build --release --bin nokk --features render,webgl` → real canvas/WebGL rasterization
 
 `webgl` is still safe to compile in everywhere: it `dlopen`s `libEGL.so.1` at
 run time and, where Mesa is absent, falls back to the drawn surface.

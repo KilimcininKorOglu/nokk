@@ -45,9 +45,10 @@ the ground up, and skip the rendering engine entirely.**
   snapshot is cached in `~/.cache/nokk` after the first run), **~115 MB** idle with the
   default 8 isolate threads (**~65 MB** with `--workers 1`), and **~9 MB per page
   context** — the Chrome-shaped window every page gets is not small. Clearing a Cloudflare
-  interstitial peaks at **~0.6 GB** in a one-shot `--load` (one isolate thread, the
-  default there) and **~1.05 GB** on a server with 8 threads: the challenge itself opens
-  dozens of frames, sandboxes and workers, each a context.
+  interstitial peaks at **~0.45 GB** in a one-shot `--load` (one isolate thread, the
+  default there; Chrome on the same challenge: ~0.75 GB) and **~0.55 GB** with the
+  real-pixel `render` build: the challenge itself opens dozens of frames, sandboxes and
+  workers, each a context.
 - 🧩 **Drop-in for Puppeteer.** nokk speaks CDP over WebSocket. Point
   `puppeteer.connect()` at it and drive pages, navigate, and `evaluate()` as usual.
 - 🔬 **Real JS, real DOM.** Google's V8 runs page scripts against an HTML-parsed DOM,
@@ -89,9 +90,9 @@ Three variants are published per release:
 
 | Tag | Base | Notes |
 |-----|------|-------|
-| `:latest`, `:<version>`, `:distroless` | distroless | Smallest; no shell. The default. |
-| `:debian`, `:<version>-debian` | debian-slim | Larger, but has a shell for `docker exec` debugging. |
-| `:render`, `:<version>-render` | debian-slim + Mesa | **Real** canvas/WebGL pixels instead of synthesis — see [`docs/rendering.md`](docs/rendering.md). |
+| `:latest`, `:<version>`, `:distroless` | distroless | Light build, smallest image; no shell. The default. |
+| `:debian`, `:<version>-debian` | debian-slim | Light build with a shell for `docker exec` debugging. |
+| `:render`, `:<version>-render` | debian-slim + Mesa | **Real** canvas/WebGL pixels instead of synthesis, ~100 MB more at peak — see [`docs/rendering.md`](docs/rendering.md). |
 
 Or build the image yourself from a checkout: `docker build -t nokk .` (add
 `--target debian` or `--target render` for the other variants).
@@ -105,9 +106,11 @@ tar -xzf nokk-*-linux-x86_64.tar.gz
 ./nokk --eval 'navigator.webdriver'
 ```
 
-The release also carries `nokk-render-*-linux-x86_64.tar.gz`: the same engine with
-real canvas/WebGL rasterization compiled in. Canvas 2D works anywhere; WebGL needs
-Mesa on the host (`libegl1 libgl1-mesa-dri`) and falls back to synthesis without it.
+That is the light build, which `npm install` and `pip install` fetch too. The release
+also carries `nokk-render-*-linux-x86_64.tar.gz`: the same engine with real canvas/WebGL
+rasterization compiled in, for sites that compare pixels (`cargo build --features
+render,webgl` from source). Canvas 2D works anywhere; WebGL needs Mesa on the host
+(`libegl1 libgl1-mesa-dri`) and falls back to synthesis without it.
 
 ### Build from source
 
