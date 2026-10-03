@@ -158,14 +158,12 @@ struct Cli {
     /// For `--load`: fill a form field, `SELECTOR=VALUE`. Repeatable, applied
     /// in order before `--click`. Sets the value and fires the input/change
     /// events a real keystroke sequence produces.
-    #[arg(long, value_name = "SELECTOR=VALUE")]
+    #[arg(long, value_name = "SELECTOR=VALUE", requires = "load")]
     fill: Vec<String>,
 
     /// For `--load`: click an element by selector, with real (trusted) pointer
-    /// events. Repeatable, applied in order after `--fill`. A stale modal
-    /// backdrop is cleared first — an orphaned `.modal-backdrop` swallows the
-    /// pointer and the click silently does nothing.
-    #[arg(long, value_name = "SELECTOR")]
+    /// events. Repeatable, applied in order after `--fill`.
+    #[arg(long, value_name = "SELECTOR", requires = "load")]
     click: Vec<String>,
 
     /// For `--load`: after the steps above, wait for a captured response whose
@@ -264,16 +262,13 @@ async fn fill_input(ctx: &BrowserContext, spec: &str) -> Result<()> {
     }
 }
 
-/// Click one `--click SELECTOR` step with trusted pointer events: clear a stale
-/// modal backdrop, scroll the element into view, hit its centre. Fails when
-/// nothing matches.
+/// Click one `--click SELECTOR` step with trusted pointer events: scroll the
+/// element into view, hit its centre. Fails when nothing matches. The page is
+/// not touched otherwise — a click that lands on an overlay lands there, as a
+/// person's would.
 async fn click_selector(ctx: &BrowserContext, selector: &str) -> Result<()> {
     let js = format!(
-        "(sel => {{ const open = [...document.querySelectorAll('.modal.show')]; \
-           if (!open.length) {{ document.querySelectorAll('.modal-backdrop') \
-             .forEach(el => el.remove()); \
-             document.body.classList.remove('modal-open'); }} \
-           const el = document.querySelector(sel); if (!el) return 'missing'; \
+        "(sel => {{ const el = document.querySelector(sel); if (!el) return 'missing'; \
            el.scrollIntoView({{ block: 'center' }}); \
            const r = el.getBoundingClientRect(); \
            return JSON.stringify({{ x: r.left + r.width / 2, y: r.top + r.height / 2 }}); \
@@ -302,13 +297,21 @@ async fn click_selector(ctx: &BrowserContext, selector: &str) -> Result<()> {
 /// Wait for the page's own request whose URL contains `needle`, then print its
 /// body. The engine records every request with its body, so no in-page hook is
 /// needed; the event loop is pumped while waiting so the page's callbacks run.
-async fn wait_response(ctx: &BrowserContext, needle: &str, timeout_secs: u64) -> Result<()> {
+async fn wait_response(
+    ctx: &BrowserContext,
+    needle: &str,
+    timeout_secs: u64,
+    after: usize,
+) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         ctx.run_event_loop().await.ok();
+        // Only what the steps caused: a page that asked the same endpoint while
+        // loading would otherwise hand back that earlier, unrelated answer.
         if let Some(r) = ctx
             .requests()
             .into_iter()
+            .skip(after)
             .find(|r| r.url.contains(needle) && r.status != 0)
         {
             println!("{}", String::from_utf8_lossy(&r.body));
@@ -2817,6 +2820,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
 
         // Drive a form: fills, then trusted clicks, in order. Runs before
         // `--eval` so a probe sees the page the steps left behind.
+        let before_steps = ctx.requests().len();
         for spec in &cli.fill {
             fill_input(&ctx, spec).await?;
         }
@@ -2833,7 +2837,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
         // Wait for the page's own answer (e.g. a bill query's XHR), print its
         // body, and exit.
         if let Some(needle) = &cli.wait_response {
-            wait_response(&ctx, needle, cli.response_timeout).await?;
+            wait_response(&ctx, needle, cli.response_timeout, before_steps).await?;
             return Ok(());
         }
 
