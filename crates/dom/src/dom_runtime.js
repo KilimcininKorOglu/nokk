@@ -1328,7 +1328,9 @@
     requestSubmit(submitter) {
       if (this.__ptLocal !== 'form') return;
       if (submitter !== undefined && submitter !== null && !(submitter && submitter.nodeType === ELEMENT_NODE)) throw __pt_mkErr(TypeError, "Failed to execute 'requestSubmit' on 'HTMLFormElement': parameter 1 is not of type 'HTMLElement'.");
-      const ev = new (globalThis.SubmitEvent || Event)('submit', { bubbles: true, cancelable: true, submitter: submitter || null });
+      // `submit` шлёт сам браузер — оно доверенное, даже когда отправку
+      // попросил скрипт (у Chrome `isTrusted` здесь true).
+      const ev = __ptTrust(new (globalThis.SubmitEvent || Event)('submit', { bubbles: true, cancelable: true, submitter: submitter || null }));
       if (!this.dispatchEvent(ev)) return;
       this.__ptSubmit(submitter || null);
     }
