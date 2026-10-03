@@ -81,6 +81,13 @@ struct Cli {
     #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "60")]
     solve_challenge: Option<u64>,
 
+    /// For `--load` with `--solve-challenge`: stop the moment Cloudflare hands
+    /// out a fresh `cf_clearance`, without loading the site behind it. For a
+    /// caller that only wants the cookie (it lands in `--session-store`): on a
+    /// heavy site the page behind the gate is most of the time a solve takes.
+    #[arg(long, requires = "solve_challenge", env = "NOKK_UNTIL_CLEARANCE")]
+    until_clearance: bool,
+
     /// Route all requests through a proxy, e.g.
     /// `http://user:pass@host:port` or `socks5://host:port`. Essential for
     /// IP rotation against WAFs like Cloudflare (a burned IP gets an instant 403).
@@ -504,6 +511,9 @@ async fn real_main() -> Result<()> {
                 }
                 None => engine.new_context().await?,
             };
+            if cli.until_clearance {
+                c.set_stop_at_clearance(true);
+            }
             // Узкий инструмент: только конструктор `Error`, и только чтобы
             // прочитать, на чём споткнулась чужая программа. Всё, что шире —
             // подмена `JSON.stringify`, `Array.join`, `String.fromCharCode` —
@@ -2924,8 +2934,13 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
         // отдавать страницу «Just a moment…» нечестно: снаружи она выглядит как
         // обычная загрузка.
         let final_title = ctx.evaluate("document.title").await.unwrap_or_default();
-        let still_challenged =
+        let at_gate =
             matches!(&final_title, serde_json::Value::String(s) if s.contains("Just a moment"));
+        // `--until-clearance` stops on the gate's page on purpose, lock in hand.
+        let still_challenged = at_gate && !ctx.stopped_at_clearance();
+        if at_gate && !still_challenged {
+            eprintln!("clearance obtained; the site behind the gate was not loaded (--until-clearance)");
+        }
         if still_challenged {
             if cli.import_cookies.is_some() {
                 eprintln!(

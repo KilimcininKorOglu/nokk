@@ -736,6 +736,9 @@ impl Engine {
             nav_started: std::sync::Mutex::new(None),
             loading: std::sync::atomic::AtomicUsize::new(0),
             sheets_gave_up: std::sync::atomic::AtomicU64::new(0),
+            stop_at_clearance: std::sync::atomic::AtomicBool::new(false),
+            stopped_at_clearance: std::sync::atomic::AtomicBool::new(false),
+            lock_at_doc: std::sync::Mutex::new(None),
             requests: std::sync::Mutex::new(Vec::new()),
             started: std::time::Instant::now(),
             timings_sent: std::sync::Mutex::new(HashMap::new()),
@@ -911,6 +914,15 @@ pub struct BrowserContext {
     /// The document (`doc_seq + 1`) whose blocking stylesheets timed out once:
     /// its later scripts do not wait for them again.
     sheets_gave_up: std::sync::atomic::AtomicU64,
+    /// Stop at the clearance: when a response hands out a new `cf_clearance`,
+    /// do not load the page behind it (see `set_stop_at_clearance`).
+    stop_at_clearance: std::sync::atomic::AtomicBool,
+    /// Set when a navigation stopped at a fresh clearance.
+    stopped_at_clearance: std::sync::atomic::AtomicBool,
+    /// The `cf_clearance` in the jar when the current document was loaded
+    /// (`None` inside: there was none). A navigation away from a document after
+    /// a new lock arrived is the interstitial walking on to the site.
+    lock_at_doc: std::sync::Mutex<Option<Option<String>>>,
     /// Every network request the engine made for this context, in order — the
     /// built-in interception log (document + external scripts + page fetch/XHR).
     requests: std::sync::Mutex<Vec<NetworkRecord>>,
@@ -1272,10 +1284,36 @@ impl BrowserContext {
         for _ in 0..MAX_META_HOPS {
             // Use the post-redirect URL as the document base, so `window.location`
             // and relative-URL resolution reflect where we actually landed.
+            let stop = self.stop_at_clearance.load(std::sync::atomic::Ordering::Acquire);
+            // The lock as the current document saw it — the first navigation has
+            // no document yet, so the jar as it stands (a stale imported cookie
+            // must not count as a fresh one).
+            let lock_before = if stop {
+                self.lock_at_doc
+                    .lock()
+                    .ok()
+                    .and_then(|l| l.clone())
+                    .unwrap_or_else(|| self.clearance_value())
+            } else {
+                None
+            };
             let (final_url, html) = match post.take() {
                 Some((ctype, body)) => self.fetch_document_post(&current, referrer, ctype, body).await?,
                 None => self.fetch_text_from(&current, "document", referrer).await?,
             };
+            // The lock is what a solve is for. A caller that takes the cookie
+            // elsewhere (curl with the clearance, another client) has no use for
+            // the site behind it — and loading a modern site is the long half of
+            // a solve: indeed.com spent 16 s on its own React bundles after the
+            // challenge had already cleared.
+            if stop {
+                let after = self.clearance_value();
+                if after.is_some() && after != lock_before {
+                    tracing::info!(target: "nokk", url = %final_url, "clearance received; not loading the page behind it");
+                    self.stopped_at_clearance.store(true, std::sync::atomic::Ordering::Release);
+                    return Ok(());
+                }
+            }
             self.load_html(&final_url, &html).await?;
             match self.meta_refresh_target(&final_url).await {
                 Some(next) if next != final_url && next != current => current = next,
@@ -1388,6 +1426,9 @@ impl BrowserContext {
     }
 
     async fn load_html_now(&self, base_url: &str, html: &str) -> Result<(), EngineError> {
+        if let Ok(mut l) = self.lock_at_doc.lock() {
+            *l = Some(self.clearance_value());
+        }
         // The outgoing document takes its workers with it.
         self.terminate_workers_of(None).await;
         // And its realm: a browser gives every document a fresh global, so
@@ -1498,6 +1539,23 @@ impl BrowserContext {
             js_str(&v.to_string())
         );
         let _ = self.eval_in(self.idx(), &js).await;
+    }
+
+    /// Stop at the clearance: once a response hands out a new `cf_clearance`,
+    /// the navigation ends there instead of loading the page behind it, and the
+    /// solver reports `cleared` at once. For callers that only want the cookie.
+    pub fn set_stop_at_clearance(&self, on: bool) {
+        self.stop_at_clearance.store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether a navigation stopped at a fresh clearance (stop-at-clearance
+    /// mode): the page still shows the gate, and the lock is in the jar.
+    pub fn stopped_at_clearance(&self) -> bool {
+        self.stopped_at_clearance.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn clearance_value(&self) -> Option<String> {
+        self.client.cookies().into_iter().find(|c| c.name == "cf_clearance").map(|c| c.value)
     }
 
     /// The number of documents this page has loaded so far (see `doc_seq`).
@@ -2506,6 +2564,9 @@ impl BrowserContext {
         // a widget can be inserted by script a moment after the load.
         const NO_GATE_GRACE: std::time::Duration = std::time::Duration::from_secs(4);
         let mut gate_last_seen = t;
+        // In stop-at-clearance mode only a fresh lock counts: one already in the
+        // jar may be the stale cookie that sent us to the gate.
+        let lock_at_start = self.clearance_value();
         let mut gate_checked = t - std::time::Duration::from_secs(1);
         let status = loop {
             let worked = self.run_event_loop().await.unwrap_or(0);
@@ -2520,6 +2581,13 @@ impl BrowserContext {
             if token && !cleared {
                 tracing::info!(target: "nokk", elapsed_ms = t.elapsed().as_millis(), presses = pressed, "challenge complete: widget token issued");
                 break ChallengeStatus::TokenIssued;
+            }
+            if self.stop_at_clearance.load(std::sync::atomic::Ordering::Acquire)
+                && (self.stopped_at_clearance.load(std::sync::atomic::Ordering::Acquire)
+                    || (cleared && self.clearance_value() != lock_at_start))
+            {
+                tracing::info!(target: "nokk", elapsed_ms = t.elapsed().as_millis(), presses = pressed, "challenge cleared");
+                break ChallengeStatus::Cleared;
             }
             if cleared {
                 tracing::info!(target: "nokk", elapsed_ms = t.elapsed().as_millis(), presses = pressed, "challenge cleared");

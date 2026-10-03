@@ -228,6 +228,21 @@ gate), and `--solve-challenge N` is the time budget. Measured on live sites (202
 (interactive interstitial, ~10 s), the Turnstile test pages on `peet.ws` (standalone
 widget: the token lands in `cf-turnstile-response`, and that counts as success).
 
+**Only after the cookie?** `--until-clearance` stops the moment Cloudflare hands out a
+fresh `cf_clearance` and does not load the site behind the gate — on a heavy site that
+page is most of a solve. Take the cookie from `--session-store` and use it from any
+client on the same exit IP and Chrome version:
+
+```bash
+nokk --load https://www.indeed.com/ --solve-challenge 60 --until-clearance \
+     --fail-on-challenge --session-store ./sessions --session s1
+# ./sessions/s1.json now holds cf_clearance; the process exits 0
+```
+
+Measured through one proxy (October 2026): indeed 31 s → 9 s, stake 42 s → 11 s,
+cardmarket 38 s → 9 s and 40 s → 9 s of CPU — the site's own bundles, not the challenge,
+were the cost.
+
 **Over CDP / Puppeteer** it is the same engine with three ways in:
 
 ```bash
