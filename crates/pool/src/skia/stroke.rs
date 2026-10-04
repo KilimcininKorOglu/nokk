@@ -631,7 +631,7 @@ fn round_joiner(outer: &mut PathBuilder, inner: &mut PathBuilder, before_unit: P
     }
 }
 
-const ONE_OVER_SQRT2: f32 = 0.707106781;
+const ONE_OVER_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 #[allow(clippy::too_many_arguments)]
 fn miter_joiner(outer: &mut PathBuilder, inner: &mut PathBuilder, before_unit: Point, pivot: Point, after_unit: Point, radius: f32, inv_miter_limit: f32, prev_is_line: bool, curr_is_line: bool) {
