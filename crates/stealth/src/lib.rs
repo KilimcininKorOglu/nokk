@@ -8656,6 +8656,11 @@ const GL_ARITY: &str = r#"{"activeTexture":1,"attachShader":2,"bindAttribLocatio
 /// Снятое у Chrome 151: разделы предложения WebRTC и getCapabilities.
 const RTC_CHROME: &str = include_str!("rtc_chrome.json");
 
+// The windows-1250 byte table below carries literal C1 control bytes on
+// purpose: it replicates exactly what Chrome's TextDecoder hands a page, and
+// clippy::invisible_characters would otherwise refuse the very data this
+// template exists to reproduce.
+#[allow(clippy::invisible_characters)]
 const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // Форма интерфейсного объекта. Обычная функция несёт собственные `arguments`
   // и `caller` — у браузерного интерфейса их нет, и обход графа видит два лишних

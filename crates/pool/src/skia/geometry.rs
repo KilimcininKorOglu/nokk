@@ -5,7 +5,7 @@
 use super::fixed::saturate2int;
 
 pub const SCALAR_NEARLY_ZERO: f32 = 1.0 / (1 << 12) as f32;
-pub const SCALAR_ROOT_2_OVER_2: f32 = 0.707_106_78_f32;
+pub const SCALAR_ROOT_2_OVER_2: f32 = std::f32::consts::FRAC_1_SQRT_2;
 pub const SCALAR_PI: f32 = std::f32::consts::PI;
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]

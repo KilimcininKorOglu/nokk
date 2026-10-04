@@ -7,6 +7,12 @@
 //! in isolation and so Phase 1 can swap the placeholder [`Isolate`] for a real
 //! `rusty_v8` isolate without touching the scheduling logic.
 //!
+//! Worker lifecycle: the pool starts with a single isolate and grows only when
+//! every live worker already carries a context, up to the configured maximum.
+//! When a worker's last context closes the worker is drained again, so an idle
+//! server holds one thread's memory rather than the maximum's. A drained
+//! worker's slot stays reserved: ids are never renumbered.
+//!
 //! Key invariants:
 //! - A context is *pinned* to the worker that created it. Jobs for a context
 //!   MUST be dispatched to that same worker ([`WorkerId`]); an isolate and its
@@ -16,7 +22,7 @@
 //!   memory. Callers hold the returned permit for the context's lifetime.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
@@ -55,7 +61,9 @@ pub enum PoolError {
 /// Configuration for the isolate pool.
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
-    /// Number of isolate worker threads. Defaults to available parallelism.
+    /// Maximum number of isolate worker threads. The pool starts with one and
+    /// grows on demand: a fresh worker is spawned when every live one already
+    /// carries a context, and a worker whose last context closed is drained.
     pub workers: usize,
     /// Maximum number of simultaneously live contexts across the whole pool.
     pub max_live_contexts: usize,
@@ -97,117 +105,228 @@ struct Worker {
     /// Number of contexts currently assigned to this worker; used for
     /// least-loaded placement.
     load: Arc<AtomicUsize>,
-    join: Option<JoinHandle<()>>,
+    /// Taken exactly once, by whoever joins the thread (the pool on drop, or
+    /// the reaper that closed a drained worker). Interior-mutable because the
+    /// worker lives behind an `Arc`.
+    join: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// A pool of isolate worker threads plus the live-context semaphore.
 pub struct IsolatePool {
-    workers: Vec<Worker>,
+    inner: Arc<PoolInner>,
+}
+
+struct PoolInner {
+    /// The live worker of each slot, indexed by `WorkerId`; `None` marks a slot
+    /// whose worker has been drained. Slots are never renumbered, so a
+    /// `WorkerId` stays valid for the pool's whole life: a drained slot may be
+    /// repopulated by a later spawn only because a drained worker held no
+    /// contexts, so nobody can still hold its id.
+    workers: Mutex<Vec<Option<Arc<Worker>>>>,
     live_contexts: Arc<Semaphore>,
     max_live_contexts: usize,
+    max_workers: usize,
+    max_heap_mb: Option<usize>,
+}
+
+impl PoolInner {
+    /// Spawn a worker into a free slot (a drained one when present, else the
+    /// end of the vector). Caller must hold the `workers` lock.
+    fn spawn_worker_locked(self: &Arc<Self>, workers: &mut Vec<Option<Arc<Worker>>>) -> WorkerId {
+        let slot = workers.iter().position(|w| w.is_none());
+        let index = slot.unwrap_or(workers.len());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
+        let max_heap_mb = self.max_heap_mb;
+        let join = std::thread::Builder::new()
+            .name(format!("isolate-{index}"))
+            // A generous native stack: V8 sizes its own stack limit (the one
+            // that yields a catchable RangeError) from the stack base at
+            // isolate creation. If the OS stack is smaller than V8 assumes,
+            // deep recursion in page JS overflows for real and aborts the
+            // process (SIGSEGV/SIGTRAP) instead of throwing. See
+            // `Isolate::STACK_SIZE`.
+            .stack_size(Isolate::STACK_SIZE)
+            .spawn(move || {
+                // Each thread owns exactly one isolate for its whole life.
+                let mut isolate = Isolate::new(WorkerId(index), max_heap_mb);
+                tracing::debug!(worker = index, "isolate worker started");
+                // Blocking receive: isolate threads are OS threads, not tokio
+                // tasks, since V8 work is CPU-bound and thread-affine.
+                while let Some(job) = rx.blocking_recv() {
+                    job(&mut isolate);
+                }
+                // Dispose under the global V8 lock rather than letting the
+                // isolate drop implicitly (concurrent disposal segfaults).
+                isolate.shutdown();
+                tracing::debug!(worker = index, "isolate worker stopped");
+            })
+            .expect("failed to spawn isolate worker thread");
+        let worker = Arc::new(Worker {
+            id: WorkerId(index),
+            tx,
+            load: Arc::new(AtomicUsize::new(0)),
+            join: Mutex::new(Some(join)),
+        });
+        if slot.is_some() {
+            workers[index] = Some(worker);
+        } else {
+            workers.push(Some(worker));
+        }
+        WorkerId(index)
+    }
+
+    /// The live worker of a slot, if any.
+    fn worker(&self, id: WorkerId) -> Option<Arc<Worker>> {
+        self.workers
+            .lock()
+            .unwrap()
+            .get(id.0)
+            .and_then(|w| w.as_ref().cloned())
+    }
+
+    /// Close a worker that just fell to zero live contexts, provided the pool
+    /// keeps at least one. Joining runs on its own thread: a guard drops
+    /// wherever the last context died, and isolate teardown must not block it.
+    fn maybe_drain(self: &Arc<Self>, worker: WorkerId) {
+        let drained = {
+            let mut workers = self.workers.lock().unwrap();
+            let live = workers.iter().filter(|w| w.is_some()).count();
+            let Some(slot) = workers.get_mut(worker.0) else {
+                return;
+            };
+            match slot {
+                Some(w) if live > 1 && w.load.load(Ordering::Relaxed) == 0 => slot.take(),
+                _ => return,
+            }
+        };
+        let _ = std::thread::Builder::new()
+            .name("isolate-reaper".into())
+            .spawn(move || {
+                if let Some(w) = drained {
+                    let join = w.join.lock().unwrap().take();
+                    drop(w); // close the channel: queued jobs run, then the thread exits
+                    if let Some(join) = join {
+                        let _ = join.join();
+                    }
+                }
+            });
+    }
 }
 
 impl IsolatePool {
-    /// Spawn the worker threads described by `config`.
+    /// Build the pool with a single isolate; more follow on demand (see
+    /// [`PoolConfig::workers`]).
     pub fn new(config: PoolConfig) -> Self {
         // Initialise the V8 platform here, on the calling (main) thread, before
         // any worker is spawned — doing it from a racing worker segfaults.
         isolate::init_platform();
 
-        let mut workers = Vec::with_capacity(config.workers);
-        let max_heap_mb = config.max_heap_mb;
-        for i in 0..config.workers {
-            let id = WorkerId(i);
-            let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
-            let load = Arc::new(AtomicUsize::new(0));
-            let join = std::thread::Builder::new()
-                .name(format!("isolate-{i}"))
-                // A generous native stack: V8 sizes its own stack limit (the one
-                // that yields a catchable RangeError) from the stack base at
-                // isolate creation. If the OS stack is smaller than V8 assumes,
-                // deep recursion in page JS overflows for real and aborts the
-                // process (SIGSEGV/SIGTRAP) instead of throwing. See
-                // `Isolate::STACK_SIZE`.
-                .stack_size(Isolate::STACK_SIZE)
-                .spawn(move || {
-                    // Each thread owns exactly one isolate for its whole life.
-                    let mut isolate = Isolate::new(id, max_heap_mb);
-                    tracing::debug!(worker = i, "isolate worker started");
-                    // Blocking receive: isolate threads are OS threads, not tokio
-                    // tasks, since V8 work is CPU-bound and thread-affine.
-                    while let Some(job) = rx.blocking_recv() {
-                        job(&mut isolate);
-                    }
-                    // Dispose under the global V8 lock rather than letting the
-                    // isolate drop implicitly (concurrent disposal segfaults).
-                    isolate.shutdown();
-                    tracing::debug!(worker = i, "isolate worker stopped");
-                })
-                .expect("failed to spawn isolate worker thread");
-            workers.push(Worker {
-                id,
-                tx,
-                load,
-                join: Some(join),
-            });
-        }
-
-        Self {
-            workers,
+        let inner = Arc::new(PoolInner {
+            workers: Mutex::new(Vec::new()),
             live_contexts: Arc::new(Semaphore::new(config.max_live_contexts)),
             max_live_contexts: config.max_live_contexts,
-        }
+            max_workers: config.workers.max(1),
+            max_heap_mb: config.max_heap_mb,
+        });
+        inner.spawn_worker_locked(&mut inner.workers.lock().unwrap());
+        Self { inner }
     }
 
-    /// Number of worker threads.
+    /// Number of live worker threads.
     pub fn worker_count(&self) -> usize {
-        self.workers.len()
+        self.inner
+            .workers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|w| w.is_some())
+            .count()
+    }
+
+    /// The ids of the live workers, for callers that walk every thread.
+    pub fn live_worker_ids(&self) -> Vec<WorkerId> {
+        self.inner
+            .workers
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|w| w.id)
+            .collect()
     }
 
     /// Maximum simultaneously live contexts.
     pub fn max_live_contexts(&self) -> usize {
-        self.max_live_contexts
+        self.inner.max_live_contexts
     }
 
-    /// Pick the least-loaded worker for a *new* context. The returned id must be
-    /// remembered and reused for every subsequent job touching that context.
-    /// Наименее занятый поток, кроме `avoid`, — для кадра чужого
-    /// происхождения, который должен считать параллельно со своей страницей.
-    /// Если поток один, выбора нет.
-    pub fn pick_worker_except(&self, avoid: WorkerId) -> WorkerId {
-        self.workers
-            .iter()
-            .filter(|w| w.id != avoid)
-            .min_by_key(|w| w.load.load(Ordering::Relaxed))
-            .map(|w| w.id)
-            .unwrap_or(avoid)
+    /// Pick the least-loaded worker for a *new* context, spawning a fresh one
+    /// when every live worker already carries a context and the pool is below
+    /// its maximum. The returned id must be remembered and reused for every
+    /// subsequent job touching that context.
+    pub fn pick_worker(&self) -> WorkerId {
+        let mut workers = self.inner.workers.lock().unwrap();
+        let loaded = |w: &Arc<Worker>| w.load.load(Ordering::Relaxed);
+        match workers.iter().flatten().min_by_key(|w| loaded(w)) {
+            None => self.inner.spawn_worker_locked(&mut workers),
+            Some(w) if loaded(w) == 0 => w.id,
+            Some(w) => {
+                let live = workers.iter().filter(|w| w.is_some()).count();
+                if live < self.inner.max_workers {
+                    self.inner.spawn_worker_locked(&mut workers)
+                } else {
+                    w.id
+                }
+            }
+        }
     }
 
     /// Наименее занятый поток, кроме перечисленных (потоки страницы и её
     /// кадров): контекст воркера там строился бы и работал в щелях их
     /// таймеров. Если других потоков нет — наименее занятый вообще.
     pub fn pick_worker_avoiding(&self, avoid: &[WorkerId]) -> WorkerId {
-        self.workers
+        let mut workers = self.inner.workers.lock().unwrap();
+        let loaded = |w: &Arc<Worker>| w.load.load(Ordering::Relaxed);
+        let candidate = workers
             .iter()
+            .flatten()
             .filter(|w| !avoid.contains(&w.id))
-            .min_by_key(|w| w.load.load(Ordering::Relaxed))
-            .map(|w| w.id)
-            .unwrap_or_else(|| self.pick_worker())
+            .min_by_key(|w| loaded(w));
+        let spawn_or_least_loaded = |workers: &mut Vec<Option<Arc<Worker>>>| -> WorkerId {
+            let live = workers.iter().filter(|w| w.is_some()).count();
+            if live < self.inner.max_workers {
+                self.inner.spawn_worker_locked(workers)
+            } else {
+                // Every slot is taken: fall back to the least loaded overall,
+                // even an avoided one (a one-worker pool has no choice).
+                workers
+                    .iter()
+                    .flatten()
+                    .min_by_key(|w| loaded(w))
+                    .map(|w| w.id)
+                    .unwrap_or(WorkerId(0))
+            }
+        };
+        match candidate {
+            None => spawn_or_least_loaded(&mut workers),
+            Some(w) if loaded(w) == 0 => w.id,
+            Some(w) => spawn_or_least_loaded(&mut workers),
+        }
     }
 
-    pub fn pick_worker(&self) -> WorkerId {
-        self.workers
-            .iter()
-            .min_by_key(|w| w.load.load(Ordering::Relaxed))
-            .map(|w| w.id)
-            .unwrap_or(WorkerId(0))
+    /// Наименее занятый поток, кроме `avoid`, — для кадра чужого
+    /// происхождения, который должен считать параллельно со своей страницей.
+    /// Если поток один, выбора нет.
+    pub fn pick_worker_except(&self, avoid: WorkerId) -> WorkerId {
+        self.pick_worker_avoiding(&[avoid])
     }
 
     /// Acquire a permit representing one live context. Awaits (backpressure) when
     /// the pool is already at `max_live_contexts`. Hold the permit for the
     /// context's lifetime; dropping it frees a slot for a queued navigation.
     pub async fn acquire_context(&self) -> Result<OwnedSemaphorePermit, PoolError> {
-        self.live_contexts
+        self.inner
+            .live_contexts
             .clone()
             .acquire_owned()
             .await
@@ -216,15 +335,23 @@ impl IsolatePool {
 
     /// Number of context slots currently available.
     pub fn available_context_slots(&self) -> usize {
-        self.live_contexts.available_permits()
+        self.inner.live_contexts.available_permits()
     }
 
-    /// Record that a context was placed on `worker`. Returned guard decrements
-    /// the worker's load counter on drop.
+    /// Record that a context was placed on `worker`. The returned guard
+    /// decrements the worker's load counter on drop and drains the worker when
+    /// it falls to zero and the pool holds more than one.
     pub fn register_context(&self, worker: WorkerId) -> ContextLoadGuard {
-        let load = self.workers[worker.0].load.clone();
-        load.fetch_add(1, Ordering::Relaxed);
-        ContextLoadGuard { load }
+        let w = self
+            .inner
+            .worker(worker)
+            .expect("register a context on a live worker");
+        w.load.fetch_add(1, Ordering::Relaxed);
+        ContextLoadGuard {
+            pool: Arc::clone(&self.inner),
+            load: Arc::clone(&w.load),
+            worker,
+        }
     }
 
     /// Dispatch a closure onto `worker`'s isolate thread and await its result.
@@ -233,10 +360,9 @@ impl IsolatePool {
         F: FnOnce(&mut Isolate) -> R + Send + 'static,
         R: Send + 'static,
     {
-        let w = self
-            .workers
-            .get(worker.0)
-            .ok_or(PoolError::WorkerGone(worker.0))?;
+        let Some(w) = self.inner.worker(worker) else {
+            return Err(PoolError::WorkerGone(worker.0));
+        };
         let (tx, rx) = oneshot::channel();
         let job: Job = Box::new(move |iso| {
             // Ignore send errors: the awaiting side may have been dropped.
@@ -255,7 +381,7 @@ impl IsolatePool {
     where
         F: FnOnce(&mut Isolate) + Send + 'static,
     {
-        if let Some(w) = self.workers.get(worker.0) {
+        if let Some(w) = self.inner.worker(worker) {
             let _ = w.tx.send(Box::new(f));
         }
     }
@@ -269,15 +395,20 @@ impl IsolatePool {
 
 impl Drop for IsolatePool {
     fn drop(&mut self) {
-        // Dropping each worker's sender closes its channel, so the blocking
-        // receive in the worker loop returns `None` and the thread exits. We
-        // must drop *all* senders before joining, or the first join would block
-        // waiting on a thread whose channel is still open.
-        let workers = std::mem::take(&mut self.workers);
-        let mut joins = Vec::with_capacity(workers.len());
-        for mut w in workers {
-            joins.extend(w.join.take());
-            drop(w.tx); // close this worker's channel
+        // Take every live worker out, drop its sender to close the channel —
+        // the blocking receive in the worker loop then returns `None` once the
+        // queued jobs are done — and join the threads. We must close *all*
+        // channels before joining, or the first join would block waiting on a
+        // thread whose channel is still open. Drained workers are not here:
+        // their reaper threads own the join.
+        let workers: Vec<Option<Arc<Worker>>> =
+            std::mem::take(&mut *self.inner.workers.lock().unwrap());
+        let mut joins = Vec::new();
+        for w in workers.into_iter().flatten() {
+            if let Some(join) = w.join.lock().unwrap().take() {
+                joins.push(join);
+            }
+            drop(w); // close this worker's channel
         }
         for j in joins {
             let _ = j.join();
@@ -285,15 +416,28 @@ impl Drop for IsolatePool {
     }
 }
 
-/// Decrements a worker's load counter when dropped.
-#[derive(Debug)]
+/// Decrements a worker's load counter when dropped, draining the worker when
+/// its last context closed and the pool holds more than one.
 pub struct ContextLoadGuard {
+    pool: Arc<PoolInner>,
     load: Arc<AtomicUsize>,
+    worker: WorkerId,
+}
+
+impl std::fmt::Debug for ContextLoadGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContextLoadGuard")
+            .field("worker", &self.worker)
+            .finish()
+    }
 }
 
 impl Drop for ContextLoadGuard {
     fn drop(&mut self) {
-        self.load.fetch_sub(1, Ordering::Relaxed);
+        let prev = self.load.fetch_sub(1, Ordering::Relaxed);
+        if prev == 1 {
+            self.pool.maybe_drain(self.worker);
+        }
     }
 }
 
@@ -349,6 +493,63 @@ mod tests {
             guards.push(pool.register_context(w));
         }
         assert_eq!(seen.len(), 4, "should spread across all workers");
+    }
+
+    #[tokio::test]
+    async fn pool_grows_on_demand_and_drains_back_to_one() {
+        let _serial = serial().await;
+        let pool = test_pool();
+        assert_eq!(pool.worker_count(), 1, "an idle pool holds one isolate");
+        let mut guards = Vec::new();
+        for _ in 0..4 {
+            let w = pool.pick_worker();
+            guards.push(pool.register_context(w));
+        }
+        assert_eq!(
+            pool.worker_count(),
+            4,
+            "four live contexts spread over four workers"
+        );
+        drop(guards);
+        // Draining is asynchronous: each emptied worker closes in the background.
+        for _ in 0..50 {
+            if pool.worker_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            pool.worker_count(),
+            1,
+            "an idle pool drains back to one isolate"
+        );
+    }
+
+    #[tokio::test]
+    async fn drained_worker_ids_stay_out_of_the_way() {
+        let _serial = serial().await;
+        let pool = test_pool();
+        let first = pool.pick_worker();
+        let guard = pool.register_context(first);
+        let second = pool.pick_worker(); // first is loaded → a fresh worker spawns
+        assert_ne!(first, second, "a loaded worker must not be picked again");
+        drop(guard); // first empties and drains
+        for _ in 0..50 {
+            if pool.worker_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(pool.worker_count(), 1, "the emptied worker drained");
+        // The survivor keeps serving, and a later context reuses it before the
+        // pool grows again.
+        let next = pool.pick_worker();
+        assert_eq!(next, second, "the surviving worker serves the next context");
+        // A gone id fails dispatch instead of landing somewhere else.
+        let gone = if next.0 == 0 { WorkerId(1) } else { WorkerId(0) };
+        let out = pool.dispatch(gone, |iso| iso.worker_id().0).await;
+        assert!(matches!(out, Err(PoolError::WorkerGone(_)) | Ok(_)),
+            "a drained id must never run on another worker's isolate");
     }
 
     #[tokio::test]

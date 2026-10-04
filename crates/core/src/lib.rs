@@ -700,6 +700,22 @@ impl Engine {
         self.build_context(client, Some(name), bootstrap).await
     }
 
+    /// Drop the pooled client (cookie jar + connection pool) bound to an
+    /// anonymous identity. Called when a CDP browser context is disposed:
+    /// without this the per-identity client would outlive the context and
+    /// accumulate for the engine's lifetime. Named sessions keep their pooled
+    /// client by design, so the caller must not release those.
+    pub fn release_identity(&self, identity: &str) {
+        if identity.is_empty() {
+            return;
+        }
+        self.inner
+            .client_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(identity);
+    }
+
     /// Shared tail of context creation: acquire a slot, place on the least-loaded
     /// worker, build the V8 context, and wrap it with an optional session name.
     async fn build_context(
@@ -2161,16 +2177,16 @@ impl BrowserContext {
                 self.engine.pool.dispatch_detached(self.worker, |iso| iso.top_up_realms(4, 1));
                 if last_spare_topup.elapsed() >= std::time::Duration::from_millis(500) {
                     last_spare_topup = std::time::Instant::now();
-                    for w in 0..self.engine.pool.worker_count() {
+                    for w in self.engine.pool.live_worker_ids() {
                         // Не на потоках страницы и кадров: сборка занимает их на
                         // сотни миллисекунд, и таймеры страницы ждут.
-                        if w == self.worker.0 || w == self.frame_worker.0 {
+                        if w == self.worker || w == self.frame_worker {
                             continue;
                         }
                         let boot = self.bootstrap.clone();
                         self.engine
                             .pool
-                            .dispatch_detached(nokk_pool::WorkerId(w), move |iso| iso.prewarm_contexts(&boot, 1));
+                            .dispatch_detached(w, move |iso| iso.prewarm_contexts(&boot, 1));
                     }
                 }
             }
@@ -3416,14 +3432,14 @@ impl BrowserContext {
                         // И по готовому контексту воркера на каждом потоке пула:
                         // программа челленджа заводит воркеры один за другим и
                         // ждёт ответа в пределах сотен миллисекунд.
-                        for w in 0..self.engine.pool.worker_count() {
-                            if w == self.worker.0 || w == self.frame_worker.0 {
+                        for w in self.engine.pool.live_worker_ids() {
+                            if w == self.worker || w == self.frame_worker {
                                 continue;
                             }
                             let boot = boot.clone();
                             self.engine
                                 .pool
-                                .dispatch_detached(nokk_pool::WorkerId(w), move |iso| iso.prewarm_contexts(&boot, 1));
+                                .dispatch_detached(w, move |iso| iso.prewarm_contexts(&boot, 1));
                         }
                     }
                     let nav_started = std::time::Instant::now();
@@ -5135,6 +5151,39 @@ mod tests {
             .unwrap();
         // A and B each got their own client; A2 reused A's; the default is separate.
         assert_eq!(engine.inner.client_pool.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn releasing_an_identity_drops_its_pooled_client() {
+        let _serial = serial().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 8,
+                max_heap_mb: None,
+            },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let _a = engine
+            .new_context_with_identity("A".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(engine.inner.client_pool.lock().unwrap().len(), 1);
+        engine.release_identity("A");
+        assert!(
+            engine.inner.client_pool.lock().unwrap().is_empty(),
+            "a released identity must not keep its client pooled"
+        );
+        // Releasing an unknown identity is a harmless no-op.
+        engine.release_identity("never-created");
+        // Re-creating the identity builds a fresh client again.
+        let _a2 = engine
+            .new_context_with_identity("A".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(engine.inner.client_pool.lock().unwrap().len(), 1);
     }
 
     /// A unique, empty session-store directory for a test.
@@ -7384,6 +7433,13 @@ mod tests {
             (sum - 124.04347527516074).abs() < 1e-12,
             "сумма модулей {sum}, у Chrome 151 — 124.04347527516074"
         );
+        // The joined length reads every one of the 44100 samples' decimal
+        // digits. The compressor calls the machine's libm for log10f/powf —
+        // on purpose (see crates/pool/src/compressor.rs): nokk matches the
+        // Chrome of the machine it runs on. On anything but the Linux box the
+        // constants were recorded on, a few samples land one ulp off and spell
+        // one character longer, so that exact length holds on Linux only.
+        #[cfg(target_os = "linux")]
         assert_eq!(p["joined"], 882861, "длина склейки отсчётов: {p}");
         let mid: Vec<f64> = p["mid"]
             .as_array()
@@ -7486,6 +7542,11 @@ mod tests {
               // Миллион удерживаемых объектов: сборка мусора бутстрапа посреди
               // цикла отдаёт десятки мегабайт, и меньший прирост её не перекрывал.
               for (let i = 0; i < 1000000; i++) junk.push({ x: i, s: 'abc' + i });
+              // Показания памяти обновляются не чаще раза в 50 мс, как у Chrome:
+              // на быстрой машине весь цикл укладывается в это окно, и повторное
+              // чтение без паузы вернуло бы прежнее значение на всякой сборке.
+              const t0 = Date.now();
+              while (Date.now() - t0 < 60) {}
               const after = m.usedJSHeapSize;
               return __ptJSON.stringify({
                 before, after, total: m.totalJSHeapSize, limit: m.jsHeapSizeLimit,
