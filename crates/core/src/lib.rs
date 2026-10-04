@@ -7433,6 +7433,13 @@ mod tests {
             (sum - 124.04347527516074).abs() < 1e-12,
             "сумма модулей {sum}, у Chrome 151 — 124.04347527516074"
         );
+        // The joined length reads every one of the 44100 samples' decimal
+        // digits. The compressor calls the machine's libm for log10f/powf —
+        // on purpose (see crates/pool/src/compressor.rs): nokk matches the
+        // Chrome of the machine it runs on. On anything but the Linux box the
+        // constants were recorded on, a few samples land one ulp off and spell
+        // one character longer, so that exact length holds on Linux only.
+        #[cfg(target_os = "linux")]
         assert_eq!(p["joined"], 882861, "длина склейки отсчётов: {p}");
         let mid: Vec<f64> = p["mid"]
             .as_array()
