@@ -1130,12 +1130,10 @@ impl Isolate {
     pub fn dispose_context(&mut self, index: usize) {
         self.log_heap("dispose");
         if let Some(slot) = self.contexts.get_mut(index) {
-            if slot.take().is_some() && std::env::var_os("NOKK_NO_GC_HINT").is_none() {
-                // Контекст — это мегабайты кучи, и освободит их только сборка.
-                // Под потолком в несколько гигабайт V8 собирает лениво, и за одно
-                // решение заставы (полсотни контекстов: кадры, песочницы,
-                // воркеры) мёртвые копились до пика. Умеренное давление — это
-                // постепенная сборка, без остановки страницы.
+            if slot.take().is_some() && gc_hint_due() {
+                // Контекст — это мегабайты кучи, и освободит их только сборка;
+                // подсказка ускоряет её ценой процессора — включается
+                // `NOKK_GC_HINT_MS` (см. `gc_hint_due`).
                 self.isolate
                     .memory_pressure_notification(v8::MemoryPressureLevel::Moderate);
             }
@@ -1522,3 +1520,27 @@ fn exception_message(
         None => "unknown JS error".to_string(),
     }
 }
+
+/// Whether a disposed context should nudge the collector now. Off unless
+/// `NOKK_GC_HINT_MS=<ms>` asks for it (0 = on every disposal): each nudge starts
+/// a concurrent marking of the whole heap on V8's helper threads, and a solve
+/// disposes dozens of contexts. Measured on two Cloudflare interstitials, four
+/// runs each: hinting on every disposal 9.3 s CPU / 430 MB peak, at most every
+/// 3 s 8.3 s / 510 MB, never 6.9 s / 575 MB. A server bound by cores, not RAM,
+/// wants the last; a tight-memory box can trade CPU back for memory.
+fn gc_hint_due() -> bool {
+    use std::cell::Cell;
+    thread_local! { static LAST: Cell<Option<std::time::Instant>> = const { Cell::new(None) }; }
+    let Some(every) = std::env::var("NOKK_GC_HINT_MS").ok().and_then(|v| v.parse::<u64>().ok()) else {
+        return false;
+    };
+    LAST.with(|last| {
+        let now = std::time::Instant::now();
+        let due = last.get().is_none_or(|t| now.duration_since(t).as_millis() as u64 >= every);
+        if due {
+            last.set(Some(now));
+        }
+        due
+    })
+}
+
