@@ -7542,6 +7542,11 @@ mod tests {
               // Миллион удерживаемых объектов: сборка мусора бутстрапа посреди
               // цикла отдаёт десятки мегабайт, и меньший прирост её не перекрывал.
               for (let i = 0; i < 1000000; i++) junk.push({ x: i, s: 'abc' + i });
+              // Показания памяти обновляются не чаще раза в 50 мс, как у Chrome:
+              // на быстрой машине весь цикл укладывается в это окно, и повторное
+              // чтение без паузы вернуло бы прежнее значение на всякой сборке.
+              const t0 = Date.now();
+              while (Date.now() - t0 < 60) {}
               const after = m.usedJSHeapSize;
               return __ptJSON.stringify({
                 before, after, total: m.totalJSHeapSize, limit: m.jsHeapSizeLimit,
