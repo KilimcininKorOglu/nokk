@@ -243,6 +243,11 @@ impl IsolatePool {
             .count()
     }
 
+    /// Whether `id` still names a live worker (a drained one does not).
+    pub fn is_live(&self, id: WorkerId) -> bool {
+        self.inner.worker(id).is_some()
+    }
+
     /// The ids of the live workers, for callers that walk every thread.
     pub fn live_worker_ids(&self) -> Vec<WorkerId> {
         self.inner
@@ -342,14 +347,18 @@ impl IsolatePool {
     /// decrements the worker's load counter on drop and drains the worker when
     /// it falls to zero and the pool holds more than one.
     pub fn register_context(&self, worker: WorkerId) -> ContextLoadGuard {
-        let w = self
-            .inner
-            .worker(worker)
-            .expect("register a context on a live worker");
-        w.load.fetch_add(1, Ordering::Relaxed);
+        // A worker drained between placement and registration counts nothing:
+        // the caller's dispatch to it fails on its own.
+        let load = match self.inner.worker(worker) {
+            Some(w) => {
+                w.load.fetch_add(1, Ordering::Relaxed);
+                Arc::clone(&w.load)
+            }
+            None => Arc::new(AtomicUsize::new(1)),
+        };
         ContextLoadGuard {
             pool: Arc::clone(&self.inner),
-            load: Arc::clone(&w.load),
+            load,
             worker,
         }
     }

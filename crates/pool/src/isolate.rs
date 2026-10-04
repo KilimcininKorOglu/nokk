@@ -1536,7 +1536,7 @@ fn gc_hint_due() -> bool {
     };
     LAST.with(|last| {
         let now = std::time::Instant::now();
-        let due = last.get().is_none_or(|t| now.duration_since(t).as_millis() as u64 >= every);
+        let due = last.get().map_or(true, |t| now.duration_since(t).as_millis() as u64 >= every);
         if due {
             last.set(Some(now));
         }

@@ -738,7 +738,7 @@ impl Engine {
         // Поток для будущих кадров чужого происхождения выбирается сразу.
         let frame_worker = self.inner.pool.pick_worker_except(worker);
         Ok(BrowserContext {
-            frame_worker,
+            frame_worker: std::sync::Mutex::new(frame_worker),
             frame_pump_count: std::sync::atomic::AtomicUsize::new(0),
             last_frame_turn: std::sync::Mutex::new(std::time::Instant::now()),
             frames_live: std::sync::atomic::AtomicBool::new(false),
@@ -1000,7 +1000,8 @@ pub struct BrowserContext {
     /// время долгих последовательностей вроде загрузки скриптов страницы.
     last_frame_turn: std::sync::Mutex<std::time::Instant>,
     /// Поток для кадров чужого происхождения (см. `apply_frame_ops`).
-    frame_worker: nokk_pool::WorkerId,
+    /// The thread cross-origin frames run on; re-picked when the pool drained it.
+    frame_worker: std::sync::Mutex<nokk_pool::WorkerId>,
     /// Кадры сейчас крутятся, пока страница ждёт сеть: второй раз изнутри
     /// того же пульса их не трогаем.
     frames_live: std::sync::atomic::AtomicBool,
@@ -1224,6 +1225,17 @@ impl BrowserContext {
     /// The worker this context is pinned to.
     pub fn worker(&self) -> WorkerId {
         self.worker
+    }
+
+    /// The thread for cross-origin frames. The pool drains a thread whose last
+    /// context closed, so a frame thread can vanish between two frames; pick a
+    /// live one then.
+    fn frame_worker(&self) -> WorkerId {
+        let mut fw = self.frame_worker.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.engine.pool.is_live(*fw) {
+            *fw = self.engine.pool.pick_worker_except(self.worker);
+        }
+        *fw
     }
 
     /// The context's index within its isolate.
@@ -2180,7 +2192,7 @@ impl BrowserContext {
                     for w in self.engine.pool.live_worker_ids() {
                         // Не на потоках страницы и кадров: сборка занимает их на
                         // сотни миллисекунд, и таймеры страницы ждут.
-                        if w == self.worker || w == self.frame_worker {
+                        if w == self.worker || w == self.frame_worker() {
                             continue;
                         }
                         let boot = self.bootstrap.clone();
@@ -2916,7 +2928,7 @@ impl BrowserContext {
                     // свою, и ответ приходит через время сообщения, а не через
                     // время «страница освободилась». У нас всё жило на одном
                     // изоляте, и каждый ход воркера отнимался у страницы.
-                    let place = self.engine.pool.pick_worker_avoiding(&[self.worker, self.frame_worker]);
+                    let place = self.engine.pool.pick_worker_avoiding(&[self.worker, self.frame_worker()]);
                     let load = std::sync::Arc::new(self.engine.pool.register_context(place));
                     let t_create = std::time::Instant::now();
                     let Ok(Ok(child)) = self
@@ -3425,7 +3437,7 @@ impl BrowserContext {
                         let boot = self.bootstrap.clone();
                         self.engine
                             .pool
-                            .dispatch_detached(self.frame_worker, {
+                            .dispatch_detached(self.frame_worker(), {
                                 let boot = boot.clone();
                                 move |iso| iso.prewarm_realms(&boot, 3)
                             });
@@ -3433,7 +3445,7 @@ impl BrowserContext {
                         // программа челленджа заводит воркеры один за другим и
                         // ждёт ответа в пределах сотен миллисекунд.
                         for w in self.engine.pool.live_worker_ids() {
-                            if w == self.worker || w == self.frame_worker {
+                            if w == self.worker || w == self.frame_worker() {
                                 continue;
                             }
                             let boot = boot.clone();
@@ -3457,7 +3469,7 @@ impl BrowserContext {
                     // страницей.
                     let cross = origin_of(&url) != origin_of(base);
                     let place = if cross && std::env::var_os("NOKK_FRAMES_SHARED").is_none() {
-                        self.frame_worker
+                        self.frame_worker()
                     } else {
                         self.worker
                     };
