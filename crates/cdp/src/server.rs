@@ -806,31 +806,7 @@ impl Conn {
                 );
                 vec![ok(id, &session, json!({ "browserContextId": bcid }))]
             }
-            "Target.disposeBrowserContext" => {
-                let mut out = Vec::new();
-                if let Some(bc) = params.get("browserContextId").and_then(|v| v.as_str()) {
-                    self.browser_contexts.remove(bc);
-                    // Close (drop) every page in this context, freeing its engine
-                    // context, and tell the client — otherwise the targets leak.
-                    let closing: Vec<String> = self
-                        .targets
-                        .iter()
-                        .filter(|t| t.browser_context_id.as_deref() == Some(bc))
-                        .map(|t| t.target_id.clone())
-                        .collect();
-                    self.targets
-                        .retain(|t| t.browser_context_id.as_deref() != Some(bc));
-                    for tid in closing {
-                        out.push(event(
-                            "Target.targetDestroyed",
-                            &None,
-                            json!({ "targetId": tid }),
-                        ));
-                    }
-                }
-                out.push(ok(id, &session, json!({ "success": true })));
-                out
-            }
+            "Target.disposeBrowserContext" => self.dispose_browser_context(id, &params, &session),
             "Target.getTargets" => {
                 let infos: Vec<Value> = self.targets.iter().map(target_info).collect();
                 vec![ok(id, &session, json!({ "targetInfos": infos }))]
@@ -964,6 +940,46 @@ impl Conn {
                     .await
             }
         }
+    }
+
+    /// Drop a browser context: forget its config, close its pages, and evict the
+    /// identity's pooled client. Without the eviction every disposed context
+    /// would leave its wreq client (cookie jar, connection pool) in the engine
+    /// for good. Named sessions keep theirs by design — the jar is shared for
+    /// the engine's lifetime.
+    fn dispose_browser_context(
+        &mut self,
+        id: i64,
+        params: &Value,
+        session: &Option<String>,
+    ) -> Vec<Value> {
+        let mut out = Vec::new();
+        if let Some(bc) = params.get("browserContextId").and_then(|v| v.as_str()) {
+            let named = self.browser_contexts.get(bc).and_then(|c| c.session.clone());
+            self.browser_contexts.remove(bc);
+            // Close (drop) every page in this context, freeing its engine
+            // context, and tell the client — otherwise the targets leak.
+            let closing: Vec<String> = self
+                .targets
+                .iter()
+                .filter(|t| t.browser_context_id.as_deref() == Some(bc))
+                .map(|t| t.target_id.clone())
+                .collect();
+            self.targets
+                .retain(|t| t.browser_context_id.as_deref() != Some(bc));
+            for tid in closing {
+                out.push(event(
+                    "Target.targetDestroyed",
+                    &None,
+                    json!({ "targetId": tid }),
+                ));
+            }
+            if named.is_none() && !bc.is_empty() {
+                self.engine.release_identity(bc);
+            }
+        }
+        out.push(ok(id, session, json!({ "success": true })));
+        out
     }
 
     async fn dispatch_session(

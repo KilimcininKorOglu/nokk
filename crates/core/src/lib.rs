@@ -700,6 +700,22 @@ impl Engine {
         self.build_context(client, Some(name), bootstrap).await
     }
 
+    /// Drop the pooled client (cookie jar + connection pool) bound to an
+    /// anonymous identity. Called when a CDP browser context is disposed:
+    /// without this the per-identity client would outlive the context and
+    /// accumulate for the engine's lifetime. Named sessions keep their pooled
+    /// client by design, so the caller must not release those.
+    pub fn release_identity(&self, identity: &str) {
+        if identity.is_empty() {
+            return;
+        }
+        self.inner
+            .client_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(identity);
+    }
+
     /// Shared tail of context creation: acquire a slot, place on the least-loaded
     /// worker, build the V8 context, and wrap it with an optional session name.
     async fn build_context(
@@ -5135,6 +5151,39 @@ mod tests {
             .unwrap();
         // A and B each got their own client; A2 reused A's; the default is separate.
         assert_eq!(engine.inner.client_pool.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn releasing_an_identity_drops_its_pooled_client() {
+        let _serial = serial().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 8,
+                max_heap_mb: None,
+            },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let _a = engine
+            .new_context_with_identity("A".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(engine.inner.client_pool.lock().unwrap().len(), 1);
+        engine.release_identity("A");
+        assert!(
+            engine.inner.client_pool.lock().unwrap().is_empty(),
+            "a released identity must not keep its client pooled"
+        );
+        // Releasing an unknown identity is a harmless no-op.
+        engine.release_identity("never-created");
+        // Re-creating the identity builds a fresh client again.
+        let _a2 = engine
+            .new_context_with_identity("A".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(engine.inner.client_pool.lock().unwrap().len(), 1);
     }
 
     /// A unique, empty session-store directory for a test.
