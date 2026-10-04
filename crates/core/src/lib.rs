@@ -1299,7 +1299,7 @@ impl BrowserContext {
             };
             let (final_url, html) = match post.take() {
                 Some((ctype, body)) => self.fetch_document_post(&current, referrer, ctype, body).await?,
-                None => self.fetch_text_from(&current, "document", referrer).await?,
+                None => self.fetch_document_retrying(&current, referrer).await?,
             };
             // The lock is what a solve is for. A caller that takes the cookie
             // elsewhere (curl with the clearance, another client) has no use for
@@ -4562,6 +4562,32 @@ impl BrowserContext {
         referrer: Option<&str>,
     ) -> Result<(String, String), EngineError> {
         self.fetch_text_at(self.idx(), url, resource_type, referrer).await
+    }
+
+    /// A document by GET, retried when the connection itself failed — no
+    /// response at all: a proxy that refused the tunnel (`CONNECT … 503`), a
+    /// reset, a timeout. Those come and go on rotating proxies, and a solve used
+    /// to end there in a fraction of a second. Any HTTP answer, a 403 gate
+    /// included, is returned as is; a POST is never repeated.
+    async fn fetch_document_retrying(
+        &self,
+        url: &str,
+        referrer: Option<&str>,
+    ) -> Result<(String, String), EngineError> {
+        const PAUSES_MS: [u64; 2] = [500, 1500];
+        let mut attempt = 0;
+        loop {
+            match self.fetch_text_from(url, "document", referrer).await {
+                Err(EngineError::Net(e @ (NetError::Connect(_) | NetError::Timeout)))
+                    if attempt < PAUSES_MS.len() =>
+                {
+                    tracing::warn!(target: "nokk", %url, error = %e, attempt = attempt + 1, "document fetch failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(PAUSES_MS[attempt])).await;
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Документ по POST: запрос документа с телом формы.
