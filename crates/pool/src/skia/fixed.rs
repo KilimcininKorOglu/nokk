@@ -1,7 +1,7 @@
-//! Целочисленная арифметика Skia: SkFixed (16.16) и SkFDot6 (26.6).
-//! Каждая формула повторяет `include/private/base/SkFixed.h` и
-//! `src/core/SkFDot6.h` дословно — покрытие краёв считается в этих
-//! единицах, и любое отклонение в округлении меняет байты отпечатка.
+//! Skia integer arithmetic: SkFixed (16.16) and SkFDot6 (26.6).
+//! Each formula mirrors `include/private/base/SkFixed.h` and
+//! `src/core/SkFDot6.h` verbatim: edge coverage is computed in these
+//! units, and any rounding difference changes fingerprint bytes.
 
 pub type Fixed = i32;
 pub type FDot6 = i32;
@@ -97,7 +97,7 @@ pub fn fixed_to_fdot6(x: Fixed) -> FDot6 {
 pub fn fdot6_to_fixed(x: FDot6) -> Fixed {
     left_shift(x, 10)
 }
-/// `SkScalarToFDot6`: обычное приведение к целому, с отбрасыванием дроби.
+/// `SkScalarToFDot6`: plain truncating cast.
 #[inline]
 pub fn scalar_to_fdot6(x: f32) -> FDot6 {
     (x * FDOT6_ONE as f32) as i32
@@ -112,10 +112,10 @@ pub fn fdot6_div(a: FDot6, b: FDot6) -> Fixed {
     }
 }
 
-/// `sk_float_saturate2int`: перевод в i32 с насыщением по краям.
+/// `sk_float_saturate2int`: to i32, saturating at the ends.
 #[inline]
 pub fn saturate2int(x: f32) -> i32 {
-    // Как в Skia: NaN → отрицательный край (так ведёт себя cvttss2si).
+    // As in Skia: NaN maps to the negative end (cvttss2si behaviour).
     if x.is_nan() {
         return i32::MIN;
     }

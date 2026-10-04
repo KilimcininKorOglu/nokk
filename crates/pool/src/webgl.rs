@@ -38,9 +38,9 @@ struct GlSurface {
     /// means "the canvas", which here is this object rather than the window-system
     /// framebuffer 0 (surfaceless: there isn't one).
     fbo: glow::NativeFramebuffer,
-    /// Хранилища цвета и глубины: холст можно увеличить после того, как
-    /// контекст уже создан, и тогда буфер рисования пересоздаётся под новый
-    /// размер — иначе чтение вернёт один пиксель и поле нулей.
+    /// Color and depth storage, kept so the drawing buffer can be recreated
+    /// when the canvas is resized after context creation (otherwise reads
+    /// return one pixel and zeros).
     color_rb: glow::NativeRenderbuffer,
     depth_rb: glow::NativeRenderbuffer,
     // Held for lifetime/cleanup; the context must stay current on this thread.
@@ -188,8 +188,8 @@ fn make_surface(w: i32, h: i32) -> Result<GlSurface, String> {
 }
 
 /// Drop a GL surface and its context.
-/// Изменение размера холста после создания контекста. По спецификации буфер
-/// рисования пересоздаётся и очищается, а окно вывода остаётся прежним.
+/// Canvas resize after context creation: per spec the drawing buffer is
+/// recreated and cleared, while the viewport stays unchanged.
 pub fn resize(id: u32, w: u32, h: u32) {
     let (w, h) = (w.clamp(1, 8192) as i32, h.clamp(1, 8192) as i32);
     SURFACES.with(|s| {

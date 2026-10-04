@@ -1,17 +1,17 @@
-//! Тень холста: маска фигуры (A8) → размытие `SkMaskBlurFilter` → блит
-//! маски краской тени. Порт `SkMaskFilterBase::filterPath`,
-//! `skcpu::DrawToMask`, `SkBlurMask::BoxBlur`, `SkMaskBlurFilter.cpp` и
-//! `SkGaussFilter.cpp` из Skia ревизии Chrome 151.
+//! Canvas shadows: shape mask (A8) → `SkMaskBlurFilter` blur → mask blit
+//! with the shadow paint. Port of `SkMaskFilterBase::filterPath`,
+//! `skcpu::DrawToMask`, `SkBlurMask::BoxBlur`, `SkMaskBlurFilter.cpp` and
+//! `SkGaussFilter.cpp` from Skia at Chrome 151.
 
 use super::blit::Blitter;
 use super::geometry::{IRect, Rect};
 
-/// Маска A8 с положением на холсте.
+/// A8 mask with its position on the canvas.
 #[derive(Clone, Debug)]
 pub struct Mask {
     pub bounds: IRect,
     pub row_bytes: usize,
-    /// Пусто — «только границы» (как `fImage == nullptr` у Skia).
+    /// Empty means bounds only (like `fImage == nullptr` in Skia).
     pub image: Vec<u8>,
 }
 
@@ -21,7 +21,7 @@ impl Mask {
     }
 }
 
-// ── Блиттер A8 (SkA8_Blitter, srcover, цвет непрозрачный) ─────────────────
+// ── A8 blitter (SkA8_Blitter, srcover, opaque colour) ─────────────────────
 
 #[inline]
 fn div255(prod: u32) -> u8 {
@@ -36,7 +36,7 @@ fn srcover_p(src: u8, dst: u8) -> u8 {
     src.wrapping_add(div255((255 - src as u32) * dst as u32))
 }
 
-/// `SkA8_Blitter` с `fSrc = 255`, srcover: так рисуется маска фигуры.
+/// `SkA8_Blitter` with `fSrc = 255`, srcover: how the shape mask is drawn.
 pub struct A8Blitter<'a> {
     data: &'a mut [u8],
     width: i32,
@@ -60,7 +60,7 @@ impl<'a> A8Blitter<'a> {
             None
         }
     }
-    /// `A8_row_aa` с `canFoldAA`: src = div255(255·aa) = aa; dst = srcover(src, dst).
+    /// `A8_row_aa` with `canFoldAA`: src = div255(255·aa) = aa; dst = srcover(src, dst).
     fn row_aa(&mut self, x: i32, y: i32, w: i32, aa: u8) {
         if y < 0 || y >= self.height {
             return;
@@ -122,7 +122,7 @@ impl<'a> Blitter for A8Blitter<'a> {
         }
     }
     fn blit_anti_h2(&mut self, x: i32, y: i32, a0: u8, a1: u8) {
-        // SkBlitter::blitAntiH2 по умолчанию: blitAntiH с двумя прогонами по 1.
+        // Default SkBlitter::blitAntiH2: blitAntiH with two runs of 1.
         let runs = [1i16, 1, 0];
         let aa = [a0, a1];
         self.blit_anti_h(x, y, &aa, &runs);
@@ -245,10 +245,10 @@ fn mulhi(a: u16, b: u16) -> u16 {
 
 const HALF88: u16 = 0x80;
 
-/// `blur_x_radius_N` над окном из 8 значений `s0` (8.8): вклад в d0/d8.
+/// `blur_x_radius_N` over a window of 8 `s0` values (8.8): contribution to d0/d8.
 fn blur_x_radius(radius: usize, s0: &[u16; 8], g: &[u16; 5], d0: &mut [u16; 8], d8: &mut [u16; 8]) {
-    // D[n..n+7+2r] += сдвиги произведений s0·G[k]: для k от r до 0 и обратно.
-    // Общая форма: для смещения o в 0..=2r вклад s0·G[|o - r|] в позиции n+o.
+    // D[n..n+7+2r] += shifted products s0·G[k], k from r down to 0 and back.
+    // General form: for offset o in 0..=2r, s0·G[|o - r|] goes to position n+o.
     let mut v = [[0u16; 8]; 5];
     for k in 0..=radius {
         for i in 0..8 {
@@ -314,19 +314,19 @@ fn blur_row(radius: usize, g: &[u16; 5], src: &[u8], src_off: usize, src_w: usiz
 }
 
 fn blur_y_radius(radius: usize, s0: &[u16; 8], g: &[u16; 5], d: &mut [[u16; 8]; 8]) -> [u16; 8] {
-    // d[0..2r] — конвейер частичных сумм: answer = d[0] + s·G[r]; d[i] = d[i+1] + s·G[|i+1-r|]...
+    // d[0..2r] is a pipeline of partial sums: answer = d[0] + s·G[r]; d[i] = d[i+1] + s·G[|i+1-r|]...
     let mut v = [[0u16; 8]; 5];
     for k in 0..=radius {
         for i in 0..8 {
             v[k][i] = mulhi(s0[i], g[k]);
         }
     }
-    let n = 2 * radius; // число буферов d01..d(2r)
+    let n = 2 * radius; // number of buffers d01..d(2r)
     let mut answer = [0u16; 8];
     for i in 0..8 {
         answer[i] = d[0][i].wrapping_add(v[radius][i]);
     }
-    // d[j] = d[j+1] + s·G[k_j], где k_j = |radius - (j+1)|; последний = s·G[r] + half.
+    // d[j] = d[j+1] + s·G[k_j], k_j = |radius - (j+1)|; the last is s·G[r] + half.
     for j in 0..n {
         let k = (radius as i32 - (j as i32 + 1)).unsigned_abs() as usize;
         for i in 0..8 {
@@ -370,7 +370,7 @@ fn small_blur(sigma: f64, src: &Mask) -> (Mask, (i32, i32)) {
     let dst_w = dst.bounds.width() as usize;
     let dst_h = dst.bounds.height() as usize;
     let dst_rb = dst.row_bytes;
-    // Вертикально: в столбцах по 8 в dst со смещением radius по x.
+    // Vertical pass: columns of 8 into dst, offset by radius in x.
     let mut x = 0usize;
     while x + 8 <= src_w {
         blur_column(radius, 8, &g, &src.image, x, src.row_bytes, src_h, &mut dst.image, radius + x, dst_rb);
@@ -380,7 +380,7 @@ fn small_blur(sigma: f64, src: &Mask) -> (Mask, (i32, i32)) {
     if x_tail > 0 {
         blur_column(radius, x_tail, &g, &src.image, x, src.row_bytes, src_h, &mut dst.image, radius + x, dst_rb);
     }
-    // Горизонтально на месте: источник — dst со смещением radius.
+    // Horizontal pass in place: source is dst offset by radius.
     let tmp = dst.image.clone();
     for y in 0..dst_h {
         blur_row(radius, &g, &tmp, y * dst_rb + radius, src_w, &mut dst.image, y * dst_rb, dst_w);
@@ -458,7 +458,7 @@ impl PlanGauss {
             di += dst_stride;
             produced += 1;
         }
-        // Справа налево — остаток.
+        // Remainder, right to left.
         for v in b0.iter_mut() {
             *v = 0;
         }
@@ -484,7 +484,7 @@ impl PlanGauss {
     }
 }
 
-/// `SkMaskBlurFilter::blur`: (маска, поля).
+/// `SkMaskBlurFilter::blur`: (mask, margins).
 pub fn mask_blur(sigma: f64, src: &Mask) -> (Mask, (i32, i32)) {
     let sigma = sigma.clamp(0.0, 135.0);
     if sigma < 2.0 {
@@ -504,12 +504,12 @@ pub fn mask_blur(sigma: f64, src: &Mask) -> (Mask, (i32, i32)) {
     let tmp_w = src_h;
     let tmp_h = dst_w;
     let mut tmp = vec![0u8; tmp_w * tmp_h];
-    // Горизонтально с транспонированием: строка y → столбец y в tmp.
+    // Horizontal pass with transpose: row y → column y in tmp.
     for y in 0..src_h {
         let src_row = &src.image[y * src.row_bytes..y * src.row_bytes + src_w];
         plan_w.blur(src_row, 1, src_w, &mut tmp, y, tmp_w, tmp_h, src_w);
     }
-    // Вертикально (по памяти tmp) и обратное транспонирование.
+    // Vertical pass (over tmp memory) and transpose back.
     let dst_rb = dst.row_bytes;
     for y in 0..tmp_h {
         let row = tmp[y * tmp_w..y * tmp_w + tmp_w].to_vec();
@@ -523,7 +523,7 @@ pub fn has_no_blur(sigma: f64) -> bool {
     sigma < 1.0 / 3.0
 }
 
-/// `compute_mask_bounds`: границы маски под путь с полем размытия.
+/// `compute_mask_bounds`: mask bounds for the path plus the blur margin.
 pub fn compute_mask_bounds(dev_bounds: &Rect, clip: &IRect, sigma: f64) -> Option<IRect> {
     let outset = Rect::from_ltrb(dev_bounds.left - 0.5, dev_bounds.top - 0.5, dev_bounds.right + 0.5, dev_bounds.bottom + 0.5);
     let mut bounds = outset.round_out();

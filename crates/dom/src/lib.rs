@@ -37,18 +37,17 @@ pub enum Script {
     Skipped,
 }
 
-/// Когда скрипт исполняется. Браузер исполняет обычный скрипт по ходу
-/// разбора, `defer` и модули — после разбора по порядку, `async` — как только
-/// придёт. Мы исполняли всё по ходу разбора, и страница, мерившая себя из
-/// отложенного модуля, видела документ до `DOMContentLoaded`, которого у
-/// браузера в этот миг уже нет.
+/// When a script runs. A browser runs a classic script during parsing,
+/// `defer` scripts and modules after parsing in document order, and `async`
+/// ones as soon as they arrive. A deferred module must not see the document
+/// before `DOMContentLoaded`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScriptMode {
-    /// По ходу разбора.
+    /// During parsing.
     Blocking,
-    /// После разбора, по порядку документа.
+    /// After parsing, in document order.
     Defer,
-    /// По готовности, без порядка.
+    /// On arrival, unordered.
     Async,
 }
 
@@ -60,15 +59,15 @@ pub struct ParsedPage {
     pub root: Value,
     /// Scripts to execute, in document order.
     pub scripts: Vec<Script>,
-    /// Когда исполнять каждый из [`Self::scripts`] — индекс в индекс.
+    /// When to run each of [`Self::scripts`], index for index.
     pub script_modes: Vec<ScriptMode>,
     /// The document's `<!DOCTYPE …>`, if it had one: name, public id, system id.
     /// A page without one is in quirks mode and its `document.doctype` is null —
     /// both of which a fingerprint reads, so the difference has to survive the
     /// parse instead of being dropped with the node.
     pub doctype: Option<(String, String, String)>,
-    /// Исходная разметка: по ней считаются номера строк вписанных скриптов
-    /// (стек и нарушения CSP браузер считает от начала документа).
+    /// The source markup: inline script line numbers count from the start of
+    /// the document (stack traces and CSP reports do).
     pub markup: String,
 }
 
@@ -155,9 +154,8 @@ fn serialize(node: &Handle, scripts: &mut Vec<Script>, modes: &mut Vec<ScriptMod
                 let nomodule = attrs.borrow().iter().any(|a| &*a.name.local == "nomodule");
                 let has = |name: &str| attrs.borrow().iter().any(|a| &*a.name.local == name);
                 let has_src = attr("src").map(|s| !s.is_empty()).unwrap_or(false);
-                // `async` и `defer` у обычного скрипта значат что-то только при
-                // `src`; модуль отложен всегда, а `async` делает его «по
-                // готовности».
+                // `async`/`defer` only matter on a classic script with `src`;
+                // a module is always deferred, and `async` makes it run on arrival.
                 let mode = if module {
                     if has("async") { ScriptMode::Async } else { ScriptMode::Defer }
                 } else if has_src && has("async") {
@@ -209,11 +207,9 @@ fn serialize(node: &Handle, scripts: &mut Vec<Script>, modes: &mut Vec<ScriptMod
                 }
             }
 
-            // `<template>` держит разобранное содержимое отдельно от детей —
-            // так велит разбор, и html5ever кладёт его в `template_contents`.
-            // Мы читали только `children` и теряли содержимое целиком: у
-            // страницы `t.content` оказывался пуст, а код, который строит узлы
-            // через шаблон, — ни с чем.
+            // `<template>` keeps its parsed content apart from its children
+            // (html5ever puts it in `template_contents`); without it
+            // `t.content` is empty.
             let holder = template_contents.borrow();
             let source = match holder.as_ref() {
                 Some(contents) => contents,
@@ -227,8 +223,8 @@ fn serialize(node: &Handle, scripts: &mut Vec<Script>, modes: &mut Vec<ScriptMod
                 .filter(|v| !v.is_null())
                 .collect();
 
-            // Пространство имён — для чужого содержимого (SVG, MathML): без него
-            // встроенный <svg> страницы становился HTMLUnknownElement.
+            // Namespace for foreign content (SVG, MathML); without it an
+            // inline <svg> becomes HTMLUnknownElement.
             let ns = name.ns.to_string();
             if ns.is_empty() || ns == "http://www.w3.org/1999/xhtml" {
                 json!({ "k": "e", "tag": tag, "attrs": attrs_json, "children": children })

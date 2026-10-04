@@ -1,8 +1,8 @@
-//! Порт `SkStroke` / `SkPathStroker` / `SkStrokerPriv` (Skia ревизии Chrome 151):
-//! контур обводки пути квадриками с проверкой близости к оригиналу, стыки
-//! miter/round/bevel, концы butt/round/square, прямоугольник — отдельным
-//! путём (`strokeRect`). Так Chrome рисует `stroke()` толще пикселя и
-//! `strokeText` (через `SkScalerContext::internalGetPath`).
+//! Port of `SkStroke` / `SkPathStroker` / `SkStrokerPriv` (Skia at Chrome 151):
+//! stroke outline built from quads checked against the original, joins
+//! miter/round/bevel, caps butt/round/square, rects on a separate path
+//! (`strokeRect`). Chrome uses this for `stroke()` wider than a pixel and for
+//! `strokeText` (via `SkScalerContext::internalGetPath`).
 
 use super::geometry::{chop_cubic_at, find_unit_quad_roots, Conic, Matrix, Point, Rect, SCALAR_NEARLY_ZERO};
 use super::path::{Path, PathBuilder, Verb};
@@ -21,7 +21,7 @@ pub enum Join {
     Bevel,
 }
 
-/// `SkStroke` / `SkStrokeRec` для обводки: ширина, предел скоса, концы, стыки,
+/// `SkStroke` / `SkStrokeRec` for stroking: width, miter limit, caps, joins,
 /// `resScale` (`SkMatrixPriv::ComputeResScaleForStroking`).
 #[derive(Clone, Copy, Debug)]
 pub struct StrokeParams {
@@ -53,7 +53,7 @@ pub fn res_scale_for_stroking(m: &Matrix) -> f32 {
     1.0
 }
 
-// ── арифметика точек (SkPoint) ────────────────────────────────────────────
+// ── point arithmetic (SkPoint) ───────────────────────────────────────────
 
 #[inline]
 fn add(a: Point, b: Point) -> Point {
@@ -130,7 +130,7 @@ fn set_length(x: f32, y: f32, len: f32) -> Option<Point> {
     }
 }
 
-// ── кривые (SkGeometry) ───────────────────────────────────────────────────
+// ── curves (SkGeometry) ──────────────────────────────────────────────────
 
 fn eval_quad_at(q: &[Point; 3], t: f32) -> Point {
     // SkQuadCoeff: C = p0, B = 2(p1−p0), A = p2 − 2p1 + p0; (A·t + B)·t + C.
@@ -399,7 +399,7 @@ impl<'a> PathIter<'a> {
     fn new(path: &'a Path) -> Self {
         PathIter { path, vi: 0, pi: 0, ci: 0, move_to: Point::default(), last_pt: Point::default(), need_close: false }
     }
-    /// `autoClose`: линия к началу контура или сам Close.
+    /// `autoClose`: line to the contour start, or the Close itself.
     fn auto_close(&mut self) -> Seg {
         if self.last_pt != self.move_to {
             if self.last_pt.x.is_nan() || self.last_pt.y.is_nan() || self.move_to.x.is_nan() || self.move_to.y.is_nan() {
@@ -518,7 +518,7 @@ fn has_valid_tangent(iter: &PathIter) -> bool {
     false
 }
 
-// ── SkStrokerPriv: концы и стыки ──────────────────────────────────────────
+// ── SkStrokerPriv: caps and joins ────────────────────────────────────────
 
 fn set_last_point(b: &mut PathBuilder, p: Point) {
     if let Some(l) = b.pts.last_mut() {
@@ -643,7 +643,7 @@ fn miter_joiner(outer: &mut PathBuilder, inner: &mut PathBuilder, before_unit: P
     if angle_type == AngleType::NearlyLine {
         return;
     }
-    // Ветвление goto-блоков оригинала: DO_MITER → DO_BLUNT.
+    // Mirrors the original's goto branches: DO_MITER → DO_BLUNT.
     let mut do_miter: Option<Point> = None;
     let (o, i): (&mut PathBuilder, &mut PathBuilder);
     if angle_type == AngleType::Nearly180 {
@@ -1598,8 +1598,8 @@ fn pts_in_verb(v: Verb) -> usize {
     }
 }
 
-/// `SkPathBuilder::privateReversePathTo`: сегменты пути в обратном порядке до
-/// его первого Move (сам Move не добавляется).
+/// `SkPathBuilder::privateReversePathTo`: path segments in reverse up to
+/// its first Move (the Move itself is not added).
 fn reverse_path_to(b: &mut PathBuilder, path: &Path) {
     if path.verbs.is_empty() {
         return;
@@ -1626,8 +1626,8 @@ fn reverse_path_to(b: &mut PathBuilder, path: &Path) {
     }
 }
 
-/// `SkPathBuilder::addPath(src)` (append): вербы и точки как есть; висячий
-/// Move в конце приёмника снимается.
+/// `SkPathBuilder::addPath(src)` (append): verbs and points as is; a
+/// trailing lone Move in the destination is dropped.
 fn append_path(b: &mut PathBuilder, src: &Path) {
     if src.verbs.is_empty() {
         return;
@@ -1642,7 +1642,7 @@ fn append_path(b: &mut PathBuilder, src: &Path) {
     b.note_appended();
 }
 
-// ── прямоугольник (SkPathPriv::IsRectContour, SkStroke::strokeRect) ───────
+// ── rect (SkPathPriv::IsRectContour, SkStroke::strokeRect) ───────────────
 
 struct RectContour {
     rect: Rect,
@@ -1816,7 +1816,7 @@ fn add_bevel(b: &mut PathBuilder, r: &Rect, outer: &Rect, cw: bool) {
     b.close();
 }
 
-/// `SkStroke::strokeRect`; None — стык round (RRect ещё не портирован).
+/// `SkStroke::strokeRect`; None for a round join (RRect not ported yet).
 fn stroke_rect(orig: &Rect, p: &StrokeParams, cw: bool) -> Option<Path> {
     let radius = p.width / 2.0;
     if radius <= 0.0 {
@@ -1849,8 +1849,8 @@ fn stroke_rect(orig: &Rect, p: &StrokeParams, cw: bool) -> Option<Path> {
     Some(b.detach())
 }
 
-/// `SkStroke::strokePath` (без stroke-and-fill). None — вариант, которого у
-/// нас ещё нет (round-стык у прямоугольника); пустой путь — нулевая ширина.
+/// `SkStroke::strokePath` (no stroke-and-fill). None for a case we lack
+/// (round join on a rect); an empty path for zero width.
 pub fn stroke_path(src: &Path, p: &StrokeParams) -> Option<Path> {
     let radius = p.width / 2.0;
     if radius <= 0.0 {

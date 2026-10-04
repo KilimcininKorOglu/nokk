@@ -1,13 +1,13 @@
-//! Радиальный градиент холста: `CanvasGradient` → `Gradient::CreateRadial` у
-//! Blink → `SkShaders::TwoPointConicalGradient` → `SkConicalGradient` и его
-//! стадии конвейера (`SkConicalGradient.cpp`, `SkGradientBaseShader.cpp`).
+//! Canvas gradients: `CanvasGradient` → Blink's `Gradient::CreateRadial` →
+//! `SkShaders::TwoPointConicalGradient` → `SkConicalGradient` and its
+//! pipeline stages (`SkConicalGradient.cpp`, `SkGradientBaseShader.cpp`).
 
 use super::blit::BlendMode;
 use super::geometry::{nearly_equal, Matrix, Point, SCALAR_NEARLY_ZERO};
 use super::pipeline::Stage;
 
-/// Описание из JS: тип (0 — линейный, 1 — радиальный), центры, радиусы,
-/// остановки (позиция, цвет 0..255 straight-alpha).
+/// Description from JS: kind (0 linear, 1 radial), centres, radii,
+/// stops (position, colour 0..255 straight alpha).
 #[derive(Clone, Debug)]
 pub struct GradientDesc {
     pub radial: bool,
@@ -19,7 +19,7 @@ pub struct GradientDesc {
 }
 
 impl GradientDesc {
-    /// Разобрать плоский вектор `encodeGrad` из JS.
+    /// Parses the flat `encodeGrad` vector from JS.
     pub fn parse(g: &[f32]) -> Option<GradientDesc> {
         if g.len() < 8 {
             return None;
@@ -45,7 +45,7 @@ impl GradientDesc {
     }
 }
 
-/// Готовый шейдер: матрица точек→единичное пространство и стадии.
+/// Built shader: points-to-unit-space matrix and stages.
 pub struct Shader {
     pub pts_to_unit: Matrix,
     pub stages: Vec<Stage>,
@@ -53,10 +53,10 @@ pub struct Shader {
     pub colors: Vec<[f32; 4]>,
     pub positions: Option<Vec<f32>>,
     pub colors_are_opaque: bool,
-    /// `SkShaderBase::isOpaque()`: у конической всегда false, у радиальной —
-    /// по цветам (при clamp).
+    /// `SkShaderBase::isOpaque()`: always false for conical, for radial
+    /// it depends on the colours (with clamp).
     pub is_opaque: bool,
-    /// Один цвет на всём — `MakeDegenerateGradient` (пустой шейдер или цвет).
+    /// One colour everywhere: `MakeDegenerateGradient` (empty shader or colour).
     pub constant: Option<[f32; 4]>,
 }
 
@@ -66,8 +66,8 @@ fn length(p: Point) -> f32 {
     (p.x * p.x + p.y * p.y).sqrt()
 }
 
-/// `Gradient::FillSkiaStops` у Blink: остановки отсортированы, добавлены
-/// крайние на 0 и 1, если их нет.
+/// Blink's `Gradient::FillSkiaStops`: stops sorted, end stops at 0 and 1
+/// added when missing.
 fn fill_skia_stops(desc: &GradientDesc) -> (Vec<[f32; 4]>, Vec<f32>) {
     let mut stops = desc.stops.clone();
     stops.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -91,7 +91,7 @@ fn fill_skia_stops(desc: &GradientDesc) -> (Vec<[f32; 4]>, Vec<f32>) {
     (colors, pos)
 }
 
-/// Построить шейдер для заливки холста.
+/// Builds the shader for a canvas fill.
 pub fn make_shader(desc: &GradientDesc) -> Option<Shader> {
     let (colors, pos) = fill_skia_stops(desc);
     if desc.radial {
@@ -103,7 +103,7 @@ pub fn make_shader(desc: &GradientDesc) -> Option<Shader> {
     }
 }
 
-/// `SkGradientBaseShader` — общая подготовка остановок (конструктор).
+/// `SkGradientBaseShader`: shared stop preparation (constructor).
 fn base(colors: Vec<[f32; 4]>, pos: Vec<f32>, pts_to_unit: Matrix) -> Shader {
     let mut fcolors: Vec<[f32; 4]> = Vec::new();
     let mut colors_are_opaque = true;
@@ -119,7 +119,7 @@ fn base(colors: Vec<[f32; 4]>, pos: Vec<f32>, pts_to_unit: Matrix) -> Shader {
     if last_implicit {
         fcolors.push(*colors.last().unwrap());
     }
-    // Позиции: первая принудительно 0, последняя — 1, монотонно.
+    // Positions: first forced to 0, last to 1, monotonic.
     let mut positions: Vec<f32> = vec![0.0];
     let mut prev = 0.0f32;
     let start_index = if first_implicit { 0 } else { 1 };
@@ -142,7 +142,7 @@ fn base(colors: Vec<[f32; 4]>, pos: Vec<f32>, pts_to_unit: Matrix) -> Shader {
     let positions = if uniform {
         None
     } else {
-        // Дедупликация повторов (clamp): оставить левый и правый из группы.
+        // Dedupe repeats (clamp): keep the leftmost and rightmost of a group.
         let mut dp: Vec<f32> = Vec::new();
         let mut dc: Vec<[f32; 4]> = Vec::new();
         let n = fcolors.len();
@@ -178,17 +178,17 @@ fn base(colors: Vec<[f32; 4]>, pos: Vec<f32>, pts_to_unit: Matrix) -> Shader {
 
 fn linear(p0: Point, p1: Point, colors: Vec<[f32; 4]>, pos: Vec<f32>) -> Option<Shader> {
     if length(p1.sub(p0)) <= DEGENERATE_THRESHOLD {
-        // Вырожденный: при clamp — последний цвет всюду.
+        // Degenerate: with clamp, the last colour everywhere.
         let mut s = base(colors.clone(), pos, Matrix::IDENTITY);
         s.constant = Some(*colors.last().unwrap());
         return Some(s);
     }
-    // pts_to_unit: единичный вектор вдоль p0→p1 (SkLinearGradient).
+    // pts_to_unit: unit vector along p0→p1 (SkLinearGradient).
     let vec = p1.sub(p0);
     let mag = length(vec);
     let inv = if mag != 0.0 { 1.0 / mag } else { 0.0 };
     let v = Point::new(vec.x * inv, vec.y * inv);
-    // setSinCos(-v.y, v.x, p0.x, p0.y): поворот вокруг p0.
+    // setSinCos(-v.y, v.x, p0.x, p0.y): rotation about p0.
     let (s, c) = (-v.y, v.x);
     let one_minus_c = 1.0 - c;
     let mut m = Matrix {
@@ -214,7 +214,7 @@ fn two_point_conical(c0: Point, r0: f32, c1: Point, r1: f32, colors: Vec<[f32; 4
     if d <= DEGENERATE_THRESHOLD {
         if (r0 - r1).abs() <= DEGENERATE_THRESHOLD {
             if r1 > DEGENERATE_THRESHOLD {
-                // Кольцо нулевой толщины: первый цвет до 1, потом последний.
+                // Zero-width ring: first colour up to 1, then the last.
                 let front = colors[0];
                 let back = *colors.last().unwrap();
                 return radial(c0, r1, vec![front, front, back], vec![0.0, 1.0, 1.0]);
@@ -304,8 +304,8 @@ fn two_point_conical(c0: Point, r0: f32, c1: Point, r1: f32, colors: Vec<[f32; 4
     Some(s)
 }
 
-/// `SkShaders::RadialGradient` → `SkRadialGradient`: pts_to_unit — сдвиг в
-/// центр и масштаб 1/r; стадия `xy_to_radius`.
+/// `SkShaders::RadialGradient` → `SkRadialGradient`: pts_to_unit translates to
+/// the centre and scales by 1/r; stage `xy_to_radius`.
 fn radial(center: Point, radius: f32, colors: Vec<[f32; 4]>, pos: Vec<f32>) -> Option<Shader> {
     if radius <= DEGENERATE_THRESHOLD {
         let mut s = base(colors.clone(), pos, Matrix::IDENTITY);
@@ -384,29 +384,29 @@ pub fn append_matrix(stages: &mut Vec<Stage>, m: &Matrix) {
     }
 }
 
-/// `SkGradientBaseShader::appendStages` + цветовой конвейер краски: стадии
-/// цвета для блиттера (без clamp_01 и покрытия). `ctm` — матрица холста,
-/// `paint_alpha` — globalAlpha, `color_filter` — цвет тени (srcin), `dither`.
+/// `SkGradientBaseShader::appendStages` plus the paint colour pipeline: colour
+/// stages for the blitter (no clamp_01 or coverage). `ctm` is the canvas matrix,
+/// `paint_alpha` globalAlpha, `color_filter` the shadow colour (srcin), `dither`.
 pub fn color_stages(shader: &Shader, ctm: &Matrix, paint_alpha: f32, color_filter: Option<[f32; 4]>, dither: bool) -> Option<Vec<Stage>> {
     let mut p: Vec<Stage> = Vec::new();
     if let Some(c) = shader.constant {
-        // Постоянный цвет: appendConstantColor premul.
+        // Constant colour: appendConstantColor premul.
         let pm = [c[0] * c[3], c[1] * c[3], c[2] * c[3], c[3]];
         p.push(Stage::UniformColor(pm));
     } else {
-        // MatrixRec::apply: total = ptsToUnit · CTM⁻¹, seed_shader, матрица.
+        // MatrixRec::apply: total = ptsToUnit · CTM⁻¹, seed_shader, matrix.
         let inv = ctm.invert()?;
         let total = Matrix::concat(&shader.pts_to_unit, &inv);
         p.push(Stage::SeedShader);
         append_matrix(&mut p, &total);
         p.extend(shader.stages.iter().cloned());
-        // Tile clamp: clamp_x_1 только при равномерных остановках.
+        // Tile clamp: clamp_x_1 only for evenly spaced stops.
         if shader.positions.is_none() {
             p.push(Stage::ClampX1);
         }
-        // SkColor4fXformer: sRGB → sRGB, без premul при непрозрачных цветах;
-        // иначе premul интерполяции нет (fInPremul = kNo у холста), значит
-        // цвета остаются straight, а premul делается стадией после.
+        // SkColor4fXformer: sRGB → sRGB, no premul for opaque colours;
+        // otherwise there is no premul interpolation (fInPremul = kNo for canvas),
+        // so colours stay straight and a later stage premultiplies.
         let colors = &shader.colors;
         if colors.len() == 2 && shader.positions.is_none() {
             let (l, r) = (colors[0], colors[1]);
@@ -418,7 +418,7 @@ pub fn color_stages(shader: &Shader, ctm: &Matrix, paint_alpha: f32, color_filte
                 None => (0..colors.len()).map(|i| i as f32 / (colors.len() - 1) as f32).collect(),
             };
             // init_stop_pos / init_stop_evenly: factor = (c_r - c_l)/gap, bias = c_l - factor·t_l;
-            // индекс 0 — цвет до первой остановки (factor 0).
+            // index 0: colour before the first stop (factor 0).
             let mut factors = vec![[0.0f32; 4]; colors.len()];
             let mut biases = vec![[0.0f32; 4]; colors.len()];
             factors[0] = [0.0; 4];
@@ -441,7 +441,7 @@ pub fn color_stages(shader: &Shader, ctm: &Matrix, paint_alpha: f32, color_filte
                 factors[i] = f;
                 biases[i] = b;
             }
-            // Последняя запись: цвет после последней остановки (factor 0).
+            // Last entry: colour after the last stop (factor 0).
             let last = *colors.last().unwrap();
             factors.push([0.0; 4]);
             biases.push(last);
@@ -458,7 +458,7 @@ pub fn color_stages(shader: &Shader, ctm: &Matrix, paint_alpha: f32, color_filte
         p.push(Stage::Scale1Float(paint_alpha));
     }
     if let Some(c) = color_filter {
-        // SkBlendModeColorFilter (srcin): move_src_dst, цвет premul, srcin.
+        // SkBlendModeColorFilter (srcin): move_src_dst, premul colour, srcin.
         p.push(Stage::MoveSrcDst);
         p.push(Stage::UniformColor([c[0] * c[3], c[1] * c[3], c[2] * c[3], c[3]]));
         p.push(Stage::Blend(BlendMode::SrcIn));

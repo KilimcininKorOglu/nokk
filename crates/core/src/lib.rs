@@ -429,48 +429,44 @@ fn emulation_os_for(profile: &StealthProfile) -> nokk_net::EmulationOs {
 /// and last the remaining platform surface — it only fills names nothing else
 /// defined, so everything real has to exist before it looks.
 fn build_bootstrap(profile: &StealthProfile) -> String {
-    // Флаги трасс реализации (`NOKK_TRACE_CANVAS`, `NOKK_TRACE_GPU`) — в самом
-    // начале загрузчика, чтобы стоять в каждом реалме раньше любого кода
-    // страницы: пробник, ставящий их позже, пропускает ранние вызовы.
+    // Implementation trace flags (`NOKK_TRACE_CANVAS`, `NOKK_TRACE_GPU`) go first so
+    // they exist in every realm before page code: a probe set later misses early calls.
     let mut flags = String::new();
     for (env, name) in [("NOKK_TRACE_CANVAS", "__pt_canvasTrace"), ("NOKK_TRACE_GRID", "__pt_gridTrace"), ("NOKK_TRACE_GPU", "__pt_gpuTrace"), ("NOKK_TRACE_ENC", "__pt_encTrace"), ("NOKK_TRACE_SRCDOC", "__pt_srcdocTrace")] {
         if let Some(v) = std::env::var_os(env) {
-            // Значение флага доступно трассе: `NOKK_TRACE_ENC=9000-9300,8600-8700`
-            // высыпает куски отчёта этих длин целиком.
+            // The value reaches the tracer: `NOKK_TRACE_ENC=9000-9300,8600-8700` dumps
+            // report chunks of those lengths in full.
             let v = v.to_string_lossy().replace(['\'', '\\', '\n'], "");
             flags.push_str(&format!("Object.defineProperty(globalThis, '{name}', {{ value: '{v}', configurable: true }});\n"));
         }
     }
-    // `NOKK_TRACE_BOOT=1` — время каждого слоя загрузчика в консоль (`[boot]`).
+    // `NOKK_TRACE_BOOT=1` logs each bootstrap layer's time to the console (`[boot]`).
     let timed = std::env::var_os("NOKK_TRACE_BOOT").is_some();
     let mark = |name: &str| -> String {
         if timed { format!("\n;(globalThis.__pt_bootT = globalThis.__pt_bootT || []).push(['{name}', Date.now()]);\n") } else { "\n".to_string() }
     };
     let pieces: Vec<(&str, String)> = vec![
-        // Первой строкой — запись изнутри: ею пользуются все слои, а свойства
-        // только для чтения появляются лишь в последнем.
+        // The write helper first: every layer uses it, and read-only properties only
+        // appear in the last one.
         ("write_helper", nokk_stealth::write_helper_script()),
         ("bootstrap", nokk_stealth::bootstrap_script(profile)),
         ("dom_runtime", nokk_dom::runtime_js().to_string()),
         ("fingerprint", nokk_stealth::fingerprint_script(profile)),
         ("web_surface", nokk_stealth::web_surface_script()),
-        // И последним — снимок методов, которыми движок пользуется сам: он должен
-        // лечь поверх всех слоёв, но раньше любого скрипта страницы.
-        // Натурализация — после поздних интерфейсов и до снимка: каждый член
-        // должен выглядеть родным, а снимок — держать уже итоговые функции.
+        // Late interfaces, then naturalization (every member must look native), then the
+        // snapshot of methods the engine itself uses: over all layers, before any page script.
         ("late_interfaces", nokk_stealth::late_interfaces_script()),
-        // `NOKK_NO_PROTO_SHAPE=1` — без слоя формы, для бисекции.
+        // `NOKK_NO_PROTO_SHAPE=1` skips the shape layer, for bisection.
         ("proto_shape", if std::env::var_os("NOKK_NO_PROTO_SHAPE").is_some() { String::new() } else { nokk_stealth::proto_shape_script() }),
         ("naturalize", nokk_stealth::naturalize_script()),
         ("late_originals", nokk_stealth::late_originals_script()),
         ("shape_fixes", nokk_stealth::shape_fixes_script()),
-        // Порядок имён окна — последним: перечисление отдаёт их в порядке
-        // заведения, и всякий слой, заводящий своё имя, этот порядок сдвигает.
+        // Window name order last: enumeration follows creation order, and any layer
+        // that defines a name shifts it.
         ("window_order", nokk_stealth::window_order_script()),
-        // Только при сборке снимка V8 (`__pt_lateNames` заводит сборщик):
-        // что V8 доставит при восстановлении — SharedArrayBuffer, WebAssembly,
-        // Float16Array, DisposableStack… — загрузчик не видел; после
-        // восстановления повторяем для них то, что он сделал бы.
+        // Only when building the V8 snapshot (the builder defines `__pt_lateNames`): what
+        // V8 installs on restore (SharedArrayBuffer, WebAssembly, Float16Array,
+        // DisposableStack…) the bootstrap never saw, so redo for it what it would have done.
         ("restore_hook", format!(
             "if (globalThis.__pt_lateNames) Object.defineProperty(globalThis, '__pt_afterRestore', {{ writable: true, configurable: true, value: () => {{\n\
              try {{ delete globalThis.SharedArrayBuffer; }} catch (e) {{}}\n\
@@ -479,12 +475,10 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
             nokk_stealth::window_order_script()
         )),
     ];
-    // Служебные поля движка (`node.__ptKids = …`) создавались обычным
-    // присваиванием — перечислимыми: `for…in` по узлу, событию, окну показывал
-    // их, `Object.entries` считал, а `JSON.stringify(div)` бросал «circular
-    // structure» (у Chrome — "{}"). Сеттер на Object.prototype для каждого
-    // такого имени заводит поле неперечислимым; имена собираются из самих
-    // исходников загрузчика.
+    // Internal fields (`node.__ptKids = …`) assigned plainly are enumerable: `for…in`
+    // and `Object.entries` see them and `JSON.stringify(div)` throws "circular
+    // structure" (Chrome gives "{}"). A setter on Object.prototype per such name,
+    // collected from the bootstrap sources, makes them non-enumerable.
     let hide = internal_field_setters(pieces.iter().map(|(_, js)| js.as_str()));
     let mut base = format!("{flags}{hide}{}", mark("start"));
     for (name, js) in pieces {
@@ -502,9 +496,8 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
     }
 }
 
-/// Скрипт: для каждого имени вида `__pt…`, которому где-либо в `sources`
-/// присваивают значение (`.__ptX = `), — сеттер на Object.prototype, заводящий
-/// поле собственным неперечислимым свойством.
+/// For each `__pt…` name assigned anywhere in `sources` (`.__ptX = `), a setter on
+/// Object.prototype that defines the field as an own non-enumerable property.
 fn internal_field_setters<'a>(sources: impl Iterator<Item = &'a str>) -> String {
     let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for src in sources {
@@ -578,10 +571,9 @@ impl Engine {
                 EngineError::Session(format!("create store `{}`: {e}", dir.display()))
             })?;
         }
-        // V8 и данные ICU — первыми: от ICU зависит загрузчик (родной `Intl`
-        // вместо заглушки), а загрузчик по умолчанию уходит в снимок V8, с
-        // которым рождаются изоляты пула. Контекст из снимка поднимается за
-        // миллисекунды вместо ~300 мс исполнения загрузчика.
+        // V8 and ICU data first: the bootstrap depends on ICU (native `Intl`), and by
+        // default goes into the V8 snapshot pool isolates start from. A context from the
+        // snapshot comes up in milliseconds instead of ~300 ms of bootstrap execution.
         nokk_pool::init_v8();
         nokk_stealth::set_native_intl(nokk_pool::icu_ready());
         match nokk_pool::build_snapshot(&build_bootstrap(&config.stealth)) {
@@ -735,7 +727,7 @@ impl Engine {
             .await?
             .map_err(EngineError::Js)?;
         tracing::debug!(?worker, index, "context created");
-        // Поток для будущих кадров чужого происхождения выбирается сразу.
+        // Pick the thread for future cross-origin frames now.
         let frame_worker = self.inner.pool.pick_worker_except(worker);
         Ok(BrowserContext {
             frame_worker: std::sync::Mutex::new(frame_worker),
@@ -868,8 +860,7 @@ fn req_method(req: &Request) -> String {
     req.method.clone()
 }
 
-/// Что нужно, чтобы после ответа сети записать запрос и разрешить обещание.
-/// Номера контекстов для записей о запросах воркеров: вне диапазона кадров.
+/// Request ids for worker request records: outside the frame index range.
 const WORKER_RECORD_BASE: usize = 1 << 40;
 
 struct FetchInfo {
@@ -881,7 +872,7 @@ struct FetchInfo {
     sent: Vec<u8>,
 }
 
-/// Куда доставить итог: в кадр (по индексу контекста) или в воркер.
+/// Where to deliver the result: a frame (by context index) or a worker.
 enum Deliver {
     Frame(usize),
     Worker(nokk_pool::WorkerId, usize),
@@ -945,11 +936,10 @@ pub struct BrowserContext {
     /// When this context started, and how many of its requests have been handed
     /// to the page as Resource Timing entries.
     started: std::time::Instant,
-    /// Сколько записей уже отдано каждому контексту: у страницы и у каждого
-    /// кадра лента своя.
+    /// Entries already handed to each context: the page and every frame have their own timeline.
     timings_sent: std::sync::Mutex<HashMap<usize, usize>>,
-    /// Кадры, которым уже отдана их навигация. Своих записей у кадра может не
-    /// быть вовсе, так что считать по ним нечего — нужна отдельная пометка.
+    /// Frames already given their navigation entry. A frame may have no entries of its
+    /// own, so this needs a separate mark.
     nav_sent: std::sync::Mutex<std::collections::HashSet<usize>>,
     /// Name of the persistent session this context belongs to, if any. On drop
     /// its cookie jar is flushed to the session store.
@@ -974,9 +964,8 @@ pub struct BrowserContext {
     /// what `Page.addScriptToEvaluateOnNewDocument` means in Chrome — it applies
     /// to the whole frame tree, not just the top document.
     frame_init_scripts: std::sync::Mutex<Vec<String>>,
-    /// То же — для воркеров. У воркера свой реалм и свои прототипы, и крючок,
-    /// поставленный странице, там не виден: сборка тела, которую воркер делает
-    /// у себя, из страницы не просматривается вовсе.
+    /// The same, for workers. A worker has its own realm and prototypes, so a hook set
+    /// on the page cannot see what the worker builds.
     worker_init_scripts: std::sync::Mutex<Vec<String>>,
     /// The same, for this page's own document. "On new document" means *before*
     /// the document's own scripts — that is the whole point of the API, and what
@@ -984,8 +973,7 @@ pub struct BrowserContext {
     /// the page had already executed made them useless for anything that has to be
     /// in place first.
     init_scripts: std::sync::Mutex<Vec<String>>,
-    /// Запросы кадров и воркеров, ушедшие в сеть и ещё не отвеченные: сеть
-    /// идёт своим ходом, а JS в это время не стоит — как у браузера.
+    /// Frame and worker requests still on the network: JS keeps running meanwhile, as in a browser.
     inflight: std::sync::Mutex<Vec<InFlight>>,
     /// When this page's earliest pending timer comes due, as of the last turn of
     /// the event loop. `None` means nothing is pending. Timers wait out their real
@@ -994,16 +982,15 @@ pub struct BrowserContext {
     /// times a second, or leaving its `setInterval` frozen between commands.
     next_timer_at: std::sync::Mutex<Option<std::time::Instant>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
-    _load: nokk_pool::ContextLoadGuard,    /// Счётчик пульсов кадров: дорогие довески идут не на каждом.
+    _load: nokk_pool::ContextLoadGuard,    /// Frame pump counter: the expensive extras do not run on every pump.
     frame_pump_count: std::sync::atomic::AtomicUsize,
-    /// Когда кадры получали ход в последний раз — чтобы давать его и во
-    /// время долгих последовательностей вроде загрузки скриптов страницы.
+    /// When frames last got a turn, so they get one during long sequences such as
+    /// loading the page's scripts too.
     last_frame_turn: std::sync::Mutex<std::time::Instant>,
-    /// Поток для кадров чужого происхождения (см. `apply_frame_ops`).
     /// The thread cross-origin frames run on; re-picked when the pool drained it.
     frame_worker: std::sync::Mutex<nokk_pool::WorkerId>,
-    /// Кадры сейчас крутятся, пока страница ждёт сеть: второй раз изнутри
-    /// того же пульса их не трогаем.
+    /// Frames are being pumped while the page waits on the network: do not re-enter
+    /// them from the same pump.
     frames_live: std::sync::atomic::AtomicBool,
 
 }
@@ -1030,7 +1017,7 @@ struct FrameState {
     /// applied yet when the frame is first connected — so it is re-checked as
     /// the page settles, the way a browser resizes a frame that changed.
     viewport: (f64, f64),
-    /// Кадр на своём потоке держит его занятым, пока жив.
+    /// A frame on its own thread keeps that thread loaded while alive.
     _load: Option<std::sync::Arc<nokk_pool::ContextLoadGuard>>,
 }
 
@@ -1040,16 +1027,15 @@ struct FrameState {
 /// with the blob's origin.
 #[derive(Debug, Clone)]
 struct WorkerState {
-    /// Поток пула, на изоляте которого живёт контекст воркера. Он не обязан
-    /// совпадать с потоком страницы — в браузере воркер и есть отдельный поток,
-    /// — а номер контекста нумеруется внутри изолята, так что адресом воркера
-    /// работает только пара «поток + номер».
+    /// Pool thread whose isolate hosts the worker's context. It need not be the page's
+    /// thread (a worker is its own thread in a browser), and context indices are
+    /// per isolate, so a worker is addressed by the (thread, index) pair.
     worker: nokk_pool::WorkerId,
     index: usize,
     url: String,
     fetch_base: String,
-    /// Пока контекст жив, поток пула считает его своим: без этого выбор
-    /// наименее нагруженного потока перестал бы видеть воркеров вовсе.
+    /// While alive, the pool counts the context as its thread's load, so least-loaded
+    /// thread selection sees workers.
     _load: std::sync::Arc<nokk_pool::ContextLoadGuard>,
 }
 
@@ -1133,19 +1119,15 @@ pub struct NetworkRecord {
     /// page that reports no timings is a page that never loaded anything.
     pub started_ms: f64,
     pub duration_ms: f64,
-    /// Сколько байт тела пришло по проводу — до распаковки. Из него строится
-    /// `encodedBodySize` (а `transferSize` — он же плюс заголовки): у сжатого
-    /// скрипта это втрое меньше распакованной длины, и сторона, отдавшая файл,
-    /// знает точное число.
+    /// Body bytes on the wire, before decompression. Feeds `encodedBodySize` (and
+    /// `transferSize`, which adds headers); the server knows the exact number.
     pub encoded_len: usize,
-    /// Чем было сжато тело по проводу (`br`, `gzip`), пусто — ничем.
+    /// Wire content encoding (`br`, `gzip`); empty if none.
     pub content_encoding: String,
-    /// Через сколько миллисекунд от начала запроса закончилось последнее
-    /// перенаправление; `None` — их не было.
+    /// Milliseconds from request start to the end of the last redirect; `None` if none.
     pub redirect_ms: Option<f64>,
-    /// Контекст, который запросил: страница или один из её кадров. Времена
-    /// ресурсов раздаются по нему — у кадра в браузере своя лента, и пустая
-    /// лента там заметна не меньше, чем пустая у страницы.
+    /// The requesting context: the page or one of its frames. Resource timings are
+    /// handed out per context, since a frame has its own timeline in a browser.
     pub context: usize,
 }
 
@@ -1282,8 +1264,8 @@ impl BrowserContext {
         self.navigate_inner(url, referrer, None).await
     }
 
-    /// Переход с телом — отправка формы методом POST (`form.submit()`): так
-    /// застава Cloudflare уносит замок на исходный адрес.
+    /// Navigation with a body: a POST form submit (`form.submit()`), which is how the
+    /// Cloudflare interstitial carries the clearance to the original URL.
     async fn navigate_inner(
         &self,
         url: &str,
@@ -1382,9 +1364,8 @@ impl BrowserContext {
         self.eval_at(worker, raw, source).await
     }
 
-    /// Поток и номер контекста в его изоляте. Страница и кадры её
-    /// происхождения живут на потоке страницы; кадр чужого происхождения —
-    /// на своём, как в браузере с изоляцией сайтов.
+    /// Thread and context index in its isolate. The page and same-origin frames live
+    /// on the page's thread; a cross-origin frame on its own, as with site isolation.
     fn route(&self, index: usize) -> (nokk_pool::WorkerId, usize) {
         if index & OWN_THREAD != 0 {
             (nokk_pool::WorkerId((index >> 32) & 0xFFFF), index & 0xFFFF_FFFF)
@@ -1393,10 +1374,9 @@ impl BrowserContext {
         }
     }
 
-    /// Выполнить скрипт страницы, назвав его своим адресом. Имя уходит в
-    /// `ScriptOrigin`: его видно и в кадрах самого скрипта, и там, где движок
-    /// называет родителя вложенного `eval`/`new Function` — `//# sourceURL`
-    /// второго не даёт, и вместо адреса выходило `unknown source`.
+    /// Run a page script named by its URL. The name goes into `ScriptOrigin`, so it shows
+    /// in the script's own stack frames and as the parent of nested `eval`/`new Function`;
+    /// `//# sourceURL` does not cover the latter, which came out as `unknown source`.
     async fn eval_named_in(
         &self,
         index: usize,
@@ -1417,10 +1397,9 @@ impl BrowserContext {
         Ok(Value::String(out))
     }
 
-    /// То же, но в контексте на другом потоке пула. Номера контекстов свои у
-    /// каждого изолята, поэтому воркер, живущий не с нами, адресуется только
-    /// парой «поток + номер»; [`Self::eval_in`] — этот же вызов для потока
-    /// страницы.
+    /// Same, in a context on another pool thread. Context indices are per isolate, so a
+    /// worker elsewhere is addressed by (thread, index); [`Self::eval_in`] is this call
+    /// for the page's thread.
     async fn eval_at(
         &self,
         worker: nokk_pool::WorkerId,
@@ -1596,10 +1575,8 @@ impl BrowserContext {
         self.base_url.lock().map(|b| b.clone()).unwrap_or_default()
     }
 
-    /// Кодировка, объявленная заголовком `Content-Type` ответа на документ
-    /// по этому адресу, если она там есть.
-    /// Заголовок Content-Security-Policy ответа документа — движок применяет
-    /// его к контексту до первого скрипта (`__pt_applyCsp`).
+    /// The document response's Content-Security-Policy header; applied to the context
+    /// before its first script (`__pt_applyCsp`).
     fn document_csp(&self, url: &str) -> Option<String> {
         let log = self.requests.lock().ok()?;
         let r = log.iter().rev().find(|r| r.url == url)?;
@@ -1607,6 +1584,7 @@ impl BrowserContext {
         if v.trim().is_empty() { None } else { Some(v.to_string()) }
     }
 
+    /// Charset declared by the document response's `Content-Type`, if any.
     fn document_charset(&self, url: &str) -> Option<String> {
         let log = self.requests.lock().ok()?;
         let r = log.iter().rev().find(|r| r.url == url)?;
@@ -1663,8 +1641,8 @@ impl BrowserContext {
             let js = format!("try {{ if (typeof __pt_applyCsp === 'function') __pt_applyCsp({}, 'header'); }} catch (e) {{}}", js_str(&csp));
             let _ = self.eval_in(index, &js).await;
         }
-        // Кодировка из заголовка ответа: документ с `charset=utf-8` в
-        // Content-Type браузер называет UTF-8, даже если в разметке ни слова.
+        // Charset from the response header: with `charset=utf-8` in Content-Type a browser
+        // reports UTF-8 even when the markup says nothing.
         if let Some(charset) = self.document_charset(base_url) {
             let js = format!(
                 "try {{ Object.defineProperty(document, '__ptCharset', {{ value: (typeof __normEncoding === 'function' ? __normEncoding({0}) : {0}), configurable: true, enumerable: false }}); }} catch (e) {{}}",
@@ -1677,10 +1655,9 @@ impl BrowserContext {
         // document-order script list the DOM runtime built, so `__pt_beginScript`
         // can point `document.currentScript` at the running node (document.write
         // positioning); `__pt_endScript` clears it afterward.
-        // Сначала всё, что исполняется по ходу разбора; потом «по готовности»
-        // (`async`: запрос у них короткий, отложенным же ещё тянуть граф
-        // модулей), потом отложенные по порядку документа. Между ними — конец
-        // разбора: `readyState` становится `interactive`.
+        // Parser-executed scripts first, then `async` ones as they become ready, then
+        // deferred ones in document order. Between them parsing ends and `readyState`
+        // becomes `interactive`.
         let mode_of = |i: usize| {
             page.script_modes
                 .get(i)
@@ -1697,12 +1674,10 @@ impl BrowserContext {
             .chain(std::iter::once(None))
             .chain(later.map(Some))
             .collect();
-        // Сканер предзагрузки: браузер находит внешние скрипты документа ещё
-        // при разборе и просит их все разом, а исполняет по своему порядку. Мы
-        // просили каждый, только когда до него доходила очередь, и сотня
-        // файлов chess.com шла цепочкой: между запуском api.js и отрисовкой
-        // виджета проходила секунда против двухсот-трёхсот миллисекунд у
-        // Chrome, и это число уходит в тело первого POST.
+        // Preload scanner: a browser finds a document's external scripts while parsing and
+        // requests them all at once, executing in its own order. Fetching each only when
+        // its turn came chained chess.com's hundred files: a second from api.js start to
+        // widget render vs 200-300 ms in Chrome, and that number goes into the first POST.
         let mut preload: HashMap<String, Preloaded> = HashMap::new();
         if index == self.idx() && std::env::var_os("NOKK_NO_PRELOAD").is_none() {
             for script in &page.scripts {
@@ -1734,9 +1709,8 @@ impl BrowserContext {
                 nokk_dom::Script::Skipped => "skipped",
                 _ => "script",
             }, "script step");
-            // Ход кадрам перед каждым скриптом документа, каким бы он ни был.
-            // Страница вроде chess.com грузит их десятками — и модулями тоже,
-            // а модуль уходит из этого цикла раньше, чем доходит до конца.
+            // Give frames a turn before every document script: pages like chess.com load
+            // dozens, modules included, and a module leaves this loop early.
             if index == self.idx() {
                 self.frames_take_a_turn().await;
                 self.wait_for_blocking_sheets(index).await;
@@ -1748,7 +1722,7 @@ impl BrowserContext {
             if matches!(script, nokk_dom::Script::Skipped) {
                 continue;
             }
-            // CSP документа: инлайн без nonce и запрещённый адрес — мимо.
+            // Document CSP: inline without a nonce, or a blocked URL, is skipped.
             if let Ok(v) = self
                 .eval_in(index, &format!("(typeof __pt_cspScriptBlocked === 'function' && __pt_cspScriptBlocked({idx})) ? 'blocked' : ''"))
                 .await
@@ -1786,19 +1760,15 @@ impl BrowserContext {
             }
             // Which script it was, for the log below: an anonymous "a script
             // threw" says nothing on a page that runs forty of them.
-            // Имя скрипта — его адрес: у внешнего свой, у встроенного адрес
-            // страницы, как у браузера.
+            // The script's name is its URL; an inline script gets the page URL, as in a browser.
             let mut whose = if base_url.is_empty() {
                 String::from("inline")
             } else {
                 base_url.to_string()
             };
             let code = match script {
-                // Встроенный скрипт — тоже скрипт с адресом: в браузере кадры
-                // стека внутри него названы адресом документа, а не пустотой.
-                // Без имени каждый такой кадр читается как `<anonymous>` —
-                // видно всякому, кто разбирает `new Error().stack`, а его
-                // разбирают.
+                // Inline scripts are named too: in a browser their stack frames carry the
+                // document URL, not `<anonymous>`, and pages parse `new Error().stack`.
                 nokk_dom::Script::Inline(code) if !base_url.is_empty() => code.clone(),
                 nokk_dom::Script::Inline(code) => code.clone(),
                 nokk_dom::Script::External(src) => match resolve_url(base_url, src) {
@@ -1810,10 +1780,8 @@ impl BrowserContext {
                             continue;
                         }
                         match self.with_frames_live(self.take_preloaded(preload.remove(&abs), &abs)).await {
-                            // `sourceURL` — не отладочная мелочь: без него каждый
-                            // кадр стека выглядит как `<anonymous>`, тогда как в
-                            // браузере там адрес скрипта. `new Error().stack`
-                            // читают, и форма стека — часть отпечатка.
+                            // `sourceURL` matters: without it every stack frame reads `<anonymous>` instead
+                            // of the script URL, and the stack shape is part of the fingerprint.
                             Ok((_, code)) => {
                                 whose = abs.clone();
                                 code
@@ -1834,11 +1802,9 @@ impl BrowserContext {
                 | nokk_dom::Script::ExternalModule(_)
                 | nokk_dom::Script::Skipped => continue,
             };
-            // Запись о скрипте должна быть видна, пока он исполняется: у
-            // браузера ответ пришёл раньше, чем скрипт начал. api.js Turnstile
-            // ищет свою запись первой же строкой и отдаёт её виджету; у нас
-            // записи раздавались только после всех скриптов, и лента была
-            // пуста.
+            // The script's timing entry must be visible while it runs: in a browser the
+            // response arrived before the script started. Turnstile's api.js looks up its own
+            // entry on its first line and hands it to the widget.
             self.flush_resource_timings(index).await;
             let _ = self
                 .eval_in(index, &format!("__pt_beginScript({idx})"))
@@ -1861,10 +1827,9 @@ impl BrowserContext {
         // job: for the top-level page that is `load_html` below, and for a frame
         // it is `pump_frames`, which gives it turns of its own. Pumping here would
         // mean a frame's load re-entering the parent's whole event loop.
-        // Перед событиями загрузки: страница, читающая тайминги в `load`,
-        // обязана увидеть уже полный список. Только своя страница: журнал
-        // запросов один на контекст, и отдать его фрейму — значит и фрейму
-        // солгать, и странице ничего не оставить.
+        // Before the load events: a page reading timings in `load` must see the full list.
+        // Top page only: the request log is per context, and handing it to a frame would
+        // mislead the frame and leave nothing for the page.
         if index == self.idx() {
             self.flush_resource_timings(index).await;
         }
@@ -1958,11 +1923,9 @@ impl BrowserContext {
             //    is a *total* budget across rounds so a runaway `setInterval` is
             //    bounded overall, not merely per round.
             let remaining = TIMER_CAP.saturating_sub(total_timers);
-            // Воркеры крутятся здесь же, а не своей очередью после страницы:
-            // они живут на других потоках пула, и ждать друг друга им больше
-            // незачем. В браузере это так и есть — страница считает, воркер
-            // считает, и время ответа складывается из дороги сообщения, а не из
-            // того, кто кого дождался.
+            // Workers run here too, not in a queue after the page: they live on other pool
+            // threads, so neither waits for the other. Reply time then comes from message
+            // latency, as in a browser.
             let page_slice = self.engine.pool.dispatch(self.worker, move |iso| {
                 // Short per-round grab so the worker is released back to other
                 // contexts frequently (fairness), rather than held for seconds.
@@ -1993,9 +1956,8 @@ impl BrowserContext {
             self.log_console("page", &queues);
             // How long until the page's next timer, straight from the same queue
             // the driver just pumped: -1 for "nothing pending".
-            // Часы очереди теперь дробные, и «через 49.9 мс» приходит числом
-            // с запятой: `as_i64` на нём отдавал пустоту, то есть «таймеров
-            // нет», и загрузка переставала их дожидаться.
+            // The queue clock is fractional now ("in 49.9 ms"): `as_i64` returned None,
+            // meaning "no timers", and loading stopped waiting for them.
             let next_timer_ms = queues["timers"]
                 .as_f64()
                 .map(|v| if v < 0.0 { -1 } else { v.ceil() as i64 })
@@ -2014,7 +1976,7 @@ impl BrowserContext {
             self.apply_frame_ops(&base, &frame_ops).await;
             self.apply_worker_ops(index, &base, &worker_ops).await;
             self.apply_script_ops(index, &base, &script_ops).await;
-            // `import()` спрашивают у движка напрямую, минуя очереди страницы.
+            // `import()` asks the engine directly, bypassing the page's queues.
             self.serve_dynamic_imports().await;
 
             // 5. The page asked to go somewhere. Only the last request counts —
@@ -2059,14 +2021,11 @@ impl BrowserContext {
 
             // 5. Perform each fetch off the isolate thread, then settle its
             //    Promise back on the worker.
-            // Запросы раунда идут разом, как у браузера: он не ждёт шрифта,
-            // чтобы попросить таблицу стилей. У нас они шли по одному, по
-            // полсотни миллисекунд каждый, и страница с десятком ссылок в
-            // заголовке теряла на этом полсекунды до первого скрипта.
-            // Очередь уже забрана целиком: что не выполнено здесь, не выполнится
-            // никогда — обещание повиснет. Раньше брались первые 200, а хвост
-            // пропадал: у stake.com за 389 предзагрузками модулей стояли все
-            // 128 таблиц стилей, и страница ждала их вечно. Теперь всё, пачками.
+            // A round's requests go out together, as in a browser that does not wait for a
+            // font to ask for a stylesheet; one by one cost a page with ten head links half a
+            // second before its first script. The queue is already drained, so anything not
+            // done here never settles: stake.com had 128 stylesheets behind 389 module
+            // preloads and waited forever when only the first 200 were taken. All, in batches.
             let mut settles = Vec::with_capacity(reqs.len());
             for batch in reqs.chunks(MAX_FETCHES) {
                 fetches_done += batch.len();
@@ -2084,11 +2043,9 @@ impl BrowserContext {
                     .dispatch(w, move |iso| iso.eval(raw, &settle))
                     .await?
                     .map_err(EngineError::Js)?;
-                // Между загрузками кадрам дают ход. Страница вроде chess.com
-                // тянет сотню файлов подряд, и пока они идут по очереди, виджет
-                // в кадре стоит: его собственные часы показывали восемь секунд
-                // там, где у браузера полторы. Браузеру это даётся само —
-                // чужой источник живёт в своём потоке.
+                // Give frames turns between loads. While chess.com pulls a hundred files in
+                // sequence, the widget's frame would stall (8 s on its own clock vs 1.5 s in a
+                // browser, where the cross-origin frame has its own thread).
                 if self.has_frames()
                     && last_frame_pump.elapsed() >= FRAME_PUMP_EVERY
                     && std::time::Instant::now() < deadline
@@ -2116,12 +2073,11 @@ impl BrowserContext {
                 let t = std::time::Instant::now();
                 frames_ran = self.pump_frames().await?;
                 tracing::debug!(target: "nokk::pace", gap_ms = gap,
-                    pump_ms = t.elapsed().as_millis() as u64, frames_ran, "круг кадров");
+                    pump_ms = t.elapsed().as_millis() as u64, frames_ran, "frame round");
             }
 
-            // Ждали только таблиц из разметки — пришли, и хватит: дальше
-            // исполняется следующий скрипт, а не всё, что успела завести
-            // страница.
+            // Only markup stylesheets were awaited and they arrived: run the next script
+            // rather than everything the page has queued.
             if until_sheets {
                 let left = self
                     .eval_in(index, "globalThis.__ptBlockingSheets | 0")
@@ -2137,8 +2093,8 @@ impl BrowserContext {
             if busy || frames_ran > 0 || !frame_ops.is_empty() {
                 continue;
             }
-            // Ответы кадров и воркеров ещё в пути: подождать немного и дать
-            // кадрам ход, а не объявлять простой.
+            // Frame and worker replies are still in flight: wait a bit and give frames a
+            // turn instead of declaring idle.
             if self.inflight_pending() && std::time::Instant::now() < deadline {
                 tokio::time::sleep(FRAME_PUMP_EVERY).await;
                 if self.has_frames() {
@@ -2158,11 +2114,9 @@ impl BrowserContext {
                 let d = std::time::Duration::from_millis(next_timer_ms as u64);
                 if waited + d <= idle_wait && std::time::Instant::now() + d < deadline {
                     waited += d;
-                    // Ждать чужой таймер — не значит замереть. Кадры живут по
-                    // своим часам, и пока страница ждёт секунду до следующего
-                    // тика, виджет в кадре должен успеть свои двести. Сон
-                    // целиком держал его ровно столько, сколько ждала страница,
-                    // и это давало те самые провалы в секунды.
+                    // Waiting for a page timer must not freeze frames: they run on their own clocks,
+                    // and a widget needs its 200 ms ticks while the page waits a second. Sleeping
+                    // the whole wait caused the second-long gaps.
                     let until = std::time::Instant::now() + d;
                     loop {
                         let left = until.saturating_duration_since(std::time::Instant::now());
@@ -2182,16 +2136,15 @@ impl BrowserContext {
                 }
             }
 
-            // Простой страницы — добрать запас пустых реалмов на её потоке и
-            // по готовому контексту воркера на каждом потоке пула (не чаще
-            // раза в полсекунды: пустая проверка — тоже задача в очереди потока).
+            // Page idle: top up spare realms on its thread and one ready worker context on
+            // each pool thread (at most every 500 ms: even an empty check is a queued task).
             if std::env::var_os("NOKK_NO_SPARE_REALMS").is_none() {
                 self.engine.pool.dispatch_detached(self.worker, |iso| iso.top_up_realms(4, 1));
                 if last_spare_topup.elapsed() >= std::time::Duration::from_millis(500) {
                     last_spare_topup = std::time::Instant::now();
                     for w in self.engine.pool.live_worker_ids() {
-                        // Не на потоках страницы и кадров: сборка занимает их на
-                        // сотни миллисекунд, и таймеры страницы ждут.
+                        // Not on the page or frame threads: building occupies them for hundreds of
+                        // milliseconds and page timers wait.
                         if w == self.worker || w == self.frame_worker() {
                             continue;
                         }
@@ -2401,8 +2354,7 @@ impl BrowserContext {
                 .lock()
                 .map(|c| c.get(&index).copied().unwrap_or(0))
                 .unwrap_or(0);
-            // Каждому контексту — только его собственные запросы: у кадра в
-            // браузере своя лента, и чужих ресурсов в ней нет.
+            // Each context gets only its own requests: a frame has its own timeline in a browser.
             let all: Vec<NetworkRecord> = self
                 .requests
                 .lock()
@@ -2410,9 +2362,9 @@ impl BrowserContext {
                 .unwrap_or_default();
             (sent, all)
         };
-        // Документ кадра браузер показывает дважды: у родителя это ресурс с
-        // `initiatorType: "iframe"`, а внутри самого кадра — его навигация.
-        // Запись о нём одна, поэтому кадру она отдаётся отдельно, первой.
+        // A browser shows a frame's document twice: as an `initiatorType: "iframe"`
+        // resource in the parent and as the frame's own navigation. There is one record,
+        // so the frame gets it separately, first.
         let nav_due = index != self.idx()
             && self
                 .nav_sent
@@ -2461,15 +2413,12 @@ impl BrowserContext {
             .iter()
             .enumerate()
             .map(|(i, r)| {
-                // Навигация у каждого документа своя: у страницы это её адрес, у
-                // кадра — его собственный. Всё остальное, что он запросил, — его
-                // ресурсы.
+                // Each document has its own navigation entry: the page's URL for the page, the
+                // frame's for a frame. Everything else it requested is a resource.
                 let top_document = from + i == 0 && r.resource_type == "document";
                 let kind = if top_document { "navigation" } else { "resource" };
-                // Имена те же, что называет браузер: у стиля, взятого через
-                // `<link>`, это `link`, у XHR — `xmlhttprequest`, а `img` носит
-                // только то, что и правда картинка. Мы звали картинкой всё
-                // подряд, и перечень ресурсов — а его читают — был не тот.
+                // Initiator names as a browser gives them: `link` for a `<link>` stylesheet,
+                // `xmlhttprequest` for XHR, `img` only for real images. Pages read this list.
                 let initiator = match r.resource_type.as_str() {
                     "script" => "script",
                     "xhr" => "xmlhttprequest",
@@ -2487,10 +2436,8 @@ impl BrowserContext {
                     "name": r.url,
                     "entryType": kind,
                     "initiatorType": initiator,
-                    // Навигация в браузере всегда начинается с нуля: её запись —
-                    // начало отсчёта для всех остальных. Мы ставили сюда время
-                    // самого запроса, и страница видела навигацию, начавшуюся
-                    // через сто миллисекунд после собственного начала времён.
+                    // A browser's navigation entry always starts at 0: it is the origin for all the
+                    // others.
                     "start": if top_document { 0.0 } else { r.started_ms },
                     "duration": r.duration_ms,
                     "size": r.encoded_len + 300,
@@ -2507,9 +2454,8 @@ impl BrowserContext {
         if let Ok(mut c) = self.timings_sent.lock() {
             c.insert(index, records.len());
         }
-        // Времена записей — по часам страницы; у кадра свои часы (его
-        // timeOrigin позже), поэтому кадру передаём начало часов страницы в
-        // миллисекундах эпохи, и запись переводится на его время.
+        // Entry times are on the page clock; a frame has its own (later timeOrigin), so it
+        // gets the page's clock origin in epoch ms and converts.
         let page_epoch = if index != self.idx() {
             let since = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2540,11 +2486,9 @@ impl BrowserContext {
     async fn settle(&self, how_long: std::time::Duration) {
         let until = std::time::Instant::now() + how_long;
         while std::time::Instant::now() < until {
-            // Пока страница работает, между прокачками спим миллисекунду, а не
-            // пять: браузерный таймер на 1 мс срабатывает через 1 мс, а у нас
-            // получалось три, и вложенные — пять вместо четырёх. Эти доли
-            // читают: частота кадров и зажим вложенных таймеров — обычная
-            // проба на движок.
+            // While the page is busy sleep 0.5 ms between pumps, not 5: a browser's 1 ms timer
+            // fires after 1 ms (we got 3, and 5 instead of 4 for nested ones). Frame rate and
+            // nested-timer clamping are common engine probes.
             let worked = self.run_event_loop().await.unwrap_or(0);
             let nap = if worked > 0 { 500 } else { 5_000 };
             tokio::time::sleep(std::time::Duration::from_micros(nap)).await;
@@ -2675,10 +2619,9 @@ impl BrowserContext {
                     }
                 }
             }
-            // Два захода в изоляты на каждом витке — часы страницы и кадра
-            // виджета. Убраны как отладочные — и интерактивная застава перестала
-            // проходить: заход в кадр между его срезами, похоже, нужен ему как
-            // пульс. Оставлены как есть, пока причина не названа точно.
+            // Two isolate visits per iteration (page clock and widget frame clock). Removing
+            // them as debug code made the interactive interstitial stop passing: the visit
+            // between the frame's slices seems to act as a pulse. Kept until the cause is known.
             let _ = self
                 .evaluate("typeof __pt_nextTimerDelay === 'function' ? String(__pt_nextTimerDelay()) : 'nofn'")
                 .await;
@@ -2742,12 +2685,9 @@ impl BrowserContext {
             // Inside the frame that owns it, so no coordinate has to survive a
             // trip through a parent that lays its frames out differently.
             //
-            // Три события подряд в один такт — не нажатие человека, а его
-            // отсутствие: указатель возникает в точном центре, давит и
-            // отпускает за нулевое время. Челлендж этот промежуток измеряет.
-            // Поэтому: подвод по дуге, пауза перед нажатием, удержание, и
-            // конечная точка чуть в стороне от центра — руки в центр не
-            // попадают.
+            // Three events in one tick is not a human press: the pointer appears dead centre
+            // and presses and releases in zero time, and the challenge measures that. So:
+            // approach along an arc, pause, hold, and land slightly off centre.
             let trace = std::env::var_os("NOKK_TRACE_CONTROLS").is_some();
             let press_t0 = std::time::Instant::now();
             let send = async |js: String| {
@@ -2760,9 +2700,9 @@ impl BrowserContext {
                     tracing::info!(target: "nokk::press", took_ms = t.elapsed().as_millis() as u64, at_ms = press_t0.elapsed().as_millis() as u64, what = %js.chars().take(40).collect::<String>(), "step");
                 }
             };
-            // Экранная точка начала документа, где лежит флажок: окно плюс
-            // рамка браузера плюс положение кадра на странице. Без неё
-            // screenX/Y равнялись clientX/Y — у настоящей мыши так не бывает.
+            // Screen position of the document origin holding the checkbox: window plus browser
+            // chrome plus the frame's position. Without it screenX/Y equalled clientX/Y, which
+            // a real mouse never gives.
             let origin_js = match frame {
                 None => "__pt_screenOrigin()".to_string(),
                 Some(id) => format!(
@@ -2777,8 +2717,8 @@ impl BrowserContext {
                 .filter(|v| v.len() == 2)
                 .map(|v| (v[0], v[1]))
                 .unwrap_or((0.0, 0.0));
-            // Разброс берём из самих координат: он постоянен для одной цели и
-            // разный у разных, без обращения к случайности.
+            // Spread derived from the coordinates: stable per target, different across
+            // targets, no randomness.
             let spread = ((x + y * 7.0) as i64).unsigned_abs() % 5;
             let mut seed = ((x * 131.0 + y * 977.0) as i64).unsigned_abs() | 1;
             let mut rnd = move || {
@@ -2788,9 +2728,9 @@ impl BrowserContext {
                 (seed % 10_000) as f64 / 10_000.0
             };
             let (tx, ty) = (x + 1.0 + spread as f64 * 0.37 + rnd() * 0.6, y - 1.0 + (spread % 3) as f64 * 0.41 + rnd() * 0.6);
-            // Подвод, как у записанной руки в Chrome: два десятка точек за
-            // полсекунды с лишним, шаг неровный (8–60 мс, изредка дольше),
-            // издалека по дуге и с замедлением у цели.
+            // Approach like a recorded hand in Chrome: about twenty points over half a second,
+            // uneven steps (8-60 ms, occasionally longer), arcing in from afar and slowing near
+            // the target.
             let steps = 18 + (spread as usize * 2) % 7;
             let (sx0, sy0) = (tx + 55.0 + rnd() * 20.0, ty + 18.0 + rnd() * 12.0);
             for i in 1..=steps {
@@ -2812,7 +2752,7 @@ impl BrowserContext {
             self.settle(std::time::Duration::from_millis(85 + (rnd() * 50.0) as u64))
                 .await;
             send(format!("__pt_mouse(\"mouseReleased\", {tx:.4}, {ty:.4}, \"left\", 1, {ox:.4}, {oy:.4})")).await;
-            // Рука после нажатия не замирает: пара точек в сторону.
+            // The hand does not freeze after the press: a few points off to the side.
             for k in 1..=3 {
                 self.settle(std::time::Duration::from_millis(30 + (rnd() * 60.0) as u64)).await;
                 let (px, py) = (tx + k as f64 * (2.0 + rnd() * 3.0), ty + k as f64 * (4.0 + rnd() * 5.0));
@@ -2923,11 +2863,9 @@ impl BrowserContext {
                         continue;
                     }
                     let boot = self.bootstrap.clone();
-                    // Воркеру — свой поток. В браузере он и есть отдельный
-                    // поток: страница считает свою работу, пока воркер считает
-                    // свою, и ответ приходит через время сообщения, а не через
-                    // время «страница освободилась». У нас всё жило на одном
-                    // изоляте, и каждый ход воркера отнимался у страницы.
+                    // A worker gets its own thread, as in a browser: page and worker compute in
+                    // parallel and a reply costs message latency, not "the page is free". On a shared
+                    // isolate every worker turn was taken from the page.
                     let place = self.engine.pool.pick_worker_avoiding(&[self.worker, self.frame_worker()]);
                     let load = std::sync::Arc::new(self.engine.pool.register_context(place));
                     let t_create = std::time::Instant::now();
@@ -2957,9 +2895,8 @@ impl BrowserContext {
                     let _ = self
                         .eval_at(place, child, &nokk_stealth::worker_scope_script(name, &url))
                         .await;
-                    // Область воркера наследует у создателя доступ к хранилищу
-                    // (`sec-fetch-storage-access: active` на его запросах), а
-                    // воркер из blob шлёт запросы без реферера — как у Chrome.
+                    // The worker scope inherits its creator's storage access
+                    // (`sec-fetch-storage-access: active`), and a blob worker sends no referrer, as in Chrome.
                     let storage_access = self
                         .eval_in(index, "!!globalThis.__ptStorageAccess")
                         .await
@@ -2976,9 +2913,8 @@ impl BrowserContext {
                                       try {{ const d = D(globalThis, k); if (d && d.enumerable && d.configurable) {{ d.enumerable = false; Object.defineProperty(globalThis, k, d); }} }} catch (e) {{}} }} }})();"),
                         )
                         .await;
-                    // Крючки наблюдателя — следом за областью: воркер стартует
-                    // со своим реалмом, и всё, что поставлено странице, здесь
-                    // не действует.
+                    // Observer hooks right after the scope: the worker has its own realm, so nothing
+                    // installed on the page applies here.
                     let winit = self
                         .worker_init_scripts
                         .lock()
@@ -3028,10 +2964,9 @@ impl BrowserContext {
                             let data = op["data"].as_str().unwrap_or("null");
                             tracing::debug!(owner = index, worker = id, bytes = data.len(),
                                             head = %&data[..data.len().min(420)], "worker post");
-                            // Задача целиком — в файл, когда её надо прочитать.
-                            // Челлендж посылает воркеру модуль WebAssembly на
-                            // несколько килобайт, и в строку лога он не влезает,
-                            // а сравнивать его с браузером нужно дословно.
+                            // Dump the whole task to a file on request: the challenge sends the worker a
+                            // multi-KB WebAssembly module that does not fit a log line and must be compared
+                            // with the browser verbatim.
                             if let Ok(dir) = std::env::var("NOKK_DUMP_WORKER_TASKS") {
                                 let n = WORKER_TASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let _ = std::fs::create_dir_all(&dir);
@@ -3043,11 +2978,9 @@ impl BrowserContext {
                             let _ = self
                                 .eval_at(place, child, &format!("__pt_workerDeliver({})", js_str(data)))
                                 .await;
-                            // И сразу отдаём воркеру ход. Задание обычно ставит
-                            // короткий таймер и ждёт его: челлендж просит
-                            // «отзовись через 55 мс» и меряет, сколько вышло.
-                            // Дожидаться общего круга значило приписать к его
-                            // 55 мс наши тридцать.
+                            // Give the worker a turn right away. The task usually sets a short timer and the
+                            // challenge measures it ("reply in 55 ms"); waiting for the general round added
+                            // our ~30 ms to it.
                             self.serve_worker_soon(index, id, place, child).await;
                         }
                         None => tracing::debug!(owner = index, worker = id, "worker post: no such worker"),
@@ -3064,9 +2997,8 @@ impl BrowserContext {
         }
     }
 
-    /// Дать воркеру доработать то, что вот-вот наступит: свежедоставленное
-    /// сообщение почти всегда ставит короткий таймер, и время до него — это
-    /// время, которое кто-то замеряет.
+    /// Let the worker finish what is about to happen: a fresh message almost always
+    /// sets a short timer, and the time until it fires is measured.
     async fn serve_worker_soon(
         &self,
         owner: usize,
@@ -3074,10 +3006,9 @@ impl BrowserContext {
         place: nokk_pool::WorkerId,
         child: usize,
     ) {
-        // Ждём только то, что вот-вот: короткий таймер задания. Длинные — не
-        // наше дело, их обслужит общий круг, иначе один воркер задержит всех.
-        // Ожидание живёт на потоке воркера: возвращать ход сюда ради каждого
-        // пятимиллисекундного шага дороже самого шага.
+        // Wait only for the near timer; long ones belong to the general round, or one
+        // worker would delay everyone. The wait runs on the worker's thread: returning
+        // here for every 5 ms step costs more than the step.
         const NEAR: std::time::Duration = std::time::Duration::from_millis(80);
         const TURN: std::time::Duration = std::time::Duration::from_millis(150);
         let _ = self
@@ -3087,9 +3018,9 @@ impl BrowserContext {
                 iso.run_worker_loop(child, 400, TURN, NEAR)
             })
             .await;
-        // Запросы сети, которые задание поставило сразу (fetch из воркера),
-        // уходят тут же: до общего круга они лежали в очереди до полутора
-        // секунд, и челлендж мерил это как время ответа сервера.
+        // Network requests the task queued (fetch from the worker) go out now: waiting for
+        // the general round queued them for up to 1.5 s, which the challenge measured as
+        // server response time.
         if let Ok(Value::String(qjson)) = self.eval_at(place, child, DRAIN_IO).await {
             let queues: Value = serde_json::from_str(&qjson).unwrap_or_default();
             self.log_console("worker", &queues);
@@ -3107,15 +3038,13 @@ impl BrowserContext {
                 }
             }
         }
-        // Ответ уходит домой сразу же, а не следующим общим кругом: это
-        // последние миллисекунды, которые челлендж приписывает к нашему времени
-        // отклика.
+        // Deliver the reply home now, not on the next round: the challenge counts those
+        // milliseconds into our response time.
         self.flush_worker_out(owner, id, place, child).await;
     }
 
-    /// Отдать домой всё, что воркер уже отправил. Отдельно от общего круга,
-    /// потому что время между «колбэк положил сообщение» и «страница его
-    /// получила» тоже засекают.
+    /// Deliver home everything the worker already posted. Separate from the general
+    /// round because the time from post to page receipt is measured too.
     async fn flush_worker_out(
         &self,
         owner: usize,
@@ -3141,9 +3070,7 @@ impl BrowserContext {
             })
             .unwrap_or_default();
         for m in messages {
-            // Та же запись, что и на общем круге: ответ, ушедший быстрым путём,
-            // раньше не оставлял в логе следа — и разговор выглядел так, будто
-            // воркер промолчал.
+            // Same log line as the general round, so a fast-path reply leaves a trace.
             tracing::debug!(worker = id, bytes = m.len(),
                             head = %&m[..m.len().min(420)], "worker reply delivered");
             let _ = self
@@ -3165,17 +3092,14 @@ impl BrowserContext {
         for (key, state) in workers {
             let (owner, id) = key;
             let (place, child) = (state.worker, state.index);
-            // Пока воркеру есть что делать, даём ещё срез — до четырёх подряд.
-            // Один срез в 50 мс на виток родительского цикла означал, что
-            // секунда работы воркера растягивалась на несколько секунд стены:
-            // сборщик отпечатка отвечал рывками с провалами по три-четыре
-            // секунды, и челлендж успевал объявить себя просроченным.
+            // More slices while the worker has work (up to four in a row). One 50 ms slice per
+            // parent iteration stretched a second of worker work over several wall seconds,
+            // and the challenge declared itself expired.
             let turn_started = std::time::Instant::now();
-            // Пока воркеру есть что делать — или вот-вот будет, — не отдаём его
-            // ход обратно. Бюджет ограничивает жадность: страница и другие
-            // контексты ждать вечно не должны. Ждёт воркер сам, на своём потоке:
-            // их сборщик разложен на цепочку таймеров по 55 мс, и поездка сюда
-            // за каждым шагом стоила дороже самого шага.
+            // Keep the turn while the worker has work now or soon. The budget bounds greed so
+            // the page and other contexts do not wait forever. The worker waits on its own
+            // thread: its collector is a chain of 55 ms timers, and a round trip per step costs
+            // more than the step.
             const WORKER_TURN: std::time::Duration = std::time::Duration::from_millis(500);
             const NEAR: std::time::Duration = std::time::Duration::from_millis(80);
             let ran = self
@@ -3188,8 +3112,7 @@ impl BrowserContext {
                 .unwrap_or(0);
             let slices_ms = turn_started.elapsed().as_millis();
             work += ran as usize;
-            // Что воркер ждёт, когда молчит: свой таймер (и через сколько) или
-            // ничего вовсе — тогда он висит на обещании.
+            // What an idle worker waits on: its own timer (and how soon), or nothing (a promise).
             let pending = self
                 .eval_at(place, child, "typeof __pt_nextTimerDelay === 'function' ? __pt_nextTimerDelay() : -1")
                 .await
@@ -3198,8 +3121,8 @@ impl BrowserContext {
                 .unwrap_or(-1);
             tracing::debug!(worker = id, ran, slices_ms, pending, "worker turn");
 
-            // Воркер мог быть остановлен (его кадр убрали) между перечнем и
-            // ходом: это конец воркера, а не ошибка перехода страницы.
+            // The worker may have been stopped (its frame removed) between listing and turn:
+            // that ends the worker, not the page navigation.
             let qjson = match self.eval_at(place, child, DRAIN_IO).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -3428,8 +3351,8 @@ impl BrowserContext {
                     if self.frames.lock().map(|f| f.len()).unwrap_or(0) >= MAX_FRAMES {
                         continue;
                     }
-                    // Запас пустых реалмов на потоке кадров строится, пока документ
-                    // кадра идёт по сети: программе челленджа они нужны сразу.
+                    // Build spare realms on the frame thread while the frame document loads: the
+                    // challenge program needs them immediately.
                     if origin_of(&url) != origin_of(base)
                         && std::env::var_os("NOKK_FRAMES_SHARED").is_none()
                         && std::env::var_os("NOKK_NO_SPARE_REALMS").is_none()
@@ -3441,9 +3364,8 @@ impl BrowserContext {
                                 let boot = boot.clone();
                                 move |iso| iso.prewarm_realms(&boot, 3)
                             });
-                        // И по готовому контексту воркера на каждом потоке пула:
-                        // программа челленджа заводит воркеры один за другим и
-                        // ждёт ответа в пределах сотен миллисекунд.
+                        // And one ready worker context on each pool thread: the challenge program starts
+                        // workers one after another and expects replies within hundreds of milliseconds.
                         for w in self.engine.pool.live_worker_ids() {
                             if w == self.worker || w == self.frame_worker() {
                                 continue;
@@ -3460,13 +3382,10 @@ impl BrowserContext {
                         continue;
                     };
                     let boot = self.bootstrap.clone();
-                    // Кадр чужого происхождения — на своём потоке: в браузере он
-                    // в своём процессе и считает, пока страница занята. На общем
-                    // потоке виджет Turnstile ждал, пока страница догрузит сотню
-                    // своих кусков, и его собственные часы показывали отрезки в
-                    // три-пять раз длиннее хромовских — а они уходят в тело
-                    // первого POST. Кадр своего происхождения остаётся со
-                    // страницей.
+                    // A cross-origin frame gets its own thread: in a browser it runs in its own process
+                    // while the page is busy. On a shared thread the Turnstile widget waited for the
+                    // page's hundred chunks, and its own clock showed intervals 3-5x Chrome's, which go
+                    // into the first POST. A same-origin frame stays with the page.
                     let cross = origin_of(&url) != origin_of(base);
                     let place = if cross && std::env::var_os("NOKK_FRAMES_SHARED").is_none() {
                         self.frame_worker()
@@ -3489,8 +3408,8 @@ impl BrowserContext {
                             Some(std::sync::Arc::new(self.engine.pool.register_context(place))),
                         )
                     };
-                    // Часы кадра идут от начала его навигации, а не от постройки
-                    // контекста: документ к этому мигу уже пришёл.
+                    // The frame's clock starts at its navigation, not at context construction: the
+                    // document has already arrived by now.
                     let ago = nav_started.elapsed().as_secs_f64() * 1000.0;
                     let _ = self
                         .eval_in(index, &format!("globalThis.__pt_shiftOrigin && __pt_shiftOrigin({ago:.3});"))
@@ -3501,9 +3420,9 @@ impl BrowserContext {
                     let _ = self
                         .eval_in(index, &format!("__pt_markAsFrame({id});"))
                         .await;
-                    // Стороннесть и реферер: в стороннем кадре Chrome отвечает
-                    // «denied» на разрешения, а `document.referrer` при
-                    // strict-origin-when-cross-origin — только источник родителя.
+                    // Third-party status and referrer: in a third-party frame Chrome answers "denied"
+                    // to permissions, and `document.referrer` under strict-origin-when-cross-origin is
+                    // just the parent's origin.
                     let referrer = if cross {
                         format!("{}/", origin_of(base))
                     } else {
@@ -3521,15 +3440,13 @@ impl BrowserContext {
                             ),
                         )
                         .await;
-                    // И своё окно: у кадра оно размером с его `<iframe>`, а не со
-                    // страницей. Виджет Turnstile живёт в 300×65 и этот размер
-                    // читает; наши кадры отвечали размером окна страницы.
+                    // The frame's window is the size of its `<iframe>`, not the page: the Turnstile
+                    // widget lives in 300x65 and reads it.
                     let (mut fw, mut fh) = (
                         op["w"].as_f64().unwrap_or(300.0),
                         op["h"].as_f64().unwrap_or(150.0),
                     );
-                    // Элемент мог получить размер уже после вставки (стили
-                    // разбираются позже) — спрашиваем родителя ещё раз, сейчас.
+                    // The element may get its size after insertion (styles parse later): ask the parent again now.
                     let raw = self.eval_in(self.idx(), &format!("__pt_frameBox({id})")).await;
                     tracing::debug!(?raw, "frame box from parent");
                     if let Ok(Value::String(box_)) = raw {
@@ -3599,12 +3516,10 @@ impl BrowserContext {
                 // opposite directions.
                 "post" => {
                     let data = op["data"].as_str().unwrap_or("null").to_string();
-                    // Виден весь обмен со фреймом — без патчей в JS, которые ломают
-                    // проверку `event.source === iframe.contentWindow`.
-                    // Перекличка сторожевого кота идёт каждые 900 мс и в полном
-                    // виде топит остальной обмен. Её считаем отдельной строкой:
-                    // важно не содержимое, а что она вообще идёт — и в обе ли
-                    // стороны.
+                    // The whole frame exchange is visible without JS patches, which would break
+                    // `event.source === iframe.contentWindow`. The watchcat heartbeat every 900 ms
+                    // would drown the rest, so it gets a separate line: what matters is that it flows,
+                    // and in both directions.
                     let beat = data.contains("\"meow\"") || data.contains("\"food\"");
                     if beat {
                         tracing::debug!(to_parent = op["toParent"].as_bool().unwrap_or(false),
@@ -3661,11 +3576,10 @@ impl BrowserContext {
         seen.insert(url.to_string());
         let mut pending = vec![(url.to_string(), source)];
 
-        // Волнами: разобрать всё, что уже пришло, собрать новые адреса и
-        // забрать их разом. Браузер тянет граф параллельно; мы — по одному
-        // файлу, и у chess.com (сотня модулей) api.js Turnstile начинал
-        // грузиться на четвёртой-восьмой секунде вместо половины первой. Эта
-        // цифра уходит виджету в письме (`apiJsResourceTiming.startTime`).
+        // In waves: parse everything that arrived, collect new URLs, fetch them together.
+        // A browser fetches the graph in parallel; one file at a time made Turnstile's
+        // api.js on chess.com (a hundred modules) start loading at 4-8 s instead of under
+        // 0.5 s, and that number goes to the widget (`apiJsResourceTiming.startTime`).
         while !pending.is_empty() {
             let wave = std::mem::take(&mut pending);
             let mut to_fetch: Vec<String> = Vec::new();
@@ -3694,9 +3608,8 @@ impl BrowserContext {
                         continue;
                     }
                     seen.insert(target.clone());
-                    // Уже собранный модуль второй раз не тянем: у браузера на реалм
-                    // одна карта модулей, и адрес в ней один, сколько бы кусков его
-                    // ни импортировало.
+                    // Do not refetch an already built module: a browser has one module map per realm
+                    // with one entry per URL, however many chunks import it.
                     let u = target.clone();
                     if self
                         .engine
@@ -3751,7 +3664,7 @@ impl BrowserContext {
             Ok(v) => v,
             Err(_) => return 0,
         };
-        // Кадры на своих потоках — со своих изолятов, и только свои.
+        // Frames on their own threads come from their own isolates, and only ours.
         let away: Vec<usize> = self
             .frames
             .lock()
@@ -3837,8 +3750,8 @@ impl BrowserContext {
                 }
                 continue;
             }
-            // <script type="module"> без src: исходник пришёл вместе с операцией,
-            // но исполнять его всё равно надо как модуль — со своим `import`.
+            // <script type="module"> without src: the source came with the op, but it must
+            // still run as a module, with its own `import`.
             if let Some(code) = op["code"].as_str() {
                 if let Err(e) = self.run_module(index, base, code.to_string()).await {
                     tracing::debug!(error = %e, "inline module threw");
@@ -3859,9 +3772,8 @@ impl BrowserContext {
             }
             match self.fetch_text_in(index, &url, "script", None).await {
                 Ok((_, code)) => {
-                    // Скрипт читает тайминг собственного <script> первой же
-                    // строкой — запись должна быть на месте до того, как он
-                    // начнёт, а не в конце круга.
+                    // A script reads its own <script> timing on its first line: the entry must exist
+                    // before it starts, not at the end of the round.
                     if index == self.idx() {
                         self.flush_resource_timings(index).await;
                     }
@@ -3872,8 +3784,8 @@ impl BrowserContext {
                         let _ = self.eval_in(index, &done(true)).await;
                         continue;
                     }
-                    // Классический скрипт: пока он идёт, `currentScript` —
-                    // он сам; имя — его адрес в `ScriptOrigin`, а не комментарий.
+                    // Classic script: `currentScript` is itself while it runs; its name is its URL in
+                    // `ScriptOrigin`, not a comment.
                     let _ = self
                         .eval_in(index, &format!("__pt_scriptStart({id});"))
                         .await;
@@ -3914,20 +3826,13 @@ impl BrowserContext {
         self.next_timer_in() == Some(std::time::Duration::ZERO)
     }
 
-    /// Drain what every live frame queued (its `parent.postMessage` calls) and
-    /// give each one an event-loop turn, so a frame's own timers and fetches make
-    /// progress rather than freezing the moment its document finished loading.
-    /// Дать кадрам ход, если с прошлого прошло достаточно. Зовётся из
-    /// длинных последовательностей главного документа: пока страница по
-    /// очереди качает и исполняет свои скрипты, виджет в кадре иначе стоит
-    /// целыми секундами — у браузера он живёт в своём процессе и не ждёт.
-    /// Дождаться таблиц стилей из разметки, прежде чем исполнять следующий
-    /// скрипт, — как браузер. Ожидание не простой: страница живёт, её
-    /// таймеры идут, а запросы за таблицами обслуживаются тем же циклом.
+    /// Wait for markup stylesheets before running the next script, as a browser does.
+    /// The wait is not idle: the page lives, its timers run, and the stylesheet
+    /// requests are served by the same loop.
     async fn wait_for_blocking_sheets(&self, index: usize) {
-        // Один срок на документ, а не на каждый скрипт: таблица, что не пришла
-        // за 15 с, не придёт и к следующему скрипту, а страница на SvelteKit
-        // несёт их десятки — stake.com стоял так полчаса на 100% процессора.
+        // One deadline per document, not per script: a sheet that missed 15 s will not
+        // arrive for the next script, and a SvelteKit page carries dozens (stake.com sat
+        // like this for half an hour at 100% CPU).
         let doc = self.doc_seq.load(std::sync::atomic::Ordering::Acquire);
         if self.sheets_gave_up.load(std::sync::atomic::Ordering::Acquire) == doc + 1 {
             return;
@@ -3954,24 +3859,22 @@ impl BrowserContext {
                 self.sheets_gave_up.store(doc + 1, std::sync::atomic::Ordering::Release);
                 return;
             }
-            // Цикл может сам загрузить документ, а тот — снова ждать таблиц.
+            // The loop may load a document itself, which then waits for sheets again.
             let worked = match Box::pin(self.run_event_loop_waiting(std::time::Duration::ZERO, true)).await {
                 Ok(n) => n,
                 Err(_) => return,
             };
-            // Ждём сеть, а не крутимся: без паузы этот цикл съедал ядро целиком.
+            // Wait for the network rather than spin: without the pause this loop ate a whole core.
             if worked == 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         }
     }
 
-    /// Дождаться `fut`, не останавливая кадры. Кадр чужого происхождения в
-    /// браузере живёт в своём процессе и считает, пока страница тянет свои
-    /// куски; у нас он стоял всё это время. Виджет Turnstile меряет свои этапы
-    /// часами (`Date.now`), и два его отрезка выходили у нас в три-пять раз
-    /// длиннее хромовских — ровно на время, пока страница грузила сотню
-    /// файлов, а кадр ждал хода. Эти числа уходят в тело первого POST.
+    /// Await `fut` without stopping frames. A cross-origin frame in a browser runs in its
+    /// own process while the page loads its chunks; here it stalled meanwhile. The
+    /// Turnstile widget times its stages with `Date.now`, and two of them came out 3-5x
+    /// Chrome's, exactly the time the page spent loading. These go into the first POST.
     async fn with_frames_live<F: std::future::Future>(&self, fut: F) -> F::Output {
         use std::sync::atomic::Ordering;
         if !self.has_frames()
@@ -3994,6 +3897,9 @@ impl BrowserContext {
         out
     }
 
+    /// Give frames a turn if enough time has passed. Called from the main document's
+    /// long sequences: while the page fetches and runs its scripts one by one, the
+    /// framed widget would otherwise stall for seconds (in a browser it has its own process).
     async fn frames_take_a_turn(&self) {
         if !self.has_frames() {
             return;
@@ -4007,11 +3913,13 @@ impl BrowserContext {
             }
             *last = std::time::Instant::now();
         }
-        // Вложенность здесь настоящая: пульс кадров может сам грузить
-        // документ, а тот — снова дать ход кадрам. Значит через кучу.
+        // Real recursion: a frame pump may load a document, which pumps frames again; hence boxed.
         let _ = Box::pin(self.pump_frames()).await;
     }
 
+    /// Drain what every live frame queued (its `parent.postMessage` calls) and
+    /// give each one an event-loop turn, so a frame's own timers and fetches make
+    /// progress rather than freezing the moment its document finished loading.
     async fn pump_frames(&self) -> Result<usize, EngineError> {
         let frames: Vec<(u32, usize)> = self
             .frames
@@ -4020,20 +3928,18 @@ impl BrowserContext {
             .unwrap_or_default();
         let mut work = 0;
         for (id, index) in frames {
-            // Кадру — его собственная лента времён, и до того, как он начнёт
-            // считать: у виджета Turnstile первое же, что делает программа, —
-            // читает `performance`, а пустая лента там значит «я ничего не
-            // грузил», чего про живой документ не бывает.
-            // Ленту времён и размер кадра пересчитываем не на каждом пульсе:
-            // каждый из них — отдельный заход в изолят, и вместе они стоили
-            // больше, чем сама работа кадра.
+            // A frame gets its own timing timeline before it starts: the first thing the
+            // Turnstile widget program does is read `performance`, and an empty timeline means
+            // "loaded nothing", impossible for a live document. Timeline and frame size are
+            // refreshed only every 8th pump: each is a separate isolate visit, and together
+            // they cost more than the frame's own work.
             let full = self.frame_pump_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8 == 0;
             if full {
                 self.flush_resource_timings(index).await;
             }
             let t_slice = std::time::Instant::now();
-            // Кадр мог исчезнуть между перечнем и прокачкой (страница убрала
-            // iframe): это не ошибка перехода, а просто конец кадра.
+            // The frame may have vanished between listing and pumping (the page removed the
+            // iframe): the frame's end, not a navigation error.
             let ran = match self
                 .engine
                 .pool
@@ -4051,9 +3957,7 @@ impl BrowserContext {
                 }
             };
             work += ran as usize;
-            // Кадр простаивает — самое время добрать запас пустых реалмов на
-            // его потоке: следующий вставленный им кадр получит готовый.
-            tracing::debug!(target: "nokk::pace", frame = id, ran, slice_ms = t_slice.elapsed().as_millis() as u64, "срез кадра");
+            tracing::debug!(target: "nokk::pace", frame = id, ran, slice_ms = t_slice.elapsed().as_millis() as u64, "frame slice");
             let qjson = match self.eval_in(index, DRAIN_IO).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -4066,10 +3970,9 @@ impl BrowserContext {
                 Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
                 _ => Value::Null,
             };
-            // Кадр простаивает — можно добрать запас пустых реалмов на его
-            // потоке, но только если ближайший таймер не скоро: сборка реалма
-            // занимает поток на ~300 мс, и таймер кадра, стоящий за ней,
-            // опаздывал на столько же (секции отчёта растягивались втрое).
+            // Idle frame: top up spare realms on its thread, but only if the next timer is far:
+            // building a realm holds the thread ~300 ms, and the frame timer behind it was
+            // late by as much (report sections stretched 3x).
             let next_timer = queues["timers"].as_f64().unwrap_or(-1.0);
             if ran == 0 && index & OWN_THREAD != 0 && (next_timer < 0.0 || next_timer > 400.0)
                 && std::env::var_os("NOKK_NO_SPARE_REALMS").is_none()
@@ -4080,9 +3983,8 @@ impl BrowserContext {
             let base = self.frame_base(id);
             self.log_console(&format!("frame {id}"), &queues);
 
-            // Кадр узнаёт свой размер не один раз: стили доезжают позже вставки,
-            // и элемент может измениться. Браузер в этом случае меняет окно
-            // кадра — делаем то же, пока размер не устоится.
+            // A frame learns its size more than once: styles arrive after insertion and the
+            // element can change. A browser then resizes the frame window; do the same until it settles.
             let boxed = if full {
                 self.eval_in(self.idx(), &format!("__pt_frameBox({id})")).await
             } else {
@@ -4121,9 +4023,9 @@ impl BrowserContext {
             if let Some(reqs) = queues["fetch"].as_array() {
                 for r in reqs.iter().take(64) {
                     work += 1;
-                    // В сеть — сразу и без ожидания: JS кадра идёт дальше, а
-                    // ответ доставит `settle_inflight`. Пока запрос ждал
-                    // соседа по очереди, маячок челленджа держал всё на секунды.
+                    // To the network immediately: the frame's JS moves on and `settle_inflight`
+                    // delivers the reply. While a request waited its turn, the challenge beacon held
+                    // everything for seconds.
                     if let Some(settle) = self.start_fetch(Deliver::Frame(index), index, &base, r) {
                         let _ = self.eval_in(index, &settle).await;
                     }
@@ -4139,8 +4041,8 @@ impl BrowserContext {
                 }
             }
 
-            // И `import()`, которого движок ждёт: он спрашивает не через очередь
-            // страницы, а через свой крючок, и обещание висит, пока не ответим.
+            // And `import()` the engine is waiting on: it asks through its own hook, not the
+            // page queue, and the promise hangs until answered.
             work += self.serve_dynamic_imports().await;
 
             // A widget's collection runs in workers *it* started, not the page's:
@@ -4338,15 +4240,14 @@ impl BrowserContext {
         }
     }
 
-    /// Запустить запрос кадра или воркера, не дожидаясь ответа: ответ
-    /// заберёт `settle_inflight` на одном из следующих пульсов. Мгновенно
-    /// решённое (заблокированный адрес) возвращается сразу.
+    /// Start a frame or worker request without waiting: `settle_inflight` picks the reply
+    /// up on a later pump. An instantly settled one (blocked URL) is returned now.
     fn start_fetch(&self, deliver: Deliver, context: usize, base: &str, r: &Value) -> Option<String> {
         match self.prepare_fetch(context, base, r) {
             Prepared::Settled(js) => Some(js),
             Prepared::Send(req, mut info) => {
-                // Запрос воркера — в ленте воркера, а не кадра-хозяина: у Chrome
-                // fetch из воркера в performance кадра не попадает.
+                // A worker's request goes on the worker's timeline, not its owner frame's: in
+                // Chrome a worker fetch does not appear in the frame's performance entries.
                 if matches!(deliver, Deliver::Worker(..)) {
                     info.context = WORKER_RECORD_BASE + context;
                 }
@@ -4364,8 +4265,8 @@ impl BrowserContext {
         self.inflight.lock().map(|v| !v.is_empty()).unwrap_or(false)
     }
 
-    /// Доставить ответы, которые уже пришли: записать запрос и разрешить
-    /// обещание там, откуда его просили.
+    /// Deliver replies that have arrived: record the request and settle the promise
+    /// where it was made.
     async fn settle_inflight(&self) -> Result<usize, EngineError> {
         let done: Vec<InFlight> = match self.inflight.lock() {
             Ok(mut v) => {
@@ -4391,8 +4292,8 @@ impl BrowserContext {
             let settle = self.settle_fetch(&f.info, res);
             match f.deliver {
                 Deliver::Frame(index) => {
-                    // Запись о ресурсе у браузера появляется раньше, чем
-                    // страница узнаёт об ответе (load/then), — ставим её до.
+                    // A browser adds the resource entry before the page learns of the response
+                    // (load/then), so flush first.
                     self.flush_resource_timings(index).await;
                     let _ = self.eval_in(index, &settle).await;
                 }
@@ -4447,8 +4348,8 @@ impl BrowserContext {
             headers,
             body,
             kind: nokk_net::RequestKind::Xhr,
-            // Кадр сказал, что ему дали доступ к своим кукам: с этого момента
-            // браузер помечает его запросы `sec-fetch-storage-access`.
+            // The frame was granted access to its cookies: from now on a browser marks its
+            // requests with `sec-fetch-storage-access`.
             third_party: r["storageAccess"].as_bool().unwrap_or(false),
             user_activated: false,
         };
@@ -4482,9 +4383,8 @@ impl BrowserContext {
                 // used to report no size at all — `naturalWidth` undefined,
                 // `width` zero — and anything that measures what it drew, as the
                 // challenge does with its beacon PNG, read a picture 0 by 0.
-                // Картинку узнаём по самим байтам, а не по тому, кто её просил:
-                // маячок челленджа приезжает как `<link>`, а рисуют его как
-                // картинку, и по объявленному виду мы бы его пропустили.
+                // Detect images by their bytes, not by the requester: the challenge beacon arrives
+                // as a `<link>` but is drawn as an image.
                 let meta = if image_size(&resp.body).is_some() {
                     // Whether the server opened the image up to other origins
                     // decides whether drawing it costs the canvas its readability.
@@ -4537,13 +4437,9 @@ impl BrowserContext {
                 if !matches!(e, NetError::Unimplemented) {
                     self.record_in(context, method, url, kind, 0, &[]);
                 }
-                // Хост без маршрута мы одно время оставляли висеть, решив, что
-                // так поступает браузер. Лента Chrome с этой же машины говорит
-                // обратное: его fetch к тому же IPv6-only хосту челленджа
-                // отклоняется, и воркер челленджа докладывает об этом
-                // (`TypeError: Failed to fetch`) — а следующую фазу он начинает
-                // только получив такой ответ. Ожидание навсегда оставляло его
-                // ждать вместе с нами. Отказ — это тоже ответ.
+                // An unroutable host must reject, not hang: Chrome on this machine rejects fetches
+                // to the challenge's IPv6-only host, the challenge worker reports
+                // `TypeError: Failed to fetch`, and only then starts its next phase.
                 if let NetError::Unreachable(why) = &e {
                     tracing::debug!(url = %url, %why, "no route to host: rejecting, as the browser does");
                 }
@@ -4568,8 +4464,8 @@ impl BrowserContext {
         self.fetch_text_from(url, resource_type, None).await
     }
 
-    /// То же, но запрос числится за кадром: его документ и его скрипты — его
-    /// собственная лента времён, как в браузере.
+    /// Same, but the request belongs to a frame: its document and scripts go on its own
+    /// timeline, as in a browser.
     async fn fetch_text_in(
         &self,
         context: usize,
@@ -4618,7 +4514,7 @@ impl BrowserContext {
         }
     }
 
-    /// Документ по POST: запрос документа с телом формы.
+    /// A document via POST: a document request with a form body.
     async fn fetch_document_post(
         &self,
         url: &str,
@@ -4649,8 +4545,7 @@ impl BrowserContext {
         self.finish_text(context, url, resource_type, started, sent)
     }
 
-    /// Скрипт, запрошенный сканером предзагрузки, — или, если его не
-    /// просили заранее, запрошенный сейчас.
+    /// A script requested by the preload scanner, or fetched now if it was not preloaded.
     async fn take_preloaded(
         &self,
         pre: Option<Preloaded>,
@@ -4665,8 +4560,7 @@ impl BrowserContext {
         }
     }
 
-    /// Запрос `GET`, каким его шлёт документ: заголовки отпечатка, реферер,
-    /// назначение.
+    /// A `GET` as a document sends it: fingerprint headers, referrer, destination.
     fn get_request(&self, url: &str, resource_type: &str, referrer: Option<&str>) -> Request {
         let mut headers = std::collections::BTreeMap::new();
         headers.insert(
@@ -4708,9 +4602,8 @@ impl BrowserContext {
         }
     }
 
-    /// Записать пришедший ответ (или отказ) и отдать текст. `started` —
-    /// когда запрос ушёл: для заранее отправленного скрипта это миг сканера
-    /// предзагрузки, а не миг, когда до него дошла очередь.
+    /// Record the response (or failure) and return the text. `started` is when the
+    /// request went out: for a preloaded script, the scanner's moment, not when its turn came.
     fn finish_text(
         &self,
         context: usize,
@@ -4721,8 +4614,8 @@ impl BrowserContext {
     ) -> Result<(String, String), EngineError> {
         match sent {
             Ok(resp) => {
-                // Длительность — от ухода запроса до конца ответа, как у браузера;
-                // запись ставится в ленту по мигу ухода.
+                // Duration from request start to response end, as in a browser; the entry is placed
+                // at the start time.
                 let measured = resp.elapsed_ms;
                 let lag = started.elapsed().as_secs_f64() * 1000.0 - measured;
                 self.record_full(
@@ -4758,8 +4651,8 @@ impl BrowserContext {
         }
     }
 
-    /// Сдвинуть начало последней записи об `url` назад на `lag` мс: ответ
-    /// пришёл раньше, чем его взяли.
+    /// Move the start of the last record for `url` back by `lag` ms: the response
+    /// arrived before it was taken.
     fn shift_last_record(&self, context: usize, url: &str, lag: f64) {
         if let Ok(mut log) = self.requests.lock() {
             if let Some(r) = log.iter_mut().rev().find(|r| r.context == context && r.url == url) {
@@ -4773,7 +4666,7 @@ impl BrowserContext {
         self.record_in(self.idx(), method, url, resource_type, status, body)
     }
 
-    /// То же, но от имени кадра или воркера, который этот запрос заказал.
+    /// Same, on behalf of the frame or worker that made the request.
     fn record_in(
         &self,
         context: usize,
@@ -4821,10 +4714,9 @@ impl BrowserContext {
         redirect_ms: Option<f64>,
     ) {
         let now = self.started.elapsed().as_secs_f64() * 1000.0;
-        // Замеренное время обращения, а не одно и то же число на всех: у
-        // браузера у каждого ресурса своя длительность, и страницы их читают.
-        // Без замера (запрос не состоялся) остаётся прежняя оценка быстрого
-        // локального хода: ресурс, взявший ноль времени, — не ресурс.
+        // Measured time, not one number for all: a browser gives each resource its own
+        // duration and pages read them. Without a measurement (request failed) keep the
+        // fast-local estimate: a zero-duration resource is not a resource.
         let duration_ms = measured_ms.unwrap_or(12.0);
         let started_ms = now - duration_ms;
         let rec = NetworkRecord {
@@ -4902,22 +4794,20 @@ const IDLE_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_millis(1
 const LOAD_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_000);
 
 /// How often frames are given an event-loop turn while the page runs.
-// Каждые четыре миллисекунды, а не двадцать: через эту очередь идут и
-// сообщения кадра своему воркеру, а челлендж замеряет круг «поставь таймер на
-// 55 мс — ответь». Двадцать миллисекунд задержки на доставку превращали
-// честные 55 в 79, и виджет гонял эту пробу заново, пока не выходил срок.
+// Every 4 ms, not 20: a frame's messages to its worker go through this queue, and
+// the challenge times "set a 55 ms timer, reply". 20 ms delivery lag turned 55 into
+// 79, and the widget retried the probe until it expired.
 const FRAME_PUMP_EVERY: std::time::Duration = std::time::Duration::from_millis(4);
 
-/// Скрипт, запрошенный заранее: миг запроса и задача, которая его ждёт.
+/// A preloaded script: when it was requested and the task awaiting it.
 type Preloaded = (
     std::time::Instant,
     tokio::task::JoinHandle<Result<nokk_net::Response, NetError>>,
 );
 
-/// Номер контекста кадра, живущего на своём потоке пула. Номера контекстов у
-/// каждого изолята свои, поэтому такой кадр адресуется парой «поток + номер»,
-/// упакованной в одно число с меткой: всё, что принимает `index`, работает с
-/// ним как прежде, а [`BrowserContext::route`] разворачивает его в пару.
+/// Context index of a frame on its own pool thread. Indices are per isolate, so such
+/// a frame is addressed by (thread, index) packed into one tagged number: anything
+/// taking `index` works as before, and [`BrowserContext::route`] unpacks it.
 const OWN_THREAD: usize = 1usize << 48;
 
 fn own_thread_index(worker: nokk_pool::WorkerId, raw: usize) -> usize {
@@ -5055,7 +4945,7 @@ fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
-/// Порядковый номер выгружаемой задачи воркера (см. `NOKK_DUMP_WORKER_TASKS`).
+/// Sequence number for dumped worker tasks (see `NOKK_DUMP_WORKER_TASKS`).
 static WORKER_TASK_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub fn reason_phrase(status: u16) -> &'static str {
@@ -5391,11 +5281,6 @@ mod tests {
         assert!(engine.injection_script().contains("'webdriver', false"));
     }
 
-    /// Что переживает дорогу до воркера и обратно. Браузер отправляет
-    /// сообщения структурным клонированием: двоичные данные приходят
-    /// двоичными, `Map` остаётся `Map`, дата — датой. Мы возим их через JSON,
-    /// и всё это по дороге превращается в что-то другое — а код на той стороне
-    /// ждёт своего типа.
     /// Every document gets its own global: what one page left on `window` or
     /// patched into a built-in is gone on the next. What outlives a document —
     /// its origin's storage, the tab's history length — comes along, and only
@@ -5483,6 +5368,9 @@ mod tests {
         );
     }
 
+    /// What survives the trip to a worker and back. A browser uses structured
+    /// clone: binary stays binary, a `Map` stays a `Map`, a date a date. Going
+    /// through JSON turned them into something else.
     #[tokio::test]
     async fn a_message_to_a_worker_keeps_its_shape() {
         let _serial = serial().await;
@@ -5527,18 +5415,17 @@ mod tests {
         }
 
         let got = probe(&ctx, "__ptJSON.stringify(globalThis.__got)").await;
-        assert_eq!(got["said"]["kind"], "[object Uint8Array]", "байты приезжают байтами: {got}");
+        assert_eq!(got["said"]["kind"], "[object Uint8Array]", "bytes arrive as bytes: {got}");
         assert_eq!(got["said"]["first"], 1, "{got}");
         assert_eq!(got["said"]["len"], 3, "{got}");
-        assert_eq!(got["said"]["mapKind"], "[object Map]", "Map остаётся Map: {got}");
-        assert_eq!(got["said"]["dateKind"], "[object Date]", "дата остаётся датой: {got}");
-        assert_eq!(got["backKind"], "[object Uint8Array]", "и обратно тоже: {got}");
+        assert_eq!(got["said"]["mapKind"], "[object Map]", "Map stays a Map: {got}");
+        assert_eq!(got["said"]["dateKind"], "[object Date]", "a date stays a date: {got}");
+        assert_eq!(got["backKind"], "[object Uint8Array]", "and back too: {got}");
         assert_eq!(got["backFirst"], 7, "{got}");
     }
 
-    /// `DOMContentLoaded` всплывает с документа на окно, и слушают его чаще
-    /// именно там. Наше не всплывало — и код, который ждёт его на окне (так
-    /// api.js Turnstile ставит свой авторендер), не получал ничего.
+    /// `DOMContentLoaded` bubbles from the document to the window, where it is usually
+    /// heard; Turnstile's api.js sets up its auto-render there.
     #[tokio::test]
     async fn dom_content_loaded_reaches_the_window() {
         let _serial = serial().await;
@@ -5557,18 +5444,17 @@ mod tests {
         .unwrap();
 
         let out = probe(&ctx, "__ptJSON.stringify(window.__log)").await;
-        assert_eq!(out["onWindow"], true, "окно слышит событие: {out}");
-        assert_eq!(out["onDocument"], true, "и документ тоже: {out}");
-        // В браузере во время DOMContentLoaded документ уже `interactive`.
+        assert_eq!(out["onWindow"], true, "the window hears the event: {out}");
+        assert_eq!(out["onDocument"], true, "and the document too: {out}");
+        // In a browser the document is already `interactive` during DOMContentLoaded.
         assert_eq!(out["state"], "interactive", "{out}");
         assert_eq!(out["load"], true, "{out}");
     }
 
-    /// Весь путь Turnstile целиком, на тестовых ключах самого Cloudflare:
-    /// виджет строится, разговаривает со страницей, у интерактивного варианта
-    /// движок нажимает флажок — и страница получает токен. Это проверка
-    /// машинерии, а не отпечатка: ключи `1x…AA` и `3x…FF` выдают токен любому,
-    /// кто дошёл до конца, и потому показывают, цела ли дорога.
+    /// The whole Turnstile path on Cloudflare's own test keys: the widget builds, talks
+    /// to the page, the engine clicks the checkbox for the interactive variant, and the
+    /// page gets a token. Tests the machinery, not the fingerprint: keys `1x…AA` and
+    /// `3x…FF` give a token to anyone who gets to the end.
     #[tokio::test]
     async fn a_turnstile_widget_runs_to_a_token() {
         let _serial = serial().await;
@@ -5643,21 +5529,20 @@ mod tests {
             let events = events.as_str().unwrap_or("").to_string();
             assert!(
                 token.as_str().map_or(false, |t| t.contains("TOKEN")),
-                "ключ {key} должен выдать токен: события [{events}]"
+                "key {key} must yield a token: events [{events}]"
             );
-            assert!(events.contains("complete"), "и сказать `complete`: [{events}]");
+            assert!(events.contains("complete"), "and report `complete`: [{events}]");
             if interactive {
                 assert!(
                     events.contains("interactiveBegin") && events.contains("interactiveEnd"),
-                    "интерактивный вариант проходит через нажатие: [{events}]"
+                    "the interactive variant goes through a click: [{events}]"
                 );
             }
         }
     }
 
-    /// Обещания, которых ждёт сборщик: адаптер WebGPU, декодирование медиа,
-    /// раскладка клавиатуры, оценка хранилища, разрешения. Любое неразрешённое
-    /// — это остановка их программы, и снаружи она выглядит тишиной.
+    /// Promises a collector waits on: WebGPU adapter, media decoding, keyboard layout,
+    /// storage estimate, permissions. Any that never settles stalls its program silently.
     #[tokio::test]
     async fn the_promises_a_collector_waits_for_all_settle() {
         let _serial = serial().await;
@@ -5674,21 +5559,21 @@ mod tests {
               try {
                 navigator.gpu.requestAdapter().then(
                   (a) => note('adapter', a ? Object.prototype.toString.call(a) : String(a)),
-                  (e) => note('adapter', 'отказ'));
-              } catch (e) { note('adapter', 'бросил'); }
+                  (e) => note('adapter', 'rejected'));
+              } catch (e) { note('adapter', 'threw'); }
               try {
                 navigator.mediaCapabilities.decodingInfo({ type: 'file',
                   video: { contentType: 'video/mp4; codecs="avc1.42E01E"', width: 640, height: 480, bitrate: 1000, framerate: 30 } })
-                  .then((r) => note('mediaCaps', !!r), () => note('mediaCaps', 'отказ'));
-              } catch (e) { note('mediaCaps', 'бросил'); }
-              try { navigator.keyboard.getLayoutMap().then((m) => note('layout', !!m), () => note('layout', 'отказ')); }
-              catch (e) { note('layout', 'бросил'); }
-              try { navigator.storage.estimate().then((r) => note('estimate', !!r), () => note('estimate', 'отказ')); }
-              catch (e) { note('estimate', 'бросил'); }
-              try { navigator.permissions.query({ name: 'notifications' }).then((s) => note('perm', s && s.state), () => note('perm', 'отказ')); }
-              catch (e) { note('perm', 'бросил'); }
-              try { navigator.storage.getDirectory().then((d) => note('opfs', !!d), () => note('opfs', 'отказ')); }
-              catch (e) { note('opfs', 'бросил'); }
+                  .then((r) => note('mediaCaps', !!r), () => note('mediaCaps', 'rejected'));
+              } catch (e) { note('mediaCaps', 'threw'); }
+              try { navigator.keyboard.getLayoutMap().then((m) => note('layout', !!m), () => note('layout', 'rejected')); }
+              catch (e) { note('layout', 'threw'); }
+              try { navigator.storage.estimate().then((r) => note('estimate', !!r), () => note('estimate', 'rejected')); }
+              catch (e) { note('estimate', 'threw'); }
+              try { navigator.permissions.query({ name: 'notifications' }).then((s) => note('perm', s && s.state), () => note('perm', 'rejected')); }
+              catch (e) { note('perm', 'threw'); }
+              try { navigator.storage.getDirectory().then((d) => note('opfs', !!d), () => note('opfs', 'rejected')); }
+              catch (e) { note('opfs', 'threw'); }
               return 1;
             })()"#,
         )
@@ -5700,13 +5585,12 @@ mod tests {
 
         let out = probe(&ctx, "__ptJSON.stringify(globalThis.__r)").await;
         for key in ["adapter", "mediaCaps", "layout", "estimate", "perm", "opfs"] {
-            assert!(out.get(key).is_some(), "обещание `{key}` не разрешилось: {out}");
+            assert!(out.get(key).is_some(), "promise `{key}` did not settle: {out}");
         }
     }
 
-    /// SHA-256 через `crypto.subtle.digest` — то, чем страница подписывает
-    /// собранное. Проверяем на известном векторе: у "abc" хеш начинается с
-    /// ba 78 16 bf.
+    /// SHA-256 via `crypto.subtle.digest`, which pages sign their collected data with.
+    /// Known vector: "abc" hashes to ba 78 16 bf...
     #[tokio::test]
     async fn subtle_crypto_computes_a_real_digest() {
         let _serial = serial().await;
@@ -5721,7 +5605,7 @@ mod tests {
                 globalThis.__h = null;
                 crypto.subtle.digest('SHA-256', new TextEncoder().encode('abc')).then(
                   (b) => { globalThis.__h = Array.from(new Uint8Array(b)); },
-                  (e) => { globalThis.__h = 'отказ: ' + e; });
+                  (e) => { globalThis.__h = 'rejected: ' + e; });
                 return 1;
               })()"#,
         )
@@ -5733,18 +5617,16 @@ mod tests {
 
         let out = probe(&ctx, "__ptJSON.stringify(globalThis.__h)").await;
         let bytes = out.as_array().cloned().unwrap_or_default();
-        assert_eq!(bytes.len(), 32, "должно быть тридцать два байта: {out}");
+        assert_eq!(bytes.len(), 32, "expected 32 bytes: {out}");
         assert_eq!(bytes[0], 0xba, "{out}");
         assert_eq!(bytes[1], 0x78, "{out}");
         assert_eq!(bytes[2], 0x16, "{out}");
         assert_eq!(bytes[3], 0xbf, "{out}");
     }
 
-    /// Список свойств CSS — это подпись движка и его версии, и сборщик
-    /// отпечатка его сериализует целиком. У браузера имена лежат собственными
-    /// свойствами объявления (семьсот три, в своём порядке), а методы — на
-    /// прототипе; у нас было наоборот: собственными были методы, имён не было
-    /// вовсе. Значения сняты с Chrome 148.
+    /// The CSS property list is an engine/version signature that collectors serialize
+    /// whole. A browser keeps the names as own properties of the declaration (in its
+    /// order) and the methods on the prototype. Values taken from Chrome 148.
     #[tokio::test]
     async fn a_style_declaration_is_shaped_like_a_browsers() {
         let _serial = serial().await;
@@ -5775,13 +5657,13 @@ mod tests {
                   computedFirst: cs[0],
                   computedDashed: cs['background-color'],
                   sameProto: Object.getPrototypeOf(cs) === Object.getPrototypeOf(st),
-                  // Описание свойства у браузера — значение, а не акцессор.
+                  // A browser's property descriptor is a data value, not an accessor.
                   inlineDesc: (() => { const d = Object.getOwnPropertyDescriptor(st, 'color');
                     return [typeof d.get, d.value, !!d.writable, !!d.enumerable, !!d.configurable]; })(),
                   computedDesc: (() => { const d = Object.getOwnPropertyDescriptor(cs, 'backgroundColor');
                     return [typeof d.get, d.value]; })(),
-                  // А девять `-epub-` — имена без описания: в списке есть, `in`
-                  // отвечает «нет», читается `undefined`.
+                  // The nine `-epub-` names have no descriptor: listed, but `in` says no and the
+                  // value reads `undefined`.
                   epub: [names.includes('epubWordBreak'),
                          Object.getOwnPropertyDescriptor(st, 'epubWordBreak') === undefined,
                          'epubWordBreak' in st, String(st.epubWordBreak),
@@ -5792,54 +5674,50 @@ mod tests {
         )
         .await;
 
-                // Два объявления — значит два числовых свойства поверх семисот сорока
-        // пяти имён. Девять из них — с приставкой `-epub-`: в списке собственных
-        // они есть, а описания у них нет, как у браузера. Порядок браузера:
-        // индексы впереди.
+                // Two declarations: two index properties over 745 names. Nine are `-epub-`: listed
+                // as own but without a descriptor, as in a browser. Browser order: indices first.
         assert_eq!(out["inlineOwn"], 747, "{out}");
         assert_eq!(
             out["firstThree"],
             serde_json::json!(["0", "1", "accentColor"]),
-            "и в порядке браузера: {out}"
+            "and in browser order: {out}"
         );
         assert_eq!(out["protoOwn"], 10, "{out}");
-        // Форма формой, а работать оно обязано по-прежнему.
+        // Shape aside, it must still work.
         assert_eq!(out["color"], "red", "{out}");
         assert_eq!(out["background"], "blue", "{out}");
         assert_eq!(out["inlineLength"], 2, "{out}");
         assert_eq!(out["cssText"], "color: red; background-color: blue;", "{out}");
-        // Вычисленный стиль: 475 свойств по индексам плюс те же имена, включая
-        // девять `-epub-`.
+        // Computed style: 475 indexed properties plus the same names, including the nine `-epub-`.
         assert_eq!(out["computedLength"], 475, "{out}");
         assert_eq!(out["computedOwn"], 1220, "{out}");
         assert_eq!(out["computedFirst"], "accent-color", "{out}");
-        assert!(out["computedDashed"].is_string(), "дефисное имя читается: {out}");
-        assert_eq!(out["sameProto"], true, "оба объявления одного интерфейса: {out}");
+        assert!(out["computedDashed"].is_string(), "dashed name reads: {out}");
+        assert_eq!(out["sameProto"], true, "both declarations share an interface: {out}");
         assert_eq!(
             out["inlineDesc"],
             serde_json::json!(["undefined", "red", true, true, true]),
-            "свойство отдаётся значением, а не акцессором: {out}"
+            "property is a data value, not an accessor: {out}"
         );
         assert_eq!(
             out["computedDesc"],
             serde_json::json!(["undefined", "rgb(0, 0, 255)"]),
-            "у вычисленного — тоже значением, и уже разобранным: {out}"
+            "computed one too, already resolved: {out}"
         );
         assert_eq!(
             out["epub"],
             serde_json::json!([true, true, false, "undefined", "normal"]),
-            "имя есть, описания нет: {out}"
+            "name listed, no descriptor: {out}"
         );
         assert_eq!(
             out["epubAt"],
             serde_json::json!([195, "emptyCells"]),
-            "и стоит там же, где у браузера: {out}"
+            "at the same position as in a browser: {out}"
         );
     }
 
-    /// Картинка — это запрос. `new Image().src = …` — обычный способ послать
-    /// GET, и раньше он уходил в сеть только по абсолютному `http(s)` адресу:
-    /// относительный, каким его пишут почти всегда, не отправлял ничего.
+    /// An image is a request: `new Image().src = …` is a common way to send a GET, and
+    /// a relative URL (the usual form) used to send nothing.
     #[tokio::test]
     async fn setting_an_image_source_makes_a_request() {
         let _serial = serial().await;
@@ -5887,15 +5765,14 @@ mod tests {
         let asked = hits.lock().map(|v| v.clone()).unwrap_or_default();
         assert!(
             asked.iter().any(|p| p.starts_with("/pixel.png")),
-            "запрос за картинкой должен уйти: {asked:?}"
+            "the image request must go out: {asked:?}"
         );
     }
 
-    /// Файловая система источника. Челлендж просит её у воркера, создаёт файл,
-    /// берёт синхронную ручку, пишет байт и засекает `flush()` — а наш
-    /// `getDirectory()` отвечал отказом «доступ запрещён», которого в
-    /// защищённом контексте Chrome не бывает. Проверяем ровно ту пробу, что
-    /// приходит с чужой стороны.
+    /// Origin private file system. The challenge asks for it in a worker, creates a
+    /// file, takes a sync handle, writes a byte and times `flush()`; our
+    /// `getDirectory()` rejected with "access denied", which Chrome never does in a
+    /// secure context. Runs the exact probe the challenge sends.
     #[tokio::test]
     async fn the_origin_private_file_system_answers_from_a_worker() {
         let _serial = serial().await;
@@ -5929,19 +5806,15 @@ mod tests {
 
         let got = probe(&ctx, "__ptJSON.stringify(globalThis.__got || [])").await;
         let list = got.as_array().cloned().unwrap_or_default();
-        assert_eq!(list.len(), 1, "воркер обязан ответить: {got}");
-        // `hnMoX4` — сколько занял `flush()`. Ответ должен быть числом, а не
-        // жалобой в `CEnF0`: последнее значит, что файловой системы нет.
+        assert_eq!(list.len(), 1, "the worker must answer: {got}");
+        // `hnMoX4` is how long `flush()` took. It must be a number, not a complaint in
+        // `CEnF0`, which means no file system.
         assert!(
             list[0]["hnMoX4"].is_number(),
-            "проба прошла до конца, а не упала: {got}"
+            "the probe ran to the end without failing: {got}"
         );
     }
 
-    /// Первое, что челлендж спрашивает у своего воркера, — поля навигатора,
-    /// одним сообщением с объектом в ответ. В Chrome ответ приходит сразу; у
-    /// нас он терялся, хотя следом стоящий таймер из того же скрипта доезжал
-    /// исправно. Проверяем ровно тот скрипт, который приходит с чужой стороны.
     /// The challenge fingerprints by walking the global graph. Closing that graph
     /// by name was not enough: every interface object we made was an ordinary
     /// function, and an ordinary function owns `arguments` and `caller`, which no
@@ -6010,9 +5883,9 @@ mod tests {
             })"#,
         )
         .await;
-        assert_eq!(got["inner"], got["doc"], "окно и документ разошлись: {got}");
+        assert_eq!(got["inner"], got["doc"], "window and document disagree: {got}");
         assert!(got["inner"][0].as_u64().unwrap_or(0) > 0, "{got}");
-        // И заодно единственный вопрос кадра, на который мы отвечали пустотой.
+        // Also the one frame question we answered with nothing.
         assert_eq!(got["filter"], "none", "{got}");
     }
 
@@ -6108,7 +5981,7 @@ mod tests {
             &ctx,
             &format!(
                 r#"__ptJSON.stringify((() => {{
-                    if (typeof __pt_imageBytes !== 'function') return 'нет растеризатора';
+                    if (typeof __pt_imageBytes !== 'function') return 'no rasterizer';
                     const size = __pt_imageBytes('https://example.com/p.png', "{PNG_B64}");
                     const c = document.createElement('canvas'); c.width = 2; c.height = 1;
                     const x = c.getContext('2d');
@@ -6121,14 +5994,14 @@ mod tests {
         )
         .await;
         // Without the `render` feature there is no rasterizer and nothing to test.
-        if got.as_str() == Some("нет растеризатора") {
+        if got.as_str() == Some("no rasterizer") {
             return;
         }
-        assert_eq!(got["size"], 2 << 16 | 1, "размер картинки: {got}");
+        assert_eq!(got["size"], 2 << 16 | 1, "image size: {got}");
         assert_eq!(
             got["row"],
             serde_json::json!([255, 0, 0, 255, 0, 0, 255, 255]),
-            "пиксели читаются обратно как есть: {got}"
+            "pixels read back unchanged: {got}"
         );
     }
 
@@ -6157,14 +6030,14 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        let got = probe(&ctx, "__ptJSON.stringify(globalThis.__r || '(тишина)')").await;
-        assert_eq!(got.as_str(), Some("загрузилось: привет"), "{got}");
+        let got = probe(&ctx, "__ptJSON.stringify(globalThis.__r || '(silence)')").await;
+        assert_eq!(got.as_str(), Some("loaded: \u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}"), "{got}");
         // And a module both chunks import is fetched once, as in a browser:
         // one module map per realm, one address in it.
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "общая зависимость должна быть загружена один раз"
+            "the shared dependency must load once"
         );
     }
 
@@ -6190,8 +6063,8 @@ mod tests {
                         "/index.html" => ("text/html", concat!(
                             "<html><body><script type=\"module\">",
                             "import('./a.js').then(m => import('./b.js').then(n => {",
-                            "  globalThis.__r = 'загрузилось: ' + m.hi() + n.tail();",
-                            "}), e => { globalThis.__r = 'отказ: ' + e.message; });",
+                            "  globalThis.__r = 'loaded: ' + m.hi() + n.tail();",
+                            "}), e => { globalThis.__r = 'rejected: ' + e.message; });",
                             "</script></body></html>").to_string()),
                         "/a.js" => ("text/javascript",
                             "import { word } from './shared.js';\nexport function hi() { return word; }".to_string()),
@@ -6199,7 +6072,7 @@ mod tests {
                             "import { word } from './shared.js';\nexport function tail() { return word ? '' : '?'; }".to_string()),
                         "/shared.js" => {
                             counted.fetch_add(1, Ordering::SeqCst);
-                            ("text/javascript", "export const word = 'привет';".to_string())
+                            ("text/javascript", "export const word = '\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}';".to_string())
                         }
                         _ => ("text/plain", String::new()),
                     };
@@ -6242,23 +6115,21 @@ mod tests {
         )
         .await;
         // Chrome 148, measured on the same machine.
-        // Chrome 148 на этой машине отвечает 1677721/2^24. Последний бит зависит
-        // от того, на какой отметке мерить — вычитание двух точек решётки
-        // округляется по-разному, — поэтому сверяем с точностью до пары ulp и
-        // отдельно проверяем, что это не ровная десятая, как было у нас.
-        let min = got["min"].as_f64().expect("число");
+        // It answers 1677721/2^24. The last bit depends on which tick is measured
+        // (subtracting two lattice points rounds differently), so compare within a couple
+        // of ulps and check separately that it is not an even 0.1, as ours was.
+        let min = got["min"].as_f64().expect("number");
         let want = 1_677_721.0 / 16_777_216.0;
-        // Допуск — шаг решётки: разность двух соседних отметок иногда
-        // округляется в соседнюю, и строгое равенство здесь ловит не подмену
-        // часов, а удачу замера.
+        // Tolerance is one lattice step: the difference of two neighbouring ticks
+        // sometimes rounds to the next one.
         let step = 1.0 / 16_777_216.0;
         assert!(
             (min - want).abs() < 2.0 * step,
-            "разрешение часов: {min} против {want}"
+            "clock resolution: {min} vs {want}"
         );
         assert!(
             (min - 0.1_f64).abs() > 1e-9,
-            "ровная десятая — признак часов, считающих от нуля: {min}"
+            "an even 0.1 means a clock counting from zero: {min}"
         );
         assert_eq!(got["onLattice"], true, "{got}");
     }
@@ -6277,7 +6148,7 @@ mod tests {
         let got = probe(
             &ctx,
             r#"__ptJSON.stringify((() => {
-                const say = (f) => { try { f(); return 'ответил'; }
+                const say = (f) => { try { f(); return 'answered'; }
                                      catch (e) { return e.name + ': ' + e.message; } };
                 const c = document.createElement('canvas'); c.width = 4; c.height = 4;
                 const x = c.getContext('2d');
@@ -6318,19 +6189,19 @@ mod tests {
             &ctx,
             r#"__ptJSON.stringify((() => {
                 const hidden = document.createElement('div');
-                hidden.innerHTML = '<style>.z{color:red}</style><b>текст</b>';
+                hidden.innerHTML = '<style>.z{color:red}</style><b>\u0442\u0435\u043a\u0441\u0442</b>';
                 hidden.style.display = 'none';
                 document.body.appendChild(hidden);
                 const shown = document.createElement('div');
-                shown.innerHTML = '<style>.z{color:red}</style><b>текст</b>';
+                shown.innerHTML = '<style>.z{color:red}</style><b>\u0442\u0435\u043a\u0441\u0442</b>';
                 document.body.appendChild(shown);
                 return { hidden: hidden.innerText, shown: shown.innerText };
             })())"#,
         )
         .await;
         // Chrome 148, exactly.
-        assert_eq!(got["hidden"], ".z{color:red}текст", "{got}");
-        assert_eq!(got["shown"], "текст", "стиль не отрисован: {got}");
+        assert_eq!(got["hidden"], ".z{color:red}\u{442}\u{435}\u{43a}\u{441}\u{442}", "{got}");
+        assert_eq!(got["shown"], "\u{442}\u{435}\u{43a}\u{441}\u{442}", "style is not rendered: {got}");
     }
 
     /// A call made wrongly is answered exactly, and the answer names the method
@@ -6349,7 +6220,7 @@ mod tests {
         let got = probe(
             &ctx,
             r#"__ptJSON.stringify((() => {
-                const say = (f) => { try { f(); return 'ответил'; }
+                const say = (f) => { try { f(); return 'answered'; }
                                      catch (e) { return e.name + ': ' + e.message; } };
                 const el = document.createElement('div');
                 return {
@@ -6359,9 +6230,9 @@ mod tests {
                     noAttr: say(() => el.setAttribute()),
                     selfChild: say(() => el.appendChild(el)),
                     notMine: say(() => document.body.removeChild(el)),
-                    badPosition: say(() => el.insertAdjacentHTML('нетакое', 'x')),
+                    badPosition: say(() => el.insertAdjacentHTML('nosuchplace', 'x')),
                     noListener: say(() => el.addEventListener()),
-                    badUrl: say(() => new URL('не адрес')),
+                    badUrl: say(() => new URL('not a url')),
                     noItem: say(() => localStorage.setItem()),
                     goodSelector: say(() => document.querySelector('body')),
                 };
@@ -6380,7 +6251,7 @@ mod tests {
         assert_eq!(got["noItem"], "TypeError: Failed to execute 'setItem' on 'Storage': 2 arguments required, but only 0 present.", "{got}");
         assert!(got["badPosition"].as_str().unwrap_or("").starts_with("SyntaxError: Failed to execute 'insertAdjacentHTML'"), "{got}");
         // And a call made properly is untouched.
-        assert_eq!(got["goodSelector"], "ответил", "{got}");
+        assert_eq!(got["goodSelector"], "answered", "{got}");
     }
 
     /// The challenge times exactly one call: `flush()` on an origin-private
@@ -6401,7 +6272,7 @@ mod tests {
                 const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
                 globalThis.__got = null;
                 w.onmessage = (e) => { globalThis.__got = e.data; };
-                w.postMessage("~function(){navigator.storage.getDirectory().then(function(a){var s={};s['create']=true;return a.getFileHandle('пробa',s)}).then(function(h){return h.createSyncAccessHandle()}).then(function(h){h.write(new Uint8Array(64),{at:0});var t=performance.now();h.flush();var d=performance.now()-t;h.close();postMessage({took:d})}).catch(function(e){postMessage({err:String(e)})})}()");
+                w.postMessage("~function(){navigator.storage.getDirectory().then(function(a){var s={};s['create']=true;return a.getFileHandle('\u043f\u0440\u043e\u0431a',s)}).then(function(h){return h.createSyncAccessHandle()}).then(function(h){h.write(new Uint8Array(64),{at:0});var t=performance.now();h.flush();var d=performance.now()-t;h.close();postMessage({took:d})}).catch(function(e){postMessage({err:String(e)})})}()");
                 return 1;
             })()"#,
         )
@@ -6423,8 +6294,8 @@ mod tests {
             return;
         }
         let took = got["took"].as_f64().unwrap_or(0.0);
-        assert!(took > 0.2, "запись на диск не бывает мгновенной: {got}");
-        assert!(took < 500.0, "и не бывает вечной: {got}");
+        assert!(took > 0.2, "a disk write is never instant: {got}");
+        assert!(took < 500.0, "nor endless: {got}");
     }
 
     /// A list sits directly on its own interface, with nothing in between.
@@ -6463,7 +6334,7 @@ mod tests {
         for k in [
             "nodeList", "live", "collection", "tokens", "attrs", "sheets", "shadowSheets",
         ] {
-            assert_eq!(got[k], true, "{k} должен лежать на своём интерфейсе: {got}");
+            assert_eq!(got[k], true, "{k} must live on its own interface: {got}");
         }
         // Chrome 148 and 151 alike: 23 names, and none of them borrowed from
         // Element — a shadow root's chain never reaches it.
@@ -6517,7 +6388,7 @@ mod tests {
         let _ = one;
         ctx.run_event_loop().await.unwrap();
         let state = probe(&ctx, "__ptJSON.stringify(globalThis.__s)").await;
-        assert_eq!(state, "prompt", "камеру никто не разрешал: {state}");
+        assert_eq!(state, "prompt", "camera was never granted: {state}");
     }
 
     #[test]
@@ -6556,12 +6427,12 @@ mod tests {
                 const c = document.createElement('canvas');
                 const x = c.getContext('2d');
                 x.fillStyle = '#f00'; x.fillRect(0, 0, 4, 4);
-                try { x.getImageData(0, 0, 1, 1); return 'читается'; }
-                catch (e) { return 'бросок: ' + e.message; }
+                try { x.getImageData(0, 0, 1, 1); return 'readable'; }
+                catch (e) { return 'threw: ' + e.message; }
             })())"#,
         )
         .await;
-        assert_eq!(clean.as_str(), Some("читается"));
+        assert_eq!(clean.as_str(), Some("readable"));
 
         // An image from another origin, drawn without permission, costs the
         // canvas its readability — both ways out of it.
@@ -6574,9 +6445,9 @@ mod tests {
                 im.src = 'https://cdn.example.org/logo.png';
                 x.drawImage(im, 0, 0);
                 const out = [];
-                try { x.getImageData(0, 0, 1, 1); out.push('данные отданы'); }
+                try { x.getImageData(0, 0, 1, 1); out.push('data returned'); }
                 catch (e) { out.push(e.name + ': ' + e.message); }
-                try { c.toDataURL(); out.push('картинка отдана'); }
+                try { c.toDataURL(); out.push('image returned'); }
                 catch (e) { out.push(e.name); }
                 return out;
             })())"#,
@@ -6598,14 +6469,17 @@ mod tests {
                 const im = document.createElement('img');
                 im.src = 'https://example.com/app/logo.png';
                 x.drawImage(im, 0, 0);
-                try { x.getImageData(0, 0, 1, 1); return 'читается'; }
-                catch (e) { return 'бросок: ' + e.message; }
+                try { x.getImageData(0, 0, 1, 1); return 'readable'; }
+                catch (e) { return 'threw: ' + e.message; }
             })())"#,
         )
         .await;
-        assert_eq!(same.as_str(), Some("читается"));
+        assert_eq!(same.as_str(), Some("readable"));
     }
 
+    /// The challenge's first question to its worker: navigator fields, answered
+    /// with one object message. Chrome answers at once; ours got lost while a timer
+    /// from the same script arrived fine. Runs the exact script the challenge sends.
     #[tokio::test]
     async fn a_worker_answers_the_first_question_about_itself() {
         let _serial = serial().await;
@@ -6627,8 +6501,8 @@ mod tests {
         )
         .await
         .unwrap();
-        // Таймер в воркере длиннее ближнего порога, так что круг надо крутить,
-        // пока он не наступит, — как это делает живая страница.
+        // The worker's timer is longer than the near threshold, so keep pumping until it
+        // fires, as a live page would.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while std::time::Instant::now() < deadline {
             ctx.run_event_loop().await.unwrap();
@@ -6643,27 +6517,25 @@ mod tests {
         let list = got.as_array().cloned().unwrap_or_default();
         assert!(
             list.len() >= 2,
-            "оба сообщения воркера должны дойти — и ответ, и таймер: {got}"
+            "both worker messages must arrive, the reply and the timer: {got}"
         );
         let first = &list[0];
         assert!(
             first["KzOg4"].as_str().unwrap_or("").starts_with("Linux"),
-            "платформа в ответе: {got}"
+            "platform in the reply: {got}"
         );
-        assert!(first["TzEx3"].is_array(), "языки массивом: {got}");
-        assert!(first["Bwko4"].as_u64().unwrap_or(0) > 0, "ядра: {got}");
+        assert!(first["TzEx3"].is_array(), "languages as an array: {got}");
+        assert!(first["Bwko4"].as_u64().unwrap_or(0) > 0, "cores: {got}");
         assert!(
             first["EhUAu5"].as_str().unwrap_or("").contains("Chrome/"),
             "user-agent: {got}"
         );
-        assert_eq!(list[1]["dnjTe7"], 1, "и таймер следом: {got}");
+        assert_eq!(list[1]["dnjTe7"], 1, "and the timer after it: {got}");
     }
 
-    /// Контекст рисования — это интерфейс, а не мешок свойств. В Chrome у
-    /// самого контекста нет ни одного собственного свойства: все 73 имени 2D и
-    /// все 442 имени WebGL живут на прототипе, и сборщик отпечатка идёт именно
-    /// по нему. У нас было наоборот — пустой прототип и семь десятков имён на
-    /// объекте, что видно с первого шага обхода.
+    /// A drawing context is an interface, not a bag of properties. In Chrome the
+    /// context has no own properties: all 73 2D names and 442 WebGL names live on the
+    /// prototype, which is what fingerprint collectors walk.
     #[tokio::test]
     async fn a_drawing_context_is_an_interface_not_a_bag_of_properties() {
         let _serial = serial().await;
@@ -6680,8 +6552,8 @@ mod tests {
                 a.width = 60; a.height = 30;
                 const x = a.getContext('2d');
                 x.fillStyle = '#f60'; x.fillRect(0, 0, 40, 20);
-                // Второй контекст: аксессоры прототипа уже стоят, и сборка
-                // второй реализации не должна попасть в них саму на себя.
+                // Second context: the prototype accessors already exist, and building the
+                // second implementation must not route into them.
                 const b = document.createElement('canvas');
                 const y = b.getContext('2d');
                 y.fillStyle = '#0af'; y.fillRect(0, 0, 5, 5);
@@ -6706,28 +6578,27 @@ mod tests {
         )
         .await;
 
-        // Снято с Chrome 148: 73 имени плюс `constructor`, 436+6 плюс он же.
+        // From Chrome 148: 73 names plus `constructor`, 436+6 plus it.
         assert_eq!(out["own2d"], 0, "{out}");
         assert_eq!(out["ownSecond"], 0, "{out}");
         assert_eq!(out["proto2d"], 74, "{out}");
         assert_eq!(out["fillRect"], "function", "{out}");
         assert_eq!(out["isCtx"], true, "{out}");
         assert_eq!(out["canvasBack"], true, "{out}");
-        // Рисование при этом целое, и два холста по-прежнему различимы.
+        // Drawing still works, and the two canvases stay distinct.
         assert_eq!(out["style"], "#ff6600", "{out}");
         assert_eq!(out["otherStyle"], "#00aaff", "{out}");
         assert_eq!(out["painted"], serde_json::json!([255, 102, 0, 255]), "{out}");
         assert_eq!(out["differ"], true, "{out}");
         assert_eq!(out["ownGl"], 0, "{out}");
         assert_eq!(out["protoGl"], 443, "{out}");
-        assert_eq!(out["constOnProto"], 256, "константы тоже на прототипе: {out}");
+        assert_eq!(out["constOnProto"], 256, "constants on the prototype too: {out}");
         assert_eq!(out["vendor"], "WebKit", "{out}");
     }
 
-    /// Объект, который страница построила сама, называет себя своим именем.
-    /// Тридцать один из тридцати шести проверенных отвечал `[object Object]`, а
-    /// `Object.prototype.toString.call(new Blob([]))` — строчка из любого
-    /// набора проверок. Значения сняты с Chrome 148.
+    /// An object the page builds names itself: 31 of 36 checked answered `[object Object]`,
+    /// and `Object.prototype.toString.call(new Blob([]))` is in every check suite.
+    /// Values from Chrome 148.
     #[tokio::test]
     async fn an_object_the_page_builds_names_itself() {
         let _serial = serial().await;
@@ -6763,8 +6634,8 @@ mod tests {
         .await;
 
         assert_eq!(out["blob"], "[object Blob]", "{out}");
-        // У настоящего Blob собственных свойств нет: размер и тип — с прототипа,
-        // а части лежат под символом, которого в перечислении не видно.
+        // A real Blob has no own properties: size and type come from the prototype and
+        // the parts sit under a non-enumerable symbol.
         assert_eq!(out["blobOwn"], 0, "{out}");
         assert_eq!(out["blobSize"], 1, "{out}");
         assert_eq!(out["blobType"], "text/plain", "{out}");
@@ -6776,16 +6647,15 @@ mod tests {
         assert_eq!(out["channel"], "[object MessageChannel]", "{out}");
         assert_eq!(out["mql"], "[object MediaQueryList]", "{out}");
         assert_eq!(out["range"], "[object Range]", "{out}");
-        // `Audio` — фабрика, а не интерфейс: она отдаёт элемент.
+        // `Audio` is a factory, not an interface: it returns an element.
         assert_eq!(out["audio"], "[object HTMLAudioElement]", "{out}");
         assert_eq!(out["decoder"], "[object TextDecoder]", "{out}");
     }
 
-    /// Хранилище должно хранить. Наше отдавало `null` на только что записанное
-    /// и держало `length` в нуле: методы живут на прототипе и берут данные по
-    /// `this`, а страница держит в руках Proxy, тогда как карта была заведена
-    /// на его цель — и каждый вызов получал свежую пустую. Виджет Turnstile
-    /// пишет туда `cf.turnstile.u` и читает обратно.
+    /// Storage must store. Ours returned `null` for a fresh write with `length` 0: the
+    /// methods on the prototype read data via `this`, which is the page's Proxy, while
+    /// the map lived on its target. The Turnstile widget writes `cf.turnstile.u` and
+    /// reads it back.
     #[tokio::test]
     async fn what_the_page_stores_it_can_read_back() {
         let _serial = serial().await;
@@ -6816,24 +6686,23 @@ mod tests {
         .await;
 
         assert_eq!(out["back"], "abc123", "{out}");
-        assert_eq!(out["viaProp"], "abc123", "ключ читается и как свойство: {out}");
-        assert_eq!(out["fromProperty"], "via property", "и пишется как свойство: {out}");
+        assert_eq!(out["viaProp"], "abc123", "a key reads as a property too: {out}");
+        assert_eq!(out["fromProperty"], "via property", "and writes as a property: {out}");
         assert_eq!(out["len"], 2, "{out}");
         assert_eq!(out["key0"], "cf.turnstile.u", "{out}");
         assert_eq!(
             out["keys"],
             serde_json::json!(["cf.turnstile.u", "direct"]),
-            "ключи — собственные свойства объекта: {out}"
+            "keys are own properties: {out}"
         );
-        // Два хранилища — две разные корзины.
+        // Two storages, two separate buckets.
         assert_eq!(out["separate"], Value::Null, "{out}");
         assert_eq!(out["gone"], Value::Null, "{out}");
     }
 
-    /// `IntersectionObserver` доставляет первое наблюдение сам, как только за
-    /// элементом начали следить. У нас настоящая реализация проигрывала пустой
-    /// заготовке из таблицы имён (`X = X || …`, а имя уже занято), и код,
-    /// ждущий этого колбэка, ждал вечно.
+    /// `IntersectionObserver` delivers the first observation by itself once observing
+    /// starts. The real implementation lost to an empty name-table stub (`X = X || …`
+    /// with the name already taken), and code awaiting the callback waited forever.
     #[tokio::test]
     async fn watching_an_element_reports_it_straight_away() {
         let _serial = serial().await;
@@ -6866,16 +6735,15 @@ mod tests {
         assert_eq!(
             out["seen"],
             serde_json::json!([["t", true]]),
-            "наблюдение приходит само: {out}"
+            "the observation arrives by itself: {out}"
         );
         assert_eq!(out["tag"], "[object IntersectionObserver]", "{out}");
     }
 
-    /// Платформенный объект называет себя сам. Заготовки из таблицы имён были
-    /// пустыми объектами и отвечали `[object Object]` там, где Chrome говорит
-    /// `[object VisualViewport]` или `[object BarProp]`, — а
-    /// `Object.prototype.toString` по всему окну подряд сборщик отпечатка зовёт
-    /// первым делом. Значения сняты с Chrome 148.
+    /// A platform object names itself. Name-table stubs were empty objects answering
+    /// `[object Object]` where Chrome says `[object VisualViewport]` or `[object BarProp]`,
+    /// and collectors call `Object.prototype.toString` across the window first thing.
+    /// Values from Chrome 148.
     #[tokio::test]
     async fn a_platform_object_says_what_it_is() {
         let _serial = serial().await;
@@ -6912,21 +6780,19 @@ mod tests {
         assert_eq!(tags["intl"], "[object Intl]", "{tags}");
         assert_eq!(tags["css"], "[object CSS]", "{tags}");
         assert_eq!(tags["channel"], "[object RTCDataChannel]", "{tags}");
-        // Шесть панелей окна — один интерфейс на всех, и он тот же, что в
-        // `instanceof`: разные прототипы под одним именем видно сразу.
+        // The six window bars share one interface, the same as in `instanceof`.
         assert_eq!(tags["sameBar"], true, "{tags}");
         assert_eq!(tags["isBar"], true, "{tags}");
         assert_eq!(tags["visible"], true, "{tags}");
-        // Порядок имён на прототипе тоже читают: члены, потом `constructor`.
+        // Prototype name order is read too: members, then `constructor`.
         assert_eq!(tags["order"], "visible,constructor", "{tags}");
-        assert_eq!(tags["width"], true, "видимая часть окна — это окно: {tags}");
-        assert_eq!(tags["sameNavigator"], true, "одно значение под двумя именами: {tags}");
+        assert_eq!(tags["width"], true, "the visual viewport is the window: {tags}");
+        assert_eq!(tags["sameNavigator"], true, "one value under two names: {tags}");
     }
 
-    /// Каждая сборка Vite приезжает вдвойне: модульная половина и запасная под
-    /// `nomodule`. Браузер с модулями берёт первую и пропускает вторую — а мы
-    /// исполняли обе, то есть запускали приложение дважды. На 2captcha это
-    /// кончалось бесконечной перезагрузкой страницы.
+    /// Every Vite build ships twice: a module half and a `nomodule` fallback. A module
+    /// browser takes the first and skips the second; we ran both, starting the app twice,
+    /// which on 2captcha ended in an endless reload.
     #[tokio::test]
     async fn a_nomodule_script_does_not_run_and_the_page_says_it_has_modules() {
         let _serial = serial().await;
@@ -6952,8 +6818,7 @@ mod tests {
             ctx.evaluate("globalThis.ran.join(',')").await.unwrap(),
             Value::String("classic".into())
         );
-        // `'noModule' in script` — тем же вопросом Vite решает, какую половину
-        // сборки нам отдать.
+        // `'noModule' in script` is how Vite decides which half to serve.
         assert_eq!(
             ctx.evaluate("globalThis.detect").await.unwrap(),
             Value::String("true/true".into())
@@ -7173,8 +7038,7 @@ mod tests {
             let leaked = p[key]
                 .as_array()
                 .unwrap_or_else(|| panic!("probe missing {key}"));
-            // У события одно своё свойство и у браузера: `isTrusted`
-            // ([LegacyUnforgeable]).
+            // A browser event has one own property too: `isTrusted` ([LegacyUnforgeable]).
             if key == "evtOwn" {
                 assert_eq!(leaked, &vec![serde_json::json!("isTrusted")], "evtOwn: {leaked:?}");
                 continue;
@@ -7264,7 +7128,7 @@ mod tests {
               ordered: (t => t.loadEventEnd >= t.domComplete && t.domComplete >= t.domInteractive
                         && t.domInteractive >= t.responseEnd && t.responseEnd >= t.requestStart
                         && t.requestStart >= t.navigationStart)(performance.timing),
-              // У Chrome navigationStart — целые миллисекунды, timeOrigin — дробные.
+              // In Chrome navigationStart is whole milliseconds, timeOrigin fractional.
               navigationStartAtOrigin: Number.isInteger(performance.timing.navigationStart)
                 && Math.abs(performance.timing.navigationStart - performance.timeOrigin) < 1,
               navType: performance.navigation.type,
@@ -7325,14 +7189,11 @@ mod tests {
         }
     }
 
-    /// Текст переносится по строкам, а прокрутка знает своё содержимое. Абзац
-    /// шириной сто двадцать пикселей отвечал высотой восемнадцать вместо
-    /// семидесяти двух — в одну строку укладывалось что угодно, — а
-    /// `Range.getClientRects()` отдавал пустой список, то есть «текста нет».
-    /// Блок с `overflow: auto` называл видимую часть равной себе, без места под
-    /// полосу, и `scrollWidth` равным `clientWidth`. Числа сверены с Chrome 151.
-    /// Ширины строк настоящие только со сборкой `render`: без неё текст меряется
-    /// на глаз, и перенос ложится по другим словам.
+    /// Text wraps into lines and a scroller knows its content. A 120 px paragraph
+    /// reported 18 px height instead of 72, `Range.getClientRects()` was empty, and an
+    /// `overflow: auto` box had no room for the scrollbar with `scrollWidth` equal to
+    /// `clientWidth`. Numbers checked against Chrome 151. Line widths are real only with
+    /// the `render` feature; without it wrapping falls on different words.
     #[cfg(feature = "render")]
     #[tokio::test]
     async fn text_wraps_and_a_scroll_box_knows_its_content() {
@@ -7370,9 +7231,9 @@ mod tests {
         )
         .await;
 
-        // Полоса прокрутки занимает пятнадцать пикселей, содержимое — 300×200.
+        // The scrollbar takes 15 px; content is 300x200.
         assert_eq!(p["scroll"], serde_json::json!([85, 25, 300, 200]));
-        // Четыре строки по восемнадцать пикселей.
+        // Four lines of 18 px.
         assert_eq!(p["wrap"], serde_json::json!([120, 72]));
         assert_eq!(
             p["rects"],
@@ -7392,12 +7253,10 @@ mod tests {
         );
     }
 
-    /// Звуковой отпечаток — тот самый, который снимают все: треугольник на
-    /// 10 кГц через компрессор со стандартными полями, сумма модулей отсчётов
-    /// с 4500 по 5000. У Chrome 151 это 124.0435; у нас было 11.87, потому что
-    /// осциллятор звучал вполовину громче нужного и не был ограничен по
-    /// спектру, а «компрессор» делил амплитуду на степень сжатия, не зная ни
-    /// колена, ни следящего детектора, ни — главное — компенсирующего усиления.
+    /// The common audio fingerprint: a 10 kHz triangle through a compressor with default
+    /// fields, sum of absolute samples 4500..5000. Chrome 151 gives 124.0435; we had 11.87
+    /// (oscillator twice too loud and not band-limited, compressor ignoring the knee,
+    /// the envelope detector and makeup gain).
     #[tokio::test]
     async fn the_audio_fingerprint_is_the_number_a_browser_produces() {
         let _serial = serial().await;
@@ -7416,8 +7275,8 @@ mod tests {
               osc.connect(comp); comp.connect(oc.destination); osc.start(0);
               let out = null;
               oc.startRendering().then((b) => { out = b; });
-              // Рендер у нас синхронный, обещание уже разрешено к этому месту
-              // только после микрозадачи — поэтому берём буфер и напрямую.
+              // Our rendering is synchronous but the promise resolves only after a microtask,
+              // so take the buffer directly too.
               const b = out || oc.__ptRender(1, 44100);
               const d = b.getChannelData(0);
               let sum = 0;
@@ -7438,12 +7297,11 @@ mod tests {
         .await;
 
         let sum = p["sum"].as_f64().expect("the sum is a number");
-        // Сверка побитная: страница склеивает все сорок четыре тысячи
-        // отсчётов и читает каждый разряд, а звук одинаков на всякой машине с
-        // той же сборкой браузера. Числа сняты с Chrome 151 здесь же.
+        // Bit-exact: pages join all 44100 samples and read every digit, and the sound is
+        // identical on any machine with the same browser build. Numbers from Chrome 151 here.
         assert!(
             (sum - 124.04347527516074).abs() < 1e-12,
-            "сумма модулей {sum}, у Chrome 151 — 124.04347527516074"
+            "sum of abs {sum}, Chrome 151 has 124.04347527516074"
         );
         // The joined length reads every one of the 44100 samples' decimal
         // digits. The compressor calls the machine's libm for log10f/powf —
@@ -7452,7 +7310,7 @@ mod tests {
         // constants were recorded on, a few samples land one ulp off and spell
         // one character longer, so that exact length holds on Linux only.
         #[cfg(target_os = "linux")]
-        assert_eq!(p["joined"], 882861, "длина склейки отсчётов: {p}");
+        assert_eq!(p["joined"], 882861, "joined samples length: {p}");
         let mid: Vec<f64> = p["mid"]
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
@@ -7465,9 +7323,9 @@ mod tests {
                 -0.005692707374691963,
                 0.3892313539981842
             ],
-            "отсчёты бит в бит: {p}"
+            "samples bit for bit: {p}"
         );
-        // Живой контекст: частота карты, задержка буфера, остановлен до жеста.
+        // Live context: card rate, buffer latency, suspended until a gesture.
         assert_eq!(p["rate"], 48000);
         assert!((p["baseLatency"].as_f64().unwrap_or(0.0) - 512.0 / 48000.0).abs() < 1e-9);
         assert_eq!(p["state"], "suspended");
@@ -7479,12 +7337,10 @@ mod tests {
         );
     }
 
-    /// `drawImage` рисует всем, чем рисует браузер. Он отвергал
-    /// `OffscreenCanvas` и `ImageBitmap` — притом что собственный текст ошибки
-    /// перечислял их среди допустимых, — а холст-источник подменял штампом
-    /// вместо пикселей. Сборщик Cloudflare рисует так свой `OffscreenCanvas`, и
-    /// в трассировке это было видно как `THROW ctx2d.drawImage(...)`. Пиксели
-    /// настоящие только со сборкой `render`; без неё холст отвечает штампом.
+    /// `drawImage` accepts every source a browser does. It rejected `OffscreenCanvas`
+    /// and `ImageBitmap` (while its own error text listed them) and stamped a source
+    /// canvas instead of copying pixels; Cloudflare's collector draws its own
+    /// `OffscreenCanvas` this way. Real pixels only with the `render` feature.
     #[cfg(feature = "render")]
     #[tokio::test]
     async fn draw_image_takes_every_source_a_browser_takes() {
@@ -7533,12 +7389,9 @@ mod tests {
         assert_eq!(p["bitmapIsBitmap"], "[object ImageBitmap]");
     }
 
-    /// `performance.memory` — показания, а не три постоянные величины. Три
-    /// константы стояли здесь и не двигались ни на байт: страница, которая
-    /// выделяет память и перечитывает `usedJSHeapSize`, в браузере видит
-    /// выросшее число, а у нас видела прежнее. Предел движок считает от
-    /// физической памяти той же функцией V8, которой его считает Chrome, —
-    /// на машине с 16 ГБ оба объявляют 4 395 630 592.
+    /// `performance.memory` is a reading, not three constants: a page that allocates and
+    /// rereads `usedJSHeapSize` sees it grow in a browser. The limit comes from physical
+    /// memory via the same V8 function Chrome uses: 4 395 630 592 on a 16 GB machine.
     #[tokio::test]
     async fn the_heap_readings_move_when_the_page_allocates() {
         let _serial = serial().await;
@@ -7551,12 +7404,11 @@ mod tests {
               const m = performance.memory;
               const before = m.usedJSHeapSize;
               const junk = [];
-              // Миллион удерживаемых объектов: сборка мусора бутстрапа посреди
-              // цикла отдаёт десятки мегабайт, и меньший прирост её не перекрывал.
+              // A million retained objects: a bootstrap GC mid-loop frees tens of MB, and a
+              // smaller growth did not outweigh it.
               for (let i = 0; i < 1000000; i++) junk.push({ x: i, s: 'abc' + i });
-              // Показания памяти обновляются не чаще раза в 50 мс, как у Chrome:
-              // на быстрой машине весь цикл укладывается в это окно, и повторное
-              // чтение без паузы вернуло бы прежнее значение на всякой сборке.
+              // Memory readings refresh at most every 50 ms, as in Chrome: on a fast machine the
+              // loop fits in that window and an immediate reread returns the old value.
               const t0 = Date.now();
               while (Date.now() - t0 < 60) {}
               const after = m.usedJSHeapSize;
@@ -7585,10 +7437,9 @@ mod tests {
             p["total"].as_f64().unwrap_or(0.0) >= after,
             "totalJSHeapSize is below what is in use"
         );
-        // Как и у всякого объекта, который мы отдаём, состояние живёт на прототипе.
+        // As with every object we expose, state lives on the prototype.
         assert_eq!(p["own"], 0, "MemoryInfo exposes own properties");
-        // Chrome берёт её от физической памяти машины и округляет к степени
-        // двойки; восьмёрки как потолка там больше нет.
+        // Chrome derives it from physical memory, rounded to a power of two; 8 is no longer the cap.
         let dm = p["deviceMemory"].as_u64().expect("deviceMemory is a number");
         assert!(
             dm.is_power_of_two() && (1..=64).contains(&dm),
@@ -8761,12 +8612,11 @@ mod tests {
         );
     }
 
-    // Рамка SVG-текста — отдельный измерительный тракт, и им тоже снимают
-    // отпечаток. Числа сняты с Chrome 151 на этой машине: рамка объединяет
-    // коробку чернил с коробкой раскладки (вправо берётся дальняя, влево —
-    // только вылет чернил), высота — из метрик шрифта, начало отсчитывается от
-    // атрибутов `x` и `y`. Пробелы по краям в счёт не идут, у пустого текста
-    // рамки нет вовсе.
+    // The SVG text bbox is a separate measuring path, also fingerprinted. Numbers from
+    // Chrome 151 on this machine: the box unites the ink box with the layout box (the
+    // farther one to the right, only ink overhang to the left), height comes from font
+    // metrics, origin from the `x` and `y` attributes. Edge spaces do not count; empty
+    // text has no box.
     #[cfg(feature = "render")]
     #[tokio::test]
     async fn an_svg_text_box_is_the_one_a_browser_measures() {
@@ -8813,32 +8663,30 @@ mod tests {
                 .map(|n| n.as_f64().unwrap())
                 .collect()
         };
-        // Чернила «jjj» уходят на пиксель левее начала — рамка едет за ними, а
-        // ширина этот вылет вбирает.
-        assert_eq!(box_of("jjj"), vec![9.0, 36.0, 11.672, 17.0], "рамка «jjj»");
-        // Моноширинный: чернила уже раскладки, и вправо берётся раскладка.
+        // The ink of "jjj" starts a pixel left of the origin: the box follows and the width absorbs it.
+        assert_eq!(box_of("jjj"), vec![9.0, 36.0, 11.672, 17.0], "box of \"jjj\"");
+        // Monospace: ink is narrower than layout, so the layout is taken on the right.
         assert_eq!(
             box_of("mono"),
             vec![10.0, 24.0, 187.203, 33.0],
-            "рамка моноширинной строки"
+            "monospace line box"
         );
         assert_eq!(
             v["length"].as_f64().unwrap(),
             187.203,
-            "длина строки — ширина раскладки"
+            "line length is the layout width"
         );
         assert_eq!(
             box_of("spaced"),
             box_of("tight"),
-            "пробелы по краям в рамку не идут"
+            "edge spaces are not in the box"
         );
-        assert_eq!(box_of("empty"), vec![0.0, 0.0, 0.0, 0.0], "у пустого текста рамки нет");
+        assert_eq!(box_of("empty"), vec![0.0, 0.0, 0.0, 0.0], "empty text has no box");
     }
 
-    /// Список селекторов через запятую отдаёт элементы в порядке документа, а
-    /// не сгруппированными по селекторам. api.js Turnstile описывает форму
-    /// именно так (`querySelectorAll("input, select, textarea, button")`), и у
-    /// нас кнопки уезжали в конец — виджету уходила чужая форма.
+    /// A comma selector list returns elements in document order, not grouped by
+    /// selector. Turnstile's api.js collects its form this way
+    /// (`querySelectorAll("input, select, textarea, button")`).
     #[tokio::test]
     async fn a_selector_list_answers_in_document_order() {
         let _serial = serial().await;
@@ -8866,9 +8714,8 @@ mod tests {
         assert_eq!(out["nested"], serde_json::json!(["b1", "t1", "b2"]), "{out}");
     }
 
-    /// Псевдоклассы и все четыре комбинатора. Прежний движок читал `:root`
-    /// как имя тега, и переменные из `:root { … }` не доходили ни до одного
-    /// элемента.
+    /// Pseudo-classes and all four combinators. The old engine read `:root` as a tag
+    /// name, so variables from `:root { … }` reached no element.
     #[tokio::test]
     async fn selectors_know_pseudo_classes_and_siblings() {
         let _serial = serial().await;
@@ -8909,10 +8756,9 @@ mod tests {
         assert_eq!(out["scope"], 3, "{out}");
     }
 
-    /// Значения современного CSS: `var()` с запасом, собственные свойства с
-    /// регистром, `calc()`/`min()`/`clamp()`, `dvh`, `rem` от корня,
-    /// `box-sizing: inherit` и сетка с `gap`. Числа — из Chrome 151 на той же
-    /// разметке (окно 1920×942).
+    /// Modern CSS values: `var()` with fallback, registered custom properties,
+    /// `calc()`/`min()`/`clamp()`, `dvh`, root `rem`, `box-sizing: inherit` and grid
+    /// with `gap`. Numbers from Chrome 151 on the same markup (1920x942 window).
     #[tokio::test]
     async fn modern_css_values_resolve_like_chrome() {
         let _serial = serial().await;
@@ -8965,24 +8811,23 @@ mod tests {
         assert_eq!(out["grid"], serde_json::json!([152, "16px", 112]), "{out}");
     }
 
-    /// Скрипт, вставленный страницей, видит себя так же, как видит браузерный:
-    /// `document.currentScript` — он сам, а его запись Resource Timing уже на
-    /// месте, пока он исполняется. api.js Turnstile ищет её первой же строкой
-    /// и пересылает виджету целиком; у нас не было ни того, ни другого, и тело
-    /// первого POST выходило на шесть полей короче браузерного.
+    /// A page-inserted script sees itself as in a browser: `document.currentScript` is
+    /// itself, and its Resource Timing entry exists while it runs. Turnstile's api.js
+    /// looks it up on its first line and forwards it whole to the widget; without it
+    /// the first POST body was six fields short.
     #[tokio::test]
     async fn an_inserted_script_sees_itself_and_its_timing() {
         let _serial = serial().await;
         const PAGE: &str = r#"<html><body><script>
             const s = document.createElement('script'); s.src = '/self.js';
-            s.onload = () => { globalThis.__после = document.currentScript === null; };
+            s.onload = () => { globalThis.__after = document.currentScript === null; };
             document.head.appendChild(s);
           </script></body></html>"#;
         const JS: &str = "(function () {
             var cs = document.currentScript;
             var all = performance.getEntriesByType('resource');
             var mine = all.filter(function (e) { return cs && e.name.indexOf(cs.src) >= 0; });
-            globalThis.__сам = {
+            globalThis.__self = {
               cs: !!cs, inst: mine.length ? mine[0] instanceof PerformanceResourceTiming : false,
               found: mine.length, keys: mine.length ? Object.keys(mine[0].toJSON()).slice(0, 8) : [],
               type: mine.length ? mine[0].contentType : null,
@@ -9019,25 +8864,24 @@ mod tests {
         let ctx = engine.new_context().await.unwrap();
         ctx.navigate(&format!("http://{addr}/")).await.unwrap();
         ctx.run_event_loop().await.unwrap();
-        let out = probe(&ctx, "__ptJSON.stringify({ сам: globalThis.__сам, после: globalThis.__после })").await;
-        assert_eq!(out["сам"]["cs"], true, "currentScript — сам скрипт: {out}");
-        assert_eq!(out["сам"]["found"], 1, "запись о себе видна во время исполнения: {out}");
-        assert_eq!(out["сам"]["inst"], true, "{out}");
+        let out = probe(&ctx, "__ptJSON.stringify({ self: globalThis.__self, after: globalThis.__after })").await;
+        assert_eq!(out["self"]["cs"], true, "currentScript is the script itself: {out}");
+        assert_eq!(out["self"]["found"], 1, "its own entry is visible while running: {out}");
+        assert_eq!(out["self"]["inst"], true, "{out}");
         assert_eq!(
-            out["сам"]["keys"],
+            out["self"]["keys"],
             serde_json::json!(["name", "entryType", "startTime", "duration", "navigationId",
                                "initiatorType", "deliveryType", "nextHopProtocol"]),
-            "поля в браузерном порядке: {out}"
+            "fields in browser order: {out}"
         );
-        assert_eq!(out["сам"]["type"], "text/javascript", "MIME сокращён, как у браузера: {out}");
-        assert_eq!(out["после"], true, "после исполнения currentScript снова пуст: {out}");
+        assert_eq!(out["self"]["type"], "text/javascript", "MIME trimmed, as in a browser: {out}");
+        assert_eq!(out["after"], true, "currentScript is null again afterwards: {out}");
     }
 
-    /// Фокус у браузера — четыре события, а не два: `blur` и `focusout` на
-    /// прежнем, `focus` и `focusin` на новом, у каждого второй участник в
-    /// `relatedTarget`. Шлёт их сам браузер, поэтому они доверены, даже когда
-    /// фокус попросили из скрипта. Тело — это «ни на ком»: в `relatedTarget`
-    /// тогда пусто.
+    /// Focus is four events, not two: `blur` and `focusout` on the old element, `focus`
+    /// and `focusin` on the new, each with the other in `relatedTarget`. The browser
+    /// sends them, so they are trusted even when a script asked for focus. Body means
+    /// "nobody": `relatedTarget` is then null.
     #[tokio::test]
     async fn focus_moves_the_way_a_browser_moves_it() {
         let _serial = serial().await;
@@ -9046,11 +8890,11 @@ mod tests {
         ctx.load_html(
             "https://example.com/",
             r#"<html><body><input id=a><input id=b><script>
-              globalThis.__лог = [];
+              globalThis.__focusLog = [];
               for (const t of ['focus', 'blur', 'focusin', 'focusout']) {
                 for (const id of ['a', 'b']) {
                   document.getElementById(id).addEventListener(t, (e) => {
-                    __лог.push([id, t, e.isTrusted, e.relatedTarget ? e.relatedTarget.id : null,
+                    __focusLog.push([id, t, e.isTrusted, e.relatedTarget ? e.relatedTarget.id : null,
                                 Object.prototype.toString.call(e), e.bubbles]);
                   });
                 }
@@ -9061,7 +8905,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let out = probe(&ctx, "__ptJSON.stringify(globalThis.__лог)").await;
+        let out = probe(&ctx, "__ptJSON.stringify(globalThis.__focusLog)").await;
         assert_eq!(
             out,
             serde_json::json!([
@@ -9072,14 +8916,13 @@ mod tests {
                 ["b", "focus", true, "a", "[object FocusEvent]", false],
                 ["b", "focusin", true, "a", "[object FocusEvent]", true],
             ]),
-            "порядок, доверие и второй участник"
+            "order, trust and related target"
         );
     }
 
-    /// События жизненного цикла приходят от движка, а движок здесь — браузер:
-    /// у настоящих `isTrusted` истина, и читают это первой же строкой. Плюс те
-    /// два, которых у нас не было вовсе: `readystatechange` на каждом шаге
-    /// готовности и `pageshow` следом за `load`.
+    /// Lifecycle events come from the engine, which here is the browser: real ones have
+    /// `isTrusted` true, and pages read it first. Plus two that were missing:
+    /// `readystatechange` at each readiness step and `pageshow` after `load`.
     #[tokio::test]
     async fn the_lifecycle_events_are_trusted_like_a_browsers() {
         let _serial = serial().await;
@@ -9088,36 +8931,35 @@ mod tests {
         ctx.load_html(
             "https://example.com/",
             r#"<html><body><script>
-              globalThis.__итог = {};
+              globalThis.__lifecycle = {};
               document.addEventListener('readystatechange', (e) => {
-                __итог['готовность:' + document.readyState] = e.isTrusted;
+                __lifecycle['ready:' + document.readyState] = e.isTrusted;
               });
-              document.addEventListener('DOMContentLoaded', (e) => { __итог.dcl = e.isTrusted; });
-              window.addEventListener('DOMContentLoaded', (e) => { __итог.dclОкно = e.isTrusted; });
-              window.addEventListener('load', (e) => { __итог.load = e.isTrusted; });
-              document.addEventListener('load', (e) => { __итог.loadДокумент = e.isTrusted; });
+              document.addEventListener('DOMContentLoaded', (e) => { __lifecycle.dcl = e.isTrusted; });
+              window.addEventListener('DOMContentLoaded', (e) => { __lifecycle.dclWindow = e.isTrusted; });
+              window.addEventListener('load', (e) => { __lifecycle.load = e.isTrusted; });
+              document.addEventListener('load', (e) => { __lifecycle.loadDocument = e.isTrusted; });
               window.addEventListener('pageshow', (e) => {
-                __итог.pageshow = e.isTrusted; __итог.persisted = e.persisted;
+                __lifecycle.pageshow = e.isTrusted; __lifecycle.persisted = e.persisted;
               });
             </script></body></html>"#,
         )
         .await
         .unwrap();
-        let out = probe(&ctx, "__ptJSON.stringify(globalThis.__итог)").await;
-        for key in ["dcl", "dclОкно", "load", "loadДокумент", "pageshow"] {
-            assert_eq!(out[key], true, "{key} должно быть доверенным: {out}");
+        let out = probe(&ctx, "__ptJSON.stringify(globalThis.__lifecycle)").await;
+        for key in ["dcl", "dclWindow", "load", "loadDocument", "pageshow"] {
+            assert_eq!(out[key], true, "{key} must be trusted: {out}");
         }
-        assert_eq!(out["готовность:interactive"], true, "{out}");
-        assert_eq!(out["готовность:complete"], true, "{out}");
-        assert_eq!(out["persisted"], false, "обычная загрузка, не возврат: {out}");
+        assert_eq!(out["ready:interactive"], true, "{out}");
+        assert_eq!(out["ready:complete"], true, "{out}");
+        assert_eq!(out["persisted"], false, "a normal load, not a back navigation: {out}");
     }
 
-    // Вид описания у члена интерфейса читается одной строкой, и обход графа у
-    // челленджа читает его именно так. У браузера свойство интерфейса — это
-    // акцессор (у доступных на запись есть и установщик), метод — перечислимое
-    // значение, а константа не переписывается и не удаляется. Сверено с
-    // Chrome 151 обходом всех девятисот пятидесяти интерфейсов; здесь — по
-    // одному образцу на каждый вид.
+    // A member's descriptor kind reads as one string, and the challenge's graph walk
+    // reads it that way. In a browser an interface attribute is an accessor (with a
+    // setter if writable), a method an enumerable value, a constant non-writable and
+    // non-configurable. Checked against Chrome 151 across all ~950 interfaces; here one
+    // sample per kind.
     #[tokio::test]
     async fn an_interface_member_is_described_the_way_a_browser_describes_it() {
         let _serial = serial().await;
@@ -9131,7 +8973,7 @@ mod tests {
             r#"(() => {
                 const kind = (o, n) => {
                     const d = Object.getOwnPropertyDescriptor(o, n);
-                    if (!d) return 'нет';
+                    if (!d) return 'none';
                     return (d.get || d.set)
                         ? 'a' + (d.get ? 'g' : '') + (d.set ? 's' : '')
                             + (d.enumerable ? 'e' : '') + (d.configurable ? 'c' : '')
@@ -9148,8 +8990,7 @@ mod tests {
                     body: kind(Document.prototype, 'body'),
                     svgPx: kind(SVGLength.prototype, 'SVG_LENGTHTYPE_PX'),
                     svgPxValue: SVGLength.SVG_LENGTHTYPE_PX,
-                    // Запись изнутри всё ещё работает: страница поля не пишет,
-                    // а движок пишет.
+                    // Internal writes still work: the page cannot write the field, the engine can.
                     lifecycle: (() => {
                         const d = document.createElement('i');
                         document.body.appendChild(d);
@@ -9160,19 +9001,19 @@ mod tests {
             })()"#,
         )
         .await;
-        assert_eq!(out["namespaceURI"], "agec", "только чтение: {out}");
-        assert_eq!(out["title"], "agsec", "и чтение, и запись: {out}");
+        assert_eq!(out["namespaceURI"], "agec", "read-only: {out}");
+        assert_eq!(out["title"], "agsec", "read and write: {out}");
         assert_eq!(out["ownerDocument"], "agec", "{out}");
-        assert_eq!(out["appendChild"], "vfwec", "метод — значение: {out}");
-        assert_eq!(out["elementNode"], "vne", "константу не переписать: {out}");
+        assert_eq!(out["appendChild"], "vfwec", "a method is a value: {out}");
+        assert_eq!(out["elementNode"], "vne", "a constant cannot be overwritten: {out}");
         assert_eq!(out["geolocation"], "agec", "{out}");
         assert_eq!(out["body"], "agsec", "{out}");
         assert_eq!(out["svgPx"], "vne", "{out}");
-        assert_eq!(out["svgPxValue"], 5, "константа — число, а не пустота: {out}");
+        assert_eq!(out["svgPxValue"], 5, "a constant is a number, not empty: {out}");
         assert_eq!(
             out["lifecycle"],
             serde_json::json!(["complete", "BODY", true, 1]),
-            "движку запись изнутри по-прежнему доступна: {out}"
+            "internal writes still work for the engine: {out}"
         );
     }
 
@@ -9418,7 +9259,7 @@ mod tests {
               scripts: document.scripts.length, forms: document.forms.length,
               images: document.images.length, docLinks: document.links.length,
               anchors: document.anchors.length, sheets: document.styleSheets.length,
-              // Не массив, а коллекция — как на платформе: перебор, но без .map.
+              // A collection, not an array, as on the platform: iterable, but no .map.
               sheetHref: Array.from(document.styleSheets).map(s => s.href || 'inline'),
               collection: [document.scripts.map, Array.isArray(document.forms)]
                 .every(x => !x),
@@ -9527,10 +9368,9 @@ mod tests {
             Value::String(s) => serde_json::from_str::<Value>(&s).unwrap(),
             v => panic!("expected the probe result, got {v:?}"),
         };
-        // Объявленный размер — это поле содержимого: движок браузера рисует
-        // вокруг `<iframe>` рамку в два пикселя, и внешняя коробка на четыре
-        // пикселя больше. Проверено на Chrome 151: голый `<iframe>` отдаёт
-        // 304×154 при содержимом 300×150.
+        // The declared size is the content box: Chrome draws a 2 px border around an
+        // `<iframe>`, so the outer box is 4 px larger. Chrome 151: a bare `<iframe>` gives
+        // 304x154 for 300x150 content.
         assert_eq!(out["attr"], serde_json::json!([304, 69]), "width/height attributes");
         assert_eq!(out["style"], serde_json::json!([304, 69]), "and inline CSS");
         assert_eq!(out["offset"], serde_json::json!([304, 69]), "offsetWidth/Height agree");
@@ -10136,9 +9976,8 @@ mod tests {
         assert_eq!(out["fetch"], "function", "what a worker does have, it has");
         assert_eq!(out["json"], "function", "the language comes along");
         // Measured against Chrome 151, level by level: the shape of the realm is
-        // the first thing a collector inside a worker enumerates. Имён 335 —
-        // `FontFaceSet` в их числе: у браузера `self.fonts` это интерфейс, а не
-        // безымянный объект.
+        // the first thing a collector inside a worker enumerates. 335 names,
+        // including `FontFaceSet`: in a browser `self.fonts` is an interface instance.
         assert_eq!(out["own"], 335, "own names on the scope: {out}");
         assert_eq!(out["keys"], 12, "and twelve of them enumerable");
         assert_eq!(out["scope"], 30, "WorkerGlobalScope carries the rest");
@@ -10151,13 +9990,11 @@ mod tests {
         );
     }
 
-    /// Сколько миллисекунд проходит между «страница отправила» и «страница
-    /// получила ответ». Число само по себе ничего не доказывает — но челлендж
-    /// его меряет: сборщик отпечатка просит воркер отозваться через 55 мс и
-    /// смотрит, сколько вышло на самом деле. Живой браузер укладывается в
-    /// шестьдесят с небольшим, потому что воркер — отдельный поток; здесь тот же
-    /// круг, десять раз подряд, и порог оставлен заведомо мягким, чтобы тест
-    /// ловил обвал на порядок, а не дрожание машины.
+    /// Milliseconds from "page posted" to "page got the reply". The challenge measures
+    /// it: the collector asks a worker to reply in 55 ms and checks the real time. A live
+    /// browser stays around 60 because the worker is its own thread. Ten rounds here,
+    /// with a deliberately loose threshold to catch an order-of-magnitude regression,
+    /// not machine jitter.
     #[tokio::test]
     async fn a_message_to_a_worker_and_back_takes_about_a_frame() {
         let _serial = serial().await;
@@ -10171,9 +10008,8 @@ mod tests {
             r#"(() => {
             const src = `self.onmessage = (e) => { postMessage(e.data + 1); };`;
             const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
-            // Страница при этом занята — как всякая живая страница. Пока всё
-            // жило на одном изоляте, ответ воркера ждал, когда она освободится,
-            // и круг вырастал ровно на её работу.
+            // The page is busy meanwhile, like any live page. On a shared isolate the worker's
+            // reply waited for it and the round grew by exactly its work.
             const burn = () => {
               const until = performance.now() + 15;
               while (performance.now() < until) {}
@@ -10215,12 +10051,10 @@ mod tests {
         );
     }
 
-    /// Воркер держит своё время сам. Сборщик отпечатка Cloudflare разложен в
-    /// цепочку коротких таймеров внутри воркера, и пока всё жило на одном
-    /// изоляте, каждый его шаг ждал, когда освободится страница: секунда работы
-    /// растягивалась на секунды стены, а челлендж успевал объявить сборщик
-    /// повисшим. Здесь цепочка из двадцати шагов по 5 мс идёт на фоне занятой
-    /// страницы — и должна укладываться в своё собственное время.
+    /// A worker keeps its own time. Cloudflare's collector is a chain of short timers in
+    /// a worker; on a shared isolate each step waited for the page, stretching a second
+    /// of work over wall seconds until the challenge declared the collector hung. Here
+    /// a 20-step chain of 5 ms runs against a busy page and must fit its own time.
     #[tokio::test]
     async fn a_worker_keeps_its_own_clock_while_the_page_is_busy() {
         let _serial = serial().await;
@@ -10263,8 +10097,8 @@ mod tests {
         let wall = done["wall"].as_f64().unwrap_or(f64::MAX);
         let inside = done["inWorker"].as_f64().unwrap_or(f64::MAX);
         println!("worker chain: {inside:.0} ms inside the worker, {wall:.0} ms of wall clock");
-        // Двадцать шагов по 5 мс — это сто миллисекунд работы. Порог мягкий:
-        // ловим не дрожание, а возврат к прежнему порядку величины.
+        // 20 steps of 5 ms is 100 ms of work. Loose threshold: catch a return to the old
+        // order of magnitude, not jitter.
         assert!(
             wall < 600.0,
             "a worker's own timer chain must not wait for the page: {done}"
@@ -10624,8 +10458,8 @@ mod tests {
         let out = probe(&ctx, r#"(() => {
             const p = trustedTypes.createPolicy('nokk-eval', { createScript: (s) => s });
             const code = p.createScript('function __declared(){ return 42 }');
-            // Как у Chrome: косвенный eval объявляет глобально, прямой видит
-            // локальную область (обёртка над eval делала прямой вызов косвенным).
+            // As in Chrome: indirect eval declares globally, direct eval sees the local scope
+            // (a wrapper around eval turned direct calls into indirect ones).
             (0, eval)(code);
             const local = 5;
             const direct = eval(p.createScript('local * 2'));
@@ -10636,7 +10470,7 @@ mod tests {
               kind: Object.prototype.toString.call(code),
               declared: typeof globalThis.__declared,
               value: typeof globalThis.__declared === 'function' ? __declared() : null,
-              // Строка остаётся строкой: обычный eval работает как работал.
+              // A string stays a string: plain eval works as before.
               plain: (eval('1 + 1')),
               native: /native code/.test(Function.prototype.toString.call(eval)),
               enumerable: Object.keys(globalThis).indexOf('eval') >= 0,
@@ -10725,7 +10559,7 @@ mod tests {
             .unwrap();
 
         let out = probe(&ctx, r#"(() => {
-            // Их цикл, слово в слово.
+            // Their loop, verbatim.
             let min;
             let advances = 0;
             for (let d = 0; d < 5000; d++) {
@@ -10737,7 +10571,7 @@ mod tests {
             const values = [...seen];
             return __ptJSON.stringify({
               advances, min: min === undefined ? -1 : min, distinct: values.length,
-              // Шаг ровно тот же, что у Chrome, и та же арифметика с плавающей точкой.
+              // Same step as Chrome and the same floating-point arithmetic.
               quantum: values.length > 1 ? Math.round((values[1] - values[0]) * 1000) / 1000 : -1,
               monotonic: values.every((v, i) => i === 0 || v > values[i - 1]),
               coherent: Math.abs(performance.timeOrigin + performance.now() - Date.now()) < 1000,
@@ -10774,7 +10608,7 @@ mod tests {
               unknown: document.fonts.check('12px "No Such Font XYZ"'),
               bad,
               iterable: [...document.fonts].length,
-              // Chrome не публикует это имя на окне — интерфейс есть, глобали нет.
+              // Chrome does not publish this name on the window: interface, no global.
               global: typeof globalThis.FontFaceSet,
               locks: Object.prototype.toString.call(navigator.locks),
               lockMembers: Object.getOwnPropertyNames(Object.getPrototypeOf(navigator.locks))
@@ -10789,8 +10623,8 @@ mod tests {
         assert_eq!(out["unknown"], true, "a fallback is always there, so any family checks out");
         assert_eq!(out["bad"], "SyntaxError");
         assert_eq!(out["iterable"], 0);
-        // Имя на окне у браузера есть: `FontFaceSet` лежит рядом с
-        // `FontFaceSetLoadEvent`, и `document.fonts` — его экземпляр.
+        // A browser does have the name on the window: `FontFaceSet` sits next to
+        // `FontFaceSetLoadEvent`, and `document.fonts` is an instance.
         assert_eq!(out["global"], "function");
         assert_eq!(out["locks"], "[object LockManager]");
         assert_eq!(out["lockMembers"], serde_json::json!(["query", "request"]));
@@ -10851,7 +10685,7 @@ mod tests {
             const clone = t.cloneNode(true);
             return __ptJSON.stringify({
               content: tag(t.content), nodeType: t.content.nodeType,
-              // Разобранные дети — в содержимом, сам элемент пуст.
+              // Parsed children go into the content; the element itself is empty.
               kids: t.content.childNodes.length, own: t.childNodes.length,
               first: t.content.firstChild.localName,
               innerHTML: t.innerHTML,
@@ -11061,11 +10895,10 @@ opacity: 0.9; flex-flow: column; }",
         assert_eq!(out["parentIsUs"], true);
     }
 
-    /// Стек ошибки — часть отпечатка: его снимают и разбирают. В браузере между
-    /// обработчиком события и местом вызова нет ни одного кадра JS, а у нас
-    /// диспетчер написан на JS, и всякий `new Error()` внутри обработчика
-    /// показывал `fire`, `__ptDispatch` и позицию в безымянном скрипте. Заодно
-    /// встроенный скрипт обязан называться адресом документа, а не пустотой.
+    /// An error stack is part of the fingerprint. In a browser there is no JS frame
+    /// between an event listener and the dispatch site; our dispatcher is JS, so any
+    /// `new Error()` in a listener showed `fire`, `__ptDispatch` and a position in an
+    /// unnamed script. Also an inline script must be named by the document URL.
     #[tokio::test]
     async fn a_stack_shows_the_page_and_not_the_engine() {
         let _serial = serial().await;
@@ -11077,7 +10910,7 @@ opacity: 0.9; flex-flow: column; }",
               const out = {};
               const b = document.createElement('button');
               document.body.appendChild(b);
-              b.addEventListener('click', () => { out.listener = new Error('ай').stack; });
+              b.addEventListener('click', () => { out.listener = new Error('\u0430\u0439').stack; });
               b.dispatchEvent(new MouseEvent('click'));
               out.builtin = [1].map(() => new Error().stack)[0];
               const mine = (e, sites) => sites.map((f) => typeof f.getFileName);
@@ -11094,43 +10927,42 @@ opacity: 0.9; flex-flow: column; }",
         let out = probe(&ctx, "__ptJSON.stringify(window.__stacks)").await;
         let listener = out["listener"].as_str().unwrap_or_default();
         assert!(
-            listener.starts_with("Error: ай\n    at "),
-            "заголовок и кадры как у V8: {listener}"
+            listener.starts_with("Error: \u{430}\u{439}\n    at "),
+            "header and frames as in V8: {listener}"
         );
         assert!(
             listener.contains("https://example.com/:"),
-            "кадр обработчика назван адресом документа: {listener}"
+            "the listener frame is named by the document URL: {listener}"
         );
         for engine_frame in ["__ptDispatch", "fire (", "dispatchEvent"] {
             assert!(
                 !listener.contains(engine_frame),
-                "кадров движка в стеке страницы быть не должно ({engine_frame}): {listener}"
+                "no engine frames in the page stack ({engine_frame}): {listener}"
             );
         }
         assert!(
             !listener.contains("(<anonymous>:"),
-            "и безымянных скриптов с позицией тоже: {listener}"
+            "nor unnamed scripts with a position: {listener}"
         );
         let builtin = out["builtin"].as_str().unwrap_or_default();
         assert!(
             builtin.contains("at Array.map (<anonymous>)"),
-            "встроенное V8 в стеке остаётся, как в браузере: {builtin}"
+            "V8 builtins stay in the stack, as in a browser: {builtin}"
         );
         assert_eq!(
             out["identity"], true,
-            "страница читает свой же `prepareStackTrace`"
+            "the page reads back its own `prepareStackTrace`"
         );
         assert_eq!(
             out["sites"][0], "function",
-            "и получает настоящие кадры, а не строки"
+            "and gets real call sites, not strings"
         );
     }
 
-    /// `importNode` стояло в перечне имён, но вызов возвращал пустоту — и
-    /// страница, которая кладёт содержимое шаблона в тело (челлендж Cloudflare
-    /// делает ровно это), падала строкой ниже, на `replaceChild(undefined, …)`.
-    /// Сообщения об ошибке — тоже поверхность отпечатка: чужой код зовёт эти
-    /// методы не тем нарочно и сверяет ответ с браузерным дословно.
+    /// `importNode` was listed but returned nothing, so a page moving template content
+    /// into the body (as the Cloudflare challenge does) failed on
+    /// `replaceChild(undefined, …)`. Error messages are fingerprint surface too: foreign
+    /// code misuses these methods on purpose and compares the text verbatim.
     #[tokio::test]
     async fn a_document_imports_a_node_and_complains_like_a_browser() {
         let _serial = serial().await;
@@ -11141,7 +10973,7 @@ opacity: 0.9; flex-flow: column; }",
             .unwrap();
 
         let out = probe(&ctx, r#"(() => {
-            const say = (f) => { try { f(); return 'без ошибки'; }
+            const say = (f) => { try { f(); return 'no error'; }
                                  catch (e) { return e.constructor.name + ': ' + e.message; } };
             const t = document.createElement('template');
             t.innerHTML = '<div id=a><span>x</span></div>';
@@ -11164,8 +10996,8 @@ opacity: 0.9; flex-flow: column; }",
             });
         })()"#).await;
 
-        assert_eq!(out["imported"], true, "содержимое шаблона легло в тело");
-        assert_eq!(out["shallow"], 0, "без `deep` копируется только сам узел");
+        assert_eq!(out["imported"], true, "template content landed in the body");
+        assert_eq!(out["shallow"], 0, "without `deep` only the node itself is copied");
         assert_eq!(out["adopted"], true);
         assert_eq!(
             out["noArgs"],
@@ -11193,12 +11025,11 @@ opacity: 0.9; flex-flow: column; }",
         );
     }
 
-    /// Опрос кодеков идёт в отчёт челленджа целиком, а наше правило было
-    /// втрое шире браузерного — «известный контейнер плюс известный кодек».
-    /// Chrome сверяет кодек именно с контейнером, и у потокового источника
-    /// список свой, не равный `canPlayType`. Обе таблицы сняты перебором 597
-    /// строк на Chrome 151; здесь закреплены те ответы, на которых прежнее
-    /// правило ошибалось.
+    /// The codec poll goes into the challenge report whole, and our rule ("known
+    /// container plus known codec") was three times wider than the browser's. Chrome
+    /// checks the codec against the container, and MediaSource has its own list, not
+    /// `canPlayType`'s. Both tables from 597 strings on Chrome 151; pinned here are the
+    /// answers the old rule got wrong.
     #[tokio::test]
     async fn codecs_are_answered_container_by_container() {
         let _serial = serial().await;
@@ -11252,21 +11083,19 @@ opacity: 0.9; flex-flow: column; }",
             ("mpegOpus", ""),
             ("wavPcm", "probably"),
         ] {
-            assert_eq!(out[key], want, "{key} отвечает не как браузер: {out}");
+            assert_eq!(out[key], want, "{key} answers unlike a browser: {out}");
         }
-        assert_eq!(out["mseTs"], true, "поток MPEG-TS источник принимает");
-        assert_eq!(out["mseMp4Mp3"], false, "а mp3 в mp4 — нет, хотя canPlayType про него говорит `probably`");
+        assert_eq!(out["mseTs"], true, "MediaSource accepts MPEG-TS");
+        assert_eq!(out["mseMp4Mp3"], false, "but not mp3 in mp4, though canPlayType says `probably`");
         assert_eq!(out["mseMp4Avc"], true);
-        assert_eq!(out["mseMkv"], false, "матрёшку потоковый источник не берёт вовсе");
+        assert_eq!(out["mseMkv"], false, "MediaSource rejects Matroska entirely");
         assert_eq!(out["mseAacBare"], true);
         assert_eq!(out["mseMp4Bare"], false);
     }
 
-    /// Наш офскрин — настоящий `<canvas>` под капотом, и он делал свою работу
-    /// теми же именами, что видит страница: сборщик, обернувший
-    /// `HTMLCanvasElement.prototype.getContext`, считал по лишнему вызову на
-    /// каждый офскрин, которого в браузере нет вовсе (у Cloudflare это видно
-    /// прямо в ленте: двенадцать офскринов — двенадцать чужих `getContext`).
+    /// Our offscreen canvas is a real `<canvas>` underneath and did its work through
+    /// page-visible names: a collector wrapping `HTMLCanvasElement.prototype.getContext`
+    /// counted an extra call per offscreen canvas that a browser never makes.
     #[tokio::test]
     async fn an_offscreen_canvas_leaves_no_trace_on_the_page() {
         let _serial = serial().await;
@@ -11290,9 +11119,8 @@ opacity: 0.9; flex-flow: column; }",
             g.fillRect(0, 0, 8, 8);
             const px = Array.from(g.getImageData(0, 0, 1, 1).data);
             const bmp = off.transferToImageBitmap();
-            // И то, что движок делает сам: снимок через `createImageBitmap`
-            // строится на своём холсте, WebGPU у нас лежит поверх WebGL — ни
-            // того, ни другого странице видеть не положено.
+            // And what the engine does itself: `createImageBitmap` builds on its own canvas,
+            // and our WebGPU sits on WebGL; the page must see neither.
             Promise.all([
               createImageBitmap(off, 0, 0, 4, 4),
               (navigator.gpu ? navigator.gpu.requestAdapter().then((a) => a && a.requestDevice()) : null),
@@ -11302,7 +11130,7 @@ opacity: 0.9; flex-flow: column; }",
               tag: Object.prototype.toString.call(g),
             });
         })()"#).await;
-        // Снимок и устройство приходят обещаниями — дать кругу событий доделать.
+        // Bitmap and device come as promises: let the event loop finish.
         ctx.run_event_loop().await.unwrap();
         let later = probe(
             &ctx,
@@ -11313,20 +11141,20 @@ opacity: 0.9; flex-flow: column; }",
         assert_eq!(
             out["seen"].as_array().map(Vec::len),
             Some(0),
-            "страница не должна видеть ни одного вызова: {out}"
+            "the page must see no calls: {out}"
         );
-        assert_eq!(out["px"][0], 255, "и при этом офскрин рисует: {out}");
+        assert_eq!(out["px"][0], 255, "and the offscreen canvas still draws: {out}");
         assert_eq!(out["px"][2], 255);
         assert_eq!(out["bmp"], "16x16");
         assert_eq!(out["tag"], "[object OffscreenCanvasRenderingContext2D]");
-        assert_eq!(later["cut"], "4x4", "снимок с вырезкой при этом делается: {later}");
-        assert_eq!(later["gpu"], true, "и WebGPU поверх нашего GL строится: {later}");
+        assert_eq!(later["cut"], "4x4", "a cropped bitmap still works: {later}");
+        assert_eq!(later["gpu"], true, "and WebGPU builds over our GL: {later}");
     }
 
-    /// Разбор разметки и фабрики `new Image`/`new Audio` шли через те же
-    /// имена, что видит страница: присваивание `innerHTML` показывало
-    /// десятки `createElement`/`appendChild`/`setAttribute` всякому, кто их
-    /// обернул. В браузере эта работа внутри движка и не видна никому.
+    /// Markup parsing and the `new Image`/`new Audio` factories went through
+    /// page-visible names: setting `innerHTML` showed dozens of
+    /// `createElement`/`appendChild`/`setAttribute` calls to anyone wrapping them. In a
+    /// browser this work is internal and invisible.
     #[tokio::test]
     async fn building_markup_does_not_call_the_page_back() {
         let _serial = serial().await;
@@ -11352,16 +11180,16 @@ opacity: 0.9; flex-flow: column; }",
             wrap(Element.prototype, 'removeAttribute');
             wrap(Node.prototype, 'removeChild');
             const host = document.body;
-            host.innerHTML = '<p class=x>привет <b>мир</b><!--тут--></p>';
+            host.innerHTML = '<p class=x>\u043f\u0440\u0438\u0432\u0435\u0442 <b>\u043c\u0438\u0440</b><!--\u0442\u0443\u0442--></p>';
             const img = new Image(5, 7);
             const audio = new Audio('/x.mp3');
-            // Отражённые атрибуты, стиль, классы, текст и вставка разметки —
-            // всё это в браузере нативная работа, и крючок её не видит.
+            // Reflected attributes, style, classes, text and markup insertion are native work
+            // in a browser, invisible to the hook.
             const div = document.createElement('div');
             host.insertBefore(div, host.firstChild);
             div.style.color = 'red';
             div.classList.add('a');
-            div.textContent = 'привет';
+            div.textContent = '\u043f\u0440\u0438\u0432\u0435\u0442';
             div.insertAdjacentHTML('beforeend', '<i>x</i>');
             img.src = 'https://example.com/x.png';
             const style = getComputedStyle(div).color;
@@ -11376,8 +11204,8 @@ opacity: 0.9; flex-flow: column; }",
             });
         })()"#).await;
 
-        // `host.insertBefore` и `audio.getAttribute` странице засчитываются —
-        // она сама их и позвала; всё прочее движок обязан делать молча.
+        // `host.insertBefore` and `audio.getAttribute` count, since the page called them;
+        // everything else the engine must do silently.
         let seen: Vec<&str> = out["seen"]
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
@@ -11385,27 +11213,26 @@ opacity: 0.9; flex-flow: column; }",
         assert_eq!(
             seen,
             vec!["insertBefore", "getAttribute"],
-            "страница не должна видеть внутренних вызовов движка: {out}"
+            "the page must not see the engine's internal calls: {out}"
         );
         assert_eq!(
-            out["markup"], "<p class=\"x\">привет <b>мир</b><!--тут--></p>",
-            "и разметка при этом разбирается: {out}"
+            out["markup"], "<p class=\"x\">\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442} <b>\u{43c}\u{438}\u{440}</b><!--\u{442}\u{443}\u{442}--></p>",
+            "and the markup still parses: {out}"
         );
         assert_eq!(out["img"], "5x7");
         assert_eq!(out["audio"], "/x.mp3");
         assert_eq!(
             out["colour"], "rgb(255, 0, 0)",
-            "стиль ставится и печатается как у браузера: {out}"
+            "style is set and serialized as in a browser: {out}"
         );
         assert_eq!(out["cls"], "a");
-        assert_eq!(out["text"], "привет<i>x</i>");
+        assert_eq!(out["text"], "\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}<i>x</i>");
     }
 
-    /// Вычисленный стиль челлендж снимает целиком — это самый большой кусок
-    /// его отчёта. У нас он был «почти»: цвет оставался записью автора
-    /// (`red`, `#0f0`, `hsl(...)`), сокращения не раскладывались по длинным
-    /// (`background: blue` не давало `background-color`), а сами сокращения
-    /// лишними именами торчали в перечислении. Числа сняты с Chrome 151.
+    /// The challenge captures the whole computed style, the largest part of its report.
+    /// Ours was "almost": colours kept the author's form (`red`, `#0f0`, `hsl(...)`),
+    /// shorthands were not expanded to longhands, and shorthands themselves showed up
+    /// as extra names. Numbers from Chrome 151.
     #[tokio::test]
     async fn a_computed_style_answers_like_a_browser() {
         let _serial = serial().await;
@@ -11413,7 +11240,7 @@ opacity: 0.9; flex-flow: column; }",
         let ctx = engine.new_context().await.unwrap();
         ctx.load_html(
             "https://example.com/",
-            r#"<html><head><style>
+            concat!(r#"<html><head><style>
               body { font: 16px/1.4 system-ui, sans-serif; color: #111; }
               #w { display: flex; border: 1px solid #e0e0e0; border-radius: 4px;
                    box-shadow: 0 0 5px rgba(0,0,0,0.1); background: rgba(255,255,255,0.9); }
@@ -11423,8 +11250,8 @@ opacity: 0.9; flex-flow: column; }",
                      text-decoration: underline dotted red; }
               a { color: rebeccapurple; }
             </style></head><body>
-              <div id=w><div id=box></div><a id=lnk href=#>ссылка</a></div>
-            </body></html>"#,
+              <div id=w><div id=box></div><a id=lnk href=#>"#, "\u{441}\u{441}\u{44b}\u{43b}\u{43a}\u{430}", r#"</a></div>
+            </body></html>"#),
         )
         .await
         .unwrap();
@@ -11457,46 +11284,44 @@ opacity: 0.9; flex-flow: column; }",
             });
         })()"#).await;
 
-        assert_eq!(out["names"], 475, "столько же имён, сколько у браузера: {out}");
-        assert_eq!(out["shorthands"], 0, "сокращений среди них нет");
+        assert_eq!(out["names"], 475, "as many names as a browser: {out}");
+        assert_eq!(out["shorthands"], 0, "no shorthands among them");
         assert_eq!(out["bgW"], "rgba(255, 255, 255, 0.9)");
-        assert_eq!(out["radiusW"], "4px", "логический угол повторяет физический");
+        assert_eq!(out["radiusW"], "4px", "logical corner mirrors the physical one");
         assert_eq!(out["shadowW"], "rgba(0, 0, 0, 0.1) 0px 0px 5px 0px");
-        assert_eq!(out["lineW"], "22.4px", "множитель печатается в пикселях");
+        assert_eq!(out["lineW"], "22.4px", "a multiplier serializes in pixels");
         assert_eq!(out["borderW"], "rgb(224, 224, 224)|solid|1px");
         assert_eq!(out["logical"], "rgb(224, 224, 224)");
         assert_eq!(out["bgBox"], "rgb(0, 0, 255)");
-        assert_eq!(out["sizeBox"], "14px", "кегль из сокращённого `font`");
+        assert_eq!(out["sizeBox"], "14px", "font size from the `font` shorthand");
         assert_eq!(out["lineBox"], "21px");
         assert_eq!(out["variantBox"], "small-caps");
         assert_eq!(out["styleBox"], "italic");
         assert_eq!(out["decorBox"], "underline dotted rgb(255, 0, 0)");
         assert_eq!(out["outlineBox"], "rgb(0, 128, 0)|dotted");
         assert_eq!(out["transBox"], "0.2s|ease-in-out");
-        assert_eq!(out["minBox"], "auto", "ребёнок гибкого контейнера: минимум `auto`");
+        assert_eq!(out["minBox"], "auto", "flex item: min is `auto`");
         assert_eq!(out["displayBox"], "block");
-        assert_eq!(out["caretBox"], "rgb(17, 17, 17)", "`currentColor` — это цвет элемента");
+        assert_eq!(out["caretBox"], "rgb(17, 17, 17)", "`currentColor` is the element's colour");
         assert_eq!(out["colourLnk"], "rgb(102, 51, 153)");
         assert_eq!(out["fontW"], "16px / 22.4px system-ui, sans-serif",
-                   "сокращение `font` печатается целиком, с межстрочным: {out}");
+                   "the `font` shorthand serializes whole, with line height: {out}");
         assert_eq!(out["fontBox"], "italic small-caps 700 14px / 21px Georgia, serif");
         assert_eq!(out["transitionBox"], "0.2s ease-in-out");
         assert_eq!(out["webkitBox"], "2px solid rgb(0, 120, 212)",
-                   "вендорные имена логических сторон отвечают тем же: {out}");
+                   "vendor names of logical sides answer the same: {out}");
         assert_eq!(out["webkitAlias"], "row",
-                   "а `webkitFlexDirection` — просто другое имя для `flex-direction`");
+                   "`webkitFlexDirection` is just an alias of `flex-direction`");
         assert_eq!(out["strokeLnk"], "0px rgb(102, 51, 153)");
-        assert_eq!(out["cursorLnk"], "pointer", "у ссылки свой стиль от браузера");
+        assert_eq!(out["cursorLnk"], "pointer", "a link has its UA style");
         assert_eq!(out["decorLnk"], "underline");
     }
 
-    /// `local("Имя")` в `@font-face` — то, чем страницы перечисляют
-    /// установленные шрифты: обещание разрешается на существующее имя и
-    /// отклоняется сетевой ошибкой на чужое. У нас конструктор `FontFace`
-    /// бросал `TypeError`, и в отчёте челленджа не было целого блока — у
-    /// браузера там список из пяти семейств. Подмены fontconfig не в счёт:
-    /// браузер ищет по именам самих файлов, поэтому `Arial` на этой машине
-    /// не находится, а `Liberation Sans` находится.
+    /// `local("Name")` in `@font-face` is how pages enumerate installed fonts: the
+    /// promise resolves for an existing name and rejects with a network error otherwise.
+    /// Our `FontFace` constructor threw `TypeError`, dropping a whole report block (five
+    /// families in a browser). fontconfig substitutes do not count: the browser matches
+    /// the files' own names, so `Arial` is not found here and `Liberation Sans` is.
     #[tokio::test]
     async fn local_fonts_are_found_by_their_own_names() {
         let _serial = serial().await;
@@ -11512,7 +11337,7 @@ opacity: 0.9; flex-flow: column; }",
                              tag: Object.prototype.toString.call(new FontFace('x', 'local("DejaVu Sans")')) };
             window.__out.native = typeof __pt_localFont === 'function';
             const names = ['DejaVu Sans', 'Liberation Sans', 'Arial', 'Zzz Quux'];
-            const faces = names.map((n) => new FontFace('проба', 'local("' + n + '")'));
+            const faces = names.map((n) => new FontFace('\u043f\u0440\u043e\u0431\u0430', 'local("' + n + '")'));
             window.__out.before = faces[0].status;
             Promise.all(faces.map((f, i) => f.load().then(() => names[i], (e) => e.name)))
               .then((r) => { window.__out.result = r; window.__out.after = faces.map((f) => f.status); });
@@ -11531,18 +11356,18 @@ opacity: 0.9; flex-flow: column; }",
             "ascentOverride,constructor,descentOverride,display,family,featureSettings,\
 lineGapOverride,load,loaded,sizeAdjust,status,stretch,style,unicodeRange,variant,\
 variationSettings,weight",
-            "форма интерфейса как у браузера: {out}"
+            "interface shape as in a browser: {out}"
         );
         assert_eq!(out["len"], 2);
         assert_eq!(out["tag"], "[object FontFace]");
         assert_eq!(out["before"], "unloaded");
-        // Сборка без `render` шрифтов не знает вовсе: там честный отказ на
-        // всё, и проверять нечего, кроме формы.
+        // A build without `render` knows no fonts: it rejects everything, so only the
+        // shape is checked.
         if out["native"] == true {
             assert_eq!(
                 out["result"],
                 serde_json::json!(["DejaVu Sans", "Liberation Sans", "NetworkError", "NetworkError"]),
-                "установленные находятся, подменённые и выдуманные — нет: {out}"
+                "installed fonts found, substituted and made-up ones not: {out}"
             );
             assert_eq!(
                 out["after"],
@@ -11552,20 +11377,18 @@ variationSettings,weight",
             assert_eq!(
                 out["result"],
                 serde_json::json!(["NetworkError", "NetworkError", "NetworkError", "NetworkError"]),
-                "без шрифтов — отказ на всё: {out}"
+                "without fonts everything rejects: {out}"
             );
         }
-        assert_eq!(out["size"], 1, "набор настоящий: {out}");
+        assert_eq!(out["size"], 1, "the set is real: {out}");
         assert_eq!(out["has"], true);
         assert_eq!(out["sizeAfter"], 0);
     }
 
-    /// Звуковой контекст считает граф, а не подменяет его синтезом: раньше
-    /// здесь всегда рисовался осциллятор со сжимателем, чем бы страница ни
-    /// соединила узлы, и источник из буфера отдавал чужие числа. Сжиматель
-    /// при этом обязан показывать затухание — браузер держит в `reduction`
-    /// сглаженный минимум в децибелах, и его читают прямо. Числа сняты с
-    /// Chrome 151 на том же графе.
+    /// The audio context renders the graph rather than a fixed synthesis: it used to
+    /// always render oscillator plus compressor whatever the page connected. The
+    /// compressor must also report `reduction` (a smoothed minimum in dB), which pages
+    /// read. Numbers from Chrome 151 on the same graph.
     #[tokio::test]
     async fn an_audio_graph_is_rendered_node_by_node() {
         let _serial = serial().await;
@@ -11591,7 +11414,7 @@ variationSettings,weight",
               src.connect(comp); comp.connect(gain); gain.connect(ac.destination);
               src.start(0);
               const out = (await ac.startRendering()).getChannelData(0);
-              // И граф, который ни к чему не подключён, молчит — как в браузере.
+              // An unconnected graph is silent, as in a browser.
               const mute = new OfflineAudioContext(1, 128, 44100);
               const lone = mute.createOscillator();
               lone.start(0);
@@ -11611,29 +11434,27 @@ variationSettings,weight",
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
             .unwrap_or_default();
-        // Усилитель вдвое тише сжимателя — значит граф пройден целиком.
+        // The gain is half the compressor's output, so the whole graph was traversed.
         let want = [-0.05188492, 0.11460970, -0.13615012];
-        assert_eq!(got.len(), 3, "три отсчёта: {out}");
+        assert_eq!(got.len(), 3, "three samples: {out}");
         for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
             assert!(
                 (a - b).abs() < 1e-6,
-                "отсчёт {i}: {a} против браузерного {b} ({out})"
+                "sample {i}: {a} vs browser {b} ({out})"
             );
         }
         let reduction = out["reduction"].as_f64().unwrap_or_default();
         assert!(
             (reduction + 20.2256).abs() < 1e-3,
-            "затухание сжимателя как у браузера: {reduction} ({out})"
+            "compressor reduction as in a browser: {reduction} ({out})"
         );
-        assert_eq!(out["silent"], true, "неподключённый узел молчит: {out}");
+        assert_eq!(out["silent"], true, "an unconnected node is silent: {out}");
     }
 
-    /// Места, которые страница трогает мимоходом, а сборщик отпечатков — с
-    /// умыслом. Каждое сверено с Chrome 151 на одной и той же странице:
-    /// `DOMParser` и `XMLSerializer` были пустыми классами из таблицы имён,
-    /// набор полей и строка запроса не перебирались, перенос буфера не
-    /// отцеплял исходный, `CSS.supports` соглашался на выдуманное свойство,
-    /// а `TextDecoder` знал одну латиницу.
+    /// Things pages touch in passing and collectors on purpose, each checked against
+    /// Chrome 151: `DOMParser` and `XMLSerializer` were empty name-table classes,
+    /// FormData and URLSearchParams did not iterate, transfer did not detach the source
+    /// buffer, `CSS.supports` accepted a made-up property, `TextDecoder` knew only Latin-1.
     #[tokio::test]
     async fn the_odds_and_ends_answer_like_a_browser() {
         let _serial = serial().await;
@@ -11644,13 +11465,13 @@ variationSettings,weight",
             .unwrap();
 
         let out = probe(&ctx, r#"(() => {
-            const say = (f) => { try { return f(); } catch (e) { return 'бросок ' + e.name; } };
+            const say = (f) => { try { return f(); } catch (e) { return 'threw ' + e.name; } };
             const p = new URLSearchParams('a=1&a=2&b=');
             const fd = new FormData();
             fd.append('a', '1'); fd.append('a', '2');
             const buf = new ArrayBuffer(8);
             const moved = structuredClone(buf, { transfer: [buf] });
-            const doc = new DOMParser().parseFromString('<p>привет</p>', 'text/html');
+            const doc = new DOMParser().parseFromString('<p>\u043f\u0440\u0438\u0432\u0435\u0442</p>', 'text/html');
             return __ptJSON.stringify({
               params: [p.getAll('a'), p.toString(), [...p].length, p.size],
               form: [[...fd.keys()], [...fd].length],
@@ -11663,12 +11484,11 @@ variationSettings,weight",
               decoded: new TextDecoder('windows-1251').decode(new Uint8Array([207, 240, 232, 226, 229, 242])),
               koi: new TextDecoder('koi8-r').decode(new Uint8Array([208, 210, 201, 215, 197, 212])),
               labels: [new TextDecoder('cp1251').encoding, new TextDecoder('latin1').encoding],
-              // Пять «дыр» windows-1252 (0x81, 0x8D, 0x8F, 0x90, 0x9D) по
-              // Encoding Standard — управляющие C1, а не U+FFFD: холст
-              // челленджа читается через этот раскодировщик побайтно.
+              // The five windows-1252 "holes" (0x81, 0x8D, 0x8F, 0x90, 0x9D) are C1 controls per
+              // the Encoding Standard, not U+FFFD: the challenge canvas is read byte by byte via this decoder.
               holes: [...new TextDecoder('windows-1252').decode(new Uint8Array([0x80, 0x81, 0x8d, 0x8f, 0x90, 0x9d, 0xff]))].map((c) => c.charCodeAt(0)),
               koiu: [...new TextDecoder('koi8-u').decode(new Uint8Array([0xae, 0xbe]))].map((c) => c.charCodeAt(0)),
-              badLabel: say(() => { new TextDecoder('вздор'); return 'без броска'; }),
+              badLabel: say(() => { new TextDecoder('bogus'); return 'no throw'; }),
               requestType: new Request('https://example.com/x', { method: 'POST', body: 'b' })
                 .headers.get('content-type'),
               entryTypes: PerformanceObserver.supportedEntryTypes.length,
@@ -11677,27 +11497,25 @@ variationSettings,weight",
 
         assert_eq!(out["params"], serde_json::json!([["1", "2"], "a=1&a=2&b=", 3, 3]));
         assert_eq!(out["form"], serde_json::json!([["a", "a"], 2]));
-        assert_eq!(out["transfer"], serde_json::json!([8, 0]), "перенос отцепляет исходный буфер");
-        assert_eq!(out["parsed"], serde_json::json!(["P", "привет", "text/html"]));
+        assert_eq!(out["transfer"], serde_json::json!([8, 0]), "transfer detaches the source buffer");
+        assert_eq!(out["parsed"], serde_json::json!(["P", "\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}", "text/html"]));
         assert_eq!(out["xml"], "<div xmlns=\"http://www.w3.org/1999/xhtml\"></div>");
         assert_eq!(out["xmlVoid"], "<br xmlns=\"http://www.w3.org/1999/xhtml\" />");
         assert_eq!(out["supports"], serde_json::json!([true, true, false, true]));
-        assert_eq!(out["decoded"], "Привет");
-        assert_eq!(out["koi"], "привет");
+        assert_eq!(out["decoded"], "\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}");
+        assert_eq!(out["koi"], "\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}");
         assert_eq!(out["labels"], serde_json::json!(["windows-1251", "windows-1252"]));
         assert_eq!(out["holes"], serde_json::json!([0x20ac, 0x81, 0x8d, 0x8f, 0x90, 0x9d, 0xff]));
         assert_eq!(out["koiu"], serde_json::json!([0x45e, 0x40e]));
-        assert_eq!(out["badLabel"], "бросок RangeError");
+        assert_eq!(out["badLabel"], "threw RangeError");
         assert_eq!(out["requestType"], "text/plain;charset=UTF-8");
         assert_eq!(out["entryTypes"], 15);
     }
 
-    /// Второй круг сверки с Chrome 151: разрешения, устройства, наблюдатель
-    /// пересечений, сеанс проигрывания, батарея, сеть. Всё это страница
-    /// читает мимоходом, а сборщик отпечатков — с умыслом: пустой список
-    /// устройств описывает машину без звуковой карты, `prompt` на выдуманное
-    /// имя разрешения — движок без таблицы, а заряд 0,71 — ноутбук там, где
-    /// мы называемся настольной машиной.
+    /// Second pass against Chrome 151: permissions, devices, intersection observer, media
+    /// session, battery, network. An empty device list describes a machine without a
+    /// sound card, `prompt` for a made-up permission an engine without a table, and a
+    /// 0.71 charge a laptop where we claim to be a desktop.
     #[tokio::test]
     async fn permissions_and_devices_answer_like_a_browser() {
         let _serial = serial().await;
@@ -11710,14 +11528,14 @@ variationSettings,weight",
         ctx.evaluate(r#"(() => {
             const out = {};
             const ask = (n) => navigator.permissions.query({ name: n })
-              .then((s) => s.state, (e) => 'бросок ' + e.name);
-            Promise.all([ask('geolocation'), ask('accelerometer'), ask('push'), ask('вздор'),
+              .then((s) => s.state, (e) => 'threw ' + e.name);
+            Promise.all([ask('geolocation'), ask('accelerometer'), ask('push'), ask('bogus'),
                          navigator.mediaDevices.enumerateDevices(), navigator.getBattery()])
               .then(([geo, accel, push, bad, devices, battery]) => {
                 out.perms = [geo, accel, push, bad];
                 out.devices = devices.map((d) => d.kind + ':' + d.deviceId + ':' + d.label);
                 out.battery = [battery.charging, battery.level, battery.chargingTime,
-                               battery.dischargingTime === Infinity ? 'вечно' : battery.dischargingTime];
+                               battery.dischargingTime === Infinity ? 'forever' : battery.dischargingTime];
                 const io = new IntersectionObserver(() => {}, { threshold: [0, 0.5], rootMargin: '10px' });
                 out.io = [io.thresholds, io.rootMargin, io.root];
                 out.session = [navigator.mediaSession.playbackState,
@@ -11733,28 +11551,26 @@ variationSettings,weight",
         let out = probe(&ctx, "__ptJSON.stringify(window.__nav)").await;
         assert_eq!(
             out["perms"],
-            serde_json::json!(["prompt", "granted", "бросок NotSupportedError", "бросок TypeError"]),
-            "таблица разрешений как у браузера: {out}"
+            serde_json::json!(["prompt", "granted", "threw NotSupportedError", "threw TypeError"]),
+            "permission table as in a browser: {out}"
         );
         assert_eq!(
             out["devices"],
             serde_json::json!(["audioinput::", "videoinput::", "audiooutput::"]),
-            "три устройства без имён — как без разрешения у браузера: {out}"
+            "three unnamed devices, as a browser without permission: {out}"
         );
-        assert_eq!(out["battery"], serde_json::json!([true, 1, 0, "вечно"]));
+        assert_eq!(out["battery"], serde_json::json!([true, 1, 0, "forever"]));
         assert_eq!(out["io"], serde_json::json!([[0, 0.5], "10px 10px 10px 10px", null]));
         assert_eq!(out["session"], serde_json::json!(["none", "function"]));
         assert_eq!(out["constraints"], 36);
         assert_eq!(out["activation"], serde_json::json!([false, false]),
-                   "до жеста — ложь на оба: {out}");
+                   "false for both before a gesture: {out}");
         assert_eq!(out["scheduling"], "function");
     }
 
-    /// Частота кадров — обычная проба на движок: отметку времени браузер
-    /// кладёт на сетку развёртки и округляет до десятой доли миллисекунды,
-    /// отчего соседние отличаются то на 16,6, то на 16,7. У нас кадр был
-    /// «таймером на шестнадцать миллисекунд» с дрожанием и полной точностью
-    /// — и отбивал ровные 16,667, чего у развёртки не бывает.
+    /// Frame rate is a common engine probe: a browser puts the timestamp on the refresh
+    /// grid rounded to 0.1 ms, so neighbours differ by 16.6 or 16.7. Ours was a jittery
+    /// full-precision 16 ms timer ticking an even 16.667.
     #[tokio::test]
     async fn frames_land_on_the_refresh_grid() {
         let _serial = serial().await;
@@ -11784,24 +11600,22 @@ variationSettings,weight",
 
         assert!(
             out["count"].as_u64().unwrap_or(0) >= 5,
-            "кадры приходят один за другим: {out}"
+            "frames arrive one after another: {out}"
         );
-        assert_eq!(out["tenths"], true, "отметка округлена до десятой доли: {out}");
+        assert_eq!(out["tenths"], true, "timestamp rounded to 0.1: {out}");
         for d in out["deltas"].as_array().cloned().unwrap_or_default() {
             let v = d.as_f64().unwrap_or_default();
             assert!(
                 (v - 16.6).abs() < 0.06 || (v - 16.7).abs() < 0.06,
-                "соседние отметки отстоят на 16,6 или 16,7: {v} ({out})"
+                "neighbouring timestamps differ by 16.6 or 16.7: {v} ({out})"
             );
         }
     }
 
-    /// Правило печатается так, как его печатает браузер: значения приводятся
-    /// к своему виду, перезаписанное свойство уходит в конец, сокращение с
-    /// перебитой частью распадается на составляющие, а отдельно написанные
-    /// стороны собираются обратно. Челлендж снимает `cssText` всех правил
-    /// своей таблицы — а это одно и то же на всякой машине. Числа сняты с
-    /// Chrome 151.
+    /// A rule serializes as a browser prints it: values normalized, an overwritten
+    /// property moves to the end, a shorthand with an overridden part splits into
+    /// longhands, separately written sides recombine. The challenge captures `cssText`
+    /// of all its rules, identical on any machine. Numbers from Chrome 151.
     #[tokio::test]
     async fn a_rule_prints_the_way_the_browser_prints_it() {
         let _serial = serial().await;
@@ -11853,18 +11667,16 @@ variationSettings,weight",
             ".m { background: url(\"x.png\") red; }",
             ".n { border-width: 1px; border-style: solid; border-color: blue red red; border-image: none; }",
         ];
-        assert_eq!(got.len(), want.len(), "все правила на месте: {got:?}");
+        assert_eq!(got.len(), want.len(), "all rules present: {got:?}");
         for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
-            assert_eq!(g, w, "правило {i}");
+            assert_eq!(g, w, "rule {i}");
         }
     }
 
-    /// Поля соседних блоков схлопываются, а поле первого и последнего ребёнка
-    /// уходит наружу через пустой край родителя. Без этого между двумя
-    /// абзацами выходило вдвое больше места, чем у браузера, и вся геометрия
-    /// ниже уезжала. Заодно: разбор куска разметки не делает узлов из
-    /// `<html>`/`<body>`, а сокращение в стиле читается длинными именами.
-    /// Числа сняты с Chrome 151 на той же разметке.
+    /// Adjacent block margins collapse, and a first/last child's margin escapes through
+    /// the parent's empty edge; without it two paragraphs got twice the browser's gap.
+    /// Also: parsing a fragment makes no `<html>`/`<body>` nodes, and a shorthand reads
+    /// via longhand names. Numbers from Chrome 151 on the same markup.
     #[tokio::test]
     async fn margins_collapse_the_way_the_browser_collapses_them() {
         let _serial = serial().await;
@@ -11894,26 +11706,24 @@ variationSettings,weight",
               border: document.getElementById('c').style.borderTopWidth });
         })()"#).await;
 
-        assert_eq!(out["a"]["h"], 54.0, "два абзаца: 19 + 16 + 19, а не вшестеро: {out}");
-        assert_eq!(out["a"]["kids"][0], 0.0, "поле первого ушло наружу: {out}");
-        assert_eq!(out["a"]["kids"][1], 35.0, "между абзацами одно поле, не два: {out}");
-        assert_eq!(out["b"]["h"], 0.0, "пустой блок схлопывается целиком: {out}");
-        assert_eq!(out["c"]["h"], 51.0, "рамка держит поле внутри: {out}");
-        assert_eq!(out["c"]["kids"][0], 17.0, "рамка плюс поле: {out}");
-        assert_eq!(out["d"]["h"], 0.0, "`<html>` в куске разметки узлом не становится: {out}");
-        assert_eq!(out["d"]["kids"].as_array().map(|a| a.len()), Some(0), "и детей не даёт: {out}");
-        assert_eq!(out["border"], "1px", "сокращение читается длинным именем: {out}");
+        assert_eq!(out["a"]["h"], 54.0, "two paragraphs: 19 + 16 + 19: {out}");
+        assert_eq!(out["a"]["kids"][0], 0.0, "the first child's margin escaped: {out}");
+        assert_eq!(out["a"]["kids"][1], 35.0, "one margin between paragraphs, not two: {out}");
+        assert_eq!(out["b"]["h"], 0.0, "an empty block collapses entirely: {out}");
+        assert_eq!(out["c"]["h"], 51.0, "a border keeps the margin inside: {out}");
+        assert_eq!(out["c"]["kids"][0], 17.0, "border plus margin: {out}");
+        assert_eq!(out["d"]["h"], 0.0, "`<html>` in a fragment makes no node: {out}");
+        assert_eq!(out["d"]["kids"].as_array().map(|a| a.len()), Some(0), "and no children: {out}");
+        assert_eq!(out["border"], "1px", "the shorthand reads via the longhand: {out}");
     }
 
-    /// Строчные дети ложатся в одну строку, переносятся по ширине и стоят на
-    /// общей базовой линии, а пустая строчная коробка строки не делает. Раньше
-    /// всякий ребёнок начинал новую строку, и геометрия любого виджета —
-    /// а его меряют прямоугольниками — расходилась с браузерной.
+    /// Inline children share a line, wrap by width and sit on a common baseline; an
+    /// empty inline box makes no line. Previously every child started a new line, and
+    /// widget geometry (measured by rectangles) diverged.
     ///
-    /// Проверяются отношения, а не числа: точные пиксели зависят от метрик
-    /// гарнитуры, а они есть только в сборке с `render`. Chrome 151 на этой
-    /// разметке даёт строку 19, слова 16 и 18 шириной, строчно-блочных на
-    /// базовой линии в 6 и 2 пикселях сверху и два переноса по 19.
+    /// Relations are checked, not numbers: exact pixels need font metrics, available only
+    /// with `render`. Chrome 151 here gives a 19 px line, words 16 and 18 wide,
+    /// inline-blocks on the baseline at 6 and 2 px from the top, and two wraps of 19.
     #[tokio::test]
     async fn inline_children_share_a_line_like_a_browser() {
         let _serial = serial().await;
@@ -11954,31 +11764,30 @@ variationSettings,weight",
         let h = |key: &str| out[key]["h"].as_f64().unwrap_or_default();
 
         let a = kids("a");
-        assert_eq!(a.len(), 2, "оба слова на месте: {out}");
-        assert_eq!(a[0][1], a[1][1], "оба слова на одной строке: {out}");
-        assert_eq!(a[1][0], a[0][2], "второе начинается там, где кончилось первое: {out}");
-        assert_eq!(a[0][3], h("a"), "высота строки — высота коробки: {out}");
+        assert_eq!(a.len(), 2, "both words present: {out}");
+        assert_eq!(a[0][1], a[1][1], "both words on one line: {out}");
+        assert_eq!(a[1][0], a[0][2], "the second starts where the first ended: {out}");
+        assert_eq!(a[0][3], h("a"), "line height is the box height: {out}");
 
-        assert_eq!(h("b"), 0.0, "пустая строчная коробка строки не делает: {out}");
+        assert_eq!(h("b"), 0.0, "an empty inline box makes no line: {out}");
 
         let c = kids("c");
-        assert_eq!(c[0][0], 0.0, "первый строчно-блочный у левого края: {out}");
-        assert_eq!(c[1][0], 30.0, "второй сразу за ним: {out}");
+        assert_eq!(c[0][0], 0.0, "first inline-block at the left edge: {out}");
+        assert_eq!(c[1][0], 30.0, "second right after it: {out}");
         assert_eq!(c[0][1] + c[0][3], c[1][1] + c[1][3],
-            "оба стоят нижним краем на общей базовой линии: {out}");
-        assert!(h("c") > c[0][1] + c[0][3], "под базовой линией остаётся спуск: {out}");
+            "both bottoms on the common baseline: {out}");
+        assert!(h("c") > c[0][1] + c[0][3], "descent remains below the baseline: {out}");
 
         let d = kids("d");
-        assert_eq!(d[0][0], 0.0, "перенесённое начинается слева: {out}");
-        assert_eq!(d[1][0], 0.0, "и второе тоже: {out}");
-        assert!(d[1][1] > d[0][1], "второе ушло на новую строку: {out}");
-        assert_eq!(h("d"), 2.0 * h("a"), "две строки той же высоты: {out}");
+        assert_eq!(d[0][0], 0.0, "wrapped content starts at the left: {out}");
+        assert_eq!(d[1][0], 0.0, "and the second too: {out}");
+        assert!(d[1][1] > d[0][1], "the second moved to a new line: {out}");
+        assert_eq!(h("d"), 2.0 * h("a"), "two lines of the same height: {out}");
     }
 
-    /// Таблица стилей самого браузера: поля тела страницы, заголовков и
-    /// абзацев, направление письма и моноширинный кегль. Челлендж снимает
-    /// вычисленный стиль целиком, а эти значения одинаковы на всякой машине —
-    /// сверить их с браузером можно без сети. Числа сняты с Chrome 151.
+    /// The UA stylesheet: margins of body, headings and paragraphs, direction and
+    /// monospace size. The challenge captures the whole computed style, and these are
+    /// identical on any machine, so they can be checked offline. Numbers from Chrome 151.
     #[tokio::test]
     async fn the_browser_own_stylesheet_shows_through_computed_style() {
         let _serial = serial().await;
@@ -12006,21 +11815,20 @@ variationSettings,weight",
                 .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
                 .unwrap_or_default()
         };
-        assert_eq!(row("body"), ["8px", "8px", "normal", "16px"], "тело: {out}");
-        assert_eq!(row("p"), ["16px", "0px", "isolate", "16px"], "абзац — кегль сверху: {out}");
-        assert_eq!(row("h1"), ["21.44px", "0px", "isolate", "32px"], "заголовок — доля кегля: {out}");
-        assert_eq!(out["h1w"], "700", "и насыщенность от браузера: {out}");
-        assert_eq!(row("pre"), ["13px", "0px", "isolate", "13px"], "моноширинное: {out}");
-        assert_eq!(row("ul"), ["16px", "0px", "isolate", "16px"], "список: {out}");
-        assert_eq!(row("quote"), ["16px", "40px", "isolate", "16px"], "цитата: {out}");
-        assert_eq!(row("input"), ["0px", "0px", "normal", "13.3333px"], "поле ввода: {out}");
-        assert_eq!(row("div"), ["0px", "0px", "isolate", "16px"], "блок: {out}");
+        assert_eq!(row("body"), ["8px", "8px", "normal", "16px"], "body: {out}");
+        assert_eq!(row("p"), ["16px", "0px", "isolate", "16px"], "paragraph: font size on top: {out}");
+        assert_eq!(row("h1"), ["21.44px", "0px", "isolate", "32px"], "heading: fraction of font size: {out}");
+        assert_eq!(out["h1w"], "700", "and UA font weight: {out}");
+        assert_eq!(row("pre"), ["13px", "0px", "isolate", "13px"], "monospace: {out}");
+        assert_eq!(row("ul"), ["16px", "0px", "isolate", "16px"], "list: {out}");
+        assert_eq!(row("quote"), ["16px", "40px", "isolate", "16px"], "quote: {out}");
+        assert_eq!(row("input"), ["0px", "0px", "normal", "13.3333px"], "input: {out}");
+        assert_eq!(row("div"), ["0px", "0px", "isolate", "16px"], "div: {out}");
     }
 
-    /// Стиль считается по тому документу, которому элемент принадлежит. Страница
-    /// заводит кадр и меряет его тело чужим окном — браузер отвечает своими
-    /// умолчаниями, потому что таблицы хозяйской страницы туда не достают. Мы
-    /// отвечали её цветом и кеглем, и весь перечисленный стиль расходился.
+    /// Style is computed against the element's own document. A page creates a frame and
+    /// measures its body through the frame window; a browser answers with defaults since
+    /// the host's sheets do not reach it. We answered with the host's colour and size.
     #[tokio::test]
     async fn a_frame_body_is_styled_by_its_own_document() {
         let _serial = serial().await;
@@ -12044,19 +11852,18 @@ variationSettings,weight",
               host: [own.color, own.fontSize] });
         })()"#).await;
 
-        let frame = out["frame"].as_array().expect("тело кадра меряется");
-        assert_eq!(frame[0], "rgb(0, 0, 0)", "цвет по умолчанию, не хозяйский: {out}");
-        assert_eq!(frame[1], "16px", "кегль по умолчанию: {out}");
-        assert_eq!(frame[2], "\"Times New Roman\"", "шрифт по умолчанию: {out}");
-        assert_eq!(frame[3], "8px", "поле от таблицы браузера: {out}");
-        assert_eq!(out["host"][0], "rgb(10, 10, 10)", "а хозяйский документ — свой: {out}");
+        let frame = out["frame"].as_array().expect("frame body is measured");
+        assert_eq!(frame[0], "rgb(0, 0, 0)", "default colour, not the host's: {out}");
+        assert_eq!(frame[1], "16px", "default font size: {out}");
+        assert_eq!(frame[2], "\"Times New Roman\"", "default font: {out}");
+        assert_eq!(frame[3], "8px", "margin from the UA stylesheet: {out}");
+        assert_eq!(out["host"][0], "rgb(10, 10, 10)", "the host document keeps its own: {out}");
     }
 
-    /// Гибкий контейнер: дети ложатся в ряд, свободное место делится по
-    /// `flex-grow`, поперёк они выравниваются по правилу контейнера, а
-    /// высота у них — строки из стиля, а не чернил гарнитуры. Виджет почти
-    /// всегда гибкий, и его геометрию сборщик меряет. Числа сняты с Chrome
-    /// 151 на той же разметке.
+    /// Flex container: children in a row, free space split by `flex-grow`, cross-axis
+    /// alignment per the container, height from the style's line height, not glyph ink.
+    /// Widgets are nearly always flex and collectors measure them. Numbers from Chrome
+    /// 151 on the same markup.
     #[tokio::test]
     async fn a_flex_row_places_its_children_like_a_browser() {
         let _serial = serial().await;
@@ -12092,25 +11899,24 @@ variationSettings,weight",
                 .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
                 .unwrap_or_default()
         };
-        assert_eq!(nums("w"), vec![0.0, 0.0, 326.0, 67.0], "коробка контейнера: {out}");
+        assert_eq!(nums("w"), vec![0.0, 0.0, 326.0, 67.0], "container box: {out}");
         assert_eq!(
             nums("box"), vec![21.0, 19.5, 28.0, 28.0],
-            "первый ребёнок стоит по центру поперёк: {out}"
+            "first child centred on the cross axis: {out}"
         );
         let txt = nums("txt");
-        assert_eq!(txt[0], 57.0, "второй начинается за первым: {out}");
-        assert_eq!(txt[2], 256.0, "и растягивается на всё свободное место: {out}");
-        assert_eq!(txt[3], 22.39, "высота — строка из стиля: {out}");
-        assert_eq!(out["display"], "block", "ребёнок гибкого контейнера блочный");
+        assert_eq!(txt[0], 57.0, "the second starts after the first: {out}");
+        assert_eq!(txt[2], 256.0, "and grows into all free space: {out}");
+        assert_eq!(txt[3], 22.39, "height is the style's line height: {out}");
+        assert_eq!(out["display"], "block", "a flex item is blockified");
         assert_eq!(out["grow"], "1");
         assert_eq!(out["line"], "22.4px");
     }
 
-    /// Внешняя таблица стилей — это правила, а не просто запрос: тело у нас
-    /// выбрасывалось, и на настоящей странице `document.styleSheets[i]
-    /// .cssRules` был пуст (у Chrome их там три тысячи), а каскад не видел
-    /// ни одного правила из внешнего файла. Заодно `window.length` — счёт
-    /// живых кадров, и его спрашивают о странице первым делом.
+    /// An external stylesheet brings rules, not just a request: we dropped the body, so
+    /// `document.styleSheets[i].cssRules` was empty (Chrome has thousands on a real
+    /// page) and the cascade saw none of it. Also `window.length` counts live frames,
+    /// one of the first things asked about a page.
     #[tokio::test]
     async fn an_external_stylesheet_brings_its_rules() {
         let _serial = serial().await;
@@ -12118,9 +11924,9 @@ variationSettings,weight",
         let ctx = engine.new_context().await.unwrap();
         ctx.load_html(
             "https://example.com/",
-            r#"<html><head>
+            concat!(r#"<html><head>
                <link rel="stylesheet" href="data:text/css,p%7Bcolor%3A%20rgb(1%2C%202%2C%203)%7D">
-               </head><body><p id=p>текст</p></body></html>"#,
+               </head><body><p id=p>"#, "\u{442}\u{435}\u{43a}\u{441}\u{442}", r#"</p></body></html>"#),
         )
         .await
         .unwrap();
@@ -12128,8 +11934,8 @@ variationSettings,weight",
 
         let out = probe(&ctx, r#"(() => {
             const sheet = document.styleSheets[0];
-            // Строка, кончающаяся экранированной косой, раньше съедала весь
-            // остаток файла: кавычка после неё считалась экранированной.
+            // A string ending in an escaped backslash used to swallow the rest of the file:
+            // the following quote was treated as escaped.
             const tricky = document.createElement('style');
             tricky.textContent = '@charset "utf-8"; a:before{content:"\\\\"} b{color:red} i{color:blue}';
             document.head.appendChild(tricky);
@@ -12149,17 +11955,17 @@ variationSettings,weight",
             });
         })()"#).await;
 
-        assert_eq!(out["sheets"], 2, "внешняя таблица и добавленная: {out}");
+        assert_eq!(out["sheets"], 2, "external sheet and the added one: {out}");
         assert!(
             out["rules"].as_i64().unwrap_or(0) >= 1,
-            "и правила из неё разобраны: {out}"
+            "and its rules parsed: {out}"
         );
-        assert_eq!(out["first"], "p", "селектор читается: {out}");
-        assert_eq!(out["escaped"], 2, "строка с экранированной косой не рвёт разбор: {out}");
-        assert_eq!(out["charset"], 0, "а `@charset` в перечень правил не попадает: {out}");
-        assert_eq!(out["applied"], "rgb(1, 2, 3)", "и правило действует на элемент: {out}");
-        assert_eq!(out["frames"], 1, "кадр посчитан: {out}");
-        assert_eq!(out["windowed"], "object", "и доступен по номеру: {out}");
+        assert_eq!(out["first"], "p", "selector reads: {out}");
+        assert_eq!(out["escaped"], 2, "an escaped backslash string does not break parsing: {out}");
+        assert_eq!(out["charset"], 0, "`@charset` is not in the rule list: {out}");
+        assert_eq!(out["applied"], "rgb(1, 2, 3)", "and the rule applies to the element: {out}");
+        assert_eq!(out["frames"], 1, "the frame is counted: {out}");
+        assert_eq!(out["windowed"], "object", "and reachable by index: {out}");
     }
 
     /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`
@@ -12193,10 +11999,9 @@ variationSettings,weight",
         assert_eq!(out["ran"], true, "the worker ran from a revoked URL: {out}");
     }
 
-    /// У кадра своя лента времён. Мы наливали её только странице, и документ
-    /// внутри кадра отвечал `performance.getEntries()` пустым массивом — то
-    /// есть «я ничего не грузил», чего про живой документ не бывает. Сборщик
-    /// отпечатка Turnstile читает её в кадре виджета первым делом.
+    /// A frame has its own resource timeline. We filled only the page's, so a framed
+    /// document's `performance.getEntries()` was empty ("loaded nothing"), and the
+    /// Turnstile collector reads it in the widget frame first thing.
     #[tokio::test]
     async fn a_frame_has_a_resource_timeline_of_its_own() {
         let _serial = serial().await;
@@ -12230,11 +12035,11 @@ variationSettings,weight",
             .await
             .expect("frame answered");
         let seen: Value = serde_json::from_str(seen.as_str().unwrap_or("{}")).unwrap_or_default();
-        assert_eq!(seen["nav"], 1, "кадр знает свою навигацию: {seen}");
-        // И это его собственный адрес, а не адрес страницы.
+        assert_eq!(seen["nav"], 1, "the frame knows its navigation: {seen}");
+        // Its own URL, not the page's.
         assert!(
             seen["name"].as_str().unwrap_or("").ends_with("/frame"),
-            "навигация кадра — его документ: {seen}"
+            "the frame's navigation is its document: {seen}"
         );
         assert_eq!(seen["kind"], "navigation", "{seen}");
     }
@@ -12382,8 +12187,7 @@ variationSettings,weight",
             navigation: performance.getEntriesByType('navigation').length,
             resources: performance.getEntriesByType('resource').length,
             named: Object.prototype.toString.call(performance.getEntries()[0]),
-            // У записи отрисовки нет ни `responseEnd`, ни тела — как и в
-            // браузере; сверяем сроки только там, где они есть.
+            // Paint entries have no `responseEnd` or body, as in a browser; check timings only where present.
             sized: performance.getEntries().every(e => e.duration >= 0
               && (e.responseEnd === undefined || e.responseEnd >= e.startTime)),
             paint: performance.getEntriesByType('paint').map(e => e.name).join(','),
@@ -12397,7 +12201,7 @@ variationSettings,weight",
         assert_eq!(timing["sized"], true, "with timings that make sense");
         assert_eq!(
             timing["paint"], "first-paint,first-contentful-paint",
-            "и две записи отрисовки рядом с переходом, как у браузера: {timing}"
+            "and two paint entries next to the navigation, as in a browser: {timing}"
         );
 
         // ICE gathering takes event-loop turns, as it does in a browser: start it,
@@ -12509,8 +12313,8 @@ variationSettings,weight",
         })()"#,
         )
         .await;
-        // Флажок стоит не в самом углу кадра: у тела страницы восемь пикселей
-        // поля от таблицы стилей браузера, и ещё три — своих у флажка.
+        // The checkbox is not in the frame corner: the body has an 8 px UA margin, and the
+        // checkbox 3 px of its own.
         let (x, y) = (
             rect["x"].as_f64().unwrap() + 16.0,
             rect["y"].as_f64().unwrap() + 16.0,

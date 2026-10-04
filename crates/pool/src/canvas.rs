@@ -22,34 +22,29 @@ use tiny_skia::{
     RadialGradient, Rect, Shader, SpreadMode, Stroke, Transform,
 };
 
-/// Bundled Liberation Sans (OFL, Arial-metric): последний запасной вариант,
-/// когда системных шрифтов нет вовсе — в голом контейнере, например. Обычная
-/// машина отвечает своими файлами, и тогда метрики совпадают с браузерными.
+/// Bundled Liberation Sans (OFL, Arial-metric): last-resort fallback when the
+/// system has no fonts at all (e.g. a bare container).
 const FONT_BYTES: &[u8] = include_bytes!("../fonts/LiberationSans-Regular.ttf");
 
-/// Куда смотрит система за шрифтами. Порядок как у fontconfig: сначала общие
-/// каталоги, потом домашний.
+/// Font directories, in fontconfig order.
 const FONT_DIRS: &[&str] = &[
     "/usr/share/fonts",
     "/usr/local/share/fonts",
     "/usr/X11R6/lib/X11/fonts",
 ];
 
-/// Какой файл берёт браузер под каким именем. Снято с Chrome 151 на этой
-/// машине: `16px Arial` и `16px "Liberation Sans"` дают одну и ту же ширину до
-/// тысячной, потому что fontconfig подменяет метрически совместимый шрифт.
-/// Семейство, которого в списке нет, браузер не находит вовсе и переходит к
-/// следующему в объявлении — а если не нашлось ни одного, берёт свой основной,
-/// и здесь это Liberation Serif.
+/// Which file Chrome 151 picks for which family name on this machine.
+/// fontconfig substitutes metric-compatible fonts, so `16px Arial` and
+/// `16px "Liberation Sans"` measure the same. An unlisted family is skipped;
+/// if none matches, Chrome falls back to Liberation Serif.
 const FAMILIES: &[(&str, &[&str])] = &[
     ("sans-serif", &["LiberationSans-Regular.ttf", "Arimo-Regular.ttf", "DejaVuSans.ttf"]),
     ("arial", &["LiberationSans-Regular.ttf", "Arimo-Regular.ttf"]),
     ("helvetica", &["LiberationSans-Regular.ttf", "Arimo-Regular.ttf"]),
     ("liberation sans", &["LiberationSans-Regular.ttf"]),
-    // Родовой `serif` браузер на этой машине разрешает в Liberation Serif, а не
-    // в DejaVu: измерено — «mmmmmmmmmmlli» на 72 пикселях даёт у него 620.05, а
-    // у DejaVu 751.82. Двадцать процентов разницы видит любая страница, меряющая
-    // текст, и это была единственная родовая семья, где мы расходились.
+    // Chrome resolves generic `serif` to Liberation Serif here, not DejaVu:
+    // "mmmmmmmmmmlli" at 72px is 620.05 vs DejaVu's 751.82, which any
+    // text-measuring page sees.
     ("serif", &["LiberationSerif-Regular.ttf", "Tinos-Regular.ttf", "DejaVuSerif.ttf"]),
     ("times new roman", &["LiberationSerif-Regular.ttf", "Tinos-Regular.ttf"]),
     ("times", &["LiberationSerif-Regular.ttf", "Tinos-Regular.ttf"]),
@@ -62,24 +57,20 @@ const FAMILIES: &[(&str, &[&str])] = &[
     ("dejavu serif", &["DejaVuSerif.ttf"]),
     ("dejavu sans mono", &["DejaVuSansMono.ttf"]),
     ("noto sans mono", &["NotoSansMono-Regular.ttf"]),
-    // Метрически совместимые имена: этих файлов на машине нет, но fontconfig
-    // подменяет их Liberation, и браузер отвечает шириной подмены — то есть
-    // считает семейство существующим.
+    // Metric-compatible names: no such files, but fontconfig substitutes
+    // Liberation, so the browser reports the family as present.
     ("arimo", &["LiberationSans-Regular.ttf"]),
     ("tinos", &["LiberationSerif-Regular.ttf"]),
     ("cousine", &["LiberationMono-Regular.ttf"]),
-    // `system-ui` — шрифт рабочего стола; Chrome спрашивает его у системы
-    // и получает здесь Cantarell.
+    // `system-ui` is the desktop font; Chrome gets Cantarell here.
     ("system-ui", &["Cantarell-Regular.otf", "NotoSans-Regular.ttf", "DejaVuSans.ttf"]),
     ("cantarell", &["Cantarell-Regular.otf"]),
 ];
 
-/// Есть ли в системе шрифт с таким именем — как его ищет `local()` в
-/// `@font-face`. Именно так страница перечисляет установленные шрифты: на
-/// существующее имя `new FontFace(…, 'local("X")').load()` разрешается, на
-/// чужое — отклоняется сетевой ошибкой. Подмены fontconfig здесь не в счёт:
-/// браузер ищет по именам самих файлов, поэтому `Arial` на этой машине не
-/// находится, а `Liberation Sans` находится.
+/// Whether a font with this name exists, as `local()` in `@font-face` looks it
+/// up. Pages enumerate installed fonts this way: `new FontFace(…, 'local("X")')`
+/// resolves for a present name and rejects otherwise. fontconfig substitution
+/// does not apply: `Arial` is not found here, `Liberation Sans` is.
 pub fn has_local_font(name: &str) -> bool {
     let key = name.trim().to_lowercase();
     if key.is_empty() {
@@ -88,10 +79,9 @@ pub fn has_local_font(name: &str) -> bool {
     local_index().contains(&key)
 }
 
-/// Имена, по которым ищет `local()`: полное имя начертания (запись 4) и имя
-/// PostScript (запись 6). Именно они, а не семейство: у Chrome `local(
-/// "Cantarell")` не находится, а `local("Cantarell Regular")` и
-/// `local("Cantarell-Regular")` находятся — проверено на этой машине.
+/// Names `local()` matches: full face name (name ID 4) and PostScript name
+/// (ID 6), not the family. In Chrome `local("Cantarell")` fails while
+/// `local("Cantarell Regular")` and `local("Cantarell-Regular")` succeed.
 fn local_index() -> &'static std::collections::HashSet<String> {
     static INDEX: std::sync::OnceLock<std::collections::HashSet<String>> =
         std::sync::OnceLock::new();
@@ -138,19 +128,19 @@ fn local_index() -> &'static std::collections::HashSet<String> {
     })
 }
 
-/// Основной шрифт браузера: им меряется всё, для чего семейство не нашлось.
+/// Browser default font, used when no listed family is found.
 const FALLBACK_FAMILY: &str = "times new roman";
 
 thread_local! {
     static CANVASES: RefCell<HashMap<u32, Pixmap>> = RefCell::new(HashMap::new());
-    /// Разобранные файлы шрифтов, по имени файла. Разбор недёшев, а страница,
-    /// перебирающая семейства ради отпечатка, спрашивает их сотнями.
+    /// Parsed font files by file name. Parsing is costly and fingerprinting pages
+    /// probe hundreds of families.
     static LOADED: RefCell<HashMap<String, Option<&'static FontVec>>> =
         RefCell::new(HashMap::new());
-    /// Каким шрифтом закрывается знак, не нашедшийся в названных семействах.
+    /// Fallback font per char not covered by the named families.
     static FALLBACK: RefCell<HashMap<char, Option<&'static FontVec>>> =
         RefCell::new(HashMap::new());
-    /// Раскладчики, по адресу шрифта.
+    /// Shapers by font address.
     static SHAPERS: RefCell<HashMap<usize, Option<&'static rustybuzz::Face<'static>>>> =
         RefCell::new(HashMap::new());
     /// Decoded images, by address. A page draws the same picture many times —
@@ -159,11 +149,9 @@ thread_local! {
     static IMAGES: RefCell<HashMap<String, (u32, u32, Vec<u8>)>> = RefCell::new(HashMap::new());
 }
 
-/// Указатель «семейство → файл», построенный по самим шрифтам. Таблица имён у
-/// нас была на девятнадцать семейств, а на машине их две сотни: страница,
-/// перебирающая шрифты измерением — а это самый ходовой способ, — находила у
-/// нас одиннадцать против двадцати трёх у браузера. Имя семейства читается из
-/// таблицы `name` самого файла, а не угадывается по его названию.
+/// Family -> file index built from the fonts' own `name` tables. A fixed
+/// table missed most installed families, so measurement-based font
+/// enumeration found far fewer fonts than in Chrome.
 fn font_index() -> &'static std::collections::HashMap<String, (std::path::PathBuf, bool)> {
     static INDEX: std::sync::OnceLock<std::collections::HashMap<String, (std::path::PathBuf, bool)>> =
         std::sync::OnceLock::new();
@@ -195,12 +183,11 @@ fn font_index() -> &'static std::collections::HashMap<String, (std::path::PathBu
                     let Ok(face) = ttf_parser::Face::parse(&bytes, 0) else {
                         continue;
                     };
-                    // Обычное начертание предпочтительнее, но семейство,
-                    // у которого есть только наклонное — а такие бывают, Z003
-                    // из них, — всё равно существует, и браузер его находит.
+                    // Prefer the regular face, but a family with only an italic face (e.g.
+                    // Z003) still exists for the browser.
                     let plain = !face.is_bold() && !face.is_italic();
                     for name in face.names() {
-                        // 1 — семейство, 16 — типографское семейство.
+                        // 1 = family, 16 = typographic family.
                         if name.name_id != 1 && name.name_id != 16 {
                             continue;
                         }
@@ -224,7 +211,7 @@ fn font_index() -> &'static std::collections::HashMap<String, (std::path::PathBu
     })
 }
 
-/// Найти файл шрифта по имени в системных каталогах.
+/// Find a font file by name in the system font directories.
 fn font_path(file: &str) -> Option<std::path::PathBuf> {
     for dir in FONT_DIRS {
         let mut stack = vec![std::path::PathBuf::from(dir)];
@@ -245,9 +232,8 @@ fn font_path(file: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Загрузить шрифт по имени файла, один раз за поток. Утечка намеренная:
-/// шрифтов конечное число, живут они до конца процесса, а `FontVec` иначе
-/// пришлось бы возвращать за замыканием.
+/// Load a font by file name, once per thread. Leaked on purpose: the set is
+/// finite and lives for the whole process.
 fn load(file: &str) -> Option<&'static FontVec> {
     LOADED.with(|m| {
         if let Some(hit) = m.borrow().get(file) {
@@ -262,14 +248,14 @@ fn load(file: &str) -> Option<&'static FontVec> {
     })
 }
 
-/// Разрешить список семейств так, как его разрешает браузер: по очереди, до
-/// первого, который в системе есть. Не нашлось ни одного — основной шрифт.
+/// Resolve a family list like the browser: first family present in the
+/// system, else the default font.
 fn face(file: &str, bold: bool, italic: bool) -> Option<&'static FontVec> {
     if !bold && !italic {
         return load(file);
     }
-    // Имена начертаний у гарнитур разные: Liberation зовёт их `-Bold`/`-Italic`
-    // через `-Regular`, DejaVu приписывает `-Bold`/`-Oblique` к голому имени.
+    // Face file naming differs: Liberation uses `-Regular`/`-Bold`/`-Italic`,
+    // DejaVu appends `-Bold`/`-Oblique` to the bare name.
     let (stem, ext) = file.rsplit_once('.')?;
     let suffixes: &[&str] = match (bold, italic) {
         (true, true) => &["BoldItalic", "BoldOblique"],
@@ -289,13 +275,12 @@ fn face(file: &str, bold: bool, italic: bool) -> Option<&'static FontVec> {
     load(file)
 }
 
-/// Все семейства списка по порядку — для поглифной подмены.
+/// All families of the list in order, for per-glyph fallback.
 ///
-/// Браузер берёт знак из первого семейства, где он есть, а не из первого
-/// семейства вообще: шрифт вроде «Noto Color Emoji» латиницы не содержит, и
-/// строка на нём меряется запасным. Мы мерили самим найденным шрифтом, и
-/// страница, перебирающая шрифты измерением, видела найденными и те, которых
-/// у неё быть не может.
+/// The browser takes each char from the first family that has it, not from the
+/// first family found: e.g. "Noto Color Emoji" has no Latin, so Latin text in
+/// it measures with the fallback. Otherwise font enumeration by measurement
+/// reports fonts as present that cannot be.
 fn resolve_chain(families: &str, bold: bool, italic: bool) -> Vec<&'static FontVec> {
     let mut out: Vec<&'static FontVec> = Vec::new();
     let mut push = |f: &'static FontVec| {
@@ -336,8 +321,8 @@ fn resolve_chain(families: &str, bold: bool, italic: bool) -> Vec<&'static FontV
     out
 }
 
-/// Раскладчик строки для этого шрифта. Разбор лица недёшев, а страница меряет
-/// надписи сотнями, поэтому он живёт до конца процесса, как и сам шрифт.
+/// Shaper for this font. Face parsing is costly and pages measure hundreds of
+/// strings, so it lives for the whole process, like the font.
 fn shaper(font: &'static FontVec) -> Option<&'static rustybuzz::Face<'static>> {
     SHAPERS.with(|m| {
         let key = font as *const FontVec as usize;
@@ -351,31 +336,27 @@ fn shaper(font: &'static FontVec) -> Option<&'static rustybuzz::Face<'static>> {
     })
 }
 
-/// Разложенный знак: глиф, шрифт и его начало в пикселях.
+/// A shaped glyph: glyph id, font and its origin in pixels.
 struct Shaped {
     font: &'static FontVec,
     id: ab_glyph::GlyphId,
     x: f64,
 }
 
-/// Перевести длину из единиц шрифта в пиксели так, как это делает FreeType, а
-/// за ним Skia и браузер: кегль хранится в 26.6, множитель — в 16.16, и
-/// результат остаётся дробью со знаменателем 65536.
+/// Convert font units to pixels like FreeType (and so Skia/Chrome): size in
+/// 26.6, scale in 16.16, result a fraction over 65536.
 ///
-/// Разница видна на шрифтах с 1000 единицами на кегль: `16px "Noto Sans Mono"`
-/// даёт у браузера 9.600021362304688 на знак, а честное `600*16/1000` — ровно
-/// 9.6. На сорока знаках это уже тысячная доля пикселя, и страница, меряющая
-/// строку, видит чужое число. У шрифтов с 2048 единицами деление точное, и там
-/// расхождения не было.
+/// Visible on 1000-upem fonts: `16px "Noto Sans Mono"` gives
+/// 9.600021362304688 per glyph in Chrome, not 9.6. 2048-upem fonts divide
+/// exactly.
 fn ft_px(units: i32, upem: i64, size_px: f32) -> f64 {
     if upem <= 0 {
         return 0.0;
     }
-    // FT_DivFix: кегль в 26.6, поднятый в 16.16, делится на единицы с
-    // округлением к ближайшему.
+    // FT_DivFix: 26.6 size raised to 16.16, divided by upem, rounded to nearest.
     let size26_6 = (size_px as f64 * 64.0).round() as i64;
     let x_scale = ((size26_6 << 16) + upem / 2) / upem;
-    // FT_MulFix со знаком: округление к ближайшему по модулю.
+    // Signed FT_MulFix: round half away from zero.
     let a = (units as i64) * 1024;
     let prod = a * x_scale;
     let fixed = if prod >= 0 {
@@ -386,7 +367,7 @@ fn ft_px(units: i32, upem: i64, size_px: f32) -> f64 {
     fixed as f64 / 65536.0
 }
 
-/// Уложить кусок строки одним шрифтом.
+/// Shape a run of the string with one font.
 fn shape_run(
     out: &mut Vec<Shaped>,
     caret: &mut f64,
@@ -408,9 +389,8 @@ fn shape_run(
                 id,
                 x: *caret + ft_px(p.x_offset, upem, size_px),
             });
-            // У цветного шрифта знаки лежат картинками, и ширину браузер берёт
-            // из выбранной полосы, а не из таблицы ширин: смайлик при шестнадцати
-            // пикселях выходит 19.96, а не 19.92.
+            // Color fonts store glyphs as bitmaps; the advance comes from the chosen
+            // strike, not hmtx (emoji at 16px: 19.96, not 19.92).
             match raster_advance(face, ttf_parser::GlyphId(info.glyph_id as u16), size_px) {
                 Some(w) => *caret += w,
                 None => *caret += ft_px(p.x_advance, upem, size_px),
@@ -425,19 +405,17 @@ fn shape_run(
     }
 }
 
-/// Ширина знака, нарисованного картинкой: полоса выбирается по кеглю, и
-/// ширина считается из её разрешения. Контурным шрифтам это не касается — там
-/// пусто.
+/// Advance of a bitmap glyph: strike chosen by size, width from its ppem.
+/// None for outline fonts.
 fn raster_advance(face: &rustybuzz::Face<'static>, id: ttf_parser::GlyphId, size_px: f32) -> Option<f64> {
     let img = raster_image(face, id, size_px)?;
-    // Ширина остаётся дробью со знаменателем 65536, и остаток отбрасывается:
-    // у смайлика при шестнадцати пикселях выходит 19.963302612304688, а не
-    // 19.96330275229358, как при честном делении.
+    // Keep the width as a fraction over 65536, truncated: emoji at 16px gives
+    // 19.963302612304688, not 19.96330275229358.
     let exact = img.width as f64 * size_px as f64 / img.pixels_per_em as f64;
     Some((exact * 65536.0).floor() / 65536.0)
 }
 
-/// Картинка знака из выбранной полосы — у цветных шрифтов контуров нет вовсе.
+/// Bitmap of the glyph from the chosen strike; color fonts have no outlines.
 fn raster_image<'a>(
     face: &'a rustybuzz::Face<'static>,
     id: ttf_parser::GlyphId,
@@ -453,23 +431,20 @@ fn raster_image<'a>(
     Some(img)
 }
 
-/// Разложить строку так, как её раскладывает браузер: по словам, внутри слова —
-/// первым шрифтом цепочки, где знак есть, с лигатурами и кернингом самого
-/// шрифта.
+/// Shape a string like the browser: word by word, each char from the first
+/// font in the chain that has it, with the font's ligatures and kerning.
 ///
-/// Словами — не для красоты: раскладка у браузера словарная (слово ложится в
-/// кеш целиком), и пара, разделённая пробелом, кернингом не подгоняется. У
-/// Liberation Serif пара «пробел + W» сдвинута на 37 единиц, и «To Wave» без
-/// этого правила выходило на три сотых пикселя уже браузерной.
+/// Blink shapes per word (word cache), so a pair across a space is not kerned.
+/// Liberation Serif kerns "space + W" by 37 units; without this rule
+/// "To Wave" came out 0.03px narrower than Chrome.
 fn shape(chain: &[&'static FontVec], text: &str, size_px: f32) -> (Vec<Shaped>, f64) {
     let mut out: Vec<Shaped> = Vec::new();
     let mut caret = 0.0f64;
     let mut run = String::new();
     let mut run_font: Option<&'static FontVec> = None;
     for ch in text.chars() {
-        // Соединитель и метки не выбирают шрифт сами: у смайлика из нескольких
-        // знаков они держат всю связку в одном шрифте, и тогда он сводится в
-        // один знак — как в браузере.
+        // ZWJ and marks do not pick a font themselves: they keep a multi-codepoint
+        // emoji in one font so it shapes into a single glyph, as in the browser.
         let cf = if clings_to_previous(ch) {
             run_font.unwrap_or_else(|| face_for(chain, ch))
         } else {
@@ -494,10 +469,9 @@ fn shape(chain: &[&'static FontVec], text: &str, size_px: f32) -> (Vec<Shaped>, 
     (out, caret)
 }
 
-/// Раскладка как у Blink (см. `skia::text`): те же слова и та же цепочка
-/// шрифтов, что у `shape`, но ширины — Skia (кегль до сотых, усечение до
-/// 26.6), кернинг — HarfBuzz в 16.16. `fonts` — байты шрифтов по индексу
-/// глифа.
+/// Blink-style layout (see `skia::text`): same words and font chain as
+/// `shape`, but Skia advances (size to 1/100, truncated to 26.6) and HarfBuzz
+/// kerning in 16.16. `fonts` holds font bytes per glyph index.
 fn shape_blink(chain: &[&'static FontVec], text: &str, eff: f32) -> (Vec<crate::skia::text::ShapedGlyph>, f32, Vec<&'static [u8]>) {
     use crate::skia::text::{em_mult, to_hb_position, ShapedGlyph};
     let mut out: Vec<ShapedGlyph> = Vec::new();
@@ -511,7 +485,7 @@ fn shape_blink(chain: &[&'static FontVec], text: &str, eff: f32) -> (Vec<crate::
             fonts.len() - 1
         }
     };
-    // Позиция в 16.16 (InlineLayoutUnit у Blink).
+    // Position in 16.16 (Blink's InlineLayoutUnit).
     let mut total: i64 = 0;
     let mut run_it = |out: &mut Vec<ShapedGlyph>, font: &'static FontVec, run: &str| {
         let fi = font_index(font);
@@ -535,7 +509,7 @@ fn shape_blink(chain: &[&'static FontVec], text: &str, eff: f32) -> (Vec<crate::
         for (info, p) in infos.iter().zip(pos.iter()) {
             let gid = info.glyph_id as u16;
             let tid = ttf_parser::GlyphId(gid);
-            // Ширина от Skia; у картиночного знака — по выбранной полосе.
+            // Skia advance; bitmap glyphs use the chosen strike.
             let hb_adv = match raster_advance(face, tid, eff) {
                 Some(w) => (w * 65536.0).floor() as i32,
                 None => to_hb_position(metrics.advance_width(skrifa::GlyphId::from(gid)).unwrap_or(0.0)),
@@ -575,23 +549,20 @@ fn shape_blink(chain: &[&'static FontVec], text: &str, eff: f32) -> (Vec<crate::
     (out, total as f32 / 65536.0, fonts)
 }
 
-/// Шрифт, которым рисуется этот знак: первый в цепочке, где он есть.
+/// Font used to draw this char: the first in the chain that has it.
 fn face_for(chain: &[&'static FontVec], ch: char) -> &'static FontVec {
     for f in chain {
         if f.glyph_id(ch).0 != 0 {
             return f;
         }
     }
-    // Знака нет ни в одном названном семействе — браузер ищет его по всем
-    // установленным шрифтам, и для смайлика находит цветной. Мы же рисовали
-    // его первым шрифтом цепочки, то есть пустым прямоугольником, и ширина
-    // выходила чужая.
+    // Char missing from every named family: the browser searches all installed
+    // fonts (e.g. finds the color emoji font), otherwise the width differs.
     system_face(ch).unwrap_or(chain[0])
 }
 
-/// Семейства, которыми браузер закрывает знаки, не нашедшиеся в названных.
-/// Порядок как у fontconfig на этой машине: смайлики цветным шрифтом, дальше
-/// обычные.
+/// Families used for chars missing from the named ones, in this machine's
+/// fontconfig order: color emoji first, then regular fonts.
 const FALLBACK_FAMILIES: &[&str] = &[
     "NotoColorEmoji.ttf",
     "DejaVuSans.ttf",
@@ -601,8 +572,8 @@ const FALLBACK_FAMILIES: &[&str] = &[
     "NotoSansMono-Regular.ttf",
 ];
 
-/// Шрифт из системы, в котором этот знак есть. Ответ запоминается: страница,
-/// меряющая сотни знаков, спрашивает одно и то же много раз.
+/// System font that has this char. Cached: pages ask for the same chars many
+/// times.
 fn system_face(ch: char) -> Option<&'static FontVec> {
     FALLBACK.with(|m| {
         if let Some(hit) = m.borrow().get(&ch) {
@@ -618,8 +589,7 @@ fn system_face(ch: char) -> Option<&'static FontVec> {
             }
         }
         if found.is_none() {
-            // Ничего из списка не подошло — перебрать всё, что есть в системе,
-            // в постоянном порядке.
+            // Nothing in the list matched: scan all system fonts in a stable order.
             let mut names: Vec<_> = font_index().values().map(|(p, _)| p.clone()).collect();
             names.sort();
             names.dedup();
@@ -640,8 +610,8 @@ fn system_face(ch: char) -> Option<&'static FontVec> {
     })
 }
 
-/// Знаки, которые не выбирают шрифт сами, а остаются со своим соседом:
-/// соединитель нулевой ширины, указатель начертания, тон кожи, метки.
+/// Chars that stay with their neighbour's font: ZWJ, variation selectors,
+/// skin tone modifiers, combining marks.
 fn clings_to_previous(ch: char) -> bool {
     matches!(ch as u32,
         0x200D | 0xFE0E | 0xFE0F | 0x1F3FB..=0x1F3FF | 0x20E3
@@ -662,7 +632,7 @@ fn resolve(families: &str, bold: bool, italic: bool) -> Option<&'static FontVec>
             }
             continue;
         }
-        // Не в таблице подмен — значит ищем семейство как оно есть.
+        // Not substituted: look the family up as is.
         if let Some((path, _)) = font_index().get(&name) {
             if let Some(file) = path.file_name().and_then(|n| n.to_str()) {
                 if let Some(f) = face(file, bold, italic) {
@@ -678,7 +648,7 @@ fn resolve(families: &str, bold: bool, italic: bool) -> Option<&'static FontVec>
         .or_else(bundled)
 }
 
-/// Встроенный шрифт: система без шрифтов всё равно должна что-то нарисовать.
+/// Built-in font: a system without fonts must still draw something.
 fn bundled() -> Option<&'static FontVec> {
     LOADED.with(|m| {
         if let Some(hit) = m.borrow().get("\u{0}bundled") {
@@ -692,17 +662,15 @@ fn bundled() -> Option<&'static FontVec> {
     })
 }
 
-/// Масштаб, которым `ab_glyph` рисует шрифт кегля `size_px`. `PxScale` задаёт
-/// не размер em, а высоту строки, поэтому кегль надо пересчитать: без этого все
-/// ширины выходят ровно во столько раз меньше браузерных, во сколько высота
-/// шрифта больше его em. У Liberation Sans это 2288/2048, то есть 1,1172 — и
-/// именно во столько наши измерения расходились с Chrome.
+/// Scale at which `ab_glyph` draws a font of size `size_px`. `PxScale` is line
+/// height, not em, so convert; otherwise every width is short by
+/// height/em (2288/2048 = 1.1172 for Liberation Sans).
 fn px_scale<F: Font>(font: &F, size_px: f32) -> PxScale {
     let upem = font.units_per_em().unwrap_or(1000.0);
     PxScale::from(size_px * font.height_unscaled() / upem)
 }
 
-/// Метрики строки, как их возвращает `measureText`.
+/// Line metrics as returned by `measureText`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TextMetrics {
     pub width: f64,
@@ -712,9 +680,8 @@ pub struct TextMetrics {
     pub descent: f64,
     pub font_ascent: f64,
     pub font_descent: f64,
-    /// Высота строки при `line-height: normal` — подъём, спуск и просвет
-    /// гарнитуры. У Liberation Sans это ровно 1,15 кегля, и раскладка без неё
-    /// не сходится с браузерной ни на пиксель.
+    /// Line height for `line-height: normal`: ascent + descent + line gap
+    /// (1.15 em for Liberation Sans).
     pub line: f64,
 }
 
@@ -838,15 +805,12 @@ pub fn draw_image(id: u32, url: &str, dx: f32, dy: f32, dw: f32, dh: f32) -> boo
     })
 }
 
-/// `drawImage(sourceCanvas, …)` — один холст на другом. Браузер принимает
-/// холстом всё, у чего есть пиксели: элемент, `OffscreenCanvas`, `ImageBitmap`,
-/// — а у нас `drawImage` их отвергал, хотя собственный текст ошибки перечислял
-/// их среди допустимых. Сборщик Cloudflare рисует так свой `OffscreenCanvas` и
-/// получал исключение вместо картинки.
+/// `drawImage(sourceCanvas, …)`: draw one canvas onto another. Chrome accepts
+/// any pixel source (canvas element, `OffscreenCanvas`, `ImageBitmap`);
+/// Cloudflare's collector draws its `OffscreenCanvas` this way.
 ///
-/// Вырезка задаётся в координатах источника: девятиаргументный `drawImage`
-/// берёт из картинки прямоугольник, а не её целиком, и без него страница,
-/// раскладывающая спрайт по клеткам, рисует одно и то же место.
+/// The source rect is in source coordinates: 9-arg `drawImage` takes a
+/// sub-rectangle (sprite sheets).
 #[allow(clippy::too_many_arguments)]
 pub fn blit(
     dst_id: u32,
@@ -863,8 +827,8 @@ pub fn blit(
     if dst_id == src_id {
         return false;
     }
-    // Пиксели источника снимаются заранее: две записи в одну карту сразу не
-    // взять, а копия здесь короче, чем разделение хранилища.
+    // Snapshot the source pixels first: two borrows of one map at once are not
+    // possible, and a copy is simpler than splitting the storage.
     let src = CANVASES.with(|c| {
         c.borrow().get(&src_id).map(|pm| {
             (
@@ -880,7 +844,7 @@ pub fn blit(
     if full_w <= 0 || full_h <= 0 {
         return false;
     }
-    // Прямоугольник источника: по умолчанию — вся картинка.
+    // Source rect, defaulting to the whole image.
     let (ox_s, oy_s) = (sx.round() as i64, sy.round() as i64);
     let sw = if sw_in > 0.0 { sw_in.round() as i64 } else { full_w };
     let sh = if sh_in > 0.0 { sh_in.round() as i64 } else { full_h };
@@ -916,8 +880,8 @@ pub fn blit(
                     continue;
                 }
                 let si = ((sy * full_w + sx) * 4) as usize;
-                // Источник уже помножен на альфу — как и приёмник, — поэтому
-                // складываем по «source-over» прямо в этом виде.
+                // Source and destination are both premultiplied, so composite source-over
+                // directly.
                 let (sr, sg, sb, sa) = (src[si], src[si + 1], src[si + 2], src[si + 3]);
                 let di = (py * cw + px) as usize;
                 let old = dst[di];
@@ -1015,19 +979,18 @@ fn path_from_verbs(verbs: &[f32]) -> Option<tiny_skia::Path> {
 
 /// `fill()` a tessellated path with a straight-alpha RGBA color. `even_odd`
 /// selects the fill rule (canvas `'evenodd'` vs default nonzero winding).
-/// Тень холста. Браузер рисует её так: та же фигура, залитая цветом тени,
-/// размытая по Гауссу и сдвинутая, — а поверх уже сама фигура. Без этого
-/// отпечаток холста теряет почти всю краску: размытая тень покрывает весь
-/// холст слабой альфой, и в отчёте это тысячи ненулевых байт.
+/// Canvas shadow as Chrome draws it: the shape filled with the shadow color,
+/// Gaussian-blurred and offset, then the shape on top. Without it the canvas
+/// fingerprint loses most of its ink (the blur covers the canvas with faint
+/// alpha).
 ///
-/// Гаусс приближается тремя проходами коробчатого размытия — так делает и
-/// Skia; сигма у Chrome равна половине `shadowBlur`.
+/// Sigma is half of `shadowBlur`, as in Chrome.
 fn gaussian_blur(data: &mut [u8], w: usize, h: usize, sigma: f32) {
     if sigma <= 0.0 || w == 0 || h == 0 {
         return;
     }
-    // Настоящее ядро, а не три коробчатых прохода: приближение коробками
-    // давало вдвое более широкую тень, чем у браузера, и хвост уходил не туда.
+    // A real kernel, not three box passes: the box approximation gave a shadow
+    // twice as wide as Chrome's.
     let radius = ((sigma * 3.0).ceil() as usize).min(128);
     let mut kernel = Vec::with_capacity(radius * 2 + 1);
     let denom = 2.0 * sigma * sigma;
@@ -1042,8 +1005,8 @@ fn gaussian_blur(data: &mut [u8], w: usize, h: usize, sigma: f32) {
         *v /= total;
     }
     let at = |i: isize, lo: isize, hi: isize| i.clamp(lo, hi) as usize;
-    // Промежуточный проход держим в вещественных числах: округление до байта
-    // между проходами заметно расширяет хвост тени.
+    // Keep the intermediate pass in floats: rounding to bytes between passes
+    // widens the tail.
     let mut tmp = vec![0.0f32; data.len()];
     for y in 0..h {
         let row = y * w * 4;
@@ -1080,7 +1043,7 @@ fn gaussian_blur(data: &mut [u8], w: usize, h: usize, sigma: f32) {
     }
 }
 
-/// `[blur, dx, dy, r, g, b, a]` — пусто, когда тени нет.
+/// `[blur, dx, dy, r, g, b, a]`; None when there is no shadow.
 fn shadow_of(sh: &[f32]) -> Option<(f32, f32, f32, [u8; 4])> {
     if sh.len() < 7 {
         return None;
@@ -1106,8 +1069,8 @@ fn shadow_of(sh: &[f32]) -> Option<(f32, f32, f32, [u8; 4])> {
     ))
 }
 
-/// Нарисовать тень фигуры: `draw` кладёт фигуру цветом тени на чистый холст
-/// того же размера, дальше размытие и снос.
+/// Draw a shape's shadow: `draw` paints the shape in the shadow color on a
+/// blank canvas of the same size, then blur and offset.
 fn paint_shadow<F>(pm: &mut tiny_skia::Pixmap, sh: &[f32], draw: F)
 where
     F: FnOnce(&mut tiny_skia::Pixmap, [u8; 4]),
@@ -1121,7 +1084,7 @@ where
     };
     draw(&mut scratch, color);
     if blur > 0.0 {
-        // Сигма — половина заявленного размытия, как в спецификации холста.
+        // Sigma is half the declared blur, per the canvas spec.
         gaussian_blur(scratch.data_mut(), w as usize, h as usize, blur / 2.0);
     }
     let paint = tiny_skia::PixmapPaint::default();
@@ -1135,9 +1098,8 @@ where
     );
 }
 
-/// `globalCompositeOperation` числом. Страница переключает наложение и рисует
-/// пересекающиеся круги — по цвету в пересечении её и узнают; мы наложение
-/// не читали вовсе, и поверх ложился просто последний круг.
+/// `globalCompositeOperation` as a number. Pages draw overlapping circles in
+/// different modes and read the overlap color.
 fn blend_mode(i: u32) -> tiny_skia::BlendMode {
     use tiny_skia::BlendMode as B;
     match i {
@@ -1197,7 +1159,7 @@ pub fn fill_path(id: u32, verbs: &[f32], even_odd: bool, rgba: [u8; 4], sh: &[f3
     });
 }
 
-/// `fill()` по операциям пути и матрице холста — растр Skia (см. `crate::skia`).
+/// `fill()` from path ops and the canvas matrix, rasterized by Skia (see `crate::skia`).
 pub fn fill_ops(id: u32, ops: &[f32], ctm: [f32; 6], even_odd: bool, rgba: [u8; 4], sh: &[f32], mode: u32) {
     CANVASES.with(|c| {
         if let Some(pm) = c.borrow_mut().get_mut(&id) {
@@ -1208,7 +1170,7 @@ pub fn fill_ops(id: u32, ops: &[f32], ctm: [f32; 6], even_odd: bool, rgba: [u8; 
     });
 }
 
-/// `fill()` градиентом: описание как у `fill_path_grad`.
+/// `fill()` with a gradient; descriptor as in `fill_path_grad`.
 pub fn fill_ops_grad(id: u32, ops: &[f32], ctm: [f32; 6], even_odd: bool, grad: &[f32], sh: &[f32], mode: u32) {
     let Some(desc) = crate::skia::gradient::GradientDesc::parse(grad) else { return };
     CANVASES.with(|c| {
@@ -1220,8 +1182,8 @@ pub fn fill_ops_grad(id: u32, ops: &[f32], ctm: [f32; 6], even_odd: bool, grad: 
     });
 }
 
-/// `stroke()` по операциям пути: волосяной штрих как у Skia; false —
-/// штрих толще пикселя, рисовать прежним путём.
+/// `stroke()` from path ops (Skia hairline/stroker). Returns false when the
+/// caller must use the old path.
 #[allow(clippy::too_many_arguments)]
 pub fn stroke_ops(id: u32, ops: &[f32], ctm: [f32; 6], line: &crate::skia::LineStyle, rgba: [u8; 4], grad: &[f32], sh: &[f32], mode: u32) -> bool {
     let paint = match crate::skia::gradient::GradientDesc::parse(grad) {
@@ -1307,8 +1269,8 @@ pub fn fill_path_grad(id: u32, verbs: &[f32], even_odd: bool, grad: &[f32], sh: 
     };
     CANVASES.with(|c| {
         if let Some(pm) = c.borrow_mut().get_mut(&id) {
-            // Тень у градиентной заливки — сплошная, цветом тени: браузер
-            // размывает силуэт фигуры, а не её раскраску.
+            // Gradient fill shadow is solid shadow color: the browser blurs the shape's
+            // silhouette, not its paint.
             let rule0 = if even_odd { FillRule::EvenOdd } else { FillRule::Winding };
             paint_shadow(pm, sh, |sp, col| {
                 let mut p2 = Paint::default();
@@ -1408,9 +1370,8 @@ pub fn fill_text(
         let Some(pm) = map.get_mut(&id) else {
             return;
         };
-        // Тень у надписи — те же глифы цветом тени, размытые и снесённые.
-        // Челлендж рисует текст именно с тенью, и без неё пропадает не только
-        // размытое пятно, но и почти всё покрытие холста.
+        // Text shadow: the same glyphs in the shadow color, blurred and offset. The
+        // challenge draws text with a shadow; without it most canvas coverage is lost.
         let (glyphs_of, _) = shape(&chain, text, size_px);
         let glyphs = |target: &mut [u8], tw: i32, th: i32, colour: [u8; 4]| {
             for g in &glyphs_of {
@@ -1444,8 +1405,8 @@ pub fn fill_text(
     });
 }
 
-/// `fillText`/`strokeText` как у Chrome: false — этот вызов движок ещё не
-/// умеет (штрих), рисовать прежним путём.
+/// `fillText`/`strokeText` like Chrome; false means not supported yet
+/// (stroke) and the caller uses the old path.
 #[allow(clippy::too_many_arguments)]
 pub fn text_ops(id: u32, text: &str, x: f32, y: f32, ctm: [f32; 6], size: f32, families: &str, bold: bool, italic: bool, stroke: bool, line: &crate::skia::LineStyle, rgba: [u8; 4], grad: &[f32], sh: &[f32], mode: u32, align: u32, baseline: u32) -> bool {
     let chain = resolve_chain(families, bold, italic);
@@ -1489,22 +1450,19 @@ pub fn measure_text(
     }
     let font = chain[0];
     let upem = font.units_per_em().unwrap_or(1000.0);
-    // Границы чернил: браузер отдаёт их целыми по вертикали и дробными по
-    // горизонтали — так же, как получаются из растеризованного контура.
-    // По горизонтали браузер отдаёт границы чернил дробными, по вертикали —
-    // целыми: первые берутся из контура, вторые из растра. Поэтому и здесь два
-    // источника, а не один.
+    // Ink bounds: Chrome reports horizontal bounds fractional (from the outline)
+    // and vertical bounds whole (from the raster), hence two sources.
     let (mut ink_l, mut ink_r) = (f64::MAX, f64::MIN);
     let (mut ink_t, mut ink_b) = (f64::MAX, f64::MIN);
     let (glyphs, _old_width) = shape(&chain, text, size_px);
-    // Ширина — по раскладке Blink (кегль до сотых, ширины Skia, кернинг HarfBuzz).
+    // Width from Blink layout (size to 1/100, Skia advances, HarfBuzz kerning).
     let eff = crate::skia::text::effective_size(size_px);
     let (bglyphs, bwidth, bfonts) = shape_blink(&chain, text, eff);
     let width = bwidth as f64;
-    // Границы чернил контурных знаков — как у Skia (generateMetrics): контур
-    // с хинтингом, его рамка roundOut, сдвинутая на место знака в строке.
-    // Так Chrome отдаёт 0 для спуска «Hello» (перелёт «o» хинтинг снимает) и
-    // 9 для подъёма 13.3px Arial. Ab_glyph без хинтинга давал 1 и 10.
+    // Ink bounds of outline glyphs as in Skia generateMetrics: hinted outline,
+    // roundOut bounds, offset to the glyph position. This gives Chrome's 0 descent
+    // for "Hello" (hinting removes the "o" overshoot) and 9 ascent for 13.3px
+    // Arial; unhinted ab_glyph gave 1 and 10.
     {
         use crate::skia::geometry::Matrix;
         let refs: Vec<Option<skrifa::FontRef>> = bfonts.iter().map(|b| skrifa::FontRef::new(b).ok()).collect();
@@ -1530,28 +1488,25 @@ pub fn measure_text(
         }
     }
     for g in &glyphs {
-        // Знак берётся из первого семейства цепочки, где он есть, — как в
-        // браузере. Кегль при подмене считается по метрикам того шрифта.
+        // Glyph from the first family in the chain that has it; size computed from
+        // that font's metrics.
         let cf = g.font;
         let cscale = px_scale(cf, size_px);
-        // Коробка чернил считается в своих координатах знака и только потом
-        // сдвигается на его место в строке. Браузер меряет так же: у одиночной
-        // «A» правая граница ровно 7 (целая), а у «AV» — 12.928, где 5.928 это
-        // дробное начало «V» после кернинга, а 7 — её собственная коробка.
-        // Округляли бы после сдвига — обе вышли бы целыми.
+        // The ink box is rounded in the glyph's own space, then offset into place.
+        // Chrome: "A" right edge 7 (whole), "AV" 12.928 (5.928 kerned origin of
+        // "V" + its box 7). Rounding after the offset would make both whole.
         let glyph = g.id.with_scale_and_position(cscale, ab_glyph::point(0.0, 0.0));
         if cf.outline_glyph(glyph).is_some() {
-            // Контурный знак уже учтён выше, по Skia.
+            // Outline glyphs were handled above via Skia.
         } else if let Some(img) = shaper(cf)
             .and_then(|f| raster_image(f, ttf_parser::GlyphId(g.id.0), size_px))
         {
-            // Знак нарисован картинкой: границы чернил — её края, приведённые
-            // к кеглю и округлённые наружу, как и у контурных.
+            // Bitmap glyph: ink bounds are its edges scaled to the size and rounded
+            // outward, like outline glyphs.
             let k = size_px as f64 / img.pixels_per_em as f64;
             ink_l = ink_l.min(g.x + (img.x as f64 * k).floor());
             ink_r = ink_r.max(g.x + ((img.x as f64 + img.width as f64) * k).ceil());
-            // `y` у картинки — от базовой линии до её низа, поэтому верх это
-            // `y + высота`.
+            // Bitmap `y` is from the baseline to its bottom, so the top is `y + height`.
             ink_t = ink_t.min(-(((img.y as f64 + img.height as f64) * k).ceil()));
             ink_b = ink_b.max((-(img.y as f64) * k).ceil());
         }
@@ -1560,9 +1515,8 @@ pub fn measure_text(
     let flat = ink_t > ink_b;
     TextMetrics {
         width,
-        // Левую границу браузер отсекает к нулю, а не округляет: чернила,
-        // начавшиеся на восемь десятых пикселя правее начала, дают 0, а на
-        // полтора — −1. Проверено на двух гарнитурах.
+        // Chrome truncates the left bound toward zero rather than rounding: ink
+        // starting 0.8px right of origin gives 0, 1.5px gives -1.
         left: if none { 0.0 } else { (-ink_l).trunc() },
         right: if none { 0.0 } else { ink_r },
         ascent: if flat { 0.0 } else { -ink_t },
@@ -1627,8 +1581,8 @@ pub fn get_image_data(id: u32, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
                 }
                 let si = ((sy * pw + sx) * 4) as usize;
                 let di = ((row * w + col) * 4) as usize;
-                // Premul → straight, как `readPixels(kUnpremul)` у Chrome:
-                // деление во float и округление к ближайшему чётному.
+                // Premul -> straight, like Chrome's `readPixels(kUnpremul)`: float division,
+                // round half to even.
                 crate::skia::read_unpremul(&data[si..si + 4], &mut out[di..di + 4]);
             }
         }
@@ -1671,96 +1625,93 @@ mod tests {
 
     #[test]
     fn a_pair_of_letters_is_kerned_like_the_browser() {
-        // «AV» уже, чем «A» и «V» порознь: пара подогнана самим шрифтом.
+        // "AV" is narrower than "A" + "V": the font kerns the pair.
         let av = measure_text("AV", 16.0, "Liberation Sans", false, false).width;
         let a = measure_text("A", 16.0, "Liberation Sans", false, false).width;
         let v = measure_text("V", 16.0, "Liberation Sans", false, false).width;
         assert!(
             av < a + v - 0.5,
-            "кернинг пары не применён: {av} против {} порознь",
+            "pair not kerned: {av} vs {} apart",
             a + v
         );
-        // Chrome на этой машине: 20.156 против 21.344 без кернинга.
+        // Chrome here: 20.156 vs 21.344 unkerned.
         assert!(
             (av - 20.15625).abs() < 0.001,
-            "ширина «AV» разошлась с браузерной: {av}"
+            "\"AV\" width differs from Chrome: {av}"
         );
     }
 
     #[test]
     fn a_space_breaks_the_kerning_pair() {
-        // Раскладка у браузера словарная: пара через пробел не подгоняется,
-        // хотя у Liberation Serif для «пробел + W» кернинг в шрифте есть.
+        // Blink shapes per word: no kerning across a space, although Liberation
+        // Serif kerns "space + W".
         let whole = measure_text("To Wave", 16.0, "Liberation Serif", false, false).width;
         let to = measure_text("To", 16.0, "Liberation Serif", false, false).width;
         let space = measure_text(" ", 16.0, "Liberation Serif", false, false).width;
         let wave = measure_text("Wave", 16.0, "Liberation Serif", false, false).width;
         assert!(
             (whole - (to + space + wave)).abs() < 1e-9,
-            "слова должны складываться без подгонки: {whole} против {}",
+            "words must add up without kerning: {whole} vs {}",
             to + space + wave
         );
     }
 
     #[test]
     fn a_ligature_narrows_the_string() {
-        // У DejaVu Sans «ffi» — одна лигатура шириной 1980 единиц против 2011
-        // у трёх знаков порознь. Браузер её ставит, и надпись выходит уже.
+        // DejaVu Sans "ffi" is one ligature of 1980 units vs 2011 for three glyphs;
+        // the browser applies it.
         let ffi = measure_text("ffi", 16.0, "DejaVu Sans", false, false).width;
         let apart = measure_text("f", 16.0, "DejaVu Sans", false, false).width * 2.0
             + measure_text("i", 16.0, "DejaVu Sans", false, false).width;
         assert!(
             ffi < apart - 0.2,
-            "лигатура не подставлена: {ffi} против {apart}"
+            "ligature not applied: {ffi} vs {apart}"
         );
     }
 
     #[test]
     fn lengths_scale_through_the_same_fixed_point_as_the_browser() {
-        // 600 единиц при 1000 на кегль и 16 пикселях: у браузера ровно
-        // 9.600021362304688, а не 9.6 — кегль идёт через 26.6, множитель через
-        // 16.16. Шрифты с 2048 единицами делятся точно, и там разницы нет.
+        // 600 units at 1000 upem and 16px: Chrome gives 9.600021362304688, not 9.6
+        // (size via 26.6, scale via 16.16). 2048-upem fonts divide exactly.
         assert_eq!(ft_px(600, 1000, 16.0), 9.600021362304688);
         assert_eq!(ft_px(600, 1000, 13.0), 7.8000030517578125);
         assert_eq!(ft_px(1366, 2048, 16.0), 10.671875);
-        assert_eq!(ft_px(-143, 2048, 16.0), -1.1171875, "кернинг со знаком");
+        assert_eq!(ft_px(-143, 2048, 16.0), -1.1171875, "signed kerning");
         assert_eq!(ft_px(0, 1000, 16.0), 0.0);
     }
 
     #[test]
     fn the_ink_box_is_rounded_in_the_glyph_own_space() {
-        // У одиночной «A» правая граница чернил целая, а у «AV» — дробная:
-        // коробка знака округляется в его координатах и только потом едет на
-        // своё место в строке. Браузер даёт 7 и 12.928.
+        // "A" has a whole right ink bound, "AV" a fractional one: the glyph box is
+        // rounded in its own space, then offset. Chrome gives 7 and 12.928.
         let a = measure_text("A", 10.0, "Liberation Sans", false, false);
         let av = measure_text("AV", 10.0, "Liberation Sans", false, false);
-        assert_eq!(a.right, 7.0, "правая граница одиночной «A»");
+        assert_eq!(a.right, 7.0, "right bound of a lone \"A\"");
         assert!(
             (av.right - 12.928).abs() < 0.001,
-            "правая граница «AV»: {}",
+            "right bound of \"AV\": {}",
             av.right
         );
     }
 
-    /// Смайлик меряется цветным шрифтом, а не первым попавшимся: у браузера
-    /// он шириной 19.963302612304688 при шестнадцати пикселях, и связка из
-    /// нескольких знаков через соединитель — тоже, потому что сводится в один
-    /// знак. Числа сняты с Chrome 151 на этой машине.
+    /// Emoji are measured with the color font: 19.963302612304688 at 16px in
+    /// Chrome, and ZWJ sequences too, since they shape into one glyph. Values
+    /// from Chrome 151 on this machine.
     #[test]
     fn an_emoji_is_measured_by_the_colour_font() {
         let one = measure_text("😀", 16.0, "sans-serif", false, false);
         assert_eq!(
             one.width, 19.963302612304688,
-            "ширина смайлика: {}",
+            "emoji width: {}",
             one.width
         );
-        assert_eq!((one.ascent, one.descent), (15.0, 4.0), "коробка чернил");
-        assert_eq!(one.right, 20.0, "правая граница");
+        assert_eq!((one.ascent, one.descent), (15.0, 4.0), "ink box");
+        assert_eq!(one.right, 20.0, "right bound");
         for seq in ["👩‍❤️‍💋‍👨", "👨‍👩‍👧‍👦", "👨‍👩‍👦", "🇺🇦", "👍🏽"] {
             let w = measure_text(seq, 16.0, "sans-serif", false, false).width;
-            assert_eq!(w, one.width, "связка «{seq}» — один знак, а не несколько");
+            assert_eq!(w, one.width, "sequence {seq} must be one glyph");
         }
-        // Кегль меняет ширину как у браузера: дробь со знаменателем 65536.
+        // Size scales the width like the browser: a fraction over 65536.
         assert_eq!(
             measure_text("😀", 11.0, "sans-serif", false, false).width,
             13.724761962890625
@@ -1830,10 +1781,9 @@ mod tests {
         );
     }
 
-    /// Семейства меряются каждое своим файлом. Раньше шрифт был один на все
-    /// имена, и страница, перебирающая гарнитуры измерением — самый ходовой
-    /// способ снять отпечаток, — видела машину, где Arial, Times и Courier
-    /// одной ширины. Числа сверены с Chrome 151 на этой машине.
+    /// Each family is measured with its own file, so measurement-based font
+    /// enumeration sees distinct widths for Arial, Times and Courier. Values
+    /// checked against Chrome 151 on this machine.
     #[test]
     fn each_family_is_measured_with_its_own_file() {
         let w = |fam: &str| measure_text("mmmmmmmmmmlli", 16.0, fam, false, false).width;
@@ -1842,9 +1792,9 @@ mod tests {
             sans != serif && serif != mono && sans != mono,
             "three families measured the same: {sans} {serif} {mono}"
         );
-        // Неизвестное имя браузер не находит и переходит к следующему.
+        // Unknown name is skipped for the next family.
         assert_eq!(w("NoSuchFontXYZ, Arial"), sans, "fell through to the next family");
-        // Жирное начертание — другой файл, значит другая ширина.
+        // Bold is another file, hence another width.
         let bold = measure_text("mmmmmmmmmmlli", 16.0, "Times New Roman", true, false).width;
         assert!(bold > serif, "bold is not wider than regular: {bold} vs {serif}");
     }

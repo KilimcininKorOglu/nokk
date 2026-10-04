@@ -1,6 +1,6 @@
-//! Геометрия Skia (`SkGeometry.cpp`, `SkPoint.cpp`, `SkMatrix.cpp`):
-//! точки, матрица, коники и их разбиение на квадрики, резка кривых по
-//! экстремумам. Всё во float, в том же порядке операций, что у Chrome.
+//! Skia geometry (`SkGeometry.cpp`, `SkPoint.cpp`, `SkMatrix.cpp`):
+//! points, matrix, conics and their split into quads, chopping curves at
+//! extrema. All in float, in the same operation order as Chrome.
 
 use super::fixed::saturate2int;
 
@@ -63,9 +63,9 @@ impl Point {
     }
 }
 
-// ── Матрица (только аффинная) ─────────────────────────────────────────────
+// ── Matrix (affine only) ──────────────────────────────────────────────────
 
-/// `SkMatrix` без перспективы: [scaleX skewX transX skewY scaleY transY].
+/// `SkMatrix` without perspective: [scaleX skewX transX skewY scaleY transY].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Matrix {
     pub sx: f32,
@@ -91,8 +91,8 @@ impl Matrix {
     pub fn is_translate_only(&self) -> bool {
         self.is_scale_translate() && self.sx == 1.0 && self.sy == 1.0
     }
-    /// `SkMatrix::rectStaysRect()` по `computeTypeMask`: сравнение битов,
-    /// так что −0 считается ненулём.
+    /// `SkMatrix::rectStaysRect()` per `computeTypeMask`: compares bits,
+    /// so −0 counts as non-zero.
     pub fn rect_stays_rect(&self) -> bool {
         let nz = |v: f32| v.to_bits() != 0;
         if nz(self.kx) || nz(self.ky) {
@@ -122,7 +122,7 @@ impl Matrix {
             *self = Matrix::concat(m, self);
         }
     }
-    /// `SkMatrix::setConcat(a, b)` для аффинных матриц.
+    /// `SkMatrix::setConcat(a, b)` for affine matrices.
     pub fn concat(a: &Matrix, b: &Matrix) -> Matrix {
         if a.is_identity() {
             return *b;
@@ -140,7 +140,7 @@ impl Matrix {
                 ty: a.sy * b.ty + a.ty,
             };
         }
-        // muladdmul(a, b, c, d) = a*b + c*d, считается в double и сужается.
+        // muladdmul(a, b, c, d) = a*b + c*d, computed in double and narrowed.
         let mam = |a: f32, b: f32, c: f32, d: f32| -> f32 {
             (a as f64 * b as f64 + c as f64 * d as f64) as f32
         };
@@ -153,7 +153,7 @@ impl Matrix {
             ty: mam(a.ky, b.tx, a.sy, b.ty) + a.ty,
         }
     }
-    /// `SkMatrix::mapPoints` — три процедуры Skia по типу матрицы.
+    /// `SkMatrix::mapPoints`: Skia's three procs by matrix type.
     pub fn map_points(&self, pts: &mut [Point]) {
         if self.is_identity() {
             return;
@@ -199,7 +199,7 @@ impl Matrix {
     }
 }
 
-// ── Прямоугольник ─────────────────────────────────────────────────────────
+// ── Rect ──────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct Rect {
@@ -321,7 +321,7 @@ impl IRect {
     }
 }
 
-// ── Квадрики ──────────────────────────────────────────────────────────────
+// ── Quads ─────────────────────────────────────────────────────────────────
 
 #[inline]
 fn interp(v0: f32, v1: f32, t: f32) -> f32 {
@@ -341,7 +341,7 @@ pub fn chop_quad_at(src: &[Point; 3], t: f32) -> [Point; 5] {
     ]
 }
 
-/// `valid_unit_divide`: 0 < numer/denom < 1, иначе None.
+/// `valid_unit_divide`: 0 < numer/denom < 1, else None.
 pub fn valid_unit_divide(mut numer: f32, mut denom: f32) -> Option<f32> {
     if numer < 0.0 {
         numer = -numer;
@@ -411,7 +411,7 @@ fn is_not_monotonic(a: f32, b: f32, c: f32) -> bool {
     ab == 0.0 || bc < 0.0
 }
 
-/// `SkChopQuadAtYExtrema`: возвращает число квадрик (1 или 2) в `dst`.
+/// `SkChopQuadAtYExtrema`: returns the number of quads (1 or 2) in `dst`.
 pub fn chop_quad_at_y_extrema(src: &[Point; 3], dst: &mut [Point; 5]) -> usize {
     let a = src[0].y;
     let mut b = src[1].y;
@@ -454,7 +454,7 @@ pub fn chop_quad_at_x_extrema(src: &[Point; 3], dst: &mut [Point; 5]) -> usize {
     1
 }
 
-// ── Кубики ────────────────────────────────────────────────────────────────
+// ── Cubics ────────────────────────────────────────────────────────────────
 
 #[inline]
 fn unchecked_mix(a: f32, b: f32, t: f32) -> f32 {
@@ -488,7 +488,7 @@ pub fn chop_cubic_at2(src: &[Point; 4], t0: f32, t1: f32) -> [Point; 10] {
         return out;
     }
     let mixp = |a: Point, b: Point, t: f32| Point::new(unchecked_mix(a.x, b.x, t), unchecked_mix(a.y, b.y, t));
-    // Две резки «параллельно», как в float4 у Skia: lo — по t0, hi — по t1.
+    // Two chops "in parallel", as with float4 in Skia: lo at t0, hi at t1.
     let ab0 = mixp(src[0], src[1], t0);
     let bc0 = mixp(src[1], src[2], t0);
     let cd0 = mixp(src[2], src[3], t0);
@@ -501,7 +501,7 @@ pub fn chop_cubic_at2(src: &[Point; 4], t0: f32, t1: f32) -> [Point; 10] {
     let abc1 = mixp(ab1, bc1, t1);
     let bcd1 = mixp(bc1, cd1, t1);
     let abcd1 = mixp(abc1, bcd1, t1);
-    // middle = mix(abc, bcd, shuffle<2,3,0,1>(T)): lo по t1, hi по t0.
+    // middle = mix(abc, bcd, shuffle<2,3,0,1>(T)): lo at t1, hi at t0.
     let middle_lo = mixp(abc0, bcd0, t1);
     let middle_hi = mixp(abc1, bcd1, t0);
     [
@@ -517,7 +517,7 @@ pub fn find_cubic_extrema(a: f32, b: f32, c: f32, d: f32) -> ([f32; 2], usize) {
     find_unit_quad_roots(aa, bb, cc)
 }
 
-/// `SkChopCubicAt(src, dst, tValues, roots)` — общий вид с 0..2 корнями.
+/// `SkChopCubicAt(src, dst, tValues, roots)`: general form with 0..2 roots.
 fn chop_cubic_at_roots(src: &[Point; 4], t: &[f32], dst: &mut [Point; 10]) {
     match t.len() {
         0 => dst[..4].copy_from_slice(src),
@@ -531,7 +531,7 @@ fn chop_cubic_at_roots(src: &[Point; 4], t: &[f32], dst: &mut [Point; 10]) {
     }
 }
 
-/// `SkChopCubicAtYExtrema`: число кубиков (1..3) в `dst`.
+/// `SkChopCubicAtYExtrema`: number of cubics (1..3) in `dst`.
 pub fn chop_cubic_at_y_extrema(src: &[Point; 4], dst: &mut [Point; 10]) -> usize {
     let (t, n) = find_cubic_extrema(src[0].y, src[1].y, src[2].y, src[3].y);
     chop_cubic_at_roots(src, &t[..n], dst);
@@ -565,7 +565,7 @@ pub fn chop_cubic_at_x_extrema(src: &[Point; 4], dst: &mut [Point; 10]) -> usize
     n + 1
 }
 
-// ── Коники ────────────────────────────────────────────────────────────────
+// ── Conics ────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Conic {
@@ -591,9 +591,9 @@ impl Conic {
         Conic { pts: [p0, p1, p2], w }
     }
 
-    /// `SkConic::chop` — вариант под `SK_SUPPORT_LEGACY_CONIC_CHOP`: Chromium
-    /// собирает Skia с этим флагом (`skia/config/SkUserConfig.h`), и порядок
-    /// операций во float здесь другой, чем в новом коде.
+    /// `SkConic::chop`, the `SK_SUPPORT_LEGACY_CONIC_CHOP` variant: Chromium
+    /// builds Skia with this flag (`skia/config/SkUserConfig.h`), and the float
+    /// operation order differs from the new code.
     pub fn chop(&self) -> [Conic; 2] {
         let scale = 1.0 / (1.0 + self.w);
         let nw = subdivide_w_value(self.w);
@@ -669,7 +669,7 @@ impl Conic {
         Conic::subdivide(&dst[1], pts, level - 1);
     }
 
-    /// `SkConic::chopIntoQuadsPOW2`: точки квадрик (1 + 2·N штук), N квадрик.
+    /// `SkConic::chopIntoQuadsPOW2`: quad points (1 + 2·N of them), N quads.
     pub fn chop_into_quads_pow2(&self, mut pow2: usize) -> (Vec<Point>, usize) {
         if self.w < 0.0 || !self.w.is_finite() {
             pow2 = 0;
@@ -814,7 +814,7 @@ pub fn nearly_equal(a: f32, b: f32) -> bool {
     (a - b).abs() <= SCALAR_NEARLY_ZERO
 }
 
-// ── Матрица: обращение, PolyToPoly, масштаб (SkMatrix.cpp) ────────────────
+// ── Matrix: invert, PolyToPoly, scale (SkMatrix.cpp) ──────────────────────
 
 impl Matrix {
     pub fn translate(dx: f32, dy: f32) -> Matrix {
@@ -840,8 +840,8 @@ impl Matrix {
     fn is_affine_mask(&self) -> bool {
         self.kx != 0.0 || self.ky != 0.0
     }
-    /// `SkMatrix::invert()` без перспективы: путь для scale/translate и общий
-    /// через double.
+    /// `SkMatrix::invert()` without perspective: a scale/translate path and a
+    /// general one in double.
     pub fn invert(&self) -> Option<Matrix> {
         if !self.is_scale_mask() && !self.is_translate_mask() && !self.is_affine_mask() {
             return Some(*self);
@@ -865,7 +865,7 @@ impl Matrix {
             }
             return Some(Matrix::translate(-self.tx, -self.ty));
         }
-        // sk_inv_determinant: dcross(scaleX, scaleY, skewX, skewY) в double.
+        // sk_inv_determinant: dcross(scaleX, scaleY, skewX, skewY) in double.
         let det = self.sx as f64 * self.sy as f64 - self.kx as f64 * self.ky as f64;
         let nz = SCALAR_NEARLY_ZERO * SCALAR_NEARLY_ZERO * SCALAR_NEARLY_ZERO;
         if (det as f32).abs() <= nz {
@@ -888,7 +888,7 @@ impl Matrix {
         }
         Some(m)
     }
-    /// `SkMatrix::PolyToPoly` для двух точек: `Poly2Proc(src)`⁻¹ · `Poly2Proc(dst)`.
+    /// `SkMatrix::PolyToPoly` for two points: `Poly2Proc(src)`⁻¹ · `Poly2Proc(dst)`.
     pub fn poly_to_poly2(src: [Point; 2], dst: [Point; 2]) -> Option<Matrix> {
         let poly2 = |p: [Point; 2]| Matrix {
             sx: p[1].y - p[0].y,
@@ -903,20 +903,20 @@ impl Matrix {
         let temp = poly2(dst);
         Some(Matrix::concat(&temp, &inverse))
     }
-    /// `mapVectors` для одного вектора: без сноса.
+    /// `mapVectors` for a single vector: no translation.
     pub fn map_vector(&self, v: Point) -> Point {
         let mut t = *self;
         t.tx = 0.0;
         t.ty = 0.0;
         t.map_point(v)
     }
-    /// Девять чисел `get9` (row-major), как их читает конвейер.
+    /// The nine values of `get9` (row-major), as the pipeline reads them.
     pub fn get9(&self) -> [f32; 9] {
         [self.sx, self.kx, self.tx, self.ky, self.sy, self.ty, 0.0, 0.0, 1.0]
     }
 }
 
-// ── Кубики: резка по нескольким t, максимум кривизны (для волосяных линий) ─
+// ── Cubics: chop at several t, max curvature (for hairlines) ───────────────
 
 pub fn chop_cubic_at_ts(src: &[Point; 4], ts: &[f32]) -> Vec<Point> {
     let mut out: Vec<Point> = Vec::new();
@@ -1015,7 +1015,7 @@ pub(crate) fn formulate_f1_dot_f2(s: [f32; 4]) -> [f32; 4] {
     [c * c, 3.0 * b * c, 2.0 * b * b + c * a, a * b]
 }
 
-/// `SkChopCubicAtMaxCurvature`: кубики (по 4 точки с общими концами).
+/// `SkChopCubicAtMaxCurvature`: cubics (4 points each, sharing endpoints).
 pub fn chop_cubic_at_max_curvature(src: &[Point; 4]) -> Vec<Point> {
     let cx = formulate_f1_dot_f2([src[0].x, src[1].x, src[2].x, src[3].x]);
     let cy = formulate_f1_dot_f2([src[0].y, src[1].y, src[2].y, src[3].y]);

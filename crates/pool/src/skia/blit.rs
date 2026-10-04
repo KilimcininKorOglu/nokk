@@ -1,10 +1,10 @@
-//! Блиттер по образцу `SkRasterPipelineBlitter` для RGBA8888 premul с
-//! однотонной краской: та же lowp-арифметика (`SkRasterPipeline_opts.h`,
-//! `namespace lowp`), те же стадии для каждого вида вызова.
+//! Blitter modelled on `SkRasterPipelineBlitter` for RGBA8888 premul with a
+//! solid paint: same lowp arithmetic (`SkRasterPipeline_opts.h`,
+//! `namespace lowp`), same stages for each kind of call.
 
 use super::geometry::IRect;
 
-/// `SkBlendMode` — подмножество, которое умеет холст.
+/// `SkBlendMode`: the subset the canvas supports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlendMode {
     Clear,
@@ -52,7 +52,7 @@ impl BlendMode {
                 | BlendMode::Xor
         )
     }
-    /// Есть ли у режима lowp-реализация в Skia.
+    /// Whether Skia has a lowp implementation of the mode.
     #[allow(dead_code)]
     pub fn has_lowp(self) -> bool {
         !matches!(
@@ -68,7 +68,7 @@ impl BlendMode {
     }
 }
 
-/// Один пиксель в 16-битных «полках» lowp: r,g,b,a ∈ 0..=255 (premul).
+/// One pixel in lowp 16-bit lanes: r,g,b,a in 0..=255 (premul).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Px {
     pub r: u16,
@@ -90,7 +90,7 @@ fn div255_accurate(v: u16) -> u16 {
 fn inv(v: u16) -> u16 {
     255 - v
 }
-// Арифметика 16-битных полок lowp: всё по модулю 2¹⁶, как в векторах Skia.
+// lowp 16-bit lane arithmetic: everything mod 2^16, as in Skia's vectors.
 #[inline]
 fn m(a: u16, b: u16) -> u16 {
     a.wrapping_mul(b)
@@ -112,13 +112,13 @@ fn from_float(f: f32) -> u16 {
     (f * 255.0 + 0.5) as u16
 }
 
-/// Стадия наложения в lowp: `s`, `d` — premul; возвращает результат.
+/// lowp blend stage: `s`, `d` premul; returns the result.
 fn blend_lowp(mode: BlendMode, s: Px, d: Px) -> Px {
-    // Режимы «по каналам» (BLEND_MODE с общей формулой для альфы).
+    // Per-channel modes (BLEND_MODE with the shared alpha formula).
     let per_channel = |f: &dyn Fn(u16, u16, u16, u16) -> u16| -> Px {
         Px { r: f(s.r, d.r, s.a, d.a), g: f(s.g, d.g, s.a, d.a), b: f(s.b, d.b, s.a, d.a), a: f(s.a, d.a, s.a, d.a) }
     };
-    // Режимы с фиксированной альфой: a = a + div255(da*inv(a)).
+    // Fixed-alpha modes: a = a + div255(da*inv(a)).
     let per_channel_srcover_alpha = |f: &dyn Fn(u16, u16, u16, u16) -> u16| -> Px {
         Px {
             r: f(s.r, d.r, s.a, d.a),
@@ -164,7 +164,7 @@ fn blend_lowp(mode: BlendMode, s: Px, d: Px) -> Px {
             let t = if m(2, d) <= da { m(m(2, s), d) } else { sb(m(sa, da), m(m(2, sb(sa, s)), sb(da, d))) };
             div255(ad(ad(m(s, inv(da)), m(d, inv(sa))), t))
         }),
-        // Без lowp-реализации: считаем во float (highp), как Skia.
+        // No lowp implementation: compute in float (highp), as Skia does.
         _ => blend_highp(mode, s, d),
     }
 }
@@ -212,7 +212,7 @@ fn blend_highp(mode: BlendMode, s: Px, d: Px) -> Px {
             (ch(sr, dr), ch(sg, dg), ch(sb, db), sa + da - sa * da)
         }
         _ => {
-            // hue/saturation/color/luminosity — редкость на холсте; source-over.
+            // hue/saturation/color/luminosity: rare on canvas; source-over.
             (sr + dr * (1.0 - sa), sg + dg * (1.0 - sa), sb + db * (1.0 - sa), sa + da * (1.0 - sa))
         }
     };
@@ -220,7 +220,7 @@ fn blend_highp(mode: BlendMode, s: Px, d: Px) -> Px {
     Px { r: u(r), g: u(g), b: u(b), a: u(a) }
 }
 
-/// Пиксельная поверхность: RGBA8888 premul, построчно.
+/// Pixel surface: RGBA8888 premul, row-major.
 pub struct Surface<'a> {
     pub data: &'a mut [u8],
     pub width: i32,
@@ -245,12 +245,12 @@ impl<'a> Surface<'a> {
     }
 }
 
-/// `SkRectClipBlitter`: обёртка, которую `SkScanClipper` ставит перед
-/// настоящим блиттером, когда границы пути выходят за окно по горизонтали.
-/// Важна не обрезкой (наши блиттеры и так не пишут вне окна), а тем, что
-/// `blitAntiH2`/`blitAntiV2` у неё не переопределены: они уходят в базовые
-/// `SkBlitter::blitAntiH2/V2`, то есть в `blitAntiH` с пробегами, а это
-/// другая арифметика смешивания у `SkARGB32_*_Blitter`.
+/// `SkRectClipBlitter`: the wrapper `SkScanClipper` puts in front of the
+/// real blitter when path bounds exceed the clip horizontally.
+/// It matters not for clipping (our blitters never write outside the clip) but
+/// because it does not override `blitAntiH2`/`blitAntiV2`: they fall to the base
+/// `SkBlitter::blitAntiH2/V2`, i.e. `blitAntiH` with runs, which uses
+/// different blend arithmetic in `SkARGB32_*_Blitter`.
 pub struct RectClipBlitter<'a> {
     inner: &'a mut dyn Blitter,
     clip: IRect,
@@ -284,7 +284,7 @@ fn compute_anti_width(runs: &[i16]) -> i32 {
     width
 }
 
-/// `SkAlphaRuns::BreakAt`: разрезать пробег на позиции `x`.
+/// `SkAlphaRuns::BreakAt`: split a run at `x`.
 fn break_at(runs: &mut [i16], alpha: &mut [u8], mut x: i32) {
     let mut i = 0usize;
     while x > 0 {
@@ -354,7 +354,7 @@ impl<'a> Blitter for RectClipBlitter<'a> {
         }
     }
     fn blit_anti_h2(&mut self, x: i32, y: i32, a0: u8, a1: u8) {
-        // SkBlitter::blitAntiH2 (не переопределён у SkRectClipBlitter).
+        // SkBlitter::blitAntiH2 (not overridden by SkRectClipBlitter).
         let runs = [1i16, 1, 0];
         let aa = [a0, a1];
         self.blit_anti_h(x, y, &aa, &runs);
@@ -393,7 +393,7 @@ impl<'a> Blitter for RectClipBlitter<'a> {
     }
 }
 
-/// Интерфейс `SkBlitter` (то, что зовут обходчики).
+/// `SkBlitter` interface (what the scan converters call).
 pub trait Blitter {
     fn blit_h(&mut self, x: i32, y: i32, width: i32);
     fn blit_anti_h(&mut self, x: i32, y: i32, alphas: &[u8], runs: &[i16]);
@@ -402,7 +402,7 @@ pub trait Blitter {
     fn blit_anti_h2(&mut self, x: i32, y: i32, a0: u8, a1: u8);
     fn blit_anti_v2(&mut self, x: i32, y: i32, a0: u8, a1: u8);
     fn blit_anti_rect(&mut self, x: i32, y: i32, width: i32, height: i32, left_alpha: u8, right_alpha: u8);
-    /// Маска A8: `mask[(yy-top)*row_bytes + (xx-left)]`, рисуется в `clip`.
+    /// A8 mask: `mask[(yy-top)*row_bytes + (xx-left)]`, drawn within `clip`.
     fn blit_mask(&mut self, mask: &[u8], mask_bounds: &IRect, row_bytes: usize, clip: &IRect);
     /// `SkBlitter::blitFatAntiRect`.
     fn blit_fat_anti_rect(&mut self, rect: &super::geometry::Rect) {
@@ -457,14 +457,14 @@ pub trait Blitter {
     }
 }
 
-/// Однотонная краска: цвет straight-alpha 0..255 и режим наложения.
+/// Solid paint: straight-alpha color 0..255 and blend mode.
 #[derive(Clone, Copy, Debug)]
 pub struct SolidPaint {
     pub rgba: [u8; 4],
     pub mode: BlendMode,
 }
 
-// ── Целочисленные помощники SkColorPriv/SkColorData ───────────────────────
+// ── Integer helpers from SkColorPriv/SkColorData ──────────────────────────────
 
 #[inline]
 fn mul_div255_round(a: u32, b: u32) -> u32 {
@@ -486,7 +486,7 @@ fn premultiply(rgba: [u8; 4]) -> [u8; 4] {
         rgba[3],
     ]
 }
-/// `SkAlphaMulQ(c, scale)`: каждый канал `(c * scale) >> 8`, scale ∈ 0..=256.
+/// `SkAlphaMulQ(c, scale)`: each channel `(c * scale) >> 8`, scale in 0..=256.
 #[inline]
 fn alpha_mul_q(c: [u8; 4], scale: u32) -> [u8; 4] {
     [
@@ -498,7 +498,7 @@ fn alpha_mul_q(c: [u8; 4], scale: u32) -> [u8; 4] {
 }
 #[inline]
 fn add4(a: [u8; 4], b: [u8; 4]) -> [u8; 4] {
-    // Сложение по каналам: у Skia оно без насыщения (переполнения нет).
+    // Per-channel add: unsaturated in Skia (cannot overflow).
     [a[0].wrapping_add(b[0]), a[1].wrapping_add(b[1]), a[2].wrapping_add(b[2]), a[3].wrapping_add(b[3])]
 }
 /// `skvx::approx_scale(x, y)` = (x·y + x) / 256.
@@ -526,7 +526,7 @@ fn fast_four_byte_interp(src: [u8; 4], dst: [u8; 4], w: u8) -> [u8; 4] {
     let ch = |s: u8, d: u8| ((s as u32 * scale + (256 - scale) * d as u32) >> 8) as u8;
     [ch(src[0], dst[0]), ch(src[1], dst[1]), ch(src[2], dst[2]), ch(src[3], dst[3])]
 }
-/// `SkBlitRow::Color32` для одного пикселя: dst = ((dst·invA) >> 8) + color.
+/// `SkBlitRow::Color32` for one pixel: dst = ((dst*invA) >> 8) + color.
 #[inline]
 fn color32_px(dst: [u8; 4], color: [u8; 4]) -> [u8; 4] {
     match color[3] {
@@ -541,13 +541,13 @@ fn color32_px(dst: [u8; 4], color: [u8; 4]) -> [u8; 4] {
 }
 
 enum Strategy {
-    /// `SkARGB32_Blitter` / `_Opaque_` / `_Black_`: source-over на N32.
+    /// `SkARGB32_Blitter` / `_Opaque_` / `_Black_`: source-over on N32.
     Legacy { pm: [u8; 4], opaque: bool, black: bool },
-    /// `SkRasterPipelineBlitter`: остальные режимы наложения.
+    /// `SkRasterPipelineBlitter`: the other blend modes.
     Pipeline { src: Px, mode: BlendMode, memset: Option<Px> },
 }
 
-/// Блиттер однотонной краски — выбор как в `SkBlitter::Choose`.
+/// Solid-paint blitter, chosen as in `SkBlitter::Choose`.
 pub struct SolidBlitter<'a> {
     surf: Surface<'a>,
     st: Strategy,
@@ -556,7 +556,7 @@ pub struct SolidBlitter<'a> {
 impl<'a> SolidBlitter<'a> {
     pub fn new(surf: Surface<'a>, paint: &SolidPaint) -> SolidBlitter<'a> {
         let mut mode = paint.mode;
-        // CheckFastPath: «copy» однотонной непрозрачной краской — это srcover.
+        // CheckFastPath: "copy" with an opaque solid paint is srcover.
         if mode == BlendMode::Src && paint.rgba[3] == 255 {
             mode = BlendMode::SrcOver;
         }
@@ -565,12 +565,12 @@ impl<'a> SolidBlitter<'a> {
             let black = paint.rgba == [0, 0, 0, 255];
             return SolidBlitter { surf, st: Strategy::Legacy { pm, opaque: paint.rgba[3] == 255, black } };
         }
-        // Clear — как Src с прозрачным цветом.
+        // Clear is Src with a transparent color.
         let rgba = if mode == BlendMode::Clear { [0, 0, 0, 0] } else { paint.rgba };
         if mode == BlendMode::Clear {
             mode = BlendMode::Src;
         }
-        // appendConstantColor: premul во float, потом *255 + 0.5 → u16.
+        // appendConstantColor: premul in float, then *255 + 0.5 -> u16.
         let f = |v: u8| v as f32 * (1.0 / 255.0);
         let a = f(rgba[3]);
         let pmf = [f(rgba[0]) * a, f(rgba[1]) * a, f(rgba[2]) * a, a];
@@ -610,7 +610,7 @@ impl<'a> SolidBlitter<'a> {
         self.surf.data[i..i + 4].copy_from_slice(&p);
     }
 
-    // ── конвейер (режимы кроме source-over) ──
+    // ── pipeline (modes other than source-over) ──
 
     #[inline]
     fn pipe_coverage(&mut self, x: i32, y: i32, cov: u16) {
@@ -618,7 +618,7 @@ impl<'a> SolidBlitter<'a> {
         let s = src;
         let d = self.surf.load(x, y);
         let out = if mode == BlendMode::Src {
-            // Src не масштабирует покрытие заранее: lerp(d, s, cov).
+            // Src does not pre-scale coverage: lerp(d, s, cov).
             let _ = memset;
             Px { r: lerp(d.r, s.r, cov), g: lerp(d.g, s.g, cov), b: lerp(d.b, s.b, cov), a: lerp(d.a, s.a, cov) }
         } else if mode.should_pre_scale_coverage() {
@@ -642,8 +642,8 @@ impl<'a> SolidBlitter<'a> {
         self.surf.store(x, y, out);
     }
 
-    /// Пиксель с покрытием `aa` (0..=255) в строке — как `blitAntiH` у
-    /// выбранного блиттера.
+    /// Pixel with coverage `aa` (0..=255) in a row, like the chosen blitter's
+    /// `blitAntiH`.
     fn span(&mut self, x: i32, y: i32, w: i32, aa: u8) {
         if !self.in_y(y) {
             return;
@@ -684,7 +684,7 @@ impl<'a> SolidBlitter<'a> {
                         self.pipe_full(xx, y);
                     }
                 } else {
-                    // blitAntiH: покрытие идёт через float и from_float.
+                    // blitAntiH: coverage goes through float and from_float.
                     let cv = from_float(aa as f32 * (1.0 / 255.0));
                     for xx in x0..x1 {
                         self.pipe_coverage(xx, y, cv);
@@ -726,7 +726,7 @@ impl<'a> Blitter for SolidBlitter<'a> {
                     return;
                 }
                 let color = if black && alpha != 255 {
-                    // У чёрного блиттера blitV не переопределён: SkARGB32_Blitter::blitV.
+                    // The black blitter does not override blitV: SkARGB32_Blitter::blitV.
                     alpha_mul_q(pm, alpha as u32 + 1)
                 } else if alpha != 255 {
                     alpha_mul_q(pm, alpha as u32 + 1)
@@ -855,16 +855,16 @@ impl<'a> Blitter for SolidBlitter<'a> {
     }
 }
 
-/// Чтение пикселей как `readPixels(kUnpremul)`: highp `unpremul` и
-/// `store_8888` с округлением `to_unorm`.
+/// Read pixels like `readPixels(kUnpremul)`: highp `unpremul` and
+/// `store_8888` with `to_unorm` rounding.
 pub fn read_unpremul(data: &[u8], out: &mut [u8]) {
     for (src, dst) in data.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
         let a = src[3] as f32 * (1.0 / 255.0);
         let scale = if a == 0.0 { 0.0 } else { 1.0 / a };
         let conv = |v: u8| -> u8 {
             let f = v as f32 * (1.0 / 255.0) * scale;
-            // to_unorm: round(min(max(0, v*255), 255)); round на AVX2 —
-            // cvtps_epi32, к ближайшему чётному.
+            // to_unorm: round(min(max(0, v*255), 255)); round on AVX2 is
+            // cvtps_epi32, round-half-even.
             let s = (f * 255.0).clamp(0.0, 255.0);
             s.round_ties_even() as u8
         };

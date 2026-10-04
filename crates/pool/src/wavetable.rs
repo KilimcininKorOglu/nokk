@@ -1,21 +1,17 @@
-//! Таблицы волн осциллятора — те же числа, что у браузера, до последнего бита.
+//! Oscillator wavetables, bit-exact with the browser.
 //!
-//! `OscillatorNode` звучит не синусом из библиотеки, а записью из таблицы,
-//! построенной заранее: браузер берёт коэффициенты ряда Фурье, обрезает
-//! гармоники выше предела для этой полосы высот и делает обратное
-//! преобразование Фурье **в одинарной точности**. Отпечаток по звуку — это,
-//! по сути, содержимое такой таблицы, и оно одинаково на всякой машине с той
-//! же сборкой браузера. Значит, сверять его можно точно — и нам нужно
-//! совпасть не «почти», а бит в бит.
+//! `OscillatorNode` plays from a precomputed table: Chrome takes the Fourier
+//! coefficients, drops harmonics above the limit for each pitch range, and runs
+//! the inverse FFT in single precision. The audio fingerprint is essentially
+//! that table's content, identical on every machine with the same Chrome
+//! build, so it must match bit for bit.
 //!
-//! Отсюда вендорённый PFFFT (см. `vendor/pffft`): порядок сложений в его
-//! бабочках определяет последние разряды каждого отсчёта. Честное
-//! преобразование в двойной точности, как и любая другая библиотека, даёт
-//! другие числа — проверено на снятой с Chrome таблице: совпадало 932 отсчёта
-//! из 4096, с этой — все 4096.
+//! Hence the vendored PFFFT (`vendor/pffft`): the addition order in its
+//! butterflies decides the last bits. A double-precision FFT matched only 932
+//! of 4096 samples of a table recorded from Chrome; PFFFT matches all 4096.
 //!
-//! Перенос `PeriodicWaveImpl::CreateBandLimitedTables` и
-//! `FFTFrame::PlatformDoInverseFFT` из Chrome 151.
+//! Port of `PeriodicWaveImpl::CreateBandLimitedTables` and
+//! `FFTFrame::PlatformDoInverseFFT` from Chrome 151.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -42,7 +38,7 @@ extern "C" {
     fn pffft_aligned_free(p: *mut core::ffi::c_void);
 }
 
-/// Обратное преобразование одного размера со своими буферами.
+/// Inverse FFT of one size with its own buffers.
 struct Inverse {
     size: usize,
     setup: *mut PffftSetup,
@@ -53,8 +49,8 @@ struct Inverse {
 
 impl Inverse {
     fn new(size: usize) -> Option<Self> {
-        // SAFETY: размер — степень двойки не меньше 32, такие PFFFT принимает;
-        // при отказе он отдаёт пустой указатель, и мы его проверяем.
+        // SAFETY: size is a power of two >= 32, which PFFFT accepts; on failure
+        // it returns null, which is checked.
         unsafe {
             let setup = pffft_new_setup(size as i32, PFFFT_REAL);
             if setup.is_null() {
@@ -71,12 +67,11 @@ impl Inverse {
         }
     }
 
-    /// `FFTFrame::PlatformDoInverseFFT`: половинки складываются в одну
-    /// комплексную запись, преобразование не нормирует, и результат делится
-    /// на размер.
+    /// `FFTFrame::PlatformDoInverseFFT`: halves packed into one complex
+    /// array, the transform is unnormalized, the result is divided by size.
     fn run(&mut self, real: &[f32], imag: &[f32], out: &mut [f32]) {
         let half = self.size / 2;
-        // SAFETY: буферы выделены на `size` чисел, пишем ровно столько.
+        // SAFETY: buffers hold `size` floats; exactly that many are written.
         unsafe {
             let inp = std::slice::from_raw_parts_mut(self.input, self.size);
             for k in 0..half {
@@ -101,7 +96,7 @@ impl Inverse {
 
 impl Drop for Inverse {
     fn drop(&mut self) {
-        // SAFETY: указатели получены от PFFFT и освобождаются один раз.
+        // SAFETY: pointers come from PFFFT and are freed once.
         unsafe {
             pffft_destroy_setup(self.setup);
             pffft_aligned_free(self.input as *mut _);
@@ -111,12 +106,12 @@ impl Drop for Inverse {
     }
 }
 
-/// Полос на октаву и центов на полосу — как у браузера.
+/// Ranges per octave and cents per range, as in the browser.
 const BANDS: f32 = 3.0;
 const CENTS_PER_RANGE: f32 = 1200.0 / BANDS;
 
-/// Размер таблицы для этой частоты дискретизации. Точки перелома браузерные:
-/// сорок четыре килогерца дают четыре тысячи записей.
+/// Table size for this sample rate; breakpoints are the browser's
+/// (44.1 kHz gives 4096).
 pub fn wave_size(sample_rate: f32) -> usize {
     if sample_rate <= 24000.0 {
         2048
@@ -127,20 +122,19 @@ pub fn wave_size(sample_rate: f32) -> usize {
     }
 }
 
-/// Сколько полос высот покрывает таблица.
+/// Number of pitch ranges the table covers.
 pub fn number_of_ranges(sample_rate: f32) -> usize {
     (0.5 + BANDS * (wave_size(sample_rate) as f32).log2()) as usize
 }
 
-/// Самая низкая основная частота, от которой считаются полосы.
+/// Lowest fundamental frequency the ranges start from.
 pub fn lowest_fundamental(sample_rate: f32) -> f32 {
     let nyquist = 0.5 * sample_rate;
     nyquist / (wave_size(sample_rate) / 2) as f32
 }
 
-/// Коэффициенты ряда Фурье для готовой формы. Все формы нечётные, поэтому у
-/// косинусов коэффициенты нулевые, а синусные считаются в одинарной точности —
-/// как в браузере, до последнего разряда.
+/// Fourier coefficients for a built-in shape. All shapes are odd, so cosine
+/// terms are zero; sine terms are computed in single precision as in the browser.
 fn basic_coefficients(shape: &str, half: usize) -> Vec<f32> {
     let mut imag = vec![0.0f32; half];
     for n in 1..half {
@@ -174,15 +168,15 @@ fn basic_coefficients(shape: &str, half: usize) -> Vec<f32> {
     imag
 }
 
-/// Сколько гармоник остаётся в этой полосе: чем выше тон, тем больше их
-/// приходится выбросить, чтобы не поймать зеркальные частоты.
+/// Harmonics kept in this range: the higher the pitch, the more are dropped
+/// to avoid aliasing.
 fn partials_for_range(range_index: usize, half: usize) -> usize {
     let cents_to_cull = range_index as f32 * CENTS_PER_RANGE;
     let culling_scale = 2.0f64.powf((-cents_to_cull / 1200.0) as f64) as f32;
     (culling_scale * half as f32) as usize
 }
 
-/// Все таблицы одной формы: `CreateBandLimitedTables` целиком.
+/// All tables for one shape: `CreateBandLimitedTables`.
 fn build(sample_rate: f32, real_src: &[f32], imag_src: &[f32], normalize: bool) -> Vec<Vec<f32>> {
     let size = wave_size(sample_rate);
     let half = size / 2;
@@ -192,13 +186,13 @@ fn build(sample_rate: f32, real_src: &[f32], imag_src: &[f32], normalize: bool) 
     };
     let components = real_src.len().min(half);
     let mut out = Vec::with_capacity(ranges);
-    // Множитель нормировки берётся с первой полосы — самой полной по звуку.
+    // Normalization factor comes from the first range (the fullest one).
     let mut normalization = 0.5f32;
     for range_index in 0..ranges {
         let mut real = vec![0.0f32; half];
         let mut imag = vec![0.0f32; half];
-        // Браузер домножает на размер, чтобы снять деление, которое сделает
-        // обратное преобразование, и берёт сопряжённое — оттого минус.
+        // Pre-multiply by size to cancel the inverse FFT's division, and
+        // conjugate (hence the minus).
         let scale = size as f32;
         for i in 0..components {
             real[i] = real_src[i] * scale;
@@ -209,7 +203,7 @@ fn build(sample_rate: f32, real_src: &[f32], imag_src: &[f32], normalize: bool) 
             real[i] = 0.0;
             imag[i] = 0.0;
         }
-        // Постоянная составляющая и упакованная частота Найквиста — в ноль.
+        // Zero the DC term and the packed Nyquist term.
         real[0] = 0.0;
         imag[0] = 0.0;
         let mut data = vec![0.0f32; size];
@@ -229,13 +223,13 @@ fn build(sample_rate: f32, real_src: &[f32], imag_src: &[f32], normalize: bool) 
 }
 
 thread_local! {
-    /// Таблицы живут до конца потока: страница, меряющая звук, просит их
-    /// десятками тысяч раз на один отсчёт.
+    /// Thread-lifetime cache: audio-fingerprinting pages request tables
+    /// tens of thousands of times.
     static CACHE: RefCell<HashMap<String, Vec<Vec<f32>>>> = RefCell::new(HashMap::new());
 }
 
-/// Таблица готовой формы (`sine`, `square`, `sawtooth`, `triangle`) для этой
-/// полосы высот. Пустой ответ — размер не по зубам PFFFT.
+/// Table for a built-in shape (`sine`, `square`, `sawtooth`, `triangle`) in this
+/// pitch range. Empty if PFFFT cannot handle the size.
 pub fn basic_table(shape: &str, sample_rate: f32, range_index: usize) -> Vec<f32> {
     let key = format!("{shape}@{sample_rate}");
     CACHE.with(|c| {
@@ -250,7 +244,7 @@ pub fn basic_table(shape: &str, sample_rate: f32, range_index: usize) -> Vec<f32
     })
 }
 
-/// Таблица для формы, заданной страницей через `createPeriodicWave`.
+/// Table for a page-defined shape from `createPeriodicWave`.
 pub fn custom_table(
     real: &[f32],
     imag: &[f32],
@@ -264,7 +258,7 @@ pub fn custom_table(
     let mut i = vec![0.0f32; n];
     r[..real.len().min(n)].copy_from_slice(&real[..real.len().min(n)]);
     i[..imag.len().min(n)].copy_from_slice(&imag[..imag.len().min(n)]);
-    // Без нормировки браузер оставляет постоянный множитель в половину.
+    // Without normalization the browser keeps a constant factor of 0.5.
     let tables = build(sample_rate, &r, &i, !disable_normalization);
     tables.get(range_index).cloned().unwrap_or_default()
 }
@@ -275,20 +269,19 @@ mod tests {
 
     #[test]
     fn the_sizes_are_the_ones_the_browser_uses() {
-        assert_eq!(wave_size(44100.0), 4096, "сорок четыре килогерца");
-        assert_eq!(wave_size(22050.0), 2048, "низкая частота — короткая таблица");
-        assert_eq!(wave_size(96000.0), 16384, "высокая — длинная");
-        assert_eq!(number_of_ranges(44100.0), 36, "три полосы на октаву");
+        assert_eq!(wave_size(44100.0), 4096, "44.1 kHz");
+        assert_eq!(wave_size(22050.0), 2048, "low rate, short table");
+        assert_eq!(wave_size(96000.0), 16384, "high rate, long table");
+        assert_eq!(number_of_ranges(44100.0), 36, "three ranges per octave");
         assert!((lowest_fundamental(44100.0) - 10.766602).abs() < 1e-4);
     }
 
-    /// Числа сняты с Chrome 151 на этой машине: таблица треугольника для
-    /// первой полосы при 44100 Гц. Сверяется побитно — приблизительного
-    /// совпадения тут мало, страница читает все разряды.
+    /// Values recorded from Chrome 151 on this machine: triangle table, first
+    /// range, 44100 Hz. Compared bit for bit, since the page reads every bit.
     #[test]
     fn a_triangle_table_matches_the_browser_bit_for_bit() {
         let t = basic_table("triangle", 44100.0, 1);
-        assert_eq!(t.len(), 4096, "таблица построена");
+        assert_eq!(t.len(), 4096, "table built");
         let want: [(usize, f32); 6] = [
             (0, 0.0),
             (1, 0.000976848),
@@ -300,21 +293,21 @@ mod tests {
         for (i, v) in want {
             assert!(
                 (t[i] - v).abs() < 1e-6,
-                "отсчёт {i}: {} против браузерного {v}",
+                "sample {i}: {} vs browser {v}",
                 t[i]
             );
         }
         let peak = t.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-        assert!((peak - 0.9999486).abs() < 1e-6, "пик таблицы: {peak}");
+        assert!((peak - 0.9999486).abs() < 1e-6, "table peak: {peak}");
     }
 
     #[test]
     fn a_sine_table_is_a_sine() {
         let t = basic_table("sine", 44100.0, 0);
         assert_eq!(t.len(), 4096);
-        // Чистый синус: четверть периода — единица, половина — ноль.
-        assert!((t[1024] - 1.0).abs() < 1e-6, "четверть периода: {}", t[1024]);
-        assert!(t[2048].abs() < 1e-6, "половина периода: {}", t[2048]);
-        assert!((t[3072] + 1.0).abs() < 1e-6, "три четверти: {}", t[3072]);
+        // Pure sine: 1 at a quarter period, 0 at half.
+        assert!((t[1024] - 1.0).abs() < 1e-6, "quarter period: {}", t[1024]);
+        assert!(t[2048].abs() < 1e-6, "half period: {}", t[2048]);
+        assert!((t[3072] + 1.0).abs() < 1e-6, "three quarters: {}", t[3072]);
     }
 }

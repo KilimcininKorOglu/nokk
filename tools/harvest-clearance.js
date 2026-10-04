@@ -1,22 +1,22 @@
 #!/usr/bin/env node
-// Снять `cf_clearance` настоящим Chrome — чтобы движок потом ходил по нему.
+// Harvest `cf_clearance` with a real Chrome so the engine can reuse it.
 //
-//   node tools/harvest-clearance.js <url> [секунд] [файл]
-//   PROFILE=/tmp/мой-профиль node tools/harvest-clearance.js https://цель/
+//   node tools/harvest-clearance.js <url> [seconds] [file]
+//   PROFILE=/tmp/my-profile node tools/harvest-clearance.js https://target/
 //
-// Замок Cloudflare привязан к отпечатку TLS того, кто его получил, к выходному
-// адресу и к версии браузера. Движок выдаёт себя за Chrome 151 и его JA4
-// совпадает с настоящим знак в знак, поэтому снятый здесь замок движок
-// принимает. Проверено на заставе `scrapingcourse.com/cloudflare-challenge`:
-// без замка «Just a moment…», с замком — сама страница.
+// The clearance is bound to the holder's TLS fingerprint, exit address and
+// browser version. The engine presents as Chrome 151 with an identical JA4, so
+// it accepts a clearance taken here. Verified on
+// `scrapingcourse.com/cloudflare-challenge`: "Just a moment…" without it, the
+// page itself with it.
 //
-// Браузер видимый (DISPLAY=:0): безголовый управляемую заставу проходит
-// заметно хуже. Ничего в страницу не внедряется — только сеть и список кук,
-// как в `netwatch.js`: инструмент, меняющий измеряемое, здесь не нужен.
+// The browser is headed (DISPLAY=:0): headless does noticeably worse on the
+// managed challenge. Nothing is injected into the page, only network and the
+// cookie list, as in `netwatch.js`.
 //
-// Дальше замок переносится в движок:
+// Then hand the clearance to the engine:
 //
-//   nokk --load https://цель/ --session-store ./sess --session cf \
+//   nokk --load https://target/ --session-store ./sess --session cf \
 //        --import-cookies cf_clearance.json
 const { spawn } = require('child_process');
 const http = require('http');
@@ -24,10 +24,10 @@ const fs = require('fs');
 
 const PORT = +(process.env.PORT || 9340);
 const URL_ = process.argv[2];
-const СРОК = +(process.argv[3] || 40) * 1000;
-const ФАЙЛ = process.argv[4] || 'cf_clearance.json';
+const TIMEOUT = +(process.argv[3] || 40) * 1000;
+const OUT_FILE = process.argv[4] || 'cf_clearance.json';
 if (!URL_) {
-  console.error('нужен адрес: node tools/harvest-clearance.js <url> [секунд] [файл]');
+  console.error('usage: node tools/harvest-clearance.js <url> [seconds] [file]');
   process.exit(2);
 }
 
@@ -40,69 +40,66 @@ const chrome = spawn('google-chrome', [
 ], { env: { ...process.env, DISPLAY: process.env.DISPLAY || ':0' }, stdio: 'ignore' });
 
 const get = (path) => new Promise((res, rej) => {
-  const попытка = (n) => http.get({ host: '127.0.0.1', port: PORT, path }, (r) => {
+  const attempt = (n) => http.get({ host: '127.0.0.1', port: PORT, path }, (r) => {
     let b = ''; r.on('data', (d) => b += d); r.on('end', () => res(JSON.parse(b)));
-  }).on('error', (e) => (n > 0 ? setTimeout(() => попытка(n - 1), 400) : rej(e)));
-  попытка(50);
+  }).on('error', (e) => (n > 0 ? setTimeout(() => attempt(n - 1), 400) : rej(e)));
+  attempt(50);
 });
 
-const конец = (код) => {
+const finish = (code) => {
   try { chrome.kill(); } catch (e) {}
-  // Выход сразу после печати обрезает вывод, когда он идёт в файл.
-  setTimeout(() => process.exit(код), 60);
+  // Exiting right after the write truncates output redirected to a file.
+  setTimeout(() => process.exit(code), 60);
 };
 
 (async () => {
-  const список = await get('/json/list');
-  const вкладка = список.find((t) => t.type === 'page');
-  const ws = new WebSocket(вкладка.webSocketDebuggerUrl);
+  const targets = await get('/json/list');
+  const tab = targets.find((t) => t.type === 'page');
+  const ws = new WebSocket(tab.webSocketDebuggerUrl);
   let id = 0;
-  const ждут = new Map();
+  const pending = new Map();
   const send = (method, params = {}) => new Promise((res) => {
-    const i = ++id; ждут.set(i, res);
+    const i = ++id; pending.set(i, res);
     ws.send(JSON.stringify({ id: i, method, params }));
   });
   ws.addEventListener('message', (ev) => {
     const m = JSON.parse(ev.data);
-    if (m.id && ждут.has(m.id)) { ждут.get(m.id)(m.result); ждут.delete(m.id); }
+    if (m.id && pending.has(m.id)) { pending.get(m.id)(m.result); pending.delete(m.id); }
   });
   await new Promise((r) => ws.addEventListener('open', r));
   await send('Network.enable');
   await send('Page.enable');
   await send('Page.navigate', { url: URL_ });
 
-  // Ждём не по часам, а по делу: как только замок появился — уходим. Застава
-  // с проверкой в фоне отдаёт его через несколько секунд, управляемая — после
-  // нажатия, и лишнее ожидание тут стоит дороже, чем кажется: каждое
-  // обращение к заставе тратит доверие к адресу.
-  const хост = new URL(URL_).hostname;
-  const корень = хост.split('.').slice(-2).join('.');
-  const срок = Date.now() + СРОК;
-  let замок = null, куки = [];
-  while (Date.now() < срок) {
+  // Leave as soon as the clearance appears: every extra hit on the challenge
+  // costs the address reputation.
+  const host = new URL(URL_).hostname;
+  const root = host.split('.').slice(-2).join('.');
+  const deadline = Date.now() + TIMEOUT;
+  let clearance = null, cookies = [];
+  while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 1000));
-    const { cookies } = await send('Network.getAllCookies');
-    куки = cookies.filter((c) => c.domain.replace(/^\./, '').endsWith(корень));
-    замок = куки.find((c) => c.name === 'cf_clearance') || null;
-    if (замок) break;
+    const { cookies: all } = await send('Network.getAllCookies');
+    cookies = all.filter((c) => c.domain.replace(/^\./, '').endsWith(root));
+    clearance = cookies.find((c) => c.name === 'cf_clearance') || null;
+    if (clearance) break;
   }
 
-  const банка = {};
-  for (const c of куки) банка[c.name] = c.value;
-  fs.writeFileSync(ФАЙЛ, JSON.stringify({ cookies: банка, domain: хост, url: URL_ }, null, 1));
-  const имена = куки.map((c) => c.name).join(', ');
-  // Срок в самой куке — год, и верить ему нельзя: годность решает сторона
-  // Cloudflare, а она смотрит ещё на адрес и на отпечаток. Печатаем как есть,
-  // но живой замок или нет — отвечает движок (`--fail-on-challenge`).
-  const срокЗамка = замок && замок.expires > 0
-    ? `, в куке до ${new Date(замок.expires * 1000).toISOString().replace('T', ' ').slice(0, 19)}`
+  const jar = {};
+  for (const c of cookies) jar[c.name] = c.value;
+  fs.writeFileSync(OUT_FILE, JSON.stringify({ cookies: jar, domain: host, url: URL_ }, null, 1));
+  const names = cookies.map((c) => c.name).join(', ');
+  // The cookie's own expiry (a year) means little: Cloudflare also checks
+  // address and fingerprint. Use `--fail-on-challenge` to test it for real.
+  const expiry = clearance && clearance.expires > 0
+    ? `, cookie expires ${new Date(clearance.expires * 1000).toISOString().replace('T', ' ').slice(0, 19)}`
     : '';
   process.stdout.write(
-    `кук с ${корень}: ${куки.length} (${имена})\n`
-    + (замок ? `cf_clearance: ${замок.value.slice(0, 32)}…${срокЗамка} → ${ФАЙЛ}\n`
-             : `cf_clearance не появился за ${СРОК / 1000} с — в файле только остальные куки\n`),
-    () => конец(замок ? 0 : 1),
+    `cookies for ${root}: ${cookies.length} (${names})\n`
+    + (clearance ? `cf_clearance: ${clearance.value.slice(0, 32)}…${expiry} → ${OUT_FILE}\n`
+             : `no cf_clearance within ${TIMEOUT / 1000} s; file has the other cookies only\n`),
+    () => finish(clearance ? 0 : 1),
   );
 })().catch((e) => {
-  process.stdout.write(`ошибка: ${e.message}\n`, () => конец(2));
+  process.stdout.write(`error: ${e.message}\n`, () => finish(2));
 });

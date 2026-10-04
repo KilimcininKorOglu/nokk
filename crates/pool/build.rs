@@ -1,9 +1,9 @@
-//! Сборка вендорённого PFFFT — того же, что лежит в Chrome 151.
+//! Builds the vendored PFFFT, the same copy Chrome 151 ships.
 //!
-//! Таблицы волн осциллятора браузер строит обратным преобразованием этой
-//! библиотеки в одинарной точности, и последние разряды каждого отсчёта
-//! зависят от порядка сложений в её бабочках. Своя реализация даёт другие
-//! числа (проверено: из 4096 отсчётов совпадало 932), а страница их сверяет.
+//! Chrome builds oscillator wave tables with this library's single-precision
+//! inverse FFT; the low bits of every sample depend on the summation order in
+//! its butterflies. Another implementation gives different numbers (only 932
+//! of 4096 samples matched), and pages fingerprint them.
 
 fn main() {
     println!("cargo:rerun-if-changed=vendor/pffft/pffft.c");

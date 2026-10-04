@@ -1,10 +1,10 @@
-//! Растр 2D-холста «как у Chrome 151»: путь строится по правилам Blink,
-//! рёбра и покрытие — по Skia (аналитическое сглаживание), пиксели — по
-//! lowp-конвейеру SkRasterPipeline. Поверхность — RGBA8888 premul.
+//! 2D canvas raster matching Chrome 151: paths built by Blink rules,
+//! edges and coverage by Skia (analytic AA), pixels by the lowp
+//! SkRasterPipeline. Surface is RGBA8888 premul.
 //!
-//! Вход — поток операций холста в координатах страницы (как их получил
-//! JS, уже приведённых к float) и матрица холста; всё остальное —
-//! здесь, в том же порядке и с той же арифметикой, что в браузере.
+//! Input is the canvas op stream in page coordinates (already float, as JS
+//! produced them) plus the canvas matrix; everything else happens here in
+//! the same order and arithmetic as the browser.
 
 pub mod aaa;
 pub mod blit;
@@ -25,7 +25,7 @@ use gradient::GradientDesc;
 use path::{create_draw_arc_path, oval_path, CanvasPath, Drawable, FillType, Path, PathBuilder};
 use pipeline::PipelineBlitter;
 
-/// Коды операций потока пути (см. `fillOps` в JS холста).
+/// Path stream opcodes (see `fillOps` in the canvas JS).
 pub const OP_MOVE: i32 = 0;
 pub const OP_LINE: i32 = 1;
 pub const OP_QUAD: i32 = 2;
@@ -34,10 +34,9 @@ pub const OP_CLOSE: i32 = 4;
 pub const OP_ARC: i32 = 5;
 pub const OP_ELLIPSE: i32 = 6;
 pub const OP_RECT: i32 = 7;
-/// `fillRect`: тот же прямоугольник, но маршрут `drawRect` (SkScan::AntiFillRect).
+/// `fillRect`: same rectangle, but via `drawRect` (SkScan::AntiFillRect).
 pub const OP_DRAW_RECT: i32 = 8;
 
-/// Собрать `CanvasPath` из потока операций.
 pub fn canvas_path_from_ops(ops: &[f32]) -> CanvasPath {
     let mut cp = CanvasPath::new();
     let mut i = 0usize;
@@ -89,7 +88,7 @@ pub fn canvas_path_from_ops(ops: &[f32]) -> CanvasPath {
     cp
 }
 
-/// Номер `globalCompositeOperation` из JS → `SkBlendMode` (таблица GCO).
+/// JS `globalCompositeOperation` index -> `SkBlendMode`.
 pub fn blend_mode_from_index(i: u32) -> BlendMode {
     match i {
         1 => BlendMode::SrcIn,
@@ -121,14 +120,14 @@ pub fn blend_mode_from_index(i: u32) -> BlendMode {
     }
 }
 
-/// Краска холста: однотонная или градиент.
+/// Canvas paint: solid color or gradient.
 #[derive(Clone, Debug)]
 pub enum PaintKind {
     Solid([u8; 4]),
     Gradient(GradientDesc),
 }
 
-/// Тень: размытие (радиус, сигма = половина), снос в координатах холста, цвет.
+/// Shadow: blur (radius, sigma = half), offset in canvas coordinates, color.
 #[derive(Clone, Copy, Debug)]
 pub struct Shadow {
     pub blur: f32,
@@ -138,7 +137,7 @@ pub struct Shadow {
 }
 
 impl Shadow {
-    /// Из описания JS `[размытие, сносX, сносY, r, g, b, a]`.
+    /// From the JS tuple `[blur, offsetX, offsetY, r, g, b, a]`.
     pub fn parse(sh: &[f32]) -> Option<Shadow> {
         if sh.len() < 7 {
             return None;
@@ -155,26 +154,26 @@ impl Shadow {
     }
 }
 
-/// Слой рисования (DrawLooper): для тени — маска-фильтр размытия, цветовой
-/// фильтр «цвет тени IN краска» и снос; для содержимого — как есть.
+/// Draw layer (DrawLooper): for the shadow, a blur mask filter, a
+/// "shadow color IN paint" color filter and the offset; content as is.
 struct Layer {
     ctm: Matrix,
     sigma: Option<f64>,
     filter: Option<[u8; 4]>,
 }
 
-/// Что рисуем: заливку или волосяной штрих с покрытием.
+/// What to draw: a fill or a hairline stroke with coverage.
 #[derive(Clone, Copy)]
 enum Style {
     Fill,
-    /// `drawRect`: прямоугольник в координатах пользователя; под матрицей,
-    /// сохраняющей прямоугольники, идёт через AntiFillRect, иначе как путь.
+    /// `drawRect`: rect in user space; under a rect-preserving matrix it goes
+    /// through AntiFillRect, otherwise as a path.
     Rect(Rect),
     Hairline { coverage: f32 },
 }
 
-/// `SkColorFilter::filterColor4f` для srcin: цвет тени через альфу краски,
-/// как это делает `SkPaintPriv::RemoveColorFilter` для однотонной краски.
+/// `SkColorFilter::filterColor4f` for srcin: shadow color times paint alpha,
+/// as `SkPaintPriv::RemoveColorFilter` does for a solid paint.
 fn shadow_solid_color(paint: [u8; 4], shadow: [u8; 4]) -> [u8; 4] {
     let f = |v: u8| v as f32 * (1.0 / 255.0);
     let pa = f(paint[3]);
@@ -186,12 +185,12 @@ fn shadow_solid_color(paint: [u8; 4], shadow: [u8; 4]) -> [u8; 4] {
     let inv = 1.0 / out[3];
     let inv = if inv.is_finite() { inv } else { 0.0 };
     let un = [out[0] * inv, out[1] * inv, out[2] * inv, out[3]];
-    // toSkColor: pin(v·255 + 0.5, 0, 255) с отбрасыванием дроби.
+    // toSkColor: pin(v*255 + 0.5, 0, 255), fraction truncated.
     let b = |v: f32| (v * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
     [b(un[0]), b(un[1]), b(un[2]), b(un[3])]
 }
 
-/// `DrawTreatAsHairline` + `modifyPaintForHairlines`: покрытие тонкого штриха.
+/// `DrawTreatAsHairline` + `modifyPaintForHairlines`: thin stroke coverage.
 fn hairline_coverage(line_width: f32, ctm: &Matrix) -> Option<f32> {
     if line_width == 0.0 {
         return Some(1.0);
@@ -212,8 +211,8 @@ fn hairline_coverage(line_width: f32, ctm: &Matrix) -> Option<f32> {
     }
 }
 
-/// Блиттер слоя под краску: сплошной цвет — старые блиттеры SkARGB32,
-/// градиент — конвейер растра.
+/// Layer blitter for the paint: solid color uses the legacy SkARGB32
+/// blitters, gradients the raster pipeline.
 struct LayerBlitter<'a> {
     solid: Option<SolidBlitter<'a>>,
     pipe: Option<PipelineBlitter<'a>>,
@@ -249,7 +248,7 @@ impl<'a> LayerBlitter<'a> {
     }
 }
 
-/// Один слой: краска → блиттер → (маска + размытие |) растр.
+/// One layer: paint -> blitter -> (mask + blur |) raster.
 #[allow(clippy::too_many_arguments)]
 fn draw_layer(data: &mut [u8], w: u32, h: u32, dev: &Path, style: Style, paint: &PaintKind, alpha: u8, mode: BlendMode, layer: &Layer) -> bool {
     let clip = IRect::from_ltrb(0, 0, w as i32, h as i32);
@@ -265,15 +264,15 @@ fn draw_layer(data: &mut [u8], w: u32, h: u32, dev: &Path, style: Style, paint: 
             }
             let mut image = vec![0u8; (mw * mh) as usize];
             {
-                // draw_into_mask: путь со сдвигом в маску, окно — сама маска.
-                // Как SkPathData::MakeTransform + Raw(kYes): выпуклость считается
-                // заново по сдвинутым точкам (transform её сбрасывает).
+                // draw_into_mask: path offset into the mask, clip is the mask itself.
+                // Like SkPathData::MakeTransform + Raw(kYes): convexity is recomputed
+                // from the offset points (transform resets it).
                 let mut shifted = dev.transform(&Matrix::translate(-bounds.left as f32, -bounds.top as f32));
                 shifted.resolve_convexity();
                 let mut a8 = blur::A8Blitter::new(&mut image, mw, mh);
                 let mclip = IRect::from_ltrb(0, 0, mw, mh);
                 match style {
-                    // С маской-фильтром drawRect тоже идёт как путь (kPath_RectType).
+                    // With a mask filter drawRect also goes as a path (kPath_RectType).
                     Style::Fill | Style::Rect(_) => aaa::anti_fill_path(&shifted, &mclip, &mut a8),
                     Style::Hairline { .. } => hair::anti_hair_path(&shifted, &mclip, &mut a8),
                 }
@@ -290,7 +289,7 @@ fn draw_layer(data: &mut [u8], w: u32, h: u32, dev: &Path, style: Style, paint: 
         Style::Fill => aaa::anti_fill_path(dev, &clip, blitter),
         Style::Rect(r) => {
             if layer.ctm.rect_stays_rect() {
-                // SkDraw::drawRect: две угловые точки через матрицу, sort.
+                // SkDraw::drawRect: two corner points through the matrix, sorted.
                 let mut pts = [Point::new(r.left, r.top), Point::new(r.right, r.bottom)];
                 layer.ctm.map_points(&mut pts);
                 let dev_r = Rect::from_ltrb(pts[0].x, pts[0].y, pts[1].x, pts[1].y).sorted();
@@ -306,13 +305,13 @@ fn draw_layer(data: &mut [u8], w: u32, h: u32, dev: &Path, style: Style, paint: 
     true
 }
 
-/// Рисование пути краской с тенью: слои как у `cc::DrawLooper`.
+/// Draw a path with paint and shadow: layers as in `cc::DrawLooper`.
 #[allow(clippy::too_many_arguments)]
 fn draw_with_layers(data: &mut [u8], w: u32, h: u32, path: &Path, ctm: &Matrix, line_width: Option<f32>, rect: Option<Rect>, paint: &PaintKind, shadow: Option<Shadow>, mode: BlendMode) -> bool {
     if !path.is_finite() {
         return true;
     }
-    // Волосяной штрих: покрытие переходит в альфу краски.
+    // Hairline: coverage folds into the paint alpha.
     let mut alpha: u8 = 255;
     let style = match line_width {
         None => match rect {
@@ -341,7 +340,7 @@ fn draw_with_layers(data: &mut [u8], w: u32, h: u32, path: &Path, ctm: &Matrix, 
     layers.push(Layer { ctm: *ctm, sigma: None, filter: None });
     let clip = IRect::from_ltrb(0, 0, w as i32, h as i32);
     for layer in &layers {
-        // internalQuickReject по границам пути в device space.
+        // internalQuickReject on the path bounds in device space.
         let dev_bounds = layer.ctm.map_rect(&path.bounds());
         if !dev_bounds.is_finite() {
             continue;
@@ -358,7 +357,7 @@ fn draw_with_layers(data: &mut [u8], w: u32, h: u32, path: &Path, ctm: &Matrix, 
     true
 }
 
-/// Путь для заливки/обводки из операций холста (Blink `DrawPathInternal`).
+/// Fill/stroke path from canvas ops (Blink `DrawPathInternal`).
 fn path_for_ops(ops: &[f32], even_odd: bool, is_fill: bool) -> Option<Path> {
     let cp = canvas_path_from_ops(ops);
     let fill_type = if even_odd { FillType::EvenOdd } else { FillType::Winding };
@@ -401,11 +400,11 @@ fn ctm_of(ctm: [f32; 6]) -> Matrix {
     Matrix { sx: ctm[0], ky: ctm[1], kx: ctm[2], sy: ctm[3], tx: ctm[4], ty: ctm[5] }
 }
 
-/// `fill()` холста: поток операций, матрица холста, правило заливки,
-/// краска, тень и режим наложения — в поверхность `data` (w×h RGBA premul).
+/// Canvas `fill()`: op stream, canvas matrix, fill rule, paint, shadow and
+/// blend mode, into surface `data` (w x h RGBA premul).
 #[allow(clippy::too_many_arguments)]
 pub fn fill_ops_paint(data: &mut [u8], w: u32, h: u32, ops: &[f32], ctm: [f32; 6], even_odd: bool, paint: &PaintKind, shadow: Option<Shadow>, mode: u32) {
-    // fillRect: один прямоугольник маршрутом drawRect.
+    // fillRect: a single rectangle via drawRect.
     let mut rect = None;
     if ops.len() == 5 && ops[0] == OP_DRAW_RECT as f32 {
         let r = Rect::from_ltrb(ops[1], ops[2], ops[1] + ops[3], ops[2] + ops[4]);
@@ -418,23 +417,23 @@ pub fn fill_ops_paint(data: &mut [u8], w: u32, h: u32, ops: &[f32], ctm: [f32; 6
     draw_with_layers(data, w, h, &path, &ctm_of(ctm), None, rect, paint, shadow, blend_mode_from_index(mode));
 }
 
-/// Однотонная заливка (совместимый вход).
+/// Solid fill (compat entry point).
 pub fn fill_ops(data: &mut [u8], w: u32, h: u32, ops: &[f32], ctm: [f32; 6], even_odd: bool, rgba: [u8; 4], mode: u32) {
     fill_ops_paint(data, w, h, ops, ctm, even_odd, &PaintKind::Solid(rgba), None, mode);
 }
 
-/// `stroke()` холста. Возвращает false, если штрих не волосяной (толще
-/// пикселя устройства) — тогда рисует прежний растр.
+/// Canvas `stroke()`. Returns false if the stroke is not a hairline (wider
+/// than a device pixel); the caller then uses the old rasterizer.
 #[allow(clippy::too_many_arguments)]
 pub fn stroke_ops(data: &mut [u8], w: u32, h: u32, ops: &[f32], ctm: [f32; 6], line: &LineStyle, paint: &PaintKind, shadow: Option<Shadow>, mode: u32) -> bool {
     let Some(path) = path_for_ops(ops, false, false) else { return true };
     let m = ctm_of(ctm);
-    // Тонкий штрих — волосяной путь Skia (DrawTreatAsHairline).
+    // Thin stroke: Skia hairline path (DrawTreatAsHairline).
     if hairline_coverage(line.width, &m).is_some() {
         return draw_with_layers(data, w, h, &path, &m, Some(line.width), None, paint, shadow, blend_mode_from_index(mode));
     }
-    // Иначе FillPathWithPaint: обводка в координатах пользователя с resScale
-    // от матрицы, затем заливка контура как пути.
+    // Otherwise FillPathWithPaint: stroke in user space with resScale from
+    // the matrix, then fill the outline as a path.
     if !path.is_finite() {
         return true;
     }
@@ -446,8 +445,8 @@ pub fn stroke_ops(data: &mut [u8], w: u32, h: u32, ops: &[f32], ctm: [f32; 6], l
     draw_with_layers(data, w, h, &stroked, &m, None, None, paint, shadow, blend_mode_from_index(mode))
 }
 
-/// Параметры штриха холста: ширина, концы (0 butt, 1 round, 2 square), стыки
-/// (0 miter, 1 round, 2 bevel), предел скоса.
+/// Canvas stroke params: width, caps (0 butt, 1 round, 2 square), joins
+/// (0 miter, 1 round, 2 bevel), miter limit.
 #[derive(Clone, Copy, Debug)]
 pub struct LineStyle {
     pub width: f32,
@@ -472,16 +471,16 @@ impl LineStyle {
     }
 }
 
-/// Текст холста (`fillText`): слои как у путей, глифы как у Skia поверх
-/// Fontations (см. `text.rs`). `align`: 0 start/left, 1 center, 2 right/end;
+/// Canvas text (`fillText`): layers as for paths, glyphs as Skia on top of
+/// Fontations (see `text.rs`). `align`: 0 start/left, 1 center, 2 right/end;
 /// `baseline`: 0 alphabetic, 1 top/hanging, 2 middle, 3 bottom/ideographic.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_text(data: &mut [u8], w: u32, h: u32, fonts: &[&'static [u8]], glyphs: &[text::ShapedGlyph], width: f32, x: f32, y: f32, ctm: [f32; 6], eff: f32, align: u32, baseline: u32, line: Option<&LineStyle>, paint: &PaintKind, shadow: Option<Shadow>, mode: u32) -> bool {
     if !x.is_finite() || !y.is_finite() || glyphs.is_empty() || fonts.is_empty() {
         return true;
     }
-    // strokeText: штрих контура глифа в пространстве кегля (`internalGetPath`),
-    // ширина 0 — волосяной глиф, его пока нет.
+    // strokeText: stroke the glyph outline in text-size space (`internalGetPath`);
+    // width 0 would be a hairline glyph, not implemented yet.
     let stroke_params = match line {
         Some(l) if l.width > 0.0 => Some(stroke::StrokeParams { width: l.width, miter_limit: l.miter_limit, cap: l.cap, join: l.join, res_scale: 1.0 }),
         Some(_) => return false,
@@ -491,8 +490,8 @@ pub fn draw_text(data: &mut [u8], w: u32, h: u32, fonts: &[&'static [u8]], glyph
     let Some(first) = glyphs.first() else { return true };
     let Ok(font) = skrifa::FontRef::new(fonts[first.font]) else { return true };
     let m = ctm_of(ctm);
-    // MakeRecAndEffects: fPost2x2 из матрицы устройства через sk_relax
-    // (округление до 1/1024) — по типу матрицы, как считает SkMatrix.
+    // MakeRecAndEffects: fPost2x2 from the device matrix via sk_relax
+    // (rounded to 1/1024), per matrix type as SkMatrix computes it.
     let relax = |x: f32| (x * 1024.0).round() / 1024.0;
     let affine = m.kx != 0.0 || m.ky != 0.0;
     let scaled = affine || m.sx != 1.0 || m.sy != 1.0;
@@ -504,15 +503,15 @@ pub fn draw_text(data: &mut [u8], w: u32, h: u32, fonts: &[&'static [u8]], glyph
         tx: 0.0,
         ty: 0.0,
     };
-    // Скейлер на каждый шрифт цепочки, что встретился в строке.
+    // One scaler per fallback-chain font used in the string.
     let font_refs: Vec<Option<skrifa::FontRef>> = fonts.iter().map(|b| skrifa::FontRef::new(b).ok()).collect();
     let scalers: Vec<Option<text::Scaler>> = fonts
         .iter()
         .zip(font_refs.iter())
         .map(|(b, f)| f.as_ref().and_then(|f| text::Scaler::new(b, f, eff, &post)))
         .collect();
-    // Расположение как в DrawTextInternal: выравнивание по ширине, базовая
-    // линия — по метрикам шрифта (alphabetic = 0).
+    // Placement as in DrawTextInternal: align by width, baseline from font
+    // metrics (alphabetic = 0).
     let mut loc = Point::new(x, y);
     match align {
         1 => loc.x -= width / 2.0,
@@ -551,7 +550,7 @@ pub fn draw_text(data: &mut [u8], w: u32, h: u32, fonts: &[&'static [u8]], glyph
         let pos_m = text::pre_translate(&layer.ctm, loc.x, loc.y);
         for g in glyphs {
             let Some(scaler) = scalers.get(g.font).and_then(|s| s.as_ref()) else { continue };
-            // Картиночный знак (цветной смайлик) рисуется отдельно, после слоёв.
+            // Bitmap glyphs (color emoji) are drawn separately, after the layers.
             if scaler.path(g.gid).is_none_or(|p| p.pts.is_empty()) {
                 if layer.filter.is_none() && stroke_params.is_none() {
                     bitmap_glyphs.push((g.font, g.gid, pos_m.sx * g.x + pos_m.tx, pos_m.ky * g.x + pos_m.ty));
@@ -566,7 +565,7 @@ pub fn draw_text(data: &mut [u8], w: u32, h: u32, fonts: &[&'static [u8]], glyph
             let Some(mut mask) = mask else { continue };
             match layer.sigma {
                 Some(sigma) => {
-                    // Маска-фильтр в контексте скейлера: без гамма-таблицы.
+                    // Mask filter in the scaler context: no gamma table.
                     let Some(blurred) = text::blur_mask(&mask, sigma) else { continue };
                     text::blit_glyph(blitter, &blurred, dp.x, dp.y, &clip);
                 }
@@ -577,10 +576,10 @@ pub fn draw_text(data: &mut [u8], w: u32, h: u32, fonts: &[&'static [u8]], glyph
             }
         }
     }
-    // Цветные знаки-картинки (Noto Color Emoji, CBDT): у Chrome FreeType даёт
-    // растр полосы, Skia масштабирует его к кеглю; цвет — свой, от заливки
-    // берётся только прозрачность. Флаг-смайлик 1px на холсте 1×1 — проба
-    // челленджа (секция pYHZ2): у Chrome пиксель цветной, у нас был пустой.
+    // Color bitmap glyphs (Noto Color Emoji, CBDT): in Chrome FreeType yields
+    // the strike bitmap and Skia scales it to the text size; color is its own,
+    // only alpha comes from the fill. A 1px flag emoji on a 1x1 canvas is a
+    // challenge probe (section pYHZ2): Chrome's pixel is colored.
     let alpha = match paint {
         PaintKind::Solid(c) => c[3] as f32 / 255.0,
         PaintKind::Gradient(_) => 1.0,
@@ -594,14 +593,14 @@ pub fn draw_text(data: &mut [u8], w: u32, h: u32, fonts: &[&'static [u8]], glyph
     true
 }
 
-/// Без `render` таблицы шрифта не разбираем (ttf-parser — зависимость
-/// растеризатора): цветной знак просто не рисуется.
+/// Without `render` font tables are not parsed (ttf-parser is a rasterizer
+/// dependency): color glyphs are just not drawn.
 #[cfg(not(feature = "render"))]
 #[allow(clippy::too_many_arguments)]
 fn draw_bitmap_glyph(_data: &mut [u8], _w: u32, _h: u32, _font: &[u8], _gid: u16, _x: f32, _y: f32, _size: f32, _alpha: f32) {}
 
-/// Растровый знак шрифта (PNG полосы CBDT/sbix) — в буфер premul RGBA:
-/// масштаб площадным усреднением, наложение source-over.
+/// Bitmap glyph (CBDT/sbix PNG strike) into a premul RGBA buffer:
+/// area-average scaling, source-over compositing.
 #[cfg(feature = "render")]
 #[allow(clippy::too_many_arguments)]
 fn draw_bitmap_glyph(data: &mut [u8], w: u32, h: u32, font: &[u8], gid: u16, x: f32, y: f32, size: f32, alpha: f32) {
@@ -611,7 +610,7 @@ fn draw_bitmap_glyph(data: &mut [u8], w: u32, h: u32, font: &[u8], gid: u16, x: 
         return;
     }
     let mut dec = png::Decoder::new(std::io::Cursor::new(img.data));
-    // Полосы Noto Color Emoji — палитровые PNG с tRNS: раскрыть в RGBA.
+    // Noto Color Emoji strikes are palette PNGs with tRNS: expand to RGBA.
     dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let Ok(mut reader) = dec.read_info() else { return };
     let mut buf = vec![0u8; reader.output_buffer_size()];
@@ -700,11 +699,11 @@ fn draw_bitmap_glyph(data: &mut [u8], w: u32, h: u32, font: &[u8], gid: u16, x: 
 }
 
 fn rect_touches(r: &Rect, c: &IRect) -> bool {
-    // Пустой в float прямоугольник (нулевая ширина) всё же может лежать в окне.
+    // An empty-in-float rect (zero width) can still lie inside the clip.
     r.right >= c.left as f32 && r.left <= c.right as f32 && r.bottom >= c.top as f32 && r.top <= c.bottom as f32
 }
 
-/// `getImageData`: premul → straight, как `readPixels(kUnpremul)`.
+/// `getImageData`: premul -> straight, like `readPixels(kUnpremul)`.
 pub fn read_unpremul(data: &[u8], out: &mut [u8]) {
     blit::read_unpremul(data, out)
 }
@@ -717,7 +716,7 @@ mod tests {
     use super::*;
 
     fn circle_ops() -> Vec<f32> {
-        // Программа блока 49×44 челленджа (см. .nokk-notes/chl_canvas_ops_2026-09-25.txt).
+        // The challenge's 49x44 block program (see .nokk-notes/chl_canvas_ops_2026-09-25.txt).
         vec![]
     }
 
@@ -738,8 +737,8 @@ mod tests {
 
     #[test]
     fn dump_cases() {
-        // NOKK_SKIA_CASES=out.json: рисует набор фигур 48×48 и пишет base64 буферов
-        // (сверка с Chrome: scratchpad/cmp_cases.py).
+        // NOKK_SKIA_CASES=out.json: draws a set of 48x48 shapes and writes the buffers
+        // as base64.
         let Some(out) = std::env::var_os("NOKK_SKIA_CASES") else { return };
         let (w, h) = (48u32, 48u32);
         let m = OP_MOVE as f32; let l = OP_LINE as f32; let c = OP_CLOSE as f32; let q = OP_QUAD as f32;
@@ -767,8 +766,8 @@ mod tests {
 
     #[test]
     fn partial_row_of_draw_rect_is_not_snapped() {
-        // fillRect идёт маршрутом drawRect (AntiFillRect): нижняя строка 38..38.4
-        // даёт покрытие 0.4 → 102, а не 0.5 → 128, как дал бы путь со снапом.
+        // fillRect goes via drawRect (AntiFillRect): bottom row 38..38.4 gives
+        // coverage 0.4 -> 102, not 0.5 -> 128 as a snapped path would.
         let (w, h) = (48u32, 48u32);
         let ops = [OP_DRAW_RECT as f32, 0.0, 0.0, 100.0, 100.0];
         let mut data = vec![0u8; (w * h * 4) as usize];
@@ -805,7 +804,7 @@ mod dump_tests {
 
     #[test]
     fn dump_oval_quads() {
-        // Овал круга (80,40) r40 при масштабе 0.4 → device (16,0)-(48,32).
+        // Circle oval (80,40) r40 at scale 0.4 -> device (16,0)-(48,32).
         let p = oval_path(&Rect::from_ltrb(40.0, 0.0, 120.0, 80.0));
         let d = p.transform(&Matrix::scale(0.4, 0.4));
         let mut pi = 0usize;

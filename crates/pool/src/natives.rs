@@ -31,15 +31,14 @@ type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 /// second window from it without handing the source to the page.
 pub struct RealmBootstrap(pub String);
 
-/// Запас заранее построенных реалмов. Построить реалм — это новый контекст и
-/// весь бутстрап, 50–90 мс; в браузере пустой кадр появляется за миллисекунду.
-/// Программа челленджа вставляет такие кадры по нескольку раз и меряет себя
-/// часами, так что каждая постройка на месте удлиняла её этапы втрое против
-/// Chrome. Запас наполняется заранее, а выдаётся мгновенно.
+/// Pool of prebuilt realms. Building one (new context plus the whole bootstrap)
+/// takes 50-90 ms, while Chrome creates an empty frame in about 1 ms. The
+/// challenge inserts such frames several times and times itself, so on-demand
+/// building tripled its stage times. Filled ahead, handed out instantly.
 #[derive(Default)]
 pub struct SpareRealms(pub Vec<v8::Global<v8::Context>>);
 
-/// Запас готовых контекстов для воркеров — см. `Isolate::prewarm_contexts`.
+/// Prebuilt worker contexts, see `Isolate::prewarm_contexts`.
 #[derive(Default)]
 pub struct SpareContexts(pub Vec<v8::Global<v8::Context>>);
 
@@ -100,7 +99,7 @@ pub fn install(scope: &mut v8::PinScope) {
         bind(scope, "__pt_canvasBlit", canvas_blit);
     }
 
-    // Классический скрипт страницы исполняется настоящим скриптом.
+    // Classic page scripts run as real scripts, not via eval.
     bind(scope, "__pt_evalScript", eval_script);
 
     // Optional real WebGL (the `webgl` feature) — a headless Mesa GL context. Their
@@ -328,7 +327,7 @@ fn canvas_text_ops(
     rv.set_bool(ok);
 }
 
-/// `__pt_localFont(name)` — есть ли в системе шрифт с таким именем.
+/// `__pt_localFont(name)`: whether a system font with this name exists.
 #[cfg(feature = "render")]
 fn local_font(
     scope: &mut v8::PinScope,
@@ -393,7 +392,7 @@ fn canvas_fill_path(
 }
 
 /// `__pt_canvasFillOps(id, opsF32, ctmF32, evenOdd, r, g, b, a, shF32, mode)` —
-/// заливка по операциям пути (координаты страницы) и матрице холста.
+/// fill from path ops (page coordinates) and the canvas matrix.
 #[cfg(feature = "render")]
 fn canvas_fill_ops(
     scope: &mut v8::PinScope,
@@ -587,14 +586,12 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
         .map_err(|_| ())
 }
 
-/// Файлы источника (OPFS) — настоящие.
+/// Real files behind OPFS.
 ///
-/// Всё дерево живёт в памяти, и это ничему не мешало, пока не выяснилось, что
-/// челлендж засекает ровно `flush()`: у браузера это запись на диск и ожидание
-/// её завершения, около четырёх миллисекунд, а пустая функция стоит ноль.
-/// Столько не стоит ни одна настоящая файловая система, и ноль виден сразу.
-/// Поэтому синхронная ручка держит за собой файл во временном каталоге:
-/// содержимое по-прежнему в памяти, а `flush` честно кладёт его на диск.
+/// The tree lives in memory, but the challenge times `flush()`: in Chrome it is
+/// a disk write plus wait, about 4 ms, and a no-op costing zero is obvious.
+/// So a sync handle keeps a temp file: content stays in memory, `flush`
+/// actually writes it to disk.
 #[cfg(feature = "render")]
 mod opfs {
     use std::cell::RefCell;
@@ -607,8 +604,8 @@ mod opfs {
         static NEXT: RefCell<u32> = const { RefCell::new(0) };
     }
 
-    /// Один каталог на процесс, внутри временного. Имя файла — из ключа, а всё,
-    /// что не буква и не цифра, заменяется: путь приходит со страницы.
+    /// One directory per process under the temp dir. The file name comes from
+    /// the key with non-alphanumerics replaced, since the path comes from the page.
     fn path_for(key: &str) -> std::path::PathBuf {
         let safe: String = key
             .chars()
@@ -639,7 +636,7 @@ mod opfs {
         })
     }
 
-    /// Записать и сбросить на диск — то, за что браузер платит миллисекундами.
+    /// Write and sync to disk: the milliseconds Chrome pays.
     pub fn flush(id: u32, bytes: &[u8]) -> bool {
         FILES.with(|f| {
             let mut map = f.borrow_mut();
@@ -652,9 +649,9 @@ mod opfs {
             if file.write_all(bytes).is_err() {
                 return false;
             }
-            // Длину правим, только если она изменилась, и сбрасываем данные без
-            // метаданных: браузер платит за `flush` около четырёх миллисекунд,
-            // а полный `sync_all` втрое дороже — это уже другая машина.
+            // Truncate only when the length changed, and sync data without
+            // metadata: Chrome's `flush` costs ~4 ms, a full `sync_all` is three
+            // times that.
             if file.metadata().map(|m| m.len()).unwrap_or(0) != bytes.len() as u64 {
                 let _ = file.set_len(bytes.len() as u64);
             }
@@ -774,7 +771,7 @@ fn gl_create(
     );
 }
 
-/// `__pt_glResize(id, w, h)` — холст сменил размер, буфер рисования следом.
+/// `__pt_glResize(id, w, h)`: canvas resized, drawing buffer follows.
 #[cfg(feature = "webgl")]
 fn gl_resize(
     scope: &mut v8::PinScope,
@@ -1455,14 +1452,14 @@ fn gl_depth_func(
     );
 }
 
-/// Указатели всех нативных обработчиков в порядке первой установки — список
-/// внешних ссылок для снимка V8 (одинаковый при создании и восстановлении:
-/// тот же процесс, те же адреса).
+/// Pointers of all native callbacks in first-install order: the external
+/// references list for the V8 snapshot (same at creation and restore: same
+/// process, same addresses).
 static NATIVE_REFS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
-/// Замороженный список внешних ссылок (после первой полной установки).
+/// Frozen external references list (after the first full install).
 struct RefsSlice(&'static [v8::ExternalReference]);
-// Только адреса функций, неизменные всю жизнь процесса.
+// Function addresses only, constant for the process lifetime.
 unsafe impl Send for RefsSlice {}
 unsafe impl Sync for RefsSlice {}
 
@@ -1524,7 +1521,7 @@ fn arg_usize(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> usize {
     value.integer_value(scope).unwrap_or(0).max(0) as usize
 }
 
-/// Отдать числа в JS как `Float32Array`.
+/// Return numbers to JS as a `Float32Array`.
 fn set_floats(scope: &mut v8::PinScope, rv: &mut v8::ReturnValue, values: &[f32]) {
     let mut bytes = Vec::with_capacity(values.len() * 4);
     for v in values {
@@ -1539,7 +1536,7 @@ fn set_floats(scope: &mut v8::PinScope, rv: &mut v8::ReturnValue, values: &[f32]
     }
 }
 
-/// Разобрать `Float32Array` (или обычный массив чисел) из довода.
+/// Read a `Float32Array` (or a plain number array) from an argument.
 fn arg_floats(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> Vec<f32> {
     if let Ok(arr) = v8::Local::<v8::Array>::try_from(value) {
         let n = arr.length() as usize;
@@ -1560,8 +1557,8 @@ fn arg_floats(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> Vec<f32>
         .collect()
 }
 
-/// `__pt_waveTable(shape, sampleRate, rangeIndex)` — таблица волны готовой
-/// формы, та же до последнего бита, что строит браузер.
+/// `__pt_waveTable(shape, sampleRate, rangeIndex)`: wavetable for a built-in
+/// shape, bit-exact with the browser's.
 fn wave_table(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -1575,7 +1572,7 @@ fn wave_table(
 }
 
 /// `__pt_waveTableCustom(real, imag, sampleRate, rangeIndex, disableNormalization)`
-/// — то же для формы, заданной страницей через `createPeriodicWave`.
+/// - the same for a page-defined shape from `createPeriodicWave`.
 fn wave_table_custom(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -1591,8 +1588,8 @@ fn wave_table_custom(
 }
 
 /// `__pt_compress(samples, rate, threshold, knee, ratio, attack, release)` —
-/// сжиматель звука. Отдаёт отсчёты, а последним числом — показание затухания,
-/// которое страница читает у узла как `reduction`.
+/// dynamics compressor. Returns the samples, with the `reduction` reading the
+/// page sees on the node as the last number.
 fn compress(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -1614,12 +1611,11 @@ fn compress(
     set_floats(scope, &mut rv, &all);
 }
 
-/// `__pt_atob(s)` — «прощающее» base64-декодирование по стандарту HTML:
-/// пробелы ASCII выбрасываются, до двух `=` в конце допускаются, лишние биты
-/// в хвосте не мешают. Ответ — строка по байту на знак, или `null`, если вход
-/// не base64 (обёртка тогда бросает браузерную ошибку). На JS это был
-/// посимвольный цикл: программа челленджа расшифровывает так мегабайт и
-/// тратила на трёх вызовах восемьдесят миллисекунд, у браузера — единицы.
+/// `__pt_atob(s)`: forgiving base64 decode per the HTML spec (ASCII whitespace
+/// dropped, up to two trailing `=`, extra tail bits ignored). Returns a
+/// byte-per-char string, or `null` if the input is not base64 (the wrapper then
+/// throws the browser error). Native because the challenge decodes about a
+/// megabyte this way, and the JS loop took 80 ms over three calls.
 fn atob_native(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -1663,7 +1659,7 @@ fn atob_native(
     }
 }
 
-/// Число из довода — без оглядки на то, собрана ли отрисовка.
+/// Number from an argument, regardless of the `render` feature.
 fn arg_f32_any(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> f32 {
     value.number_value(scope).unwrap_or(0.0) as f32
 }
@@ -1710,7 +1706,7 @@ fn make_realm(
             return;
         }
     };
-    // Спрос на реалмы отмечается самим запасом: где он есть, его подпитывают.
+    // Demand is marked by the pool's presence: where it exists, it is refilled.
     if scope.get_slot::<SpareRealms>().is_none() {
         scope.set_slot(SpareRealms::default());
     }
@@ -1724,7 +1720,7 @@ fn make_realm(
         {
             let inner = &mut v8::ContextScope::new(scope, context);
             v8::tc_scope!(inner, inner);
-            // Часы нового окна начинаются в миг выдачи, а не постройки.
+            // The new window's clock starts when handed out, not when built.
             if let Some(src) = v8::String::new(inner, "globalThis.__pt_resetClock && __pt_resetClock()") {
                 if let Some(script) = v8::Script::compile(inner, src, None) {
                     let _ = script.run(inner);
@@ -1775,11 +1771,9 @@ fn make_realm(
     rv.set(global.into());
 }
 
-/// `__pt_evalScript(code, url)` — исполнить классический скрипт страницы так,
-/// как это делает браузер: настоящим скриптом со своим источником, а не через
-/// `eval`. От этого зависит вид следа вызовов: у `eval` V8 приписывает к
-/// каждому кадру «eval at <имя вызвавшей функции>», и наше внутреннее имя
-/// торчало в стеке любой страницы — метка, которую видно с первой же ошибки.
+/// `__pt_evalScript(code, url)`: run a classic page script the way Chrome
+/// does, as a real script with its own source, not via `eval`. Under `eval` V8
+/// tags every stack frame with "eval at <caller>", exposing our internal name.
 fn eval_script(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -1787,8 +1781,8 @@ fn eval_script(
 ) {
     let code = arg_string(scope, args.get(0));
     let url = arg_string(scope, args.get(1));
-    // Строка документа, с которой начинается вписанный скрипт: браузер считает
-    // строки стека и нарушений CSP от начала разметки, а не от `<script>`.
+    // Document line where the inline script starts: Chrome counts stack and
+    // CSP violation lines from the start of the markup, not from `<script>`.
     let line_offset = args.get(2).int32_value(scope).unwrap_or(0).max(0);
     tracing::debug!(target: "nokk::script", bytes = code.len(), url = %url, "inline script");
     let Some(src) = v8::String::new(scope, &code) else {
@@ -2101,20 +2095,8 @@ fn png_data_url(
     }
 }
 
-/// `__pt_hrtime()` — миллисекунды с запуска процесса, с разрешением часов
-/// операционной системы.
-///
-/// `performance.now()` считался от `Date.now()`, а тот идёт целыми
-/// миллисекундами: внутри одной задачи время не двигалось вовсе. Челлендж
-/// Cloudflare меряет это в лоб — пять тысяч подряд идущих замеров и минимальная
-/// положительная разница между ними; у браузера она 0.1 мс, у нас не было ни
-/// одного продвижения. Отсюда и берётся настоящий монотонный источник, а
-/// огрубление до браузерного шага делает уже JS.
-/// Что V8 знает о своей куче: занято, отведено, предел. `performance.memory`
-/// в браузере — не три постоянные величины, а показания, которые растут по мере
-/// того, как страница выделяет память; страница, которая выделит массив и
-/// перечитает `usedJSHeapSize`, у нас видела бы одно и то же число, а в Chrome —
-/// выросшее.
+/// V8 heap usage: used, total, limit. In Chrome `performance.memory` grows as
+/// the page allocates, so it must not be three constants.
 fn heap_stats(
     scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
@@ -2132,17 +2114,13 @@ fn heap_stats(
     rv.set(out.into());
 }
 
-/// `__pt_setCodegen(allowed)` — разрешено ли в этом контексте порождать код
-/// из строк (`eval`, `Function`). С запретом V8 зовёт наш крючок подмены
-/// источника (см. `modify_codegen` в isolate.rs), и CSP без 'unsafe-eval'
-/// отвечает EvalError с текстом Chrome даже на прямой `eval`.
-// --- WebRTC: настоящие сокеты и STUN ---------------------------------------
+// --- WebRTC: real sockets and STUN ---------------------------------------
 //
-// Chrome на каждый раздел предложения открывает по UDP-сокету на семейство
-// адресов (хост-кандидаты — их порты, под именами mDNS) и шлёт STUN Binding
-// на серверы из конфигурации; ответ (XOR-MAPPED-ADDRESS) — srflx-кандидат с
-// публичным адресом. Сервер stun.cloudflare.com принадлежит тому же, кто
-// проверяет отчёт, поэтому запрос должен быть настоящим.
+// For each offer section Chrome opens a UDP socket per address family (host
+// candidates: their ports, under mDNS names) and sends a STUN Binding to the
+// configured servers; the XOR-MAPPED-ADDRESS reply becomes the srflx candidate
+// with the public address. stun.cloudflare.com belongs to the same party that
+// checks the report, so the request must be real.
 
 struct RtcJob {
     results: Vec<(u8, usize, String, u16)>,
@@ -2206,8 +2184,8 @@ fn stun_mapped(buf: &[u8], txid: &[u8; 12]) -> Option<(String, u16)> {
     None
 }
 
-/// `__pt_rtcStart(n, serversJson)` → `{"id","v4":[порты],"v6":[порты]}`:
-/// открыть по `n` сокетов на семейство и в фоне спросить STUN.
+/// `__pt_rtcStart(n, serversJson)` -> `{"id","v4":[ports],"v6":[ports]}`:
+/// open `n` sockets per family and query STUN in the background.
 fn rtc_start(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -2224,8 +2202,8 @@ fn rtc_start(
             v4.push(s);
         }
     }
-    // IPv6 — только если есть маршрут наружу (как у Chrome: хост-кандидат по
-    // v6 есть лишь при глобальном адресе).
+    // IPv6 only with an outbound route (as in Chrome: a v6 host candidate
+    // exists only with a global address).
     let has6 = UdpSocket::bind("[::]:0")
         .and_then(|s| s.connect("[2606:4700:4700::1111]:53").map(|_| s))
         .is_ok();
@@ -2252,7 +2230,7 @@ fn rtc_start(
             for (i, s) in v6.into_iter().enumerate() {
                 socks.push((6, i, s));
             }
-            // Адреса серверов по семействам.
+            // Server addresses per family.
             let mut addrs4 = Vec::new();
             let mut addrs6 = Vec::new();
             for srv in &servers {
@@ -2309,8 +2287,8 @@ fn rtc_start(
     }
 }
 
-/// `__pt_rtcPoll(id)` → `{"r":[[семейство,номер,адрес,порт]…],"done"}` —
-/// пришедшие с прошлого опроса ответы STUN.
+/// `__pt_rtcPoll(id)` -> `{"r":[[family,index,address,port]...],"done"}`:
+/// STUN replies received since the last poll.
 fn rtc_poll(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -2337,9 +2315,9 @@ fn rtc_poll(
     }
 }
 
-/// `__pt_fnLocation(fn)` → `[имя ресурса, строка, столбец]` (с нуля) или null:
-/// где в исходнике начинается функция — для записей long-animation-frame
-/// (sourceURL / sourceCharPosition у PerformanceScriptTiming).
+/// `__pt_fnLocation(fn)` -> `[resource name, line, column]` (zero-based) or
+/// null: where a function starts in its source, for long-animation-frame
+/// entries (sourceURL / sourceCharPosition of PerformanceScriptTiming).
 fn fn_location(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -2366,6 +2344,10 @@ fn fn_location(
     rv.set(arr.into());
 }
 
+/// `__pt_setCodegen(allowed)`: whether this context may generate code from
+/// strings (`eval`, `Function`). When disallowed V8 calls our source-modifying
+/// hook (`modify_codegen` in isolate.rs), so CSP without 'unsafe-eval' throws
+/// Chrome's EvalError text even for direct `eval`.
 fn set_codegen(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -2376,6 +2358,12 @@ fn set_codegen(
     context.set_allow_generation_from_strings(allowed);
 }
 
+/// `__pt_hrtime()`: milliseconds since process start at OS clock resolution.
+///
+/// Deriving `performance.now()` from `Date.now()` froze time within a task.
+/// Cloudflare takes 5000 consecutive readings and checks the minimum positive
+/// delta (0.1 ms in Chrome). Hence a real monotonic source; JS coarsens it to
+/// the browser's step.
 fn hrtime(
     scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
@@ -2387,16 +2375,16 @@ fn hrtime(
     rv.set(v8::Number::new(scope, ms).into());
 }
 
-// ---- неизменяемые прототипы ---------------------------------------------
+// ---- immutable prototypes ---------------------------------------------
 //
-// У Chrome прототип нельзя сменить у окна, Window.prototype, WindowProperties,
-// EventTarget.prototype, location и Location.prototype: `Object.setPrototypeOf`
-// бросает «Immutable prototype object '#<Window>' cannot have their prototype
-// set», а тот же прототип принимает молча. Обход графа в челлендже (секция
-// oebe1) проверяет это на каждом объекте. Из JS такой объект не сделать —
-// только шаблоном V8, как делает Blink: прототипы рождаются из цепочки
-// FunctionTemplate (EventTarget ← WindowProperties ← Window), глобальный
-// объект — из шаблона экземпляра Window.
+// In Chrome the prototype of window, Window.prototype, WindowProperties,
+// EventTarget.prototype, location and Location.prototype cannot be changed:
+// `Object.setPrototypeOf` throws "Immutable prototype object '#<Window>' cannot
+// have their prototype set" but accepts the same prototype silently. The
+// challenge's graph walk (section oebe1) checks this on every object. JS cannot
+// make such objects; only V8 templates can, as Blink does: prototypes come from
+// the FunctionTemplate chain (EventTarget <- WindowProperties <- Window), the
+// global from Window's instance template.
 
 struct ProtoTemplates {
     et: v8::Global<v8::FunctionTemplate>,
@@ -2413,8 +2401,8 @@ fn note_ref(p: usize) {
     }
 }
 
-/// Функции шаблонов странице не видны (у интерфейсов свои фасады), но
-/// конструктором быть не должны.
+/// Template functions are not visible to the page (interfaces have their own
+/// facades) but must not be constructible.
 fn template_ctor(scope: &mut v8::PinScope, _args: v8::FunctionCallbackArguments, _rv: v8::ReturnValue) {
     if let Some(msg) = v8::String::new(scope, "Illegal constructor") {
         let err = v8::Exception::type_error(scope, msg);
@@ -2422,8 +2410,8 @@ fn template_ctor(scope: &mut v8::PinScope, _args: v8::FunctionCallbackArguments,
     }
 }
 
-/// WindowProperties у Chrome — объект именованных свойств: своё свойство на
-/// нём не заводится («Named property setter is not supported»).
+/// Chrome's WindowProperties is a named-properties object: own properties
+/// cannot be defined on it ("Named property setter is not supported").
 fn named_props_definer<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     key: v8::Local<'s, v8::Name>,
@@ -2431,9 +2419,9 @@ fn named_props_definer<'s>(
     args: v8::PropertyCallbackArguments<'s>,
     _rv: v8::ReturnValue<v8::Boolean>,
 ) -> v8::Intercepted {
-    // Отказ — только пока объект и есть WindowProperties: воркер берёт это
-    // же звено под WorkerGlobalScope.prototype (сняв метку) и заводит на нём
-    // свои члены.
+    // Refuse only while the object is still WindowProperties: a worker reuses
+    // this link under WorkerGlobalScope.prototype (with the tag removed) and
+    // defines its members on it.
     let tag = v8::Symbol::get_to_string_tag(scope);
     let is_wp = args
         .holder()
@@ -2468,9 +2456,9 @@ fn build_proto_templates(scope: &mut v8::PinScope<'_, '_, ()>) -> ProtoTemplates
             .definer_raw(definer)
             .flags(v8::PropertyHandlerFlags::ONLY_INTERCEPT_STRINGS | v8::PropertyHandlerFlags::NON_MASKING),
     );
-    // Имени класса у Window нет намеренно: V8 назвал бы им и глобальный
-    // объект воркера. Без него имя в сообщении берётся из метки прототипа —
-    // «Window» в окне, «DedicatedWorkerGlobalScope» в воркере.
+    // No class name on Window on purpose: V8 would use it for the worker's
+    // global too. Without it the error message takes the name from the
+    // prototype's tag: "Window" in a window, "DedicatedWorkerGlobalScope" in a worker.
     let w = v8::FunctionTemplate::new_raw(scope, ctor);
     w.inherit(wp);
     w.prototype_template(scope).set_immutable_proto();
@@ -2493,14 +2481,14 @@ fn proto_templates_ready(scope: &mut v8::PinScope<'_, '_, ()>) {
     }
 }
 
-/// Снять шаблоны с изолята: создатель снимка не принимает живых глобальных
-/// ручек (сами шаблоны уходят в снимок через объекты контекста).
+/// Drop the templates from the isolate: the snapshot creator rejects live
+/// global handles (the templates reach the snapshot via context objects).
 pub(crate) fn drop_proto_templates(iso: &mut v8::Isolate) {
     let _ = iso.remove_slot::<std::rc::Rc<ProtoTemplates>>();
 }
 
-/// Контекст страницы: глобальный объект — из шаблона Window (прототип
-/// неизменяем, цепочка Window → WindowProperties → EventTarget готова).
+/// Page context: the global comes from the Window template (immutable
+/// prototype, Window -> WindowProperties -> EventTarget chain in place).
 pub(crate) fn new_page_context<'s>(scope: &mut v8::PinScope<'s, '_, ()>) -> v8::Local<'s, v8::Context> {
     proto_templates_ready(scope);
     let t = scope.get_slot::<std::rc::Rc<ProtoTemplates>>().cloned();
@@ -2511,8 +2499,8 @@ pub(crate) fn new_page_context<'s>(scope: &mut v8::PinScope<'s, '_, ()>) -> v8::
     v8::Context::new(scope, v8::ContextOptions { global_template: global, ..Default::default() })
 }
 
-/// `__pt_protoTemplates()` → `{et, wp, w, loc, location}`: прототипы из
-/// шаблонов этого контекста и экземпляр Location. Зовётся загрузчиком один раз.
+/// `__pt_protoTemplates()` -> `{et, wp, w, loc, location}`: prototypes from
+/// this context's templates plus a Location instance. Called once by the loader.
 fn proto_templates_js(scope: &mut v8::PinScope, _args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
     let Some(t) = scope.get_slot::<std::rc::Rc<ProtoTemplates>>().cloned() else {
         return;
@@ -2526,7 +2514,7 @@ fn proto_templates_js(scope: &mut v8::PinScope, _args: v8::FunctionCallbackArgum
         let k = v8::String::new(scope, name).unwrap();
         out.set(scope, k.into(), p);
         if name == "loc" {
-            // Шаблон экземпляра, а не вызов функции: та бросает «Illegal constructor».
+            // Instance template, not a function call: that throws "Illegal constructor".
             if let Some(inst) = ft.instance_template(scope).new_instance(scope) {
                 let k = v8::String::new(scope, "location").unwrap();
                 out.set(scope, k.into(), inst.into());
@@ -2536,12 +2524,12 @@ fn proto_templates_js(scope: &mut v8::PinScope, _args: v8::FunctionCallbackArgum
     rv.set(out.into());
 }
 
-/// Скрытое поле TrustedScript: текст сценария. Его читает обработчик
-/// генерации кода (isolate.rs), не исполняя JS.
+/// Hidden TrustedScript field holding the script text, read by the codegen
+/// handler (isolate.rs) without running JS.
 pub(crate) const TRUSTED_SCRIPT_KEY: &str = "nokk::trustedScript";
 
-/// `__pt_codeLike(text)` → пустой объект, несущий текст сценария скрыто: eval и
-/// new Function исполняют его как строку (из него загрузчик делает TrustedScript).
+/// `__pt_codeLike(text)` -> empty object carrying script text hidden: eval and
+/// new Function run it as a string (the loader makes TrustedScript from it).
 fn code_like_js(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
     let Some(text) = args.get(0).to_string(scope) else { return };
     let o = v8::Object::new(scope);

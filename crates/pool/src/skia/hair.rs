@@ -1,6 +1,6 @@
-//! Волосяные линии со сглаживанием — порт `SkScan_Antihair.cpp` и
-//! `SkScan_Hairline.cpp` (butt cap): так Skia рисует штрих холста, когда
-//! его ширина в пикселях устройства не больше единицы.
+//! Anti-aliased hairlines: port of `SkScan_Antihair.cpp` and
+//! `SkScan_Hairline.cpp` (butt cap). Skia uses this for canvas strokes
+//! at most one device pixel wide.
 
 use super::blit::Blitter;
 use super::fixed::*;
@@ -321,8 +321,8 @@ fn do_anti_hairline(mut x0: FDot6, mut y0: FDot6, mut x1: FDot6, mut y1: FDot6, 
             }
         }
     }
-    // SkRectClipBlitter: меняет не только обрезку, но и арифметику
-    // (blitAntiH2/V2 через blitAntiH с пробегами), см. blit::RectClipBlitter.
+    // SkRectClipBlitter changes the arithmetic too, not just the clip
+    // (blitAntiH2/V2 go through blitAntiH with runs), see blit::RectClipBlitter.
     let mut wrapped;
     let b: &mut dyn Blitter = match clip {
         Some(c) => {
@@ -408,7 +408,7 @@ pub fn intersect_line(src: &[Point; 2], clip: &Rect) -> Option<[Point; 2]> {
     Some(tmp)
 }
 
-/// `SkScan::AntiHairLineRgn`: ломаная; `clip` — окно (None, если не нужно).
+/// `SkScan::AntiHairLineRgn`: polyline; `clip` is the window (None if unneeded).
 fn anti_hair_line_rgn(src: &[Point], clip: Option<&IRect>, b: &mut dyn Blitter) {
     if src.is_empty() {
         return;
@@ -447,7 +447,7 @@ fn anti_hair_line_rgn(src: &[Point], clip: Option<&IRect>, b: &mut dyn Blitter) 
     }
 }
 
-// ── SkScan_Hairline: кривые в ломаные ─────────────────────────────────────
+// ── SkScan_Hairline: curves to polylines ─────────────────────────────────
 
 const MAX_CUBIC_SUBDIVIDE_LEVEL: usize = 9;
 const MAX_QUAD_SUBDIVIDE_LEVEL: usize = 5;
@@ -607,8 +607,8 @@ fn hairconic(pts: &[Point; 3], w: f32, p: &Params, b: &mut dyn Blitter) {
     }
 }
 
-/// `SkScan::AntiHairPath` (butt cap) — путь в координатах устройства,
-/// `rclip` — окно.
+/// `SkScan::AntiHairPath` (butt cap): path in device coordinates,
+/// `rclip` is the window.
 pub fn anti_hair_path(path: &Path, rclip: &IRect, b: &mut dyn Blitter) {
     if path.is_empty() {
         return;
@@ -744,11 +744,11 @@ fn antifilldot8(l: FDot8, t: FDot8, r: FDot8, bt: FDot8, b: &mut dyn Blitter, fi
     }
 }
 
-/// `SkScan::AntiFillRect(rect, clip, blitter)` для прямоугольной области:
-/// маршрут `drawRect` (без снапа рёбер на четверть пикселя, как у путей).
+/// `SkScan::AntiFillRect(rect, clip, blitter)` for a rect clip: the
+/// `drawRect` route (no quarter-pixel edge snapping, unlike paths).
 pub fn anti_fill_rect(orig: &Rect, clip: &IRect, b: &mut dyn Blitter) {
     let Some(r) = clip.to_rect().intersect(orig) else { return };
-    // XRect_set: SkScalarToFixed = saturate2int(x · 65536), с усечением.
+    // XRect_set: SkScalarToFixed = saturate2int(x · 65536), truncating.
     let fx = |v: f32| saturate2int(v * 65536.0);
     antifilldot8(fixed_to_fdot8(fx(r.left)), fixed_to_fdot8(fx(r.top)), fixed_to_fdot8(fx(r.right)), fixed_to_fdot8(fx(r.bottom)), b, true);
 }

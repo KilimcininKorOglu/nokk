@@ -6,8 +6,8 @@
 // otherwise costs an evening — where our run stops matching a browser's.
 //
 //   node tools/chrome-compare.js <url> [ms]
-//   PROXY=http://host:port node tools/chrome-compare.js <url>   — через тот же
-//   выход, что и `nokk --proxy`: иначе сравниваются разные адреса.
+//   PROXY=http://host:port node tools/chrome-compare.js <url>   (use the same
+//   exit as `nokk --proxy`, otherwise two different addresses are compared)
 //   NOKK_TRACE_HOOKS=1 nokk --load <url> --solve-challenge 40 --eval 1
 //
 // Needs google-chrome, and DISPLAY for a visible window (a headless Chrome is
@@ -16,16 +16,14 @@ const { spawn } = require('child_process');
 const http = require('http');
 
 const PORT = 9333, URL_ = process.argv[2], WAIT = +(process.argv[3] || 40000);
-// Какой кусок отчёта высыпать целиком: DUMPENC=30000-32000. То же окно, что
-// `NOKK_DUMP_ENC` у движка, иначе две ленты не сравнить.
+// Report chunk length range to dump in full, e.g. DUMPENC=30000-32000; use the
+// same window as the engine's `NOKK_DUMP_ENC`.
 const [DUMP_LO, DUMP_HI] = (process.env.DUMPENC || '15000-16000').split('-').map(Number);
 const chrome = spawn('google-chrome', [
   `--remote-debugging-port=${PORT}`, '--user-data-dir=/tmp/cdp-profile', '--no-first-run',
   '--no-default-browser-check', '--window-size=1280,900',
   ...(process.env.UA ? [`--user-agent=${process.env.UA}`] : []),
   ...(process.env.CHROME_ARGS ? process.env.CHROME_ARGS.split(' ') : []),
-  // Контроль должен выходить в сеть там же, где движок, иначе сравниваются
-  // два разных адреса и вывод ничего не стоит.
   ...(process.env.PROXY ? [`--proxy-server=${process.env.PROXY}`] : []),
   'about:blank',
 ], { env: { ...process.env, DISPLAY: ':0' }, stdio: 'ignore' });
@@ -40,67 +38,63 @@ const get = (path) => new Promise((res, rej) => {
 const HOOK = `(() => {
   globalThis.__JMIN = ${+(process.env.JMIN || 2000)};
   const tag = () => { try { return location.host + location.pathname.slice(0, 24); } catch (e) { return '?'; } };
-  // Что челлендж роняет по пути: часть бросков у него нарочная (он читает
-  // собственный стек), и отличить нарочные от настоящих можно только
-  // сравнив ленты браузера и движка. Тот же крючок стоит в движке —
-  // NOKK_TRACE_BEACON, метка [бросок].
+  // Errors the challenge throws. Some are deliberate (it reads its own stack);
+  // only diffing against the engine tells them apart. Engine side:
+  // NOKK_TRACE_BEACON, tag [thrown].
   const t0 = Date.now();
   addEventListener('error', (e) => {
-    try { console.log('[бросок] ' + (Date.now() - t0) + 'мс ' + String(e.message || '') + ' @ ' +
+    try { console.log('[thrown] ' + (Date.now() - t0) + 'ms ' + String(e.message || '') + ' @ ' +
       String(e.filename || '').slice(-58) + ':' + e.lineno); } catch (x) {}
   });
   addEventListener('unhandledrejection', (e) => {
-    try { console.log('[бросок] ' + (Date.now() - t0) + 'мс отклонено: ' +
+    try { console.log('[thrown] ' + (Date.now() - t0) + 'ms rejected: ' +
       String((e.reason && (e.reason.stack || e.reason.message)) || e.reason).slice(0, 150)); } catch (x) {}
   });
   try {
     const S = XMLHttpRequest.prototype.send, O = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (m, u) {
       this.__u = String(u);
-      // Окно сериализации: тело собирается между открытием запроса и
-      // отправкой; вне этого окна лента строк показывает не тело.
+      // Serialization window: the body is built between open() and send().
       try {
-        if (/\\/cdn-cgi\\/challenge-platform\\//.test(this.__u) && !globalThis.__ptСобрано) {
-          globalThis.__ptСериализуем = 1;
+        if (/\\/cdn-cgi\\/challenge-platform\\//.test(this.__u) && !globalThis.__ptCollected) {
+          globalThis.__ptSerializing = 1;
         }
       } catch (e) {}
       return O.apply(this, arguments);
     };
     XMLHttpRequest.prototype.send = function (b) {
       console.log('[send] ' + tag() + ' bytes=' + ((b && b.length) || 0) + ' url=' + String(this.__u || '').slice(-40));
-      // Тело первого POST — то, что уходит до программы; разница с движком
-      // видна только текстом.
+      // First POST body, sent before the program; dump it as text.
       try {
         if (/\\/cdn-cgi\\/challenge-platform\\//.test(this.__u || '') && b && b.length > 1000
             && b.length < 20000 && !globalThis.__ptFirstBody) {
           globalThis.__ptFirstBody = 1;
-          // Вектор чисел, собранный к этому мигу: дальше он продолжится уже
-          // сбором отчёта, а сравнивать надо то, что ушло первым. Если он
-          // пуст — надо знать, наш ли крючок ещё стоит: пустота и снятый
-          // крючок выглядят одинаково.
-          globalThis.__ptСобрано = 1;
-          globalThis.__ptСериализуем = 0;
+          // Numbers collected so far (later ones belong to the report). Also
+          // print whether our hook is still installed: an empty vector and a
+          // removed hook look the same.
+          globalThis.__ptCollected = 1;
+          globalThis.__ptSerializing = 0;
           try {
-            const стр = globalThis.__ptСтроки || [];
-            const s2 = JSON.stringify(стр);
-            console.log('[строки] всего=' + стр.length);
+            const strs = globalThis.__ptStrings || [];
+            const s2 = JSON.stringify(strs);
+            console.log('[strings] total=' + strs.length);
             for (let q = 0; q < s2.length; q += 250) {
-              console.log('[строки ' + стр.length + ':' + (q / 250) + '] ' + s2.slice(q, q + 250));
+              console.log('[strings ' + strs.length + ':' + (q / 250) + '] ' + s2.slice(q, q + 250));
             }
           } catch (e) {}
           try {
-            const ряд = globalThis.__ptЧисла || [];
-            console.log('[числа] всего=' + ряд.length
-                  + ' крючок=' + (globalThis.isFinite && globalThis.isFinite.__ptНаш ? 'наш' : 'чужой')
-                  + ' имя=' + (globalThis.isFinite && globalThis.isFinite.name));
-            const s1 = JSON.stringify(ряд);
+            const series = globalThis.__ptNumbers || [];
+            console.log('[numbers] total=' + series.length
+                  + ' hook=' + (globalThis.isFinite && globalThis.isFinite.__ptOurs ? 'ours' : 'foreign')
+                  + ' name=' + (globalThis.isFinite && globalThis.isFinite.name));
+            const s1 = JSON.stringify(series);
             for (let q = 0; q < s1.length; q += 250) {
-              console.log('[числа ' + ряд.length + ':' + (q / 250) + '] ' + s1.slice(q, q + 250));
+              console.log('[numbers ' + series.length + ':' + (q / 250) + '] ' + s1.slice(q, q + 250));
             }
           } catch (e) {}
           const s0 = String(b);
           for (let q = 0; q < s0.length; q += 250) {
-            console.log('[ПЕРВЫЙ ' + s0.length + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
+            console.log('[FIRST ' + s0.length + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
           }
         }
       } catch (e) {}
@@ -118,78 +112,73 @@ const HOOK = `(() => {
     if (W) globalThis.Worker = function (u, o) { console.log('[worker] ' + tag() + ' ' + String(u).slice(0, 60)); return new W(u, o); };
     const P = globalThis.postMessage;
   } catch (e) {}
-  // Отчёт целиком — то же, что печатает NOKK_DUMP_REPORT=1 у нас. Их
-  // сериализация идёт через склейку массива, поэтому здесь виден текст до
-  // сжатия и шифрования.
-  // Письма от страницы к кадру виджета: часть тела первого POST виджет
-  // получает так (extraParams — стек, времена шагов, слепок страницы). Тот же
-  // крючок стоит в движке, метка [письмо].
+  // Messages from the page to the widget frame: part of the first POST body
+  // arrives this way (extraParams: stack, step timings, page snapshot).
+  // Engine side: tag [postmsg].
   try {
-    const чужой0 = () => { try { return /challenges\\.cloudflare/.test(location.host); } catch (e) { return false; } };
+    const inChallenge0 = () => { try { return /challenges\\.cloudflare/.test(location.host); } catch (e) { return false; } };
     const AL = EventTarget.prototype.addEventListener;
-    const нат0 = (f, src) => {
+    const asNative0 = (f, src) => {
       try {
         Object.defineProperty(f, 'name', { value: src.name, configurable: true });
         Object.defineProperty(f, 'length', { value: src.length, configurable: true });
       } catch (e) {}
       return f;
     };
-    EventTarget.prototype.addEventListener = нат0(function (type, fn, opts) {
-      if (чужой0() && String(type) === 'message' && typeof fn === 'function') {
-        const свой = function (ev) {
+    EventTarget.prototype.addEventListener = asNative0(function (type, fn, opts) {
+      if (inChallenge0() && String(type) === 'message' && typeof fn === 'function') {
+        const wrapped = function (ev) {
           try {
-            if ((globalThis.__ptПисем = (globalThis.__ptПисем || 0) + 1) < 25) {
+            if ((globalThis.__ptMsgN = (globalThis.__ptMsgN || 0) + 1) < 25) {
               const d = ev && ev.data;
               let t;
               if (typeof d === 'string') t = d;
               else { try { t = JSON.stringify(d); } catch (e) { t = String(d); } }
               t = String(t);
-              if (t.length <= 220) console.log('[письмо] ' + t);
+              if (t.length <= 220) console.log('[postmsg] ' + t);
               else for (let q = 0; q < Math.min(t.length, 4000); q += 220) {
-                console.log('[письмо ' + t.length + ':' + (q / 220) + '] ' + t.slice(q, q + 220));
+                console.log('[postmsg ' + t.length + ':' + (q / 220) + '] ' + t.slice(q, q + 220));
               }
             }
           } catch (e) {}
           return fn.apply(this, arguments);
         };
-        return AL.call(this, type, свой, opts);
+        return AL.call(this, type, wrapped, opts);
       }
       return AL.apply(this, arguments);
     }, AL);
   } catch (e) {}
 
-  // Числа, которые челлендж проверяет перед отправкой. Он прогоняет весь
-  // собранный вектор через isFinite, и это единственное место, где значения
-  // видны по одному — тело уже шифр. Тот же ряд движок печатает своим
-  // наблюдателем (NOKK_TRACE_PROBES), и вектора сравниваются напрямую.
+  // The challenge runs its whole collected vector through isFinite before
+  // sending: the only place values are visible one by one. The engine prints
+  // the same series under NOKK_TRACE_PROBES.
   try {
-    const чужой = () => { try { return /challenges\\.cloudflare/.test(location.host); } catch (e) { return false; } };
+    const inChallenge = () => { try { return /challenges\\.cloudflare/.test(location.host); } catch (e) { return false; } };
     const IF = globalThis.isFinite;
-    const ряд = [];
-    globalThis.__ptЧисла = ряд;
-    const нат = (f, src) => {
+    const series = [];
+    globalThis.__ptNumbers = series;
+    const asNative = (f, src) => {
       try {
         Object.defineProperty(f, 'name', { value: src.name, configurable: true });
         Object.defineProperty(f, 'length', { value: src.length, configurable: true });
       } catch (e) {}
       return f;
     };
-    globalThis.isFinite = нат(function (x) {
-      if (чужой() && ряд.length < 4000) ряд.push(typeof x === 'number' ? x : String(x).slice(0, 20));
+    globalThis.isFinite = asNative(function (x) {
+      if (inChallenge() && series.length < 4000) series.push(typeof x === 'number' ? x : String(x).slice(0, 20));
       return IF.call(this, x);
     }, IF);
-    try { globalThis.isFinite.__ptНаш = true; } catch (e) {}
-    if (чужой()) console.log('[числа] крючок стоит');
-    // Ряд печатается, когда уходит первый POST: дальше он продолжается уже
-    // другим — сбором отчёта.
+    try { globalThis.isFinite.__ptOurs = true; } catch (e) {}
+    if (inChallenge()) console.log('[numbers] hook installed');
+    // Printed at the first POST; later values belong to the report.
     const S = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.send = нат(function (b) {
+    XMLHttpRequest.prototype.send = asNative(function (b) {
       try {
-        if (чужой() && b && b.length > 1000 && b.length < 20000 && !globalThis.__ptЧислаВыданы) {
-          globalThis.__ptЧислаВыданы = 1;
-          const s0 = JSON.stringify(ряд);
+        if (inChallenge() && b && b.length > 1000 && b.length < 20000 && !globalThis.__ptNumbersShown) {
+          globalThis.__ptNumbersShown = 1;
+          const s0 = JSON.stringify(series);
           for (let q = 0; q < s0.length; q += 250) {
-            console.log('[числа ' + ряд.length + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
+            console.log('[numbers ' + series.length + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
           }
         }
       } catch (e) {}
@@ -197,33 +186,32 @@ const HOOK = `(() => {
     }, S);
   } catch (e) {}
 
-  // Открытый текст, который читают знак за знаком: сжатие и разбор стека идут
-  // именно так. Заметка на самом горячем месте языка, поэтому проверка
-  // короткая — только нулевой знак и только в кадре челленджа.
+  // Plaintext read char by char (compression, stack parsing). Hot path, so
+  // only index 0 and only in the challenge frame.
   try {
-    const чужой = () => { try { return /challenges\\.cloudflare/.test(location.host); } catch (e) { return false; } };
+    const inChallenge = () => { try { return /challenges\\.cloudflare/.test(location.host); } catch (e) { return false; } };
     const CCA = String.prototype.charCodeAt;
-    const видели = Object.create(null);
-    const нат = (f, src) => {
+    const seen = Object.create(null);
+    const asNative = (f, src) => {
       try {
         Object.defineProperty(f, 'name', { value: src.name, configurable: true });
         Object.defineProperty(f, 'length', { value: src.length, configurable: true });
       } catch (e) {}
       return f;
     };
-    String.prototype.charCodeAt = нат(function (i) {
-      if (i === 0 && this.length > 0 && this.length < 120 && globalThis.__ptСериализуем && чужой()) {
-        const ряд = globalThis.__ptСтроки || (globalThis.__ptСтроки = []);
-        if (ряд.length < 400) ряд.push(String(this));
+    String.prototype.charCodeAt = asNative(function (i) {
+      if (i === 0 && this.length > 0 && this.length < 120 && globalThis.__ptSerializing && inChallenge()) {
+        const series = globalThis.__ptStrings || (globalThis.__ptStrings = []);
+        if (series.length < 400) series.push(String(this));
       }
-      if (i === 0 && this.length > 300 && this.length < 40000 && чужой()) {
+      if (i === 0 && this.length > 300 && this.length < 40000 && inChallenge()) {
         const n = this.length;
-        if (!видели[n] && Object.keys(видели).length < 30) {
-          видели[n] = 1;
+        if (!seen[n] && Object.keys(seen).length < 30) {
+          seen[n] = 1;
           const s0 = String(this);
-          console.log('[исходник ' + n + '] ' + Math.round(performance.now()) + 'мс');
+          console.log('[source ' + n + '] ' + Math.round(performance.now()) + 'ms');
           for (let q = 0; q < s0.length; q += 250) {
-            console.log('[исходник ' + n + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
+            console.log('[source ' + n + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
           }
         }
       }
@@ -241,29 +229,27 @@ const HOOK = `(() => {
           const n = globalThis.__ptJoinN++;
           let host = '?';
           try { host = location.host.slice(0, 12); } catch (e) {}
-          // Тело первого POST собирается такой же склейкой; длины кусков по
-          // порядку показывают, какой из них у движка короче.
+          // First POST body is joined the same way; part lengths show which one differs.
           if (out.length > 3000 && out.length < 6000 && String(sep) === ''
               && this.length > 1 && !globalThis.__ptFirstParts) {
             globalThis.__ptFirstParts = 1;
             try {
               const lens = Array.prototype.map.call(this, (x) => String(x == null ? '' : x).length);
-              console.log('[первые куски] всего=' + out.length + ' n=' + lens.length +
-                    ' длины=' + lens.join(','));
+              console.log('[first parts] total=' + out.length + ' n=' + lens.length +
+                    ' lengths=' + lens.join(','));
             } catch (e) {}
           }
-          // Из чего склеен отчёт: сколько кусков и какой длины. Сравнение
-          // поэлементно показывает, какое именно поле у кого короче.
+          // Report parts and their lengths, for a per-field diff.
           if (out.length > 50000 && String(sep) === '' && this.length !== out.length && !globalThis.__ptPartsDone) {
             globalThis.__ptPartsDone = 1;
             try {
               const lens = Array.prototype.map.call(this, (x) => String(x == null ? '' : x).length);
               const big = lens.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]).slice(0, 25);
               console.log('[parts] n=' + lens.length + ' total=' + out.length +
-                    ' крупнейшие: ' + big.map(([v, i]) => i + ':' + v).join(' '));
+                    ' largest: ' + big.map(([v, i]) => i + ':' + v).join(' '));
               const buckets = [0, 0, 0, 0, 0];
               for (const v of lens) buckets[v < 10 ? 0 : v < 100 ? 1 : v < 1000 ? 2 : v < 10000 ? 3 : 4]++;
-              console.log('[parts] по размеру: <10=' + buckets[0] + ' <100=' + buckets[1] +
+              console.log('[parts] by size: <10=' + buckets[0] + ' <100=' + buckets[1] +
                     ' <1k=' + buckets[2] + ' <10k=' + buckets[3] + ' >=10k=' + buckets[4]);
             } catch (e) {}
           }
@@ -288,16 +274,13 @@ const HOOK = `(() => {
       return out;
     };
   } catch (e) {}
-  // Перепись вызовов: сколько раз челлендж позвал каждый из ходовых методов.
-  // Наш собственный пробник считает то же самое, и разница в счётчиках
-  // показывает, где сбор у нас обрывается, — это точнее, чем искать любые
-  // расхождения подряд.
+  // Call counts per method; the engine's probe counts the same, so a count
+  // difference shows where our collection stops.
   try {
     const N = Object.create(null);
     const L = Object.create(null);
     const bump = (k) => { N[k] = (N[k] || 0) + 1; };
-    // Сколько знаков всего вернул каждый метод: вызовы у нас с браузером
-    // сходятся, значит разница в отчёте — в длине ответов.
+    // Total length of what each method returned.
     const grew = (k, v) => {
       try {
         const n = v == null ? 0 : (typeof v === 'string' ? v.length
@@ -335,8 +318,8 @@ const HOOK = `(() => {
         }
       }
     };
-    // Через TextEncoder.encode проходит сам отчёт: его куски видны здесь в
-    // открытом виде, до сжатия и шифрования. Записываем длину каждого и начало.
+    // The report passes through TextEncoder.encode in plaintext, before
+    // compression and encryption: log each chunk's length and head.
     globalThis.__ptDumpLo = ${DUMP_LO};
     globalThis.__ptDumpHi = ${DUMP_HI};
     try {
@@ -352,22 +335,19 @@ const HOOK = `(() => {
               at = String(new Error().stack || '').split('\\n').slice(2, 5)
                 .map((x) => x.trim().replace(/^at /, '').slice(0, 46)).join(' < ');
             } catch (e) {}
-            console.log('[enc ' + (n++) + '] ' + Math.round(performance.now()) + 'мс ' + (() => { try { return location.host.slice(0, 18) + ' '; } catch (e) { return '? '; } })() + s.length + ' | ненулевых=' + (() => { let n = 0, sum = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { n++; sum = (sum * 31 + c) >>> 0; } } return n + ' сумма=' + sum; })() + (s.length < 2000 || s.length > 14000 ? ' текст: ' + s.slice(0, 400).replace(/[^\x20-\x7e]/g, '.') : ' коды: ') + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
+            console.log('[enc ' + (n++) + '] ' + Math.round(performance.now()) + 'ms ' + (() => { try { return location.host.slice(0, 18) + ' '; } catch (e) { return '? '; } })() + s.length + ' | nonzero=' + (() => { let n = 0, sum = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { n++; sum = (sum * 31 + c) >>> 0; } } return n + ' sum=' + sum; })() + (s.length < 2000 || s.length > 14000 ? ' text: ' + s.slice(0, 400).replace(/[^\x20-\x7e]/g, '.') : ' codes: ') + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
 if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__ptDumpHi || 16000) && !(globalThis.__ptD = globalThis.__ptD || {})[s.length]) {
   globalThis.__ptD[s.length] = 1;
-  for (let q = 0; q < s.length; q += 250) console.log('[кус ' + s.length + ':' + (q / 300) + '] ' + s.slice(q, q + 300));
-  console.log('[хвост ' + s.length + '] куски=' + s.split('|').length + ' последние=' + JSON.stringify(s.split('|').slice(-3).map((x) => x.slice(-40))));
+  for (let q = 0; q < s.length; q += 250) console.log('[chunk ' + s.length + ':' + (q / 300) + '] ' + s.slice(q, q + 300));
+  console.log('[tail ' + s.length + '] parts=' + s.split('|').length + ' last=' + JSON.stringify(s.split('|').slice(-3).map((x) => x.slice(-40))));
 }
           }
           return enc.call(this, x);
         }, writable: true, configurable: true });
       }
     } catch (e) {}
-    // Чей стиль перечисляют. Челлендж высыпает весь
-    // вычисленный стиль одного узла, и у нас он выходит на
-    // триста знаков длиннее хромовского: значит меряется не
-    // тот узел или не в том окружении. Крючок лёгкий —
-    // только приметы узла, по двадцать первых вызовов.
+    // Which node's computed style is enumerated (ours came out ~300 chars
+    // longer than Chrome's). Light hook: node traits, first 20 calls only.
     try {
       const G = globalThis.getComputedStyle;
       if (G && !G.__ptSaid) {
@@ -380,11 +360,11 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
                 (n.className && n.className.baseVal === undefined && typeof n.className === 'string' && n.className ? '.' + n.className.slice(0, 24) : '');
               let chain = '', p = el;
               for (let i = 0; i < 4 && p; i++) { chain += (i ? ' < ' : '') + who(p); p = p.parentNode; }
-              console.log('[cs] ' + who(el) + ' в цепочке ' + chain +
-                ' связан=' + (el && el.isConnected) +
-                ' псевдо=' + String(ps) +
-                ' док=' + (el && el.ownerDocument === document) +
-                ' цвет=' + (r && r.color) + ' кегль=' + (r && r.fontSize) +' дети=' + (el && el.children ? Array.prototype.map.call(el.children, (k) => k.nodeName + (k.getAttribute && k.getAttribute('style') ? '[' + k.getAttribute('style').slice(0, 40) + ']' : '')).join(',').slice(0, 160) : '?') + ' текст=' + JSON.stringify(String((el && el.textContent) || '').slice(0, 40)) + ' откуда=' + (() => { try { return String(new Error().stack || '').split('\\n').slice(2, 4).map((x) => x.trim().replace(/^at /, '').slice(0, 60)).join(' < '); } catch (e) { return '?'; } })());
+              console.log('[cs] ' + who(el) + ' chain ' + chain +
+                ' connected=' + (el && el.isConnected) +
+                ' pseudo=' + String(ps) +
+                ' doc=' + (el && el.ownerDocument === document) +
+                ' color=' + (r && r.color) + ' fontSize=' + (r && r.fontSize) +' children=' + (el && el.children ? Array.prototype.map.call(el.children, (k) => k.nodeName + (k.getAttribute && k.getAttribute('style') ? '[' + k.getAttribute('style').slice(0, 40) + ']' : '')).join(',').slice(0, 160) : '?') + ' text=' + JSON.stringify(String((el && el.textContent) || '').slice(0, 40)) + ' from=' + (() => { try { return String(new Error().stack || '').split('\\n').slice(2, 4).map((x) => x.trim().replace(/^at /, '').slice(0, 60)).join(' < '); } catch (e) { return '?'; } })());
             }
           } catch (e) {}
           return r;
@@ -393,8 +373,7 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
         globalThis.getComputedStyle = V;
       }
     } catch (e) {}
-    // Чем меряют надписи в SVG: у эмодзи это способ узнать,
-    // какие последовательности браузер сводит в один знак.
+    // SVG text metrics: used on emoji to see which sequences render as one glyph.
     try {
       const P = globalThis.SVGTextContentElement && SVGTextContentElement.prototype;
       for (const name of ['getComputedTextLength', 'getSubStringLength', 'getNumberOfChars',
@@ -408,7 +387,7 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
               const show = (v) => (v && typeof v === 'object'
                 ? '{' + ['x', 'y', 'width', 'height'].map((k) => k + '=' + (v[k] === undefined ? '?' : v[k])).join(',') + '}'
                 : String(v));
-              console.log('[svg] ' + name + '(' + a.join(',') + ') шрифт=' + (() => { try { const cs = getComputedStyle(this); return cs.fontSize + '/' + cs.fontFamily.slice(0, 20); } catch (e) { return '?'; } })() + ' текст=' +
+              console.log('[svg] ' + name + '(' + a.join(',') + ') font=' + (() => { try { const cs = getComputedStyle(this); return cs.fontSize + '/' + cs.fontFamily.slice(0, 20); } catch (e) { return '?'; } })() + ' text=' +
                 JSON.stringify(String(this.textContent || '').slice(0, 70)) + ' -> ' + show(r));
             }
           } catch (e) {}
@@ -425,7 +404,7 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
           const r = bb.apply(this, a);
           try {
             if ((globalThis.__ptBBoxN = (globalThis.__ptBBoxN || 0) + 1) <= 40) {
-              console.log('[svg] getBBox шрифт=' + (() => { try { const cs = getComputedStyle(this); return cs.fontSize + '/' + cs.fontFamily.slice(0, 20); } catch (e) { return '?'; } })() + ' текст=' +
+              console.log('[svg] getBBox font=' + (() => { try { const cs = getComputedStyle(this); return cs.fontSize + '/' + cs.fontFamily.slice(0, 20); } catch (e) { return '?'; } })() + ' text=' +
                 JSON.stringify(String(this.textContent || '').slice(0, 70)) +
                 ' -> {' + [r.x, r.y, r.width, r.height].join(',') + '}');
             }
@@ -436,9 +415,7 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
         Object.defineProperty(G, 'getBBox', { value: V, writable: true, configurable: true });
       }
     } catch (e) {}
-    // Что страница склеивает в JSON и что кодирует в base64:
-    // начальная посылка собирается именно так, и её содержимое
-    // видно только здесь.
+    // JSON.stringify and btoa inputs: the initial payload is built this way.
     try {
       const J = JSON.stringify;
       if (!J.__ptSaid) {
@@ -494,7 +471,7 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
       ['transferControlToOffscreen', 'toDataURL', 'toBlob', 'captureStream', 'getContext']);
     wrapProto(globalThis.OffscreenCanvas && OffscreenCanvas.prototype, 'off',
       ['convertToBlob', 'transferToImageBitmap']);
-    // Какие именно контексты просят у офскрина и что получают.
+    // Which canvas contexts are requested and what comes back.
     try {
           for (const N of ['WebGLRenderingContext', 'WebGL2RenderingContext']) {
             const W = globalThis[N] && globalThis[N].prototype;
@@ -545,7 +522,7 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
                     for (let i = 0; i < arguments.length; i++) {
                       const v = arguments[i];
                       if (v && typeof v === 'object') {
-                        a.push((v.localName || (v.constructor && v.constructor.name) || 'об') +
+                        a.push((v.localName || (v.constructor && v.constructor.name) || 'obj') +
                           '<' + (v.width !== undefined ? v.width + 'x' + v.height : '?') + '>' +
                           (typeof v.src === 'string' ? ' src=' + v.src.slice(0, 46) : ''));
                       } else a.push(String(v).slice(0, 40));
@@ -554,7 +531,7 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
                       (cv.width !== 2 ? '' : (() => { try { const r = f.apply(this, arguments);
                         return ' -> ' + (r && typeof r === 'object' ? (r.data
                           ? Object.prototype.toString.call(r.data) + '[' + [].slice.call(r.data).join(',') + '] ' + r.colorSpace + '/' + r.pixelFormat
-                          : JSON.stringify(r)) : String(r)); } catch (e) { return ' -> бросил ' + e.name; } })()));
+                          : JSON.stringify(r)) : String(r)); } catch (e) { return ' -> threw ' + e.name; } })()));
                   }
                   return f.apply(this, arguments);
                 };
@@ -592,15 +569,15 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
                 try {
                   show = ' -> ' + Object.prototype.toString.call(r.data) +
                     '[' + [].slice.call(r.data).join(',') + '] ' + r.colorSpace + '/' + r.pixelFormat +
-                    ' настройки=' + JSON.stringify(arguments[4] || null) +
-                    ' холст=' + JSON.stringify(this.getContextAttributes ? this.getContextAttributes() : null);
+                    ' options=' + JSON.stringify(arguments[4] || null) +
+                    ' canvas=' + JSON.stringify(this.getContextAttributes ? this.getContextAttributes() : null);
                 } catch (e) { show = ' -> ' + e.name; }
               }
-              console.log('[gid] #' + globalThis.__ptCvId(this.canvas) + ' ' + w + 'x' + h + ' на ' + (this.canvas ? this.canvas.width + 'x' + this.canvas.height : '?') + show);
+              console.log('[gid] #' + globalThis.__ptCvId(this.canvas) + ' ' + w + 'x' + h + ' on ' + (this.canvas ? this.canvas.width + 'x' + this.canvas.height : '?') + show);
               return r;
             };
           }
-          // Полный след WebGPU: какие объекты и какие вызовы.
+          // Full WebGPU trace.
           if (!globalThis.__ptGpuTrace) {
             globalThis.__ptGpuTrace = 1;
             const names = Object.getOwnPropertyNames(globalThis).filter((n) => /^GPU/.test(n));
@@ -619,13 +596,13 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
                       if (v === null || v === undefined) return String(v);
                       if (typeof v === 'object') {
                         try { return JSON.stringify(v).slice(0, 1400); }
-                        catch (e) { return (v.constructor && v.constructor.name) || 'об'; }
+                        catch (e) { return (v.constructor && v.constructor.name) || 'obj'; }
                       }
                       return String(v).slice(0, 40);
                     });
                     const r = f.apply(this, args);
                     const shown = r && typeof r === 'object'
-                      ? ((r.constructor && r.constructor.name) || 'об') : String(r).slice(0, 30);
+                      ? ((r.constructor && r.constructor.name) || 'obj') : String(r).slice(0, 30);
                     console.log('[gpu] ' + n + '.' + k + '(' + a.join(' | ') + ') -> ' + shown);
                     return r;
                   };
@@ -641,10 +618,10 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
               if (typeof f !== 'function') continue;
               gpu[k] = function () {
                 let r;
-                try { r = f.apply(this, arguments); } catch (e) { console.log('[gpu] ' + k + ' бросил ' + e.name); throw e; }
+                try { r = f.apply(this, arguments); } catch (e) { console.log('[gpu] ' + k + ' threw ' + e.name); throw e; }
                 if (r && typeof r.then === 'function') {
-                  return r.then((v) => { console.log('[gpu] ' + k + ' -> ' + (v ? 'объект' : String(v))); return v; },
-                                (e) => { console.log('[gpu] ' + k + ' отказ ' + e); throw e; });
+                  return r.then((v) => { console.log('[gpu] ' + k + ' -> ' + (v ? 'object' : String(v))); return v; },
+                                (e) => { console.log('[gpu] ' + k + ' rejected ' + e); throw e; });
                 }
                 console.log('[gpu] ' + k + ' -> ' + String(r));
                 return r;
@@ -660,9 +637,8 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
               try { r = og.call(this, ty, a); } catch (e) { err = e.name; }
               const id = ++seq;
               console.log('[octx] #' + id + ' ' + ty + ' ' + this.width + 'x' + this.height +
-                  ' настройки=' + (a ? JSON.stringify(a) : '-') + ' -> ' + (err || (r ? 'ok' : String(r))));
-              // Для холста 49x44 — след первых операций: по нему видно, чем
-              // третий отличается от первых двух.
+                  ' options=' + (a ? JSON.stringify(a) : '-') + ' -> ' + (err || (r ? 'ok' : String(r))));
+              // 49x44 canvas: trace the first ops to see how the third differs from the first two.
               if (r && ty === '2d' && this.width * this.height === 2156) {
                 let n = 0;
                 const seen = Object.create(null);
@@ -697,10 +673,9 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
       try { globalThis[n] = function (...a) { bump('win.' + n); return f.apply(this, a); }; } catch (e) {}
     }
     globalThis.__ptCounts = () => N;
-    // Выгружаем на исходе прогона: печатаем по строке на имя.
     setTimeout(() => {
       const rows = Object.entries(N).sort((a, b) => (L[b[0]] || 0) - (L[a[0]] || 0));
-      for (const [k, v] of rows) console.log('[count] ' + v + ' вызовов, ' + (L[k] || 0) + ' знаков — ' + k);
+      for (const [k, v] of rows) console.log('[count] ' + v + ' calls, ' + (L[k] || 0) + ' chars — ' + k);
     }, 26000);
   } catch (e) {}
 
@@ -732,14 +707,13 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker|count|бросок|время|первые|исходник|числа|письмо)\]|^\[[jPC]\d* |^\[cs\]|^\[строки |^\[письмо |^\[числа |^\[исходник |^\[ПЕРВЫЙ |^\[svg\]|^\[хвост |^\[parts|^\[звук |^\[json |^\[btoa |^\[кус |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
+      if (/^\[(send|hook|hookerr|blob|worker|count|thrown|time|first|source|numbers|postmsg)\]|^\[[jPC]\d* |^\[cs\]|^\[strings |^\[postmsg |^\[numbers |^\[source |^\[FIRST |^\[svg\]|^\[tail |^\[parts|^\[audio |^\[json |^\[btoa |^\[chunk |^\[enc |^\[octx\]|^\[cop\]|^\[rp\]|^\[gid\]|^\[c48\]|^\[stop\]|^\[c49\]|^\[gpu\]|^\[ectx\]/.test(String(t)))
         lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
     }
-    // Крючок мог и не встать: у внедрения ошибка видна только так, а без неё
-    // лента выходит пустой и молчит о причине.
+    // A failing hook injection is only visible here; otherwise the tape is silently empty.
     if (m.method === 'Runtime.exceptionThrown') {
       const d = m.params.exceptionDetails || {};
-      lines.push('[крючок упал] ' + (d.text || '') + ' ' +
+      lines.push('[hook failed] ' + (d.text || '') + ' ' +
         ((d.exception && (d.exception.description || d.exception.value)) || '').slice(0, 200));
     }
     if (m.method === 'Target.attachedToTarget') {
@@ -748,9 +722,8 @@ if (s.length >= (globalThis.__ptDumpLo || 15000) && s.length <= (globalThis.__pt
       send('Runtime.enable', {}, s);
       send('Page.enable', {}, s);
       send('Page.addScriptToEvaluateOnNewDocument', { source: HOOK }, s);
-      // Крючок и в уже готовый документ: кадр виджета приезжает своей целью, и
-      // к моменту привязки его документ бывает создан — тогда «на новый
-      // документ» опаздывает, и лента выходит пустой.
+      // Also inject into the existing document: the widget frame may already
+      // be created at attach time, too late for addScriptToEvaluateOnNewDocument.
       send('Runtime.evaluate', { expression: HOOK, includeCommandLineAPI: false }, s);
       send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, s);
       send('Runtime.runIfWaitingForDebugger', {}, s);

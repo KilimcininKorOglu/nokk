@@ -352,24 +352,20 @@ async fn eval_and_print(ctx: &BrowserContext, js: &str) -> Result<()> {
         eprintln!("eval error: {e}");
         std::process::exit(1);
     }
-    // Один оборот круга доводит микрозадачи — но не таймер и не воркера, а
-    // всякая интересная проба ждёт именно их: `undefined` вместо ответа было
-    // свойством измерителя, а не измеряемого. Крутим, пока обещание не решится.
+    // One loop turn only drains microtasks, not timers or workers, and most
+    // probes wait on those. Spin until the promise settles.
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         ctx.run_event_loop().await.ok();
-        // `evaluate` отдаёт результат строкой, а не логическим значением, и
-        // сравнение с `Bool(true)` не совпадало никогда — каждый `--eval` ждал
-        // все пятнадцать секунд до упора, даже когда ответ был готов сразу.
+        // `evaluate` returns the result as a string, not a bool.
         let done = ctx.evaluate("globalThis.__outDone === true").await;
         let ready = matches!(&done, Ok(serde_json::Value::Bool(true)))
             || matches!(&done, Ok(serde_json::Value::String(s)) if s == "true");
         if ready || Instant::now() > deadline {
             break;
         }
-        // Миллисекунда, а не десять: на десяти кадры анимации ложатся на
-        // чужую сетку, и `requestAnimationFrame` отбивает то двенадцать
-        // миллисекунд, то двадцать четыре вместо ровных 16,7.
+        // 1 ms, not 10: at 10 ms animation frames land on the wrong grid and
+        // `requestAnimationFrame` ticks at 12/24 ms instead of 16.7.
         tokio::time::sleep(Duration::from_micros(500)).await;
     }
     let out = ctx
@@ -517,17 +513,15 @@ async fn real_main() -> Result<()> {
             if cli.until_clearance {
                 c.set_stop_at_clearance(true);
             }
-            // Узкий инструмент: только конструктор `Error`, и только чтобы
-            // прочитать, на чём споткнулась чужая программа. Всё, что шире —
-            // подмена `JSON.stringify`, `Array.join`, `String.fromCharCode` —
-            // меняет ход челленджа и рассказывает про измеритель, а не про
-            // измеряемое. Этот же виден только через `toString`, а он замаскирован.
+            // Narrow tool: only the `Error` constructor, to see what the foreign
+            // program tripped on. Wider hooks (`JSON.stringify`, `Array.join`,
+            // `String.fromCharCode`) change the challenge's course. This one is only
+            // visible via `toString`, which is masked.
             if std::env::var("NOKK_TRACE_THROWS").is_ok() {
                 let probe = r#"(() => {
-                  // Заодно — кто и с чем зовёт раскодировщик: пустой буфер там,
-                  // где у браузера данные, виден только так.
-                  // И кто просит пиксели: пустой ответ у нас против данных у
-                  // браузера означает холст нулевого размера.
+                  // Also log who calls the decoder and with what (an empty buffer where
+                  // Chrome has data), and who reads pixels (an empty result means a
+                  // zero-size canvas).
                   try {
                     const C = globalThis.CanvasRenderingContext2D;
                     if (C && C.prototype && C.prototype.getImageData) {
@@ -535,7 +529,7 @@ async fn real_main() -> Result<()> {
                       C.prototype.getImageData = function (x, y, w, h) {
                         try {
                           const c = this.canvas || {};
-                          console.error('[pixels] просят ' + w + 'x' + h + ' у холста ' +
+                          console.error('[pixels] request ' + w + 'x' + h + ' from canvas ' +
                                         c.width + 'x' + c.height + ' (' + (c.id || c.className || '') + ')');
                         } catch (e) {}
                         return G.apply(this, arguments);
@@ -545,9 +539,8 @@ async fn real_main() -> Result<()> {
                   globalThis.__pt_decodeSpy = (buf) => {
                     try {
                       if (Object.prototype.toString.call(buf) !== '[object ArrayBuffer]') return;
-                      // Челлендж занижает `stackTraceLimit` и подменяет
-                      // `prepareStackTrace`, чтобы спрятать свои кадры;
-                      // снимаем поверх этого.
+                      // The challenge lowers `stackTraceLimit` and replaces `prepareStackTrace`
+                      // to hide its frames; read the stack around that.
                       const lim = Error.stackTraceLimit;
                       const prep = Error.prepareStackTrace;
                       try { Error.stackTraceLimit = 30; Error.prepareStackTrace = undefined; } catch (e) {}
@@ -555,7 +548,7 @@ async fn real_main() -> Result<()> {
                       try { Error.stackTraceLimit = lim; Error.prepareStackTrace = prep; } catch (e) {}
                       const st = snap.split('\n').slice(2, 8)
                         .map((l) => l.trim()).join(' | ');
-                      console.error('[decode] ArrayBuffer ' + buf.byteLength + ' байт @ ' + st.slice(0, 330));
+                      console.error('[decode] ArrayBuffer ' + buf.byteLength + ' bytes @ ' + st.slice(0, 330));
                     } catch (e) {}
                   };
                   const E = globalThis.Error;
@@ -582,11 +575,10 @@ async fn real_main() -> Result<()> {
                 c.add_frame_init_script(probe.to_string());
                 c.add_init_script(probe.to_string());
             }
-            // Откуда шлют маяк ошибки. Челлендж стучит на `/eb/`, когда у него
-            // что-то не сложилось, — а браузер на том же месте не стучит вовсе.
-            // Тело маяка зашифровано, но место, откуда его отправили, читается
-            // из стека. Пробник нарочно узкий: один крючок на отправку и ничего
-            // больше — всякая лишняя подмена меняет то, что мы измеряем.
+            // Where the error beacon is sent from. The challenge posts to `/eb/` when
+            // something fails; Chrome never does there. The body is encrypted but the
+            // call site is readable from the stack. Deliberately narrow: one hook on
+            // send, since any extra patching changes what is measured.
             if std::env::var("NOKK_TRACE_BEACON").is_ok() {
                 let probe = r#"(() => {
                   globalThis.__ptEncMin = __ENCMIN__;
@@ -596,60 +588,55 @@ async fn real_main() -> Result<()> {
                     const O = XMLHttpRequest.prototype.open;
                     XMLHttpRequest.prototype.open = function (m, u) {
                       this.__ptU = String(u);
-                      // Окно сериализации: тело собирается между открытием
-                      // запроса и отправкой, и только в это время лента строк
-                      // показывает поля тела, а не разбор стилей самим движком.
+                      // Serialization window: the body is built between open and send; only then
+                      // does the string feed show body fields rather than the engine's own style
+                      // parsing.
                       try {
-                        if (/\/cdn-cgi\/challenge-platform\//.test(this.__ptU) && !globalThis.__ptСобрано) {
-                          globalThis.__ptСериализуем = 1;
+                        if (/\/cdn-cgi\/challenge-platform\//.test(this.__ptU) && !globalThis.__ptCollected) {
+                          globalThis.__ptSerializing = 1;
                         }
                       } catch (e) {}
                       return O.apply(this, arguments);
                     };
                     XMLHttpRequest.prototype.send = function (b) {
                       try {
-                        // Отчёт уходит — значит сбор закончен, самое время
-                        // высыпать счётчики.
+                        // Report is going out, so collection is done: dump the counters.
                         if (/\/fo\//.test(this.__ptU || '') && b && b.length > 50000) {
                           try { globalThis.__ptDumpCounts && __ptDumpCounts(); } catch (e) {}
                           try {
                             const T = globalThis.__ptTime || {};
                             const rows = Object.keys(T).map((k) => [k, T[k]]).sort((x, y) => y[1] - x[1]).slice(0, 14);
                             for (const [k, v] of rows) {
-                              console.error('[время] ' + Math.round(v) + 'мс — ' + k);
+                              console.error('[time] ' + Math.round(v) + 'ms - ' + k);
                             }
                           } catch (e) {}
                         }
-                        // Оракул по размерам: какая программа пришла в ответ на
-                        // первый POST и чем ответили на отчёт. Расшифрованная
-                        // длина, а не сжатая, — сравнивать с Chrome через
+                        // Size oracle: which program came back for the first POST and what the
+                        // report got. Decrypted length, not compressed; compare with Chrome via
                         // `tools/netwatch.js`.
-                        // Тело первого POST — то, что уходит до программы. У нас оно
-                        // на полсотни знаков короче хромовского, и разница видна только
-                        // текстом.
-                        // Метка в ленте наблюдателя: всё, что прочитано до неё, и
-                        // есть то, из чего собрано тело первого POST.
+                        // Mark in the probe feed: everything read before it went into the first
+                        // POST body.
                         if (/\/cdn-cgi\/challenge-platform\//.test(this.__ptU || '') && b && b.length > 1000
                             && !globalThis.__ptMarked) {
                           globalThis.__ptMarked = 1;
-                          try { globalThis.__pt_probeMark && __pt_probeMark('первый POST ' + b.length); } catch (e) {}
+                          try { globalThis.__pt_probeMark && __pt_probeMark('first POST ' + b.length); } catch (e) {}
                         }
                         if (/\/cdn-cgi\/challenge-platform\//.test(this.__ptU || '') && b && b.length > 1000
                             && b.length < 20000 && !globalThis.__ptFirstBody) {
                           globalThis.__ptFirstBody = 1;
-                          globalThis.__ptСобрано = 1;
-                          globalThis.__ptСериализуем = 0;
+                          globalThis.__ptCollected = 1;
+                          globalThis.__ptSerializing = 0;
                           try {
-                            const ряд = globalThis.__ptСтроки || [];
-                            const s1 = JSON.stringify(ряд);
-                            console.error('[строки] всего=' + ряд.length);
+                            const strs = globalThis.__ptStrings || [];
+                            const s1 = JSON.stringify(strs);
+                            console.error('[strings] total=' + strs.length);
                             for (let q = 0; q < s1.length; q += 250) {
-                              console.error('[строки ' + ряд.length + ':' + (q / 250) + '] ' + s1.slice(q, q + 250));
+                              console.error('[strings ' + strs.length + ':' + (q / 250) + '] ' + s1.slice(q, q + 250));
                             }
                           } catch (e) {}
                           const s0 = String(b);
                           for (let q = 0; q < s0.length; q += 250) {
-                            console.error('[ПЕРВЫЙ ' + s0.length + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
+                            console.error('[FIRST ' + s0.length + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
                           }
                         }
                         if (/\/cdn-cgi\/challenge-platform\//.test(this.__ptU || '')) {
@@ -658,24 +645,23 @@ async fn real_main() -> Result<()> {
                           this.addEventListener('loadend', () => {
                             let got = 0;
                             try { got = (this.responseText || '').length; } catch (e) {}
-                            console.error('[xhr] ' + t0 + 'мс тело=' + sent + ' → ' + this.status +
-                                          ' ответ=' + got + ' за ' + (Math.round(performance.now()) - t0) +
-                                          'мс ' + url.slice(-46));
+                            console.error('[xhr] ' + t0 + 'ms body=' + sent + ' → ' + this.status +
+                                          ' resp=' + got + ' in ' + (Math.round(performance.now()) - t0) +
+                                          'ms ' + url.slice(-46));
                           });
                         }
                         if (/\/eb\//.test(this.__ptU || '')) {
-                          const at = String(new Error().stack || '(без стека)');
+                          const at = String(new Error().stack || '(no stack)');
                           for (const line of at.split('\n').slice(0, 14)) {
                             console.error('[beacon] ' + line.trim().slice(0, 220));
                           }
-                          console.error('[beacon] размер=' + ((b && b.length) || 0));
+                          console.error('[beacon] size=' + ((b && b.length) || 0));
                         }
                       } catch (e) {}
                       return S.apply(this, arguments);
                     };
-                    // Счётчик обращений к тому, чего наш обычный пробник не
-                    // видит: сборщик у браузера зовёт эти вещи, и надо знать,
-                    // доходит ли до них наш прогон.
+                    // Counts calls our usual probe does not see: Chrome's collector calls
+                    // these, and we need to know whether our run reaches them.
                     const N = Object.create(null);
                     const L = Object.create(null);
                     const bump = (k) => { N[k] = (N[k] || 0) + 1; };
@@ -688,10 +674,8 @@ async fn real_main() -> Result<()> {
                       } catch (e) {}
                     };
                     const count = (obj, label, names) => {
-                      // `NOKK_TRACE_BEACON=light` — только лента запросов, без
-                      // подмены членов: счётчики меряют и себя, и на сборе это
-                      // видно секундами. Сколько сбор занимает на самом деле,
-                      // видно только лёгким прогоном.
+                      // `NOKK_TRACE_BEACON=light`: request feed only, no member patching. The
+                      // counters slow collection by seconds; real timing needs the light run.
                       if (globalThis.__ptLight || !obj) return;
                       for (const n of names) {
                         const f = obj[n];
@@ -702,9 +686,8 @@ async fn real_main() -> Result<()> {
                               bump(label + '.' + n);
                               const t0 = performance.now();
                               const r = f.apply(this, a);
-                              // Сколько времени ушло на каждый вызов: челлендж
-                              // меряет себя сам, и медленный ответ виден ему
-                              // не хуже неправильного.
+                              // Time per call: the challenge times itself, so a slow answer is as
+                              // visible to it as a wrong one.
                               try {
                                 const key = label + '.' + n;
                                 const T = (globalThis.__ptTime = globalThis.__ptTime || {});
@@ -718,10 +701,9 @@ async fn real_main() -> Result<()> {
                         } catch (e) {}
                       }
                     };
-                    // Отчёт проходит через `TextEncoder.encode` до сжатия и
-                    // шифрования: его куски видны здесь в открытом виде. Крючок
-                    // ставится с повтором — сам кодировщик появляется позже
-                    // пробника.
+                    // The report passes through `TextEncoder.encode` before compression and
+                    // encryption, so its pieces are plaintext here. Retried hook: the encoder
+                    // appears after the probe.
                     {
                       let en = 0;
                       const arm = () => {
@@ -736,11 +718,11 @@ async fn real_main() -> Result<()> {
                               at = String(new Error().stack || '').split('\n').slice(2, 5)
                                 .map((x) => x.trim().replace(/^at /, '').slice(0, 46)).join(' < ');
                             } catch (e) {}
-                            console.error('[enc ' + (en++) + '] ' + Math.round(performance.now()) + 'мс ' + (() => { try { return location.host.slice(0, 18) + ' '; } catch (e) { return '? '; } })() + s.length + ' | ненулевых=' + (() => { let n = 0, sum = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { n++; sum = (sum * 31 + c) >>> 0; } } return n + ' сумма=' + sum; })() + (s.length < 2000 || s.length > 14000 ? ' текст: ' + s.slice(0, 400).replace(/[^\x20-\x7e]/g, '.') : ' коды: ') + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
+                            console.error('[enc ' + (en++) + '] ' + Math.round(performance.now()) + 'ms ' + (() => { try { return location.host.slice(0, 18) + ' '; } catch (e) { return '? '; } })() + s.length + ' | nonzero=' + (() => { let n = 0, sum = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { n++; sum = (sum * 31 + c) >>> 0; } } return n + ' sum=' + sum; })() + (s.length < 2000 || s.length > 14000 ? ' text: ' + s.slice(0, 400).replace(/[^\x20-\x7e]/g, '.') : ' codes: ') + Array.from(s.slice(0, 24)).map((c) => c.charCodeAt(0)).join(',') + ' | ' + Array.from(s.slice(Math.floor(s.length / 2), Math.floor(s.length / 2) + 12)).map((c) => c.charCodeAt(0)).join(','));
 if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = globalThis.__ptD || {})[s.length]) {
   globalThis.__ptD[s.length] = 1;
-  for (let q = 0; q < s.length; q += 60) console.error('[кус ' + s.length + ':' + (q / 60) + '] ' + Array.from(s.slice(q, q + 60)).map((c) => c.charCodeAt(0)).join(','));
-  console.error('[хвост ' + s.length + '] куски=' + s.split('|').length + ' последние=' + JSON.stringify(s.split('|').slice(-3).map((x) => x.slice(-40))));
+  for (let q = 0; q < s.length; q += 60) console.error('[chunk ' + s.length + ':' + (q / 60) + '] ' + Array.from(s.slice(q, q + 60)).map((c) => c.charCodeAt(0)).join(','));
+  console.error('[tail ' + s.length + '] parts=' + s.split('|').length + ' last=' + JSON.stringify(s.split('|').slice(-3).map((x) => x.slice(-40))));
 }
                           }
                           return enc.call(this, x);
@@ -756,11 +738,9 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                         const t = setInterval(() => { if (arm() || ++tries > 40) clearInterval(t); }, 25);
                       }
                     }
-                    // Чей стиль перечисляют. Челлендж высыпает весь
-                    // вычисленный стиль одного узла, и у нас он выходит на
-                    // триста знаков длиннее хромовского: значит меряется не
-                    // тот узел или не в том окружении. Крючок лёгкий —
-                    // только приметы узла, по двадцать первых вызовов.
+                    // Whose style is enumerated. The challenge dumps a node's whole computed
+                    // style, and ours came out 300 chars longer than Chrome's: wrong node or
+                    // wrong environment. Light hook: node traits only, first twenty calls.
                     try {
                       const G = globalThis.getComputedStyle;
                       if (G && !G.__ptSaid) {
@@ -773,11 +753,11 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                                 (n.className && n.className.baseVal === undefined && typeof n.className === 'string' && n.className ? '.' + n.className.slice(0, 24) : '');
                               let chain = '', p = el;
                               for (let i = 0; i < 4 && p; i++) { chain += (i ? ' < ' : '') + who(p); p = p.parentNode; }
-                              console.error('[cs] ' + who(el) + ' в цепочке ' + chain +
-                                ' связан=' + (el && el.isConnected) +
-                                ' псевдо=' + String(ps) +
-                                ' док=' + (el && el.ownerDocument === document) +
-                                ' цвет=' + (r && r.color) + ' кегль=' + (r && r.fontSize) +' дети=' + (el && el.children ? Array.prototype.map.call(el.children, (k) => k.nodeName + (k.getAttribute && k.getAttribute('style') ? '[' + k.getAttribute('style').slice(0, 40) + ']' : '')).join(',').slice(0, 160) : '?') + ' текст=' + JSON.stringify(String((el && el.textContent) || '').slice(0, 40)) + ' откуда=' + (() => { try { return String(new Error().stack || '').split('\n').slice(2, 4).map((x) => x.trim().replace(/^at /, '').slice(0, 60)).join(' < '); } catch (e) { return '?'; } })());
+                              console.error('[cs] ' + who(el) + ' chain ' + chain +
+                                ' connected=' + (el && el.isConnected) +
+                                ' pseudo=' + String(ps) +
+                                ' doc=' + (el && el.ownerDocument === document) +
+                                ' color=' + (r && r.color) + ' fontSize=' + (r && r.fontSize) +' children=' + (el && el.children ? Array.prototype.map.call(el.children, (k) => k.nodeName + (k.getAttribute && k.getAttribute('style') ? '[' + k.getAttribute('style').slice(0, 40) + ']' : '')).join(',').slice(0, 160) : '?') + ' text=' + JSON.stringify(String((el && el.textContent) || '').slice(0, 40)) + ' from=' + (() => { try { return String(new Error().stack || '').split('\n').slice(2, 4).map((x) => x.trim().replace(/^at /, '').slice(0, 60)).join(' < '); } catch (e) { return '?'; } })());
                             }
                           } catch (e) {}
                           return r;
@@ -786,8 +766,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                         globalThis.getComputedStyle = globalThis.__pt_native ? __pt_native(V) : V;
                       }
                     } catch (e) {}
-                    // Чем меряют надписи в SVG: у эмодзи это способ узнать,
-                    // какие последовательности браузер сводит в один знак.
+                    // How SVG text is measured: for emoji this reveals which sequences the
+                    // browser merges into one glyph.
                     try {
                       const P = globalThis.SVGTextContentElement && SVGTextContentElement.prototype;
                       for (const name of ['getComputedTextLength', 'getSubStringLength', 'getNumberOfChars',
@@ -801,7 +781,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                               const show = (v) => (v && typeof v === 'object'
                                 ? '{' + ['x', 'y', 'width', 'height'].map((k) => k + '=' + (v[k] === undefined ? '?' : v[k])).join(',') + '}'
                                 : String(v));
-                              console.error('[svg] ' + name + '(' + a.join(',') + ') шрифт=' + (() => { try { const cs = getComputedStyle(this); return cs.fontSize + '/' + cs.fontFamily.slice(0, 20); } catch (e) { return '?'; } })() + ' текст=' +
+                              console.error('[svg] ' + name + '(' + a.join(',') + ') font=' + (() => { try { const cs = getComputedStyle(this); return cs.fontSize + '/' + cs.fontFamily.slice(0, 20); } catch (e) { return '?'; } })() + ' text=' +
                                 JSON.stringify(String(this.textContent || '').slice(0, 70)) + ' -> ' + show(r));
                             }
                           } catch (e) {}
@@ -818,7 +798,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           const r = bb.apply(this, a);
                           try {
                             if ((globalThis.__ptBBoxN = (globalThis.__ptBBoxN || 0) + 1) <= 40) {
-                              console.error('[svg] getBBox шрифт=' + (() => { try { const cs = getComputedStyle(this); return cs.fontSize + '/' + cs.fontFamily.slice(0, 20); } catch (e) { return '?'; } })() + ' текст=' +
+                              console.error('[svg] getBBox font=' + (() => { try { const cs = getComputedStyle(this); return cs.fontSize + '/' + cs.fontFamily.slice(0, 20); } catch (e) { return '?'; } })() + ' text=' +
                                 JSON.stringify(String(this.textContent || '').slice(0, 70)) +
                                 ' -> {' + [r.x, r.y, r.width, r.height].join(',') + '}');
                             }
@@ -829,9 +809,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                         Object.defineProperty(G, 'getBBox', { value: V, writable: true, configurable: true });
                       }
                     } catch (e) {}
-                    // Что страница склеивает в JSON и что кодирует в base64:
-                    // начальная посылка собирается именно так, и её содержимое
-                    // видно только здесь.
+                    // What the page passes to JSON and base64: the initial payload is built
+                    // this way and its content is only visible here.
                     try {
                       const J = JSON.stringify;
                       if (!J.__ptSaid) {
@@ -870,16 +849,15 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     count(globalThis.OfflineAudioContext && OfflineAudioContext.prototype, 'audio',
                           ['startRendering', 'createOscillator', 'createDynamicsCompressor']);
                     count(globalThis.HTMLMediaElement && HTMLMediaElement.prototype, 'media', ['canPlayType']);
-                    // Что именно спрашивают про кодеки и что мы ответили:
-                    // Chrome на том же списке даёт другие слова, а список
-                    // нужен целиком, чтобы сверить его offline.
+                    // Which codecs are queried and what we answered: Chrome answers the same
+                    // list differently, and the whole list is needed to compare offline.
                     try {
                       const M = globalThis.HTMLMediaElement && HTMLMediaElement.prototype;
                       const C = M && M.canPlayType;
                       if (C && !C.__ptSaid) {
                         const V = function canPlayType(t) {
                           const r = C.apply(this, arguments);
-                          try { console.error('[кодек] ' + String(t) + ' -> ' + String(r)); } catch (e) {}
+                          try { console.error('[codec] ' + String(t) + ' -> ' + String(r)); } catch (e) {}
                           return r;
                         };
                         V.__ptSaid = 1;
@@ -925,31 +903,28 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                             if (w * h <= 4) {
                               try {
                                 show = ' -> ' + Object.prototype.toString.call(r.data) + '[' + [].slice.call(r.data).join(',') + '] ' +
-                                  r.colorSpace + '/' + r.pixelFormat + ' настройки=' + JSON.stringify(arguments[4] || null) +
-                                  ' холст=' + JSON.stringify(this.getContextAttributes ? this.getContextAttributes() : null);
+                                  r.colorSpace + '/' + r.pixelFormat + ' options=' + JSON.stringify(arguments[4] || null) +
+                                  ' canvas=' + JSON.stringify(this.getContextAttributes ? this.getContextAttributes() : null);
                               } catch (e) { show = ' -> ' + e.name; }
                             }
-                            console.error('[gid] ' + w + 'x' + h + ' на ' + (this.canvas ? this.canvas.width + 'x' + this.canvas.height : '?') + show);
+                            console.error('[gid] ' + w + 'x' + h + ' on ' + (this.canvas ? this.canvas.width + 'x' + this.canvas.height : '?') + show);
                             return r;
                             
                           };
                         }
-                        // Челлендж ловит свои исключения сам и докладывает о них
-                        // на `/eb/`. Ловушка на самом рождении ошибки — самое
-                        // лёгкое, что можно поставить: конструктор, а не метод.
-                        // Маяк `/eb/` уходит зашифрованным, но перед шифром
-                        // челлендж сериализует пойманную ошибку сам —
-                        // `JSON.stringify(err, Object.getOwnPropertyNames(err))`.
-                        // Здесь она видна открытым текстом. Крючок срабатывает
-                        // только на ошибке: всё прочее идёт мимо него нетронутым.
+                        // The challenge catches its own exceptions and reports them to `/eb/`.
+                        // A trap at error construction is the lightest possible hook. The beacon
+                        // is encrypted, but the challenge first serializes the error itself with
+                        // `JSON.stringify(err, Object.getOwnPropertyNames(err))`, so it is
+                        // plaintext here. Fires only on errors; nothing else is touched.
                         if (!globalThis.__ptJsonHook) {
                           globalThis.__ptJsonHook = 1;
                           const S = JSON.stringify;
                           JSON.stringify = function (v, ...rest) {
                             try {
                               if (v instanceof Error) {
-                                console.error('[пойман] ' + Math.round(performance.now()) + 'мс ' +
-                                  String(v.name) + ': ' + String(v.message).slice(0, 200) + ' | поля: ' +
+                                console.error('[caught] ' + Math.round(performance.now()) + 'ms ' +
+                                  String(v.name) + ': ' + String(v.message).slice(0, 200) + ' | fields: ' +
                                   Object.getOwnPropertyNames(v).join(',') + ' | ' +
                                   String(v.stack || '').split(String.fromCharCode(10)).slice(0, 5)
                                     .map((l) => l.trim()).join(' <- ').slice(0, 300));
@@ -967,22 +942,18 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                             if (typeof C !== 'function') continue;
                             const W = function (...a) {
                               const e = new C(...a);
-                              // Челлендж занижает `stackTraceLimit` и ставит свой
-                              // `prepareStackTrace`: прочитанный поверх них стек —
-                              // его пересказ, а не наш. Снимаем на время чтения,
-                              // иначе имена скриптов подменяются на `<anonymous>`
-                              // и путь до кода читается неверно.
+                              // The challenge lowers `stackTraceLimit` and installs its own
+                              // `prepareStackTrace`; lift both while reading, otherwise script names
+                              // become `<anonymous>` and the code path reads wrong.
                               const lim = E0.stackTraceLimit, prep = E0.prepareStackTrace;
                               try { E0.stackTraceLimit = 30; E0.prepareStackTrace = undefined; } catch (x) {}
                               const snap = String(e.stack || '');
                               try { E0.stackTraceLimit = lim; E0.prepareStackTrace = prep; } catch (x) {}
                               if (shown++ < 120) {
                                 try {
-                                  // Шесть кадров, а не три: своя ошибка у
-                                  // челленджа без сообщения, и единственное, что
-                                  // о ней говорит, — кто её строил и из какого
-                                  // шага сбора.
-                                  console.error('[бросок] ' + Math.round(performance.now()) + 'мс ' + N + ': ' + String(a[0]).slice(0, 90) +
+                                  // Six frames, not three: the challenge's own errors have no message, so
+                                  // only the constructing code and collection step identify them.
+                                  console.error('[thrown] ' + Math.round(performance.now()) + 'ms ' + N + ': ' + String(a[0]).slice(0, 90) +
                                     ' | ' + snap.split(String.fromCharCode(10)).slice(1, 8)
                                       .map((l) => l.trim().replace(/^at /, '')).join(' <- ').slice(0, 460));
                                 } catch (x) {}
@@ -994,9 +965,9 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                             try { globalThis[N] = W; } catch (x) {}
                           }
                         }
-                        // Задержка цикла событий в этом кадре: если страница-хозяин
-                        // занимает поток, челлендж просто ждёт, и его собственные
-                        // часы показывают секунды там, где у браузера доли.
+                        // Event-loop lag in this frame: if the host page hogs the thread, the
+                        // challenge just waits and its own clock shows seconds where Chrome shows
+                        // fractions.
                         if (!globalThis.__ptLagProbe) {
                           globalThis.__ptLagProbe = 1;
                           let last = performance.now(), worst = 0, ticks = 0;
@@ -1005,13 +976,13 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                             const lag = now - last - 4;
                             if (lag > worst) worst = lag;
                             if (lag > 400) {
-                              console.error('[стоп] с ' + Math.round(last) + 'мс по ' + Math.round(now) +
-                                            'мс, простой ' + Math.round(lag) + 'мс');
+                              console.error('[stall] from ' + Math.round(last) + 'ms to ' + Math.round(now) +
+                                            'ms, idle ' + Math.round(lag) + 'ms');
                             }
                             last = now;
                             if (++ticks % 100 === 0) {
-                              console.error('[лаг] ' + Math.round(now) + 'мс тиков=' + ticks +
-                                            ' худшая задержка=' + Math.round(worst) + 'мс');
+                              console.error('[lag] ' + Math.round(now) + 'ms ticks=' + ticks +
+                                            ' worst delay=' + Math.round(worst) + 'ms');
                               worst = 0;
                             }
                             setTimeout(tick, 4);
@@ -1026,10 +997,10 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                             if (typeof f !== 'function') continue;
                             gpu[k] = function () {
                               let r;
-                              try { r = f.apply(this, arguments); } catch (e) { console.error('[gpu] ' + k + ' бросил ' + e.name); throw e; }
+                              try { r = f.apply(this, arguments); } catch (e) { console.error('[gpu] ' + k + ' threw ' + e.name); throw e; }
                               if (r && typeof r.then === 'function') {
-                                return r.then((v) => { console.error('[gpu] ' + k + ' -> ' + (v ? 'объект' : String(v))); return v; },
-                                              (e) => { console.error('[gpu] ' + k + ' отказ ' + e); throw e; });
+                                return r.then((v) => { console.error('[gpu] ' + k + ' -> ' + (v ? 'object' : String(v))); return v; },
+                                              (e) => { console.error('[gpu] ' + k + ' rejected ' + e); throw e; });
                               }
                               console.error('[gpu] ' + k + ' -> ' + String(r));
                               return r;
@@ -1045,9 +1016,9 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                             try { r = og.call(this, ty, a); } catch (e) { err = e.name; }
                             const id = ++seq;
                             console.error('[octx] #' + id + ' ' + ty + ' ' + this.width + 'x' + this.height +
-                                ' настройки=' + (a ? JSON.stringify(a) : '-') + ' -> ' + (err || (r ? 'ok' : String(r))));
-                            // Для холста 49x44 — след первых операций: по нему видно, чем
-                            // третий отличается от первых двух.
+                                ' options=' + (a ? JSON.stringify(a) : '-') + ' -> ' + (err || (r ? 'ok' : String(r))));
+                            // For the 49x44 canvas, trace the first ops: shows how the third differs
+                            // from the first two.
                             if (r && ty === '2d' && this.width * this.height === 2156) {
                               let n = 0;
                               const seen = Object.create(null);
@@ -1073,7 +1044,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     count(globalThis.Navigator && Navigator.prototype, 'nav', ['getGamepads']);
                     count(globalThis, 'win', ['atob', 'btoa', 'matchMedia', 'getComputedStyle',
                                               'setTimeout', 'requestAnimationFrame', 'queueMicrotask']);
-                    // Что ещё может быть медленным: измерения, разметка, картинки.
+                    // Other possibly slow calls: measurement, layout, images.
                     count(globalThis.Document && Document.prototype, 'd',
                           ['createElement', 'createElementNS', 'querySelector', 'querySelectorAll', 'getElementById']);
                     count(globalThis.Element && Element.prototype, 'el',
@@ -1088,29 +1059,28 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     count(globalThis.SVGGraphicsElement && SVGGraphicsElement.prototype, 'svg', ['getBBox']);
                     count(globalThis.FontFaceSet && FontFaceSet.prototype, 'fonts', ['check', 'load']);
                     count(globalThis.RTCPeerConnection && RTCPeerConnection.prototype, 'rtc', ['getStats']);
-                    // Выгрузка в момент отправки отчёта, а не по таймеру: кадр
-                    // виджета к сроку успевает исчезнуть, и счётчики пропадали
-                    // вместе с ним.
+                    // Dump when the report is sent, not on a timer: the widget frame may be
+                    // gone by then, taking the counters with it.
                     globalThis.__ptDumpCounts = () => {
                       for (const k of Object.keys(N).sort((a, b) => (L[b] || 0) - (L[a] || 0))) {
-                        console.error('[count] ' + N[k] + ' вызовов, ' + (L[k] || 0) + ' знаков — ' + k);
+                        console.error('[count] ' + N[k] + ' calls, ' + (L[k] || 0) + ' chars - ' + k);
                       }
                     };
                     setTimeout(() => { try { __ptDumpCounts(); } catch (e) {} }, 24000);
-                    // Заодно то, что челлендж сам считает ошибкой: он зовёт
-                    // `console.error` перед маяком далеко не всегда, но своё
-                    // отклонённое обещание отдаёт в общий обработчик.
+                    // Also what the challenge itself treats as an error: it does not always
+                    // call `console.error` before the beacon, but its rejected promise reaches
+                    // the global handler.
                     addEventListener('unhandledrejection', (e) => {
-                      try { console.error('[beacon] отклонено: ' + String((e.reason && e.reason.stack) || e.reason).slice(0, 300)); } catch (x) {}
+                      try { console.error('[beacon] rejected: ' + String((e.reason && e.reason.stack) || e.reason).slice(0, 300)); } catch (x) {}
                     });
                     addEventListener('error', (e) => {
-                      try { console.error('[beacon] ошибка: ' + String(e.message || '') + ' @ ' + String(e.filename || '').slice(-40) + ':' + e.lineno); } catch (x) {}
+                      try { console.error('[beacon] error: ' + String(e.message || '') + ' @ ' + String(e.filename || '').slice(-40) + ':' + e.lineno); } catch (x) {}
                     });
                   } catch (e) {}
                 })();"#;
-                // Порог, ниже которого куски отчёта в лог не идут: мелочь
-                // топит вывод, но иногда именно короткий кусок и отличается
-                // (список шрифтов у Chrome — 71 знак).
+                // Report pieces below this length are not logged: small ones flood the
+                // output, though sometimes the short one differs (Chrome's font list is
+                // 71 chars).
                 let probe = probe.replace(
                     "__LIGHT__",
                     if std::env::var("NOKK_TRACE_BEACON").as_deref() == Ok("light") { "1" } else { "0" },
@@ -1119,10 +1089,9 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     "__ENCMIN__",
                     &std::env::var("NOKK_ENC_MIN").unwrap_or_else(|_| "30".into()),
                 );
-                // Какой кусок высыпать целиком: `NOKK_DUMP_ENC=30000-32000`.
-                // По умолчанию — звуковой блок, его сверяли чаще всего. Тот же
-                // разброс задаётся Chrome через `DUMPENC` у `chrome-compare`,
-                // иначе сравнивать нечего.
+                // Which piece to dump whole: `NOKK_DUMP_ENC=30000-32000`. Defaults to the
+                // audio block. Set the same range for Chrome via `DUMPENC` in
+                // `chrome-compare`.
                 let window = std::env::var("NOKK_DUMP_ENC").unwrap_or_else(|_| "15000-16000".into());
                 let (lo, hi) = window.split_once('-').unwrap_or(("15000", "16000"));
                 let probe = probe.replace("__DUMPLO__", lo.trim()).replace("__DUMPHI__", hi.trim());
@@ -1130,11 +1099,10 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                 c.add_worker_init_script(probe.clone());
                 c.add_init_script(probe);
             }
-            // Исходник чужой программы. Её строят `new Function`, и это
-            // единственное место, где она видна текстом: то, что приходит по
-            // сети, — шифр, а стек внутри неё указывает смещением, немым без
-            // исходника. Крючок один, на конструкторе, и снимается вместе с
-            // `NOKK_DUMP_VM`.
+            // Source of the foreign program. It is built with `new Function`, the only
+            // place it is plaintext: the network copy is encrypted and its stack gives
+            // offsets that are useless without the source. One hook, on the
+            // constructor, enabled with `NOKK_DUMP_VM`.
             if std::env::var("NOKK_DUMP_VM").is_ok() {
                 let probe = r#"(() => {
                   try {
@@ -1145,17 +1113,15 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                         if (t.length > (globalThis.__ptVmMin || 20000) &&
                             (!globalThis.__pt_vmSrc || t.length > globalThis.__pt_vmSrc.length)) {
                           globalThis.__pt_vmSrc = t;
-                          console.error('[vmsrc] ' + Math.round(performance.now()) + 'мс ' + t.length + ' знаков');
+                          console.error('[vmsrc] ' + Math.round(performance.now()) + 'ms ' + t.length + ' chars');
                         }
                       } catch (e) {}
                     };
                     const mask = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
                     const wrap = (host) => {
-                      // Маяк `/eb/` уходит зашифрованным, но пойманную ошибку
-                      // челлендж сериализует до шифра — и `JSON` для этого
-                      // берёт не наш, а чистый, из области. Здесь она видна
-                      // открытым текстом. Жалуемся в консоль кадра: своей у
-                      // области нет, её никто не вычитывает.
+                      // The challenge serializes caught errors before encrypting the `/eb/`
+                      // beacon, using a clean `JSON` from the sandbox realm, so it is plaintext
+                      // here. Log to the frame console: the realm has none that is read.
                       try {
                         const J = host.JSON;
                         if (J && typeof J.stringify === 'function' && !J.stringify.__ptSeen) {
@@ -1163,9 +1129,9 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           const V = function stringify(v) {
                             try {
                               if (v && typeof v === 'object' && typeof v.stack === 'string') {
-                                console.error('[пойман] ' + Math.round(performance.now()) + 'мс ' +
+                                console.error('[caught] ' + Math.round(performance.now()) + 'ms ' +
                                   String(v.name) + ': ' + String(v.message).slice(0, 200) +
-                                  ' | поля: ' + Object.getOwnPropertyNames(v).join(',') + ' | ' +
+                                  ' | fields: ' + Object.getOwnPropertyNames(v).join(',') + ' | ' +
                                   String(v.stack).split(String.fromCharCode(10)).slice(0, 6)
                                     .map((l) => l.trim()).join(' <- ').slice(0, 320));
                               }
@@ -1176,19 +1142,18 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           J.stringify = mask(V);
                         }
                       } catch (e) {}
-                      // Чем зовут подмену узла. Чистые ссылки челлендж берёт
-                      // из области, поэтому крючок ставится там же; соседние
-                      // `appendChild`/`insertBefore` не трогаем — они на
-                      // горячем пути, и обёртка на них меняет ход сбора.
+                      // Who calls node replacement. The challenge takes clean references from
+                      // the sandbox realm, so the hook goes there too. `appendChild` and
+                      // `insertBefore` stay untouched: they are hot and wrapping them changes
+                      // collection.
                       try {
-                        // Кольцо последних обращений к тем местам, откуда
-                        // берут узлы: когда подмена получает пустоту, надо
-                        // знать, что её родило.
+                        // Ring of recent node lookups: when replacement gets an empty value, we
+                        // need to know what produced it.
                         if (!globalThis.__ptRing) globalThis.__ptRing = [];
                         const ring = globalThis.__ptRing;
                         const note = (what, got) => {
                           try {
-                            ring.push(Math.round(performance.now()) + 'мс ' + what + ' -> ' +
+                            ring.push(Math.round(performance.now()) + 'ms ' + what + ' -> ' +
                               (got === undefined ? 'undefined' : got === null ? 'null'
                                 : (typeof got === 'object' ? String(got.nodeName || Object.prototype.toString.call(got)) : typeof got)));
                             if (ring.length > 16) ring.shift();
@@ -1223,12 +1188,12 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           const F = P.replaceChild;
                           const V = function replaceChild(...a) {
                             try {
-                              console.error('[замена] ' + Math.round(performance.now()) + 'мс на ' +
-                                (this && this.nodeName) + ' аргументов=' + a.length + ' [' +
+                              console.error('[replace] ' + Math.round(performance.now()) + 'ms on ' +
+                                (this && this.nodeName) + ' args=' + a.length + ' [' +
                                 a.map((x) => x === undefined ? 'undefined' : x === null ? 'null'
                                   : (typeof x === 'object' ? String(x.nodeName) : typeof x + ':' + String(x).slice(0, 20))).join(', ') + ']');
                               if (a[0] === undefined || a[0] === null) {
-                                for (const line of (globalThis.__ptRing || [])) console.error('[до замены] ' + line);
+                                for (const line of (globalThis.__ptRing || [])) console.error('[before replace] ' + line);
                               }
                             } catch (e) {}
                             return F.apply(this, a);
@@ -1248,11 +1213,9 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           { value: W, writable: true, configurable: true });
                       } catch (e) {}
                       try { host.Function = mask(W); } catch (e) {}
-                      // Тем же именем зовут и родню `Function`: тело кода
-                      // компилируют через конструктор асинхронной функции или
-                      // генератора ровно так же, а глаз на них никто не держит.
-                      // Родню берём у самой области, а не у себя, — иначе
-                      // подменишь свою и не заметишь чужую.
+                      // `Function`'s siblings compile code the same way (async function and
+                      // generator constructors). Take them from the realm itself, not from us,
+                      // or we would patch ours and miss theirs.
                       let kin = [];
                       try {
                         kin = new G('return [Object.getPrototypeOf(async function(){}).constructor,' +
@@ -1271,11 +1234,10 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     };
                     globalThis.__ptVmMin = __VMMIN__;
                     wrap(globalThis);
-                    console.error('[vmsrc] крючок стоит, порог ' + globalThis.__ptVmMin);
-                    // Чужая программа берёт `Function` не у нас, а из чистой
-                    // области — пустого однородного кадра, за `contentWindow`.
-                    // Там наши правки ещё не стояли; ставим их на самом выходе
-                    // области, пока её никому не отдали.
+                    console.error('[vmsrc] hook installed, threshold ' + globalThis.__ptVmMin);
+                    // The foreign program takes `Function` from a clean realm (an empty
+                    // same-origin frame, via `contentWindow`) where our patches are not yet
+                    // installed; install them as the realm is handed out.
                     const R = globalThis.__pt_makeRealm;
                     if (typeof R === 'function') {
                       globalThis.__pt_makeRealm = mask(function __pt_makeRealm() {
@@ -1286,8 +1248,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     }
                   } catch (e) {}
                 })();"#;
-                // Порог — чтобы не топить лог в мелочи страницы; своим числом
-                // его опускают, когда ищут, чем вообще компилируют.
+                // Threshold to keep page noise out of the log; lower it to find what
+                // compiles code at all.
                 let probe = probe.replace(
                     "__VMMIN__",
                     &std::env::var("NOKK_VM_MIN").unwrap_or_else(|_| "20000".into()),
@@ -1296,35 +1258,30 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                 c.add_worker_init_script(probe.clone());
                 c.add_init_script(probe);
             }
-            // Наблюдение за крючками челленджа: программа, пришедшая с сервера,
-            // зовёт виджет через его же таблицу колбэков, и увидеть, какие из
-            // них она позвала, — единственный способ прочитать её решение.
-            // Лента полей первого POST — и ничего больше. Полная трассировка
-            // в кадре и его свежем реалме останавливает виджет: POST не уходит
-            // вовсе. Здесь три крючка, все с родным видом: `charCodeAt` (так
-            // сериализатор читает каждое поле и значение), `open` и `send`.
-            // Трасса холста 2D: вызовы и присваивания контекста, изнутри реализации.
+            // 2D canvas trace: context calls and assignments, from inside the
+            // implementation.
             if std::env::var("NOKK_TRACE_CANVAS").is_ok() {
                 let flag = "Object.defineProperty(globalThis, '__pt_canvasTrace', { value: 1, configurable: true });";
                 c.add_frame_init_script(spread_to_realms(flag, "canvas"));
                 c.add_worker_init_script(flag.to_string());
                 c.add_init_script(flag.to_string());
             }
-            // Трасса WebGPU: флаг для реализации (в кадре, в его реалмах и в воркере).
+            // WebGPU trace: flag for the implementation (frame, its realms, workers).
             if std::env::var("NOKK_TRACE_GPU").is_ok() {
                 let flag = "Object.defineProperty(globalThis, '__pt_gpuTrace', { value: 1, configurable: true });";
                 c.add_frame_init_script(spread_to_realms(flag, "gpu"));
                 c.add_worker_init_script(flag.to_string());
                 c.add_init_script(flag.to_string());
             }
-            // Свой сценарий в каждый кадр при рождении (`NOKK_FRAME_INIT=<файл>`):
-            // для сверок с Chrome, где то же самое ставится через CDP. Итог
-            // сценарий кладёт в глобальную, а `NOKK_EVAL_FRAMES` её вычитывает.
+            // Custom script injected into every frame at creation
+            // (`NOKK_FRAME_INIT=<file>`), for Chrome comparisons where CDP injects the
+            // same. The script stores its result in a global that `NOKK_EVAL_FRAMES`
+            // reads.
             if let Ok(path) = std::env::var("NOKK_FRAME_INIT") {
                 match std::fs::read_to_string(&path) {
                     Ok(js) => {
-                        // И в реалмы пустых кадров: челлендж держит там свою
-                        // песочницу, и без пробника в ней половина вызовов не видна.
+                        // Also into empty-frame realms: the challenge keeps its sandbox there and
+                        // half of its calls are invisible without the probe.
                         c.add_frame_init_script(spread_to_realms(&js, "frame_init"));
                         c.add_init_script(spread_to_realms(&js, "frame_init"));
                     }
@@ -1341,9 +1298,9 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     return globalThis.__pt_native ? __pt_native(f) : f;
                   };
                   const cf = () => {
-                    if (globalThis.__ptВРеалме) return true;
-                    // И сама страница заставы (оркестратор на домене сайта): у неё
-                    // свои отчёты в /cdn-cgi/challenge-platform/.
+                    if (globalThis.__ptInRealm) return true;
+                    // And the interstitial page itself (orchestrator on the site's domain): it
+                    // posts its own reports to /cdn-cgi/challenge-platform/.
                     if (globalThis._cf_chl_opt) return true;
                     try { return /challenges\.cloudflare/.test(location.host); } catch (e) { return false; }
                   };
@@ -1352,102 +1309,102 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     P.open = nat(function open(m, u) {
                       try {
                         if (cf() && /challenge-platform/.test(String(u))) {
-                          if (!globalThis.__ptСобрано) globalThis.__ptСериализуем = 1;
-                          // Второе окно — отчёт: тот же сериализатор, те же
-                          // строки знак за знаком, только тело за 50 К.
-                          else globalThis.__ptСериализуем2 = 1;
+                          if (!globalThis.__ptCollected) globalThis.__ptSerializing = 1;
+                          // Second window is the report: same serializer, same per-char reads, body
+                          // over 50K.
+                          else globalThis.__ptSerializing2 = 1;
                         }
                       } catch (e) {}
                       return XO.apply(this, arguments);
                     }, XO);
                     P.send = nat(function send(b) {
                       try {
-                        if (globalThis.__ptСериализуем && b && b.length > 1000 && b.length < 20000 && !globalThis.__ptСобрано) {
-                          globalThis.__ptСобрано = 1;
-                          globalThis.__ptСериализуем = 0;
-                          const ряд = globalThis.__ptСтроки || [];
-                          const s1 = JSON.stringify(ряд);
-                          console.error('[поля] всего=' + ряд.length + ' тело=' + b.length);
-                          globalThis.__ptСтроки = [];
+                        if (globalThis.__ptSerializing && b && b.length > 1000 && b.length < 20000 && !globalThis.__ptCollected) {
+                          globalThis.__ptCollected = 1;
+                          globalThis.__ptSerializing = 0;
+                          const strs = globalThis.__ptStrings || [];
+                          const s1 = JSON.stringify(strs);
+                          console.error('[fields] total=' + strs.length + ' body=' + b.length);
+                          globalThis.__ptStrings = [];
                           try {
-                            const Ж = globalThis.__ptЧтения || [];
-                            const s2 = JSON.stringify(Ж.slice(-200));
-                            for (let q = 0; q < s2.length; q += 250) console.error('[чтения ' + q / 250 + '] ' + s2.slice(q, q + 250));
+                            const readLog = globalThis.__ptReads || [];
+                            const s2 = JSON.stringify(readLog.slice(-200));
+                            for (let q = 0; q < s2.length; q += 250) console.error('[reads ' + q / 250 + '] ' + s2.slice(q, q + 250));
                           } catch (e) {}
                           for (let q = 0; q < s1.length; q += 250) {
-                            console.error('[поля ' + ряд.length + ':' + (q / 250) + '] ' + s1.slice(q, q + 250));
+                            console.error('[fields ' + strs.length + ':' + (q / 250) + '] ' + s1.slice(q, q + 250));
                           }
                         }
-                        if (globalThis.__ptСериализуем2 && b && b.length > 1000 && b.length <= 50000) {
-                          // Малый отчёт после первого (финальный отчёт оркестратора заставы).
-                          const k = (globalThis.__ptМалыйK = (globalThis.__ptМалыйK || 0) + 1);
-                          globalThis.__ptСериализуем2 = 0;
-                          const ряд = globalThis.__ptСтроки2 || [];
-                          globalThis.__ptСтроки2 = [];
-                          const s1 = JSON.stringify(ряд);
-                          console.error('[поля#' + k + '] всего=' + ряд.length + ' тело=' + b.length + ' ломтей=' + Math.ceil(s1.length / 250));
-                          for (let q = 0; q * 250 < s1.length; q++) console.error('[поля#' + k + ' ' + q + '] ' + s1.slice(q * 250, (q + 1) * 250));
+                        if (globalThis.__ptSerializing2 && b && b.length > 1000 && b.length <= 50000) {
+                          // Small report after the first (the interstitial orchestrator's final one).
+                          const k = (globalThis.__ptSmallK = (globalThis.__ptSmallK || 0) + 1);
+                          globalThis.__ptSerializing2 = 0;
+                          const strs = globalThis.__ptStrings2 || [];
+                          globalThis.__ptStrings2 = [];
+                          const s1 = JSON.stringify(strs);
+                          console.error('[fields#' + k + '] total=' + strs.length + ' body=' + b.length + ' slices=' + Math.ceil(s1.length / 250));
+                          for (let q = 0; q * 250 < s1.length; q++) console.error('[fields#' + k + ' ' + q + '] ' + s1.slice(q * 250, (q + 1) * 250));
                         }
-                        if (globalThis.__ptСериализуем2 && b && b.length > 50000) {
-                          // Отчётов может быть несколько (второй — после нажатия):
-                          // каждый — своей пачкой, строки сбрасываются.
-                          const k = (globalThis.__ptОтчётK = (globalThis.__ptОтчётK || 0) + 1);
-                          globalThis.__ptОтчётСобран = 1;
-                          globalThis.__ptСериализуем2 = 0;
-                          const ряд = globalThis.__ptСтроки2 || [];
-                          globalThis.__ptСтроки2 = [];
-                          const s1 = JSON.stringify(ряд);
-                          console.error('[отчёт#' + k + '] всего=' + ряд.length + ' тело=' + b.length + ' знаков=' + s1.length + ' ломтей=' + Math.ceil(s1.length / 250));
-                          // Консоль держит 256 строк между выемками — ломти
-                          // уходят пачками по таймеру.
-                          const всего = Math.ceil(s1.length / 250);
+                        if (globalThis.__ptSerializing2 && b && b.length > 50000) {
+                          // There may be several reports (the second after a click); each gets its
+                          // own batch and the strings are reset.
+                          const k = (globalThis.__ptReportK = (globalThis.__ptReportK || 0) + 1);
+                          globalThis.__ptReportCollected = 1;
+                          globalThis.__ptSerializing2 = 0;
+                          const strs = globalThis.__ptStrings2 || [];
+                          globalThis.__ptStrings2 = [];
+                          const s1 = JSON.stringify(strs);
+                          console.error('[report#' + k + '] total=' + strs.length + ' body=' + b.length + ' chars=' + s1.length + ' slices=' + Math.ceil(s1.length / 250));
+                          // The console holds 256 lines between drains, so slices go out in batches
+                          // on a timer.
+                          const chunks = Math.ceil(s1.length / 250);
                           let q = 0;
-                          const пачка = () => {
-                            for (let k = 0; k < 100 && q < всего; k++, q++) console.error('[отчёт ' + всего + ':' + q + '] ' + s1.slice(q * 250, (q + 1) * 250));
-                            if (q < всего) setTimeout(пачка, 40);
+                          const flush = () => {
+                            for (let k = 0; k < 100 && q < chunks; k++, q++) console.error('[report ' + chunks + ':' + q + '] ' + s1.slice(q * 250, (q + 1) * 250));
+                            if (q < chunks) setTimeout(flush, 40);
                           };
-                          пачка();
+                          flush();
                         }
                       } catch (e) {}
                       return XS.apply(this, arguments);
                     }, XS);
                   } catch (e) {}
-                  // Журнал чтений времени (NOKK_TRACE_READS): что кадр читал из
-                  // часов перед тем, как собрать тело.
+                  // Clock read log (NOKK_TRACE_READS): what the frame read from clocks
+                  // before building the body.
                   if (__READS__ && cf) {
-                    const журнал = (what, v) => {
+                    const noteRead = (what, v) => {
                       try {
                         if (!cf()) return;
-                        const Ж = globalThis.__ptЧтения || (globalThis.__ptЧтения = []);
-                        let где = '';
-                        try { где = String(new Error().stack).split('\n').slice(3, 5).map((x) => x.trim().replace(/^at /, '').replace(/\(?https?:\/\/[^)]*?(:\d+:\d+)\)?/, '$1')).join(' < '); } catch (e) {}
-                        Ж.push([what, typeof v === 'number' ? Math.round(v * 10) / 10 : String(v).slice(0, 30), где]);
-                        if (Ж.length > 400) Ж.splice(0, 100);
+                        const readLog = globalThis.__ptReads || (globalThis.__ptReads = []);
+                        let site = '';
+                        try { site = String(new Error().stack).split('\n').slice(3, 5).map((x) => x.trim().replace(/^at /, '').replace(/\(?https?:\/\/[^)]*?(:\d+:\d+)\)?/, '$1')).join(' < '); } catch (e) {}
+                        readLog.push([what, typeof v === 'number' ? Math.round(v * 10) / 10 : String(v).slice(0, 30), site]);
+                        if (readLog.length > 400) readLog.splice(0, 100);
                       } catch (e) {}
                     };
                     try {
-                      // Медленные вставки и замеры геометрии: что именно стоит.
-                      const медленно = (label, f) => nat(function () {
+                      // Slow insertions and geometry reads: what exactly is expensive.
+                      const slow = (label, f) => nat(function () {
                         const t0 = performance.now();
                         const r = f.apply(this, arguments);
                         const dt = performance.now() - t0;
                         if (dt > 3 && cf()) {
                           const a = arguments[0];
-                          журнал('медленно ' + label, Math.round(dt) + ' ' + ((a && a.nodeName) || (this && this.nodeName) || ''));
+                          noteRead('slow ' + label, Math.round(dt) + ' ' + ((a && a.nodeName) || (this && this.nodeName) || ''));
                         }
                         return r;
                       }, f);
                       const NP = Node.prototype;
-                      for (const k of ['appendChild', 'insertBefore', 'removeChild', 'replaceChild']) NP[k] = медленно(k, NP[k]);
-                      if (globalThis.SVGGraphicsElement) SVGGraphicsElement.prototype.getBBox = медленно('getBBox', SVGGraphicsElement.prototype.getBBox);
-                      Element.prototype.getBoundingClientRect = медленно('rect', Element.prototype.getBoundingClientRect);
-                      globalThis.getComputedStyle = медленно('gcs', globalThis.getComputedStyle);
+                      for (const k of ['appendChild', 'insertBefore', 'removeChild', 'replaceChild']) NP[k] = slow(k, NP[k]);
+                      if (globalThis.SVGGraphicsElement) SVGGraphicsElement.prototype.getBBox = slow('getBBox', SVGGraphicsElement.prototype.getBBox);
+                      Element.prototype.getBoundingClientRect = slow('rect', Element.prototype.getBoundingClientRect);
+                      globalThis.getComputedStyle = slow('gcs', globalThis.getComputedStyle);
                     } catch (e) {}
                     try {
                       const PN = Performance.prototype.now;
-                      Performance.prototype.now = nat(function now() { const v = PN.call(this); журнал('now', v); return v; }, PN);
+                      Performance.prototype.now = nat(function now() { const v = PN.call(this); noteRead('now', v); return v; }, PN);
                       const DN = Date.now;
-                      Date.now = nat(function now() { const v = DN(); журнал('Date.now', v % 100000); return v; }, DN);
+                      Date.now = nat(function now() { const v = DN(); noteRead('Date.now', v % 100000); return v; }, DN);
                       for (const [proto, label] of [[globalThis.PerformanceTiming && PerformanceTiming.prototype, 'timing'],
                                                     [globalThis.PerformanceNavigationTiming && PerformanceNavigationTiming.prototype, 'nav'],
                                                     [globalThis.PerformanceResourceTiming && PerformanceResourceTiming.prototype, 'res'],
@@ -1457,7 +1414,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           const d = Object.getOwnPropertyDescriptor(proto, k);
                           if (!d || !d.get || k === 'constructor') continue;
                           const g = d.get;
-                          Object.defineProperty(proto, k, { get: nat(function () { const v = g.call(this); if (typeof v === 'number') журнал(label + '.' + k, label === 'timing' ? v % 100000 : v); return v; }, g), set: d.set, enumerable: d.enumerable, configurable: true });
+                          Object.defineProperty(proto, k, { get: nat(function () { const v = g.call(this); if (typeof v === 'number') noteRead(label + '.' + k, label === 'timing' ? v % 100000 : v); return v; }, g), set: d.set, enumerable: d.enumerable, configurable: true });
                         }
                       }
                     } catch (e) {}
@@ -1465,12 +1422,12 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                   try {
                     const CCA = String.prototype.charCodeAt;
                     String.prototype.charCodeAt = nat(function charCodeAt(i) {
-                      if (i === 0 && globalThis.__ptСериализуем && this.length < 120) {
-                        const ряд = globalThis.__ptСтроки || (globalThis.__ptСтроки = []);
-                        if (ряд.length < 600) ряд.push(String(this));
-                      } else if (i === 0 && globalThis.__ptСериализуем2) {
-                        const ряд = globalThis.__ptСтроки2 || (globalThis.__ptСтроки2 = []);
-                        if (ряд.length < 60000) ряд.push(this.length < 2000 ? String(this) : '\u0001' + this.length);
+                      if (i === 0 && globalThis.__ptSerializing && this.length < 120) {
+                        const strs = globalThis.__ptStrings || (globalThis.__ptStrings = []);
+                        if (strs.length < 600) strs.push(String(this));
+                      } else if (i === 0 && globalThis.__ptSerializing2) {
+                        const strs = globalThis.__ptStrings2 || (globalThis.__ptStrings2 = []);
+                        if (strs.length < 60000) strs.push(this.length < 2000 ? String(this) : '\u0001' + this.length);
                       }
                       return CCA.call(this, i);
                     }, CCA);
@@ -1481,16 +1438,17 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     if std::env::var("NOKK_TRACE_READS").is_ok() { "true" } else { "false" },
                 );
                 c.add_frame_init_script(spread_to_realms(&probe, "fields"));
-                // И на саму страницу: у заставы свои отчёты в /challenge-platform/.
+                // Also on the page itself: the interstitial posts its own reports to
+                // /challenge-platform/.
                 c.add_init_script(spread_to_realms(&probe, "fields"));
             }
             if std::env::var("NOKK_TRACE_HOOKS").is_ok() {
                 let hook = r#"(() => {
                   try { console.error('[hook] installed'); } catch (e) {}
                   globalThis.__pt_streamHooks = __STREAM__;
-                  // Опыт: недостижимый хост в браузере не отвечает вовсе —
-                  // запрос висит. У нас соединение падает сразу, и челлендж
-                  // получает отказ там, где Chrome не получает ничего.
+                  // Experiment: in Chrome an unreachable host never answers and the request
+                  // hangs. Here the connection fails at once, so the challenge gets a
+                  // rejection where Chrome gets nothing.
                   if (__HANG__) {
                     try {
                       const F = globalThis.fetch;
@@ -1504,9 +1462,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       };
                     } catch (e) {}
                   }
-                  // Собранный отпечаток уходит через JSON.stringify до того, как
-                  // его сожмут и зашифруют — это единственная точка, где видно,
-                  // что именно мы про себя рассказали.
+                  // The collected fingerprint goes through JSON.stringify before compression
+                  // and encryption: the only point where we can see what we reported.
                   try {
                     const S_ = XMLHttpRequest.prototype.send, O_ = XMLHttpRequest.prototype.open;
                     XMLHttpRequest.prototype.open = function (m, u) { this.__ptU = String(u); return O_.apply(this, arguments); };
@@ -1516,12 +1473,11 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           : (typeof b === 'string' ? b.length
                           : (b.byteLength !== undefined ? b.byteLength
                           : (b.size !== undefined ? b.size : (b.length || 0))));
-                        console.error('[send] ' + Math.round(performance.now()) + 'мс bytes=' + size + ' kind=' + Object.prototype.toString.call(b) +
+                        console.error('[send] ' + Math.round(performance.now()) + 'ms bytes=' + size + ' kind=' + Object.prototype.toString.call(b) +
                                       ' url=' + String(this.__ptU || '').slice(-40));
                       } catch (e) {}
-                      // Маяк `/eb/` — единственное место, где челлендж сам
-                      // рассказывает, что у него не так. Тело собирается мимо
-                      // JSON.stringify и btoa, поэтому берём его прямо здесь.
+                      // The `/eb/` beacon is the only place the challenge says what went wrong.
+                      // Its body bypasses JSON.stringify and btoa, so capture it here.
                       try {
                         if (/\/eb\//.test(String(this.__ptU || ''))) {
                           const t = typeof b === 'string' ? b : Object.prototype.toString.call(b);
@@ -1534,17 +1490,16 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     };
                   } catch (e) {}
                   try {
-                    // Их сериализация не идёт через JSON — но строка где-то
-                    // собирается: из массива, конкатенацией или из кодов.
+                    // Their serialization skips JSON, but the string is assembled somewhere:
+                    // from an array, by concatenation or from char codes.
                     let seen = 0, dumped = 0;
-                    // Тело первого POST у Chrome собирается склейкой массива, а у
-                    // нас такой склейки нет вовсе — значит собирают иначе. Ставим
-                    // ещё три заметки: коды знаков, склейка типизированного
-                    // массива и base64. Печатают только строки нужного размера.
-                    // Заметки ставятся «нативными»: у подменённой функции виден и
-                    // исходник, и другая длина, а челлендж их читает — под грубой
-                    // подменой он просто не начинается.
-                    const асНатив = (f, src) => {
+                    // Chrome builds the first POST body with an array join; we have no such
+                    // join, so it is built differently. Three more hooks: char codes, typed
+                    // array join and base64. Only strings of the right size are printed.
+                    // Hooks are made to look native: a patched function shows different
+                    // source and length, the challenge reads both, and under crude patching
+                    // it does not start.
+                    const asNative = (f, src) => {
                       try {
                         Object.defineProperty(f, 'name', { value: src.name, configurable: true });
                         Object.defineProperty(f, 'length', { value: src.length, configurable: true });
@@ -1553,12 +1508,12 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     };
                     try {
                       const FCC = String.fromCharCode;
-                      String.fromCharCode = асНатив(function (...a) {
+                      String.fromCharCode = asNative(function (...a) {
                         const out = FCC.apply(this, a);
                         try {
                           if (out.length > 1000 && out.length < 9000
                               && (globalThis.__ptFccN = (globalThis.__ptFccN || 0) + 1) < 12) {
-                            console.error('[коды ' + out.length + '] доводов=' + a.length +
+                            console.error('[codes ' + out.length + '] args=' + a.length +
                                   ' ' + out.slice(0, 120));
                           }
                         } catch (e) {}
@@ -1568,12 +1523,12 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     try {
                       const TA = Object.getPrototypeOf(Int8Array.prototype);
                       const TJ = TA.join;
-                      TA.join = асНатив(function (sep) {
+                      TA.join = asNative(function (sep) {
                         const out = TJ.apply(this, arguments);
                         try {
                           if (typeof out === 'string' && out.length > 1000
                               && (globalThis.__ptTaN = (globalThis.__ptTaN || 0) + 1) < 12) {
-                            console.error('[склейка чисел ' + out.length + '] n=' + this.length +
+                            console.error('[join numbers ' + out.length + '] n=' + this.length +
                                   ' ' + out.slice(0, 100));
                           }
                         } catch (e) {}
@@ -1583,7 +1538,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     try {
                       const B = globalThis.btoa;
                       if (typeof B === 'function') {
-                        globalThis.btoa = асНатив(function (x) {
+                        globalThis.btoa = asNative(function (x) {
                           const src = String(x == null ? '' : x);
                           try {
                             if (src.length > 1000 && src.length < 9000
@@ -1595,49 +1550,49 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                         }, B);
                       }
                     } catch (e) {}
-                    // Что видит api.js, когда ищет свою запись Resource Timing.
+                    // What api.js sees when it looks up its Resource Timing entry.
                     try {
                       const P = globalThis.Performance && Performance.prototype;
                       const G = P && P.getEntriesByType;
-                      if (G) P.getEntriesByType = асНатив(function (t) {
+                      if (G) P.getEntriesByType = asNative(function (t) {
                         const r = G.apply(this, arguments);
                         try {
-                          if (String(t) === 'resource' && !__ptЧужой()
-                              && (globalThis.__ptРесЗапр = (globalThis.__ptРесЗапр || 0) + 1) < 6) {
+                          if (String(t) === 'resource' && !__ptForeign()
+                              && (globalThis.__ptResQueries = (globalThis.__ptResQueries || 0) + 1) < 6) {
                             const cs = document.currentScript;
                             const cf = r.filter((e) => /challenges\.cloudflare/.test(e.name));
-                            console.error('[ресурсы] всего=' + r.length + ' cf=' + cf.length
-                                  + ' текущий=' + (cs ? String(cs.src || '(встроенный)').slice(-60) : 'нет')
-                                  + ' имена=' + cf.map((e) => String(e.name).slice(-50) + (e instanceof PerformanceResourceTiming ? '' : '(не PRT)')).join(','));
+                            console.error('[resources] total=' + r.length + ' cf=' + cf.length
+                                  + ' current=' + (cs ? String(cs.src || '(inline)').slice(-60) : 'none')
+                                  + ' names=' + cf.map((e) => String(e.name).slice(-50) + (e instanceof PerformanceResourceTiming ? '' : '(not PRT)')).join(','));
                           }
                         } catch (e) {}
                         return r;
                       }, G);
                     } catch (e) {}
 
-                    // Где стоит обёртка виджета в тот миг, когда api.js её
-                    // меряет (поле `wp` письма): цепочка предков и число таблиц.
+                    // Where the widget wrapper sits when api.js measures it (the `wp` field of
+                    // the message): ancestor chain and stylesheet count.
                     try {
                       const E = globalThis.Element && Element.prototype;
                       const R = E && E.getBoundingClientRect;
-                      if (R) E.getBoundingClientRect = асНатив(function () {
+                      if (R) E.getBoundingClientRect = asNative(function () {
                         const r = R.apply(this, arguments);
                         try {
-                          if (!__ptЧужой() && this.closest && this.closest('#turnstile-login-form')
-                              && (globalThis.__ptМест = (globalThis.__ptМест || 0) + 1) < 4) {
-                            const цеп = [];
-                            for (let e = this; e && e.nodeType === 1 && цеп.length < 9; e = e.parentElement) {
+                          if (!__ptForeign() && this.closest && this.closest('#turnstile-login-form')
+                              && (globalThis.__ptPlaceN = (globalThis.__ptPlaceN || 0) + 1) < 4) {
+                            const anc = [];
+                            for (let e = this; e && e.nodeType === 1 && anc.length < 9; e = e.parentElement) {
                               const q = R.call(e);
-                              цеп.push(e.tagName.toLowerCase() + '.' + String(e.className || '').split(' ')[0]
+                              anc.push(e.tagName.toLowerCase() + '.' + String(e.className || '').split(' ')[0]
                                 + ' ' + q.left + ',' + q.top + ' ' + q.width + 'x' + q.height);
                             }
-                            console.error('[место] таблиц=' + document.styleSheets.length + ' готовность=' + document.readyState
-                              + ' t=' + Math.round(performance.now()) + ' | ' + цеп.join(' < '));
-                            console.error('[место] стек ' + String(new Error().stack).split('\n').slice(2, 9).map((x) => x.trim().replace(/https?:\/\/[^ ]*\//, '')).join(' / '));
-                            console.error('[место] скрипты ' + [...document.getElementsByTagName('script')].map((x) =>
+                            console.error('[place] sheets=' + document.styleSheets.length + ' readyState=' + document.readyState
+                              + ' t=' + Math.round(performance.now()) + ' | ' + anc.join(' < '));
+                            console.error('[place] stack ' + String(new Error().stack).split('\n').slice(2, 9).map((x) => x.trim().replace(/https?:\/\/[^ ]*\//, '')).join(' / '));
+                            console.error('[place] scripts ' + [...document.getElementsByTagName('script')].map((x) =>
                               x.src ? x.src.replace(/^https:\/\/[^/]+/, '').slice(0, 60)
                                     : 'inline:' + x.textContent.trim().slice(0, 30).replace(/\s+/g, ' ')).join(' | '));
-                            console.error('[место] ' + [...document.styleSheets].map((t) => {
+                            console.error('[place] ' + [...document.styleSheets].map((t) => {
                               let n = '?'; try { n = t.cssRules.length; } catch (e) { n = 'x'; }
                               return String(t.href || (t.ownerNode && t.ownerNode.tagName) || '').slice(-40) + '=' + n;
                             }).join(' '));
@@ -1647,52 +1602,51 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       }, R);
                     } catch (e) {}
 
-                    // Что приходит кадру письмами: часть тела первого POST
-                    // виджет получает от страницы (api.js) — и у Chrome в этом
-                    // месте есть поля, которых у нас нет.
+                    // Messages posted to the frame: part of the first POST body comes from the
+                    // page (api.js), and Chrome has fields there that we lack.
                     try {
                       const AL2 = EventTarget.prototype.addEventListener;
-                      EventTarget.prototype.addEventListener = асНатив(function (type, fn, opts) {
-                        if (__ptЧужой() && String(type) === 'message' && typeof fn === 'function') {
-                          const свой = function (ev) {
+                      EventTarget.prototype.addEventListener = asNative(function (type, fn, opts) {
+                        if (__ptForeign() && String(type) === 'message' && typeof fn === 'function') {
+                          const listener = function (ev) {
                             try {
-                              if ((globalThis.__ptПисем = (globalThis.__ptПисем || 0) + 1) < 25) {
+                              if ((globalThis.__ptMessages = (globalThis.__ptMessages || 0) + 1) < 25) {
                                 const d = ev && ev.data;
                                 const t = typeof d === 'string' ? d : (() => {
                                   try { return JSON.stringify(d); } catch (e) { return String(d); }
                                 })();
-                                // Длинные письма печатаются кусками: в них и лежит
-                                // то, чего не хватает телу первого POST.
+                                // Long messages are printed in pieces: they hold what the first POST body
+                                // is missing.
                                 const s1 = String(t);
                                 if (s1.length <= 220) {
-                                  console.error('[письмо] ' + String(ev && ev.origin).slice(0, 30) + ' ' + s1);
+                                  console.error('[postmsg] ' + String(ev && ev.origin).slice(0, 30) + ' ' + s1);
                                 } else {
                                   for (let q = 0; q < Math.min(s1.length, 8000); q += 220) {
-                                    console.error('[письмо ' + s1.length + ':' + (q / 220) + '] ' + s1.slice(q, q + 220));
+                                    console.error('[postmsg ' + s1.length + ':' + (q / 220) + '] ' + s1.slice(q, q + 220));
                                   }
                                 }
                               }
                             } catch (e) {}
                             return fn.apply(this, arguments);
                           };
-                          return AL2.call(this, type, свой, opts);
+                          return AL2.call(this, type, listener, opts);
                         }
                         return AL2.apply(this, arguments);
                       }, AL2);
                     } catch (e) {}
 
-                    // Где челлендж берёт нетронутые встроенные функции: он строит
-                    // себе кадр-песочницу и читает у него `contentWindow`. Если
-                    // окна не дают (или дают не то), код идёт другой веткой — и
-                    // тело собирается в другом реалме, чем у браузера.
+                    // Where the challenge gets pristine builtins: it builds a sandbox frame
+                    // and reads its `contentWindow`. If that window is missing or wrong, the
+                    // code takes another branch and the body is built in a different realm
+                    // than in Chrome.
                     try {
                       const D = Document.prototype.createElement;
-                      Document.prototype.createElement = асНатив(function (tag) {
+                      Document.prototype.createElement = asNative(function (tag) {
                         const el = D.apply(this, arguments);
                         try {
-                          if (__ptЧужой() && /^iframe$/i.test(String(tag))
-                              && (globalThis.__ptРамок = (globalThis.__ptРамок || 0) + 1) < 12) {
-                            console.error('[песочница] создан кадр #' + globalThis.__ptРамок);
+                          if (__ptForeign() && /^iframe$/i.test(String(tag))
+                              && (globalThis.__ptFrames = (globalThis.__ptFrames || 0) + 1) < 12) {
+                            console.error('[sandbox] frame created #' + globalThis.__ptFrames);
                           }
                         } catch (e) {}
                         return el;
@@ -1701,15 +1655,15 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       const d = IF && Object.getOwnPropertyDescriptor(IF.prototype, 'contentWindow');
                       if (d && d.get) {
                         Object.defineProperty(IF.prototype, 'contentWindow', {
-                          get: асНатив(function () {
+                          get: asNative(function () {
                             const w = d.get.call(this);
                             try {
-                              if (__ptЧужой()
-                                  && (globalThis.__ptОкон = (globalThis.__ptОкон || 0) + 1) < 12) {
-                                console.error('[песочница] contentWindow → ' + (w ? 'окно' : String(w))
+                              if (__ptForeign()
+                                  && (globalThis.__ptWindows = (globalThis.__ptWindows || 0) + 1) < 12) {
+                                console.error('[sandbox] contentWindow -> ' + (w ? 'window' : String(w))
                                       + ' src=' + String(this.getAttribute('src') || '-').slice(0, 30)
                                       + ' sandbox=' + String(this.getAttribute('sandbox') || '-').slice(0, 30)
-                                      + ' в дереве=' + !!this.isConnected);
+                                      + ' connected=' + !!this.isConnected);
                               }
                             } catch (e) {}
                             return w;
@@ -1719,99 +1673,94 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       }
                     } catch (e) {}
 
-                    // Какие события челлендж слушает и какие до него доходят.
-                    // Он держит их список и отправляет сводкой; у Chrome к
-                    // первой отправке этот список пуст, у нас — нет, и тогда
-                    // видно, что движок сам что-то присылает.
+                    // Which events the challenge listens to and which reach it. It keeps a
+                    // list and sends a summary; in Chrome the list is empty at the first send,
+                    // so a non-empty one means the engine dispatches something itself.
                     try {
                       const ET = EventTarget.prototype;
                       const AL = ET.addEventListener;
                       const DE = ET.dispatchEvent;
-                      const кто = (o) => {
+                      const whoOf = (o) => {
                         try {
-                          return o === globalThis ? 'окно'
-                            : (o && o.nodeType === 9) ? 'документ'
+                          return o === globalThis ? 'window'
+                            : (o && o.nodeType === 9) ? 'document'
                             : (o && o.localName) || (o && o.constructor && o.constructor.name) || '?';
                         } catch (e) { return '?'; }
                       };
-                      const ВВОД0 = /^(pointer|mouse|touch|key|wheel|scroll|focus|blur|visibilitychange|selectionchange|devicemotion|deviceorientation)/;
-                      ET.addEventListener = асНатив(function (type, fn, opts) {
-                        if ((__ptЧужой() || ВВОД0.test(String(type)))
-                            && (globalThis.__ptПодписки = (globalThis.__ptПодписки || 0) + 1) < 80) {
-                          console.error('[слушает] ' + (__ptЧужой() ? 'кадр ' : 'страница ')
-                                + кто(this) + ' ' + String(type));
+                      const INPUT0 = /^(pointer|mouse|touch|key|wheel|scroll|focus|blur|visibilitychange|selectionchange|devicemotion|deviceorientation)/;
+                      ET.addEventListener = asNative(function (type, fn, opts) {
+                        if ((__ptForeign() || INPUT0.test(String(type)))
+                            && (globalThis.__ptSubscriptions = (globalThis.__ptSubscriptions || 0) + 1) < 80) {
+                          console.error('[listens] ' + (__ptForeign() ? 'frame ' : 'page ')
+                                + whoOf(this) + ' ' + String(type));
                         }
                         return AL.apply(this, arguments);
                       }, AL);
-                      // Сводку о вводе собирает страница (api.js) и пересылает в
-                      // кадр сообщением; поэтому ввод смотрим и на странице —
-                      // но только его, иначе лента тонет.
-                      const ВВОД = /^(pointer|mouse|touch|key|wheel|scroll|focus|blur|visibilitychange|selectionchange|devicemotion|deviceorientation)/;
-                      ET.dispatchEvent = асНатив(function (ev) {
-                        const тип = String((ev && ev.type) || '');
-                        const свой = __ptЧужой();
-                        if ((свой || ВВОД.test(тип))
-                            && (globalThis.__ptСобытий = (globalThis.__ptСобытий || 0) + 1) < 120) {
-                          console.error('[событие] ' + (свой ? 'кадр ' : 'страница ') + кто(this) + ' ' + тип
-                                + ' доверено=' + !!(ev && ev.isTrusted));
+                      // The page (api.js) collects the input summary and forwards it to the
+                      // frame, so watch input on the page too, but only input, or the feed
+                      // drowns.
+                      const INPUT_RE = /^(pointer|mouse|touch|key|wheel|scroll|focus|blur|visibilitychange|selectionchange|devicemotion|deviceorientation)/;
+                      ET.dispatchEvent = asNative(function (ev) {
+                        const typ = String((ev && ev.type) || '');
+                        const inFrame = __ptForeign();
+                        if ((inFrame || INPUT_RE.test(typ))
+                            && (globalThis.__ptEvents = (globalThis.__ptEvents || 0) + 1) < 120) {
+                          console.error('[event] ' + (inFrame ? 'frame ' : 'page ') + whoOf(this) + ' ' + typ
+                                + ' trusted=' + !!(ev && ev.isTrusted));
                         }
                         return DE.apply(this, arguments);
                       }, DE);
                     } catch (e) {}
 
-                    // Откуда челлендж зовёт `isFinite` перед первой отправкой: у
-                    // Chrome этих вызовов нет вовсе, у нас три десятка — значит
-                    // его код идёт другой веткой, и стек покажет какой.
+                    // Where the challenge calls `isFinite` before the first send: Chrome makes
+                    // no such calls, we made ~30, so the code takes another branch; the stack
+                    // shows which.
                     try {
                       const IF = globalThis.isFinite;
-                      let счёт = 0;
-                      globalThis.isFinite = асНатив(function (x) {
-                        if (__ptЧужой() && счёт < 40) {
-                          счёт++;
-                          let стек = '';
+                      let cnt = 0;
+                      globalThis.isFinite = asNative(function (x) {
+                        if (__ptForeign() && cnt < 40) {
+                          cnt++;
+                          let stk = '';
                           try {
-                            стек = String(new Error().stack || '').split('\n').slice(1, 3)
+                            stk = String(new Error().stack || '').split('\n').slice(1, 3)
                               .map((l) => l.trim().replace(/^at /, '').replace(/https?:[^)]*normal\?lang=auto/, ''))
                               .join(' | ');
                           } catch (e) {}
-                          console.error('[конечно ' + счёт + '] ' + x + ' ← ' + стек.slice(0, 260));
+                          console.error('[isFinite ' + cnt + '] ' + x + ' <- ' + stk.slice(0, 260));
                         }
                         return IF.call(this, x);
                       }, IF);
                     } catch (e) {}
 
-                    // Открытый текст первого POST. Он не проходит ни через
-                    // `TextEncoder`, ни через `JSON.stringify` — его сжимают, а
-                    // сжатие читает строку по знакам. Заметка стоит на самом
-                    // горячем месте языка, поэтому проверка короткая: только
-                    // нулевой знак и только у длинных строк.
-                    // Заметка нужна только в кадре челленджа: страница сама
-                    // читает строки знак за знаком тысячами, и её ленту смотреть
-                    // незачем.
-                    const __ptЧужой = () => {
-                      if (globalThis.__ptВРеалме) return true;
+                    // Plaintext of the first POST. It goes through neither `TextEncoder` nor
+                    // `JSON.stringify`; the compressor reads it char by char. This hook sits
+                    // on the hottest path, so the check is short: index 0 and long strings
+                    // only. Only needed in the challenge frame: the page itself reads
+                    // thousands of strings per char.
+                    const __ptForeign = () => {
+                      if (globalThis.__ptInRealm) return true;
                       try { return /challenges\.cloudflare/.test(location.host); } catch (e) { return false; }
                     };
                     try {
                       const CCA = String.prototype.charCodeAt;
-                      const видели = Object.create(null);
-                      String.prototype.charCodeAt = асНатив(function (i) {
-                        if (i === 0 && this.length > 0 && this.length < 40000 && __ptЧужой()) {
+                      const seenSrc = Object.create(null);
+                      String.prototype.charCodeAt = asNative(function (i) {
+                        if (i === 0 && this.length > 0 && this.length < 40000 && __ptForeign()) {
                           const n = this.length;
-                          // Короткие строки — это имена полей и значения самого
-                          // тела: сериализатор читает их знак за знаком так же,
-                          // как числа. Порядок важнее содержимого, поэтому ведём
-                          // ряд, а не список.
+                          // Short strings are field names and values of the body: the serializer
+                          // reads them per char like numbers. Order matters more than content, so
+                          // keep a sequence.
                           if (n < 120) {
-                            if (!globalThis.__ptСериализуем) return CCA.call(this, i);
-                            const ряд = globalThis.__ptСтроки || (globalThis.__ptСтроки = []);
-                            if (ряд.length < 400) ряд.push(String(this));
-                          } else if (!видели[n] && Object.keys(видели).length < 30) {
-                            видели[n] = 1;
+                            if (!globalThis.__ptSerializing) return CCA.call(this, i);
+                            const strs = globalThis.__ptStrings || (globalThis.__ptStrings = []);
+                            if (strs.length < 400) strs.push(String(this));
+                          } else if (!seenSrc[n] && Object.keys(seenSrc).length < 30) {
+                            seenSrc[n] = 1;
                             const s0 = String(this);
-                            console.error('[исходник ' + n + '] ' + Math.round(performance.now()) + 'мс');
+                            console.error('[source ' + n + '] ' + Math.round(performance.now()) + 'ms');
                             for (let q = 0; q < s0.length; q += 250) {
-                              console.error('[исходник ' + n + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
+                              console.error('[source ' + n + ':' + (q / 250) + '] ' + s0.slice(q, q + 250));
                             }
                           }
                         }
@@ -1819,77 +1768,68 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       }, CCA);
                     } catch (e) {}
                     const J = Array.prototype.join;
-                    Array.prototype.join = асНатив(function (sep) {
+                    Array.prototype.join = asNative(function (sep) {
                       const out = J.apply(this, arguments);
                       if (typeof out === 'string' && out.length > 1500 && seen++ < 3) {
                         try { console.error('[join ' + out.length + '] ' + out.slice(0, 700)); } catch (e) {}
                       }
-                      // Перепись склеек. Отчёт уходит склейкой массива, но
-                      // на этом стыке он уже зашифрован — длина совпадает с
-                      // длиной отправки. Значит открытый текст собирается
-                      // раньше, другой склейкой, и найти её можно только по
-                      // ряду: чем и в каком порядке страница склеивала.
-                      // Сами строки остаются в кадре, их забирает
-                      // NOKK_EVAL_FRAMES.
+                      // Join census. The report leaves as an array join, but by then it is
+                      // encrypted (same length as the send). The plaintext is joined earlier by
+                      // another join, findable only by the sequence of joins. The strings stay
+                      // in the frame for NOKK_EVAL_FRAMES.
                       if (__REPORT__ && typeof out === 'string' && out.length > __JMIN__) {
                         try {
                           if (!globalThis.__ptJoins) globalThis.__ptJoins = [];
                           if (!globalThis.__ptJoinN) globalThis.__ptJoinN = 0;
                           const n = globalThis.__ptJoinN++;
-                          // Держать сами строки дорого: часть из них — мегабайты,
-                          // и удержание меняет то, что мы измеряем (Chrome под
-                          // таким крючком начинает перезапускать челлендж). Храним
-                          // только те, что по размеру похожи на отчёт.
+                          // Retaining strings is costly (some are megabytes) and changes what we
+                          // measure: Chrome under such a hook starts re-running the challenge. Keep
+                          // only report-sized ones.
                           if (out.length < 200000) {
                             __ptJoins.push([n, out]);
                             if (__ptJoins.length > 12) __ptJoins.shift();
                           } else if (out.length > 500000) {
-                            // Программа челленджа. Её выдают в двух размерах —
-                            // короткую подозрительным, длинную доверенным, — и
-                            // разница между ними и есть то, чего нам не дают
-                            // сделать. Забирают через NOKK_EVAL_FRAMES.
+                            // The challenge program. It is served in two sizes, short to suspicious
+                            // clients and long to trusted ones. Fetched via NOKK_EVAL_FRAMES.
                             globalThis.__ptProg = out;
                           }
                           let host = '?';
                           try { host = location.host.slice(0, 12); } catch (e) {}
-                          // Ряд склеек: та же лента, что печатает chrome-compare
-                          // ([j n хост длина разделитель]), — по ней видно, чем и в
-                          // каком порядке собирали, и какой склейки у нас нет.
+                          // Join sequence: same feed as chrome-compare prints ([j n host length
+                          // separator]); shows what was joined in what order and which join we lack.
                           if (n < 40) {
                             try {
                               console.error('[j ' + n + ' ' + host + ' ' + out.length + ' ' +
                                     JSON.stringify(String(sep === undefined ? ',' : sep)).slice(0, 12) + ']');
                             } catch (e) {}
                           }
-                          // Тело первого POST собирается такой же склейкой, и у нас
-                          // оно на полсотни знаков короче хромовского. Длины кусков
-                          // по порядку показывают, какой именно кусок короче.
+                          // The first POST body is built by the same kind of join; ours is ~50 chars
+                          // shorter than Chrome's. Piece lengths in order show which piece is short.
                           if (out.length > 3000 && out.length < 6000 && String(sep) === ''
                               && this.length > 1 && !globalThis.__ptFirstParts) {
                             globalThis.__ptFirstParts = 1;
                             try {
                               const lens = Array.prototype.map.call(this, (x) => String(x == null ? '' : x).length);
-                              console.error('[первые куски] всего=' + out.length + ' n=' + lens.length +
-                                    ' длины=' + lens.join(','));
+                              console.error('[first parts] total=' + out.length + ' n=' + lens.length +
+                                    ' lengths=' + lens.join(','));
                             } catch (e) {}
                           }
-                          // Из чего склеен отчёт: длины кусков по порядку.
+                          // What the report is joined from: piece lengths in order.
                           if (out.length > 50000 && String(sep) === '' && this.length !== out.length && !globalThis.__ptPartsDone) {
             globalThis.__ptPartsDone = 1;
             try {
               const lens = Array.prototype.map.call(this, (x) => String(x == null ? '' : x).length);
               const big = lens.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]).slice(0, 25);
               console.error('[parts] n=' + lens.length + ' total=' + out.length +
-                    ' крупнейшие: ' + big.map(([v, i]) => i + ':' + v).join(' '));
+                    ' largest: ' + big.map(([v, i]) => i + ':' + v).join(' '));
               const buckets = [0, 0, 0, 0, 0];
               for (const v of lens) buckets[v < 10 ? 0 : v < 100 ? 1 : v < 1000 ? 2 : v < 10000 ? 3 : 4]++;
-              console.error('[parts] по размеру: <10=' + buckets[0] + ' <100=' + buckets[1] +
+              console.error('[parts] by size: <10=' + buckets[0] + ' <100=' + buckets[1] +
                     ' <1k=' + buckets[2] + ' <10k=' + buckets[3] + ' >=10k=' + buckets[4]);
             } catch (e) {}
           }
-                          // Перечисление стилей — целиком: сравнивать его с
-                          // браузером надо построчно, а кадр к концу прогона
-                          // уже снесён, файлом не забрать.
+                          // Style enumeration in full: it must be compared with Chrome line by line,
+                          // and the frame is gone by the end of the run.
                           if (String(sep) === '|' && out.length > 5000 &&
                               (globalThis.__ptCssN = (globalThis.__ptCssN || 0) + 1) <= 2) {
                             for (let i = 0; i < out.length; i += 4000) {
@@ -1917,10 +1857,9 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       if (typeof out === 'string' && out.length > biggest.length) biggest = out;
                       if (typeof out === 'string' && out.length > 300 && n++ < 6) {
                         try { console.error('[payload ' + out.length + '] ' + out.slice(0, 900)); } catch (e) {}
-                        // Отчёт об ошибке — единственное место, где их код сам
-                        // называет, что у него сломалось. Печатаем рядом наш
-                        // список промахов чтения: имя недостающего члена почти
-                        // всегда там, последним.
+                        // The error report is the only place their code names what broke. Print
+                        // our list of read misses next to it: the missing member is almost always
+                        // there, last.
                         if (out.indexOf('\"stack\"') >= 0 || out.indexOf('is not a function') >= 0) {
                           try {
                             const tail = (globalThis.__pt_missTail && __pt_missTail(24)) || '(none)';
@@ -1933,8 +1872,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       return out;
                     };
                     globalThis.__pt_biggestPayload = () => biggest.slice(0, 4000);
-                    // Их собственная сериализация: у бандла есть свой сборщик строк,
-                    // и отпечаток может уйти мимо JSON. Ловим и это.
+                    // Their own serializer: the bundle has its own string builder and the
+                    // fingerprint may bypass JSON. Catch that too.
                     const A = globalThis.btoa;
                     if (typeof A === 'function') {
                       globalThis.btoa = function (x) {
@@ -1945,10 +1884,9 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       };
                     }
                   } catch (e) {}
-                  // Их отправка сообщения кадру читает `contentWindow` раньше,
-                  // чем проверяет целевой origin, — и молча уходит ни с чем,
-                  // если origin пуст. Значит по чтению видно, дошёл ли тик до
-                  // отправки вообще, даже когда сообщение потерялось.
+                  // Their frame postMessage reads `contentWindow` before checking the target
+                  // origin and silently does nothing if the origin is empty. The read shows
+                  // whether a tick reached the send at all.
                   try {
                     const d = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
                     if (d && d.get) {
@@ -1964,9 +1902,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                             } catch (e) {}
                           }
                           const win = d.get.call(this);
-                          // И сам вызов: их `Cr` роняет сообщение молча, если
-                          // целевой origin пуст, — значит надо видеть, дошло ли
-                          // дело до postMessage и с чем.
+                          // The call itself: their `Cr` drops the message silently on an empty
+                          // target origin, so log whether postMessage was reached and with what.
                           try {
                             if (win && !win.__ptLogged) {
                               const P = win.postMessage;
@@ -1985,8 +1922,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       });
                     }
                   } catch (e) {}
-                  // Всё, что VM собирает на лету: стек внутри такого кода
-                  // указывает смещением, а исходник иначе взять негде.
+                  // Everything the VM compiles at runtime: stacks inside such code give
+                  // offsets, and the source is not available otherwise.
                   try {
                     globalThis.__ptBuilt = [];
                     const F0 = globalThis.Function;
@@ -2003,11 +1940,10 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       return E0.apply(this, arguments);
                     };
                   } catch (e) {}
-                  // Чего кадр ждёт, когда стоит: раз в две секунды печатаем
-                  // всё, что могло бы его разбудить, — незавершённые запросы,
-                  // ближайший таймер и обещания, которые висят дольше пяти
-                  // секунд (с местом, где их создали). Виджет замирает молча,
-                  // и другого способа спросить «чего ты ждёшь» у нас нет.
+                  // What a stalled frame waits for: every two seconds print whatever could
+                  // wake it (pending requests, next timer, promises pending over 5 s with
+                  // their creation site). The widget stalls silently; this is the only way
+                  // to ask what it waits for.
                   try {
                     const inflight = new Map();
                     let reqId = 0;
@@ -2031,7 +1967,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       this.addEventListener('loadend', () => inflight.delete(id));
                       return XS.apply(this, arguments);
                     };
-                    // Обещания: считаем только те, что создала не наша обвязка.
+                    // Promises: count only those not created by our own glue.
                     const pending = new Map();
                     let pid = 0;
                     const P0 = globalThis.Promise;
@@ -2041,9 +1977,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       try { at = String(new Error().stack || '').split('\n').slice(2, 9).map((x) => x.trim()).join(' | ').slice(0, 400); } catch (e) {}
                       let did = '';
                       const p = new P0(function (res, rej) {
-                        // Что исполнитель успел спросить у хоста, пока
-                        // выполнялся: обещание висит именно из-за этого — оно
-                        // ждёт того, о чём здесь договорилось.
+                        // What the executor asked the host while running: the promise hangs
+                        // waiting for exactly that.
                         let before = 0;
                         try { before = (globalThis.__pt_probeTail ? JSON.parse(__pt_probeTail(400)).length : 0); } catch (e) {}
                         try {
@@ -2056,9 +1991,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           } catch (e) {}
                         }
                       });
-                      // Исходник самого исполнителя: место рождения указывает
-                      // внутрь сгенерированного кода, которого у нас нет, а вот
-                      // тело функции читается всегда.
+                      // The executor's own source: the creation site points into generated
+                      // code we do not have, but the function body is always readable.
                       let body = '';
                       try {
                         body = String(executor).replace(/\s+/g, ' ').slice(0, 300)
@@ -2073,14 +2007,13 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       if (typeof P0[k] === 'function') Wrapped[k] = P0[k].bind(P0);
                     }
                     globalThis.Promise = Wrapped;
-                    // Какие задачи вообще будят кадр: кадры и микрозадачи,
-                    // порт канала сообщений, простой таймер. Если программа
-                    // ждёт одну из них, а она не приходит, — это и есть стоп.
+                    // Which tasks wake the frame at all: animation frames, microtasks, message
+                    // channel port, plain timer. If the program waits on one that never
+                    // comes, that is the stall.
                     let raf = 0, micro = 0, port = 0, idleCb = 0;
                     try { (function tick() { raf++; requestAnimationFrame(tick); })(); } catch (e) {}
-                    // Не по кругу: цепочка микрозадач сама себя кормит и
-                    // задушит всё остальное — считаем по несколько штук за раз,
-                    // ставя новую партию на таймер.
+                    // Not in a loop: a microtask chain feeds itself and starves everything
+                    // else, so count a few at a time and schedule the next batch on a timer.
                     let chan = null;
                     try {
                       chan = new MessageChannel();
@@ -2097,18 +2030,18 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                         const now = Date.now();
                         const reqs = [...inflight.values()].map((r) => r.kind + ':' + r.url + ' (' + (now - r.at) + 'ms)');
                         const old = [...pending.values()].filter((p) => now - p.born > 5000);
-                        console.error('[idle] запросов в полёте=' + reqs.length +
-                                      ' таймер через=' + (globalThis.__pt_nextTimerDelay ? __pt_nextTimerDelay() : '?') +
-                                      ' таймеров=' + (globalThis.__pt_pendingTimers ? __pt_pendingTimers() : '?') +
-                                      ' обещаний висит>5с=' + old.length +
-                                      ' | кадров=' + raf + ' микрозадач=' + micro + ' порт=' + port + ' idle=' + idleCb +
+                        console.error('[idle] requests in flight=' + reqs.length +
+                                      ' next timer in=' + (globalThis.__pt_nextTimerDelay ? __pt_nextTimerDelay() : '?') +
+                                      ' timers=' + (globalThis.__pt_pendingTimers ? __pt_pendingTimers() : '?') +
+                                      ' promises pending>5s=' + old.length +
+                                      ' | frames=' + raf + ' microtasks=' + micro + ' port=' + port + ' idle=' + idleCb +
                                       (reqs.length ? ' :: ' + reqs.join(' ; ') : ''));
                         for (const p of old.slice(-3)) {
-                          console.error('[idle] обещание с ' + Math.round((now - p.born) / 1000) + 'с @ ' + p.at);
-                          console.error('[idle] его тело: ' + p.body);
-                          console.error('[idle] исполнитель спросил: ' + (p.did || '(ничего)'));
-                          // Ищем место рождения по имени функции из стека: у
-                          // сгенерированного кода нет адреса, но есть текст.
+                          console.error('[idle] promise for ' + Math.round((now - p.born) / 1000) + 's @ ' + p.at);
+                          console.error('[idle] its body: ' + p.body);
+                          console.error('[idle] executor asked: ' + (p.did || '(nothing)'));
+                          // Find the creation site by the function name from the stack: generated
+                          // code has no URL, but it has text.
                           try {
                             const m = /at ([\w$.]+) \(<anonymous>:\d+:(\d+)\)/.exec(p.at);
                             const fname = m ? m[1].split('.').pop() : '';
@@ -2117,7 +2050,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                                 const k = src.indexOf(fname + ':function');
                                 const k2 = k >= 0 ? k : src.indexOf(fname + '=function');
                                 if (k2 >= 0) {
-                                  console.error('[idle] ' + fname + ' найдена в сборке ' + src.length + ' байт: ' +
+                                  console.error('[idle] ' + fname + ' found in bundle ' + src.length + ' bytes: ' +
                                                 src.slice(k2, k2 + 320).replace(/\s+/g, ' '));
                                   break;
                                 }
@@ -2129,9 +2062,9 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       globalThis.setTimeout(idle, 2000);
                     }, 2000);
                   } catch (e) {}
-                  // Что кот видит на каждом тике: его проверки идут по теневому
-                  // корню виджета и по его обёртке, и любая из них молча
-                  // пропускает ход. Снимаем их сами — раз в две секунды.
+                  // What the watchcat sees each tick: its checks walk the widget's shadow
+                  // root and wrapper, and any of them can silently skip the step. Re-run
+                  // them ourselves every two seconds.
                   try {
                     const shadows = [];
                     const AS = Element.prototype.attachShadow;
@@ -2156,9 +2089,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                                         ' qsWidget=' + kids.map(k => k.split('#')[1])
                                             .filter(Boolean)
                                             .map(id => id + ':' + !!sh.querySelector('#' + id)).join(' '));
-                          // Сам ход кота: он берёт найденный элемент и шлёт в
-                          // него сообщение с целевым origin. Если это бросает,
-                          // их цикл гасит исключение и молчит.
+                          // The watchcat step itself: it posts a message with a target origin to
+                          // the found element. If that throws, their loop swallows it.
                           for (const k of sh.children) {
                             if (k.localName !== 'iframe') continue;
                             let win = 'n/a', posted = 'n/a';
@@ -2175,9 +2107,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       globalThis.setTimeout(report, 2000);
                     }, 2000);
                   } catch (e) {}
-                  // Повторяющиеся таймеры: сторожевой кот Turnstile — это
-                  // setInterval на 900 мс в контексте страницы, и молчание кота
-                  // видно только так — заведён он или заведён, но не тикает.
+                  // Repeating timers: the Turnstile watchcat is a 900 ms setInterval in the
+                  // page context; this shows whether it is armed but not ticking.
                   try {
                     const SI = globalThis.setInterval;
                     let ivId = 0;
@@ -2195,9 +2126,9 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       return SI.call(this, wrapped, ms);
                     };
                   } catch (e) {}
-                  // Ошибку челлендж ловит сам и уносит в свой маяк зашифрованной
-                  // — но создаёт он её здесь, обычным конструктором. Один
-                  // перехват даёт то, ради чего иначе расшифровывают маяк.
+                  // The challenge catches errors itself and ships them encrypted in its
+                  // beacon, but constructs them here with the plain constructor. One hook
+                  // gives what would otherwise need decrypting the beacon.
                   try {
                     for (const nm of ['Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError']) {
                       const E = globalThis[nm];
@@ -2216,10 +2147,9 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       globalThis[nm] = Wrapped;
                     }
                   } catch (e) {}
-                  // Их собственные хлебные крошки: код усыпан вызовами
-                  // UpvLO0(<метка>) и eVARP2(<метка>) на каждом шаге. Метки
-                  // уникальны, поэтому последовательность вызовов — это трасса
-                  // их машины состояний, и её можно сравнить с браузерной.
+                  // Their own breadcrumbs: the code calls UpvLO0(<label>) and
+                  // eVARP2(<label>) at each step. Labels are unique, so the call sequence
+                  // traces their state machine and can be compared with Chrome.
                   for (const name of ['UpvLO0', 'eVARP2']) {
                     try {
                       let held;
@@ -2228,9 +2158,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                         get() { return held; },
                         set(v) {
                           held = typeof v !== 'function' ? v : function (tag) {
-                            // Метка зашифрована на каждую выдачу, а место вызова
-                            // — нет: строка в их бандле одна и та же и у нас, и
-                            // в Chrome, поэтому сравнивать трассы можно по ней.
+                            // The label is encrypted per issue, but the call site is not: the bundle
+                            // line is the same here and in Chrome, so traces compare by it.
                             let at = '';
                             try {
                               const f = String(new Error().stack || '').split('\n').slice(2);
@@ -2245,24 +2174,20 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     } catch (e) {}
                   }
 
-                  // Что VM успела потрогать перед броском. Стек внутри их
-                  // интерпретатора ничего не говорит: там один диспетчер опкодов,
-                  // а вот последние обращения к хостовым таблицам — говорят.
-                  // Каждое чтение свойства, которого нет: их интерпретатор
-                  // падает на `fn.call(obj, …)`, где fn — метод, взятый с
-                  // хостового объекта, и имя этого метода больше взять негде.
-                  // Дно цепочки прототипов — единственное место, где промах
-                  // виден: ставим туда Proxy и записываем, что спросили.
-                  // Снимок глобалей до первого скрипта: всё сверх него объявил
-                  // сам челлендж, и сравнение с Chrome показывает, чья ступень
-                  // у нас не отработала.
+                  // What the VM touched before a throw: stacks inside their interpreter
+                  // show only the opcode dispatcher, but the last host-table reads tell.
+                  // Their interpreter fails on `fn.call(obj, ...)` with fn read from a host
+                  // object, and a missing property is only visible at the bottom of the
+                  // prototype chain: put a Proxy there and log what was asked.
+                  // Globals snapshot before the first script: anything beyond it was
+                  // declared by the challenge; diffing with Chrome shows which stage did not
+                  // run here.
                   let baseGlobals = [];
                   try { baseGlobals = Object.getOwnPropertyNames(globalThis); } catch (e) {}
-                  // Счётчик шагов их машины. Имена в бандле меняются с каждой
-                  // выдачей, поэтому ловим не имя, а поведение: после сборки
-                  // программы берём все функции, которых на окне не было, и
-                  // считаем вызовы. Диспетчер опкодов выдаст себя частотой —
-                  // сравнивать с браузером можно именно её.
+                  // Step counter for their VM. Bundle names change every issue, so match
+                  // behaviour, not names: after the program is built, take every function
+                  // that was not on the window before and count calls. The opcode dispatcher
+                  // stands out by frequency, which is what compares with Chrome.
                   try {
                     globalThis.__ptSteps = new Map();
                     globalThis.__ptLastArgs = new Map();
@@ -2288,15 +2213,15 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       }
                       return wrapped;
                     };
-                    // Считать начинаем, когда программа собрана, и печатаем итог
-                    // раз в две секунды.
+                    // Start counting once the program is built; print totals every two
+                    // seconds.
                     globalThis.setTimeout(function counter() {
                       try {
                         const added = __ptCountVM();
                         const top = [...__ptSteps.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 4);
                         if (top.length && top[0][1].n > 0) {
                           console.error('[vmsteps] ' + top.map(([k, c]) => k + '=' + c.n).join(' ') +
-                                        (added ? ' (+' + added + ' новых)' : ''));
+                                        (added ? ' (+' + added + ' new)' : ''));
                         }
                       } catch (e) { try { console.error('[vmsteps] threw ' + e); } catch (x) {} }
                       globalThis.setTimeout(counter, 2000);
@@ -2326,8 +2251,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       } catch (e) {}
                       return t + extra;
                     };
-                    // Object.prototype неизменяем, поэтому ловушку ставим
-                    // ступенью выше — между корневым интерфейсом и им.
+                    // Object.prototype is immutable, so the trap goes one level up, between
+                    // the root interface and it.
                     const sink = () => new Proxy(Object.prototype, {
                       get(t, p, r) {
                         if (typeof p === 'string' && !(p in t) && p.lastIndexOf('__pt', 0) !== 0) {
@@ -2335,8 +2260,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           try { who = describe(r); } catch (e) {}
                           misses.push(who + '.' + p);
                           if (misses.length > 60) misses.shift();
-                          // Индексы и `toJSON` — шум сериализации, десятки тысяч
-                          // строк за прогон; в кольце они остаются, в поток не идут.
+                          // Indices and `toJSON` are serialization noise (tens of thousands of
+                          // lines per run): kept in the ring, not streamed.
                           if (globalThis.__pt_streamHooks && !/^(-?\d+|toJSON)$/.test(p)) {
                             try { console.error('[m] ' + who + '.' + p); } catch (e) {}
                           }
@@ -2370,7 +2295,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     if (recent.length > 24) recent.shift();
                     if (stream) { try { console.error('[t] ' + String(s).slice(0, 150)); } catch (e) {} }
                   };
-                  // Разговор с воркером сбора: кто кому и что послал.
+                  // Messages with the collection worker: who sent what to whom.
                   try {
                     const WP = Worker.prototype.postMessage;
                     const peek = (v) => {
@@ -2400,7 +2325,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       remember('worker.on ' + t);
                       return WA.call(this, t, wrapHandler(h), arguments[2]);
                     };
-                    // Ответ воркера приходит и через свойство-обработчик.
+                    // Worker replies also arrive via the handler property.
                     const OM = new WeakMap();
                     Object.defineProperty(Worker.prototype, 'onmessage', {
                       configurable: true, enumerable: true,
@@ -2409,8 +2334,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     });
                   } catch (e) {}
                   globalThis.__pt_recent = () => recent.join(' → ');
-                  // Вторая стадия сбора у них ставится таймером и молчит, если
-                  // внутри что-то бросило: браузер такое печатает, мы — нет.
+                  // Their second collection stage runs on a timer and is silent if it
+                  // throws inside: Chrome prints such errors, we do not.
                   try {
                     addEventListener('error', (e) => {
                       try { console.error('[err] ' + (e && e.message) + ' @ ' + (e && e.filename) + ':' + (e && e.lineno)); } catch (x) {}
@@ -2448,8 +2373,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                       const v = obj[k];
                       if (typeof v !== 'function') continue;
                       obj[k] = function () {
-                        // Один раз: их метка времени против наших часов. Челлендж
-                        // объявляет `fail`, если расхождение больше 12 часов.
+                        // Once: their timestamp vs our clock. The challenge declares `fail` if
+                        // they differ by more than 12 hours.
                         if (!globalThis.__pt_clockLogged) {
                           globalThis.__pt_clockLogged = true;
                           try {
@@ -2467,8 +2392,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                         try {
                           return v.apply(this, arguments);
                         } catch (err) {
-                          // Их код ловит такие броски сам, и наружу они не выходят —
-                          // а именно они обрывают цепочку на полпути.
+                          // Their code catches such throws itself, and these are what cut the chain
+                          // halfway.
                           try { console.error('[hookerr] ' + label + '.' + k + ': ' + ((err && err.stack) || err)); } catch (e) {}
                           throw err;
                         }
@@ -2476,9 +2401,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     }
                     return obj;
                   };
-                  // Их интерпретатор: программа с сервера приходит байткодом и
-                  // исполняется через window.runProgram. Сколько она работала и
-                  // чем кончила — половина ответа на «почему нет второго круга».
+                  // Their interpreter: the server program arrives as bytecode and runs via
+                  // window.runProgram. Log how long it ran and how it ended.
                   try {
                     let rp;
                     Object.defineProperty(globalThis, 'runProgram', {
@@ -2492,11 +2416,9 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           catch (e) { console.error('[vm] build threw after ' + (Date.now() - t0) + 'ms: ' + e); throw e; }
                           console.error('[vm] built in ' + (Date.now() - t0) + 'ms from ' +
                                         ((src && src.length) || 0) + ' bytes → ' + typeof fn);
-                          // Текст программы держим под рукой: стек внутри неё
-                          // указывает смещением, и без исходника оно немое.
-                          // Держим самую большую из собранных: главная программа
-                          // приходит первой, а следом идут мелкие куски, и
-                          // «последняя» затирала её.
+                          // Keep the program text: stacks inside it give offsets that are useless
+                          // without the source. Keep the largest one: the main program arrives
+                          // first, followed by small pieces that would overwrite it.
                           try {
                             const t = String(src || '');
                             if (!globalThis.__pt_vmSrc || t.length > globalThis.__pt_vmSrc.length) {
@@ -2562,8 +2484,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     } catch (e) {}
                   }
                 })();"#;
-                // Потоковый лог событий: включается NOKK_TRACE_STREAM=1, иначе
-                // кольцо печатается только при броске.
+                // Streaming event log: enabled by NOKK_TRACE_STREAM=1, otherwise the ring
+                // is printed only on a throw.
                 let stream = std::env::var("NOKK_TRACE_STREAM").is_ok();
                 let hook = hook.replace("__STREAM__", if stream { "true" } else { "false" });
                 let hook = hook.replace(
@@ -2635,8 +2557,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
             {
                 dump(format!("worker {url}"), v);
             }
-            // То же — про саму страницу: интерстишал рисует свой интерфейс в
-            // закрытом shadow root не хуже виджета.
+            // Same for the page itself: the interstitial draws its UI in a closed
+            // shadow root just like the widget.
             if let Ok(serde_json::Value::String(t)) = ctx
                 .evaluate("(() => { const ids = [];                    for (const el of document.querySelectorAll('*')) if (el.id) ids.push(el.localName + '#' + el.id);                    const root = (globalThis._cf_chl_opt || {}).wTgF5;                    return JSON.stringify({ids: ids.slice(0, 20),                      renderRoot: root ? (root.nodeName || 'shadow') : null,                      rootKids: root && root.childNodes ? root.childNodes.length : -1}); })()")
                 .await
@@ -2646,8 +2568,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
             if let Ok(serde_json::Value::String(t)) = ctx.evaluate("(() => { const seen = []; const walk = (root) => {                            for (const el of root.querySelectorAll('*')) {                              const tag = el.localName;                              if (tag === 'input' || tag === 'button' || el.getAttribute('role'))                                seen.push(tag + (el.type ? '[' + el.type + ']' : '') +                                          (el.getAttribute('role') ? '{' + el.getAttribute('role') + '}' : ''));                              const sr = el.shadowRoot || el.__ptShadow; if (sr) walk(sr); } };                          const root = document.body && (document.body.shadowRoot || document.body.__ptShadow);                          try { walk(document); if (root) walk(root); } catch (e) {}                          return JSON.stringify({controls: seen.slice(0, 12),                            events: (globalThis._cf_chl_opt && _cf_chl_opt.FELcX1) ? _cf_chl_opt.FELcX1.length : -1, bodyShadow: !!root,                            shadowKids: root ? root.childNodes.length : -1,                            shadowText: root ? String(root.textContent || '').trim().slice(0, 60) : '',                            bodyKids: document.body ? document.body.childNodes.length : -1,                            view: [innerWidth, innerHeight],                            html: (document.documentElement ? document.documentElement.outerHTML : '').length}); })()").await {
                 eprintln!("# page widget: {t}");
             }
-            // Что виджет в итоге нарисовал: интерактивный контрол — то, чего
-            // движок ждёт от него, и его отсутствие видно только так.
+            // What the widget finally rendered: the interactive control the engine
+            // expects; its absence is only visible this way.
             for f in ctx.frame_list() {
                 if let Ok(serde_json::Value::String(t)) = ctx
                     .evaluate_in_frame(
@@ -2659,8 +2581,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     eprintln!("# widget frame {}: {t}", f.id);
                 }
             }
-            // Ключи челленджа этого прогона: без них ответ сервера не расшифровать
-            // задним числом (ключ выводится из ray самого виджета).
+            // This run's challenge keys: without them the server response cannot be
+            // decrypted later (the key derives from the widget's ray).
             for f in ctx.frame_list() {
                 if let Ok(serde_json::Value::String(t)) = ctx
                     .evaluate_in_frame(
@@ -2700,7 +2622,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     }
                 }
             }
-            // Снимок ленты на метке: что читали последним перед отправкой.
+            // Feed snapshot at the mark: what was read last before sending.
             for slot in ctx.frame_list().iter().map(|f| Some(f.id)).chain(std::iter::once(None)) {
                 let expr = "globalThis.__pt_atMark || ''";
                 let out = match slot {
@@ -2716,7 +2638,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                             eprintln!("# mark {label}: {} rows", rows.len());
                             for row in rows {
                                 eprintln!(
-                                    "#М {:>6}ms {} -> {}",
+                                    "#M {:>6}ms {} -> {}",
                                     row[0].as_i64().unwrap_or(0),
                                     row[1].as_str().unwrap_or(""),
                                     row[2].as_str().unwrap_or("")
@@ -2753,24 +2675,21 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
             }
         }
 
-        // Три инструмента ниже — свои собственные: каждый включается своей
-        // переменной. Раньше они стояли внутри ветки трассировщика проб и
-        // молча ничего не делали без неё — а она сама меняет то, что мерят.
-        // Хвост: чем страница и каждый фрейм занимались последними, по порядку.
-        // Исходник программы челленджа — по требованию: 600+ КБ в лог не
-        // кладут, а для чтения стека он нужен целиком.
+        // Each tool below has its own env var; the probe tracer itself perturbs
+        // what is measured, so they must not depend on it.
+        // Challenge program source on demand: too big (600+ KB) for the log, but
+        // needed whole to read stack offsets.
         if let Ok(path) = std::env::var("NOKK_DUMP_VM") {
             let mut where_: Vec<Option<u32>> = vec![None];
             where_.extend(ctx.frame_list().iter().map(|f| Some(f.id)));
-            // Две большие строки, а не одна: источник, который отдают
-            // `Function`, и та, что склеивается из ответа `/fo/`. Они
-            // разные — начала не совпадают, — и сравнивать с браузером надо
-            // обе, иначе легко сличить не то с тем.
+            // Two large strings, not one: the source given to `Function` and the one
+            // joined from the `/fo/` response. They differ (different starts); compare
+            // both with Chrome.
             for (js, tag) in [
                 ("typeof __pt_vmSrc === 'string' ? __pt_vmSrc : ''", "js"),
-                // Самый большой встроенный скрипт документа: у кадра виджета
-                // там и толкователь, и сам сбор — то место, куда указывают
-                // смещения в стеке чужих ошибок.
+                // The largest inline script of the document: in the widget frame it holds
+                // the interpreter and the collector, which foreign error stacks point
+                // into.
                 (
                     "(() => { let big = ''; for (const e of document.scripts) \
                        if (!e.src && e.textContent && e.textContent.length > big.length) \
@@ -2779,9 +2698,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     "doc",
                 ),
                 ("typeof __ptProg === 'string' ? __ptProg : ''", "join"),
-                // Склейки помельче — отчёт, перечисление стилей — по одной
-                // на файл: сравнивать их с браузером построчно можно только
-                // целиком.
+                // Smaller joins (report, style enumeration) go one per file: line-by-line
+                // comparison with Chrome needs them whole.
                 ("(globalThis.__ptJoins||[]).map(j => j[0] + '\\u0000' + j[1]).join('\\u0001')", "joins"),
             ] {
             for slot in where_.clone() {
@@ -2802,21 +2720,20 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                                 };
                                 let name = format!("{name}.{n}");
                                 if std::fs::write(&name, body).is_ok() {
-                                    eprintln!("# склейка сохранена: {name} ({} байт)", body.len());
+                                    eprintln!("# join saved: {name} ({} bytes)", body.len());
                                 }
                             }
                         } else if std::fs::write(&name, &src).is_ok() {
-                            eprintln!("# программа сохранена: {name} ({} байт)", src.len());
+                            eprintln!("# program saved: {name} ({} bytes)", src.len());
                         }
                     }
                 }
             }
             }
         }
-        // Спросить одно и то же у страницы и у каждого её кадра. Кадр
-        // челленджа чужого происхождения, со страницы в него не заглянуть, а
-        // движок ходит туда сам — и без этого половина сравнений с браузером
-        // невозможна.
+        // Ask the same thing of the page and each of its frames. The challenge
+        // frame is cross-origin and unreachable from the page, but the engine can
+        // enter it directly.
         if let Ok(js) = std::env::var("NOKK_EVAL_FRAMES") {
             let mut where_: Vec<Option<u32>> = vec![None];
             where_.extend(ctx.frame_list().iter().map(|f| Some(f.id)));
@@ -2830,13 +2747,12 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     .unwrap_or_else(|| "page".to_string());
                 match out {
                     Ok(v) => eprintln!("# {label}: {}", render(&v)),
-                    Err(e) => eprintln!("# {label}: ошибка: {e}"),
+                    Err(e) => eprintln!("# {label}: error: {e}"),
                 }
             }
         }
-        // Ошибки, которые чужая программа построила у себя в кадре: их не
-        // прочитать со страницы — кадр чужого происхождения, — но движок
-        // ходит в него сам.
+        // Errors the foreign program built in its own frame: unreadable from the
+        // cross-origin page, but the engine can enter the frame.
         if std::env::var("NOKK_TRACE_THROWS").is_ok() {
             let js = "typeof __pt_throwTail === 'function' ? __pt_throwTail(20) : ''";
             let mut where_: Vec<Option<u32>> = vec![None];
@@ -2853,7 +2769,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     let label = slot
                         .map(|i| format!("frame {i}"))
                         .unwrap_or_else(|| "page".to_string());
-                    eprintln!("# броски {label}:");
+                    eprintln!("# throws {label}:");
                     for line in text.lines() {
                         eprintln!("#   {line}");
                     }
@@ -2895,13 +2811,12 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                         r.status,
                         r.body.len()
                     );
-                    // Половина разговора — то, что ушло наверх. Маячок ошибки
-                    // челленджа отвечает пустотой, а всё, что он рассказывает о
-                    // нас, лежит в теле запроса; без него дамп молчит о главном.
+                    // The outgoing half of the exchange: the challenge error beacon answers
+                    // empty, and everything it reports about us is in the request body.
                     if !r.request_body.is_empty() {
-                        eprintln!("# отправлено ({} байт):", r.request_body.len());
+                        eprintln!("# sent ({} bytes):", r.request_body.len());
                         println!("{}", String::from_utf8_lossy(&r.request_body));
-                        eprintln!("# получено ({} байт):", r.body.len());
+                        eprintln!("# received ({} bytes):", r.body.len());
                     }
                     println!("{}", String::from_utf8_lossy(&r.body));
                 }
@@ -2914,12 +2829,11 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
             let reqs = ctx.requests();
             println!("{} requests for {url}", reqs.len());
             for r in &reqs {
-                // Размер тела запроса виден только здесь, а он — половина
-                // ответа на «что мы про себя рассказали».
+                // Request body size is only visible here.
                 let sent = if r.request_body.is_empty() {
                     String::new()
                 } else {
-                    format!(" [отправлено {} байт]", r.request_body.len())
+                    format!(" [sent {} bytes]", r.request_body.len())
                 };
                 println!(
                     "[{:<8}] {:<4} {} → {} ({} bytes){sent}",
@@ -2933,9 +2847,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
             return Ok(());
         }
 
-        // Застава на выходе — это ответ на вопрос «замок ещё жив?», и молча
-        // отдавать страницу «Just a moment…» нечестно: снаружи она выглядит как
-        // обычная загрузка.
+        // A challenge still in place at exit means the clearance is dead; say so
+        // instead of returning the Just a moment page as if it loaded normally.
         let final_title = ctx.evaluate("document.title").await.unwrap_or_default();
         let at_gate =
             matches!(&final_title, serde_json::Value::String(s) if s.contains("Just a moment"));
@@ -2947,11 +2860,11 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
         if still_challenged {
             if cli.import_cookies.is_some() {
                 eprintln!(
-                    "застава на месте: замок не принят — протух, снят под другой версией \
-                     Chrome или с другого адреса"
+                    "still challenged: the imported clearance was rejected (expired, or taken \
+                     with another Chrome version or from another address)"
                 );
             } else {
-                eprintln!("застава на месте: замка у нас нет (см. --import-cookies)");
+                eprintln!("still challenged: no clearance cookie (see --import-cookies)");
             }
         }
 
@@ -3054,10 +2967,11 @@ mod tests {
     }
 }
 
-/// Пробник трассировки — ещё и во всякий свежий реалм. Виджет Turnstile
-/// сериализует и отправляет через пустой кадр за `contentWindow`, а пробники
-/// кадра туда не попадают: реалм строится из бутстрапа. Флаги окна
-/// сериализации реалм делит с родителем. Только для трассировки.
+/// Installs the trace probe into every fresh realm too. The Turnstile widget
+/// serializes and sends through an empty frame via `contentWindow`, and
+/// frame probes do not reach it since the realm is built from the
+/// bootstrap. The realm shares the serialization-window flags with its
+/// parent. Tracing only.
 fn spread_to_realms(probe: &str, key: &str) -> String {
     let body = serde_json::to_string(probe).unwrap_or_default();
     format!(
@@ -3066,22 +2980,22 @@ fn spread_to_realms(probe: &str, key: &str) -> String {
   const RM = globalThis.__pt_makeRealm;
   if (typeof RM !== 'function' || globalThis['__ptSpread_{key}']) return;
   globalThis['__ptSpread_{key}'] = 1;
-  const родитель = globalThis;
+  const parentG = globalThis;
   globalThis.__pt_makeRealm = function __pt_makeRealm() {{
     const g = RM.apply(this, arguments);
     try {{
       if (g && typeof g.eval === 'function' && !g['__ptSpread_{key}']) {{
-        for (const k of ['__ptСериализуем', '__ptСобрано', '__ptСтроки', '__ptFirstBody', '__ptMarked']) {{
+        for (const k of ['__ptSerializing', '__ptCollected', '__ptStrings', '__ptFirstBody', '__ptMarked']) {{
           if (Object.getOwnPropertyDescriptor(g, k)) continue;
-          Object.defineProperty(g, k, {{ get() {{ return родитель[k]; }}, set(v) {{ родитель[k] = v; }}, configurable: true }});
+          Object.defineProperty(g, k, {{ get() {{ return parentG[k]; }}, set(v) {{ parentG[k] = v; }}, configurable: true }});
         }}
-        g.__ptВРеалме = 1;
-        // Консоль реалма пишет в сток, который движок не читает; пробнику
-        // отдаём консоль родителя — лексически, не трогая окно реалма.
-        Object.defineProperty(g, '__ptParentConsole', {{ value: родитель.console, configurable: true }});
+        g.__ptInRealm = 1;
+        // The realm console writes to a sink the engine does not read; give the
+        // probe the parent's console lexically, without touching the realm window.
+        Object.defineProperty(g, '__ptParentConsole', {{ value: parentG.console, configurable: true }});
         g.eval('(function (console) {{' + {body} + '\n}})(globalThis.__ptParentConsole)');
       }}
-    }} catch (e) {{ try {{ console.error('[реалм] пробник не встал: ' + e); }} catch (x) {{}} }}
+    }} catch (e) {{ try {{ console.error('[realm] probe install failed: ' + e); }} catch (x) {{}} }}
     return g;
   }};
 }})();"#

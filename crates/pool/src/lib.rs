@@ -42,7 +42,7 @@ mod webgl;
 
 pub use isolate::{build_snapshot, icu_ready, Isolate};
 
-/// Поднять платформу V8 (и данные ICU) на этом потоке — до сборки снимка.
+/// Initialise the V8 platform (and ICU data) on this thread, before building the snapshot.
 pub fn init_v8() {
     isolate::init_platform();
 }
@@ -286,9 +286,9 @@ impl IsolatePool {
         }
     }
 
-    /// Наименее занятый поток, кроме перечисленных (потоки страницы и её
-    /// кадров): контекст воркера там строился бы и работал в щелях их
-    /// таймеров. Если других потоков нет — наименее занятый вообще.
+    /// Least loaded thread other than `avoid` (the page's and its frames'
+    /// threads, where a worker context would only run in their timer gaps).
+    /// Falls back to the least loaded thread overall.
     pub fn pick_worker_avoiding(&self, avoid: &[WorkerId]) -> WorkerId {
         let mut workers = self.inner.workers.lock().unwrap();
         let loaded = |w: &Arc<Worker>| w.load.load(Ordering::Relaxed);
@@ -319,9 +319,8 @@ impl IsolatePool {
         }
     }
 
-    /// Наименее занятый поток, кроме `avoid`, — для кадра чужого
-    /// происхождения, который должен считать параллельно со своей страницей.
-    /// Если поток один, выбора нет.
+    /// Least loaded thread other than `avoid`, for a cross-origin frame that
+    /// must run in parallel with its page.
     pub fn pick_worker_except(&self, avoid: WorkerId) -> WorkerId {
         self.pick_worker_avoiding(&[avoid])
     }

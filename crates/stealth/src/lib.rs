@@ -88,16 +88,15 @@ impl StealthProfile {
 
 /// The Chrome major version every profile's UA / client hints report.
 ///
-/// Держится за тем, что мы на самом деле показываем: граф свойств, порядок
-/// вычисленного стиля, пределы WebGL и всё прочее сняты с Chrome 151, и версия
-/// в заголовке обязана говорить то же самое. Браузер, который зовётся 148, а
-/// внутри устроен как 151, виден по любому свойству, добавленному между ними.
+/// Must match what the engine actually exposes: the property graph, computed
+/// style order, WebGL limits etc. are captured from Chrome 151, and a browser
+/// claiming 148 while shaped like 151 is visible through any property added
+/// in between.
 ///
-/// Рукопожатие TLS при этом идёт по самому новому набору, какой знает
-/// `wreq-util` (Chrome 149): между 149 и 151 ClientHello не менялся, а разрыв
-/// в три версии по свойствам — менялся, и заметно.
+/// TLS uses the newest profile `wreq-util` knows (Chrome 149); ClientHello did
+/// not change between 149 and 151, the property surface did.
 pub const CHROME_MAJOR: &str = "151";
-/// Полная версия сборки — та же, что у Chrome, с которого снят отпечаток.
+/// Full build version of the Chrome the fingerprint was captured from.
 pub const CHROME_FULL: &str = "151.0.7922.173";
 
 /// The OS a fingerprint profile emulates. The network layer maps this to a wreq
@@ -168,14 +167,13 @@ impl FingerprintProfile {
             ProfileOs::Windows => ("Win32", "Windows", 1920, 1080, 1032, 24),
             ProfileOs::Mac => ("MacIntel", "macOS", 1512, 982, 944, 30),
         };
-        // `navigator.deviceMemory` — не постоянная восьмёрка: Chrome берёт
-        // физическую память машины и округляет к ближайшей степени двойки.
-        // Измерено на Chrome 151 с 16 ГБ: он объявляет 16, а не 8, — потолка,
-        // о котором говорит спецификация, там больше нет.
+        // `navigator.deviceMemory` is not a constant 8: Chrome rounds physical
+        // memory to the nearest power of two. Chrome 151 on a 16 GB machine
+        // reports 16; the spec's cap of 8 is gone.
         fn device_memory_gb() -> u32 {
-            // Тот же вопрос движок задаёт себе отдельно, когда отводит кучу
-            // (`nokk_pool::Isolate::physical_memory_bytes`); связывать ради
-            // одной строки два ящика не стоит.
+            // The pool asks the same question separately
+            // (`nokk_pool::Isolate::physical_memory_bytes`); not worth linking
+            // two crates for one line.
             #[cfg(target_os = "linux")]
             let bytes = std::fs::read_to_string("/proc/meminfo")
                 .ok()
@@ -223,9 +221,8 @@ impl FingerprintProfile {
                  Chrome/151.0.0.0 Safari/537.36",
                 8,
                 "Google Inc. (Intel)",
-                // Снято с Chrome 148 на живой машине с Mesa: у ANGLE своя форма —
-                // модель чипа в скобках и «OpenGL ES 3.2», а не «OpenGL 4.6».
-                // Прежняя строка была правдоподобной выдумкой не той формы.
+                // Captured from Chrome 148 on a Mesa machine: ANGLE's form has the
+                // chip model in parentheses and "OpenGL ES 3.2", not "OpenGL 4.6".
                 "ANGLE (Intel, Mesa Intel(R) Xe Graphics (TGL GT2), OpenGL ES 3.2)",
             ),
             Self::ChromeWindows => common(
@@ -476,24 +473,21 @@ pub fn apply_geo(profile: &StealthProfile, timezone: &str, country_code: &str) -
 /// The scripts are intentionally small and composed at runtime from the profile
 /// so a single source of truth (the [`StealthProfile`]) drives every spoofed
 /// value.
-/// Запись изнутри. У браузера половина свойств интерфейса только читается —
-/// страница их не пишет, а движок пишет, и делает это через `__pt_write`: если
-/// установщик с этого имени сняли (см. [`IFACE_KINDS`]), он найдётся в
-/// хранилище, а если ничего не снимали, выйдет обычное присваивание. Ставится
-/// первой строкой каждого скрипта: зовут его и те слои, что идут раньше
-/// самого прохода.
-/// Отдаётся отдельным скриптом и ставится первым: см. [`PT_WRITE_HELPER`].
+/// Internal writes. Many interface properties are read-only to the page but
+/// written by the engine via `__pt_write`: if the setter for a name was removed
+/// (see [`IFACE_KINDS`]) it is found in the store, otherwise it falls back to
+/// plain assignment. Shipped as a separate script that runs first (see
+/// [`PT_WRITE_HELPER`]), since earlier layers call it too.
 pub fn write_helper_script() -> String {
     PT_WRITE_HELPER.to_string()
 }
 
 const PT_WRITE_HELPER: &str = r#"(() => {
   if (globalThis.__pt_write) return;
-  // Ошибка, брошенная движком (TypeError привязки, DOMException), у браузера
-  // рождается в C++ и кадров в стеке не занимает. У нас её бросает JS, и
-  // пять-шесть своих кадров съедали `Error.stackTraceLimit`: странице
-  // доставалось четыре кадра из десяти. Захватываем с запасом; форматер
-  // (`__pt_formatStack`) прячет наши кадры и режет до лимита страницы.
+  // Engine-thrown errors (binding TypeError, DOMException) are born in C++ in
+  // the browser and take no stack frames. Ours are thrown from JS, and our own
+  // frames ate into `Error.stackTraceLimit`. Capture extra; the formatter
+  // (`__pt_formatStack`) hides our frames and trims to the page's limit.
   {
     const __Err = Error;
     let depth = 0;
@@ -507,8 +501,8 @@ const PT_WRITE_HELPER: &str = r#"(() => {
       },
       writable: true, enumerable: false, configurable: true,
     });
-    // Внутри ли движок сейчас строит ошибку: DOMException, созданный самой
-    // страницей, у браузера стека не несёт, а брошенный привязкой — несёт.
+    // Whether the engine is building an error right now: a DOMException created
+    // by the page carries no stack in the browser, one thrown by a binding does.
     Object.defineProperty(globalThis, '__pt_errDepth', { value: () => depth, writable: true, enumerable: false, configurable: true });
   }
   const writers = new WeakMap();
@@ -574,26 +568,25 @@ pub fn injection_script(profile: &StealthProfile) -> String {
 /// browserleaks.com/javascript) report Chrome values with `navigator.webdriver`
 /// hidden. A real DOM (`document`, elements, events) arrives with Phases 3–4;
 /// until then, page scripts that require the DOM will not run to completion.
-/// Отвечает ли `Intl` сам движок. Со своими данными ICU он отвечает как
-/// браузерный — валюты, склонения, часовые пояса; без них его подменяет
-/// заглушка, и её ответы браузерными не назовёшь. Ставит это ядро, когда пул
-/// доложит, что данные загружены.
+/// Whether V8's own `Intl` is usable. With ICU data it answers like the
+/// browser (currencies, plurals, time zones); without it a stub stands in.
+/// Set by the core once the pool reports the data is loaded.
 static NATIVE_INTL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Сказать слою, что родной `Intl` работоспособен (см. [`NATIVE_INTL`]).
+/// Marks native `Intl` as usable (see [`NATIVE_INTL`]).
 pub fn set_native_intl(on: bool) {
     NATIVE_INTL.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Работоспособен ли родной `Intl`.
+/// Whether native `Intl` is usable.
 pub fn native_intl() -> bool {
     NATIVE_INTL.load(std::sync::atomic::Ordering::Relaxed)
         || std::env::var("NOKK_NATIVE_INTL").is_ok()
 }
 
-/// Показывать ли странице кадры самого движка в `error.stack`. Обычно нет —
-/// в браузере их там нет вовсе (см. [`STACK_TEMPLATE`]); `NOKK_STACK_RAW=1`
-/// возвращает их, когда разбираешь, обо что споткнулась чужая программа.
+/// Whether to show engine frames in `error.stack`. Normally not, the browser
+/// has none (see [`STACK_TEMPLATE`]); `NOKK_STACK_RAW=1` keeps them for
+/// debugging what a page script tripped on.
 fn stack_raw() -> bool {
     std::env::var("NOKK_STACK_RAW").is_ok()
 }
@@ -634,8 +627,8 @@ pub fn bootstrap_script(profile: &StealthProfile) -> String {
     // The Intl shim shadows the prebuilt V8's native Intl/Date-locale APIs, which
     // ICU-abort the whole process (this build lacks working ICU data). It also
     // pins timezone/locale to the profile — both fingerprint vectors.
-    // Ставится только там, где у V8 нет данных ICU: с ними родной `Intl`
-    // отвечает как браузерный, а заглушка — нет.
+    // Only installed when V8 has no ICU data: with it native `Intl` answers
+    // like the browser and the stub does not.
     let intl = if native_intl() {
         String::new()
     } else {
@@ -677,11 +670,10 @@ fn fast_timers() -> bool {
 /// [`bootstrap_script`]. Kept as a raw string so the JS reads naturally without
 /// brace-escaping.
 const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
-  // Форма интерфейсного объекта. Обычная функция несёт собственные `arguments`
-  // и `caller` — у браузерного интерфейса их нет, и обход графа видит два лишних
-  // имени на каждом из девятисот имён. Строгая функция несёт ровно
-  // `length, name, prototype`, и, в отличие от класса, бросает «Illegal
-  // constructor» и на вызов без `new` — как настоящий интерфейс.
+  // Interface object shape. A sloppy function has own `arguments` and `caller`,
+  // which browser interfaces lack (two extra names per interface in a graph
+  // walk). A strict function has exactly `length, name, prototype` and, unlike
+  // a class, throws "Illegal constructor" when called without `new` too.
   globalThis.__ptIllegal = (function () {
     'use strict';
     return function () { return function () { throw __pt_mkErr(TypeError, 'Illegal constructor'); }; };
@@ -690,9 +682,9 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
     try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {}
     return f;
   };
-  // Снимок JSON, снятый до единой строки страницы: движок сериализует свои
-  // очереди сам, и через `JSON.stringify` страницы делать это нельзя — страница,
-  // подменив его, увидела бы внутренности эмулятора. Имя `__pt`-скрыто.
+  // JSON captured before any page code: the engine serializes its own queues
+  // and must not go through the page's `JSON.stringify`, which the page could
+  // replace to see emulator internals.
   if (!globalThis.__ptJSON) {
     Object.defineProperty(globalThis, "__ptJSON", {
       value: { stringify: JSON.stringify, parse: JSON.parse },
@@ -709,16 +701,15 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   const defClass = (name, proto) => {
     const Ctor = __ptIllegal();
     try { Object.defineProperty(Ctor, "name", { value: name, configurable: true }); } catch (e) {}
-    // Прототип из шаблона V8 (неизменяемый, как у Chrome) — см. __pt_protoTemplates.
+    // Prototype from a V8 template (immutable, like Chrome's); see __pt_protoTemplates.
     if (proto) {
       try {
         Ctor.prototype = proto;
         Object.defineProperty(proto, 'constructor', { value: Ctor, writable: true, enumerable: false, configurable: true });
       } catch (e) {}
     }
-    // Без этого `Object.prototype.toString.call(navigator)` отвечает
-    // `[object Object]` вместо `[object Navigator]` — самая дешёвая проверка на
-    // подделку из всех, и мы её не проходили.
+    // Without this `Object.prototype.toString.call(navigator)` gives
+    // `[object Object]` instead of `[object Navigator]`, the cheapest spoof check.
     try {
       Object.defineProperty(Ctor.prototype, Symbol.toStringTag, { value: name, configurable: true });
     } catch (e) {}
@@ -737,7 +728,7 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
     for (const k of Object.keys(obj)) { const v = obj[k]; accessor(proto, k, () => v); }
   };
   const protoMethod = (proto, name, fn) => {
-    // То же правило: метод браузера — не конструктор, `prototype` у него нет.
+    // Same rule: a browser method is not a constructor and has no `prototype`.
     let m = fn;
     try {
       const methodish = /^[a-z_$]/.test(String(name))
@@ -776,17 +767,12 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
     orientation: { type: "landscape-primary", angle: 0 },
   });
   win.screen = Object.create(ScreenProto);
-  // Окно должно помещаться в доступную область экрана. Оно объявляло высоту
-  // 1080 при `screen.availHeight` 1053 — то есть заходило под панель рабочего
-  // стола, чего не бывает. Развёрнутое окно занимает доступную область
-  // целиком, а его содержимое — на 111 пикселей ниже: столько у Chrome
-  // занимают вкладки с адресной строкой.
+  // The window must fit the available screen area. A maximized window fills
+  // it, and its content is 111 px shorter (Chrome's tab strip and toolbar).
   win.outerWidth = __SCREEN_W__; win.outerHeight = __AVAIL_H__;
   win.innerWidth = __SCREEN_W__; win.innerHeight = __AVAIL_H__ - 111;
   win.devicePixelRatio = 1;
-  // Где окно стоит на экране. Значение приехало снимком чужого окна — десять
-  // пикселей отступа, — но окно шириной во весь экран с таким отступом не
-  // сходится: развёрнутое окно начинается в нуле. Считаем, а не помним.
+  // Window position: a maximized full-width window starts at 0, so compute it.
   {
     const w = win.screen.width || win.outerWidth, h = win.screen.height || win.outerHeight;
     const left = win.outerWidth >= w ? 0 : Math.max(0, Math.round((w - win.outerWidth) / 2));
@@ -812,9 +798,8 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
     if (!url) return;
     let abs = url;
     try { abs = new URL(url, locState.href).href; } catch (e) {}
-    // Кто именно уводит страницу — вопрос, который задаёшь каждый раз, когда
-    // сайт вдруг перезагружает сам себя. Верхние кадры стека отвечают на него
-    // сразу, поэтому едут вместе с запросом.
+    // Top stack frames tell who navigated the page; sent with the request for
+    // debugging unexpected reloads.
     let via = '';
     try { via = String(new Error().stack || '').split('\n').slice(1, 4).join(' | ').slice(0, 300); } catch (e) {}
     const op = { url: abs, replace: !!replace, via };
@@ -822,7 +807,7 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
     navQueue.push(op);
   };
   globalThis.__pt_drainNavQueue = () => navQueue.splice(0);
-  // Отправка формы (dom_runtime): GET — адрес с запросом, POST — тело.
+  // Form submission (dom_runtime): GET puts the query in the URL, POST in the body.
   Object.defineProperty(globalThis, '__pt_navSubmit', { value: (url, method, body, contentType) => askNav(url, false, method === 'POST' ? { body, contentType } : null), writable: true, enumerable: false, configurable: true });
 
   for (const k of Object.keys(locState)) {
@@ -837,10 +822,9 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   protoMethod(LocationProto, "replace", function replace(u){ askNav(u, true); });
   protoMethod(LocationProto, "reload", function reload(){ askNav(locState.href, true); });
   protoMethod(LocationProto, "toString", function toString(){ return locState.href; });
-  // `window.location = url` — такой же переход, как `location.href = url`, и
-  // именно им завершают себя многие потоки (в том числе челлендж Cloudflare).
-  // Данным свойством окно ловило строку вместо объекта: адрес затирался,
-  // перехода не было, и страница дальше жила со сломанным `location`.
+  // `window.location = url` navigates like `location.href = url` (many flows,
+  // including the Cloudflare challenge, end this way). A data property here
+  // would just overwrite `location` with a string.
   const locationObject = (__T && __T.location && Object.getPrototypeOf(__T.location) === LocationProto) ? __T.location : Object.create(LocationProto);
   accessor(win, 'location', () => locationObject, (v) => {
     if (v !== locationObject) askNav(v, false);
@@ -851,17 +835,15 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
 
   // --- history ----------------------------------------------------------
   const HistoryProto = defClass("History");
-  // История у нас была вывеской: `pushState`/`replaceState` молчали на любой
-  // адрес, `state` всегда null, `length` не рос. Челлендж это знает и зовёт
-  // `replaceState({}, '', 'https://example.org/')` — браузер на чужой origin
-  // бросает SecurityError, и именно отсутствие броска он записывал в отчёт.
-  // Теперь по правилам History::CanChangeToUrl Chrome: клон состояния,
-  // адрес того же origin и схемы (about:/opaque — только другой фрагмент),
-  // при успехе адрес документа меняется без перехода.
-  // Вкладка, открытая человеком, уже прошла новую вкладку: у Chrome длина 2.
+  // The challenge calls `replaceState({}, '', 'https://example.org/')` and
+  // records whether it throws SecurityError. Follows Chrome's
+  // History::CanChangeToUrl: state is cloned, URL must be same origin and
+  // scheme (about:/opaque: only the fragment may change), and on success the
+  // document URL changes without navigation.
+  // A tab opened by a user has already been through the new-tab page: Chrome's length is 2.
   const hist = { length: 2, scrollRestoration: 'auto', state: null };
-  // Длина истории — у вкладки, не у документа: новый документ получает её от
-  // прежнего (`__pt_carryOut`/`__pt_carryIn`, движок переносит при переходе).
+  // History length belongs to the tab, not the document: carried over on
+  // navigation (`__pt_carryOut`/`__pt_carryIn`).
   (globalThis.__pt_carryParts || (globalThis.__pt_carryParts = {})).hist = {
     out: () => hist.length,
     in: (n) => { if (typeof n === 'number' && n > 0) hist.length = n; },
@@ -876,8 +858,8 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   const canChangeTo = (u) => {
     const doc = locState.href;
     const docUrl = (() => { try { return new URL(doc); } catch (e) { return null; } })();
-    // about:blank, about:srcdoc, data:, file:, непрозрачный origin — Chrome
-    // разрешает менять только фрагмент.
+    // about:blank, about:srcdoc, data:, file:, opaque origin: Chrome only
+    // allows changing the fragment.
     if (!docUrl || /^about:/.test(doc) || locState.origin === 'null' || docUrl.protocol === 'file:' || docUrl.protocol === 'data:') return stripHash(u.href) === stripHash(doc);
     if (u.protocol !== docUrl.protocol || u.host !== docUrl.host) return false;
     return u.origin !== 'null' && u.origin === docUrl.origin;
@@ -896,8 +878,8 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
       let u = null;
       try { u = new URL(raw, locState.href); } catch (e) {}
       if (!u || !canChangeTo(u)) {
-        // Origin документа, не `location.origin`: у пустого кадра он
-        // унаследован от родителя, а `location.origin` там «null».
+        // The document's origin, not `location.origin`: an empty frame inherits
+        // it from the parent while its `location.origin` is "null".
         let docOrigin = locState.origin;
         try { if (docOrigin === 'null' && typeof globalThis.origin === 'string' && globalThis.origin !== 'null') docOrigin = globalThis.origin; } catch (e) {}
         throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute '" + method + "' on 'History': A history state object with URL '" + (u ? u.href : raw) + "' cannot be created in a document with origin '" + docOrigin + "' and URL '" + locState.href + "'.", 'SecurityError');
@@ -915,26 +897,23 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   protoMethod(HistoryProto, 'go', function go(delta) {});
   win.history = Object.create(HistoryProto);
 
-  // Окно называет себя окном: тег ставим собственным свойством, а не на
-  // прототипе — прототип у глобального объекта общий с обычными объектами.
+  // The tag is an own property: the global's prototype chain is shared with
+  // ordinary objects.
   try {
     Object.defineProperty(win, Symbol.toStringTag, { value: 'Window', configurable: true });
   } catch (e) {}
 
-  // Консоль браузера — не один общий `() => {}` на все имена: там два десятка
-  // методов, каждый со своим именем и `[native code]`, а сам объект зовётся
-  // `[object console]`. И сказанное в неё не должно пропадать: страница,
-  // сообщающая «[Cloudflare Turnstile] Unhandled error: …», говорит это именно
-  // сюда, а у нас это был самый тихий способ потерять причину.
+  // Browser console: twenty-odd methods, each with its own name and
+  // `[native code]`, the object tags as `[object console]`. Messages are kept:
+  // pages report errors there ("[Cloudflare Turnstile] Unhandled error: ...").
   const CONSOLE = ['assert', 'clear', 'context', 'count', 'countReset', 'createTask', 'debug',
     'dir', 'dirxml', 'error', 'group', 'groupCollapsed', 'groupEnd', 'info', 'log', 'profile',
     'profileEnd', 'table', 'time', 'timeEnd', 'timeLog', 'timeStamp', 'trace', 'warn'];
   const SPOKEN = { log: 1, info: 1, warn: 1, error: 1, debug: 1, trace: 1, assert: 1, dir: 1 };
   const said = [];
   globalThis.__pt_drainConsole = () => said.splice(0);
-  // Показ для журнала — без чужого кода: у браузера консоль не зовёт ни
-  // toString, ни toJSON, ни геттеры (кроме форматирования ниже), а страница
-  // это меряет.
+  // Display for the log without running page code: the browser console calls
+  // no toString/toJSON/getters (except formatting below), and pages measure it.
   const show = (v) => {
     try {
       if (typeof v === 'string') return v;
@@ -957,16 +936,16 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
       return String(v);
     } catch (e) { return '?'; }
   };
-  // Форматирование V8 (builtins-console.cc): у log/debug/info/warn/error/trace/
-  // group/groupCollapsed (и assert с второго довода, если условие ложно) первая
-  // строка с %d/%i/%f/%s преобразует следующий довод — через parseInt/parseFloat/
-  // String, то есть ToString с подсказкой «string» (toString раньше valueOf,
-  // Symbol.toPrimitive('string')); %c/%o/%O съедают довод без преобразования,
-  // %% и неизвестные — ничего не едят; Symbol под %d — NaN, без броска.
-  // Исключение из toString уходит наружу. Сверено на scratchpad/console_fmt.html.
+  // V8 formatting (builtins-console.cc): for log/debug/info/warn/error/trace/
+  // group/groupCollapsed (and assert from the second arg when the condition is
+  // false), a first string with %d/%i/%f/%s converts the next arg via
+  // parseInt/parseFloat/String, i.e. ToString with hint "string"; %c/%o/%O
+  // consume an arg unconverted, %% and unknown consume nothing; Symbol under
+  // %d gives NaN without throwing. Exceptions from toString propagate.
+  // Checked against Chrome.
   const FORMATTED = { log: 1, debug: 1, info: 1, warn: 1, error: 1, trace: 1, group: 1, groupCollapsed: 1, assert: 1 };
   const LABELED = { count: 1, countReset: 1, time: 1, timeEnd: 1, timeLog: 1, timeStamp: 1, profile: 1, profileEnd: 1, context: 1 };
-  // Методы, все доводы которых уходят в сообщение (и описываются инспектором).
+  // Methods whose arguments all go into the message (described by the inspector).
   const REPORTED = { log: 1, debug: 1, info: 1, warn: 1, error: 1, trace: 1, dir: 1, dirxml: 1, table: 1, group: 1, groupCollapsed: 1, assert: 1 };
   const format = (args, idx) => {
     if (args.length < idx + 2 || typeof args[idx] !== 'string') return;
@@ -978,7 +957,7 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
       if (c === 'd' || c === 'i') args[ai] = typeof cur === 'symbol' ? NaN : parseInt(cur, 10);
       else if (c === 'f') args[ai] = typeof cur === 'symbol' ? NaN : parseFloat(cur);
       else if (c === 's') args[ai] = String(cur);
-      else if (c === 'c' || c === 'o' || c === 'O') { /* съедается как есть */ }
+      else if (c === 'c' || c === 'o' || c === 'O') { /* consumed as is */ }
       else if (c === '%') { off = p + 2; continue; }
       else { off = p + 1; continue; }
       ai++; off = p + 2;
@@ -992,8 +971,8 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
         if (name === 'assert') { if (args[0]) return undefined; format(args, 1); }
         else format(args, 0);
       } else if (LABELED[name] && args.length) {
-        // Метка счётчика/таймера — ToString первого довода (Symbol бросает);
-        // шаблонной строкой, чтобы в стеке не появился кадр `String`.
+        // Counter/timer label: ToString of the first arg (Symbol throws); via a
+        // template string so no `String` frame appears on the stack.
         if (typeof args[0] === 'symbol') throw __pt_mkErr(TypeError, 'Cannot convert a Symbol value to a string');
         args[0] = `${args[0]}`;
       } else if (name === 'createTask') {
@@ -1001,20 +980,20 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
         const task = {}; Object.defineProperty(task, 'run', { value: ({ run(f) { return f(); } }).run, writable: true, enumerable: true, configurable: true });
         return task;
       }
-      // Как у инспектора V8 (v8-console-message.cc): текст сообщения — ToString
-      // первого довода (объект, функция; массив — поэлементно), а всякий довод-
-      // ошибка описывается через её же toString (имя, сообщение). Исключения
-      // глотаются. Страница меряет именно эти вызовы и их стек.
+      // Like V8's inspector (v8-console-message.cc): message text is ToString of
+      // the first arg (object, function; arrays element-wise), and any error arg
+      // is described via its own toString. Exceptions are swallowed. Pages
+      // measure exactly these calls and their stacks.
       const texts = [];
       if (REPORTED[name]) {
         const base = name === 'assert' ? 1 : 0;
-        // V8ValueStringBuilder: обычный объект — Object.prototype.toString (без
-        // чужого кода); Date, функция, родная ошибка, RegExp — ToString (их
-        // toString зовётся); массив — поэлементно через запятую, null/undefined
-        // внутри пропускаются.
+        // V8ValueStringBuilder: plain object -> Object.prototype.toString (no
+        // page code); Date, function, native error, RegExp -> ToString (their
+        // toString is called); arrays element-wise joined by commas, null and
+        // undefined inside are skipped.
         const tagOf = (v) => { try { return Object.prototype.toString.call(v); } catch (e) { return '[object Object]'; } };
-        // По внутреннему тегу, а не instanceof: объект другого окна (виджет
-        // пишет в консоль своего srcdoc-кадра) иначе не распознаётся.
+        // By internal tag, not instanceof: objects from another window (the
+        // widget logs to its srcdoc frame's console) would not match otherwise.
         const viaToString = (v) => { if (typeof v === 'function') return true; const t = tagOf(v); return t === '[object Date]' || t === '[object RegExp]' || t === '[object Error]'; };
         const str = (v, depth, inArray) => {
           try {
@@ -1028,8 +1007,8 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
           } catch (e) { return ''; }
         };
         if (args.length > base) texts[base] = str(args[base], 0, false);
-        // Всякий довод-ошибка описывается через её toString (имя, сообщение) —
-        // кроме первого, который уже прошёл ToString выше.
+        // Every error arg is described via its toString, except the first,
+        // which already went through ToString above.
         for (let i = base + 1; i < args.length; i++) {
           const v = args[i];
           if (v !== null && typeof v === 'object' && tagOf(v) === '[object Error]') { try { texts[i] = String(v.toString()); } catch (e) {} }
@@ -1093,11 +1072,10 @@ const INTL_SHIM_TEMPLATE: &str = r#"(() => {
     };
   }
 
-  // `Intl.Locale` — не заглушка из двух полей: страницы вызывают `maximize()`,
-  // чтобы узнать регион, и `getTextInfo()`, чтобы выбрать направление письма.
-  // Отсутствующий метод роняет весь бандл (у CapSolver — ровно так), а полный
-  // CLDR нам не нужен: хватает наиболее вероятных подтегов для живых языков и
-  // списка языков с письмом справа налево.
+  // `Intl.Locale` needs `maximize()` (pages use it to find the region) and
+  // `getTextInfo()` (writing direction); a missing method crashes whole bundles
+  // (CapSolver's does). Likely subtags for living languages and the RTL list
+  // are enough, no full CLDR.
   const RTL = new Set(['ar', 'arc', 'ckb', 'dv', 'fa', 'he', 'ks', 'ku', 'pnb', 'ps',
     'sd', 'ug', 'ur', 'yi']);
   const LIKELY = {
@@ -1284,13 +1262,12 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   let seq = 1;
   let virt = 0; // fast mode only: the clock that jumps to each due time
   const q = new Map(); // id -> {fn, delay, interval, due, cancelled, id, depth}
-  // Часы очереди — высокого разрешения: `Date.now()` меряет целыми
-  // миллисекундами, и таймер на четыре миллисекунды срабатывал где угодно
-  // между четырьмя и пятью, а сетка кадров ложилась на целые доли. У
-  // браузера и то, и другое считается по монотонным часам.
-  // Один масштаб на всю жизнь очереди: `performance` появляется позже нас, и
-  // если до него считать абсолютными миллисекундами, а после — от начала
-  // страницы, все заведённые раньше таймеры окажутся в далёком будущем.
+  // High-resolution queue clock: `Date.now()` is whole milliseconds, so a 4 ms
+  // timer fired anywhere between 4 and 5 and the frame grid snapped to integers;
+  // the browser uses a monotonic clock for both.
+  // One scale for the queue's lifetime: `performance` appears after us, and
+  // switching from absolute to page-relative ms would push existing timers
+  // far into the future.
   const T0 = Date.now();
   const hi = () => {
     const p = globalThis.performance;
@@ -1303,21 +1280,17 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   // both a tell and a way to starve every other context on the worker.
   let depth = 0;
 
-  // Задачи движка (`__pt_addTask`) нумеруются отдельно, отрицательными:
-  // первый `setTimeout` страницы отвечает 1, как в браузере, сколько бы
-  // работы движок ни поставил до него.
+  // Engine tasks (`__pt_addTask`) use separate negative ids, so the page's first
+  // `setTimeout` returns 1 as in the browser.
   let iseq = -1;
   const add = (fn, delay, interval, args, internal) => {
-    // Строка вместо функции — законный, пусть и старый, способ поставить
-    // таймер: браузер компилирует её как код глобальной области, когда время
-    // придёт. Мы её молча выбрасывали, и назначенная работа просто не
-    // происходила — ни ошибки, ни следа. Через эти же ворота Trusted Types
-    // передаёт TrustedScript.
+    // A string handler is compiled as global code when the timer fires.
+    // Trusted Types passes TrustedScript through here too.
     if (typeof fn === 'string' || (fn !== null && typeof fn === 'object' &&
         globalThis.trustedTypes && globalThis.trustedTypes.isScript &&
         (() => { try { return trustedTypes.isScript(fn); } catch (e) { return false; } })())) {
       const code = String(fn);
-      // Пустая строка — не задача: браузер отвечает нулём и ничего не ставит.
+      // Empty string: the browser returns 0 and schedules nothing.
       if (code === '') return 0;
       fn = () => { try { (0, eval)(code); } catch (e) { if (globalThis.__pt_reportError) __pt_reportError(e, 'timer string'); else throw e; } };
       args = [];
@@ -1333,31 +1306,28 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   };
   globalThis.setTimeout = (fn, delay, ...args) => add(fn, delay, false, args);
   globalThis.setInterval = (fn, delay, ...args) => add(fn, delay, true, args);
-  // У Chrome длина обоих — 1 (обязателен только обработчик).
+  // Chrome's length for both is 1 (only the handler is required).
   try { Object.defineProperty(globalThis.setTimeout, 'length', { value: 1, configurable: true }); } catch (e) {}
   try { Object.defineProperty(globalThis.setInterval, 'length', { value: 1, configurable: true }); } catch (e) {}
   globalThis.clearTimeout = (id) => { const t = q.get(id); if (t) t.cancelled = true; q.delete(id); };
-  // Отдельная функция, а не тот же объект: у браузера clearTimeout !== clearInterval.
+  // Separate function: in the browser clearTimeout !== clearInterval.
   globalThis.clearInterval = (id) => { const t = q.get(id); if (t) t.cancelled = true; q.delete(id); };
-  // Задача вне таймеров (`scheduler.postTask` с высоким приоритетом): у
-  // браузера она идёт раньше уже поставленных нулевых таймеров.
+  // Non-timer task (`scheduler.postTask` with high priority): runs before
+  // already queued zero-delay timers, as in the browser.
   Object.defineProperty(globalThis, '__pt_addTask', { value: (fn, delay, front) => {
     const id = add(fn, delay, false, [], true);
     if (front) { const t = q.get(id); if (t) t.due = clock() - 1; }
     return id;
   }, configurable: true, enumerable: false });
   globalThis.queueMicrotask = (fn) => { Promise.resolve().then(fn); };
-  // У кадров анимации свой счётчик, отдельный от таймеров: в браузере первый
-  // `requestAnimationFrame` на странице возвращает 1, даже если до него уже
-  // завели два таймера. Мы отдавали общий номер — разница видна одной строкой.
+  // Animation frames have their own counter: the page's first
+  // `requestAnimationFrame` returns 1 even after timers were created.
   let rafSeq = 0;
   const rafIds = new Map();
-  // Кадр — не «таймер на шестнадцать миллисекунд», а узел сетки развёртки:
-  // у браузера соседние отметки отстоят ровно на 16,7 мс, сколько бы он ни
-  // был занят, а у нас выходило 17,3 с дрожанием — и это первое, что меряет
-  // всякий, кто считает частоту кадров. Начало сетки — запуск страницы,
-  // поэтому первый кадр приходит через случайную долю периода, как в
-  // браузере, а не всегда через полный.
+  // A frame is a node on the vsync grid, not a 16 ms timer: browser ticks are
+  // exactly 16.7 ms apart however busy it is, which is the first thing frame
+  // rate checks measure. The grid starts at page start, so the first frame
+  // comes after a random fraction of a period.
   const FRAME_MS = 1000 / 60;
   const frameOrigin = clock();
   let frameSlot = null;
@@ -1375,11 +1345,9 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
       frameSlot = slot;
       const tid = add(() => {
         if (frameSlot === slot) frameSlot = null;
-        // Отметка времени у всех обработчиков одного кадра одна и та же —
-        // время самого кадра, а не момент вызова.
-        // Отметку кадра браузер округляет до десятой доли миллисекунды —
-        // отсюда его 16,6 и 16,7 вперемежку. Ровные 16,667 выдают счётчик,
-        // а не развёртку.
+        // All callbacks of one frame get the same timestamp (the frame time),
+        // rounded to 0.1 ms like the browser (16.6 and 16.7 alternating; an
+        // even 16.667 betrays a counter).
         const stamp = Math.round(slot.at * 10) / 10;
         for (const [id, cb] of slot.list.splice(0)) {
           rafIds.delete(id);
@@ -1388,7 +1356,7 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
           }
         }
       }, Math.max(0, at - now), false, []);
-      // Длинный кадр анимации записывается как FrameRequestCallback.
+      // A long animation frame is attributed to FrameRequestCallback.
       try { const t = q.get(tid); if (t) { t.invoker = 'FrameRequestCallback'; t.orig = fn; } } catch (e) {}
     }
     frameSlot.list.push([rid, fn]);
@@ -1422,12 +1390,12 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   // empty or nothing is due yet — either way the driver stops pumping and asks
   // `__pt_nextTimerDelay` what to do next. Microtasks scheduled by the callback
   // drain automatically when this returns to Rust.
-  // Реалмы (окна пустых и srcdoc-кадров) живут в этом же изоляте, но своих
-  // водителей у них нет: их очереди крутятся отсюда. Отцепленный кадр из
-  // списка выпадает.
+  // Realms (empty and srcdoc frame windows) share this isolate but have no
+  // driver of their own: their queues are pumped from here. Detached frames
+  // drop out of the list.
   const children = [];
   Object.defineProperty(globalThis, '__pt_addChildRealm', { value: (w) => { if (w && children.indexOf(w) < 0) children.push(w); }, configurable: true, enumerable: false });
-  // Диагностика: все реалмы, что заводило это окно (и уже отцепленные тоже).
+  // Diagnostics: every realm this window created, including detached ones.
   const everyChild = [];
   Object.defineProperty(globalThis, '__pt_childRealms', { value: () => everyChild.slice(), configurable: true, enumerable: false });
   const addEvery = globalThis.__pt_addChildRealm;
@@ -1471,7 +1439,7 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
     depth = best.depth;
     const t0 = hi();
     try { best.fn(); } catch (e) {
-      // То же, что и у обработчика события: браузер про это сообщает.
+      // As with event handlers, the browser reports it.
       if (typeof globalThis.__pt_reportError === 'function') __pt_reportError(e, 'timer');
     }
     finally {
@@ -1533,8 +1501,7 @@ pub fn probe_tracer_script() -> String {
 }
 
 const TRACER_TEMPLATE: &str = r##"(() => {
-  // Потолок ленты: по умолчанию хватает, но при разборе долгих пауз нужно
-  // видеть дальше — NOKK_TRACE_CAP поднимает его.
+  // Head ring cap; NOKK_TRACE_CAP raises it for long stalls.
   const HEAD_CAP = __HEAD_CAP__;
   const log = new Map();
   const show = (v) => {
@@ -1550,12 +1517,12 @@ const TRACER_TEMPLATE: &str = r##"(() => {
       return s.length > 90 ? s.slice(0, 90) + '…' : s;
     } catch (e) { return '<threw>'; }
   };
-  // Счётчики говорят, что страница спросила; они не говорят, на чём она встала.
-  // Поэтому рядом — хвост: последние обращения по порядку, со временем от начала.
+  // Counters say what the page asked, not where it stopped: hence the tail,
+  // the last accesses in order with time since start.
   const tail = [], head = [];
   const t0 = Date.now();
-  // `isNaN` в цикле декодера даёт сотни тысяч записей и топит след; счётчик по
-  // нему всё равно бесполезен.
+  // `isNaN` in a decoder loop yields hundreds of thousands of entries and
+  // drowns the trace.
   const NOISY = /^isNaN\(/;
   const note = (name, v) => {
     if (NOISY.test(name)) return v;
@@ -1571,13 +1538,11 @@ const TRACER_TEMPLATE: &str = r##"(() => {
     .sort((a, b) => b[1].n - a[1].n)
     .map(([k, v]) => [k, v.n, v.last]));
   globalThis.__pt_probeTail = (n) => __ptJSON.stringify(tail.slice(-(n || 60)));
-  // Метка в самой ленте: без неё непонятно, где начинается и где обрывается
-  // чужая программа, а сравнивать надо именно её отрезок.
+  // Marker in the trace, to find where a foreign program's segment begins and ends.
   globalThis.__pt_probeMark = (text) => {
     note('== ' + text, '');
-    // Снимок хвоста на метке: лента головы к этому времени переполнена, а
-    // нужен как раз отрезок перед событием — что прочитали последним, прежде
-    // чем отправить.
+    // Snapshot of the tail at the marker: the head ring has overflowed by now,
+    // and what matters is what was read just before the event.
     try { globalThis.__pt_atMark = __ptJSON.stringify(tail.slice(-400)); } catch (e) {}
   };
   globalThis.__pt_probeHead = (n) => __ptJSON.stringify(head.slice(0, n || 40000));
@@ -1589,10 +1554,10 @@ const TRACER_TEMPLATE: &str = r##"(() => {
     return native(f);
   };
 
-  // Конструктор оборачивать нельзя: обёртка теряет и статические методы, и
-  // прототип, а `Object` в обёртке ломает вообще всё. Трогаем методы и геттеры.
-  // Признак конструктора — заглавная буква в имени: `Proxy` и `Symbol` прототипа
-  // в обычном смысле не имеют, а обёртку над ними страница не переживёт.
+  // Constructors cannot be wrapped: a wrapper loses statics and the prototype,
+  // and wrapping `Object` breaks everything. Only methods and getters are
+  // touched. A capitalized name marks a constructor: `Proxy` and `Symbol` have
+  // no prototype in the usual sense and a page won't survive wrapping them.
   const isConstructor = (v) => typeof v === 'function'
     && (/^[A-Z]/.test(v.name || '') || !!v.prototype);
 
@@ -1609,8 +1574,8 @@ const TRACER_TEMPLATE: &str = r##"(() => {
         try {
           Object.defineProperty(obj, key, Object.assign({}, d, {
             get: rename(function () {
-              // Бросок из свойства — самое ценное, что может записать прибор: их
-              // VM ловит такие внутри себя, и снаружи виден только обрыв.
+              // A throw from a property is the most valuable thing to record:
+              // their VM catches it internally and only an abort is visible.
               try { return note(prefix + key, get.call(this)); }
               catch (e) { note('THROW ' + prefix + key, String((e && e.message) || e)); throw e; }
             }, 'get ' + key),
@@ -1636,9 +1601,8 @@ const TRACER_TEMPLATE: &str = r##"(() => {
     }
   };
 
-  // Перечисление — главный инструмент сборщика отпечатков: он идёт по
-  // `Object.keys` вверх по цепочке прототипов и по именам решает, что перед ним.
-  // Записываем, что именно перечисляли и сколько имён отдали.
+  // Enumeration is the fingerprinter's main tool: it walks `Object.keys` up the
+  // prototype chain. Record what was enumerated and how many names came back.
   const nameOf = (o) => {
     try {
       if (o === globalThis) return 'window';
@@ -1658,7 +1622,7 @@ const TRACER_TEMPLATE: &str = r##"(() => {
       Object.defineProperty(holder, key, {
         value: rename(function (target, ...rest) {
           const out = orig.call(this, target, ...rest);
-          note('walk:' + key + '(' + nameOf(target) + ')', Array.isArray(out) ? out.length + ' имён' : out);
+          note('walk:' + key + '(' + nameOf(target) + ')', Array.isArray(out) ? out.length + ' names' : out);
           return out;
         }, key),
         writable: true, configurable: true,
@@ -1666,15 +1630,14 @@ const TRACER_TEMPLATE: &str = r##"(() => {
     } catch (e) {}
   }
 
-  // Код, который страница сочиняет на ходу, и потоки, в которых она прячет
-  // сборку: и то и другое стоит видеть по имени.
+  // Code the page compiles on the fly and the workers it hides collection in.
   const origFunction = globalThis.Function;
   for (const name of ['Worker', 'SharedWorker', 'ServiceWorker']) {
     const C = globalThis[name];
     if (typeof C !== 'function') continue;
     try {
       globalThis[name] = new Proxy(C, {
-        construct(t, args) { note('new ' + name + '(' + show(args[0]) + ')', 'создан'); return Reflect.construct(t, args); },
+        construct(t, args) { note('new ' + name + '(' + show(args[0]) + ')', 'created'); return Reflect.construct(t, args); },
       });
     } catch (e) {}
   }
@@ -1686,23 +1649,22 @@ const TRACER_TEMPLATE: &str = r##"(() => {
       return url;
     }, 'createObjectURL');
   } catch (e) {}
-  // XHR: страница спрашивает не только свойства — она ещё и ждёт ответа. Что
-  // ушло, что вернулось и в каком состоянии — половина разбора зависаний.
+  // XHR: what went out, what came back and in what state.
   try {
     const X = globalThis.XMLHttpRequest;
     if (typeof X === 'function') {
       const open_ = X.prototype.open, send_ = X.prototype.send;
       X.prototype.open = rename(function (m, u) {
-        note('xhr.open(' + String(m) + ' ' + String(u).slice(-48) + ')', 'открыт');
+        note('xhr.open(' + String(m) + ' ' + String(u).slice(-48) + ')', 'opened');
         try {
           this.addEventListener('readystatechange', () => {
             if (this.readyState !== 4) return;
             let n = -1;
             try { n = String(this.responseText || '').length; } catch (e) {}
-            note('xhr.done(' + String(u).slice(-48) + ')', this.status + ', ' + n + ' байт');
+            note('xhr.done(' + String(u).slice(-48) + ')', this.status + ', ' + n + ' bytes');
           });
-          this.addEventListener('timeout', () => note('xhr.timeout(' + String(u).slice(-48) + ')', 'истёк'));
-          this.addEventListener('error', () => note('xhr.error(' + String(u).slice(-48) + ')', 'ошибка'));
+          this.addEventListener('timeout', () => note('xhr.timeout(' + String(u).slice(-48) + ')', 'timed out'));
+          this.addEventListener('error', () => note('xhr.error(' + String(u).slice(-48) + ')', 'error'));
         } catch (e) {}
         return open_.apply(this, arguments);
       }, 'open');
@@ -1716,17 +1678,17 @@ const TRACER_TEMPLATE: &str = r##"(() => {
   try {
     globalThis.Function = new Proxy(origFunction, {
       construct(t, args) {
-        note('new Function(' + String(args[args.length - 1] || '').slice(0, 50) + ')', 'скомпилировано');
+        note('new Function(' + String(args[args.length - 1] || '').slice(0, 50) + ')', 'compiled');
         return Reflect.construct(t, args);
       },
       apply(t, self, args) {
-        note('Function(' + String(args[args.length - 1] || '').slice(0, 50) + ')', 'скомпилировано');
+        note('Function(' + String(args[args.length - 1] || '').slice(0, 50) + ')', 'compiled');
         return Reflect.apply(t, self, args);
       },
     });
   } catch (e) {}
 
-  // Данные-свойства корней: обёртка геттеров их не видит, а сборщик читает.
+  // Data properties of roots: the getter wrapper misses them, collectors read them.
   const traceData = (obj, prefix) => {
     if (!obj) return;
     for (const key of Object.getOwnPropertyNames(obj)) {
@@ -1745,8 +1707,8 @@ const TRACER_TEMPLATE: &str = r##"(() => {
     }
   };
 
-  // Каждый корень отпечатка и каждая поверхность, по которой обычно судят:
-  // рисование, звук, шрифты, время, устройство.
+  // Every fingerprint root and commonly judged surface: drawing, audio, fonts,
+  // time, device.
   const proto = (name) => globalThis[name] && globalThis[name].prototype;
   trace(globalThis, '');
   trace(Object.getPrototypeOf(globalThis) || {}, 'Window.');
@@ -1760,8 +1722,7 @@ const TRACER_TEMPLATE: &str = r##"(() => {
     ['CSSStyleDeclaration', 'style.'], ['MediaQueryList', 'mql.'],
     ['Storage', 'storage.'], ['Crypto', 'crypto.'], ['Date', 'date.'],
     ['Intl', 'intl.'], ['RTCPeerConnection', 'rtc.'], ['SpeechSynthesis', 'speech.'],
-    // Поверхности, которых прибор до сих пор не касался: они не на виду, но
-    // отпечаток собирают и по ним.
+    // Less obvious surfaces that fingerprints are collected from too.
     ['FontFaceSet', 'fonts.'], ['NavigatorUAData', 'uaData.'], ['MediaDevices', 'mediaDevices.'],
     ['Permissions', 'permissions.'], ['StorageManager', 'storageMgr.'],
     ['MediaCapabilities', 'mediaCaps.'], ['Keyboard', 'keyboard.'],
@@ -1771,7 +1732,7 @@ const TRACER_TEMPLATE: &str = r##"(() => {
   ]) {
     trace(proto(name), tag);
   }
-  // Объекты, у которых интерфейс не назван на окне, — трогаем сами объекты.
+  // Objects whose interface is not exposed on window: trace the objects themselves.
   try {
     const pairs = [
       [globalThis.WebAssembly, 'wasm.'],
@@ -1796,47 +1757,23 @@ const TRACER_TEMPLATE: &str = r##"(() => {
 /// collects a fingerprint inside one knows exactly what belongs there. Running it
 /// in the page's realm, however carefully shimmed, gets the realm wrong; this
 /// runs in a context of its own, and only reshapes what that context exposes.
-/// Имена воркерной области, снятые с Chrome 148 (см. `worker_scope_script`).
+/// Worker scope names captured from Chrome 148 (see `worker_scope_script`).
 const WORKER_OWN: &str = r#"["AbortController", "AbortSignal", "AggregateError", "Array", "ArrayBuffer", "AsyncDisposableStack", "Atomics", "AudioData", "AudioDecoder", "AudioEncoder", "BackgroundFetchManager", "BackgroundFetchRecord", "BackgroundFetchRegistration", "BigInt", "BigInt64Array", "BigUint64Array", "Blob", "Boolean", "BroadcastChannel", "ByteLengthQueuingStrategy", "CSSSkewX", "CSSSkewY", "Cache", "CacheStorage", "CanvasGradient", "CanvasPattern", "CloseEvent", "CompressionStream", "CountQueuingStrategy", "CreateMonitor", "CropTarget", "Crypto", "CryptoKey", "CustomEvent", "DOMException", "DOMMatrix", "DOMMatrixReadOnly", "DOMPoint", "DOMPointReadOnly", "DOMQuad", "DOMRect", "DOMRectReadOnly", "DOMStringList", "DataView", "Date", "DecompressionStream", "DedicatedWorkerGlobalScope", "DisposableStack", "EncodedAudioChunk", "EncodedVideoChunk", "Error", "ErrorEvent", "EvalError", "Event", "EventSource", "EventTarget", "File", "FileList", "FileReader", "FileReaderSync", "FileSystemDirectoryHandle", "FileSystemFileHandle", "FileSystemHandle", "FileSystemObserver", "FileSystemSyncAccessHandle", "FileSystemWritableFileStream", "FinalizationRegistry", "Float16Array", "Float32Array", "Float64Array", "FontFace", "FontFaceSet", "FormData", "Function", "GPU", "GPUAdapter", "GPUAdapterInfo", "GPUBindGroup", "GPUBindGroupLayout", "GPUBuffer", "GPUBufferUsage", "GPUCanvasContext", "GPUColorWrite", "GPUCommandBuffer", "GPUCommandEncoder", "GPUCompilationInfo", "GPUCompilationMessage", "GPUComputePassEncoder", "GPUComputePipeline", "GPUDevice", "GPUDeviceLostInfo", "GPUError", "GPUExternalTexture", "GPUInternalError", "GPUMapMode", "GPUOutOfMemoryError", "GPUPipelineError", "GPUPipelineLayout", "GPUQuerySet", "GPUQueue", "GPURenderBundle", "GPURenderBundleEncoder", "GPURenderPassEncoder", "GPURenderPipeline", "GPUSampler", "GPUShaderModule", "GPUShaderStage", "GPUSupportedFeatures", "GPUSupportedLimits", "GPUTexture", "GPUTextureUsage", "GPUTextureView", "GPUUncapturedErrorEvent", "GPUValidationError", "HID", "HIDConnectionEvent", "HIDDevice", "HIDInputReportEvent", "Headers", "IDBCursor", "IDBCursorWithValue", "IDBDatabase", "IDBFactory", "IDBIndex", "IDBKeyRange", "IDBObjectStore", "IDBOpenDBRequest", "IDBRecord", "IDBRequest", "IDBTransaction", "IDBVersionChangeEvent", "IdleDetector", "ImageBitmap", "ImageBitmapRenderingContext", "ImageData", "ImageDecoder", "ImageTrack", "ImageTrackList", "Infinity", "Int16Array", "Int32Array", "Int8Array", "Intl", "Iterator", "JSON", "Lock", "LockManager", "Map", "Math", "MediaCapabilities", "MediaSource", "MediaSourceHandle", "MessageChannel", "MessageEvent", "MessagePort", "NaN", "NavigationPreloadManager", "NavigatorUAData", "NetworkInformation", "Notification", "Number", "Object", "Observable", "OffscreenCanvas", "OffscreenCanvasRenderingContext2D", "Origin", "Path2D", "Performance", "PerformanceEntry", "PerformanceMark", "PerformanceMeasure", "PerformanceObserver", "PerformanceObserverEntryList", "PerformanceResourceTiming", "PerformanceServerTiming", "PeriodicSyncManager", "PermissionStatus", "Permissions", "PressureObserver", "PressureRecord", "ProgressEvent", "Promise", "PromiseRejectionEvent", "Proxy", "PushManager", "PushSubscription", "PushSubscriptionOptions", "QuotaExceededError", "RTCDataChannel", "RTCEncodedAudioFrame", "RTCEncodedVideoFrame", "RTCRtpScriptTransformer", "RTCTransformEvent", "RangeError", "ReadableByteStreamController", "ReadableStream", "ReadableStreamBYOBReader", "ReadableStreamBYOBRequest", "ReadableStreamDefaultController", "ReadableStreamDefaultReader", "ReferenceError", "Reflect", "RegExp", "ReportBody", "ReportingObserver", "Request", "Response", "RestrictionTarget", "Scheduler", "SecurityPolicyViolationEvent", "Serial", "SerialPort", "ServiceWorkerRegistration", "Set", "SourceBuffer", "SourceBufferList", "StorageBucket", "StorageBucketManager", "StorageManager", "String", "Subscriber", "SubtleCrypto", "SuppressedError", "Symbol", "SyncManager", "SyntaxError", "TaskController", "TaskPriorityChangeEvent", "TaskSignal", "Temporal", "TextDecoder", "TextDecoderStream", "TextEncoder", "TextEncoderStream", "TextMetrics", "TransformStream", "TransformStreamDefaultController", "TrustedHTML", "TrustedScript", "TrustedScriptURL", "TrustedTypePolicy", "TrustedTypePolicyFactory", "TypeError", "URIError", "URL", "URLPattern", "URLSearchParams", "USB", "USBAlternateInterface", "USBConfiguration", "USBConnectionEvent", "USBDevice", "USBEndpoint", "USBInTransferResult", "USBInterface", "USBIsochronousInTransferPacket", "USBIsochronousInTransferResult", "USBIsochronousOutTransferPacket", "USBIsochronousOutTransferResult", "USBOutTransferResult", "Uint16Array", "Uint32Array", "Uint8Array", "Uint8ClampedArray", "UserActivation", "VideoColorSpace", "VideoDecoder", "VideoEncoder", "VideoFrame", "WGSLLanguageFeatures", "WeakMap", "WeakRef", "WeakSet", "WebAssembly", "WebGL2RenderingContext", "WebGLActiveInfo", "WebGLBuffer", "WebGLContextEvent", "WebGLFramebuffer", "WebGLObject", "WebGLProgram", "WebGLQuery", "WebGLRenderbuffer", "WebGLRenderingContext", "WebGLSampler", "WebGLShader", "WebGLShaderPrecisionFormat", "WebGLSync", "WebGLTexture", "WebGLTransformFeedback", "WebGLUniformLocation", "WebGLVertexArrayObject", "WebSocket", "WebSocketError", "WebSocketStream", "WebTransport", "WebTransportBidirectionalStream", "WebTransportDatagramDuplexStream", "WebTransportError", "Worker", "WorkerGlobalScope", "WorkerLocation", "WorkerNavigator", "WritableStream", "WritableStreamDefaultController", "WritableStreamDefaultWriter", "XMLHttpRequest", "XMLHttpRequestEventTarget", "XMLHttpRequestUpload", "cancelAnimationFrame", "close", "console", "decodeURI", "decodeURIComponent", "encodeURI", "encodeURIComponent", "escape", "eval", "globalThis", "isFinite", "isNaN", "name", "onmessage", "onmessageerror", "onrtctransform", "parseFloat", "parseInt", "postMessage", "requestAnimationFrame", "undefined", "unescape", "webkitRequestFileSystem", "webkitRequestFileSystemSync", "webkitResolveLocalFileSystemSyncURL", "webkitResolveLocalFileSystemURL"]"#;
 const WORKER_ENUMERABLE: &str = r#"["cancelAnimationFrame", "close", "name", "onmessage", "onmessageerror", "onrtctransform", "postMessage", "requestAnimationFrame", "webkitRequestFileSystem", "webkitRequestFileSystemSync", "webkitResolveLocalFileSystemSyncURL", "webkitResolveLocalFileSystemURL"]"#;
 const WORKER_NAVIGATOR: &str = r#"["appCodeName", "appName", "appVersion", "connection", "deviceMemory", "gpu", "hardwareConcurrency", "hid", "language", "languages", "locks", "mediaCapabilities", "onLine", "permissions", "platform", "product", "serial", "storage", "storageBuckets", "usb", "userAgent", "userAgentData"]"#;
 
-/// Имена воркерной области, снятые с Chrome 148 (см. `worker_scope_script`).
+/// Worker scope names captured from Chrome 148 (see `worker_scope_script`).
 const WORKER_SCOPE: &str = r#"["atob", "btoa", "caches", "clearInterval", "clearTimeout", "createImageBitmap", "crossOriginIsolated", "crypto", "fetch", "fonts", "importScripts", "indexedDB", "isSecureContext", "location", "navigator", "onerror", "onlanguagechange", "onrejectionhandled", "onunhandledrejection", "origin", "performance", "queueMicrotask", "reportError", "scheduler", "self", "setInterval", "setTimeout", "structuredClone", "trustedTypes"]"#;
 const WORKER_SCOPE_ENUMERABLE: &str = r#"["atob", "btoa", "caches", "clearInterval", "clearTimeout", "createImageBitmap", "crossOriginIsolated", "crypto", "fetch", "fonts", "importScripts", "indexedDB", "isSecureContext", "location", "navigator", "onerror", "onlanguagechange", "onrejectionhandled", "onunhandledrejection", "origin", "performance", "queueMicrotask", "reportError", "scheduler", "self", "setInterval", "setTimeout", "structuredClone", "trustedTypes"]"#;
 
-/// Последний кусок пролога: прячет для внутреннего пользования те методы
-/// холста и документа, через которые `OffscreenCanvas` делает свою работу.
-///
-/// Наш офскрин — это настоящий `<canvas>` под капотом, и он звал `getContext`,
-/// `toDataURL` и `createElement` теми же именами, что видит страница. Всякий,
-/// кто обернул `HTMLCanvasElement.prototype.getContext` — а сборщики отпечатков
-/// оборачивают, — видел лишний вызов на каждый офскрин; в браузере его нет
-/// вовсе. Ссылки снимаются последними, поверх всех слоёв, так что внутрь
-/// по-прежнему попадает то же, что получила бы страница.
-/// Интерфейсы, которые должны пережить таблицу имён. Таблица строит по имени
-/// пустой класс — для `FontFace` этого мало: `local("Имя")` это то, чем
-/// страницы перечисляют установленные шрифты, и у браузера обещание
-/// разрешается на существующее имя и отклоняется сетевой ошибкой на чужое.
-/// Кусок идёт последним, после всех слоёв, иначе его затирает та же таблица.
-/// Итоговая натурализация: каждый член каждого интерфейса выглядит родным.
-/// Слои выше маскируют то, что заводят сами (`mask`/`maskProto`), но многое
-/// проходит мимо — классы на JS, аксессоры, статика, алиасы: сверка по всем
-/// интерфейсам давала 648 неродных членов из 5711. Челлендж ловит даже одну
-/// аккуратно замаскированную обёртку в настоящем Chrome — по нашему обходу
-/// он не может не найти сотни. Проходит после всех слоёв, но до снимка
-/// методов движка.
-/// Форма прототипов — как у Chrome 151: состав и порядок собственных членов
-/// каждого интерфейса (crates/stealth/src/proto_shape.json, снято
-/// `scratchpad/protoshape.js`). У нас не было 4185 членов из 8880 (MathML,
-/// OffscreenCanvasRenderingContext2D, HTMLMediaElement, HTMLInputElement…),
-/// а у 169 интерфейсов порядок был свой; обход графа всё это видит.
-/// Недостающее: унаследованное копируется на своё место, остальное —
-/// заглушки (аксессор с ячейкой, метод-пустышка хромовской длины,
-/// константа со значением). Лишнее снимается, порядок — хромовский.
+/// Prototype shape as in Chrome 151: own members of every interface, in order
+/// (crates/stealth/src/proto_shape.json, captured from Chrome); graph walks
+/// see missing members and order.
+/// Missing members are copied from the inherited place or stubbed (accessor
+/// with a slot, no-op method of Chrome's length, constant with its value).
+/// Extra members are removed.
 pub fn proto_shape_script() -> String {
-    // `NOKK_PROTO_SHAPE_SKIP=<regex>` — интерфейсы, форму которых не трогать
-    // (для бисекции).
+    // `NOKK_PROTO_SHAPE_SKIP=<regex>`: interfaces to leave alone (for bisection).
     let skip = std::env::var("NOKK_PROTO_SHAPE_SKIP")
         .ok()
         .filter(|s| !s.is_empty())
@@ -1868,11 +1805,11 @@ const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
   const mark = (f) => { if (stubs) try { stubs.add(f); } catch (e) {} return f; };
   const named = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return f; };
   const writers = globalThis.__pt_writers;
-  // Имя и число доводов — от рождения, а не правкой `name`/`length`: правка
-  // переводит функцию в словарный режим и даёт ей свой склад свойств (~290 байт),
-  // а заглушек в каждом контексте тысячи — половина цены контекста была в этом.
-  // Геттер из литерала зовётся `get x` сам, метод из литерала — без `prototype`,
-  // как у браузера.
+  // Name and length come from birth, not by editing `name`/`length`: editing
+  // turns a function into dictionary mode with its own property store
+  // (~290 bytes), and there are thousands of stubs per context. A literal
+  // getter is named `get x` by itself, a literal method has no `prototype`,
+  // as in the browser.
   const stubAccessor = (P, name, kind) => {
     const slots = new WeakMap();
     const pair = Object.getOwnPropertyDescriptor({
@@ -1882,13 +1819,12 @@ const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
     const get = mark(pair.get);
     const write = pair.set;
     let set = kind.indexOf('s') >= 0 ? mark(write) : undefined;
-    // Только чтение снаружи — но движок пишет через `__pt_write`.
+    // Read-only from outside, but the engine writes via `__pt_write`.
     if (!set && writers) { let w = writers.get(P); if (!w) { w = Object.create(null); writers.set(P, w); } w[name] = write; }
-    // Под трассой запись в только-чтение видна с местом: кто и куда писал.
-    // Под трассой запись в только-чтение видна с местом и проходит: так
-    // собираются все места, где движок пишет мимо `__pt_write`.
+    // Under tracing a read-only write is logged with its call site and goes
+    // through: this finds every place the engine bypasses `__pt_write`.
     if (!set && TRACE) set = function (v) {
-      try { console.error('[бренд] запись в только-чтение ' + name + ' на ' + Object.prototype.toString.call(this) + ' | ' + String(new Error().stack || '').split('\n').slice(2, 6).map((x) => x.trim().replace(/https?:\/\/[^ )]*\//, '')).join(' < ')); } catch (e) {}
+      try { console.error('[brand] write to read-only ' + name + ' on ' + Object.prototype.toString.call(this) + ' | ' + String(new Error().stack || '').split('\n').slice(2, 6).map((x) => x.trim().replace(/https?:\/\/[^ )]*\//, '')).join(' < ')); } catch (e) {}
       write.call(this, v);
     };
     return { get, set };
@@ -1915,7 +1851,7 @@ const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
     for (let i = 0; i < 12 && p && p !== Object.prototype; i++) { const d = desc(p, k); if (d) return d; p = Object.getPrototypeOf(p); }
     return undefined;
   };
-  // Где у Chrome лежит член: интерфейс → имя члена → есть.
+  // Where Chrome keeps a member: interface -> member name -> present.
   const has = {};
   for (const name of Object.keys(T)) { const set = {}; for (const r of T[name].m) set[r[0]] = 1; has[name] = set; }
   const chromeOwnerUp = (name, k) => {
@@ -1923,8 +1859,8 @@ const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
     for (let i = 0; i < 12 && n && T[n]; i++) { if (has[n][k]) return n; n = T[n].p; }
     return null;
   };
-  // Первый проход: то, что у нас лежит ниже, чем у Chrome, поднимается на
-  // своё место — иначе снятие лишнего оставило бы дыру.
+  // First pass: members that sit lower in the chain than in Chrome are lifted
+  // to their place, otherwise removing extras would leave a hole.
   for (const name of Object.keys(T)) {
     const P = protoOf(name); if (!P || typeof P !== 'object') continue;
     for (const k of Object.getOwnPropertyNames(P)) {
@@ -1935,7 +1871,7 @@ const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
       if (A && !desc(A, k)) { const d = desc(P, k); if (d && d.configurable) def(A, k, d); }
     }
   }
-  // Второй проход: состав и порядок.
+  // Second pass: membership and order.
   for (const name of Object.keys(T)) {
     const P = protoOf(name); if (!P || typeof P !== 'object') continue;
     const rows = T[name].m;
@@ -1955,9 +1891,9 @@ const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
       if (!('get' in d) && !('set' in d) && kind[0] === 'v') d.writable = kind.indexOf('w') >= 0;
       built.push([k, d]);
     }
-    // Снять всё настраиваемое и положить заново по порядку. Лишнее (сорок
-    // членов, которыми пользуется сам движок: `Element.getElementById`,
-    // свои `addEventListener` у Worker и WebSocket…) остаётся, но в хвосте.
+    // Remove everything configurable and re-add in order. Extras (about forty
+    // members the engine itself uses: `Element.getElementById`, own
+    // `addEventListener` on Worker and WebSocket...) stay, at the tail.
     const extra = [];
     for (const k of Object.getOwnPropertyNames(P)) {
       if (k.slice(0, 4) === '__pt') continue;
@@ -1969,10 +1905,10 @@ const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
     for (const [k, d] of built) { if (!desc(P, k)) def(P, k, d); }
     for (const [k, d] of extra) { if (!desc(P, k)) def(P, k, d); }
   }
-  // Двойники: у офскринного контекста те же члены, что у контекста холста,
-  // и настоящие они должны быть с самого начала — программа челленджа
-  // снимает методы с прототипа заранее и зовёт их потом на контексте, а
-  // заглушка отдавала undefined, и блоки холстов из отчёта выпадали.
+  // Twins: the offscreen context has the same members as the canvas context,
+  // and they must be real from the start: the challenge grabs methods off the
+  // prototype early and calls them on a context later; stubs returned
+  // undefined and the canvas blocks dropped out of the report.
   for (const [to, from] of [['OffscreenCanvasRenderingContext2D', 'CanvasRenderingContext2D']]) {
     const P = protoOf(to), S = protoOf(from);
     if (!P || !S) continue;
@@ -1987,8 +1923,8 @@ const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
 })();"#;
 
 pub fn naturalize_script() -> String {
-    // `NOKK_NATURALIZE_SKIP=<regex>` — интерфейсы, которые не трогать: для
-    // бисекции, когда что-то после натурализации ломается.
+    // `NOKK_NATURALIZE_SKIP=<regex>`: interfaces to leave alone (for bisecting
+    // breakage after naturalization).
     let skip = std::env::var("NOKK_NATURALIZE_SKIP")
         .ok()
         .filter(|s| !s.is_empty())
@@ -2003,19 +1939,18 @@ pub fn naturalize_script() -> String {
         .replace("__BRAND_TRACE__", if std::env::var_os("NOKK_TRACE_BRAND").is_some() { "true" } else { "false" })
 }
 
-/// Члены, которые Chrome 151 вызывает с чужим `this` без «Illegal
-/// invocation» (снято `scratchpad/brandsweep.js`, 404 записи: обещания,
-/// итераторы, `toJSON`…). Все остальные бренд проверяют.
+/// Members Chrome 151 lets be called with a foreign `this` without "Illegal
+/// invocation" (captured from Chrome, 404 entries: promises, iterators,
+/// `toJSON`...). All others check the brand.
 const BRAND_EXCEPTIONS: &str = include_str!("brand_exceptions.json");
-/// Конструкторы интерфейсов Chrome 151: длина, что бывает на `new X()` без
-/// доводов (`illegal`, `args:N`, `ok`) и на вызов без `new` (`illegal`,
-/// `nonew`). Снято `scratchpad/ctorsweep.js`.
+/// Chrome 151 interface constructors: length, outcome of `new X()` without
+/// args (`illegal`, `args:N`, `ok`) and of a call without `new` (`illegal`,
+/// `nonew`). Captured from Chrome.
 const CTOR_TABLE: &str = include_str!("ctor_table.json");
-/// Значения полей событий Chrome 151 по умолчанию (`new X('t')` без словаря)
-/// — снято `scratchpad/evdef.js`.
+/// Chrome 151 default event field values (`new X('t')` without a dict).
 const EVENT_DEFAULTS: &str = include_str!("event_defaults.json");
-/// Длины методов на прототипах интерфейсов Chrome 151 (`Iface.method` →
-/// число обязательных доводов); у нас 262 из 1115 были не те.
+/// Method lengths on Chrome 151 interface prototypes (`Iface.method` ->
+/// number of required args).
 const METHOD_LENGTHS: &str = include_str!("method_lengths.json");
 
 const NATURALIZE_TEMPLATE: &str = r#"(() => {
@@ -2023,19 +1958,17 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
   const N = globalThis.__pt_native;
   if (typeof N !== 'function') return;
   const SKIP = __SKIP__;
-  // Бренд. Член интерфейса, вызванный с чужим `this`, у браузера бросает
-  // `TypeError: Illegal invocation` — 7850 членов из 8254 — и на чтении
-  // `.caller` бросает каждый. У нас не бросал ни один: отвечал `undefined`,
-  // объектом или внутренней ошибкой движка с его же именами. Так ловится
-  // любая обёртка на JS — и, значит, весь наш DOM. Свой объект — тот, в чьей
-  // цепочке прототипов есть прототип интерфейса или конструктор с его
-  // именем (объект другого реалма тоже свой).
+  // Brand checks. An interface member called with a foreign `this` throws
+  // `TypeError: Illegal invocation` in the browser (7850 of 8254 members), and
+  // every one throws on reading `.caller`. Without this any JS wrapper, and so
+  // our whole DOM, is detectable. An object is ours if its prototype chain has
+  // the interface prototype or a constructor of that name (other realms too).
   const EXC = new Set(__BRAND_EXCEPTIONS__);
   const TRACE = __BRAND_TRACE__;
   const trace = (what) => {
     try {
       const st = String(new Error().stack || '').split('\n').slice(2, 7).map((x) => x.trim().replace(/https?:\/\/[^ )]*\//, '')).join(' < ');
-      console.error('[бренд] ' + what + ' | ' + st);
+      console.error('[brand] ' + what + ' | ' + st);
     } catch (e) {}
   };
   const illegal = (label, t) => {
@@ -2045,9 +1978,9 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     }
     return __pt_mkErr(TypeError, 'Illegal invocation');
   };
-  // Сам прототип интерфейса — не экземпляр: у него собственный `constructor`,
-  // и обход графа зовёт на нём каждый геттер, ожидая «Illegal invocation».
-  // Поэтому цепочка смотрится начиная с прототипа объекта, а не с него самого.
+  // The interface prototype itself is not an instance: it has its own
+  // `constructor`, and graph walks call every getter on it expecting "Illegal
+  // invocation". So the chain is checked from the object's prototype.
   const chainHas = (t, name) => {
     let p;
     try { p = Object.getPrototypeOf(t); } catch (e) { return false; }
@@ -2060,9 +1993,9 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     }
     return false;
   };
-  // Голый вызов члена окна (`addEventListener('load', …)`, `postMessage(…)`)
-  // приходит со строгим `this === undefined`; у браузера для членов
-  // глобального объекта это и есть окно.
+  // A bare call of a window member (`addEventListener('load', ...)`,
+  // `postMessage(...)`) arrives with strict `this === undefined`; for global
+  // object members the browser treats that as the window.
   const ownerOk = (C, P, t) => {
     if (t === undefined || t === null) return P.isPrototypeOf(globalThis);
     if (typeof t !== 'object' && typeof t !== 'function') return false;
@@ -2075,15 +2008,15 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
   const desc = (o, k) => { try { return Object.getOwnPropertyDescriptor(o, k); } catch (e) { return undefined; } };
   const def = (o, k, d) => { try { Object.defineProperty(o, k, d); return true; } catch (e) { return false; } };
   const keyName = (k) => (typeof k === 'symbol' ? '[' + (k.description || '') + ']' : String(k));
-  // `name`/`length` правим, только если они не те: правка переводит функцию в
-  // словарный режим (свой склад свойств, ~290 байт), а функций тут тысячи.
+  // Only fix `name`/`length` when wrong: editing moves the function to
+  // dictionary mode (~290 bytes each), and there are thousands here.
   const setNL = (f, name, len) => {
     if (len !== undefined && f.length !== len) def(f, 'length', { value: len, configurable: true });
     if (name !== undefined && f.name !== name) def(f, 'name', { value: name, configurable: true });
     return f;
   };
-  // Конструктор (или его алиас вроде webkitURL) прототип носит по праву;
-  // метод — нет. Отличаем по составу прототипа и по имени.
+  // A constructor (or alias like webkitURL) legitimately has a prototype; a
+  // method does not. Told apart by the prototype's contents and the name.
   const ctorLike = (f, key) => {
     if (typeof key === 'string' && /^[A-Z]/.test(key)) return true;
     const p = f.prototype;
@@ -2093,16 +2026,16 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
       return names.length > 1 || (names.length === 1 && names[0] !== 'constructor');
     } catch (e) { return true; }
   };
-  // Метод заново: строгий (чтение `.caller` бросает), без `.prototype`, с
-  // проверкой бренда, если она положена. `guard` — конструктор интерфейса или
-  // null, когда владелец не прототип интерфейса.
+  // Rebuilt method: strict (reading `.caller` throws), no `.prototype`, brand
+  // check where due. `guard` is the interface constructor, or null when the
+  // owner is not an interface prototype.
   const LENGTHS = __METHOD_LENGTHS__;
-  const fewArgs = (what, need, got) => (TRACE && trace('доводы ' + what + ' нужно ' + need + ' дано ' + got), __pt_mkErr(TypeError, 'Failed to execute \'' + what.slice(what.indexOf('.') + 1) + '\' on \'' + what.slice(0, what.indexOf('.')) + '\': ' + need + ' argument' + (need === 1 ? '' : 's') + ' required, but only ' + got + ' present.'));
+  const fewArgs = (what, need, got) => (TRACE && trace('args ' + what + ' need ' + need + ' got ' + got), __pt_mkErr(TypeError, 'Failed to execute \'' + what.slice(what.indexOf('.') + 1) + '\' on \'' + what.slice(0, what.indexOf('.')) + '\': ' + need + ' argument' + (need === 1 ? '' : 's') + ' required, but only ' + got + ' present.'));
   const asMethod = (fn, key, guard) => {
     const name = keyName(key);
     const P = guard && guard.prototype;
     const label = guard ? guard.name + '.' + name : name;
-    // Число обязательных доводов — хромовское; недостача бросает, как там.
+    // Chrome's number of required args; too few throws, as there.
     const need = guard && Object.prototype.hasOwnProperty.call(LENGTHS, label) ? LENGTHS[label] : fn.length;
     const holder = guard
       ? { [name]() {
@@ -2114,19 +2047,19 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     const m = holder[name];
     return setNL(m, typeof key === 'symbol' ? name : key, need);
   };
-  // Геттеры-обещания (`closed`, `ready`, `finished`…) на чужом `this` у
-  // браузера не бросают, а отдают отклонённое обещание с тем же TypeError.
+  // Promise getters (`closed`, `ready`, `finished`...) on a foreign `this` do
+  // not throw in the browser; they return a promise rejected with the TypeError.
   const PROMISE_GETTERS = new Set(['WritableStreamDefaultWriter.closed', 'WritableStreamDefaultWriter.ready', 'ViewTransition.finished', 'ViewTransition.ready', 'ViewTransition.updateCallbackDone', 'ReadableStreamDefaultReader.closed', 'ReadableStreamBYOBReader.closed', 'NavigationTransition.committed', 'NavigationTransition.finished', 'BeforeInstallPromptEvent.userChoice', 'Animation.finished', 'Animation.ready', 'ImageDecoder.completed', 'ImageTrackList.ready', 'MediaKeySession.closed', 'WebTransport.ready', 'WebTransport.closed', 'PresentationReceiver.connectionList', 'BackgroundFetchRecord.responseReady', 'WebSocketStream.opened', 'WebSocketStream.closed']);
-  // Псевдонимы V8 носят имя оригинала: `trimLeft.name === 'trimStart'`,
-  // `Set.prototype.keys.name === 'values'` — переименовывать их нельзя.
+  // V8 aliases carry the original's name (`trimLeft.name === 'trimStart'`,
+  // `Set.prototype.keys.name === 'values'`); must not be renamed.
   const ALIAS_NAME = (owner, key, f) => (key === 'trimLeft' && f.name === 'trimStart') || (key === 'trimRight' && f.name === 'trimEnd')
     || (key === 'toGMTString' && f.name === 'toUTCString') || (key === 'keys' && f.name === 'values' && owner === Set.prototype);
   const asAccessor = (fn, key, kind, guard) => {
     const P = guard && guard.prototype;
     const rejects = !!guard && PROMISE_GETTERS.has(guard.name + '.' + keyName(key));
-    // Синтаксис метода: у переходника, как у родного геттера, нет `.prototype`.
-    // Литерал с вычисляемым ключом: имя `get x`/`set x` и длина 0/1 — от
-    // рождения, без правки.
+    // Method syntax: like a native getter, the trampoline has no `.prototype`.
+    // A literal with a computed key gets name `get x`/`set x` and length 0/1
+    // from birth.
     const k = typeof key === 'symbol' ? key : String(key);
     const g = kind === 'get '
       ? (guard ? Object.getOwnPropertyDescriptor({ get [k]() { if (!ownerOk(guard, P, this)) { const err = illegal(guard.name + '.' + keyName(key) + '#get', this); if (rejects) return Promise.reject(err); throw err; } return fn.call(asThis(P, this)); } }, k).get
@@ -2135,7 +2068,7 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
                : Object.getOwnPropertyDescriptor({ set [k](v) { return fn.call(this, v); } }, k).set);
     return setNL(g, kind + keyName(key), kind === 'get ' ? 0 : 1);
   };
-  // Строгая ли функция: у строгой (и у родной) чтение `.caller` бросает.
+  // Strict (and native) functions throw on reading `.caller`.
   const isStrict = (f) => { try { void f.caller; return false; } catch (e) { return true; } };
   const stubs = () => { try { return globalThis.__pt_stubMembers || null; } catch (e) { return null; } };
   const fix = (owner, key, guard) => {
@@ -2152,8 +2085,8 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
           const orig = f;
           f = asMethod(f, key, wantGuard ? guard : null);
           def(owner, key, Object.assign({}, d, { value: f }));
-          // Заглушка поверхности остаётся заглушкой: слои, которые ставят
-          // настоящие члены поверх заглушек (звук), узнают их по этому набору.
+          // A surface stub stays a stub: layers that install real members over
+          // stubs (audio) recognize them by this set.
           const S = stubs(); if (S && S.has(orig)) S.add(f);
         } else if (typeof key === 'string' && f.name !== key && !ALIAS_NAME(owner, key, f)) {
           def(f, 'name', { value: key, configurable: true });
@@ -2190,19 +2123,18 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array', 'Float16Array',
     'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array', 'Intl', 'Reflect', 'JSON',
     'Math', 'Atomics', 'WebAssembly', 'globalThis']);
-  // Конструктор интерфейса ведёт себя как у браузера: вызов без `new` —
-  // отказ, `new` у абстрактного — «Illegal constructor», у остальных —
-  // проверка числа доводов. Снаружи стоит фасад с прототипом и статикой
-  // настоящего класса; движок внутри держит сам класс. У нас `new Node()`
-  // строил узел, а `Event()` без `new` — событие: 719 и 648 таких случаев.
+  // Interface constructors behave like the browser's: a call without `new`
+  // is refused, `new` on an abstract one throws "Illegal constructor", others
+  // check the arg count. Outside sits a facade with the real class's
+  // prototype and statics; the engine keeps the class itself.
   const CT = __CTOR_TABLE__;
-  // Взято заранее: фасад конструктора не должен звать то, что страница
-  // может обернуть.
+  // Captured up front: the constructor facade must not call anything the page
+  // can wrap.
   const RC = Reflect.construct, GPO = Object.getPrototypeOf, GOPD = Object.getOwnPropertyDescriptor;
-  // События-заглушки (ErrorEvent, ProgressEvent, WheelEvent… — 79 из 93)
-  // строились без состояния события, и первое же `e.type` бросало. Строим
-  // через ближайшего настоящего предка (Event, UIEvent, MouseEvent…), а поля
-  // словаря кладём в свойства интерфейса.
+  // Stub events (ErrorEvent, ProgressEvent, WheelEvent...: 79 of 93) were built
+  // without event state, so the first `e.type` threw. Build through the
+  // nearest real ancestor (Event, UIEvent, MouseEvent...) and put dict fields
+  // into the interface's properties.
   const REAL_EVENT = new Map();
   const isRealEvent = (K) => {
     if (REAL_EVENT.has(K)) return REAL_EVENT.get(K);
@@ -2211,11 +2143,11 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     REAL_EVENT.set(K, ok);
     return ok;
   };
-  // Обязательные члены словарей событий — у Chrome без них конструктор
-  // отказывает (снято со всех событий окна).
+  // Required event dict members: Chrome's constructor refuses without them
+  // (captured from all window events).
   const EV_REQUIRED = {"WindowControlsOverlayGeometryChangeEvent":["titlebarAreaRect","WindowControlsOverlayGeometryChangeEventInit"],"TaskPriorityChangeEvent":["previousPriority","TaskPriorityChangeEventInit"],"RTCTrackEvent":["receiver","RTCTrackEventInit"],"RTCPeerConnectionIceErrorEvent":["errorCode","RTCPeerConnectionIceErrorEventInit"],"RTCErrorEvent":["error","RTCErrorEventInit"],"RTCDataChannelEvent":["channel","RTCDataChannelEventInit"],"PromiseRejectionEvent":["promise","PromiseRejectionEventInit"],"PictureInPictureEvent":["pictureInPictureWindow","PictureInPictureEventInit"],"OfflineAudioCompletionEvent":["renderedBuffer","OfflineAudioCompletionEventInit"],"NavigationCurrentEntryChangeEvent":["from","NavigationCurrentEntryChangeEventInit"],"NavigateEvent":["destination","NavigateEventInit"],"MediaStreamTrackEvent":["track","MediaStreamTrackEventInit"],"FormDataEvent":["formData","FormDataEventInit"],"BlobEvent":["data","BlobEventInit"],"AudioProcessingEvent":["inputBuffer","AudioProcessingEventInit"],"GPUUncapturedErrorEvent":["error","GPUUncapturedErrorEventInit"],"MediaKeyMessageEvent":["message","MediaKeyMessageEventInit"],"SensorErrorEvent":["error","SensorErrorEventInit"],"HIDConnectionEvent":["device","HIDConnectionEventInit"],"PresentationConnectionAvailableEvent":["connection","PresentationConnectionAvailableEventInit"],"PresentationConnectionCloseEvent":["reason","PresentationConnectionCloseEventInit"],"USBConnectionEvent":["device","USBConnectionEventInit"],"XRInputSourceEvent":["frame","XRInputSourceEventInit"],"XRInputSourcesChangeEvent":["added","XRInputSourcesChangeEventInit"],"XRReferenceSpaceEvent":["referenceSpace","XRReferenceSpaceEventInit"],"XRSessionEvent":["session","XRSessionEventInit"],"XRLayerEvent":["layer","XRLayerEventInit"],"XRVisibilityMaskChangeEvent":["eye","XRVisibilityMaskChangeEventInit"],"DocumentPictureInPictureEvent":["window","DocumentPictureInPictureEventInit"],"SpeechSynthesisErrorEvent":["utterance","SpeechSynthesisEventInit"],"SpeechSynthesisEvent":["utterance","SpeechSynthesisEventInit"]};
-  // Чьи словари не наследуют EventInit (bubbles/cancelable не читаются) и
-  // чей тип задан самим интерфейсом.
+  // Events whose dicts do not inherit EventInit (bubbles/cancelable are not
+  // read) and whose type is fixed by the interface.
   const EV_DEFAULTS = __EVENT_DEFAULTS__;
   const EV_FORCE = { IDBVersionChangeEvent: { bubbles: false, cancelable: false }, VirtualKeyboardGeometryChangeEvent: { bubbles: false, cancelable: false }, SecurityPolicyViolationEvent: { cancelable: false }, RTCDTMFToneChangeEvent: { type: 'tonechange' } };
   const eventFromStub = (C, args, nt, name) => {
@@ -2249,7 +2181,7 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
         return;
       }
     };
-    // Чего в словаре нет — значение Chrome по умолчанию ('' / 0 / false / null).
+    // Missing from the dict: Chrome's default ('' / 0 / false / null).
     const DEF = EV_DEFAULTS[name];
     if (DEF) for (const k of Object.keys(DEF)) {
       if (init && init[k] !== undefined) continue;
@@ -2272,17 +2204,17 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
   const EVENT_P = globalThis.Event && globalThis.Event.prototype;
   const facade = (name, C, d) => {
     const row = CT[name];
-    // Пространство имён без прототипа (NodeFilter) — не конструктор; фасад
-    // ему ни к чему.
+    // A namespace without a prototype (NodeFilter) is not a constructor and
+    // needs no facade.
     if (!row || row.n === 'notctor' || !C.prototype) return;
     const F = { [name]: function () {
-      if (TRACE && (new.target === undefined || (new.target === F && row.n !== 'ok'))) trace('конструктор ' + name + ' new=' + (new.target !== undefined) + ' доводов=' + arguments.length + ' правило=' + row.n + '/' + row.c);
+      if (TRACE && (new.target === undefined || (new.target === F && row.n !== 'ok'))) trace('ctor ' + name + ' new=' + (new.target !== undefined) + ' args=' + arguments.length + ' rule=' + row.n + '/' + row.c);
       if (new.target === undefined) {
         throw __pt_mkErr(TypeError, row.c === 'illegal' ? 'Illegal constructor'
           : 'Failed to construct \'' + name + '\': Please use the \'new\' operator, this DOM object constructor cannot be called as a function.');
       }
-      // Наследник (`class X extends HTMLElement` через `super()`) строится
-      // всегда: отказ и счёт доводов — только у самого интерфейса.
+      // A subclass (`class X extends HTMLElement` via `super()`) is always
+      // built: refusal and arg counting apply only to the interface itself.
       const own = new.target === F;
       if (own && row.n === 'illegal') throw __pt_mkErr(TypeError, 'Failed to construct \'' + name + '\': Illegal constructor');
       const m = own ? /^args:(\d+)$/.exec(row.n) : null;
@@ -2327,14 +2259,14 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     if (typeof C !== 'function') { if (d.get || d.set) fix(globalThis, name); continue; }
     fix(globalThis, name, null);
     for (const k of keysOf(C)) if (k !== 'length' && k !== 'name' && k !== 'prototype' && k !== 'arguments' && k !== 'caller') fix(C, k, null);
-    // Бренд проверяют члены интерфейсов платформы; встроенные языка (Array,
-    // Promise…) — родные V8, их не трогаем.
+    // Brand checks apply to platform interface members; language builtins
+    // (Array, Promise...) are V8-native and left alone.
     const platform = /^[A-Z]/.test(name) && !BUILTIN.has(name) && C.prototype !== Object.prototype;
     walkProto(C.prototype, platform ? C : null);
     if (platform && d.configurable) facade(name, C, d);
   }
-  // Объекты-синглтоны: их методы лежат на своих прототипах, до которых
-  // обход по конструкторам не всегда доходит.
+  // Singletons: their methods sit on their own prototypes, which the walk
+  // over constructors does not always reach.
   for (const name of ['navigator', 'document', 'performance', 'screen', 'history', 'location', 'localStorage', 'sessionStorage', 'crypto', 'speechSynthesis', 'visualViewport', 'scheduler']) {
     let o; try { o = globalThis[name]; } catch (e) { continue; }
     if (!o || typeof o !== 'object') continue;
@@ -2401,10 +2333,10 @@ pub fn late_interfaces_script() -> String {
     const o = state.get(face);
     if (!o) return Promise.reject(__pt_mkErr(TypeError, 'Illegal invocation'));
     if (o.promise) return o.promise;
-    // `local(Имя)` — единственный источник, который разрешается не выходя в
-    // сеть; всё прочее отвечает сетевой ошибкой, как у браузера с недоступным
-    // адресом. Подмены fontconfig не в счёт: браузер ищет по именам самих
-    // файлов, и `Arial` на машине без него не находится.
+    // `local(Name)` is the only source resolved without the network; anything
+    // else fails with a network error, like the browser with an unreachable
+    // URL. fontconfig substitutes do not count: the browser matches the font
+    // files' own names, and `Arial` is not found on a machine without it.
     const m = /local\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)/i.exec(o.source || '');
     const name = m ? String(m[1] || m[2] || m[3] || '').trim() : null;
     const have = !!(name && typeof globalThis.__pt_localFont === 'function' && __pt_localFont(name));
@@ -2419,17 +2351,17 @@ pub fn late_interfaces_script() -> String {
   defg(P, 'loaded', function () { return start(this); });
   try { Object.defineProperty(P, Symbol.toStringTag, { value: 'FontFace', configurable: true }); } catch (e) {}
   try { Object.defineProperty(FontFace, 'length', { value: 2, configurable: true }); } catch (e) {}
-  // Порядок имён на прототипе браузер печатает со `constructor` внутри, по
-  // алфавиту: таблица уже положила его первым, оставляем как есть.
+  // The browser lists prototype names with `constructor` among them,
+  // alphabetically: the table already put it first, leave as is.
   try {
     Object.defineProperty(globalThis, 'FontFace', {
       value: named('FontFace', FontFace), writable: true, enumerable: false, configurable: true,
     });
   } catch (e) {}
 
-  // `DOMParser` и `XMLSerializer`: таблица имён кладёт под этими именами
-  // пустые классы, и вызов бросает. Работу делает слой DOM, здесь — только
-  // объявление поверх таблицы.
+  // `DOMParser` and `XMLSerializer`: the name table puts empty classes there
+  // and calls throw. The DOM layer does the work; this only declares them on
+  // top of the table.
   const late = globalThis.__pt_lateDom;
   if (late) {
     const DOMParser = function DOMParser() {};
@@ -2463,11 +2395,11 @@ pub fn late_interfaces_script() -> String {
     }
   }
 
-  // Пять имён, которых у нас не было на окне вовсе, — а обход графа у
-  // челленджа читает окно целиком. Формы сняты с Chrome 151: порядок членов,
-  // вид описаний и предок у каждого свой.
+  // Five names we lacked on window entirely, and the challenge's graph walk
+  // reads the whole window. Shapes captured from Chrome 151: member order,
+  // descriptor kinds and parent per interface.
   {
-    const событие = (P, k) => {
+    const eventProp = (P, k) => {
       let store = null;
       try {
         Object.defineProperty(P, k, {
@@ -2477,7 +2409,7 @@ pub fn late_interfaces_script() -> String {
         });
       } catch (e) {}
     };
-    const чтение = (P, k, v) => {
+    const getterProp = (P, k, v) => {
       try {
         Object.defineProperty(P, k, {
           get: named('get ' + k, function () { return typeof v === 'function' ? v.call(this) : v; }),
@@ -2485,35 +2417,34 @@ pub fn late_interfaces_script() -> String {
         });
       } catch (e) {}
     };
-    const конец = (P, C) => {
-      // `constructor` у браузера идёт последним: он заводится после членов.
+    const finish = (P, C) => {
+      // The browser's `constructor` comes last: it is added after members.
       try { delete P.constructor; } catch (e) {}
       try {
         Object.defineProperty(P, 'constructor', { value: C, writable: true, configurable: true });
       } catch (e) {}
     };
-    const интерфейс = (имя, предок) => {
-      const C = named(имя, (function () {
+    const makeIface = (ifaceName, parentProto) => {
+      const C = named(ifaceName, (function () {
         'use strict';
         return function () { throw __pt_mkErr(TypeError, 'Illegal constructor'); };
       })());
-      const P = Object.create(предок || Object.prototype);
-      try { Object.defineProperty(P, Symbol.toStringTag, { value: имя, configurable: true }); } catch (e) {}
+      const P = Object.create(parentProto || Object.prototype);
+      try { Object.defineProperty(P, Symbol.toStringTag, { value: ifaceName, configurable: true }); } catch (e) {}
       try { Object.defineProperty(C, 'prototype', { value: P, writable: false, configurable: false }); } catch (e) {}
       try { Object.defineProperty(C, 'length', { value: 0, configurable: true }); } catch (e) {}
       return [C, P];
     };
-    const опубликовать = (имя, C) => {
+    const publish = (ifaceName, C) => {
       try {
-        Object.defineProperty(globalThis, имя, {
+        Object.defineProperty(globalThis, ifaceName, {
           value: C, writable: true, enumerable: false, configurable: true,
         });
       } catch (e) {}
     };
 
-    // `FontFaceSet` у браузера на окне есть, и `document.fonts` — его
-    // ��кземпляр. У нас интерфейс был, а имени на окне не было; заодно
-    // приводим порядок членов и вид описаний к браузерным.
+    // The browser exposes `FontFaceSet` on window and `document.fonts` is an
+    // instance; we lacked the name. Also matches member order and descriptors.
     try {
       const fonts = globalThis.document && document.fonts;
       const P = fonts ? Object.getPrototypeOf(fonts) : null;
@@ -2523,24 +2454,24 @@ pub fn late_interfaces_script() -> String {
           : named('FontFaceSet', (function () { 'use strict'; return function () { throw __pt_mkErr(TypeError, 'Illegal constructor'); }; })());
         try { Object.defineProperty(C, 'prototype', { value: P, writable: false, configurable: false }); } catch (e) {}
         try { Object.defineProperty(C, 'length', { value: 0, configurable: true }); } catch (e) {}
-        // Порядок у браузера: обработчики, чтения, методы, `constructor`.
-        const прежние = {};
+        // Browser order: handlers, getters, methods, `constructor`.
+        const prev = {};
         for (const k of Object.getOwnPropertyNames(P)) {
-          прежние[k] = Object.getOwnPropertyDescriptor(P, k);
+          prev[k] = Object.getOwnPropertyDescriptor(P, k);
           if (k !== 'constructor') { try { delete P[k]; } catch (e) {} }
         }
-        for (const k of ['onloading', 'onloadingdone', 'onloadingerror']) событие(P, k);
+        for (const k of ['onloading', 'onloadingdone', 'onloadingerror']) eventProp(P, k);
         for (const k of ['ready', 'status', 'size']) {
-          const d = прежние[k];
+          const d = prev[k];
           if (d && d.get) {
             try { Object.defineProperty(P, k, { get: d.get, enumerable: true, configurable: true }); } catch (e) {}
           } else {
-            чтение(P, k, k === 'ready' ? function () { return Promise.resolve(this); }
+            getterProp(P, k, k === 'ready' ? function () { return Promise.resolve(this); }
                        : k === 'status' ? 'loaded' : 0);
           }
         }
         for (const k of ['check', 'load', 'add', 'clear', 'delete', 'entries', 'forEach', 'has', 'keys', 'values']) {
-          const d = прежние[k];
+          const d = prev[k];
           if (d && typeof d.value === 'function') {
             try { Object.defineProperty(P, k, { value: d.value, writable: true, enumerable: true, configurable: true }); }
             catch (e) {}
@@ -2548,37 +2479,37 @@ pub fn late_interfaces_script() -> String {
             meth(P, k, function () { return undefined; });
           }
         }
-        конец(P, C);
-        опубликовать('FontFaceSet', C);
+        finish(P, C);
+        publish('FontFaceSet', C);
       }
     } catch (e) {}
 
-    // Остальные четыре имени интерфейсами и остаются: страница их читает
-    // обходом, но объектов этих классов ей не достаётся.
-    const таблица = [
-      ['CSSPseudoElement', null, [['type', 'г'], ['element', 'г'], ['parent', 'г'], ['pseudo', 'м']]],
-      ['HTMLUserMediaElement', 'HTMLElement', [['error', 'г'], ['onstream', 'с'], ['oncancel', 'с'],
-        ['onerror', 'с'], ['stream', 'г'], ['setConstraints', 'м']]],
-      ['InteractionContentfulPaint', 'PerformanceEntry', [['largestContentfulPaint', 'г'],
-        ['interactionId', 'г'], ['toJSON', 'м'], ['paintTime', 'г'], ['presentationTime', 'г']]],
-      ['PerformanceSoftNavigation', 'PerformanceEntry', [['navigationType', 'г'], ['interactionId', 'г'],
-        ['getLargestInteractionContentfulPaint', 'м'], ['paintTime', 'г'], ['presentationTime', 'г']]],
+    // The other four names stay bare interfaces: the page reads them in a
+    // walk but never gets instances.
+    const table = [
+      ['CSSPseudoElement', null, [['type', 'g'], ['element', 'g'], ['parent', 'g'], ['pseudo', 'm']]],
+      ['HTMLUserMediaElement', 'HTMLElement', [['error', 'g'], ['onstream', 'e'], ['oncancel', 'e'],
+        ['onerror', 'e'], ['stream', 'g'], ['setConstraints', 'm']]],
+      ['InteractionContentfulPaint', 'PerformanceEntry', [['largestContentfulPaint', 'g'],
+        ['interactionId', 'g'], ['toJSON', 'm'], ['paintTime', 'g'], ['presentationTime', 'g']]],
+      ['PerformanceSoftNavigation', 'PerformanceEntry', [['navigationType', 'g'], ['interactionId', 'g'],
+        ['getLargestInteractionContentfulPaint', 'm'], ['paintTime', 'g'], ['presentationTime', 'g']]],
     ];
-    for (const [имя, предокИмя, члены] of таблица) {
-      if (typeof globalThis[имя] === 'function') continue;
-      let предок = Object.prototype;
+    for (const [ifaceName, parentName, members] of table) {
+      if (typeof globalThis[ifaceName] === 'function') continue;
+      let parentProto = Object.prototype;
       try {
-        const B = предокИмя ? globalThis[предокИмя] : null;
-        if (B && B.prototype) предок = B.prototype;
+        const B = parentName ? globalThis[parentName] : null;
+        if (B && B.prototype) parentProto = B.prototype;
       } catch (e) {}
-      const [C, P] = интерфейс(имя, предок);
-      for (const [k, вид] of члены) {
-        if (вид === 'с') событие(P, k);
-        else if (вид === 'г') чтение(P, k, null);
+      const [C, P] = makeIface(ifaceName, parentProto);
+      for (const [k, kind] of members) {
+        if (kind === 'e') eventProp(P, k);
+        else if (kind === 'g') getterProp(P, k, null);
         else meth(P, k, function () { return undefined; });
       }
-      конец(P, C);
-      опубликовать(имя, C);
+      finish(P, C);
+      publish(ifaceName, C);
     }
   }
 
@@ -2586,24 +2517,22 @@ pub fn late_interfaces_script() -> String {
         .to_string()
 }
 
-/// Порядок собственных имён окна, снятый с Chrome 151: всё, что идёт после
-/// `console` — то есть после встроенных имён самого движка, которые V8 кладёт
-/// сам и в том же порядке. Обход графа у челленджа перечисляет окно целиком, а
-/// перечисление отдаёт имена в порядке заведения: у нас первые шесть десятков
-/// сходились, а дальше шло своё. Порядок — такая же примета, как состав.
+/// Window own-property order captured from Chrome 151: everything after
+/// `console`, i.e. after V8's own builtins, which V8 adds in the same order.
+/// The challenge's graph walk enumerates the window, and enumeration returns
+/// names in creation order, so order is as telling as membership.
 const WINDOW_ORDER: &str = r#"["Option","Image","Audio","webkitURL","webkitRTCPeerConnection","webkitMediaStream","WebKitMutationObserver","WebKitCSSMatrix","XPathResult","XPathExpression","XPathEvaluator","XMLSerializer","XMLHttpRequestUpload","XMLHttpRequestEventTarget","XMLHttpRequest","XMLDocument","WritableStreamDefaultWriter","WritableStreamDefaultController","WritableStream","Worker","WindowControlsOverlayGeometryChangeEvent","WindowControlsOverlay","Window","WheelEvent","WebSocket","WebGLVertexArrayObject","WebGLUniformLocation","WebGLTransformFeedback","WebGLTexture","WebGLSync","WebGLShaderPrecisionFormat","WebGLShader","WebGLSampler","WebGLRenderingContext","WebGLRenderbuffer","WebGLQuery","WebGLProgram","WebGLObject","WebGLFramebuffer","WebGLContextEvent","WebGLBuffer","WebGLActiveInfo","WebGL2RenderingContext","WaveShaperNode","VisualViewport","VisibilityStateEntry","VirtualKeyboardGeometryChangeEvent","ViewTransitionTypeSet","ViewTransition","ViewTimeline","VideoPlaybackQuality","VideoFrame","VideoColorSpace","ValidityState","VTTCue","UserActivation","URLSearchParams","URLPattern","URL","UIEvent","TrustedTypePolicyFactory","TrustedTypePolicy","TrustedScriptURL","TrustedScript","TrustedHTML","TreeWalker","TransitionEvent","TransformStreamDefaultController","TransformStream","TrackEvent","TouchList","TouchEvent","Touch","ToggleEvent","TimeRanges","TextUpdateEvent","TextTrackList","TextTrackCueList","TextTrackCue","TextTrack","TextMetrics","TextFormatUpdateEvent","TextFormat","TextEvent","TextEncoderStream","TextEncoder","TextDecoderStream","TextDecoder","Text","TaskSignal","TaskPriorityChangeEvent","TaskController","TaskAttributionTiming","SyncManager","Subscriber","SubmitEvent","StyleSheetList","StyleSheet","StylePropertyMapReadOnly","StylePropertyMap","StorageEvent","Storage","StereoPannerNode","StaticRange","SourceBufferList","SourceBuffer","ShadowRoot","Selection","SecurityPolicyViolationEvent","ScrollTimeline","ScriptProcessorNode","ScreenOrientation","Screen","Scheduling","Scheduler","SVGViewElement","SVGUseElement","SVGUnitTypes","SVGTransformList","SVGTransform","SVGTitleElement","SVGTextPositioningElement","SVGTextPathElement","SVGTextElement","SVGTextContentElement","SVGTSpanElement","SVGSymbolElement","SVGSwitchElement","SVGStyleElement","SVGStringList","SVGStopElement","SVGSetElement","SVGScriptElement","SVGSVGElement","SVGRectElement","SVGRect","SVGRadialGradientElement","SVGPreserveAspectRatio","SVGPolylineElement","SVGPolygonElement","SVGPointList","SVGPoint","SVGPatternElement","SVGPathElement","SVGNumberList","SVGNumber","SVGMetadataElement","SVGMatrix","SVGMaskElement","SVGMarkerElement","SVGMPathElement","SVGLinearGradientElement","SVGLineElement","SVGLengthList","SVGLength","SVGImageElement","SVGGraphicsElement","SVGGradientElement","SVGGeometryElement","SVGGElement","SVGForeignObjectElement","SVGFilterElement","SVGFETurbulenceElement","SVGFETileElement","SVGFESpotLightElement","SVGFESpecularLightingElement","SVGFEPointLightElement","SVGFEOffsetElement","SVGFEMorphologyElement","SVGFEMergeNodeElement","SVGFEMergeElement","SVGFEImageElement","SVGFEGaussianBlurElement","SVGFEFuncRElement","SVGFEFuncGElement","SVGFEFuncBElement","SVGFEFuncAElement","SVGFEFloodElement","SVGFEDropShadowElement","SVGFEDistantLightElement","SVGFEDisplacementMapElement","SVGFEDiffuseLightingElement","SVGFEConvolveMatrixElement","SVGFECompositeElement","SVGFEComponentTransferElement","SVGFEColorMatrixElement","SVGFEBlendElement","SVGEllipseElement","SVGElement","SVGDescElement","SVGDefsElement","SVGComponentTransferFunctionElement","SVGClipPathElement","SVGCircleElement","SVGAnimationElement","SVGAnimatedTransformList","SVGAnimatedString","SVGAnimatedRect","SVGAnimatedPreserveAspectRatio","SVGAnimatedNumberList","SVGAnimatedNumber","SVGAnimatedLengthList","SVGAnimatedLength","SVGAnimatedInteger","SVGAnimatedEnumeration","SVGAnimatedBoolean","SVGAnimatedAngle","SVGAnimateTransformElement","SVGAnimateMotionElement","SVGAnimateElement","SVGAngle","SVGAElement","Response","ResizeObserverSize","ResizeObserverEntry","ResizeObserver","Request","ReportingObserver","ReportBody","ReadableStreamDefaultReader","ReadableStreamDefaultController","ReadableStreamBYOBRequest","ReadableStreamBYOBReader","ReadableStream","ReadableByteStreamController","Range","RadioNodeList","RTCTrackEvent","RTCStatsReport","RTCSessionDescription","RTCSctpTransport","RTCRtpTransceiver","RTCRtpSender","RTCRtpReceiver","RTCPeerConnectionIceEvent","RTCPeerConnectionIceErrorEvent","RTCPeerConnection","RTCIceTransport","RTCIceCandidate","RTCErrorEvent","RTCError","RTCEncodedVideoFrame","RTCEncodedAudioFrame","RTCDtlsTransport","RTCDataChannelEvent","RTCDTMFToneChangeEvent","RTCDTMFSender","RTCCertificate","PromiseRejectionEvent","ProgressEvent","ProcessingInstruction","PopStateEvent","PointerEvent","PluginArray","Plugin","PictureInPictureWindow","PictureInPictureEvent","Permissions","PermissionStatus","PeriodicWave","PerformanceTiming","PerformanceServerTiming","PerformanceScriptTiming","PerformanceResourceTiming","PerformancePaintTiming","PerformanceObserverEntryList","PerformanceObserver","PerformanceNavigationTiming","PerformanceNavigation","PerformanceMeasure","PerformanceMark","PerformanceLongTaskTiming","PerformanceLongAnimationFrameTiming","PerformanceEventTiming","PerformanceEntry","PerformanceElementTiming","Performance","Path2D","PannerNode","PageTransitionEvent","OverconstrainedError","OscillatorNode","OffscreenCanvasRenderingContext2D","OffscreenCanvas","OfflineAudioContext","OfflineAudioCompletionEvent","Observable","NodeList","NodeIterator","NodeFilter","Node","NetworkInformation","NavigatorUAData","Navigator","NavigationTransition","NavigationPrecommitController","NavigationHistoryEntry","NavigationDestination","NavigationCurrentEntryChangeEvent","NavigationActivation","Navigation","NavigateEvent","NamedNodeMap","MutationRecord","MutationObserver","MouseEvent","MimeTypeArray","MimeType","MessagePort","MessageEvent","MessageChannel","MediaStreamTrackVideoStats","MediaStreamTrackProcessor","MediaStreamTrackGenerator","MediaStreamTrackEvent","MediaStreamTrackAudioStats","MediaStreamTrack","MediaStreamEvent","MediaStreamAudioSourceNode","MediaStreamAudioDestinationNode","MediaStream","MediaSourceHandle","MediaSource","MediaRecorder","MediaQueryListEvent","MediaQueryList","MediaList","MediaError","MediaEncryptedEvent","MediaElementAudioSourceNode","MediaCapabilities","MathMLElement","Location","LayoutShiftAttribution","LayoutShift","LargestContentfulPaint","KeyframeEffect","KeyboardEvent","IntersectionObserverEntry","IntersectionObserver","InterestEvent","InputEvent","InputDeviceInfo","InputDeviceCapabilities","Ink","ImageData","ImageBitmapRenderingContext","ImageBitmap","IdleDeadline","IIRFilterNode","IDBVersionChangeEvent","IDBTransaction","IDBRequest","IDBRecord","IDBOpenDBRequest","IDBObjectStore","IDBKeyRange","IDBIndex","IDBFactory","IDBDatabase","IDBCursorWithValue","IDBCursor","History","HighlightRegistry","Highlight","Headers","HashChangeEvent","HTMLVideoElement","HTMLUnknownElement","HTMLUListElement","HTMLTrackElement","HTMLTitleElement","HTMLTimeElement","HTMLTextAreaElement","HTMLTemplateElement","HTMLTableSectionElement","HTMLTableRowElement","HTMLTableElement","HTMLTableColElement","HTMLTableCellElement","HTMLTableCaptionElement","HTMLStyleElement","HTMLSpanElement","HTMLSourceElement","HTMLSlotElement","HTMLSelectedContentElement","HTMLSelectElement","HTMLScriptElement","HTMLQuoteElement","HTMLProgressElement","HTMLPreElement","HTMLPictureElement","HTMLParamElement","HTMLParagraphElement","HTMLOutputElement","HTMLOptionsCollection","HTMLOptionElement","HTMLOptGroupElement","HTMLObjectElement","HTMLOListElement","HTMLModElement","HTMLMeterElement","HTMLMetaElement","HTMLMenuElement","HTMLMediaElement","HTMLMarqueeElement","HTMLMapElement","HTMLLinkElement","HTMLLegendElement","HTMLLabelElement","HTMLLIElement","HTMLInputElement","HTMLImageElement","HTMLIFrameElement","HTMLHtmlElement","HTMLHeadingElement","HTMLHeadElement","HTMLHRElement","HTMLFrameSetElement","HTMLFrameElement","HTMLFormElement","HTMLFormControlsCollection","HTMLFontElement","HTMLFieldSetElement","HTMLEmbedElement","HTMLElement","HTMLDocument","HTMLDivElement","HTMLDirectoryElement","HTMLDialogElement","HTMLDetailsElement","HTMLDataListElement","HTMLDataElement","HTMLDListElement","HTMLCollection","HTMLCanvasElement","HTMLButtonElement","HTMLBodyElement","HTMLBaseElement","HTMLBRElement","HTMLAudioElement","HTMLAreaElement","HTMLAnchorElement","HTMLAllCollection","GeolocationPositionError","GeolocationPosition","GeolocationCoordinates","Geolocation","GamepadHapticActuator","GamepadEvent","GamepadButton","Gamepad","GainNode","FormDataEvent","FormData","FontFaceSetLoadEvent","FontFaceSet","FontFace","FocusEvent","FileReader","FileList","File","FeaturePolicy","External","EventTarget","EventSource","EventCounts","Event","ErrorEvent","EncodedVideoChunk","EncodedAudioChunk","ElementInternals","Element","EditContext","DynamicsCompressorNode","DragEvent","DocumentType","DocumentTimeline","DocumentFragment","Document","DelegatedInkTrailPresenter","DelayNode","DecompressionStream","DataTransferItemList","DataTransferItem","DataTransfer","DOMTokenList","DOMStringMap","DOMStringList","DOMRectReadOnly","DOMRectList","DOMRect","DOMQuad","DOMPointReadOnly","DOMPoint","DOMParser","DOMMatrixReadOnly","DOMMatrix","DOMImplementation","DOMException","DOMError","CustomStateSet","CustomEvent","CustomElementRegistry","Crypto","CountQueuingStrategy","ConvolverNode","ContentVisibilityAutoStateChangeEvent","ConstantSourceNode","CompressionStream","CompositionEvent","Comment","CommandEvent","CloseWatcher","CloseEvent","ClipboardEvent","CharacterData","CharacterBoundsUpdateEvent","ChannelSplitterNode","ChannelMergerNode","CaretPosition","CanvasRenderingContext2D","CanvasPattern","CanvasGradient","CanvasCaptureMediaStreamTrack","CSSViewTransitionRule","CSSVariableReferenceValue","CSSUnparsedValue","CSSUnitValue","CSSTranslate","CSSTransition","CSSTransformValue","CSSTransformComponent","CSSSupportsRule","CSSStyleValue","CSSStyleSheet","CSSStyleRule","CSSStyleDeclaration","CSSStartingStyleRule","CSSSkewY","CSSSkewX","CSSSkew","CSSScopeRule","CSSScale","CSSRuleList","CSSRule","CSSRotate","CSSPropertyRule","CSSPositionValue","CSSPositionTryRule","CSSPositionTryDescriptors","CSSPerspective","CSSPageRule","CSSNumericValue","CSSNumericArray","CSSNestedDeclarations","CSSNamespaceRule","CSSMediaRule","CSSMatrixComponent","CSSMathValue","CSSMathSum","CSSMathProduct","CSSMathNegate","CSSMathMin","CSSMathMax","CSSMathInvert","CSSMathClamp","CSSMarginRule","CSSLayerStatementRule","CSSLayerBlockRule","CSSKeywordValue","CSSKeyframesRule","CSSKeyframeRule","CSSImportRule","CSSImageValue","CSSGroupingRule","CSSFontPaletteValuesRule","CSSFontFaceRule","CSSCounterStyleRule","CSSContainerRule","CSSConditionRule","CSSAnimation","CSS","CSPViolationReportBody","CDATASection","ByteLengthQueuingStrategy","BrowserCaptureMediaStreamTrack","BroadcastChannel","BlobEvent","Blob","BiquadFilterNode","BeforeUnloadEvent","BeforeInstallPromptEvent","BaseAudioContext","BarProp","AudioWorkletNode","AudioSinkInfo","AudioScheduledSourceNode","AudioProcessingEvent","AudioParamMap","AudioParam","AudioNode","AudioListener","AudioDestinationNode","AudioData","AudioContext","AudioBufferSourceNode","AudioBuffer","Attr","AnimationTimeline","AnimationPlaybackEvent","AnimationEvent","AnimationEffect","Animation","AnalyserNode","AbstractRange","AbortSignal","AbortController","window","self","document","name","location","customElements","history","navigation","locationbar","menubar","personalbar","scrollbars","statusbar","toolbar","status","closed","frames","length","top","opener","parent","frameElement","navigator","origin","external","screen","innerWidth","innerHeight","scrollX","pageXOffset","scrollY","pageYOffset","visualViewport","screenX","screenY","outerWidth","outerHeight","devicePixelRatio","event","clientInformation","offscreenBuffering","screenLeft","screenTop","styleMedia","onsearch","onappinstalled","onbeforeinstallprompt","onabort","onbeforeinput","onbeforematch","onbeforetoggle","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncuechange","ondblclick","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onload","onloadeddata","onloadedmetadata","onloadstart","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onpause","onplay","onplaying","onprogress","onratechange","onreset","onresize","onscroll","onscrollend","onsecuritypolicyviolation","onseeked","onseeking","onselect","onslotchange","onstalled","onsubmit","onsuspend","ontimeupdate","ontoggle","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkittransitionend","onwheel","onauxclick","ongotpointercapture","onlostpointercapture","onpointerdown","onpointermove","onpointerup","onpointercancel","onpointerover","onpointerout","onpointerenter","onpointerleave","onselectstart","onselectionchange","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","ontransitionrun","ontransitionstart","ontransitionend","ontransitioncancel","onbeforexrselect","onafterprint","onbeforeprint","onbeforeunload","onhashchange","onlanguagechange","onmessage","onmessageerror","onoffline","ononline","onpagehide","onpageshow","onpopstate","onrejectionhandled","onstorage","onunhandledrejection","onunload","isSecureContext","crossOriginIsolated","scheduler","performance","trustedTypes","crypto","indexedDB","localStorage","sessionStorage","alert","atob","blur","btoa","cancelAnimationFrame","cancelIdleCallback","captureEvents","clearInterval","clearTimeout","close","confirm","createImageBitmap","fetch","find","focus","getComputedStyle","getSelection","matchMedia","moveBy","moveTo","open","postMessage","print","prompt","queueMicrotask","releaseEvents","reportError","requestAnimationFrame","requestIdleCallback","resizeBy","resizeTo","scroll","scrollBy","scrollTo","setInterval","setTimeout","stop","structuredClone","webkitCancelAnimationFrame","webkitRequestAnimationFrame","Temporal","SuppressedError","DisposableStack","AsyncDisposableStack","Float16Array","chrome","WebAssembly","crashReport","cookieStore","ondevicemotion","ondeviceorientation","ondeviceorientationabsolute","onpointerrawupdate","caches","documentPictureInPicture","sharedStorage","AbsoluteOrientationSensor","Accelerometer","AudioDecoder","AudioEncoder","AudioWorklet","BatteryManager","Cache","CacheStorage","Clipboard","ClipboardChangeEvent","ClipboardItem","CookieChangeEvent","CookieStore","CookieStoreManager","CreateMonitor","Credential","CredentialsContainer","CryptoKey","DeviceMotionEvent","DeviceMotionEventAcceleration","DeviceMotionEventRotationRate","DeviceOrientationEvent","FederatedCredential","GPU","GPUAdapter","GPUAdapterInfo","GPUBindGroup","GPUBindGroupLayout","GPUBuffer","GPUBufferUsage","GPUCanvasContext","GPUColorWrite","GPUCommandBuffer","GPUCommandEncoder","GPUCompilationInfo","GPUCompilationMessage","GPUComputePassEncoder","GPUComputePipeline","GPUDevice","GPUDeviceLostInfo","GPUError","GPUExternalTexture","GPUInternalError","GPUMapMode","GPUOutOfMemoryError","GPUPipelineError","GPUPipelineLayout","GPUQuerySet","GPUQueue","GPURenderBundle","GPURenderBundleEncoder","GPURenderPassEncoder","GPURenderPipeline","GPUSampler","GPUShaderModule","GPUShaderStage","GPUSupportedFeatures","GPUSupportedLimits","GPUTexture","GPUTextureUsage","GPUTextureView","GPUUncapturedErrorEvent","GPUValidationError","GravitySensor","Gyroscope","IdleDetector","ImageCapture","ImageDecoder","ImageTrack","ImageTrackList","Keyboard","KeyboardLayoutMap","LinearAccelerationSensor","MIDIAccess","MIDIConnectionEvent","MIDIInput","MIDIInputMap","MIDIMessageEvent","MIDIOutput","MIDIOutputMap","MIDIPort","MediaDeviceInfo","MediaDevices","MediaKeyMessageEvent","MediaKeySession","MediaKeyStatusMap","MediaKeySystemAccess","MediaKeys","NavigationPreloadManager","NavigatorManagedData","OrientationSensor","PasswordCredential","ProtectedAudience","RelativeOrientationSensor","ScreenDetailed","ScreenDetails","Sensor","SensorErrorEvent","ServiceWorkerRegistration","StorageManager","SubtleCrypto","VideoDecoder","VideoEncoder","VirtualKeyboard","WGSLLanguageFeatures","WebTransport","WebTransportBidirectionalStream","WebTransportDatagramDuplexStream","WebTransportError","Worklet","XRDOMOverlayState","XRLayer","XRWebGLBinding","AudioPlaybackStats","AuthenticatorAssertionResponse","AuthenticatorAttestationResponse","AuthenticatorResponse","PublicKeyCredential","CaptureController","CrashReportContext","DevicePosture","DigitalCredential","DocumentPictureInPicture","FetchLaterResult","FileSystemDirectoryHandle","FileSystemFileHandle","FileSystemHandle","FileSystemWritableFileStream","FileSystemObserver","FontData","FragmentDirective","HID","HIDConnectionEvent","HIDDevice","HIDInputReportEvent","IdentityCredential","IdentityCredentialError","IdentityProvider","NavigatorLogin","LanguageDetector","LanguageModel","Lock","LockManager","ServiceWorker","ServiceWorkerContainer","NotRestoredReasonDetails","NotRestoredReasons","OTPCredential","PaymentAddress","PaymentRequest","PaymentRequestUpdateEvent","PaymentResponse","PaymentManager","PaymentMethodChangeEvent","Presentation","PresentationAvailability","PresentationConnection","PresentationConnectionAvailableEvent","PresentationConnectionCloseEvent","PresentationConnectionList","PresentationReceiver","PresentationRequest","PressureObserver","PressureRecord","Serial","SerialPort","SpeechRecognitionPhrase","StorageBucket","StorageBucketManager","Summarizer","Translator","USB","USBAlternateInterface","USBConfiguration","USBConnectionEvent","USBDevice","USBEndpoint","USBInTransferResult","USBInterface","USBIsochronousInTransferPacket","USBIsochronousInTransferResult","USBIsochronousOutTransferPacket","USBIsochronousOutTransferResult","USBOutTransferResult","WakeLock","WakeLockSentinel","XRAnchor","XRAnchorSet","XRBoundedReferenceSpace","XRCPUDepthInformation","XRCamera","XRDepthInformation","XRFrame","XRHand","XRHitTestResult","XRHitTestSource","XRInputSource","XRInputSourceArray","XRInputSourceEvent","XRInputSourcesChangeEvent","XRJointPose","XRJointSpace","XRLightEstimate","XRLightProbe","XRPose","XRRay","XRReferenceSpace","XRReferenceSpaceEvent","XRRenderState","XRRigidTransform","XRSession","XRSessionEvent","XRSpace","XRSystem","XRTransientInputHitTestResult","XRTransientInputHitTestSource","XRView","XRViewerPose","XRViewport","XRWebGLDepthInformation","XRWebGLLayer","XRCompositionLayer","XRProjectionLayer","XRCubeLayer","XRCylinderLayer","XREquirectLayer","XRLayerEvent","XRQuadLayer","XRSubImage","XRWebGLSubImage","XRPlane","XRPlaneSet","XRVisibilityMaskChangeEvent","fetchLater","getScreenDetails","queryLocalFonts","showDirectoryPicker","showOpenFilePicker","showSaveFilePicker","originAgentCluster","viewport","onpageswap","onpagereveal","credentialless","fence","launchQueue","speechSynthesis","onscrollsnapchange","onscrollsnapchanging","ongamepadconnected","ongamepaddisconnected","AnimationTrigger","BackgroundFetchManager","BackgroundFetchRecord","BackgroundFetchRegistration","CSSFontFeatureValuesRule","CSSFunctionDeclarations","CSSFunctionDescriptors","CSSFunctionRule","CSSPseudoElement","ChapterInformation","CropTarget","DocumentPictureInPictureEvent","Fence","FencedFrameConfig","HTMLFencedFrameElement","HTMLGeolocationElement","HTMLUserMediaElement","IntegrityViolationReportBody","InteractionContentfulPaint","PerformanceSoftNavigation","LaunchParams","LaunchQueue","MediaMetadata","MediaSession","Notification","Origin","PageRevealEvent","PageSwapEvent","PerformanceTimingConfidence","PeriodicSyncManager","Profiler","PushManager","PushSubscription","PushSubscriptionOptions","QuotaExceededError","RTCDataChannel","RTCRtpScriptTransform","RemotePlayback","RestrictionTarget","Sanitizer","SharedStorage","SharedStorageWorklet","SharedStorageAppendMethod","SharedStorageClearMethod","SharedStorageDeleteMethod","SharedStorageModifierMethod","SharedStorageSetMethod","SharedWorker","SnapEvent","SpeechGrammar","SpeechGrammarList","SpeechRecognition","SpeechRecognitionErrorEvent","SpeechRecognitionEvent","SpeechSynthesis","SpeechSynthesisErrorEvent","SpeechSynthesisEvent","SpeechSynthesisUtterance","SpeechSynthesisVoice","TimelineTrigger","TimelineTriggerRange","TimelineTriggerRangeList","Viewport","WebSocketError","WebSocketStream","XSLTProcessor","webkitSpeechGrammar","webkitSpeechGrammarList","webkitSpeechRecognition","webkitSpeechRecognitionError","webkitSpeechRecognitionEvent","webkitRequestFileSystem","webkitResolveLocalFileSystemURL"]"#;
 
-/// Переставляет имена окна в браузерный порядок: собственное свойство,
-/// заведённое заново, встаёт в конец, поэтому один проход по списку
-/// выстраивает весь хвост. Идёт последним — после всех слоёв, иначе порядок
-/// снова разъедется.
-/// Поздние правки формы, поверх всех слоёв: порядок имён WebAssembly (у
-/// Chrome compileStreaming/instantiateStreaming заведены раньше JSPI), алиасы
-/// с приставкой webkit — те же объекты, что оригиналы, арность
-/// RTCPeerConnection, порядок статики Notification.
-/// Статические члены конструкторов Chrome 151 (порядок, флаги, длины) — снято walker_desc.js.
+/// Reorders window names into the browser's order: a redefined own property
+/// moves to the end, so one pass over the list fixes the whole tail. Runs
+/// last, after all layers.
+/// Late shape fixes on top of all layers: WebAssembly name order (Chrome
+/// defines compileStreaming/instantiateStreaming before JSPI), webkit-prefixed
+/// aliases being the same objects as the originals, RTCPeerConnection arity,
+/// Notification static order.
+/// Chrome 151 constructor statics (order, flags, lengths), captured from Chrome.
 const CTOR_STATICS: &str = include_str!("ctor_statics.json");
-/// Форма членов прототипов Chrome 151 (имя, длина, строгость, аксессоры) — снято walker_desc.js.
+/// Chrome 151 prototype member shapes (name, length, strictness, accessors), captured from Chrome.
 const PROTO_MEMBERS: &str = include_str!("proto_members.json");
 
 pub fn shape_fixes_script() -> String {
@@ -2621,10 +2550,10 @@ const SHAPE_FIXES: &str = r#"(() => {
     } catch (e) {}
   }
   try { if (globalThis.RTCPeerConnection) Object.defineProperty(RTCPeerConnection, 'length', { value: 0, configurable: true }); } catch (e) {}
-  // Форма графа по сверке с Chrome 151 (scratchpad/walker_diff.js).
+  // Graph shape per diff against Chrome 151.
   try {
     const nat = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
-    // Метод без `.prototype` и в маске: обёртка синтаксисом метода.
+    // Method without `.prototype`, masked: wrapper with method syntax.
     const methodize = (o, k) => {
       try {
         const d = Object.getOwnPropertyDescriptor(o, k);
@@ -2637,13 +2566,13 @@ const SHAPE_FIXES: &str = r#"(() => {
         Object.defineProperty(o, k, { value: nat(m, k), writable: d.writable, enumerable: d.enumerable, configurable: true });
       } catch (e) {}
     };
-    // Итерируемые списки делят методы с Array.prototype, как у браузера.
+    // Iterable lists share methods with Array.prototype, as in the browser.
     for (const n of ['NodeList', 'DOMTokenList', 'CSSUnparsedValue', 'CSSTransformValue', 'CSSNumericArray', 'XRInputSourceArray', 'TimelineTriggerRangeList']) {
       const P = globalThis[n] && globalThis[n].prototype; if (!P) continue;
       for (const k of ['entries', 'keys', 'values', 'forEach']) { try { Object.defineProperty(P, k, { value: Array.prototype[k], writable: true, enumerable: true, configurable: true }); } catch (e) {} }
       try { Object.defineProperty(P, Symbol.iterator, { value: Array.prototype.values, writable: true, enumerable: false, configurable: true }); } catch (e) {}
     }
-    // console: прототип-пустышка, `memory`, методы без `.prototype`.
+    // console: dummy prototype, `memory`, methods without `.prototype`.
     if (globalThis.console && typeof console === 'object') {
       try { if (Object.getPrototypeOf(console) === Object.prototype) Object.setPrototypeOf(console, Object.create(Object.prototype)); } catch (e) {}
       try {
@@ -2656,7 +2585,7 @@ const SHAPE_FIXES: &str = r#"(() => {
       } catch (e) {}
       for (const k of Object.getOwnPropertyNames(console)) methodize(console, k);
     }
-    // CSS: фабрики единиц, highlights, paintWorklet, registerProperty.
+    // CSS: unit factories, highlights, paintWorklet, registerProperty.
     if (globalThis.CSS && typeof CSS === 'object') {
       const UNITS = ['Hz', 'Q', 'cap', 'ch', 'cm', 'cqb', 'cqh', 'cqi', 'cqmax', 'cqmin', 'cqw', 'deg', 'dpcm', 'dpi', 'dppx', 'dvb', 'dvh', 'dvi', 'dvmax', 'dvmin', 'dvw', 'em', 'ex', 'fr', 'grad', 'ic', 'in', 'kHz', 'lh', 'lvb', 'lvh', 'lvi', 'lvmax', 'lvmin', 'lvw', 'mm', 'ms', 'number', 'pc', 'percent', 'pt', 'px', 'rad', 'rcap', 'rch', 'rem', 'rex', 'ric', 'rlh', 's', 'svb', 'svh', 'svi', 'svmax', 'svmin', 'svw', 'turn', 'vb', 'vh', 'vi', 'vmax', 'vmin', 'vw', 'x'];
       let U = globalThis.CSSUnitValue;
@@ -2695,16 +2624,16 @@ const SHAPE_FIXES: &str = r#"(() => {
       if (typeof CSS.registerProperty !== 'function') { Object.defineProperty(CSS, 'registerProperty', { value: nat(({ registerProperty(d) { if (arguments.length < 1) throw __pt_mkErr(TypeError, "Failed to execute 'registerProperty' on 'CSS': 1 argument required, but only 0 present."); } }).registerProperty, 'registerProperty'), writable: true, enumerable: true, configurable: true }); }
       for (const k of ['escape', 'supports']) methodize(CSS, k);
     }
-    // Замороженные статические списки.
+    // Frozen static lists.
     const FROZEN_ENC = Object.freeze(['aes128gcm', 'aesgcm']);
     const FROZEN_SRC = Object.freeze(['cpu']);
     try { if (globalThis.PushManager) Object.defineProperty(PushManager, 'supportedContentEncodings', { get: nat(function () { return FROZEN_ENC; }, 'get supportedContentEncodings'), set: undefined, enumerable: true, configurable: true }); } catch (e) {}
     try { if (globalThis.PressureObserver) Object.defineProperty(PressureObserver, 'knownSources', { get: nat(function () { return FROZEN_SRC; }, 'get knownSources'), set: undefined, enumerable: true, configurable: true }); } catch (e) {}
     try { const t = globalThis.PerformanceObserver && PerformanceObserver.supportedEntryTypes; if (Array.isArray(t) && !Object.isFrozen(t)) Object.freeze(t); } catch (e) {}
-    // styleMedia: интерфейс StyleMedia с `type` и `matchMedium`.
+    // styleMedia: StyleMedia interface with `type` and `matchMedium`.
     try {
       if (globalThis.styleMedia && typeof styleMedia === 'object' && Object.getPrototypeOf(styleMedia) === Object.prototype) {
-        // Конструктор скрыт (у Chrome глобального StyleMedia нет), прототип — свой.
+        // Constructor hidden (Chrome has no global StyleMedia), own prototype.
         const SM = nat(function StyleMedia() { throw __pt_mkErr(TypeError, 'Illegal constructor'); }, 'StyleMedia');
         const P = SM.prototype;
         Object.defineProperty(P, 'type', { get: nat(function () { if (this !== styleMedia) throw __pt_mkErr(TypeError, 'Illegal invocation'); return 'screen'; }, 'get type'), enumerable: true, configurable: true });
@@ -2715,7 +2644,7 @@ const SHAPE_FIXES: &str = r#"(() => {
         Object.setPrototypeOf(styleMedia, P);
       }
     } catch (e) {}
-    // Option.prototype — прототип HTMLOptionElement, как Image/Audio.
+    // Option.prototype is HTMLOptionElement's prototype, like Image/Audio.
     try {
       if (globalThis.Option && globalThis.HTMLOptionElement && Option.prototype !== HTMLOptionElement.prototype) {
         const d = Object.getOwnPropertyDescriptor(globalThis, 'Option');
@@ -2733,11 +2662,11 @@ const SHAPE_FIXES: &str = r#"(() => {
         Object.defineProperty(globalThis, 'Option', { value: nat(O, 'Option'), writable: true, enumerable: d ? d.enumerable : false, configurable: true });
       }
     } catch (e) {}
-    // Цепочка окна: Window.prototype → WindowProperties → EventTarget.prototype.
+    // Window chain: Window.prototype -> WindowProperties -> EventTarget.prototype.
     try {
       const WPp = Object.getPrototypeOf(Window.prototype);
       if (WPp && Object.prototype.toString.call(WPp) !== '[object WindowProperties]') {
-        // Пустая прослойка над EventTarget.prototype уже есть — это она и есть.
+        // An empty layer above EventTarget.prototype already exists: that is it.
         if (WPp !== EventTarget.prototype && Object.getOwnPropertyNames(WPp).length === 0 && Object.getPrototypeOf(WPp) === EventTarget.prototype) {
           Object.defineProperty(WPp, Symbol.toStringTag, { value: 'WindowProperties', configurable: true });
         } else {
@@ -2747,24 +2676,24 @@ const SHAPE_FIXES: &str = r#"(() => {
         }
       }
     } catch (e) {}
-    // Псевдонимы webkit* — те же функции.
+    // webkit* aliases are the same functions.
     for (const [alias, orig] of [['webkitSpeechRecognition', 'SpeechRecognition'], ['webkitSpeechGrammar', 'SpeechGrammar'], ['webkitSpeechGrammarList', 'SpeechGrammarList'], ['webkitSpeechRecognitionError', 'SpeechRecognitionErrorEvent'], ['webkitSpeechRecognitionEvent', 'SpeechRecognitionEvent']]) {
       try { const d = Object.getOwnPropertyDescriptor(globalThis, alias); const o = globalThis[orig]; if (d && d.configurable && typeof o === 'function' && d.value !== o) Object.defineProperty(globalThis, alias, { value: o, writable: true, enumerable: false, configurable: true }); } catch (e) {}
     }
-    // Лишние собственные члены: remove у Text/Comment живёт на CharacterData.
+    // Extra own members: remove on Text/Comment lives on CharacterData.
     for (const n of ['Text', 'Comment']) { try { const P = globalThis[n] && globalThis[n].prototype; if (P && Object.prototype.hasOwnProperty.call(P, 'remove') && globalThis.CharacterData && 'remove' in CharacterData.prototype) delete P.remove; } catch (e) {} }
-    // Асинхронные методы — обычные функции, отдающие обещание.
+    // Async methods are plain functions returning a promise.
     for (const n of ['RTCPeerConnection']) { const P = globalThis[n] && globalThis[n].prototype; if (!P) continue; for (const k of Object.getOwnPropertyNames(P)) { try { const d = Object.getOwnPropertyDescriptor(P, k); if (d && typeof d.value === 'function' && Object.prototype.toString.call(d.value) === '[object AsyncFunction]') methodize(P, k); } catch (e) {} } }
-    // Методы без `.prototype` и в маске.
+    // Methods without `.prototype`, masked.
     for (const [o, keys] of [[globalThis.WebAssembly, ['compileStreaming', 'instantiateStreaming']], [globalThis.location, ['valueOf']], [globalThis, ['postMessage']], [globalThis.External && External.prototype, ['AddSearchProvider', 'IsSearchProviderInstalled']], [globalThis.Scheduler && Scheduler.prototype, ['postTask', 'yield']], [globalThis.Navigation && Navigation.prototype, ['entries']], [globalThis.chrome && chrome.app, ['getDetails', 'getIsInstalled', 'installState', 'runningState']], [globalThis.DOMImplementation && DOMImplementation.prototype, ['createDocument', 'createDocumentType', 'createHTMLDocument', 'hasFeature']]]) {
       if (!o) continue; for (const k of keys) methodize(o, k);
     }
     globalThis.__pt_methodize = methodize;
-    // Наследуемое не дублируется: EventTarget-методы и потоковые close/abort
-    // живут на предках, а `resume` — только у AudioContext.
-    // Свои реализации слушателей (WebSocket, Worker…) уезжают с прототипов
-    // в таблицу, а EventTarget.prototype передаёт им вызов по цепочке — так
-    // у прототипов нет чужих для браузера собственных методов.
+    // No duplicated inherited members: EventTarget methods and stream
+    // close/abort live on ancestors, `resume` only on AudioContext.
+    // Own listener implementations (WebSocket, Worker...) move off the
+    // prototypes into a table and EventTarget.prototype forwards to them, so
+    // prototypes have no own methods the browser lacks.
     try {
       const ETP = globalThis.EventTarget && EventTarget.prototype;
       const EVT = new WeakMap();
@@ -2795,14 +2724,14 @@ const SHAPE_FIXES: &str = r#"(() => {
     } catch (e) {}
     try { const P = globalThis.FileSystemWritableFileStream && FileSystemWritableFileStream.prototype; if (P && globalThis.WritableStream) for (const k of ['close', 'abort']) if (Object.prototype.hasOwnProperty.call(P, k) && k in WritableStream.prototype) delete P[k]; } catch (e) {}
     try { const B = globalThis.BaseAudioContext && BaseAudioContext.prototype, A = globalThis.AudioContext && AudioContext.prototype; if (B && A && Object.prototype.hasOwnProperty.call(B, 'resume') && Object.prototype.hasOwnProperty.call(A, 'resume')) delete B.resume; } catch (e) {}
-    // toString у единиц CSS — на CSSNumericValue.prototype, как у браузера.
+    // toString of CSS units lives on CSSNumericValue.prototype, as in the browser.
     try { const SV = globalThis.CSSStyleValue && CSSStyleValue.prototype, U = globalThis.CSSUnitValue && CSSUnitValue.prototype; if (SV && U && Object.prototype.hasOwnProperty.call(U, 'toString')) { const d = Object.getOwnPropertyDescriptor(U, 'toString'); Object.defineProperty(SV, 'toString', d); delete U.toString; } } catch (e) {}
-    // chrome.loadTimes/csi: безымянные функции с `.prototype`, но родные на вид.
+    // chrome.loadTimes/csi: anonymous functions with `.prototype`, but native-looking.
     try { if (globalThis.chrome && globalThis.__pt_native) for (const k of ['loadTimes', 'csi']) if (typeof chrome[k] === 'function') __pt_native(chrome[k]); } catch (e) {}
   } catch (e) {}
-  // Navigation API: `navigation.currentEntry` и `navigation.activation` — у
-  // Chrome это объекты с адресом и ключами записи; у нас заглушка отвечала
-  // undefined, и страница, читающая их поля, падала.
+  // Navigation API: Chrome's `navigation.currentEntry` and
+  // `navigation.activation` are objects with URL and entry keys; pages read
+  // their fields.
   try {
     const N = globalThis.Navigation, nav = globalThis.navigation;
     const natn = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
@@ -2847,9 +2776,8 @@ const SHAPE_FIXES: &str = r#"(() => {
     }
   } catch (e) {}
   try { for (const k of ['permission', 'maxActions', 'requestPermission']) redo(globalThis.Notification, k); } catch (e) {}
-  // `tabIndex` отражается в атрибут `tabindex`, как у браузера: заглушка
-  // таблицы имён держала число в ячейке, и `el.tabIndex = -1` не оставлял
-  // следа в разметке (челлендж так помечает свой скрытый кадр).
+  // `tabIndex` reflects to the `tabindex` attribute, as in the browser (the
+  // challenge marks its hidden frame with `el.tabIndex = -1`).
   try {
     const HP = globalThis.HTMLElement && HTMLElement.prototype;
     const natn = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
@@ -2867,8 +2795,8 @@ const SHAPE_FIXES: &str = r#"(() => {
       });
     }
   } catch (e) {}
-  // `window.postMessage` самому себе: сообщение приходит задачей, со своим
-  // источником и origin. Заглушка таблицы имён ничего не доставляла.
+  // `window.postMessage` to self: the message arrives as a task with its own
+  // source and origin.
   try {
     const natp = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
     const pm = function postMessage(message, targetOrigin) {
@@ -2895,18 +2823,18 @@ const SHAPE_FIXES: &str = r#"(() => {
     const d = Object.getOwnPropertyDescriptor(globalThis, 'postMessage');
     if (!d || d.configurable) Object.defineProperty(globalThis, 'postMessage', { value: natp(pm, 'postMessage'), writable: true, enumerable: true, configurable: true });
   } catch (e) {}
-  // Планировщик: `postTask` отдаёт итог задачи обещанием, `yield` — пустое.
-  // Ставится здесь, поверх заглушек таблицы имён.
+  // Scheduler: `postTask` resolves with the task's result, `yield` with
+  // nothing. Installed over the name table's stubs.
   try {
     let SP = globalThis.scheduler && Object.getPrototypeOf(globalThis.scheduler);
-    // У голого объекта прототип — Object.prototype: туда нельзя.
+    // For a bare object the prototype is Object.prototype: can't go there.
     if (SP === Object.prototype) SP = globalThis.scheduler;
     const nat = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
     if (SP) {
       Object.defineProperty(SP, 'postTask', { value: nat(function postTask(cb, opts) {
         const delay = opts && Number(opts.delay) > 0 ? Number(opts.delay) : 0;
         const prio = String((opts && opts.priority) || (opts && opts.signal && opts.signal.priority) || 'user-visible');
-        // user-blocking/user-visible — раньше таймеров, background — как простой.
+        // user-blocking/user-visible run before timers, background like a plain one.
         return new Promise((res, rej) => {
           const run = () => { try { res(cb()); } catch (e) { rej(e); } };
           if (prio === 'background') setTimeout(run, delay + 18);
@@ -2917,11 +2845,11 @@ const SHAPE_FIXES: &str = r#"(() => {
       Object.defineProperty(SP, 'yield', { value: nat(function () { return new Promise((r) => setTimeout(r, 0)); }, 'yield'), writable: true, enumerable: true, configurable: true });
     }
   } catch (e) {}
-  // Статические члены конструкторов и пространств имён — как у Chrome 151:
-  // порядок, флаги описаний, длины и имена функций, без `.prototype`.
+  // Constructor and namespace statics as in Chrome 151: order, descriptor
+  // flags, function lengths and names, no `.prototype`.
   try { if (typeof globalThis.__pt_installRtcCaps === 'function') __pt_installRtcCaps(); } catch (e) {}
-  // ONLY — набор корней: после восстановления из снимка V8 проходим только
-  // то, что V8 доставил сам (см. __pt_lateShape ниже).
+  // ONLY is a set of roots: after a V8 snapshot restore only what V8 added
+  // itself is processed (see __pt_lateShape below).
   const ctorStatics = (ONLY) => { try {
     const TAB = __CTOR_STATICS__;
     const NS = new Set(['console', 'CSS', 'WebAssembly']);
@@ -2956,7 +2884,7 @@ const SHAPE_FIXES: &str = r#"(() => {
           } else if (kind[0] === 'a') {
             const gm = /g...\/([^/]*)\/(\d+)/.exec(kind), sm = /s...\/([^/]*)\/(\d+)/.exec(kind);
             const desc = { enumerable, configurable };
-            // Значение, которое лежало данными, теперь отдаёт геттер (frozen-списки, highlights…).
+            // A value that was a data property now comes from a getter (frozen lists, highlights...).
             if (gm) { const val = d && 'value' in d ? d.value : undefined; const g = d && d.get ? d.get : function () { return val; }; desc.get = shapeFn(g, gm[1], +gm[2]); }
             if (sm) { const st = d && d.set ? d.set : function (v) {}; desc.set = shapeFn(st, sm[1], +sm[2]); }
             Object.defineProperty(I, k, desc);
@@ -2971,9 +2899,9 @@ const SHAPE_FIXES: &str = r#"(() => {
     }
   } catch (e) {} };
   ctorStatics(null);
-  // Члены прототипов — по хромовской таблице: имя, длина, строгость, отсутствие
-  // `.prototype` у методов и аксессоров, родной toString; лишний setter
-  // снимается. Недостающих членов не добавляем (см. заметку про Performance*).
+  // Prototype members per Chrome's table: name, length, strictness, no
+  // `.prototype` on methods and accessors, native toString; an extra setter
+  // is removed. Missing members are not added (see the Performance* note).
   const protoMembers = (ONLY) => { try {
     const PS = __PROTO_MEMBERS__;
     const nat = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
@@ -2981,7 +2909,7 @@ const SHAPE_FIXES: &str = r#"(() => {
     const isNativeF = globalThis.__pt_isNative ? __pt_isNative : ((f) => { try { return /\[native code\]/.test(Function.prototype.toString.call(f)); } catch (e) { return false; } });
     const resolve = (path) => { let o = globalThis; for (const part of path.split('.')) { if (o === null || o === undefined) return null; o = part === '__proto__' ? Object.getPrototypeOf(o) : o[part]; } return o; };
     const fixFn = (f, key, sig, kindName) => {
-      // sig = "Nsp/name/len": родной, строгий, без prototype.
+      // sig = "Nsp/name/len": native, strict, no prototype.
       const m = /^(.)(.)(.)\/(.*)\/(\d+)$/.exec(sig); if (!m) return f;
       const wantStrict = m[2] === 's', wantNoProto = m[3] === 'p', name = m[4], len = +m[5];
       let g = f;
@@ -3011,7 +2939,7 @@ const SHAPE_FIXES: &str = r#"(() => {
           if (kind[0] === 'f') {
             if (typeof d.value !== 'function') continue;
             const f0 = d.value;
-            // Быстрый путь: длина, имя, нативность и отсутствие prototype уже сошлись.
+            // Fast path: length, name, nativeness and no prototype already match.
             if (d.enumerable === enumerable && d.writable === writable && kind[3] === 'p' && !Object.prototype.hasOwnProperty.call(f0, 'prototype') && isNativeF(f0)) {
               const m0 = /^f...\/(.*)\/(\d+)$/.exec(kind);
               if (m0 && f0.name === m0[1] && f0.length === +m0[2] && isStrictF(f0)) continue;
@@ -3033,9 +2961,9 @@ const SHAPE_FIXES: &str = r#"(() => {
     }
   } catch (e) {} };
   protoMembers(null);
-  // То, что V8 доставляет при восстановлении из снимка (WebAssembly,
-  // DisposableStack…), загрузчик при сборке не видел: повторяем для этих
-  // имён ровно те проходы, что их касаются, в том же порядке.
+  // What V8 adds on snapshot restore (WebAssembly, DisposableStack...) was not
+  // seen by the loader at build time: rerun exactly the passes that concern
+  // those names, in the same order.
   if (globalThis.__pt_lateNames) {
     const late = __pt_lateNames;
     Object.defineProperty(globalThis, '__pt_lateShape', { writable: true, configurable: true, value: () => {
@@ -3045,10 +2973,10 @@ const SHAPE_FIXES: &str = r#"(() => {
       protoMembers(late);
     } });
   }
-  // Символьные члены прототипов — как у Chrome 151 (снято syms_probe.js):
-  // списки перебираются Array.prototype.values, maplike — своим entries,
-  // setlike — своим values; метка типа идёт первой; у пяти узловых
-  // интерфейсов — Symbol.unscopables с прототипом null.
+  // Symbol-keyed prototype members as in Chrome 151:
+  // lists iterate with Array.prototype.values, maplike with its own entries,
+  // setlike with its own values; the type tag comes first; five node
+  // interfaces have Symbol.unscopables with a null prototype.
   try {
     const ARR = ['TouchList', 'TextTrackList', 'TextTrackCueList', 'StyleSheetList', 'SourceBufferList', 'SVGTransformList', 'SVGStringList', 'SVGPointList', 'SVGNumberList', 'SVGLengthList', 'RadioNodeList', 'Plugin', 'NamedNodeMap', 'MediaList', 'HTMLSelectElement', 'HTMLOptionsCollection', 'HTMLFormElement', 'HTMLFormControlsCollection', 'HTMLAllCollection', 'FileList', 'DataTransferItemList', 'DOMStringList', 'DOMRectList', 'CSSStyleDeclaration', 'CSSRuleList', 'CSSKeyframesRule', 'ImageTrackList', 'SpeechGrammarList', 'HTMLCollection', 'PluginArray', 'MimeTypeArray', 'NodeList', 'DOMTokenList', 'CSSNumericArray', 'CSSTransformValue', 'CSSUnparsedValue'];
     const MAPL = ['StylePropertyMapReadOnly', 'RTCStatsReport', 'HighlightRegistry', 'EventCounts', 'AudioParamMap', 'MIDIInputMap', 'MIDIOutputMap', 'MediaKeyStatusMap', 'XRHand', 'Headers', 'FormData', 'URLSearchParams'];
@@ -3056,7 +2984,7 @@ const SHAPE_FIXES: &str = r#"(() => {
     const UNSC = { Element: ['after', 'append', 'before', 'prepend', 'remove', 'replaceChildren', 'replaceWith', 'slot'], DocumentType: ['after', 'before', 'remove', 'replaceWith'], DocumentFragment: ['append', 'prepend', 'replaceChildren'], Document: ['append', 'fullscreen', 'prepend', 'replaceChildren'], CharacterData: ['after', 'before', 'remove', 'replaceWith'] };
     const nat2 = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
     const retag = (P, name) => {
-      // Метка типа — данные, неперечислимые; переставляется первой среди символов.
+      // The type tag is a non-enumerable data property, moved first among symbols.
       const d = Object.getOwnPropertyDescriptor(P, Symbol.toStringTag);
       if (d && !d.configurable) return;
       const it = Object.getOwnPropertyDescriptor(P, Symbol.iterator);
@@ -3089,8 +3017,8 @@ const SHAPE_FIXES: &str = r#"(() => {
       Object.defineProperty(P, Symbol.unscopables, { value: o, writable: false, enumerable: false, configurable: true });
     }
   } catch (e) {}
-  // Члены, которые у Chrome живут выше по цепочке (Node, CharacterData), а у
-  // нас дублировались на Text/Comment/Element; Worker без onmessageerror.
+  // Members Chrome keeps higher in the chain (Node, CharacterData) that we
+  // duplicated on Text/Comment/Element; Worker without onmessageerror.
   try {
     const hasOwnP = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
     const CD = globalThis.CharacterData && CharacterData.prototype, NP = globalThis.Node && Node.prototype;
@@ -3102,7 +3030,7 @@ const SHAPE_FIXES: &str = r#"(() => {
     }
     if (globalThis.Element && NP) for (const k of ['nodeName', 'parentElement']) if (hasOwnP(NP, k)) delete Element.prototype[k];
     if (globalThis.Worker && Worker.prototype) delete Worker.prototype.onmessageerror;
-    // HTMLOptionsCollection: length и selectedIndex — аксессоры с сеттерами, через <select>.
+    // HTMLOptionsCollection: length and selectedIndex are accessors with setters, via <select>.
     if (globalThis.HTMLOptionsCollection && typeof __pt_selSetLength === 'function') {
       const OC = HTMLOptionsCollection.prototype;
       const nat2 = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
@@ -3112,11 +3040,11 @@ const SHAPE_FIXES: &str = r#"(() => {
       Object.defineProperty(OC, 'selectedIndex', { get: nat2(({ get selectedIndex() { const s = own(this); return s ? s.selectedIndex : -1; } }).__lookupGetter__('selectedIndex')),
         set: nat2(({ set selectedIndex(v) { const s = own(this); if (s) __pt_selSetIndex(s, v); } }).__lookupSetter__('selectedIndex')), enumerable: true, configurable: true });
     }
-    // SVGElement.className — SVGAnimatedString, только чтение.
+    // SVGElement.className is a read-only SVGAnimatedString.
     if (globalThis.SVGElement) { const d = Object.getOwnPropertyDescriptor(SVGElement.prototype, 'className'); if (d && d.set) Object.defineProperty(SVGElement.prototype, 'className', { get: d.get, set: undefined, enumerable: true, configurable: true }); }
-    // styleMedia: метка типа — на прототипе, а не на самом объекте.
+    // styleMedia: the type tag lives on the prototype, not the object.
     try { const smd = Object.getOwnPropertyDescriptor(styleMedia, Symbol.toStringTag); if (smd && smd.configurable) { delete styleMedia[Symbol.toStringTag]; const SP = Object.getPrototypeOf(styleMedia); if (SP && !Object.prototype.hasOwnProperty.call(SP, Symbol.toStringTag)) Object.defineProperty(SP, Symbol.toStringTag, { value: 'StyleMedia', configurable: true }); } } catch (e) {}
-    // location[Symbol.toPrimitive] — неподделываемое undefined, как у браузера.
+    // location[Symbol.toPrimitive] is a non-configurable undefined, as in the browser.
     try { if (!Object.getOwnPropertyDescriptor(location, Symbol.toPrimitive)) Object.defineProperty(location, Symbol.toPrimitive, { value: undefined, writable: false, enumerable: false, configurable: false }); } catch (e) {}
     if (globalThis.MediaDevices) {
       const MP = MediaDevices.prototype, d = Object.getOwnPropertyDescriptor(MP, 'ondevicechange');
@@ -3149,16 +3077,16 @@ const SHAPE_FIXES: &str = r#"(() => {
       }
     }
   } catch (e) {}
-  // Встроенный ИИ Chrome 151 (LanguageModel, Summarizer, Translator,
-  // LanguageDetector): availability() — обещание строки. В окне верхнего
-  // уровня модели «downloadable» (детектор языка — «available»), create()
-  // без жеста пользователя отказывает NotAllowedError; в стороннем кадре без
-  // разрешения политики — «unavailable» и отказ «Access denied…». Заглушки
-  // отдавали undefined, и секция CMJGg7 отчёта писала ошибку вместо
-  // «unavailable». Сверено на scratchpad/ai_probe2.js (страница и кадр).
+  // Chrome 151 built-in AI (LanguageModel, Summarizer, Translator,
+  // LanguageDetector): availability() resolves to a string. In a top-level
+  // window models are "downloadable" (language detector "available"), and
+  // create() without a user gesture rejects with NotAllowedError; in a
+  // cross-site frame without policy permission: "unavailable" and "Access
+  // denied...". Report section CMJGg7 reads this. Checked against Chrome 151
+  // (page and frame).
   try {
     const nat = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
-    // Флаг стороннего кадра ставится после загрузчика — читаем при вызове.
+    // The cross-site frame flag is set after the loader: read at call time.
     const isCross = () => !!globalThis.__pt_crossSite;
     const dom = (msg, name) => (typeof DOMException === 'function' ? __pt_mkErr(DOMException, msg, name) : new Error(msg));
     const GESTURE = 'Requires a user gesture when availability is "downloading" or "downloadable".';
@@ -3185,14 +3113,14 @@ const SHAPE_FIXES: &str = r#"(() => {
       }
     }
   } catch (e) {}
-  // Поздние методы без `.prototype`: postMessage, scheduler, navigation.
+  // Late methods without `.prototype`: postMessage, scheduler, navigation.
   try { const mz = globalThis.__pt_methodize; if (typeof mz === 'function') { for (const [o, keys] of [[globalThis, ['postMessage']], [globalThis.Scheduler && Scheduler.prototype, ['postTask', 'yield']], [globalThis.Navigation && Navigation.prototype, ['entries']]]) { if (!o) continue; for (const k of keys) mz(o, k); } } delete globalThis.__pt_methodize; } catch (e) {}
-  // Объект интерфейса наследует объект родителя (WebIDL): у Chrome
-  // Object.getPrototypeOf(HTMLDivElement) === HTMLElement, Worker → EventTarget.
-  // У нас все 532 таких конструктора смотрели прямо в Function.prototype.
-  // Родитель — ближайший по цепочке прототип со своим `constructor`, который
-  // стоит на окне под своим именем. Кроме встроенного в язык (у него своё) и
-  // фабрик Image/Audio/Option и DOMException — у Chrome они прямо от Function.
+  // An interface object inherits its parent's (WebIDL): in Chrome
+  // Object.getPrototypeOf(HTMLDivElement) === HTMLElement, Worker -> EventTarget.
+  // The parent is the nearest prototype in the chain with its own
+  // `constructor` exposed on window under its name. Except language builtins
+  // (they have their own) and the Image/Audio/Option factories and
+  // DOMException, which Chrome derives straight from Function.
   try {
     const SKIP = new Set(['Image', 'Audio', 'Option', 'DOMException', 'Object', 'Function', 'Array', 'Error',
       'AggregateError', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError', 'URIError', 'SuppressedError',
@@ -3218,9 +3146,8 @@ const SHAPE_FIXES: &str = r#"(() => {
       if (parent) { try { Object.setPrototypeOf(C, parent); } catch (e) {} }
     }
   } catch (e) {}
-  // InputDeviceCapabilities: firesTouchEvents — из словаря конструктора
-  // (по умолчанию false); заглушка отвечала undefined, а у мышиного ввода
-  // Chrome это объект с false.
+  // InputDeviceCapabilities: firesTouchEvents comes from the constructor dict
+  // (default false); for mouse input Chrome gives an object with false.
   try {
     const C = globalThis.InputDeviceCapabilities;
     if (typeof C === 'function' && C.prototype) {
@@ -3240,9 +3167,9 @@ pub fn window_order_script() -> String {
 }
 
 const WINDOW_ORDER_TEMPLATE: &str = r#"(() => {
-  // Служебные имена движка (`__pt…`, `__…`) не должны перечисляться ни на
-  // прототипах интерфейсов, ни на окне: `for…in` по узлу у Chrome их не
-  // показывает. Ищем их самим for…in — его фильтр интроспекции не трогает.
+  // Engine-internal names (`__pt...`, `__...`) must not enumerate on interface
+  // prototypes or on window: Chrome's `for...in` over a node does not show them.
+  // Found with for...in itself, which the introspection filter leaves alone.
   try {
     const GOPN = globalThis.__pt_rawGOPN || Object.getOwnPropertyNames, GOPD = globalThis.__pt_rawGOPD || Object.getOwnPropertyDescriptor;
     const hideOn = (o) => {
@@ -3292,12 +3219,12 @@ pub fn late_originals_script() -> String {
     if (N) { keep.appendChild = N.appendChild; keep.insertBefore = N.insertBefore; }
     const E = globalThis.Element && Element.prototype;
     if (E) keep.setAttribute = E.setAttribute;
-    // Двумерный контекст: `createImageBitmap` у нас рисует через него, и эти
-    // два вызова видел бы всякий, кто обернул рисование.
+    // 2D context: our `createImageBitmap` draws through it, and anyone wrapping
+    // drawing would see these two calls.
     const X = globalThis.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype;
     if (X) { keep.drawImage = X.drawImage; keep.putImageData = X.putImageData; }
-    // Методы GL — целиком: наш WebGPU лежит поверх WebGL и зовёт их десятками,
-    // а страница может обернуть любой. Снимок делается один раз, отсюда.
+    // All GL methods: our WebGPU sits on WebGL and calls dozens of them, and
+    // the page can wrap any. Captured once, here.
     for (const N of ['WebGLRenderingContext', 'WebGL2RenderingContext']) {
       const C = globalThis[N];
       if (!C || !C.prototype) continue;
@@ -3310,7 +3237,7 @@ pub fn late_originals_script() -> String {
     }
     Object.defineProperty(globalThis, '__pt_orig',
       { value: keep, enumerable: false, configurable: true, writable: true });
-    // Старое имя — для слоёв, снятых до переименования.
+    // Old name, for layers captured before the rename.
     Object.defineProperty(globalThis, '__pt_canvasOrig',
       { value: keep, enumerable: false, configurable: true, writable: true });
   } catch (e) {}
@@ -3324,16 +3251,14 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
 (() => {{
   const NAME = {name};
   const URL_ = {url};
-  // Форма снята с настоящего воркера Chrome 148, уровень за уровнем: у самой
-  // области 334 собственных имени (12 перечислимых), у WorkerGlobalScope — 30,
-  // у DedicatedWorkerGlobalScope — TEMPORARY и PERSISTENT. Оконный контекст
-  // отдаёт больше тысячи имён на первом же уровне, и перечисление `self` —
-  // первое, что делает сборщик отпечатков внутри воркера.
-  // Форма интерфейсного объекта. Обычная функция несёт собственные `arguments`
-  // и `caller` — у браузерного интерфейса их нет, и обход графа видит два лишних
-  // имени на каждом из девятисот имён. Строгая функция несёт ровно
-  // `length, name, prototype`, и, в отличие от класса, бросает «Illegal
-  // constructor» и на вызов без `new` — как настоящий интерфейс.
+  // Shape captured from a real Chrome 148 worker, level by level: the scope
+  // has 334 own names (12 enumerable), WorkerGlobalScope 30,
+  // DedicatedWorkerGlobalScope TEMPORARY and PERSISTENT. A window context
+  // exposes over a thousand names at the first level, and enumerating `self`
+  // is the first thing a fingerprinter does inside a worker.
+  // Interface object shape: a strict function has exactly `length, name,
+  // prototype` (no `arguments`/`caller`) and, unlike a class, throws
+  // "Illegal constructor" when called without `new` too.
   const __ptIllegal = (function () {{
     'use strict';
     return function () {{ return function () {{ throw __pt_mkErr(TypeError, 'Illegal constructor'); }}; }};
@@ -3348,12 +3273,12 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
   const SCOPE_ENUM = new Set(__WORKER_SCOPE_ENUM__);
   const NAV_KEYS = __WORKER_NAV__;
 
-  // 1. Уровень WorkerGlobalScope: то, что в браузере лежит на прототипе, туда и
-  //    переезжает вместе со своей реализацией.
+  // 1. WorkerGlobalScope level: what the browser keeps on the prototype moves
+  //    there along with its implementation.
   const EventTargetProto = (globalThis.EventTarget && EventTarget.prototype) || Object.prototype;
-  // Глобальный объект рождён шаблоном V8 и сменить прототип не даёт (как у
-  // Chrome): звенья окна (Window.prototype, WindowProperties) становятся
-  // звеньями воркера, очищенными от оконного.
+  // The global is born from a V8 template and its prototype cannot change
+  // (as in Chrome): the window links (Window.prototype, WindowProperties)
+  // become worker links, cleared of window members.
   const __T = globalThis.__pt_protos;
   const __reuse = !!(__T && __T.w && Object.getPrototypeOf(globalThis) === __T.w && Object.getPrototypeOf(__T.wp) === EventTargetProto);
   const __clear = (o) => {{ for (const k of Reflect.ownKeys(o)) {{ try {{ delete o[k]; }} catch (e) {{}} }} return o; }};
@@ -3367,7 +3292,7 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
     }}
   }}
 
-  // 2. Всё, чего в воркере нет вовсе — прочь. Интерфейсы DOM в том числе.
+  // 2. Remove everything workers lack, DOM interfaces included.
   for (const k of Object.getOwnPropertyNames(globalThis)) {{
     if (OWN.has(k) || k.lastIndexOf('__pt', 0) === 0 || k === '__out') continue;
     try {{ delete globalThis[k]; }} catch (e) {{}}
@@ -3382,8 +3307,8 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
     }} catch (e) {{}}
   }}
 
-  // 3. WorkerNavigator: то же устройство, обрезанный интерфейс.
-  // Оконный navigator уже переехал на прототип на шаге 1 — значения берём оттуда.
+  // 3. WorkerNavigator: same device, trimmed interface.
+  // The window navigator already moved to the prototype in step 1: read values from there.
   let win = null;
   try {{ win = wgsProto.navigator; }} catch (e) {{}}
   const navProto = {{}};
@@ -3401,11 +3326,10 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
   const workerNavigator = Object.create(navProto);
   Object.defineProperty(wgsProto, 'navigator', {{ get: () => workerNavigator, enumerable: true, configurable: true }});
 
-  // 4. WorkerLocation — адрес самого скрипта. У воркера из блоба схема
-  //    непрозрачная: `href` — это `blob:<внутренний адрес>` целиком, `pathname`
-  //    — весь остаток, хоста и порта нет вовсе, а `origin` берётся у страницы,
-  //    которая блоб создала. Разбирать такой адрес как обычный `http:` — значит
-  //    выдать `blob://http://…`, чего браузер не печатал никогда.
+  // 4. WorkerLocation is the script's own URL. A blob worker has an opaque
+  //    scheme: `href` is the whole `blob:<inner URL>`, `pathname` is the
+  //    rest, no host or port, and `origin` is the creating page's. Parsing it
+  //    as plain `http:` would yield `blob://http://...`.
   const locProto = {{}};
   const opaque = URL_.lastIndexOf('blob:', 0) === 0 || URL_.lastIndexOf('data:', 0) === 0;
   let parts = null;
@@ -3433,8 +3357,8 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
   const workerLocation = Object.create(locProto);
   Object.defineProperty(wgsProto, 'location', {{ get: () => workerLocation, enumerable: true, configurable: true }});
 
-  // 5. Сама цепочка: globalThis → DedicatedWorkerGlobalScope → WorkerGlobalScope
-  //    → EventTarget → Object, как в браузере.
+  // 5. The chain: globalThis -> DedicatedWorkerGlobalScope -> WorkerGlobalScope
+  //    -> EventTarget -> Object, as in the browser.
   const WorkerGlobalScope = __ptName(__ptIllegal(), 'WorkerGlobalScope');
   WorkerGlobalScope.prototype = wgsProto;
   Object.defineProperty(wgsProto, 'constructor', {{ value: WorkerGlobalScope, writable: true, configurable: true }});
@@ -3445,21 +3369,21 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
   const DedicatedWorkerGlobalScope = __ptName(__ptIllegal(), 'DedicatedWorkerGlobalScope');
   DedicatedWorkerGlobalScope.prototype = dwgsProto;
   Object.defineProperty(dwgsProto, 'constructor', {{ value: DedicatedWorkerGlobalScope, writable: true, configurable: true }});
-  // Константы интерфейса, как у Chrome: только чтение, неудаляемые.
+  // Interface constants as in Chrome: read-only, non-configurable.
   try {{ Object.defineProperty(dwgsProto, 'TEMPORARY', {{ value: 0, writable: false, enumerable: true, configurable: false }}); }} catch (e) {{}}
   try {{ Object.defineProperty(dwgsProto, 'PERSISTENT', {{ value: 1, writable: false, enumerable: true, configurable: false }}); }} catch (e) {{}}
   try {{ Object.defineProperty(dwgsProto, Symbol.toStringTag, {{ value: 'DedicatedWorkerGlobalScope', configurable: true }}); }} catch (e) {{}}
   globalThis.WorkerGlobalScope = WorkerGlobalScope;
   globalThis.DedicatedWorkerGlobalScope = DedicatedWorkerGlobalScope;
-  // Объекты интерфейсов наследуют родителей, как на окне (WebIDL).
+  // Interface objects inherit their parents, as on window (WebIDL).
   try {{ if (typeof EventTarget === 'function') Object.setPrototypeOf(WorkerGlobalScope, EventTarget); }} catch (e) {{}}
   try {{ Object.setPrototypeOf(DedicatedWorkerGlobalScope, WorkerGlobalScope); }} catch (e) {{}}
   try {{ Object.setPrototypeOf(globalThis, dwgsProto); }} catch (e) {{}}
-  // Окно называло себя окном — здесь это имя принадлежит прототипу области.
+  // The window's own tag: here the name belongs to the scope prototype.
   try {{ delete globalThis[Symbol.toStringTag]; }} catch (e) {{}}
 
-  // 6. Чего у нас не было вовсе — доставляем заглушками той же категории, что и
-  //    в браузере: воркерные синхронные API и трансформы RTC.
+  // 6. Missing entirely: stubs of the same kind as in the browser (worker
+  //    sync APIs and RTC transforms).
   for (const [k, kind] of [['FileReaderSync', 'N'], ['FileSystemSyncAccessHandle', 'N'],
     ['RTCRtpScriptTransformer', 'N'], ['RTCTransformEvent', 'N'],
     ['webkitRequestFileSystemSync', 'N'], ['webkitResolveLocalFileSystemSyncURL', 'N'],
@@ -3476,7 +3400,7 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
       }});
     }} catch (e) {{}}
   }}
-  // RTCTransformEvent — событие: и объект, и прототип наследуют Event.
+  // RTCTransformEvent is an event: both object and prototype inherit Event.
   try {{
     const E = globalThis.RTCTransformEvent;
     if (typeof E === 'function' && typeof Event === 'function' && E.prototype) {{
@@ -3494,7 +3418,7 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
     const fonts = {{ ready: Promise.resolve(), check: () => true, load: () => Promise.resolve([]), size: 0 }};
     try {{ Object.defineProperty(wgsProto, 'fonts', {{ get: () => fonts, enumerable: true, configurable: true }}); }} catch (e) {{}}
   }}
-  // Интерфейсы воркерной области перечислимыми не бывают.
+  // Worker scope interfaces are never enumerable.
   for (const k of ['WorkerGlobalScope', 'DedicatedWorkerGlobalScope', 'WorkerNavigator', 'WorkerLocation']) {{
     try {{
       const d = Object.getOwnPropertyDescriptor(globalThis, k);
@@ -3502,46 +3426,42 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
     }} catch (e) {{}}
   }}
 
-  // 7. Порт наружу. Обе стороны порта — родные методы области, и `toString`
-  //    у них такой же, как у остальных: воркер, чей `postMessage` показывает
-  //    исходник, — не воркер.
+  // 7. The outbound port. Both sides are native scope methods with the same
+  //    `toString` as the rest; a `postMessage` showing its source betrays us.
   globalThis.name = NAME;
   const native = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
   const outbox = [];
   globalThis.__pt_drainWorkerOut = () => outbox.splice(0);
   globalThis.postMessage = native(function postMessage(data) {{
-    // Клонируем, а не сериализуем: на той стороне ждут тех же типов.
+    // Cloned, not serialized: the other side expects the same types.
     try {{ outbox.push(__pt_cloneEncode(data)); }} catch (e) {{ outbox.push('null'); }}
   }});
   globalThis.close = native(function close() {{ globalThis.__ptClosed = true; }});
   globalThis.__pt_workerDeliver = (json) => {{
     let data = null;
     try {{ data = __pt_cloneDecode(json); }} catch (e) {{}}
-    // У выделенного воркера `origin` пустой, а `source` — null: сообщение
-    // пришло по порту, а не от окна.
+    // A dedicated worker's message has empty `origin` and null `source`: it
+    // came through a port, not from a window.
     let ev;
     try {{ ev = new MessageEvent('message', {{ data, origin: '', lastEventId: '', source: null, ports: [] }}); }} catch (e) {{
       ev = {{ type: 'message', data, origin: '', lastEventId: '', source: null, ports: [] }};
     }}
     try {{ __pt_write(ev, 'target', globalThis); __pt_write(ev, 'currentTarget', globalThis); }} catch (e) {{}}
-    // Событие доставляет движок, а движок здесь — браузер: оно доверенное.
-    // Сборщик Cloudflare исполняет присланное задание только под условием
-    // `e.isTrusted && '' === e.origin && null === e.source`, и без первого
-    // из трёх воркер молча ничего не делал.
+    // Delivered by the engine, i.e. the browser: the event is trusted.
+    // Cloudflare's collector runs the posted job only if
+    // `e.isTrusted && '' === e.origin && null === e.source`.
     try {{ if (globalThis.__pt_trustEvent) __pt_trustEvent(ev); else ev.isTrusted = true; }} catch (e) {{}}
-    // Одна доставка, а не две: `dispatchEvent` сам зовёт и слушателей, и
-    // `onmessage`. Звать обоих — значит выполнить обработчик дважды, чего в
-    // браузере не бывает и что ломает любой счётчик внутри воркера.
+    // One delivery: `dispatchEvent` calls both listeners and `onmessage`;
+    // calling both would run the handler twice.
     if (typeof globalThis.dispatchEvent === 'function') {{
       try {{ globalThis.dispatchEvent(ev); return; }} catch (e) {{}}
     }}
     try {{ if (typeof globalThis.onmessage === 'function') globalThis.onmessage(ev); }} catch (e) {{}}
   }};
 
-  // OPFS в воркере — не тот же, что в окне: только здесь есть синхронная ручка
-  // (`FileSystemSyncAccessHandle`), и именно её берёт проба челленджа. Блок тот
-  // же, что и на странице, но собирается заново — в окне синхронного имени нет
-  // вовсе, и там оно не могло быть установлено.
+  // Worker OPFS differs from the window's: only here is there a sync handle
+  // (`FileSystemSyncAccessHandle`), which the challenge probe uses. Same
+  // block as the page's but built anew, since the window lacks the sync name.
 __OPFS__
   try {{
     const st = globalThis.navigator && globalThis.navigator.storage;
@@ -3554,36 +3474,35 @@ __OPFS__
       }});
     }}
   }} catch (e) {{}}
-  // Набор шрифтов у воркера — настоящий интерфейс: `self.fonts` там
-  // `FontFaceSet`, а не безымянный объект, и само имя лежит на области. Члены
-  // и вид описаний сняты с Chrome 151.
+  // Worker font set is a real interface: `self.fonts` is a `FontFaceSet` and
+  // the name lives on the scope. Members and descriptors from Chrome 151.
   try {{
     const fonts = globalThis.fonts;
     if (fonts && typeof globalThis.FontFaceSet !== 'function') {{
       const FontFaceSet = __ptName(__ptIllegal(), 'FontFaceSet');
       const P = Object.create(EventTargetProto);
-      const нат = (f, n) => (globalThis.__pt_native ? __pt_native(__ptName(f, n)) : __ptName(f, n));
+      const nat = (f, n) => (globalThis.__pt_native ? __pt_native(__ptName(f, n)) : __ptName(f, n));
       for (const [k, v] of [['onloading', null], ['onloadingdone', null], ['onloadingerror', null]]) {{
         let store = v;
         Object.defineProperty(P, k, {{
-          get: нат(function () {{ return store; }}, 'get ' + k),
-          set: нат(function (x) {{ store = x; }}, 'set ' + k),
+          get: nat(function () {{ return store; }}, 'get ' + k),
+          set: nat(function (x) {{ store = x; }}, 'set ' + k),
           enumerable: true, configurable: true,
         }});
       }}
       Object.defineProperty(P, 'ready', {{
-        get: нат(function () {{ return Promise.resolve(this); }}, 'get ready'),
+        get: nat(function () {{ return Promise.resolve(this); }}, 'get ready'),
         enumerable: true, configurable: true,
       }});
       Object.defineProperty(P, 'status', {{
-        get: нат(function () {{ return 'loaded'; }}, 'get status'),
+        get: nat(function () {{ return 'loaded'; }}, 'get status'),
         enumerable: true, configurable: true,
       }});
       Object.defineProperty(P, 'size', {{
-        get: нат(function () {{ return 0; }}, 'get size'),
+        get: nat(function () {{ return 0; }}, 'get size'),
         enumerable: true, configurable: true,
       }});
-      const члены = {{
+      const members = {{
         check: function check() {{ return true; }},
         load: function load() {{ return Promise.resolve([]); }},
         add: function add() {{ return this; }},
@@ -3595,9 +3514,9 @@ __OPFS__
         keys: function keys() {{ return [][Symbol.iterator](); }},
         values: function values() {{ return [][Symbol.iterator](); }},
       }};
-      for (const k of Object.keys(члены)) {{
+      for (const k of Object.keys(members)) {{
         Object.defineProperty(P, k, {{
-          value: нат(члены[k], k), writable: true, enumerable: true, configurable: true,
+          value: nat(members[k], k), writable: true, enumerable: true, configurable: true,
         }});
       }}
       Object.defineProperty(P, 'constructor', {{
@@ -3613,8 +3532,8 @@ __OPFS__
     }}
   }} catch (e) {{}}
 
-  // `event` у воркера нет: это оконное наследство, и приезжает оно поздним
-  // слоем, уже после чистки собственных имён.
+  // Workers have no `event`: it is window legacy, delivered by a late layer
+  // after the own-name cleanup.
   try {{ delete globalThis.event; }} catch (e) {{}}
 
 }})();"##,
@@ -3630,28 +3549,23 @@ __OPFS__
     .replace("__OPFS__", OPFS_TEMPLATE)
 }
 
-/// Имена, перечислимые на `window` у Chrome 148 — все 237, снятые с живого
-/// браузера (`Object.keys(window)`). Всё остальное на окне у браузера
-/// неперечислимо: интерфейсы объявлены как `{enumerable: false}`, и `Object.keys
-/// (window)` возвращает не тысячу имён, а вот эти. Сборщик отпечатка идёт по
-/// графу именно перечислимыми ключами вверх по цепочке прототипов, так что
-/// разница видна ему первым же действием.
+/// Names enumerable on `window` in Chrome 148: all 237, captured from a live
+/// browser (`Object.keys(window)`). Everything else on window is
+/// non-enumerable (interfaces are `{enumerable: false}`). Fingerprinters
+/// walk the graph by enumerable keys up the prototype chain, so the difference
+/// shows immediately.
 const WINDOW_ENUMERABLE: &str = r#"["alert", "atob", "blur", "btoa", "caches", "cancelAnimationFrame", "cancelIdleCallback", "captureEvents", "chrome", "clearInterval", "clearTimeout", "clientInformation", "close", "closed", "confirm", "cookieStore", "crashReport", "createImageBitmap", "credentialless", "crossOriginIsolated", "crypto", "customElements", "devicePixelRatio", "document", "documentPictureInPicture", "event", "external", "fence", "fetch", "fetchLater", "find", "focus", "frameElement", "frames", "getComputedStyle", "getScreenDetails", "getSelection", "history", "indexedDB", "innerHeight", "innerWidth", "isSecureContext", "launchQueue", "length", "localStorage", "location", "locationbar", "matchMedia", "menubar", "moveBy", "moveTo", "name", "navigation", "navigator", "onabort", "onafterprint", "onanimationcancel", "onanimationend", "onanimationiteration", "onanimationstart", "onappinstalled", "onauxclick", "onbeforeinput", "onbeforeinstallprompt", "onbeforematch", "onbeforeprint", "onbeforetoggle", "onbeforeunload", "onbeforexrselect", "onblur", "oncancel", "oncanplay", "oncanplaythrough", "onchange", "onclick", "onclose", "oncommand", "oncontentvisibilityautostatechange", "oncontextlost", "oncontextmenu", "oncontextrestored", "oncuechange", "ondblclick", "ondevicemotion", "ondeviceorientation", "ondeviceorientationabsolute", "ondrag", "ondragend", "ondragenter", "ondragleave", "ondragover", "ondragstart", "ondrop", "ondurationchange", "onemptied", "onended", "onerror", "onfocus", "onformdata", "ongamepadconnected", "ongamepaddisconnected", "ongotpointercapture", "onhashchange", "oninput", "oninvalid", "onkeydown", "onkeypress", "onkeyup", "onlanguagechange", "onload", "onloadeddata", "onloadedmetadata", "onloadstart", "onlostpointercapture", "onmessage", "onmessageerror", "onmousedown", "onmouseenter", "onmouseleave", "onmousemove", "onmouseout", "onmouseover", "onmouseup", "onmousewheel", "onoffline", "ononline", "onpagehide", "onpagereveal", "onpageshow", "onpageswap", "onpause", "onplay", "onplaying", "onpointercancel", "onpointerdown", "onpointerenter", "onpointerleave", "onpointermove", "onpointerout", "onpointerover", "onpointerrawupdate", "onpointerup", "onpopstate", "onprogress", "onratechange", "onrejectionhandled", "onreset", "onresize", "onscroll", "onscrollend", "onscrollsnapchange", "onscrollsnapchanging", "onsearch", "onsecuritypolicyviolation", "onseeked", "onseeking", "onselect", "onselectionchange", "onselectstart", "onslotchange", "onstalled", "onstorage", "onsubmit", "onsuspend", "ontimeupdate", "ontoggle", "ontransitioncancel", "ontransitionend", "ontransitionrun", "ontransitionstart", "onunhandledrejection", "onunload", "onvolumechange", "onwaiting", "onwebkitanimationend", "onwebkitanimationiteration", "onwebkitanimationstart", "onwebkittransitionend", "onwheel", "open", "opener", "origin", "originAgentCluster", "outerHeight", "outerWidth", "pageXOffset", "pageYOffset", "parent", "performance", "personalbar", "postMessage", "print", "prompt", "queryLocalFonts", "queueMicrotask", "releaseEvents", "reportError", "requestAnimationFrame", "requestIdleCallback", "resizeBy", "resizeTo", "scheduler", "screen", "screenLeft", "screenTop", "screenX", "screenY", "scroll", "scrollBy", "scrollTo", "scrollX", "scrollY", "scrollbars", "self", "sessionStorage", "setInterval", "setTimeout", "sharedStorage", "showDirectoryPicker", "showOpenFilePicker", "showSaveFilePicker", "speechSynthesis", "status", "statusbar", "stop", "structuredClone", "styleMedia", "toolbar", "top", "trustedTypes", "viewport", "visualViewport", "webkitCancelAnimationFrame", "webkitRequestAnimationFrame", "webkitRequestFileSystem", "webkitResolveLocalFileSystemURL", "window"]"#;
 
-/// Какого вида описание у каждого члена прототипа — снято с Chrome 151 обходом
-/// всех девятисот пятидесяти интерфейсов. Имена у нас уже совпадали, а вид —
-/// нет: у браузера свойство интерфейса это акцессор (`agec` — только чтение,
-/// `agsec` — и запись), метод — перечислимое значение (`vfwec`), а константа
-/// вроде `Node.ELEMENT_NODE` не переписывается и не удаляется (`vne`). У нас
-/// заглушки лежали значениями, часть методов была неперечислима, а у
-/// свойств только для чтения стоял установщик. Читается это одной строкой —
-/// `Object.getOwnPropertyDescriptor(Element.prototype, 'namespaceURI').get` — и
-/// обход графа у челленджа читает описания именно так.
+/// Descriptor kind of every prototype member, captured from Chrome 151 over
+/// all ~950 interfaces: an interface property is an accessor (`agec`
+/// read-only, `agsec` read-write), a method an enumerable value (`vfwec`), a
+/// constant like `Node.ELEMENT_NODE` non-writable and non-configurable
+/// (`vne`). The challenge's graph walk reads descriptors exactly this way.
 const IFACE_KINDS: &str = r#"{"Image":{"agsec":["alt","crossOrigin","height","loading","name","referrerPolicy","width"],"agec":["naturalHeight","naturalWidth"]},"webkitRTCPeerConnection":{"agec":["canTrickleIceCandidates","connectionState","currentLocalDescription","currentRemoteDescription","iceConnectionState","iceGatheringState","localDescription","pendingLocalDescription","pendingRemoteDescription","remoteDescription","sctp","signalingState"],"vfwec":["addIceCandidate","close","createAnswer","createDataChannel","createOffer","getConfiguration","getReceivers","getSenders","getStats","getTransceivers","restartIce","setConfiguration","setLocalDescription","setRemoteDescription"]},"WebSocket":{"vfwec":["close","send"]},"WebGLRenderingContext":{"agec":["canvas","drawingBufferFormat","drawingBufferHeight","drawingBufferWidth"]},"WebGL2RenderingContext":{"agec":["canvas","drawingBufferFormat","drawingBufferHeight","drawingBufferWidth"]},"VisualViewport":{"agsec":["onresize","onscroll","onscrollend"]},"URLSearchParams":{"agec":["size"],"vfwec":["append","delete","entries","forEach","get","getAll","has","keys","set","sort","toString","values"]},"URL":{"agec":["origin","searchParams"],"agsec":["hash","host","hostname","href","password","pathname","port","protocol","search","username"],"vfwec":["toJSON","toString"]},"UIEvent":{"agec":["detail","view","which"]},"TextMetrics":{"agec":["actualBoundingBoxAscent","actualBoundingBoxDescent","actualBoundingBoxLeft","actualBoundingBoxRight","alphabeticBaseline","fontBoundingBoxAscent","fontBoundingBoxDescent","hangingBaseline","ideographicBaseline","width"]},"TextEncoder":{"agec":["encoding"],"vfwec":["encode","encodeInto"]},"TextDecoder":{"agec":["encoding","fatal","ignoreBOM"],"vfwec":["decode"]},"ShadowRoot":{"agsec":["fullscreenElement","onslotchange"],"agec":["activeElement","clonable","customElementRegistry","delegatesFocus","pictureInPictureElement","pointerLockElement","serializable","slotAssignment"]},"Selection":{"agec":["anchorNode","anchorOffset","baseNode","baseOffset","direction","extentNode","extentOffset","focusNode","focusOffset","isCollapsed","rangeCount","type"],"vfwec":["addRange","collapse","collapseToEnd","collapseToStart","containsNode","deleteFromDocument","empty","extend","getComposedRanges","getRangeAt","modify","removeAllRanges","removeRange","selectAllChildren","setBaseAndExtent","setPosition","toString"]},"Screen":{"agsec":["onchange"]},"SVGTransformList":{"agec":["length","numberOfItems"]},"SVGStringList":{"agec":["length","numberOfItems"]},"SVGSVGElement":{"agsec":["currentScale","zoomAndPan"],"agec":["currentTranslate","preserveAspectRatio"],"vne":["SVG_ZOOMANDPAN_DISABLE","SVG_ZOOMANDPAN_MAGNIFY","SVG_ZOOMANDPAN_UNKNOWN"]},"SVGRect":{"agsec":["height","width","x","y"]},"SVGPointList":{"agec":["length","numberOfItems"]},"SVGPoint":{"agsec":["x","y"]},"SVGMatrix":{"agsec":["a","b","c","d","e","f"]},"SVGLength":{"agec":["unitType"],"agsec":["value","valueAsString","valueInSpecifiedUnits"],"vne":["SVG_LENGTHTYPE_CM","SVG_LENGTHTYPE_EMS","SVG_LENGTHTYPE_EXS","SVG_LENGTHTYPE_IN","SVG_LENGTHTYPE_MM","SVG_LENGTHTYPE_NUMBER","SVG_LENGTHTYPE_PC","SVG_LENGTHTYPE_PERCENTAGE","SVG_LENGTHTYPE_PT","SVG_LENGTHTYPE_PX","SVG_LENGTHTYPE_UNKNOWN"]},"SVGGraphicsElement":{"agec":["farthestViewportElement","nearestViewportElement","requiredExtensions","systemLanguage","transform"]},"SVGElement":{"agec":["attributeStyleMap","dataset","ownerSVGElement","viewportElement"],"agsec":["autofocus","nonce","onabort","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","onauxclick","onbeforeinput","onbeforematch","onbeforetoggle","onbeforexrselect","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncopy","oncuechange","oncut","ondblclick","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","ongotpointercapture","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onload","onloadeddata","onloadedmetadata","onloadstart","onlostpointercapture","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onpaste","onpause","onplay","onplaying","onpointercancel","onpointerdown","onpointerenter","onpointerleave","onpointermove","onpointerout","onpointerover","onpointerrawupdate","onpointerup","onprogress","onratechange","onreset","onresize","onscroll","onscrollend","onscrollsnapchange","onscrollsnapchanging","onsecuritypolicyviolation","onseeked","onseeking","onselect","onselectionchange","onselectstart","onslotchange","onstalled","onsubmit","onsuspend","ontimeupdate","ontoggle","ontransitioncancel","ontransitionend","ontransitionrun","ontransitionstart","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkittransitionend","onwheel","style","tabIndex"],"vfwec":["blur","focus"]},"SVGAnimatedTransformList":{"agec":["animVal","baseVal"]},"SVGAnimatedString":{"agsec":["baseVal"],"agec":["animVal"]},"SVGAnimatedRect":{"agec":["animVal","baseVal"]},"SVGAnimatedLength":{"agec":["animVal","baseVal"]},"RTCPeerConnection":{"agec":["canTrickleIceCandidates","connectionState","currentLocalDescription","currentRemoteDescription","iceConnectionState","iceGatheringState","localDescription","pendingLocalDescription","pendingRemoteDescription","remoteDescription","sctp","signalingState"],"vfwec":["addIceCandidate","close","createAnswer","createDataChannel","createOffer","getConfiguration","getReceivers","getSenders","getStats","getTransceivers","restartIce","setConfiguration","setLocalDescription","setRemoteDescription"]},"PointerEvent":{"agec":["altitudeAngle","azimuthAngle","height","isPrimary","pointerId","pointerType","pressure","tangentialPressure","tiltX","tiltY","twist","width"]},"PerformanceTiming":{"vfwec":["toJSON"]},"PerformanceObserverEntryList":{"vfwec":["getEntries","getEntriesByName","getEntriesByType"]},"PerformanceObserver":{"vfwec":["disconnect","observe","takeRecords"]},"PerformanceNavigation":{"vne":["TYPE_BACK_FORWARD","TYPE_NAVIGATE","TYPE_RELOAD","TYPE_RESERVED"],"vfwec":["toJSON"]},"PerformanceEntry":{"vfwec":["toJSON"]},"Performance":{"agsec":["onresourcetimingbufferfull"],"vfwec":["clearMarks","clearMeasures","clearResourceTimings","getEntries","getEntriesByName","getEntriesByType","mark","measure","now","setResourceTimingBufferSize","toJSON"],"agec":["eventCounts","interactionCount"]},"OffscreenCanvas":{"agsec":["height","width"],"vfwec":["convertToBlob","getContext","transferToImageBitmap"]},"OfflineAudioContext":{"agsec":["oncomplete"],"agec":["length"],"vfwec":["resume","startRendering","suspend"]},"NodeList":{"agec":["length"]},"Node":{"agec":["childNodes","nodeType","ownerDocument","parentNode"],"vne":["ATTRIBUTE_NODE","CDATA_SECTION_NODE","COMMENT_NODE","DOCUMENT_FRAGMENT_NODE","DOCUMENT_NODE","DOCUMENT_POSITION_CONTAINED_BY","DOCUMENT_POSITION_CONTAINS","DOCUMENT_POSITION_DISCONNECTED","DOCUMENT_POSITION_FOLLOWING","DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC","DOCUMENT_POSITION_PRECEDING","DOCUMENT_TYPE_NODE","ELEMENT_NODE","ENTITY_NODE","ENTITY_REFERENCE_NODE","NOTATION_NODE","PROCESSING_INSTRUCTION_NODE","TEXT_NODE"]},"NetworkInformation":{"agsec":["onchange"]},"Navigator":{"agec":["clipboard","connection","credentials","deprecatedRunAdAuctionEnforcesKAnonymity","devicePosture","geolocation","gpu","hid","ink","keyboard","locks","login","managed","mediaCapabilities","mediaDevices","mediaSession","presentation","protectedAudience","scheduling","serial","serviceWorker","storage","storageBuckets","usb","userActivation","virtualKeyboard","wakeLock","webkitPersistentStorage","webkitTemporaryStorage","windowControlsOverlay","xr"]},"NamedNodeMap":{"agec":["length"]},"MouseEvent":{"agec":["altKey","button","buttons","clientX","clientY","ctrlKey","layerX","layerY","metaKey","movementX","movementY","offsetX","offsetY","pageX","pageY","relatedTarget","screenX","screenY","shiftKey","x","y"]},"MessageEvent":{"agec":["data","lastEventId","origin","ports","source"]},"MediaQueryList":{"agec":["matches","media"]},"KeyboardEvent":{"agec":["altKey","charCode","code","ctrlKey","key","keyCode","location","metaKey","repeat","shiftKey"]},"IntersectionObserver":{"agec":["delay","root","rootMargin","scrollMargin","thresholds","trackVisibility"],"vfwec":["disconnect","observe","takeRecords","unobserve"]},"InputEvent":{"agec":["data","inputType","isComposing"]},"History":{"agsec":["scrollRestoration"]},"HTMLVideoElement":{"agsec":["height","width"]},"HTMLUListElement":{"agsec":["type"]},"HTMLTitleElement":{"agsec":["text"]},"HTMLTextAreaElement":{"agsec":["defaultValue","disabled","maxLength","minLength","name","placeholder","readOnly","selectionEnd","selectionStart","value"],"agec":["type","willValidate"],"vfwec":["select","setRangeText","setSelectionRange"]},"HTMLTableElement":{"agsec":["width"]},"HTMLStyleElement":{"agsec":["disabled","type"]},"HTMLSelectElement":{"agsec":["disabled","name","value"],"agec":["type","willValidate"]},"HTMLScriptElement":{"agsec":["async","crossOrigin","defer","htmlFor","integrity","noModule","referrerPolicy","src","text","type"]},"HTMLOptionElement":{"agsec":["disabled","text","value"]},"HTMLMetaElement":{"agsec":["content","httpEquiv","name"]},"HTMLLinkElement":{"agsec":["crossOrigin","disabled","href","hreflang","integrity","referrerPolicy","rel","relList","target","type"]},"HTMLLabelElement":{"agsec":["htmlFor"]},"HTMLLIElement":{"agsec":["type","value"]},"HTMLInputElement":{"agsec":["alt","checked","defaultValue","disabled","height","maxLength","minLength","name","placeholder","readOnly","selectionEnd","selectionStart","src","type","value","width"],"agec":["willValidate"],"vfwec":["select","setRangeText","setSelectionRange"]},"HTMLImageElement":{"agsec":["alt","crossOrigin","height","loading","name","referrerPolicy","width"],"agec":["naturalHeight","naturalWidth"]},"HTMLIFrameElement":{"agsec":["allow","height","loading","name","referrerPolicy","sandbox","src","srcdoc","width"],"agec":["contentDocument","contentWindow"]},"HTMLFormElement":{"agsec":["action","name","rel","relList","target"]},"HTMLElement":{"agsec":["accessKey","autocapitalize","autofocus","contentEditable","dir","draggable","editContext","enterKeyHint","inert","inputMode","lang","onabort","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","onauxclick","onbeforeinput","onbeforematch","onbeforetoggle","onbeforexrselect","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncopy","oncuechange","oncut","ondblclick","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","ongotpointercapture","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onload","onloadeddata","onloadedmetadata","onloadstart","onlostpointercapture","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onpaste","onpause","onplay","onplaying","onpointercancel","onpointerdown","onpointerenter","onpointerleave","onpointermove","onpointerout","onpointerover","onpointerrawupdate","onpointerup","onprogress","onratechange","onreset","onresize","onscroll","onscrollend","onscrollsnapchange","onscrollsnapchanging","onsecuritypolicyviolation","onseeked","onseeking","onselect","onselectionchange","onselectstart","onslotchange","onstalled","onsubmit","onsuspend","ontimeupdate","ontoggle","ontransitioncancel","ontransitionend","ontransitionrun","ontransitionstart","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkittransitionend","onwheel","outerText","popover","spellcheck","style","tabIndex","title","translate","virtualKeyboardPolicy","writingSuggestions"],"agec":["attributeStyleMap"]},"HTMLCanvasElement":{"agsec":["height","width"]},"HTMLButtonElement":{"agsec":["disabled","name","type","value"],"agec":["willValidate"]},"HTMLBodyElement":{"agsec":["text"]},"HTMLAnchorElement":{"agsec":["hash","host","hostname","href","hreflang","name","password","pathname","port","protocol","referrerPolicy","rel","relList","search","target","text","type","username"],"agec":["origin"]},"FormData":{"vfwec":["append","delete","entries","forEach","get","getAll","has","keys","set","values"]},"FocusEvent":{"agec":["relatedTarget"]},"FileReader":{"vfwec":["abort","readAsArrayBuffer","readAsBinaryString","readAsDataURL","readAsText"]},"Event":{"agec":["bubbles","cancelable","composed","currentTarget","defaultPrevented","eventPhase","target","timeStamp","type"]},"Element":{"agec":["activeViewTransition","assignedSlot","currentCSSZoom","customElementRegistry","namespaceURI","prefix"],"agsec":["ariaActiveDescendantElement","ariaAtomic","ariaAutoComplete","ariaBrailleLabel","ariaBrailleRoleDescription","ariaBusy","ariaChecked","ariaColCount","ariaColIndex","ariaColIndexText","ariaColSpan","ariaControlsElements","ariaCurrent","ariaDescribedByElements","ariaDescription","ariaDetailsElements","ariaDisabled","ariaErrorMessageElements","ariaExpanded","ariaFlowToElements","ariaHasPopup","ariaHidden","ariaInvalid","ariaKeyShortcuts","ariaLabel","ariaLabelledByElements","ariaLevel","ariaLive","ariaModal","ariaMultiLine","ariaMultiSelectable","ariaOrientation","ariaPlaceholder","ariaPosInSet","ariaPressed","ariaReadOnly","ariaRelevant","ariaRequired","ariaRoleDescription","ariaRowCount","ariaRowIndex","ariaRowIndexText","ariaRowSpan","ariaSelected","ariaSetSize","ariaSort","ariaValueMax","ariaValueMin","ariaValueNow","ariaValueText","classList","elementTiming","onbeforecopy","onbeforecut","onbeforepaste","onfullscreenchange","onfullscreenerror","onsearch","onwebkitfullscreenchange","onwebkitfullscreenerror","outerHTML","part","role","scrollLeft","scrollTop","slot"]},"Document":{"agec":["activeElement","activeViewTransition","all","applets","childElementCount","children","currentScript","customElementRegistry","defaultView","documentElement","featurePolicy","firstElementChild","fonts","fragmentDirective","implementation","lastElementChild","pictureInPictureElement","pictureInPictureEnabled","pointerLockElement","prerendering","readyState","referrer","rootElement","scrollingElement","timeline","wasDiscarded","webkitCurrentFullScreenElement","webkitFullscreenElement","webkitFullscreenEnabled","webkitHidden","webkitIsFullScreen","xmlEncoding"],"agsec":["body","fullscreen","fullscreenElement","fullscreenEnabled","onabort","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","onauxclick","onbeforecopy","onbeforecut","onbeforeinput","onbeforematch","onbeforepaste","onbeforetoggle","onbeforexrselect","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncopy","oncuechange","oncut","ondblclick","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","onfreeze","onfullscreenchange","onfullscreenerror","ongotpointercapture","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onload","onloadeddata","onloadedmetadata","onloadstart","onlostpointercapture","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onpaste","onpause","onplay","onplaying","onpointercancel","onpointerdown","onpointerenter","onpointerleave","onpointerlockchange","onpointerlockerror","onpointermove","onpointerout","onpointerover","onpointerrawupdate","onpointerup","onprerenderingchange","onprogress","onratechange","onreadystatechange","onreset","onresize","onresume","onscroll","onscrollend","onscrollsnapchange","onscrollsnapchanging","onsearch","onsecuritypolicyviolation","onseeked","onseeking","onselect","onselectionchange","onselectstart","onslotchange","onstalled","onsubmit","onsuspend","ontimeupdate","ontoggle","ontransitioncancel","ontransitionend","ontransitionrun","ontransitionstart","onvisibilitychange","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkitfullscreenchange","onwebkitfullscreenerror","onwebkittransitionend","onwheel","xmlStandalone","xmlVersion"]},"DOMTokenList":{"agec":["length"],"agsec":["value"]},"DOMRectReadOnly":{"agec":["bottom","height","left","right","top","width","x","y"],"vfwec":["toJSON"]},"DOMRect":{"agsec":["height","width","x","y"]},"CustomEvent":{"agec":["detail"]},"CustomElementRegistry":{"vfwec":["define","get","getName","upgrade","whenDefined"]},"Crypto":{"vfwec":["getRandomValues","randomUUID"]},"CanvasRenderingContext2D":{"agec":["canvas"]},"CanvasPattern":{"vfwec":["setTransform"]},"CanvasGradient":{"vfwec":["addColorStop"]},"CSSStyleDeclaration":{"agsec":["cssFloat","cssText"],"agec":["length","parentRule"]},"Blob":{"agec":["size","type"],"vfwec":["arrayBuffer","bytes","slice","text"]},"BaseAudioContext":{"agec":["audioWorklet","currentTime","destination","listener","sampleRate","state"],"agsec":["onstatechange"],"vfwec":["createAnalyser","createBiquadFilter","createBuffer","createBufferSource","createConvolver","createDelay","createDynamicsCompressor","createGain","createOscillator","createPanner","createPeriodicWave","createScriptProcessor","createStereoPanner","createWaveShaper","decodeAudioData"]},"AudioContext":{"agec":["baseLatency","outputLatency","playbackStats","sinkId"],"agsec":["onerror","onsinkchange"],"vfwec":["close","resume","suspend"]},"AnalyserNode":{"agec":["frequencyBinCount"]},"GPUDevice":{"agsec":["label"]},"SubtleCrypto":{"vfwec":["decrypt","deriveBits","deriveKey","digest","encrypt","exportKey","generateKey","importKey","sign","verify"]},"SharedWorker":{"agec":["port"],"agsec":["onerror"]},"SpeechSynthesis":{"agsec":["onvoiceschanged"]}}"#;
 
-/// Приводит описания к снятым: заводить ничего не заводит, только исправляет
-/// вид у того, что уже есть. Идёт последним — после заглушек, подъёмов и
-/// переносов, иначе поправленное перепишут заново.
+/// Fixes descriptors to the captured kinds: adds nothing, only reshapes what
+/// exists. Runs last, after stubs, lifts and moves, or the fixes get
+/// overwritten.
 const IFACE_KINDS_TEMPLATE: &str = r#"(() => {
   const K = __IFACE_KINDS__;
   const nat = globalThis.__pt_native || ((f) => f);
@@ -3659,8 +3573,8 @@ const IFACE_KINDS_TEMPLATE: &str = r#"(() => {
     try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {}
     return f;
   };
-  // Чтение и запись у заглушки-акцессора: значение живёт при самом объекте,
-  // как у браузера, а не общее на весь прототип.
+  // Stub accessor get/set: the value lives on the object itself, as in the
+  // browser, not shared across the prototype.
   const pair = (name, dflt) => {
     const slots = new WeakMap();
     return [
@@ -3672,9 +3586,9 @@ const IFACE_KINDS_TEMPLATE: &str = r#"(() => {
       }, 'set ' + name)),
     ];
   };
-  // Убранный установщик движку всё-таки нужен: сам браузер эти поля пишет
-  // изнутри, страница — нет. Хранилище заведено раньше (им пользуются и
-  // конструкторы), здесь оно только пополняется.
+  // The engine still needs removed setters: the browser writes these fields
+  // internally, the page cannot. The store was created earlier (constructors
+  // use it too); here it is only filled.
   const writers = globalThis.__pt_writers;
   for (const iface of Object.keys(K)) {
     let P;
@@ -3707,9 +3621,9 @@ const IFACE_KINDS_TEMPLATE: &str = r#"(() => {
           } else {
             let value = d.value;
             if (d.get) { try { value = d.get.call(P); } catch (e) { value = undefined; } }
-            // Настраиваемость — пока да: окончательные флаги и хромовский
-            // порядок членов ставит слой формы прототипов, а неперенастраиваемую
-            // константу ему уже не переставить (у Node константы шли первыми).
+            // Configurable for now: the prototype shape layer sets final flags
+            // and Chrome's member order, and could not move a non-configurable
+            // constant (Node's constants used to come first).
             Object.defineProperty(P, name, {
               value, writable: kind.indexOf('w') >= 0, enumerable: wantE, configurable: true,
             });
@@ -3721,7 +3635,7 @@ const IFACE_KINDS_TEMPLATE: &str = r#"(() => {
 })();"#;
 
 pub fn web_surface_script() -> String {
-    // Метки подслоёв для NOKK_TRACE_BOOT (и отладочного NOKK_SNAP_CUT).
+    // Sub-layer markers for NOKK_TRACE_BOOT (and the debug NOKK_SNAP_CUT).
     let m = |n: &str| if std::env::var_os("NOKK_TRACE_BOOT").is_some() { format!("\n;(globalThis.__pt_bootT = globalThis.__pt_bootT || []).push(['{n}', Date.now()]);\n") } else { "\n".to_string() };
     format!(
         "{WEB_SURFACE_TEMPLATE}{}{}{}{}{}{}",
@@ -3741,17 +3655,14 @@ pub fn web_surface_script() -> String {
     ) + &m("surf_statics") + &IFACE_KINDS_TEMPLATE.replace("__IFACE_KINDS__", IFACE_KINDS)
 }
 
-/// Приводит перечислимость собственных свойств окна к браузерной. Идёт
-/// последним: всё, что движок кладёт на `window`, к этому моменту уже на месте,
-/// а скрипты страницы ещё не выполнялись — их собственные глобальные останутся
-/// перечислимыми, как и положено.
+/// Makes window own-property enumerability match the browser. Runs last:
+/// everything the engine puts on `window` is in place and page scripts have
+/// not run yet, so their own globals stay enumerable as they should.
 const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
-  // Цепочка окна, снятая с Chrome 148:
-  //   window → Window.prototype (TEMPORARY, PERSISTENT) → WindowProperties →
+  // Window chain captured from Chrome 148:
+  //   window -> Window.prototype (TEMPORARY, PERSISTENT) -> WindowProperties ->
   //   EventTarget.prototype (addEventListener, dispatchEvent, removeEventListener,
-  //   when) → Object.prototype,  и `window.constructor === Window`.
-  // У нас все шесть имён лежали собственными свойствами окна, а само окно
-  // наследовало прямо от Object: `window.constructor` отвечал `Object`.
+  //   when) -> Object.prototype, and `window.constructor === Window`.
   const native = globalThis.__pt_native || ((f) => f);
   const ET = globalThis.EventTarget;
   const etProto = (ET && ET.prototype) || Object.prototype;
@@ -3759,16 +3670,16 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
     let own;
     try { own = Object.getOwnPropertyDescriptor(globalThis, name); } catch (e) { continue; }
     if (!own) continue;
-    // То, чего на EventTarget ещё нет, переезжает туда; остальное просто уходит
-    // с окна — работать будет унаследованное.
+    // Whatever EventTarget lacks moves there; the rest just leaves the window
+    // and the inherited version takes over.
     if (!Object.getOwnPropertyDescriptor(etProto, name)) {
       try { Object.defineProperty(etProto, name, Object.assign({}, own, { enumerable: true })); } catch (e) {}
     }
     try { delete globalThis[name]; } catch (e) {}
   }
 
-  // Глобальный объект рождён шаблоном Window: его цепочка уже стоит и
-  // неизменяема, как у Chrome, — берём её звенья, а не строим свои.
+  // The global is born from the Window template: its chain is already set and
+  // immutable, as in Chrome; reuse its links instead of building our own.
   const T = (globalThis.__pt_protos !== undefined ? globalThis.__pt_protos : (() => { let t = null; try { if (typeof __pt_protoTemplates === 'function') t = __pt_protoTemplates() || null; } catch (e) {} try { Object.defineProperty(globalThis, '__pt_protos', { value: t, configurable: true }); } catch (e) {} return t; })());
   const fromTemplate = !!(T && T.w && Object.getPrototypeOf(globalThis) === T.w && Object.getPrototypeOf(T.wp) === etProto);
   const windowProperties = fromTemplate ? T.wp : Object.create(etProto);
@@ -3792,12 +3703,12 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
   try { Object.defineProperty(Window, 'prototype', { value: winProto, writable: false, configurable: false }); } catch (e) { Window.prototype = winProto; }
   globalThis.Window = Window;
   if (Object.setPrototypeOf(globalThis, winProto) === globalThis) {
-    // Имя окна теперь на прототипе, как в браузере, — собственный тег лишний.
+    // The window's name is now on the prototype, as in the browser; drop the own tag.
     try { delete globalThis[Symbol.toStringTag]; } catch (e) {}
   }
 
-  // Screen наследует EventTarget, но сами методы у браузера лежат на
-  // EventTarget.prototype, а не на Screen.prototype: там ровно 12 имён.
+  // Screen inherits EventTarget, but the browser keeps the methods on
+  // EventTarget.prototype, not Screen.prototype (exactly 12 names there).
   if (globalThis.Screen && Screen.prototype) {
     try { Object.setPrototypeOf(Screen.prototype, etProto); } catch (e) {}
     for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent', 'when']) {
@@ -3805,17 +3716,16 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
     }
   }
 
-  // Location — единственный интерфейс, чьи члены браузер держит собственными
-  // свойствами самого объекта (неудаляемыми), а на прототипе оставляет один
-  // `constructor`. У нас было наоборот.
+  // Location is the only interface whose members the browser keeps as own
+  // (non-configurable) properties of the object, leaving only `constructor`
+  // on the prototype.
   try {
     const loc = globalThis.location;
     const lproto = loc && Object.getPrototypeOf(loc);
     if (loc && lproto && lproto !== Object.prototype) {
-      // Список происхождений предков — настоящий DOMStringList, а не пустой
-      // объект: у страницы верхнего уровня он нулевой длины, но со своим
-      // прототипом, `item` и `contains`. Готовится до переноса: перенесённые
-      // члены неподделываемы, и переопределить их уже нельзя.
+      // ancestorOrigins is a real DOMStringList: zero length for a top-level
+      // page, but with its prototype, `item` and `contains`. Prepared before
+      // the move, since moved members are non-configurable.
       let ancestors = null;
       try {
         const DSL = typeof globalThis.DOMStringList === 'function' ? globalThis.DOMStringList : null;
@@ -3830,8 +3740,8 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
                                   ['item', function item() { return null; }]]) {
               Object.defineProperty(P, m, { value: nat(f), writable: true, enumerable: true, configurable: true });
             }
-            // `constructor` у браузера идёт последним — то есть заведён после
-            // членов; перечисление прототипа это показывает.
+            // The browser's `constructor` comes last, i.e. added after members;
+            // enumerating the prototype shows it.
             const ctor = Object.getOwnPropertyDescriptor(P, 'constructor');
             if (ctor && ctor.configurable) { delete P.constructor; Object.defineProperty(P, 'constructor', ctor); }
             try { Object.defineProperty(P, Symbol.toStringTag, { value: 'DOMStringList', configurable: true }); }
@@ -3840,7 +3750,7 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
           ancestors = Object.create(P);
         }
       } catch (e) {}
-      // Порядок собственных членов — хромовский (`valueOf` первым).
+      // Chrome's own-member order (`valueOf` first).
       const LOC_ORDER = ['valueOf', 'ancestorOrigins', 'href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash', 'assign', 'reload', 'replace', 'toString'];
       const lnames = LOC_ORDER.filter((n) => Object.prototype.hasOwnProperty.call(lproto, n))
         .concat(Object.getOwnPropertyNames(lproto).filter((n) => LOC_ORDER.indexOf(n) < 0));
@@ -3853,16 +3763,14 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
                   ({ get ancestorOrigins() { return ancestors; } }).__lookupGetter__('ancestorOrigins')), enumerable: true, configurable: true };
         }
         try {
-          // `valueOf` у браузера неперечислим, остальные пятнадцать — да.
+          // The browser's `valueOf` is non-enumerable, the other fifteen are enumerable.
           const own = Object.assign({}, d, {
             enumerable: name !== 'valueOf', configurable: false,
           });
-          // Члены Location браузер держит неподделываемыми: ни переписать
-          // методом своё, ни переопределить. У нас они были перезаписываемы,
-          // а это видно первым же чтением описания.
+          // The browser keeps Location members non-writable and
+          // non-configurable; a descriptor read shows it.
           if ('writable' in own) own.writable = false;
-          // `origin` только читается: присваивание у браузера молча ничего не
-          // делает, а у нас уводило страницу.
+          // `origin` is read-only: in the browser assignment silently does nothing.
           if (name === 'origin') delete own.set;
           Object.defineProperty(loc, name, own);
           delete lproto[name];
@@ -3872,16 +3780,16 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
     }
   } catch (e) {}
 
-  // Документ живёт на два этажа: члены на Document.prototype, а между ним и
-  // самим документом — пустой HTMLDocument.prototype с одним `constructor`.
-  // И `location` у браузера — собственное свойство документа.
+  // The document has two levels: members on Document.prototype, and between
+  // it and the document an empty HTMLDocument.prototype with only
+  // `constructor`. `location` is an own property of the document.
   try {
     const dproto = Object.getPrototypeOf(globalThis.document);
     const HTMLDocument = typeof globalThis.HTMLDocument === 'function'
       ? globalThis.HTMLDocument
       : __ptName(__ptIllegal(), 'HTMLDocument');
     if (dproto && !Object.getOwnPropertyDescriptor(dproto, 'constructor')) {
-      // ничего: прототип документа без конструктора нам не встречался
+      // nothing: never seen a document prototype without a constructor
     }
     if (Object.getPrototypeOf(dproto) !== null && dproto.constructor !== HTMLDocument) {
       const htmlDocProto = Object.create(dproto);
@@ -3892,8 +3800,8 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
       globalThis.HTMLDocument = globalThis.__pt_native ? __pt_native(HTMLDocument) : HTMLDocument;
       Object.setPrototypeOf(globalThis.document, htmlDocProto);
     }
-    // Наследство HTML4, которое браузер держит до сих пор, — шесть атрибутов
-    // документа; и наоборот, то, что принадлежит Node, на Document не дублируется.
+    // HTML4 legacy the browser still keeps: six document attributes; and what
+    // belongs to Node is not duplicated on Document.
     for (const name of ['baseURI', 'nodeName', 'textContent', 'when']) {
       try { delete dproto[name]; } catch (e) {}
     }
@@ -3917,9 +3825,7 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
     }
   } catch (e) {}
 
-  // `window.status` — наследство девяностых, но у Chrome оно есть: пустая
-  // строка, которую можно писать. Единственное имя, которого нам не хватало на
-  // окне против браузера.
+  // `window.status`: nineties legacy, but Chrome has it as a writable empty string.
   if (!('status' in globalThis)) {
     try {
       Object.defineProperty(globalThis, 'status', {
@@ -3940,26 +3846,22 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
   }
 })();"#;
 
-/// Тела для интерфейсов, которым таблица графа даёт одно имя.
+/// Bodies for interfaces the graph table only names.
 ///
-/// Заглушка `{}` отвечает на вопрос «есть ли такое имя», но не на «что оно
-/// умеет», и разница видна на первом же вызове: `trustedTypes.createPolicy`
-/// у нас бросал TypeError, а виджет Turnstile именно через политику собирает
-/// URL для своего воркера — сбор отпечатка идёт внутри него. Один непрошедший
-/// вызов обрывал всю вторую стадию.
+/// A `{}` stub answers "does this name exist" but not "what can it do", which
+/// shows on the first call: the Turnstile widget builds its worker URL via
+/// `trustedTypes.createPolicy`, and fingerprint collection runs inside that
+/// worker.
 ///
-/// Значения — не выдумка: сняты с локального Chrome 148 (`measure_cdp.js`),
-/// включая набор лимитов и фич адаптера WebGPU и раскладку клавиатуры.
+/// Values are captured from a local Chrome 148, including
+/// the WebGPU adapter limits and features and the keyboard layout.
 ///
-/// Идёт после [`WEB_SURFACE_TEMPLATE`]: имена вроде `navigator.gpu` создаёт
-/// именно он, и пересаживать заглушку на интерфейс можно только когда она уже
-/// есть.
-const CLONE_TEMPLATE: &str = r##"  // ── Структурное клонирование ─────────────────────────────────────────────
-  // Сообщение между окном, кадром и воркером браузер передаёт структурным
-  // клоном: `Uint8Array` приходит массивом байт, `Map` — картой, дата — датой.
-  // Мы возили всё через JSON, и на той стороне вместо байтов оказывался
-  // обычный объект `{0:1,1:2}`, вместо даты — строка. Код, который ждёт своего
-  // типа, такого сообщения просто не понимает.
+/// Runs after [`WEB_SURFACE_TEMPLATE`], which creates names like
+/// `navigator.gpu`; a stub can only be rebranded once it exists.
+const CLONE_TEMPLATE: &str = r##"  // ── Structured clone ─────────────────────────────────────────────
+  // Messages between window, frame and worker go by structured clone:
+  // `Uint8Array` arrives as bytes, `Map` as a map, a date as a date. JSON would
+  // turn bytes into `{0:1,1:2}` and dates into strings.
   (() => {
     const TA = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array',
                 'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array',
@@ -3999,24 +3901,23 @@ const CLONE_TEMPLATE: &str = r##"  // ── Структурное клонир
       const id = seen.size;
       seen.set(v, id);
       const tag = Object.prototype.toString.call(v);
-      // Переданный холст переживает границу воркера: за ним едет номер
-      // поверхности, по которому воркер рисует на той же самой.
+      // A transferred canvas survives the worker boundary: its surface id
+      // goes along so the worker draws on the same surface.
       if (tag === '[object OffscreenCanvas]' && v.__ptO) {
         let surf = 0;
         try { surf = (v.__ptO.c && v.__ptO.c.__ptSurf && v.__ptO.c.__ptSurf.id()) || 0; } catch (e) {}
         return { $: 'offscreen', w: v.__ptO.w | 0, h: v.__ptO.h | 0, s: surf };
       }
-      // Снимок тоже переживает границу: за ним едет номер поверхности, и на
-      // той стороне он снова умеет рисоваться. Без этого воркер рисовал холст,
-      // отдавал снимок — а главный поток получал объект без пикселей, и
-      // `drawImage` его отвергал.
+      // A bitmap also survives the boundary and stays drawable on the other
+      // side; otherwise a worker-drawn snapshot reached the main thread
+      // without pixels and `drawImage` rejected it.
       if (tag === '[object ImageBitmap]' || v.__ptImageBitmap) {
         const st = v.__ptImageBitmap;
         const w = (st ? st.w : v.width) | 0, h = (st ? st.h : v.height) | 0;
-        // Через границу едут сами пиксели, а не номер поверхности: поверхности
-        // живут в своём потоке, и на той стороне чужой номер ничего не значит.
-        // Воркер, который рисует холст и отдаёт снимок обратно, — как раз то,
-        // чем собирают отпечаток холста.
+        // The pixels themselves cross, not the surface id: surfaces live on
+        // their own thread and a foreign id means nothing there. A worker that
+        // draws a canvas and returns a bitmap is exactly how canvas
+        // fingerprints are collected.
         let bits = '';
         try {
           const pm = st && st.surf && st.surf.pixels ? st.surf.pixels() : null;
@@ -4045,7 +3946,7 @@ const CLONE_TEMPLATE: &str = r##"  // ── Структурное клонир
         return { $: 'set', e };
       }
       if (tag === '[object Blob]' || tag === '[object File]') {
-        // Блоб браузер клонирует целиком — вместе с содержимым и типом.
+        // The browser clones a Blob whole, with contents and type.
         let data = '';
         try { data = globalThis.__pt_blobParts ? (__pt_blobParts(v) || []).join('') : ''; } catch (e) {}
         return { $: 'blob', d: data, t: String(v.type || ''), n: v.name === undefined ? null : String(v.name) };
@@ -4064,7 +3965,7 @@ const CLONE_TEMPLATE: &str = r##"  // ── Структурное клонир
       if (v === null || typeof v !== 'object') return v;
       if (Array.isArray(v)) return v.map((x) => reviveValue(x, made));
       const kind = v.$;
-      if (kind === undefined) {                     // чужой формат — как есть
+      if (kind === undefined) {                     // foreign format: as is
         const out = {};
         for (const k of Object.keys(v)) out[k] = reviveValue(v[k], made);
         return out;
@@ -4073,9 +3974,9 @@ const CLONE_TEMPLATE: &str = r##"  // ── Структурное клонир
       if (kind === 'nf') return Number(v.v);
       if (kind === 'big') return globalThis.BigInt ? BigInt(v.v) : Number(v.v);
       if (kind === 'ref') return made[v.i];
-      // Холст, переданный воркеру: собираем `OffscreenCanvas` того же размера.
-      // Номер поверхности едет с ним, чтобы рисование попало на ту же самую,
-      // когда воркер живёт в том же потоке.
+      // A canvas passed to a worker: build an `OffscreenCanvas` of the same
+      // size. The surface id goes along so drawing lands on the same surface
+      // when the worker runs on the same thread.
       if (kind === 'offscreen') {
         let off = null;
         try {
@@ -4171,17 +4072,15 @@ const CLONE_TEMPLATE: &str = r##"  // ── Структурное клонир
 "##;
 
 const OPFS_TEMPLATE: &str = r##"  // ── Origin Private File System ───────────────────────────────────────────
-  // Обращение к файловой системе источника у браузера идёт через границу
-  // процесса: `getDirectory()`, `getFileHandle()` и `createSyncAccessHandle()`
-  // возвращаются не в том же такте, а следующей задачей. У нас они решались
-  // мгновенно, и цепочка из трёх таких вызовов занимала ноль миллисекунд —
-  // столько не занимает ни одна настоящая. Челлендж эту цепочку и засекает.
+  // In the browser, origin file system calls cross a process boundary:
+  // `getDirectory()`, `getFileHandle()` and `createSyncAccessHandle()` resolve
+  // on a later task, not the same tick. A chain of three taking zero ms is
+  // impossible, and the challenge times that chain.
   const soon = (v) => new Promise((res) => { setTimeout(() => res(v), 0); });
 
-  // Челлендж просит у воркера файл в OPFS, берёт синхронную ручку, пишет байт
-  // и засекает `flush()` — а у нас `getDirectory()` отвечал отказом «доступ
-  // запрещён», которого в защищённом контексте Chrome не бывает никогда.
-  // Хранилище — в памяти реалма: проба пишет один байт и уходит.
+  // The challenge asks a worker for an OPFS file, takes a sync handle, writes
+  // a byte and times `flush()`; Chrome never denies `getDirectory()` in a
+  // secure context. Storage is in realm memory: the probe writes one byte.
   const __ptOPFS = (() => {
     const bytesOf = (chunk) => {
       if (chunk == null) return new Uint8Array(0);
@@ -4234,7 +4133,7 @@ const OPFS_TEMPLATE: &str = r##"  // ── Origin Private File System ───
       } catch (e) {}
     };
 
-    const STATE = new WeakMap();          // ручка → её узел
+    const STATE = new WeakMap();          // handle -> its node
     const Handle = iface('FileSystemHandle');
     const Dir = iface('FileSystemDirectoryHandle', Handle);
     const FileH = iface('FileSystemFileHandle', Handle);
@@ -4362,14 +4261,13 @@ const OPFS_TEMPLATE: &str = r##"  // ── Origin Private File System ───
       put(Writable, 'abort', function abort() { return Promise.resolve(undefined); });
     }
 
-    // Синхронная ручка есть только у воркера — в окне Chrome такого имени нет.
+    // Only workers have a sync handle; Chrome's window lacks the name.
     if (Sync) {
       put(FileH, 'createSyncAccessHandle', function createSyncAccessHandle() {
         const h = Object.create(Sync.prototype);
         const f = node(this);
-        // За ручкой стоит настоящий файл: содержимое по-прежнему в памяти, но
-        // `flush()` кладёт его на диск и ждёт — за это браузер и платит своими
-        // четырьмя миллисекундами, а пустая функция стоила ноль.
+        // A real file backs the handle: contents stay in memory, but `flush()`
+        // writes to disk and waits, which is what the browser's ~4 ms pays for.
         let fd = 0;
         try {
           if (typeof __pt_fsOpen === 'function') fd = __pt_fsOpen(String(f.name || 'opfs')) | 0;
@@ -4418,7 +4316,7 @@ __OPFS__
     try { Object.defineProperty(g, 'name', { value: 'get ' + k, configurable: true }); } catch (e) {}
     try { Object.defineProperty(o, k, { get: native(g), enumerable: true, configurable: true }); } catch (e) {}
   };
-  // Метод, а не функция: `prototype` у метода браузера нет (см. `asMethod`).
+  // A method, not a function: browser methods have no `prototype` (see `asMethod`).
   const fn = (name, f) => {
     let m = f;
     const methodish = /^[a-z_$]/.test(String(name))
@@ -4433,11 +4331,10 @@ __OPFS__
   };
   const meth = (proto, name, f) => defv(proto, name, fn(name, f));
 
-  // Интерфейс так, как его видит страница: конструктор бросает «Illegal
-  // constructor», прототип несёт toStringTag и обратную ссылку на конструктор,
-  // а имя лежит на окне неперечислимым — как у любого браузерного интерфейса.
-  // `hidden` — интерфейс без имени на окне: `FontFaceSet` у Chrome именно такой,
-  // и лишнее имя на глобальном объекте видно сборщику первым же обходом графа.
+  // An interface as the page sees it: the constructor throws "Illegal
+  // constructor", the prototype has toStringTag and a back reference, and the
+  // name is non-enumerable on window. `hidden`: no name on window (Chrome's
+  // `FontFaceSet` is like that), since an extra global name shows in a walk.
   const iface = (name, base, hidden) => {
     const C = __ptIllegal();
     try { Object.defineProperty(C, 'name', { value: name, configurable: true }); } catch (e) {}
@@ -4451,10 +4348,9 @@ __OPFS__
     return C;
   };
 
-  // Пересадка уже работающего объекта на настоящий интерфейс. Значения
-  // переезжают на прототип: у Chrome ни у `navigator.storage`, ни у
-  // `screen.orientation` собственных свойств нет вовсе — всё на прототипе,
-  // и сборщик отпечатка идёт по графу именно так.
+  // Moves a working object onto a real interface. Values move to the
+  // prototype: in Chrome neither `navigator.storage` nor `screen.orientation`
+  // has own properties, and fingerprinters walk the graph that way.
   const rebrand = (obj, name, base, hidden) => {
     if (!obj || typeof obj !== 'object') return obj;
     const C = iface(name, base, hidden);
@@ -4462,8 +4358,8 @@ __OPFS__
       let d;
       try { d = Object.getOwnPropertyDescriptor(obj, k); } catch (e) { continue; }
       if (!d || !d.configurable) continue;
-      // Что уже есть у предка (addEventListener у EventTarget), на прототип
-      // не копируется — только снимается с объекта и наследуется.
+      // What the parent already has (addEventListener on EventTarget) is not
+      // copied, only removed from the object and inherited.
       if (base && (k in base)) { try { delete obj[k]; } catch (e) {} continue; }
       try {
         if (typeof d.value === 'function') defv(C.prototype, k, native(d.value));
@@ -4479,8 +4375,8 @@ __OPFS__
   const ET = globalThis.EventTarget && EventTarget.prototype;
 
   // ── Trusted Types ────────────────────────────────────────────────────────
-  // Значение живёт в WeakMap, а не на объекте: у настоящего TrustedScriptURL
-  // собственных свойств нет, только toString/toJSON на прототипе.
+  // The value lives in a WeakMap: a real TrustedScriptURL has no own
+  // properties, only toString/toJSON on the prototype.
   const VAL = new WeakMap();
   const TrustedHTML = iface('TrustedHTML');
   const TrustedScript = iface('TrustedScript');
@@ -4498,12 +4394,12 @@ __OPFS__
     meth(C.prototype, 'toJSON', function () { return VAL.get(this); });
   }
 
-  // Ворота исполнения строки для TrustedScript — не обёртки над eval и
-  // таймерами (у обёртки свой `prototype`, её видит проверка родных функций
-  // челленджа, а обёрнутый eval перестаёт быть прямым): TrustedScript несёт
-  // свой текст скрытым полем (`__pt_codeLike`), и eval / new Function берут
-  // его сами через обработчик генерации кода; таймеры принимают его в своей
-  // очереди.
+  // String execution gates for TrustedScript are not wrappers around eval and
+  // timers (a wrapper has its own `prototype`, visible to the challenge's
+  // native function check, and a wrapped eval stops being direct):
+  // TrustedScript carries its text in a hidden field (`__pt_codeLike`), eval
+  // and new Function read it via the code generation callback, and timers
+  // accept it in their queue.
   const installTrustedSinks = () => {};
 
   const isTrustedScript = (v) => { try { return v instanceof TrustedScript; } catch (e) { return false; } };
@@ -4517,7 +4413,7 @@ __OPFS__
       throw __pt_mkErr(TypeError, "Failed to execute '" + member + "' on 'TrustedTypePolicy': Policy " +
                           (p ? p.name : '') + "'s TrustedTypePolicyOptions did not specify a '" + member + "' member.");
     }
-    // Правило зовётся без `this`, как всякий IDL-обратный вызов.
+    // The rule is called without `this`, like any IDL callback.
     return wrapped(C, rule.apply(undefined, arguments));
   };
   meth(TrustedTypePolicy.prototype, 'createHTML', creator('createHTML', TrustedHTML));
@@ -4532,9 +4428,9 @@ __OPFS__
   const createdNames = new Set();
   meth(TTF, 'createPolicy', function (name, rules) {
     const n = String(name);
-    // Директива `trusted-types a b default`: чужое имя — отказ, повтор имени
-    // без 'allow-duplicates' — тоже; без директивы — любое имя, но второй
-    // 'default' всё равно отказ.
+    // `trusted-types a b default` directive: an unlisted name is refused, as
+    // is a duplicate without 'allow-duplicates'; without the directive any
+    // name goes, but a second 'default' is still refused.
     let names = null;
     try { names = typeof globalThis.__pt_ttNames === 'function' ? __pt_ttNames() : null; } catch (e) {}
     if (names) {
@@ -4548,17 +4444,16 @@ __OPFS__
     const p = Object.create(TrustedTypePolicy.prototype);
     POL.set(p, { name: n, rules: rules || {} });
     if (n === 'default') defaultPolicy = p;
-    // Ворота для кода открываются только теперь: пока политики нет, ни один
-    // TrustedScript существовать не может, а `eval` остаётся тем самым
-    // интринсиком — со своей областью видимости у прямого вызова. Страница,
-    // которая Trusted Types не трогает, ничего не теряет.
+    // Code gates open only now: without a policy no TrustedScript can exist,
+    // and `eval` stays the real intrinsic with direct-call scoping. Pages that
+    // don't use Trusted Types lose nothing.
     installTrustedSinks();
     return p;
   });
   defg(TTF, 'emptyHTML', function () { return emptyHTML; });
   defg(TTF, 'emptyScript', function () { return emptyScript; });
   defg(TTF, 'defaultPolicy', function () { return defaultPolicy; });
-  // Стокам (dom_runtime) нужна политика по умолчанию с её правилами.
+  // Sinks (dom_runtime) need the default policy and its rules.
   try { Object.defineProperty(globalThis, '__pt_ttDefault', { value: () => (defaultPolicy ? POL.get(defaultPolicy) : null), writable: true, enumerable: false, configurable: true }); } catch (e) {}
   // Where Chrome demands a trusted value — measured, not guessed.
   const ATTR = {
@@ -4586,18 +4481,15 @@ __OPFS__
     });
   } catch (e) {}
 
-  // Trusted Types и eval: `eval(trustedScript)` браузер исполняет, а голый
-  // движок — нет. По спецификации PerformEval возвращает аргумент нетронутым,
-  // если это не примитивная строка, — молча, без ошибки. Именно так виджет
-  // Turnstile объявляет свой XOR-хелпер: политика делает TrustedScript, он идёт
-  // в eval, в Chrome появляется глобальная функция, а у нас не появлялось
-  // ничего, и следующая же строка их интерпретатора падала на вызове undefined.
+  // Trusted Types and eval: the browser executes `eval(trustedScript)`, a
+  // bare engine does not; per spec PerformEval returns a non-string argument
+  // untouched, silently. The Turnstile widget declares its XOR helper this
+  // way: policy -> TrustedScript -> eval -> a global function.
   //
-  // Цена обёртки известна и принята: `eval` перестаёт быть тем самым
-  // интринсиком, поэтому прямой eval внутри функции больше не видит её
-  // локальных имён (становится косвенным). Наши собственные скрипты страницы и
-  // так выполняются через `(0, eval)`, а платформенное поведение с
-  // TrustedScript важнее этого редкого случая.
+  // Known cost of a wrapper: `eval` stops being the intrinsic, so a direct
+  // eval inside a function no longer sees its locals (it becomes indirect).
+  // Our own page scripts run via `(0, eval)` anyway, and TrustedScript
+  // behaviour matters more than this rare case.
   // ── navigator.* ──────────────────────────────────────────────────────────
   const nav = globalThis.navigator;
   if (nav) {
@@ -4610,8 +4502,8 @@ __OPFS__
       }
       meth(Storage_.prototype, 'persisted', function () { return Promise.resolve(false); });
       meth(Storage_.prototype, 'persist', function () { return Promise.resolve(false); });
-      // OPFS у Chrome в защищённом контексте есть всегда: отказ здесь — сам по
-      // себе примета. Реализация общая с воркером, см. `OPFS_TEMPLATE`.
+      // Chrome always has OPFS in a secure context: a refusal is itself a
+      // tell. Implementation shared with workers, see `OPFS_TEMPLATE`.
       if (typeof __ptOPFS === 'function') {
         meth(Storage_.prototype, 'getDirectory', function getDirectory() { return __ptOPFS(); });
       }
@@ -4622,11 +4514,11 @@ __OPFS__
     rebrand(nav.ink, 'Ink');
     rebrand(nav.locks, 'LockManager');
     rebrand(nav.devicePosture, 'DevicePosture', ET);
-    // Члены — на прототипе, а не на самом объекте: у Chrome у них ничего своего.
+    // Members live on the prototype: in Chrome these objects have no own properties.
     rebrand(nav.mediaDevices, 'MediaDevices', ET);
     rebrand(nav.userActivation, 'UserActivation');
-    // Устройства, которых у пустого профиля нет: браузер отвечает пустыми
-    // списками и отказами, а не отсутствием методов. Сверено с Chrome 151.
+    // Devices an empty profile lacks: the browser answers with empty lists and
+    // rejections, not missing methods. Verified against Chrome 151.
     const USB_ = rebrand(nav.usb, 'USB', ET);
     if (USB_) {
       meth(USB_.prototype, 'getDevices', function getDevices() { return Promise.resolve([]); });
@@ -4679,10 +4571,10 @@ __OPFS__
       }); } catch (e) {}
     }
     try {
-    // Сторонний кадр в песочнице: Chrome отказывает по permissions policy и
-    // словами говорит почему; у нас методы молчали или отсутствовали.
+    // Sandboxed cross-site frame: Chrome refuses per permissions policy and
+    // says why in words.
     const crossSite = () => !!globalThis.__pt_crossSite;
-    // Переопределение поверх заглушки любого вида: сначала снять, потом положить.
+    // Override any kind of stub: remove first, then define.
     const setm = (o, k, f) => { try { const d = Object.getOwnPropertyDescriptor(o, k); if (d && d.configurable) delete o[k]; } catch (e) {} return meth(o, k, f); };
     const dx = (msg, name) => __pt_mkErr(globalThis.DOMException || Error, msg, name);
     const rejectDx = (msg, name) => Promise.reject(dx(msg, name));
@@ -4786,7 +4678,7 @@ __OPFS__
         setm(EP, 'requestPointerLock', function requestPointerLock() { if (crossSite()) return rejectDx("Failed to execute 'requestPointerLock' on 'Element': Blocked pointer lock on an element because the element's frame is sandboxed and the 'allow-pointer-lock' permission is not set.", 'SecurityError'); return Promise.resolve(undefined); });
       }
     } catch (e) {}
-    // Конструкторы, которым в стороннем кадре Chrome отказывает ещё до работы.
+    // Constructors Chrome refuses in a cross-site frame before doing anything.
     const guardCtor = (name, msg, kind) => {
       try {
         const C = globalThis[name]; if (typeof C !== 'function') return;
@@ -4813,7 +4705,7 @@ __OPFS__
     } catch (e) {}
     if (globalThis.cookieStore) { try { const CS = protoOf(globalThis.cookieStore, 'CookieStore', ET); if (CS) { setm(CS, 'getAll', function getAll() { return Promise.resolve([]); }); setm(CS, 'get', function get() { return Promise.resolve(null); }); setm(CS, 'set', function set() { return Promise.resolve(undefined); }); setm(CS, 'delete', function () { return Promise.resolve(undefined); }); } } catch (e) {} }
     } catch (e) { try { console.error('[policy block] ' + (e && e.stack)); } catch (x) {} }
-    // Планировщик: `postTask` отдаёт итог задачи обещанием, `yield` — пустое.
+    // Scheduler: `postTask` resolves with the task's result, `yield` with nothing.
     if (globalThis.scheduler) {
       try {
         let SP = Object.getPrototypeOf(globalThis.scheduler);
@@ -4829,7 +4721,7 @@ __OPFS__
 
     const MC = rebrand(nav.mediaCapabilities, 'MediaCapabilities');
     if (MC) {
-      // Chrome отвечает так на любой поддерживаемый профиль; проверено на месте.
+      // Chrome answers this for any supported profile; checked live.
       meth(MC.prototype, 'decodingInfo', function () {
         return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, keySystemAccess: null });
       });
@@ -4867,14 +4759,13 @@ __OPFS__
 
     const UA = nav.userAgentData;
     if (UA) {
-      // Значения уже есть (их ставит слой отпечатка) — забираем их до пересадки.
+      // Values already exist (set by the fingerprint layer): take them before rebranding.
       const brands = UA.brands, mobile = UA.mobile, platform = UA.platform;
       const HIGH = {"architecture":"x86","bitness":"64","formFactors":["Desktop"],"fullVersionList":[{"brand":"Not=A?Brand","version":"99.0.0.0"},{"brand":"Google Chrome","version":"__CHROME_FULL__"},{"brand":"Chromium","version":"__CHROME_FULL__"}],"model":"","platformVersion":"","uaFullVersion":"__CHROME_FULL__","wow64":false};
       const UAD = rebrand(UA, 'NavigatorUAData');
       meth(UAD.prototype, 'toJSON', function () { return { brands: brands, mobile: mobile, platform: platform }; });
       meth(UAD.prototype, 'getHighEntropyValues', function (hints) {
-        // Порядок ключей у браузера алфавитный, и он виден через
-        // `JSON.stringify` — у нас же три обязательных шли первыми.
+        // The browser's key order is alphabetical, visible via `JSON.stringify`.
         const all = { brands: brands, mobile: mobile, platform: platform };
         for (const h of (hints || [])) if (Object.prototype.hasOwnProperty.call(HIGH, h)) all[h] = HIGH[h];
         const out = {};
@@ -4887,14 +4778,14 @@ __OPFS__
     const GPU_ = rebrand(nav.gpu, 'GPU');
     if (GPU_) {
       const LIMITS = {"maxTextureDimension1D": 16384, "maxTextureDimension2D": 16384, "maxTextureDimension3D": 2048, "maxTextureArrayLayers": 2048, "maxBindGroups": 4, "maxBindGroupsPlusVertexBuffers": 24, "maxBindingsPerBindGroup": 1000, "maxDynamicUniformBuffersPerPipelineLayout": 8, "maxDynamicStorageBuffersPerPipelineLayout": 4, "maxSampledTexturesPerShaderStage": 16, "maxSamplersPerShaderStage": 16, "maxStorageBuffersPerShaderStage": 16, "maxStorageTexturesPerShaderStage": 4, "maxUniformBuffersPerShaderStage": 12, "maxUniformBufferBindingSize": 65536, "maxStorageBufferBindingSize": 1073741824, "minUniformBufferOffsetAlignment": 256, "minStorageBufferOffsetAlignment": 256, "maxVertexBuffers": 8, "maxBufferSize": 1073741824, "maxVertexAttributes": 16, "maxVertexBufferArrayStride": 2048, "maxInterStageShaderVariables": 16, "maxColorAttachments": 8, "maxColorAttachmentBytesPerSample": 128, "maxComputeWorkgroupStorageSize": 65536, "maxComputeInvocationsPerWorkgroup": 1024, "maxComputeWorkgroupSizeX": 1024, "maxComputeWorkgroupSizeY": 1024, "maxComputeWorkgroupSizeZ": 64, "maxComputeWorkgroupsPerDimension": 65535, "maxImmediateSize": 64, "maxStorageBuffersInFragmentStage": 16, "maxStorageTexturesInFragmentStage": 4, "maxStorageBuffersInVertexStage": 16, "maxStorageTexturesInVertexStage": 4};
-      // Устройство без requiredLimits/requiredFeatures — с пределами по умолчанию
-      // и одной core-features-and-limits, а не с адаптерными.
+      // A device without requiredLimits/requiredFeatures gets default limits
+      // and only core-features-and-limits, not the adapter's.
       const DEV_LIMITS = {"maxTextureDimension1D": 8192, "maxTextureDimension2D": 8192, "maxTextureDimension3D": 2048, "maxTextureArrayLayers": 256, "maxBindGroups": 4, "maxBindGroupsPlusVertexBuffers": 24, "maxBindingsPerBindGroup": 1000, "maxDynamicUniformBuffersPerPipelineLayout": 8, "maxDynamicStorageBuffersPerPipelineLayout": 4, "maxSampledTexturesPerShaderStage": 16, "maxSamplersPerShaderStage": 16, "maxStorageBuffersPerShaderStage": 8, "maxStorageTexturesPerShaderStage": 4, "maxUniformBuffersPerShaderStage": 12, "maxUniformBufferBindingSize": 65536, "maxStorageBufferBindingSize": 134217728, "minUniformBufferOffsetAlignment": 256, "minStorageBufferOffsetAlignment": 256, "maxVertexBuffers": 8, "maxBufferSize": 268435456, "maxVertexAttributes": 16, "maxVertexBufferArrayStride": 2048, "maxInterStageShaderVariables": 16, "maxColorAttachments": 8, "maxColorAttachmentBytesPerSample": 32, "maxComputeWorkgroupStorageSize": 16384, "maxComputeInvocationsPerWorkgroup": 256, "maxComputeWorkgroupSizeX": 256, "maxComputeWorkgroupSizeY": 256, "maxComputeWorkgroupSizeZ": 64, "maxComputeWorkgroupsPerDimension": 65535, "maxImmediateSize": 64, "maxStorageBuffersInFragmentStage": 8, "maxStorageTexturesInFragmentStage": 4, "maxStorageBuffersInVertexStage": 8, "maxStorageTexturesInVertexStage": 4};
       const FEATURES = ["depth32float-stencil8", "rg11b10ufloat-renderable", "bgra8unorm-storage", "texture-formats-tier1", "texture-compression-bc", "dual-source-blending", "core-features-and-limits", "float32-filterable", "indirect-first-instance", "texture-compression-astc-sliced-3d", "float32-blendable", "texture-compression-astc", "texture-compression-etc2", "depth-clip-control", "texture-compression-bc-sliced-3d", "texture-formats-tier2", "clip-distances", "shader-f16", "timestamp-query", "primitive-index", "texture-component-swizzle", "subgroups"];
       const INFO = {"vendor":"intel","architecture":"gen-12lp","device":"","description":"","subgroupMinSize":8,"subgroupMaxSize":32,"isFallbackAdapter":false};
       const WGSL = ["packed_4x8_integer_dot_product", "subgroup_uniformity", "immediate_address_space", "subgroup_id", "linear_indexing", "readonly_and_readwrite_storage_textures", "unrestricted_pointer_parameters", "texture_and_sampler_let", "pointer_composite_access", "uniform_buffer_standard_layout"];
 
-      // setlike-интерфейс: Chrome отдаёт их именно так, а не массивом.
+      // setlike interface: Chrome returns these this way, not as an array.
       const setlike = (name) => {
         const C = iface(name);
         const S = new WeakMap();
@@ -4943,7 +4834,7 @@ __OPFS__
       defg(GPUDevice.prototype, 'limits', function () { return devLimits; });
       defg(GPUDevice.prototype, 'adapterInfo', function () { return info; });
       defg(GPUDevice.prototype, 'label', function () { return ''; });
-      // Живое устройство свой `lost` не разрешает — так это и выглядит.
+      // A live device never resolves its `lost`.
       const lost = new Promise(() => {});
       defg(GPUDevice.prototype, 'lost', function () { return lost; });
       defg(GPUDevice.prototype, 'queue', function () { return Object.create(GPUQueue.prototype); });
@@ -4953,7 +4844,7 @@ __OPFS__
       });
       const adapter = Object.create(GPUAdapter.prototype);
       meth(GPU_.prototype, 'requestAdapter', function (opts) {
-        // Программного запасного адаптера на этой машине нет — как и у Chrome.
+        // No software fallback adapter on this machine, same as Chrome.
         if (opts && opts.forceFallbackAdapter) return Promise.resolve(null);
         return Promise.resolve(adapter);
       });
@@ -4964,13 +4855,12 @@ __OPFS__
   }
 
   if (globalThis.screen) {
-    // Уже пересажен раньше (блок правил кадра): второй пересад терял angle и
-    // type — их геттеры оставались на старом прототипе, а новый получал
-    // заглушки, отвечающие undefined.
+    // Already rebranded earlier (frame rules block): a second rebrand lost
+    // angle and type, whose getters stayed on the old prototype.
     const so = screen.orientation, sp = so && Object.getPrototypeOf(so);
     const SO = (sp && sp !== Object.prototype && typeof sp.constructor === 'function' && sp.constructor.name === 'ScreenOrientation')
       ? sp.constructor : rebrand(so, 'ScreenOrientation', ET);
-    // `onchange` — обработчик события: null, с чтением и записью.
+    // `onchange` is an event handler: null, read-write.
     if (SO && !Object.getOwnPropertyDescriptor(SO.prototype, 'onchange')) {
       const cell = new WeakMap();
       Object.defineProperty(SO.prototype, 'onchange', {
@@ -4981,10 +4871,10 @@ __OPFS__
     }
   }
 
-  // Всё, что стоит на окне до первого скрипта страницы, — браузерное, и
-  // `toString` обязан говорить [native code]. Интерфейсы, объявленные раньше
-  // самого механизма маскировки (XHR и его ступени, Storage), иначе читаются
-  // сборщиком как функции страницы.
+  // Everything on window before the first page script is the browser's and
+  // `toString` must say [native code]. Interfaces declared before the masking
+  // mechanism itself (XHR and its layers, Storage) would otherwise read as
+  // page functions.
   for (const name of Object.getOwnPropertyNames(globalThis)) {
     if (name.lastIndexOf('__pt', 0) === 0) continue;
     let v;
@@ -4992,12 +4882,12 @@ __OPFS__
     if (typeof v === 'function') native(v);
   }
 
-  // Второй проход по форме интерфейсов: Storage, SpeechSynthesis и звук
-  // объявляются позже DOM-слоя, и в первый раз их ещё нет.
+  // Second interface shape pass: Storage, SpeechSynthesis and audio are
+  // declared after the DOM layer and missing the first time.
   try { if (globalThis.__pt_fillShapes) __pt_fillShapes(); } catch (e) {}
-  // `for…in` по стилю отдаёт девять имён прототипа в порядке объявления, и у
-  // Chrome он свой. Заполнитель форм раскладывает члены по видам — сперва
-  // длина, потом методы, — поэтому здесь пересобираем в браузерном порядке.
+  // `for...in` over a style yields nine prototype names in declaration order,
+  // and Chrome's order differs. The shape filler groups members by kind
+  // (length first, then methods), so rebuild in browser order here.
   try {
     const P = globalThis.CSSStyleDeclaration && globalThis.CSSStyleDeclaration.prototype;
     if (P) {
@@ -5013,18 +4903,17 @@ __OPFS__
     }
   } catch (e) {}
 
-  // `document.fonts` — FontFaceSet. Проверка доступности шрифта через
-  // `fonts.check('12px "Some Font"')` — обычный способ снять отпечаток по
-  // набору шрифтов, а у нас это был пустой объект, и первый же вызов бросал.
-  // Браузер отвечает true на любое семейство (запасной шрифт есть всегда) и
-  // бросает SyntaxError на строку, которая не разбирается как шрифт.
+  // `document.fonts` is a FontFaceSet. `fonts.check('12px "Some Font"')` is a
+  // common font fingerprinting method. The browser returns true for any
+  // family (a fallback always exists) and throws SyntaxError on a string that
+  // does not parse as a font.
   if (globalThis.document) {
-    // Chrome имя FontFaceSet на окне не публикует — интерфейс есть, глобали нет.
+    // Chrome does not expose the FontFaceSet name on window: the interface exists, the global does not.
     const FFS = rebrand(document.fonts, 'FontFaceSet', ET, true);
     if (FFS) {
       const P = FFS.prototype;
-      // Набор настоящий: страница добавляет в него `FontFace` и читает
-      // `size`, перебирает его и ждёт `load`.
+      // A real set: the page adds `FontFace`s, reads `size`, iterates and
+      // awaits `load`.
       const faces = new Set();
       let pending = 0;
       defg(P, 'size', function () { return faces.size; });
@@ -5034,7 +4923,7 @@ __OPFS__
       for (const on of ['onloading', 'onloadingdone', 'onloadingerror']) {
         try { Object.defineProperty(P, on, { value: null, writable: true, enumerable: true, configurable: true }); } catch (e) {}
       }
-      // Разбор сокращения: без размера и семейства это не шрифт.
+      // Shorthand parse: without a size and family it is not a font.
       const parses = (font) => /(^|\s)(\d+(\.\d+)?(px|pt|em|rem|%)|x?x-(small|large)|small|medium|large|larger|smaller)(\s|\/)/.test(' ' + String(font) + ' ');
       meth(P, 'check', function (font) {
         if (!parses(font)) {
@@ -5042,7 +4931,7 @@ __OPFS__
         }
         return true;
       });
-      // Семейство из сокращения: `12px "Имя", serif` — это «Имя».
+      // Family from a shorthand: `12px "Name", serif` gives "Name".
       const familyOf = (font) => {
         const t = String(font);
         const m = /(?:\d+(?:\.\d+)?(?:px|pt|em|rem|%)|x?x-(?:small|large)|small|medium|large|larger|smaller)\s+(.+)$/.exec(t);
@@ -5084,7 +4973,7 @@ __OPFS__
     }
   }
 
-  // `navigator.locks` — LockManager: `request` берёт замок и зовёт колбэк.
+  // `navigator.locks` is a LockManager: `request` takes the lock and calls back.
   if (globalThis.navigator && navigator.locks) {
     const LM = rebrand(navigator.locks, 'LockManager');
     if (LM) {
@@ -5100,9 +4989,8 @@ __OPFS__
     }
   }
 
-  // `caches` был пустым объектом из таблицы графа: имя есть, методов нет, и
-  // первый же `caches.keys()` в воркере сборщика бросал TypeError. Хранилища у
-  // нас нет, но интерфейс обязан быть и обязан отвечать обещаниями.
+  // `caches` must be a real interface answering with promises (the
+  // collector's worker calls `caches.keys()`), even without real storage.
   const CS = rebrand(globalThis.caches, 'CacheStorage');
   if (CS) {
     const CacheIface = iface('Cache');
@@ -5121,15 +5009,14 @@ __OPFS__
     meth(CS.prototype, 'match', function () { return Promise.resolve(undefined); });
   }
 
-  // Заготовки из таблицы имён — это пустые объекты, и каждая отвечала
-  // `[object Object]` там, где браузер называет себя: `visualViewport`,
-  // шесть `BarProp`, `customElements`, `indexedDB`, `cookieStore`… Тридцать
-  // одна штука, снятая сравнением с Chrome 148 (`scripts` в блокноте:
-  // `tags_expr.js`). Сборщику отпечатка это первое, что видно: он зовёт
-  // `Object.prototype.toString` по всему окну подряд.
+  // Name-table placeholders are empty objects tagging as `[object Object]`
+  // where the browser names itself: `visualViewport`, six `BarProp`s,
+  // `customElements`, `indexedDB`, `cookieStore`... 31 of them, found by
+  // comparison with Chrome 148. Fingerprinters call
+  // `Object.prototype.toString` across the whole window.
   //
-  // Конструкторы для них таблица уже создала, так что достаточно пересадить
-  // объект на нужный прототип — заодно чинятся `instanceof` и `constructor`.
+  // The table already created their constructors, so moving each object onto
+  // the right prototype is enough; it also fixes `instanceof` and `constructor`.
   const BRANDED = {
     locationbar: 'BarProp', menubar: 'BarProp', personalbar: 'BarProp',
     scrollbars: 'BarProp', statusbar: 'BarProp', toolbar: 'BarProp',
@@ -5139,18 +5026,17 @@ __OPFS__
     crashReport: 'CrashReportContext', documentPictureInPicture: 'DocumentPictureInPicture',
     viewport: 'Viewport', launchQueue: 'LaunchQueue',
   };
-  // Интерфейс на имя — один: шесть панелей окна в Chrome делят один и тот же
-  // прототип, и сравнение `Object.getPrototypeOf(locationbar) ===
-  // Object.getPrototypeOf(toolbar)` это показывает.
+  // One interface per name: Chrome's six window bars share one prototype,
+  // as `Object.getPrototypeOf(locationbar) === Object.getPrototypeOf(toolbar)`
+  // shows.
   const made = new Map();
   for (const [prop, name] of Object.entries(BRANDED)) {
     try {
       const v = globalThis[prop];
       if (!v || typeof v !== 'object') continue;
-      // Пустышку из таблицы имён пересаживаем на настоящий интерфейс. А вот у
-      // объекта с собственным прототипом там живут его методы — такому имя
-      // ставим на месте, иначе `customElements` останется без `define` и
-      // `get`, и любая страница с веб-компонентами упадёт.
+      // Name-table dummies move onto the real interface. An object with its
+      // own prototype keeps its methods there, so it is tagged in place;
+      // otherwise `customElements` would lose `define` and `get`.
       const proto = Object.getPrototypeOf(v);
       if (proto && proto !== Object.prototype) {
         try { Object.defineProperty(proto, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {}
@@ -5161,15 +5047,15 @@ __OPFS__
         continue;
       }
       const done = made.get(name);
-      // Интерфейс объявляем открыто: таблица имён положила туда пустую
-      // функцию без метки, а `instanceof` и `constructor` должны сойтись с
-      // тем прототипом, на который объект сейчас переедет.
+      // Declare the interface openly: the name table put an untagged empty
+      // function there, and `instanceof`/`constructor` must match the
+      // prototype the object is about to move to.
       if (done) Object.setPrototypeOf(v, done.prototype);
       else made.set(name, rebrand(v, name, name === 'VisualViewport' ? ET : undefined));
     } catch (e) {}
   }
-  // Порядок имён на прототипе тоже читают: у Chrome сначала члены, `constructor`
-  // последним, а у свежесозданного интерфейса он оказывается первым.
+  // Prototype name order is read too: Chrome has members first and
+  // `constructor` last, while a fresh interface has it first.
   const constructorLast = (proto) => {
     try {
       const d = Object.getOwnPropertyDescriptor(proto, 'constructor');
@@ -5178,15 +5064,14 @@ __OPFS__
       Object.defineProperty(proto, 'constructor', d);
     } catch (e) {}
   };
-  // Панель окна отвечает, видно ли её, — и в обычном окне видно всё.
+  // A window bar reports whether it is visible; in a normal window all are.
   try {
     const BP = made.get('BarProp').prototype;
     defg(BP, 'visible', function () { return true; });
     constructorLast(BP);
   } catch (e) {}
-  // Видимая часть окна: та же, что `innerWidth`/`innerHeight`, без сдвига и без
-  // масштаба. Пустой `visualViewport` отвечал `undefined` на каждый вопрос —
-  // а спрашивают его первым делом, когда меряют окно.
+  // Visual viewport: same as `innerWidth`/`innerHeight`, no offset or scale.
+  // Window measurements read it first.
   try {
     const VV = made.get('VisualViewport').prototype;
     defg(VV, 'offsetLeft', function () { return 0; });
@@ -5201,9 +5086,9 @@ __OPFS__
     }
     constructorLast(VV);
   } catch (e) {}
-  // Пространства имён устроены иначе: конструктора у них нет вовсе, имя носит
-  // сам объект. `StyleMedia` из той же породы — Chrome его конструктор не
-  // публикует, а объект зовётся `[object StyleMedia]`.
+  // Namespaces differ: no constructor, the object itself carries the name.
+  // `StyleMedia` is the same kind: Chrome does not expose its constructor,
+  // yet the object tags as `[object StyleMedia]`.
   const TAGGED = {
     Intl: 'Intl', CSS: 'CSS', Temporal: 'Temporal', styleMedia: 'StyleMedia',
     GPUBufferUsage: 'GPUBufferUsage', GPUColorWrite: 'GPUColorWrite', GPUMapMode: 'GPUMapMode',
@@ -5217,8 +5102,8 @@ __OPFS__
       }
     } catch (e) {}
   }
-  // `clientInformation` — не копия навигатора, а он сам: одно и то же
-  // значение под двумя именами, и сравнение на равенство это показывает.
+  // `clientInformation` is the navigator itself, not a copy: an equality
+  // check shows it.
   try {
     if (globalThis.navigator) {
       Object.defineProperty(globalThis, 'clientInformation', {
@@ -5237,9 +5122,9 @@ __OPFS__
     rebrand(v, name, base);
   };
   try { brandInPlace(document && document.timeline, 'DocumentTimeline'); } catch (e) {}
-  // `document.timeline.currentTime` — часы кадра: число с тремя знаками
-  // (у Chrome 1514.782; у нас было undefined), замороженное на время задачи,
-  // как у Chrome (в одной задаче все чтения равны).
+  // `document.timeline.currentTime` is the frame clock: a number with three
+  // decimals (Chrome: 1514.782), frozen for the task as in Chrome (all reads
+  // within one task are equal).
   try {
     const TL = document && document.timeline;
     const TP = TL && Object.getPrototypeOf(TL);
@@ -5256,19 +5141,19 @@ __OPFS__
     }
   } catch (e) {}
   try { brandInPlace(globalThis.navigator && navigator.serviceWorker, 'ServiceWorkerContainer', ET); } catch (e) {}
-  // Канал WebRTC создаётся уже во время работы страницы — ему нужен готовый
-  // прототип с меткой, а не пустышка из таблицы.
+  // WebRTC channels are created while the page runs and need a ready tagged
+  // prototype, not a table dummy.
   try { iface('RTCDataChannel', ET); } catch (e) {}
 
-  // Объект, который страница построила сама, тоже обязан называть себя:
-  // `Object.prototype.toString.call(new Blob([]))` — строчка из любого набора
-  // проверок, и у нас на неё отвечали `[object Object]` тридцать один объект
-  // из тридцати шести проверенных (снято с Chrome 148). Метку носит прототип,
-  // поэтому чиним разом: у кого её нет — тому ставим имя интерфейса.
+  // Objects the page builds itself must tag themselves too:
+  // `Object.prototype.toString.call(new Blob([]))` is in every check suite
+  // (31 of 36 checked objects answered `[object Object]`, compared with
+  // Chrome 148). The tag lives on the prototype, so fix in bulk: give the
+  // interface name to any prototype lacking one.
   //
-  // Встроенное в язык не трогаем: там метки либо уже есть (Map, Promise), либо
-  // тип узнаётся иначе (массивы, функции), и лишняя метка — это уже отличие в
-  // другую сторону.
+  // Language builtins are left alone: they either have tags (Map, Promise)
+  // or are identified otherwise (arrays, functions), and an extra tag would
+  // be a difference the other way.
   {
     const LANGUAGE = new Set([
       'Object', 'Function', 'Array', 'Number', 'String', 'Boolean', 'Symbol', 'BigInt',
@@ -5279,8 +5164,8 @@ __OPFS__
       'Float16Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array',
       'Map', 'Set', 'WeakMap', 'WeakSet', 'WeakRef', 'FinalizationRegistry', 'Promise',
       'Iterator', 'DisposableStack', 'AsyncDisposableStack',
-      // Эти трое — не интерфейсы, а фабрики: `new Audio()` возвращает
-      // HTMLAudioElement, и метка с именем фабрики сделала бы только хуже.
+      // These three are factories, not interfaces: `new Audio()` returns an
+      // HTMLAudioElement, and a factory-named tag would be wrong.
       'Image', 'Audio', 'Option',
     ]);
     for (const name of Object.getOwnPropertyNames(globalThis)) {
@@ -5295,8 +5180,8 @@ __OPFS__
     }
   }
 
-  // `speechSynthesis` голосов не отдаёт (их и в headless-Chrome нет), но
-  // интерфейсом быть обязан: сборщик идёт по прототипу.
+  // `speechSynthesis` has no voices (headless Chrome neither), but must be
+  // an interface: collectors walk its prototype.
   const SS = rebrand(globalThis.speechSynthesis, 'SpeechSynthesis', ET);
   if (SS) {
     defg(SS.prototype, 'paused', function () { return false; });
@@ -5340,28 +5225,28 @@ const IFACE_PROTO_MOVES: &str = r#"{"Blob":{"toString":[]},"FormData":{"toString
 /// declared its interfaces — half of them do not exist earlier.
 const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
   const native = globalThis.__pt_native || ((f) => f);
-  // Строгая функция: у члена интерфейса нет собственных `arguments`/`caller`.
-  // Метод/геттер: строгий и без `.prototype`, как у родных.
+  // Strict function: interface members have no own `arguments`/`caller`.
+  // Method/getter: strict and without `.prototype`, like native ones.
   const strictFn = (function () {
     'use strict';
     return function () { return ({ f() {} }).f; };
   })();
-  // Сначала цепочка: пока `Text` не наследует `CharacterData`, класть члены по
-  // уровням бессмысленно — они лягут не туда. Ставим только там, где наша
-  // цепочка оборвана, и только если это не создаёт петли.
+  // Chain first: until `Text` inherits `CharacterData`, placing members by
+  // level is pointless. Only set where our chain is broken, and only if no
+  // cycle results.
   const CHAIN = __IFACE_CHAIN__;
   const protoOf = (n) => {
-    // %TypedArray% не имеет имени на окне — до него добираются только через
-    // любой конкретный типизированный массив.
+    // %TypedArray% has no name on window: reachable only via any concrete
+    // typed array.
     if (n === 'TypedArray') {
       try { return Object.getPrototypeOf(Int8Array.prototype); } catch (e) { return null; }
     }
     try { const C = globalThis[n]; return (typeof C === 'function' && C.prototype) || null; }
     catch (e) { return null; }
   };
-  // Порядок обхода таблицы произволен, а звенья зависят друг от друга: пока
-  // `CharacterData` сам не встроен в `Node`, вставлять `Text` под него нельзя —
-  // мы потеряли бы уровень. Повторяем, пока цепочка ещё удлиняется.
+  // Table order is arbitrary but links depend on each other: `Text` cannot
+  // go under `CharacterData` until that is linked into `Node`, or a level is
+  // lost. Repeat while the chain keeps growing.
   for (let pass = 0; pass < 6; pass++) {
   let changed = false;
   for (const child of Object.keys(CHAIN)) {
@@ -5369,9 +5254,9 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     if (!P || !Q || P === Q) continue;
     const now = Object.getPrototypeOf(P);
     if (now !== Object.prototype) {
-      // Уже во что-то встроен. Вставить недостающее звено (`Text` наследует
-      // `CharacterData`, а тот — `Node`) можно, только если нынешний предок
-      // остаётся в цепочке ниже нового: иначе мы теряем уровень.
+      // Already linked somewhere. A missing link (`Text` inherits
+      // `CharacterData`, which inherits `Node`) can be inserted only if the
+      // current parent stays in the chain below the new one.
       if (now === Q) continue;
       let keeps = false;
       for (let q = Q; q; q = Object.getPrototypeOf(q)) { if (q === now) { keeps = true; break; } }
@@ -5385,22 +5270,22 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
   if (!changed) break;
   }
 
-  // Потоковые входы WebAssembly даёт не движок, а браузер: они принимают
-  // `Response` и читают из него байты. У V8 их нет вовсе, и в перечислении
-  // пространства имён нам не хватало ровно этих двух имён против Chrome.
-  // Реализуем честно — через тот же ответ, что отдаёт наш `fetch`.
-  // Отдельной функцией: контекст из снимка получает WebAssembly от V8 уже
-  // после загрузчика, и тогда её зовёт __pt_afterRestore.
+  // WebAssembly streaming entry points come from the browser, not the engine:
+  // they take a `Response` and read its bytes. V8 lacks them, and they were
+  // the only two names missing from the namespace vs Chrome. Implemented
+  // honestly via the same response our `fetch` returns.
+  // A separate function: a snapshot context gets WebAssembly from V8 after
+  // the loader, and then __pt_afterRestore calls it.
   const wasmStreaming = () => { try {
     const W = globalThis.WebAssembly;
     if (W && typeof W.compile === 'function' && typeof W.compileStreaming !== 'function') {
-      // Как у браузера: принимается только `Response` с MIME
-      // `application/wasm` и удачным статусом, иначе TypeError его словами.
+      // As in the browser: only a `Response` with MIME `application/wasm` and
+      // an ok status is accepted, otherwise TypeError in its words.
       const bytesOf = (src, what) => Promise.resolve(src).then((r) => {
         const head = "Failed to execute '" + what + "' on 'WebAssembly': ";
         if (globalThis.__pt_encTrace) { try { (globalThis.__pt_parentConsole || console).error('[wasm] ' + what + 'Streaming src=' + Object.prototype.toString.call(r) + ' ct=' + (r && r.headers && typeof r.headers.get === 'function' ? r.headers.get('content-type') : '?') + ' status=' + (r && r.status) + ' used=' + (r && r.bodyUsed) + ' ab=' + typeof (r && r.arrayBuffer)); } catch (e) {} }
-        // Ответ может прийти из другой области (свой Response песочницы):
-        // узнаём его по форме, а не по instanceof.
+        // The response may come from another realm (a sandbox Response):
+        // recognize it by shape, not instanceof.
         const looksResponse = r && typeof r === 'object' && typeof r.arrayBuffer === 'function' && r.headers && typeof r.headers.get === 'function';
         if (!looksResponse) {
           throw __pt_mkErr(TypeError, head + "An argument must be provided, which must be a Response or Promise<Response> object");
@@ -5416,7 +5301,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       const is = function instantiateStreaming(source, imports) {
         return bytesOf(source, 'instantiate').then((b) => W.instantiate(b, imports)).catch(traceRej('instantiateStreaming'));
       };
-      // Трасса (`NOKK_TRACE_ENC=1`): чем и с чем зовут WebAssembly.
+      // Trace (`NOKK_TRACE_ENC=1`): what WebAssembly is called with.
       if (globalThis.__pt_encTrace) {
         for (const k of ['instantiate', 'compile', 'validate']) {
           const F = W[k];
@@ -5451,8 +5336,8 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     const has = (k) => Object.prototype.hasOwnProperty.call(I, k);
     for (const k of Object.keys(spec.c || {})) {
       if (has(k)) continue;
-      // Форма дескриптора браузера: константа перечислима, но не
-      // переписывается и не удаляется.
+      // Browser descriptor shape: a constant is enumerable but non-writable
+      // and non-configurable.
       try {
         Object.defineProperty(I, k, {
           value: spec.c[k], writable: false, enumerable: !hidden.has(k), configurable: false,
@@ -5465,7 +5350,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         const f = strictFn();
         Object.defineProperty(f, 'name', { value: k, configurable: true });
         Object.defineProperty(f, 'length', { value: spec.f[k], configurable: true });
-        // У метода нет prototype — он не конструктор.
+        // A method has no prototype: it is not a constructor.
         try { delete f.prototype; } catch (e2) {}
         Object.defineProperty(I, k, {
           value: native(f), writable: true, enumerable: !hidden.has(k), configurable: true,
@@ -5482,21 +5367,19 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     }
   }
 
-  // Уровнем ниже — по прототипам — таблица снята, но не поставлена. Объявить
-  // все 5007 членов, которых нам не хватает против Chrome, оказалось нельзя:
-  // имя на прототипе — обещание работы, и страница, найдя член, зовёт его. На
-  // семействе `Performance*` этим ломался виджет челленджа: наши записи
-  // тайминга живут на этих же прототипах, и заглушка перекрывала настоящее
-  // значение. Отличить «интерфейс, который движок реализует» от «имени из
-  // таблицы графа» надёжно нельзя — пустой прототип бывает и у первого, если он
-  // оформляется лениво. Так что здесь верность имени уступает верности
-  // поведения, и это осознанный размен, а не недоделка.
+  // The table for the level below (prototypes) is captured but not applied.
+  // Declaring all 5007 members we lack vs Chrome is not possible: a name on a
+  // prototype promises behaviour, and pages call what they find. With the
+  // `Performance*` family this broke the challenge widget: our timing
+  // entries live on those prototypes and stubs shadowed real values. "An
+  // interface the engine implements" cannot be reliably told apart from "a
+  // name from the graph table" (the former may have an empty, lazily filled
+  // prototype). A deliberate trade of name fidelity for behaviour.
   try { if (globalThis.__pt_sinkAudioMethods) __pt_sinkAudioMethods(); } catch (e) {}
-  // Передача холста воркеру. Метод возвращал `undefined`, и сборщик, который
-  // отдаёт холст воркеру и рисует там, обрывался целиком: из отчёта пропадали
-  // и снимок 44×49, и чтение 32×32 из WebGL — двенадцать тысяч знаков, львиная
-  // доля всей недостачи. Ставится здесь, а не в слое DOM: таблица форм
-  // интерфейсов затирает его заглушкой.
+  // Transferring a canvas to a worker. It returned `undefined`, and a
+  // collector that draws on a worker aborted entirely (the 44x49 snapshot and
+  // the 32x32 WebGL read went missing from the report). Installed here, not
+  // in the DOM layer: the interface shape table overwrites it with a stub.
   try {
     const CP = globalThis.HTMLCanvasElement && globalThis.HTMLCanvasElement.prototype;
     if (CP && globalThis.__pt_makeTransferred) {
@@ -5517,9 +5400,8 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       });
     }
   } catch (e) {}
-  // `new ImageData(...)` не работал: конструктор был заглушкой из таблицы форм,
-  // и объект выходил без пикселей — `d.data.length` бросало. Страница, которая
-  // складывает картинку сама, а не читает её с холста, обрывалась здесь.
+  // `new ImageData(...)`: the constructor was a shape-table stub producing an
+  // object without pixels, so `d.data.length` threw.
   try {
     const P0 = globalThis.ImageData && globalThis.ImageData.prototype;
     if (P0 && !globalThis.__pt_imageDataReal) {
@@ -5552,8 +5434,8 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
             throw __pt_mkErr(TypeError, "Failed to construct 'ImageData': " +
               "The provided value is not of type '(Uint8ClampedArray or Float16Array)'.");
           }
-          // Половинная точность допустима только вместе с явным форматом
-          // пикселей, и браузер говорит об этом отдельной ошибкой.
+          // Half precision is only allowed with an explicit pixel format, and
+          // the browser reports that with a separate error.
           if (f16 && !(settings && settings.pixelFormat === 'rgba-float16')) {
             throw err('Float16Array must use rgba-float16 pixel format.');
           }
@@ -5587,9 +5469,8 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     }
   } catch (e) {}
 
-  // `DOMMatrix` была заглушкой: все её поля отдавали `undefined`, и любая
-  // страница, читающая преобразование — через `getTransform`, через
-  // `WebKitCSSMatrix`, через разбор строки `transform` — получала пустоту.
+  // `DOMMatrix`: pages read transforms via `getTransform`, `WebKitCSSMatrix`
+  // or by parsing a `transform` string.
   try {
     const RO = globalThis.DOMMatrixReadOnly, MM = globalThis.DOMMatrix;
     if (MM && MM.prototype && !globalThis.__pt_matrixReal) {
@@ -5597,7 +5478,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       const ST = new WeakMap();
       const ident = () => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
       const stateOf = (o) => { let v = ST.get(o); if (!v) { v = { m: ident(), d2: true }; ST.set(o, v); } return v; };
-      // Порядок в массиве — по столбцам, как в спецификации: m11..m44.
+      // Column-major order, as in the spec: m11..m44.
       const IDX = { m11: 0, m12: 1, m13: 2, m14: 3, m21: 4, m22: 5, m23: 6, m24: 7,
         m31: 8, m32: 9, m33: 10, m34: 11, m41: 12, m42: 13, m43: 14, m44: 15 };
       const ALIAS = { a: 'm11', b: 'm12', c: 'm21', d: 'm22', e: 'm41', f: 'm42' };
@@ -5605,7 +5486,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         const st = stateOf(o);
         if (init === undefined || init === null) return o;
         if (typeof init === 'string') {
-          // Строка вида `matrix(a, b, c, d, e, f)` или `matrix3d(...)`.
+          // A string like `matrix(a, b, c, d, e, f)` or `matrix3d(...)`.
           const m = /^\s*matrix(3d)?\(([^)]*)\)\s*$/.exec(init);
           if (!m) { if (String(init).trim()) throw __pt_mkErr(globalThis.DOMException || Error, 
             "Failed to construct 'DOMMatrix': Failed to parse '" + init + "'.", 'SyntaxError'); return o; }
@@ -5628,7 +5509,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         }
         return o;
       };
-      const mulm = (A, B) => {            // A · B, оба по столбцам
+      const mulm = (A, B) => {            // A * B, both column-major
         const r = new Array(16).fill(0);
         for (let c = 0; c < 4; c++) for (let rr = 0; rr < 4; rr++) {
           let v = 0;
@@ -5642,8 +5523,8 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         const P = Cls && Cls.prototype;
         if (!P || Object.prototype.hasOwnProperty.call(P, '__ptMatrixShaped')) return;
         try { Object.defineProperty(P, '__ptMatrixShaped', { value: true }); } catch (e) {}
-        // У DOMMatrix свои только аксессоры с сеттерами, *Self-методы и
-        // setMatrixValue; остальное наследуется от DOMMatrixReadOnly.
+        // DOMMatrix's own members are only setter accessors, *Self methods and
+        // setMatrixValue; the rest is inherited from DOMMatrixReadOnly.
         const roOnly = new Set(['is2D', 'isIdentity', 'multiply', 'translate', 'scale', 'scale3d', 'scaleNonUniform', 'rotate', 'rotateFromVector', 'rotateAxisAngle', 'skewX', 'skewY', 'inverse', 'flipX', 'flipY', 'transformPoint', 'toFloat32Array', 'toFloat64Array', 'toJSON', 'toString']);
         const put = (name, get, set) => {
           if (writable && roOnly.has(name)) return;
@@ -5738,7 +5619,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       };
       shape(RO, false);
       shape(MM, true);
-      // Конструкторы: у обоих одна и та же разборка довода.
+      // Constructors: both parse the argument the same way.
       for (const Cls of [RO, MM]) {
         if (!Cls) continue;
         const orig = Cls;
@@ -5780,15 +5661,14 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     }
   } catch (e) {}
 
-  // WebGPU: объекты были пустыми оболочками, и вся ветка сбора — отрисовка
-  // треугольника в текстуру и чтение её обратно — обрывалась на первом же
-  // `createShaderModule`. Из отчёта пропадал блок в 4096 байт.
+  // WebGPU: the collector branch renders a triangle into a texture and reads
+  // it back (a 4096-byte report block).
   //
-  // Рисует всё это наш же GL: WGSL переводится в GLSL ES, а дальше идёт
-  // обычный конвейер. Перевод узкий — ровно те построения, которыми пишут
-  // такие пробы: точки входа с `@builtin`/`@location`, векторные типы,
-  // литеральные массивы и арифметика. Чего не знает — не переводит, и тогда
-  // конвейер честно отказывает, а не рисует наугад.
+  // Rendered by our GL: WGSL is translated to GLSL ES and goes through the
+  // normal pipeline. The translation is narrow, covering exactly what such
+  // probes use: entry points with `@builtin`/`@location`, vector types,
+  // literal arrays and arithmetic. Anything unknown is not translated and the
+  // pipeline honestly fails instead of guessing.
   try {
     const G = globalThis;
     const iface = (n) => (G[n] && G[n].prototype) || null;
@@ -5808,8 +5688,8 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     const mk = (n) => (iface(n) ? Object.create(iface(n)) : {});
     const ST = new WeakMap();
     const st = (o) => ST.get(o) || {};
-    // Трасса WebGPU (NOKK_TRACE_GPU=1): что программа шлёт конвейеру —
-    // шейдеры, описания, буферы, вызовы, — невидимо для страницы.
+    // WebGPU trace (NOKK_TRACE_GPU=1): shaders, descriptors, buffers and calls
+    // the program sends, invisible to the page.
     const glog = (what, v) => {
       try { if (!G.__pt_gpuTrace) return; (G.__pt_parentConsole || console).error('[gpu] ' + what + ' ' + (typeof v === 'string' ? v : JSON.stringify(v, (k, x) => (x && typeof x === 'object' && !Array.isArray(x) && ST.has(x)) ? '<' + (x.constructor && x.constructor.name) + '>' : (ArrayBuffer.isView(x) ? Array.from(x.subarray ? x.subarray(0, 64) : x).join(',') : x)))); } catch (e) {}
     };
@@ -5820,15 +5700,15 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       .replace(/\bvec2f\b/g, 'vec2').replace(/\bvec3f\b/g, 'vec3').replace(/\bvec4f\b/g, 'vec4')
       .replace(/\bvec2<f32>/g, 'vec2').replace(/\bvec3<f32>/g, 'vec3').replace(/\bvec4<f32>/g, 'vec4')
       .replace(/\bf32\b/g, 'float').replace(/\bi32\b/g, 'int').replace(/\bu32\b/g, 'uint');
-    // Целые внутри векторных сборок должны стать вещественными.
+    // Integers inside vector constructors must become floats.
     const floatLits = (t) => t.replace(/vec([234])\(([^()]*)\)/g, (m, n, args) =>
       'vec' + n + '(' + args.split(',').map((a) => {
         const s = a.trim();
         return /^-?\d+$/.test(s) ? s + '.0' : a;
       }).join(',') + ')');
     const entry = (code, kind) => {
-      // Скобки в списке доводов вложенные — `@builtin(vertex_index) i:u32`, —
-      // поэтому список берём счётом скобок, а не выражением.
+      // Parameter lists contain nested parens (`@builtin(vertex_index) i:u32`),
+      // so the list is found by counting parens, not with a regex.
       const head = new RegExp('@' + kind + '\\s+fn\\s+(\\w+)\\s*\\(', 'm');
       const h = head.exec(code);
       if (!h) return null;
@@ -5842,7 +5722,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       if (!rest) return null;
       const m = { 1: h[1], 2: params, 3: rest[1], index: h.index,
         0: code.slice(h.index, k + rest[0].length) };
-      // Тело — до парной закрывающей скобки.
+      // Body runs to the matching closing brace.
       let depth = 1, i = m.index + m[0].length;
       for (; i < code.length && depth; i++) {
         if (code[i] === '{') depth++;
@@ -5858,7 +5738,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         .replace(/\blet\s+/g, 'float ')
         .replace(/\bvar\s+/g, 'float ');
       let vs = prep(v.body), fs = prep(f.body);
-      // Довод с номером вершины становится встроенной переменной GL.
+      // The vertex index parameter becomes a GL builtin variable.
       const vi = /@builtin\(vertex_index\)\s*(\w+)/.exec(v.params);
       if (vi) vs = vs.replace(new RegExp('\\b' + vi[1] + '\\b', 'g'), 'gl_VertexID');
       const ii = /@builtin\(instance_index\)\s*(\w+)/.exec(v.params);
@@ -5867,7 +5747,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       vs = vs.replace(/return\s+([^;]+);/g, 'gl_Position = $1;');
       if (!/@location\(0\)/.test(f.ret)) return null;
       fs = fs.replace(/return\s+([^;]+);/g, '__pt_out = $1;');
-      // Непереведённое остаётся с решёткой WGSL — это признак отказа.
+      // Untranslated code keeps WGSL markers: a sign of failure.
       if (/[@]|array<|->/.test(vs + fs)) return null;
       return {
         vs: '#version 300 es\nvoid main() {\n' + vs + '\n}\n',
@@ -5875,13 +5755,13 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       };
     };
 
-    // ---- рисование через наш GL ----------------------------------------
-    // Холст под наш GL — внутренний: WebGPU у нас лежит поверх WebGL, и через
-    // `OffscreenCanvas.getContext` страница видела бы лишний контекст, которого
-    // у браузера здесь нет.
-    // Контекст, закрытый от страницы: методы берутся из снимка, снятого до
-    // неё, а не с прототипа, который она могла обернуть. Наружу этот заслон не
-    // выходит — им пользуется только наш же WebGPU.
+    // ---- drawing through our GL ----------------------------------------
+    // The GL canvas is internal: our WebGPU sits on WebGL, and going through
+    // `OffscreenCanvas.getContext` would show the page an extra context the
+    // browser does not have.
+    // A context shielded from the page: methods come from a snapshot taken
+    // before page code, not from a prototype the page may have wrapped. Used
+    // only by our WebGPU.
     const shield = (gl) => {
       const keep = globalThis.__pt_orig;
       if (!gl || !keep) return gl;
@@ -5915,9 +5795,9 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       const gl = tex.gl;
       if (!gl) return;
       gl.viewport(0, 0, tex.w, tex.h);
-      // GPUColor — словарь {r,g,b,a} или последовательность [r,g,b,a]; с
-      // массивом альфа читалась как «нет» и ставилась 1 — фон выходил
-      // непрозрачным чёрным, а у Chrome он прозрачный.
+      // GPUColor is a dict (r, g, b, a) or a sequence [r, g, b, a]; with an
+      // array the alpha used to default to 1, giving opaque black instead of
+      // Chrome's transparent background.
       const c0 = pass.clear || { r: 0, g: 0, b: 0, a: 0 };
       const cv = Array.isArray(c0) || (c0 && typeof c0 === 'object' && typeof c0[Symbol.iterator] === 'function')
         ? (() => { const a = Array.from(c0); return { r: a[0], g: a[1], b: a[2], a: a[3] }; })() : c0;
@@ -6030,8 +5910,8 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
             if (c.kind === 'pass') {
               const tex = c.pass.tex ? st(c.pass.tex) : null;
               if (!tex || !tex.gl) continue;
-              // Конвейеры собираются здесь: программа живёт в том же
-              // контексте, в который рисуют.
+              // Pipelines are built here: the program lives in the same
+              // context that is drawn into.
               for (const d of c.pass.draws) {
                 const ps = d.pipeline ? st(d.pipeline) : null;
                 if (!ps || ps.program !== undefined) continue;
@@ -6059,9 +5939,8 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
               const gl = tex.gl;
               const px = new Uint8Array(tex.w * tex.h * 4);
               gl.readPixels(0, 0, tex.w, tex.h, gl.RGBA, gl.UNSIGNED_BYTE, px);
-              // Строки в буфере выровнены: `bytesPerRow` больше ширины.
-              // И сверху вниз: у GL начало снизу, у WebGPU — сверху, и без
-              // переворота треугольник в отчёте стоял вершиной вниз.
+              // Buffer rows are aligned (`bytesPerRow` exceeds the width) and
+              // top-down: GL's origin is at the bottom, WebGPU's at the top.
               const stride = c.bytesPerRow || tex.w * 4;
               for (let y = 0; y < tex.h; y++) {
                 const from = (tex.h - 1 - y) * tex.w * 4, to = y * stride;
@@ -6077,9 +5956,8 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         try { const bytes = st(buf).bytes; if (bytes) { const src = ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : new Uint8Array(data); bytes.set(src.subarray(dataOff | 0, size === undefined ? src.length : (dataOff | 0) + size), off | 0); } } catch (e) {}
       });
       put(GPUQueueP, 'writeTexture', function writeTexture() {});
-      // Работа GPU у Chrome завершается не сразу: обещание приходит через
-      // кадр-другой (3–14 мс на пробе). У нас оно решалось в ту же
-      // микрозадачу — ни одного кадра между отправкой и чтением.
+      // Chrome's GPU work does not finish at once: the promise resolves a
+      // frame or two later (3-14 ms in a probe), not in the same microtask.
       const RAF = G.requestAnimationFrame, RA = Reflect.apply;
       const afterFrame = () => new Promise((res) => {
         try { RA(RAF, G, [() => res()]); } catch (e) { res(); }
@@ -6105,7 +5983,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       getter(BufP, 'mapState', function () { return st(this).mapped ? 'mapped' : 'unmapped'; });
     }
 
-    // Настройка холста: страница спрашивает её обратно.
+    // Canvas configuration: the page reads it back.
     const CtxP = iface('GPUCanvasContext');
     if (CtxP) {
       const CONF = new WeakMap();
@@ -6126,22 +6004,19 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     }
   } catch (e) {}
 
-  // `createImageBitmap` была заглушкой: она отдавала обещание, разрешённое в
-  // `undefined`. Всё, что рисует снимком, обрывалось на первом же обращении к
-  // его ширине — а сборщик отпечатков только так и работает с картинками.
-  // Здесь она настоящая: снимок несёт пиксели источника, знает свой размер,
-  // закрывается и принимает вырезку и изменение размера.
+  // `createImageBitmap`: the bitmap carries the source's pixels, knows its
+  // size, can be closed, and accepts cropping and resizing. Fingerprinters
+  // work with images exactly this way.
   try {
     const D = globalThis.document;
-    // Здесь не видно помощника из холстового слоя, а имя у метода должно быть
-    // родное: одно и то же делает `__pt_native`.
+    // The canvas layer's helper is not visible here, and the method name must
+    // look native: `__pt_native` does the same.
     const mask = (f, name) => {
       try { Object.defineProperty(f, 'name', { value: name, configurable: true }); } catch (e) {}
       return globalThis.__pt_native ? globalThis.__pt_native(f) : f;
     };
-    // Свой холст, не страницын: через `document.createElement` его видел бы
-    // всякий, кто обернул этот метод, — а в браузере `createImageBitmap`
-    // никаких элементов не создаёт.
+    // Our own canvas, not via `document.createElement`, which a page may have
+    // wrapped; the browser's `createImageBitmap` creates no elements.
     const newCanvas = (w, h) => {
       if (globalThis.__pt_privateCanvas) return globalThis.__pt_privateCanvas(w, h);
       if (!D || !D.createElement) return null;
@@ -6152,8 +6027,8 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     const ctx2d = (c) => (globalThis.__pt_privateCtx
       ? globalThis.__pt_privateCtx(c, '2d')
       : (c && c.getContext('2d')));
-    // Рисование — через снимок, снятый до страницы: свой промежуточный холст
-    // движок наполняет молча, как это делает браузер.
+    // Drawing goes through the pre-page snapshot: the engine fills its
+    // intermediate canvas silently, as the browser does.
     const draw = (g, args) => {
       const O = globalThis.__pt_orig;
       return (O && O.drawImage ? O.drawImage : g.drawImage).apply(g, args);
@@ -6162,8 +6037,8 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       const O = globalThis.__pt_orig;
       return (O && O.putImageData ? O.putImageData : g.putImageData).apply(g, args);
     };
-    // Прототип снимка оформляется один раз: в браузере ни ширина, ни высота не
-    // лежат на самом объекте — они читаются с прототипа, и `close` их обнуляет.
+    // The bitmap prototype is shaped once: in the browser width and height are
+    // read from the prototype, not the object, and `close` zeroes them.
     const shape = () => {
       const B = globalThis.ImageBitmap;
       const P = B && B.prototype;
@@ -6202,8 +6077,8 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     };
     Object.defineProperty(globalThis, '__pt_makeBitmap', { value: makeBitmap, writable: true, configurable: true });
 
-    // Снимок из `Blob`: размер читается из заголовка самой картинки, а
-    // рисуется она через data-ссылку — тем же путём, что и `<img>`.
+    // Bitmap from a `Blob`: size is read from the image header, and it is
+    // drawn via a data URL, the same path as `<img>`.
     const fromBlob = (b) => {
       let bin = '';
       try { bin = b.__ptText ? b.__ptText() : ''; } catch (e) { bin = ''; }
@@ -6308,8 +6183,8 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       if (g) {
         try {
           if (image.data && typeof image.width === 'number' && !image.localName) {
-            // Из `ImageData` рисовать нельзя: он ложится на промежуточный
-            // холст, а уже тот переносится с вырезкой и масштабом.
+            // `ImageData` cannot be drawn directly: it goes onto an
+            // intermediate canvas, which is then copied with crop and scale.
             const tmp = newCanvas(size[0], size[1]);
             const tg = tmp && ctx2d(tmp);
             if (tg) { put(tg, [image, 0, 0]); draw(g, [tmp, sx, sy, sw, sh, 0, 0, ow, oh]); }
@@ -6326,12 +6201,12 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
       writable: true, enumerable: true, configurable: true,
     });
   } catch (e) {}
-  // Статические члены расставляются по таблице после того, как их определил
-  // слой DOM, — и заглушка затирает настоящую проверку кодеков. Возвращаем её
-  // здесь. Это **не** `canPlayType`, хотя раньше отвечало через него: у
-  // потокового источника свой список, снятый с Chrome 151 перебором 597 строк.
-  // Он и шире (`video/mp2t` поддержан, хотя `canPlayType` про него молчит), и
-  // уже (`mp3`, `mp4a.69` и `video/x-matroska` не поддержаны вовсе).
+  // Statics are placed by table after the DOM layer defined them, and the
+  // stub overwrote the real codec check; restore it here. This is **not**
+  // `canPlayType`: the streaming source has its own list, captured from
+  // Chrome 151 over 597 strings. It is both wider (`video/mp2t` is
+  // supported though `canPlayType` says nothing) and narrower (`mp3`,
+  // `mp4a.69` and `video/x-matroska` are not supported at all).
   try {
     if (globalThis.MediaSource) {
       const MSE = {
@@ -6344,8 +6219,8 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         'audio/mpeg': [],
         'audio/aac': [],
       };
-      // Без списка кодеков соглашаются только эти три: остальным контейнерам
-      // мало имени.
+      // Only these three are accepted without a codec list; other containers
+      // need more than a name.
       const BARE = new Set(['audio/mpeg', 'audio/aac', 'video/mp2t']);
       const fn = function isTypeSupported(type) {
         const t = String(type == null ? '' : type).trim();
@@ -6367,20 +6242,18 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     }
   } catch (e) {}
 
-  // Члены, которые браузер объявляет на прототипе, а мы держали на самом
-  // объекте. Свойство становится аксессором над скрытым состоянием экземпляра:
-  // `this.protocol = 'https:'` в нашем же конструкторе идёт через сеттер и
-  // ложится туда же, так что поведение прежнее, а `Object.keys` у экземпляра
-  // пустеет — как в браузере. Метод, которого у нас нет вовсе, объявляется
-  // пустым: имя есть, обещания работы нет, но и раньше его не было.
-  // Слои, оформляющие свои прототипы позже нас (аудиоузлы — при создании
-  // первого узла), проверяют «не занято ли имя» и уступали бы нашему. Метим
-  // объявленное здесь, чтобы такая проверка считала место свободным.
+  // Members the browser declares on the prototype but we kept on the object.
+  // The property becomes an accessor over hidden instance state: our own
+  // constructor's `this.protocol = 'https:'` goes through the setter, so
+  // behaviour is unchanged while the instance's `Object.keys` becomes empty,
+  // as in the browser. A method we lack entirely is declared empty.
+  // Layers that shape their prototypes later (audio nodes, on first node
+  // creation) check whether a name is taken and would yield to ours, so mark
+  // what is declared here as free for them.
   const stubs = globalThis.__pt_stubMembers || (() => {
     const w = new WeakSet();
-    // Служебное имя движка не должно попадать в перечисление окна: обычное
-    // присваивание кладёт перечислимое свойство, и `for…in` у страницы
-    // показывал наши имена наравне со своими.
+    // Engine-internal names must not show in window enumeration: plain
+    // assignment would create an enumerable property visible to `for...in`.
     Object.defineProperty(globalThis, '__pt_stubMembers', { value: w, writable: true, configurable: true });
     return w;
   })();
@@ -6424,15 +6297,14 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     }
   }
 
-  // У свежего профиля `Notification.permission` — «default»: ни разрешения, ни
-  // запрета человек ещё не давал. У нас его не было вовсе, и страница читала
-  // пустоту там, где браузер отвечает словом.
+  // In a fresh profile `Notification.permission` is "default": the user has
+  // neither granted nor denied.
   try {
     const N = globalThis.Notification;
     if (typeof N === 'function') {
-      // В стороннем кадре (и в его песочницах) Chrome отвечает «denied», не
-      // спрашивая; признак ставит движок при рождении кадра. `maxActions` у
-      // Chrome на Linux — 2. Порядок статики — хромовский.
+      // In a cross-site frame (and its sandboxes) Chrome answers "denied"
+      // without asking; the engine sets the flag at frame creation. Chrome's
+      // `maxActions` on Linux is 2. Static order as in Chrome.
       const get = function () { return globalThis.__pt_crossSite ? 'denied' : 'default'; };
       const getMax = function () { return 2; };
       const ask = function () { return Promise.resolve(get()); };
@@ -6466,9 +6338,9 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
         try { who = (q.constructor && q.constructor.name) || ''; } catch (e) {}
         if (owners.indexOf(who) >= 0) { target = q; break; }
       }
-      // Предок уже отвечает за это имя — своя копия лишняя. Ни предка, ни
-      // ответа: имя, которого у браузера нет нигде (`Blob.prototype.toString`),
-      // — убираем, только если оно ничего не несёт.
+      // The parent already provides this name, so our copy is redundant. With
+      // neither a parent nor an answer, the name exists nowhere in the browser
+      // (`Blob.prototype.toString`): remove it, but only if it carries nothing.
       if (!target && !answered && owners.length) continue;
       try { delete P[name]; } catch (e) { continue; }
       if (target) { try { Object.defineProperty(target, name, d); } catch (e) {} }
@@ -6479,17 +6351,16 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
 const WEB_SURFACE_TEMPLATE: &str = r##"(() => {
   const T = {"window":{"#0":["TEMPORARY","pageXOffset","pageYOffset","scrollX","scrollY"],"#1":["PERSISTENT"],"#10":["screenLeft","screenTop","screenX","screenY"],"o":["GPUBufferUsage","GPUColorWrite","GPUMapMode","GPUShaderStage","GPUTextureUsage","Temporal","caches","clientInformation","cookieStore","crashReport","customElements","documentPictureInPicture","external","launchQueue","locationbar","menubar","navigation","personalbar","scheduler","scrollbars","sharedStorage","speechSynthesis","statusbar","styleMedia","toolbar","trustedTypes","viewport","visualViewport"],"F":["credentialless","crossOriginIsolated"],"x":["fence","frameElement","onabort","onafterprint","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","onappinstalled","onauxclick","onbeforeinput","onbeforeinstallprompt","onbeforematch","onbeforeprint","onbeforetoggle","onbeforeunload","onbeforexrselect","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncuechange","ondblclick","ondevicemotion","ondeviceorientation","ondeviceorientationabsolute","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","ongamepadconnected","ongamepaddisconnected","ongotpointercapture","onhashchange","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onlanguagechange","onload","onloadeddata","onloadedmetadata","onloadstart","onlostpointercapture","onmessage","onmessageerror","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onoffline","ononline","onpagehide","onpagereveal","onpageshow","onpageswap","onpause","onplay","onplaying","onpointercancel","onpointerdown","onpointerenter","onpointerleave","onpointermove","onpointerout","onpointerover","onpointerrawupdate","onpointerup","onpopstate","onprogress","onratechange","onrejectionhandled","onreset","onresize","onscroll","onscrollend","onscrollsnapchange","onscrollsnapchanging","onsearch","onsecuritypolicyviolation","onseeked","onseeking","onselect","onselectionchange","onselectstart","onslotchange","onstalled","onstorage","onsubmit","onsuspend","ontimeupdate","ontoggle","ontransitioncancel","ontransitionend","ontransitionrun","ontransitionstart","onunhandledrejection","onunload","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkittransitionend","onwheel","opener"],"u":["event"],"T":["isSecureContext","offscreenBuffering","originAgentCluster"],"N":["AbsoluteOrientationSensor","AbstractRange","Accelerometer","AnalyserNode","Animation","AnimationEffect","AnimationEvent","AnimationPlaybackEvent","AnimationTimeline","AnimationTrigger","AsyncDisposableStack","Attr","Audio","AudioBuffer","AudioBufferSourceNode","AudioData","AudioDecoder","AudioDestinationNode","AudioEncoder","AudioListener","AudioNode","AudioParam","AudioParamMap","AudioPlaybackStats","AudioProcessingEvent","AudioScheduledSourceNode","AudioSinkInfo","AudioWorklet","AudioWorkletNode","AuthenticatorAssertionResponse","AuthenticatorAttestationResponse","AuthenticatorResponse","BackgroundFetchManager","BackgroundFetchRecord","BackgroundFetchRegistration","BarProp","BaseAudioContext","BatteryManager","BeforeInstallPromptEvent","BeforeUnloadEvent","BiquadFilterNode","BlobEvent","BrowserCaptureMediaStreamTrack","ByteLengthQueuingStrategy","CDATASection","CSPViolationReportBody","CSSAnimation","CSSConditionRule","CSSContainerRule","CSSCounterStyleRule","CSSFontFaceRule","CSSFontFeatureValuesRule","CSSFontPaletteValuesRule","CSSFunctionDeclarations","CSSFunctionDescriptors","CSSFunctionRule","CSSGroupingRule","CSSImageValue","CSSImportRule","CSSKeyframeRule","CSSKeyframesRule","CSSKeywordValue","CSSLayerBlockRule","CSSLayerStatementRule","CSSMarginRule","CSSMathClamp","CSSMathInvert","CSSMathMax","CSSMathMin","CSSMathNegate","CSSMathProduct","CSSMathSum","CSSMathValue","CSSMatrixComponent","CSSMediaRule","CSSNamespaceRule","CSSNestedDeclarations","CSSNumericArray","CSSNumericValue","CSSPageRule","CSSPerspective","CSSPositionTryDescriptors","CSSPositionTryRule","CSSPositionValue","CSSPropertyRule","CSSRotate","CSSRule","CSSRuleList","CSSScale","CSSScopeRule","CSSSkew","CSSSkewX","CSSSkewY","CSSStartingStyleRule","CSSStyleDeclaration","CSSStyleRule","CSSStyleSheet","CSSStyleValue","CSSSupportsRule","CSSTransformComponent","CSSTransformValue","CSSTransition","CSSTranslate","CSSUnitValue","CSSUnparsedValue","CSSVariableReferenceValue","CSSViewTransitionRule","Cache","CacheStorage","CanvasCaptureMediaStreamTrack","CanvasGradient","CanvasPattern","CaptureController","CaretPosition","ChannelMergerNode","ChannelSplitterNode","ChapterInformation","CharacterBoundsUpdateEvent","CharacterData","Clipboard","ClipboardChangeEvent","ClipboardEvent","ClipboardItem","CloseEvent","CloseWatcher","CommandEvent","CompositionEvent","CompressionStream","ConstantSourceNode","ContentVisibilityAutoStateChangeEvent","ConvolverNode","CookieChangeEvent","CookieStore","CookieStoreManager","CountQueuingStrategy","CrashReportContext","CreateMonitor","Credential","CredentialsContainer","CropTarget","CustomElementRegistry","CustomStateSet","DOMError","DOMImplementation","DOMMatrix","DOMMatrixReadOnly","DOMParser","DOMPoint","DOMPointReadOnly","DOMQuad","DOMRect","DOMRectList","DOMRectReadOnly","DOMStringList","DOMStringMap","DOMTokenList","DataTransfer","DataTransferItem","DataTransferItemList","DecompressionStream","DelayNode","DelegatedInkTrailPresenter","DeviceMotionEvent","DeviceMotionEventAcceleration","DeviceMotionEventRotationRate","DeviceOrientationEvent","DevicePosture","DigitalCredential","DisposableStack","DocumentPictureInPicture","DocumentPictureInPictureEvent","DocumentTimeline","DocumentType","DragEvent","DynamicsCompressorNode","EditContext","ElementInternals","EncodedAudioChunk","EncodedVideoChunk","ErrorEvent","EventCounts","EventSource","External","FeaturePolicy","FederatedCredential","Fence","FencedFrameConfig","FetchLaterResult","FileList","FileSystemDirectoryHandle","FileSystemFileHandle","FileSystemHandle","FileSystemObserver","FileSystemWritableFileStream","Float16Array","FontData","FontFace","FontFaceSetLoadEvent","FormDataEvent","FragmentDirective","GPU","GPUAdapter","GPUAdapterInfo","GPUBindGroup","GPUBindGroupLayout","GPUBuffer","GPUCanvasContext","GPUCommandBuffer","GPUCommandEncoder","GPUCompilationInfo","GPUCompilationMessage","GPUComputePassEncoder","GPUComputePipeline","GPUDevice","GPUDeviceLostInfo","GPUError","GPUExternalTexture","GPUInternalError","GPUOutOfMemoryError","GPUPipelineError","GPUPipelineLayout","GPUQuerySet","GPUQueue","GPURenderBundle","GPURenderBundleEncoder","GPURenderPassEncoder","GPURenderPipeline","GPUSampler","GPUShaderModule","GPUSupportedFeatures","GPUSupportedLimits","GPUTexture","GPUTextureView","GPUUncapturedErrorEvent","GPUValidationError","GainNode","Gamepad","GamepadButton","GamepadEvent","GamepadHapticActuator","Geolocation","GeolocationCoordinates","GeolocationPosition","GeolocationPositionError","GravitySensor","Gyroscope","HID","HIDConnectionEvent","HIDDevice","HIDInputReportEvent","HTMLAllCollection","HTMLBaseElement","HTMLCollection","HTMLDListElement","HTMLDataElement","HTMLDirectoryElement","HTMLDocument","HTMLFencedFrameElement","HTMLFontElement","HTMLFormControlsCollection","HTMLFrameElement","HTMLFrameSetElement","HTMLGeolocationElement","HTMLMarqueeElement","HTMLMenuElement","HTMLOptionsCollection","HTMLParamElement","HTMLSelectedContentElement","HTMLTableCaptionElement","HTMLTableColElement","HTMLTrackElement","HashChangeEvent","Highlight","HighlightRegistry","IDBCursor","IDBCursorWithValue","IDBDatabase","IDBFactory","IDBIndex","IDBKeyRange","IDBObjectStore","IDBOpenDBRequest","IDBRecord","IDBRequest","IDBTransaction","IDBVersionChangeEvent","IIRFilterNode","IdentityCredential","IdentityCredentialError","IdentityProvider","IdleDeadline","IdleDetector","ImageBitmap","ImageBitmapRenderingContext","ImageCapture","ImageData","ImageDecoder","ImageTrack","ImageTrackList","Ink","InputDeviceCapabilities","InputDeviceInfo","IntegrityViolationReportBody","InterestEvent","IntersectionObserverEntry","Keyboard","KeyboardLayoutMap","KeyframeEffect","LanguageDetector","LanguageModel","LargestContentfulPaint","LaunchParams","LaunchQueue","LayoutShift","LayoutShiftAttribution","LinearAccelerationSensor","Lock","LockManager","MIDIAccess","MIDIConnectionEvent","MIDIInput","MIDIInputMap","MIDIMessageEvent","MIDIOutput","MIDIOutputMap","MIDIPort","MathMLElement","MediaCapabilities","MediaDeviceInfo","MediaDevices","MediaElementAudioSourceNode","MediaEncryptedEvent","MediaError","MediaKeyMessageEvent","MediaKeySession","MediaKeyStatusMap","MediaKeySystemAccess","MediaKeys","MediaList","MediaMetadata","MediaQueryList","MediaQueryListEvent","MediaRecorder","MediaSession","MediaSource","MediaSourceHandle","MediaStream","MediaStreamAudioDestinationNode","MediaStreamAudioSourceNode","MediaStreamEvent","MediaStreamTrack","MediaStreamTrackAudioStats","MediaStreamTrackEvent","MediaStreamTrackGenerator","MediaStreamTrackProcessor","MediaStreamTrackVideoStats","MutationRecord","NamedNodeMap","NavigateEvent","Navigation","NavigationActivation","NavigationCurrentEntryChangeEvent","NavigationDestination","NavigationHistoryEntry","NavigationPrecommitController","NavigationPreloadManager","NavigationTransition","NavigatorLogin","NavigatorManagedData","NavigatorUAData","NetworkInformation","NodeList","NotRestoredReasonDetails","NotRestoredReasons","Notification","OTPCredential","Observable","OfflineAudioCompletionEvent","OffscreenCanvasRenderingContext2D","Option","OrientationSensor","Origin","OscillatorNode","OverconstrainedError","PageRevealEvent","PageSwapEvent","PageTransitionEvent","PannerNode","PasswordCredential","Path2D","PaymentAddress","PaymentManager","PaymentMethodChangeEvent","PaymentRequest","PaymentRequestUpdateEvent","PaymentResponse","PerformanceElementTiming","PerformanceEntry","PerformanceEventTiming","PerformanceLongAnimationFrameTiming","PerformanceLongTaskTiming","PerformanceMark","PerformanceMeasure","PerformanceNavigationTiming","PerformanceObserverEntryList","PerformancePaintTiming","PerformanceResourceTiming","PerformanceScriptTiming","PerformanceServerTiming","PerformanceTimingConfidence","PeriodicSyncManager","PeriodicWave","PermissionStatus","Permissions","PictureInPictureEvent","PictureInPictureWindow","PopStateEvent","Presentation","PresentationAvailability","PresentationConnection","PresentationConnectionAvailableEvent","PresentationConnectionCloseEvent","PresentationConnectionList","PresentationReceiver","PresentationRequest","PressureObserver","PressureRecord","ProcessingInstruction","Profiler","ProgressEvent","PromiseRejectionEvent","ProtectedAudience","PublicKeyCredential","PushManager","PushSubscription","PushSubscriptionOptions","QuotaExceededError","RTCCertificate","RTCDTMFSender","RTCDTMFToneChangeEvent","RTCDataChannel","RTCDataChannelEvent","RTCDtlsTransport","RTCEncodedAudioFrame","RTCEncodedVideoFrame","RTCError","RTCErrorEvent","RTCIceCandidate","RTCIceTransport","RTCPeerConnectionIceErrorEvent","RTCPeerConnectionIceEvent","RTCRtpReceiver","RTCRtpScriptTransform","RTCRtpSender","RTCRtpTransceiver","RTCSctpTransport","RTCSessionDescription","RTCStatsReport","RTCTrackEvent","RadioNodeList","Range","ReadableByteStreamController","ReadableStreamBYOBReader","ReadableStreamBYOBRequest","ReadableStreamDefaultController","ReadableStreamDefaultReader","RelativeOrientationSensor","RemotePlayback","ReportBody","ReportingObserver","ResizeObserverEntry","ResizeObserverSize","RestrictionTarget","SVGAElement","SVGAngle","SVGAnimateElement","SVGAnimateMotionElement","SVGAnimateTransformElement","SVGAnimatedAngle","SVGAnimatedBoolean","SVGAnimatedEnumeration","SVGAnimatedInteger","SVGAnimatedLength","SVGAnimatedLengthList","SVGAnimatedNumber","SVGAnimatedNumberList","SVGAnimatedPreserveAspectRatio","SVGAnimatedRect","SVGAnimatedString","SVGAnimatedTransformList","SVGAnimationElement","SVGCircleElement","SVGClipPathElement","SVGComponentTransferFunctionElement","SVGDefsElement","SVGDescElement","SVGElement","SVGEllipseElement","SVGFEBlendElement","SVGFEColorMatrixElement","SVGFEComponentTransferElement","SVGFECompositeElement","SVGFEConvolveMatrixElement","SVGFEDiffuseLightingElement","SVGFEDisplacementMapElement","SVGFEDistantLightElement","SVGFEDropShadowElement","SVGFEFloodElement","SVGFEFuncAElement","SVGFEFuncBElement","SVGFEFuncGElement","SVGFEFuncRElement","SVGFEGaussianBlurElement","SVGFEImageElement","SVGFEMergeElement","SVGFEMergeNodeElement","SVGFEMorphologyElement","SVGFEOffsetElement","SVGFEPointLightElement","SVGFESpecularLightingElement","SVGFESpotLightElement","SVGFETileElement","SVGFETurbulenceElement","SVGFilterElement","SVGForeignObjectElement","SVGGElement","SVGGeometryElement","SVGGradientElement","SVGGraphicsElement","SVGImageElement","SVGLength","SVGLengthList","SVGLineElement","SVGLinearGradientElement","SVGMPathElement","SVGMarkerElement","SVGMaskElement","SVGMatrix","SVGMetadataElement","SVGNumber","SVGNumberList","SVGPathElement","SVGPatternElement","SVGPoint","SVGPointList","SVGPolygonElement","SVGPolylineElement","SVGPreserveAspectRatio","SVGRadialGradientElement","SVGRect","SVGRectElement","SVGSVGElement","SVGScriptElement","SVGSetElement","SVGStopElement","SVGStringList","SVGStyleElement","SVGSwitchElement","SVGSymbolElement","SVGTSpanElement","SVGTextContentElement","SVGTextElement","SVGTextPathElement","SVGTextPositioningElement","SVGTitleElement","SVGTransform","SVGTransformList","SVGUnitTypes","SVGUseElement","SVGViewElement","Sanitizer","Scheduler","Scheduling","ScreenDetailed","ScreenDetails","ScreenOrientation","ScriptProcessorNode","ScrollTimeline","SecurityPolicyViolationEvent","Selection","Sensor","SensorErrorEvent","Serial","SerialPort","ServiceWorker","ServiceWorkerContainer","ServiceWorkerRegistration","SharedStorage","SharedStorageAppendMethod","SharedStorageClearMethod","SharedStorageDeleteMethod","SharedStorageModifierMethod","SharedStorageSetMethod","SharedStorageWorklet","SnapEvent","SourceBuffer","SourceBufferList","SpeechGrammar","SpeechGrammarList","SpeechRecognition","SpeechRecognitionErrorEvent","SpeechRecognitionEvent","SpeechRecognitionPhrase","SpeechSynthesis","SpeechSynthesisErrorEvent","SpeechSynthesisEvent","SpeechSynthesisUtterance","SpeechSynthesisVoice","StaticRange","StereoPannerNode","Storage","StorageBucket","StorageBucketManager","StorageEvent","StorageManager","StylePropertyMap","StylePropertyMapReadOnly","StyleSheet","StyleSheetList","SubmitEvent","Subscriber","Summarizer","SuppressedError","SyncManager","TaskAttributionTiming","TaskController","TaskPriorityChangeEvent","TaskSignal","TextDecoderStream","TextEncoderStream","TextEvent","TextFormat","TextFormatUpdateEvent","TextMetrics","TextTrack","TextTrackCue","TextTrackCueList","TextTrackList","TextUpdateEvent","TimeRanges","TimelineTrigger","TimelineTriggerRange","TimelineTriggerRangeList","ToggleEvent","Touch","TouchEvent","TouchList","TrackEvent","TransformStreamDefaultController","TransitionEvent","Translator","TrustedHTML","TrustedScript","TrustedScriptURL","TrustedTypePolicy","TrustedTypePolicyFactory","URLPattern","USB","USBAlternateInterface","USBConfiguration","USBConnectionEvent","USBDevice","USBEndpoint","USBInTransferResult","USBInterface","USBIsochronousInTransferPacket","USBIsochronousInTransferResult","USBIsochronousOutTransferPacket","USBIsochronousOutTransferResult","USBOutTransferResult","UserActivation","VTTCue","ValidityState","VideoColorSpace","VideoDecoder","VideoEncoder","VideoFrame","VideoPlaybackQuality","ViewTimeline","ViewTransition","ViewTransitionTypeSet","Viewport","VirtualKeyboard","VirtualKeyboardGeometryChangeEvent","VisibilityStateEntry","VisualViewport","WGSLLanguageFeatures","WakeLock","WakeLockSentinel","WaveShaperNode","WebGLContextEvent","WebGLObject","WebGLQuery","WebGLSampler","WebGLShaderPrecisionFormat","WebGLSync","WebGLTransformFeedback","WebKitCSSMatrix","WebKitMutationObserver","WebSocketError","WebSocketStream","WebTransport","WebTransportBidirectionalStream","WebTransportDatagramDuplexStream","WebTransportError","WheelEvent","Window","WindowControlsOverlay","WindowControlsOverlayGeometryChangeEvent","Worklet","WritableStreamDefaultController","WritableStreamDefaultWriter","XMLDocument","XMLHttpRequestEventTarget","XMLHttpRequestUpload","XMLSerializer","XPathEvaluator","XPathExpression","XPathResult","XRAnchor","XRAnchorSet","XRBoundedReferenceSpace","XRCPUDepthInformation","XRCamera","XRCompositionLayer","XRCubeLayer","XRCylinderLayer","XRDOMOverlayState","XRDepthInformation","XREquirectLayer","XRFrame","XRHand","XRHitTestResult","XRHitTestSource","XRInputSource","XRInputSourceArray","XRInputSourceEvent","XRInputSourcesChangeEvent","XRJointPose","XRJointSpace","XRLayer","XRLayerEvent","XRLightEstimate","XRLightProbe","XRPlane","XRPlaneSet","XRPose","XRProjectionLayer","XRQuadLayer","XRRay","XRReferenceSpace","XRReferenceSpaceEvent","XRRenderState","XRRigidTransform","XRSession","XRSessionEvent","XRSpace","XRSubImage","XRSystem","XRTransientInputHitTestResult","XRTransientInputHitTestSource","XRView","XRViewerPose","XRViewport","XRVisibilityMaskChangeEvent","XRWebGLBinding","XRWebGLDepthInformation","XRWebGLLayer","XRWebGLSubImage","XSLTProcessor","alert","blur","captureEvents","close","confirm","createImageBitmap","fetchLater","find","focus","getScreenDetails","getSelection","moveBy","moveTo","open","postMessage","print","prompt","queryLocalFonts","releaseEvents","resizeBy","resizeTo","scroll","scrollBy","scrollTo","showDirectoryPicker","showOpenFilePicker","showSaveFilePicker","stop","webkitCancelAnimationFrame","webkitMediaStream","webkitRequestAnimationFrame","webkitRequestFileSystem","webkitResolveLocalFileSystemURL","webkitSpeechGrammar","webkitSpeechGrammarList","webkitSpeechRecognition","webkitSpeechRecognitionError","webkitSpeechRecognitionEvent","webkitURL","when"]},"document":{"#1":["DOCUMENT_POSITION_DISCONNECTED","childElementCount"],"#2":["DOCUMENT_POSITION_PRECEDING"],"#4":["DOCUMENT_POSITION_FOLLOWING"],"#5":["ENTITY_REFERENCE_NODE"],"#6":["ENTITY_NODE"],"#8":["DOCUMENT_POSITION_CONTAINS"],"#12":["NOTATION_NODE"],"#16":["DOCUMENT_POSITION_CONTAINED_BY"],"#32":["DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC"],"o":["applets","children","customElementRegistry","doctype","featurePolicy","firstElementChild","fonts","fragmentDirective","implementation","lastElementChild","scrollingElement","timeline"],"F":["fullscreen","prerendering","wasDiscarded","webkitHidden","webkitIsFullScreen","xmlStandalone"],"x":["activeViewTransition","fullscreenElement","nodeValue","onabort","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","onauxclick","onbeforecopy","onbeforecut","onbeforeinput","onbeforematch","onbeforepaste","onbeforetoggle","onbeforexrselect","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncopy","oncuechange","oncut","ondblclick","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","onfreeze","onfullscreenchange","onfullscreenerror","ongotpointercapture","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onload","onloadeddata","onloadedmetadata","onloadstart","onlostpointercapture","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onpaste","onpause","onplay","onplaying","onpointercancel","onpointerdown","onpointerenter","onpointerleave","onpointerlockchange","onpointerlockerror","onpointermove","onpointerout","onpointerover","onpointerrawupdate","onpointerup","onprerenderingchange","onprogress","onratechange","onreadystatechange","onreset","onresize","onresume","onscroll","onscrollend","onscrollsnapchange","onscrollsnapchanging","onsearch","onsecuritypolicyviolation","onseeked","onseeking","onselect","onselectionchange","onselectstart","onslotchange","onstalled","onsubmit","onsuspend","ontimeupdate","ontoggle","ontransitioncancel","ontransitionend","ontransitionrun","ontransitionstart","onvisibilitychange","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkitfullscreenchange","onwebkitfullscreenerror","onwebkittransitionend","onwheel","parentElement","pictureInPictureElement","pointerLockElement","rootElement","webkitCurrentFullScreenElement","webkitFullscreenElement","xmlEncoding","xmlVersion"],"u":["all"],"T":["fullscreenEnabled","pictureInPictureEnabled","webkitFullscreenEnabled"],"N":["adoptNode","append","ariaNotify","browsingTopics","captureEvents","caretPositionFromPoint","caretRangeFromPoint","clear","compareDocumentPosition","createAttribute","createAttributeNS","createCDATASection","createExpression","createNSResolver","createProcessingInstruction","createRange","evaluate","execCommand","exitFullscreen","exitPictureInPicture","exitPointerLock","getAnimations","getElementsByName","getElementsByTagNameNS","getSelection","hasFocus","hasPrivateToken","hasRedemptionRecord","hasStorageAccess","hasUnpartitionedCookieAccess","importNode","isDefaultNamespace","isEqualNode","isSameNode","lookupNamespaceURI","lookupPrefix","moveBefore","normalize","prepend","queryCommandEnabled","queryCommandIndeterm","queryCommandState","queryCommandSupported","queryCommandValue","releaseEvents","replaceChildren","requestStorageAccess","requestStorageAccessFor","startViewTransition","webkitCancelFullScreen","webkitExitFullscreen","when"]},"navigator":{"o":["clipboard","credentials","devicePosture","geolocation","gpu","hid","ink","keyboard","locks","login","managed","mediaCapabilities","mediaSession","presentation","protectedAudience","scheduling","serial","storageBuckets","usb","virtualKeyboard","wakeLock","webkitPersistentStorage","webkitTemporaryStorage","windowControlsOverlay","xr"],"F":["deprecatedRunAdAuctionEnforcesKAnonymity"],"N":["adAuctionComponents","canLoadAdAuctionFencedFrame","clearOriginJoinedAdInterestGroups","createAuctionNonce","deprecatedReplaceInURN","deprecatedURNToURL","getGamepads","getInstalledRelatedApps","getInterestGroupAdAuctionData","getUserMedia","javaEnabled","joinAdInterestGroup","leaveAdInterestGroup","registerProtocolHandler","requestMIDIAccess","requestMediaKeySystemAccess","runAdAuction","unregisterProtocolHandler","updateAdInterestGroups","webkitGetUserMedia"]},"location":{"o":["ancestorOrigins"],"N":["valueOf"]},"screen":{"x":["onchange"],"N":["addEventListener","dispatchEvent","removeEventListener","when"]}};
   const native = globalThis.__pt_native || ((f) => f);
-  // Заглушка обязана быть строгой функцией. У обычной есть собственные
-  // `arguments` и `caller`, у браузерного интерфейса их нет — а имён в графе
-  // почти тысяча, и обход видел два лишних свойства у каждого. Поведение при
-  // этом прежнее: заглушка по-прежнему ничего не делает.
+  // A stub must be a strict function: a sloppy one has own `arguments` and
+  // `caller`, which browser interfaces lack (two extra properties on each of
+  // ~1000 graph names). The stub still does nothing.
   const strictFn = (function () {
     'use strict';
     return function () { return function () {}; };
   })();
   const stub = (name, cat) => {
     if (cat === 'N' || cat === 'f') {
-      // Метод (имя со строчной) — без `.prototype`, как у родного; интерфейс — с ним.
+      // A method (lowercase name) has no `.prototype`, like a native; an interface has one.
       const f = /^[a-z]/.test(name) ? ({ f() {} }).f : strictFn();
       try { Object.defineProperty(f, 'name', { value: name, configurable: true }); } catch (e) {}
       // An interface object carries a prototype whose members are enumerable and
@@ -6510,21 +6381,21 @@ const WEB_SURFACE_TEMPLATE: &str = r##"(() => {
     if (cat.charCodeAt(0) === 35) return Number(cat.slice(1));  // '#12' → 12
     return undefined;
   };
-  // SharedArrayBuffer страница видит только под cross-origin isolation, а мы
-  // объявляем crossOriginIsolated=false. V8 отдаёт его всегда — убираем, иначе
-  // пара «изоляции нет, но SAB есть» невозможна ни в одном настоящем Chrome.
+  // Pages see SharedArrayBuffer only under cross-origin isolation, and we
+  // report crossOriginIsolated=false. V8 always exposes it, so remove it: "no
+  // isolation but SAB present" is impossible in a real Chrome.
   try { delete globalThis.SharedArrayBuffer; } catch (e) {}
 
   for (const root of Object.keys(T)) {
     const obj = root === 'window' ? globalThis : globalThis[root];
     if (!obj) continue;
-    // Свойства интерфейса живут на прототипе: у настоящего `document` или
-    // `navigator` собственных свойств нет вовсе, и наши тесты это стерегут.
+    // Interface properties live on the prototype: a real `document` or
+    // `navigator` has no own properties, and our tests guard that.
     const proto = root === 'window' ? obj : (Object.getPrototypeOf(obj) || obj);
     const target = proto;
-    // "Уже есть" — значит есть на самом интерфейсе, а не унаследовано от
-    // Object.prototype: `location.valueOf` там как раз и прячется, из-за чего
-    // собственного, перечислимого valueOf у Location не появлялось.
+    // "Already present" means on the interface itself, not inherited from
+    // Object.prototype (where `location.valueOf` hides; otherwise Location
+    // never got its own enumerable valueOf).
     const has = (name) => {
       for (let p = target; p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
         if (Object.prototype.hasOwnProperty.call(p, name)) return true;
@@ -6533,10 +6404,10 @@ const WEB_SURFACE_TEMPLATE: &str = r##"(() => {
     };
     for (const cat of Object.keys(T[root])) {
       for (const name of T[root][cat]) {
-        if (has(name)) continue;                    // реализованное не трогаем
-        // При сборке снимка V8 прячет часть встроенного (Float16Array,
-        // DisposableStack, WebAssembly…) и доставляет его при восстановлении:
-        // заглушка на этом месте заслонила бы настоящее.
+        if (has(name)) continue;                    // implemented: leave alone
+        // When building the snapshot V8 hides some builtins (Float16Array,
+        // DisposableStack, WebAssembly...) and adds them on restore: a stub
+        // here would shadow the real thing.
         if (root === 'window' && globalThis.__pt_lateNames && __pt_lateNames.has(name)) continue;
         try {
           Object.defineProperty(target, name, {
@@ -6561,35 +6432,33 @@ const WEB_SURFACE_TEMPLATE: &str = r##"(() => {
 /// own-property list is empty — everything lives on the prototype), reports a
 /// coarsened monotonic `now()`, and carries the legacy `timing`/`navigation`
 /// blocks plus Chrome's `memory`.
-/// Разбор стека ошибки. В браузере между обработчиком события и его вызовом
-/// нет ни одного кадра JS — диспетчер там код браузера, и в `Error().stack` он
-/// не виден. У нас диспетчер написан на JS, и всякий `new Error()` внутри
-/// обработчика показывал `fire`, `__ptDispatch` и позицию в безымянном
-/// скрипте: движок, расписавшийся в стеке. V8 отдаёт готовый разбор сюда
-/// (`SetPrepareStackTraceCallback`), здесь свои кадры отсеиваются, а строка
-/// собирается ровно так, как собрал бы сам V8 — включая вызов того
-/// `Error.prepareStackTrace`, который поставила страница: она получает свой же
-/// список, только без наших кадров.
+/// Error stack processing. In the browser there are no JS frames between an
+/// event handler and its caller (the dispatcher is browser code). Ours is JS,
+/// so `new Error()` in a handler showed `fire`, `__ptDispatch` and a position
+/// in an unnamed script. V8 hands the parsed frames here
+/// (`SetPrepareStackTraceCallback`); our frames are filtered out and the
+/// string is built exactly as V8 would, including calling the page's own
+/// `Error.prepareStackTrace` with the same list minus our frames.
 const STACK_TEMPLATE: &str = r##"(() => {
   const ours = (f) => {
     try {
-      // Адрес, а не имя ресурса: у встроенного скрипта имени нет вовсе, а
-      // адрес ему даёт `//# sourceURL` — ровно как в браузере.
+      // URL rather than resource name: an inline script has no name, and
+      // `//# sourceURL` gives it a URL, as in the browser.
       const from = typeof f.getScriptNameOrSourceURL === 'function'
         ? (f.getScriptNameOrSourceURL() || f.getFileName())
         : f.getFileName();
-      if (from) return false;                 // скрипт с адресом — страницы
-      if (f.isEval()) return false;           // eval/Function — тоже её
-      return f.getLineNumber() != null;       // безымянный, но с позицией — наш
+      if (from) return false;                 // script with a URL: the page's
+      if (f.isEval()) return false;           // eval/Function: also the page's
+      return f.getLineNumber() != null;       // unnamed but positioned: ours
     } catch (e) { return false; }
   };
-  // Прокси, которую нельзя замкнуть на себя: `Object.setPrototypeOf(x, x)`
-  // у браузера бросает «Cyclic __proto__ value» на любом объекте, а у прокси
-  // без ловушки проверка цикла обрывается на ней самой — и цель получала
-  // прототипом свою же обёртку. Обход глобального графа делает ровно это со
-  // всем подряд, и после него `Function.prototype.toString` уходил в
-  // бесконечную цепочку прототипов.
-  // Взяты заранее: ловушка не должна звать то, что страница могла обернуть.
+  // A proxy that cannot be made its own prototype: the browser's
+  // `Object.setPrototypeOf(x, x)` throws "Cyclic __proto__ value" for any
+  // object, but for a trapless proxy the cycle check stops at the proxy and
+  // the target got its own wrapper as prototype. A global graph walk does
+  // exactly this to everything, after which `Function.prototype.toString`
+  // looped through an endless prototype chain.
+  // Captured up front: the trap must not call anything the page may wrap.
   const __pxGPO = Reflect.getPrototypeOf, __pxSPO = Reflect.setPrototypeOf, __pxProxy = Proxy;
   Object.defineProperty(globalThis, '__pt_proxy', {
     value: (target, handler) => {
@@ -6607,22 +6476,21 @@ const STACK_TEMPLATE: &str = r##"(() => {
   });
   globalThis.__pt_formatStack = (err, sites) => {
     let keep = sites;
-    // Сырой стек — для разбора собственных поломок: с ним видно, в каком
-    // месте движка встала чужая программа. Наружу такой стек показывать
-    // нельзя, поэтому только по отдельной переменной окружения.
+    // Raw stack, for debugging our own breakage: shows where in the engine a
+    // foreign program stopped. Never shown to pages; separate env var only.
     if (!__STACK_RAW__) {
       try {
-        // Встроенное V8 (`String`, `Array.join`), которое позвал наш кадр, —
-        // это внутренность родной функции: у браузера преобразование довода
-        // идёт в C++ и кадра не оставляет. Такой кадр прячется вместе с
-        // нашим; встроенное, позванное самой страницей, остаётся.
+        // A V8 builtin (`String`, `Array.join`) called by our frame is part of
+        // a native function's internals: the browser converts arguments in C++
+        // and leaves no frame. Such a frame is hidden along with ours; builtins
+        // called by the page itself stay.
         const mine = Array.prototype.map.call(sites, (f) => ours(f));
         const builtin = (f) => { try { return f.getLineNumber() == null && !f.getFileName() && !f.isEval(); } catch (e) { return false; } };
-        // Консоль у браузера — встроенная: её кадр виден как
-        // `console.log (<anonymous>)`, а преобразование довода из
-        // форматирования (parseInt/parseFloat/String) — своим кадром над ним.
-        // Наш метод консоли — обычная функция пролога: её кадр не прячется, а
-        // подменяется таким же, и встроенные внутри неё остаются видны.
+        // The browser's console is builtin: its frame shows as
+        // `console.log (<anonymous>)`, with argument conversion from formatting
+        // (parseInt/parseFloat/String) as its own frame above it. Our console
+        // method is a plain prologue function: its frame is replaced with such a
+        // frame rather than hidden, and builtins inside it stay visible.
         const CONS = new Set(['assert', 'clear', 'context', 'count', 'countReset', 'createTask', 'debug', 'dir', 'dirxml', 'error', 'group', 'groupCollapsed', 'groupEnd', 'info', 'log', 'profile', 'profileEnd', 'table', 'time', 'timeEnd', 'timeLog', 'timeStamp', 'trace', 'warn']);
         const consoleName = (f, i) => { try { const n = f.getFunctionName(); const t = f.getTypeName(); return mine[i] && CONS.has(n) && (t === 'console' || t === 'Object' || t == null) ? n : null; } catch (e) { return null; } };
         const fake = (name) => {
@@ -6630,14 +6498,14 @@ const STACK_TEMPLATE: &str = r##"(() => {
           const u = () => undefined, n = () => null, no = () => false;
           return { toString: () => label, getFunctionName: () => 'console.' + name, getMethodName: () => name, getTypeName: n, getFileName: u, getScriptNameOrSourceURL: u, getLineNumber: n, getColumnNumber: n, getEnclosingLineNumber: n, getEnclosingColumnNumber: n, getPosition: () => 0, getPromiseIndex: n, getEvalOrigin: u, getThis: u, getFunction: u, getScriptHash: () => '', isNative: no, isEval: no, isConstructor: no, isToplevel: no, isAsync: no, isPromiseAll: no };
         };
-        // Снаружи внутрь: цепочка встроенных над нашим кадром прячется целиком —
-        // кроме той, что внутри кадра консоли.
+        // Outside in: a chain of builtins above our frame is hidden entirely,
+        // except the one inside a console frame.
         const hidden = new Array(sites.length), swap = new Array(sites.length);
         let inside = false;
         for (let i = sites.length - 1; i >= 0; i--) {
           const cn = consoleName(sites[i], i);
           if (cn) {
-            // Вложенные обёртки одного метода — один кадр.
+            // Nested wrappers of one method are one frame.
             if (swap[i + 1] && swap[i + 1].getMethodName() === cn) { hidden[i] = true; continue; }
             hidden[i] = false; swap[i] = fake(cn); inside = true; continue;
           }
@@ -6645,7 +6513,7 @@ const STACK_TEMPLATE: &str = r##"(() => {
         }
         keep = [];
         for (let i = 0; i < sites.length; i++) if (!hidden[i]) keep.push(swap[i] || sites[i]);
-        // Захвачено с запасом (`__pt_mkErr`): наружу — не больше лимита страницы.
+        // Captured with headroom (`__pt_mkErr`): emit no more than the page's limit.
         try { const lim = Error.stackTraceLimit; if (typeof lim === 'number' && keep.length > lim) keep = keep.slice(0, Math.max(0, Math.floor(lim))); } catch (e) {}
       } catch (e) {}
     }
@@ -6659,9 +6527,8 @@ const STACK_TEMPLATE: &str = r##"(() => {
       const m = err == null ? undefined : err.message;
       const name = n === undefined ? 'Error' : String(n);
       let msg = m === undefined || m === null || m === '' ? '' : String(m);
-      // У браузера `TypeError` от привязки в заголовке стека идёт без
-      // «Failed to execute 'x' on 'Y': » — приставка остаётся только в
-      // `message`. Мы печатали её и в стеке.
+      // The browser's binding `TypeError` stack header lacks the
+      // "Failed to execute 'x' on 'Y': " prefix; it stays only in `message`.
       if (name === 'TypeError') msg = msg.replace(/^Failed to (?:execute '[^']*' on '[^']*'|construct '[^']*'): /, '');
       head = !name ? msg : (!msg ? name : name + ': ' + msg);
     } catch (e) {}
@@ -6674,8 +6541,8 @@ const STACK_TEMPLATE: &str = r##"(() => {
 })();"##;
 
 const PERFORMANCE_TEMPLATE: &str = r#"(() => {
-  // У браузера начало отсчёта тоже не целое: оно снято с тех же часов, что и
-  // `now()`, и несёт доли миллисекунды.
+  // The browser's time origin is not an integer either: it comes from the
+  // same clock as `now()` and carries fractions of a millisecond.
   const originNow = () => {
     const ms = Date.now();
     const hr0 = typeof globalThis.__pt_hrtime === 'function' ? globalThis.__pt_hrtime() : 0;
@@ -6687,32 +6554,29 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   // DOMHighResTimeStamp: 0.1 ms granularity (Chrome coarsens it against timing
   // attacks) and never decreasing. Derived from the same clock as `Date.now()`,
   // so `timeOrigin + now()` tracks it exactly.
-  // Настоящие монотонные часы, огрублённые до браузерного шага в 0.1 мс.
-  // Считать от `Date.now()` нельзя: тот идёт целыми миллисекундами, и внутри
-  // одной задачи время не двигалось совсем — два подряд идущих `now()` всегда
-  // давали одно значение. Челлендж Cloudflare меряет ровно это: пять тысяч
-  // замеров подряд и минимальная положительная разница. У браузера 0.1 мс, у
-  // нас не было ни одного продвижения на пяти тысячах.
+  // Real monotonic clock, coarsened to the browser's 0.1 ms step. `Date.now()`
+  // won't do: it moves in whole ms, so time stood still within a task. The
+  // Cloudflare challenge measures exactly this: five thousand samples and the
+  // minimum positive difference.
   const hr = globalThis.__pt_hrtime;
   let HR_BASE = typeof hr === 'function' ? hr() : 0;
   let last = 0;
   const nowMs = () => {
     const raw = typeof hr === 'function' ? hr() - HR_BASE : Math.max(0, Date.now() - ORIGIN);
-    // Тот же квант, что у Chrome, и та же арифметика с плавающей точкой:
-    // деление на 10 даёт 98.59999996423721, а не 98.6 — это видно в замерах.
+    // Same quantum as Chrome and the same float arithmetic: dividing by 10
+    // gives 98.59999996423721, not 98.6, which shows in measurements.
     const coarse = Math.floor(raw * 10) / 10;
-    // И та же решётка, что у браузера. Chrome держит отметку с точностью
-    // 2^-24 мс, поэтому его десятые доли — не ровные: 2294.1 у него равно
-    // 2294.099999964237, а .5 и .0 точны. Измеряется это в одну строку —
-    // пять тысяч замеров подряд и минимальная разница, — и у нас выходило
-    // ровное 0.09999999999999432 против браузерного 0.09999996423721313.
+    // And the browser's grid: Chrome keeps timestamps at 2^-24 ms precision,
+    // so its tenths are inexact (2294.1 is 2294.099999964237, while .5 and .0
+    // are exact). The min-difference test shows 0.09999996423721313 in the
+    // browser vs an even 0.09999999999999432 without this.
     const v = Math.floor(coarse * 16777216) / 16777216;
     if (v > last) last = v;
     return last;
   };
 
   // Plausible, correctly ordered navigation milestones anchored at the origin.
-  // Поля `performance.timing` — целые миллисекунды эпохи, как у браузера.
+  // `performance.timing` fields are integer epoch milliseconds, as in the browser.
   const T = (d) => Math.round(ORIGIN + d);
   const TIMING = {
     navigationStart: T(0), unloadEventStart: 0, unloadEventEnd: 0,
@@ -6725,20 +6589,19 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
     domComplete: T(190), loadEventStart: T(191), loadEventEnd: T(196),
   };
   const NAVIGATION = { type: 0, redirectCount: 0 };
-  // Показания, а не постоянные величины: страница, которая выделит массив и
-  // перечитает `usedJSHeapSize`, в браузере видит выросшее число. Три
-  // константы здесь стояли годами и не двигались ни на байт. Предел движок
-  // считает от физической памяти той же функцией V8, что и Chrome, поэтому
-  // совпадает. Отсутствующий `performance.memory` под видом Chrome — тоже
-  // примета, так что запасные значения остаются на случай сборки без натива.
+  // Live readings, not constants: a page that allocates an array and rereads
+  // `usedJSHeapSize` sees a larger number in the browser. The engine computes
+  // the limit from physical memory with the same V8 function as Chrome. A
+  // missing `performance.memory` while claiming Chrome is a tell too, so
+  // fallback values remain for builds without the native hook.
   const MEMORY_FALLBACK = { jsHeapSizeLimit: 4395630592, totalJSHeapSize: 12800000, usedJSHeapSize: 10600000 };
   const heapStats = typeof __pt_heapStats === 'function' ? __pt_heapStats : null;
-  // Как у Chrome (сверено в кадре виджета, секция LYTA4 читает это восемь
-  // раз): каждое обращение к performance.memory — новый объект со снятыми
-  // значениями; сами значения обновляются не чаще раза в 50 мс; и это память
-  // своего контекста, а не всего изолята — у нас в нём живут и другие окна,
-  // и кадр виджета отвечал 266 МБ против 33 у Chrome. Считаем от рождения
-  // контекста: уровень свежей страницы Chrome плюс прирост кучи с тех пор.
+  // As in Chrome (verified in the widget frame; section LYTA4 reads this eight
+  // times): every performance.memory access is a new object with sampled
+  // values; values refresh at most every 50 ms; and it is the memory of this
+  // context, not the whole isolate (which hosts other windows too: the widget
+  // frame reported 266 MB vs Chrome's 33). Counted from context birth: Chrome's
+  // fresh page level plus heap growth since.
   const MEM_FRESH_USED = 733790, MEM_FRESH_TOTAL = 1317838;
   let MEM_BASE = null, MEM_SNAP = null, MEM_AT = -1e12;
   const memReset = () => { MEM_BASE = heapStats ? heapStats() : null; MEM_SNAP = null; MEM_AT = -1e12; };
@@ -6794,18 +6657,17 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   const navigation = new PerformanceNavigation();
   const memory = new MemoryInfo();
 
-  // Каждый запрос страницы оставляет запись Resource Timing, и после загрузки
-  // их десятки. Пустой список — признак браузера, который ничего не грузил:
-  // ровно на это смотрит анти-бот, спрашивая getEntriesByType('resource').
-  // Записи кладёт сюда движок, по мере того как запросы завершаются.
+  // Every page request leaves a Resource Timing entry, dozens after load. An
+  // empty list marks a browser that loaded nothing, which anti-bots check via
+  // getEntriesByType('resource'). The engine adds entries as requests finish.
   const entries = [];
-  // Порядок полей в `toJSON` — тот, в каком запись собрана (он сверен с
-  // Chrome), а не порядок аксессоров на прототипе: у браузера они разные.
+  // `toJSON` field order follows how the entry was built (verified against
+  // Chrome), not the prototype accessor order: in the browser they differ.
   const ENTRY_ORDER = new WeakMap();
-  // Записи, у которых toJSON — ровно поля из ENTRY_ORDER (long-animation-frame
-  // и её script: у Chrome paintTime/presentationTime/window туда не входят).
+  // Entries whose toJSON is exactly the ENTRY_ORDER fields (long-animation-frame
+  // and its script: Chrome leaves out paintTime/presentationTime/window).
   const ENTRY_STRICT = new WeakSet();
-  // navigation.confidence — PerformanceTimingConfidence, как у Chrome 151.
+  // navigation.confidence is a PerformanceTimingConfidence, as in Chrome 151.
   const __ptConfidence = () => {
     const C = globalThis.PerformanceTimingConfidence;
     const o = Object.create(C && C.prototype ? C.prototype : Object.prototype);
@@ -6822,9 +6684,9 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   };
   const putEntry = (o, bag) => { for (const k of Object.keys(bag)) __pt_write(o, k, bag[k]); };
   class PerformanceEntry {
-    // Поля — аксессоры на прототипах, а не собственные свойства записи;
-    // `toJSON` идёт по цепочке от PerformanceEntry к своему виду, в порядке
-    // объявления на каждом прототипе — так собирает Chrome.
+    // Fields are prototype accessors, not own properties; `toJSON` walks the
+    // chain from PerformanceEntry to the concrete kind, in declaration order
+    // on each prototype, as Chrome builds it.
     toJSON() {
       const chain = [];
       for (let p = Object.getPrototypeOf(this); p && p !== Object.prototype; p = Object.getPrototypeOf(p)) chain.unshift(p);
@@ -6837,7 +6699,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
       }
       for (const p of chain) {
         for (const k of Object.getOwnPropertyNames(p)) {
-          // `detail` у метки и замера в JSON у Chrome не входит.
+          // Chrome's JSON for marks and measures omits `detail`.
           if (k === 'constructor' || k === 'toJSON' || k === 'detail' || k.slice(0, 4) === '__pt') continue;
           const d = Object.getOwnPropertyDescriptor(p, k);
           if (!d || !d.get || k in o) continue;
@@ -6860,11 +6722,11 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   globalThis.PerformanceNavigationTiming = PerformanceNavigationTiming;
   globalThis.PerformancePaintTiming = PerformancePaintTiming;
 
-  // Номер навигации: у браузера он один на все записи документа.
+  // Navigation id: the browser uses one for all entries of a document.
   const NAV_ID = 1000 + Math.floor(Math.random() * 9000);
-  // «Сокращённый» MIME, как его пишет Resource Timing: у любого JavaScript —
-  // `text/javascript`, у JSON — `application/json`, у SVG и XML — свои, у
-  // прочих поддерживаемых — сама суть без параметров, у незнакомых — пусто.
+  // "Minimized" MIME as Resource Timing writes it: any JavaScript is
+  // `text/javascript`, JSON `application/json`, SVG and XML their own, other
+  // supported types the essence without parameters, unknown ones empty.
   const __ptMinimizeMime = (raw) => {
     const t = String(raw || '').split(';')[0].trim().toLowerCase();
     if (!t) return '';
@@ -6874,8 +6736,8 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
     if (t === 'text/xml' || t === 'application/xml' || /\+xml$/.test(t)) return 'application/xml';
     return t;
   };
-  // Отметки документа (domInteractive, DOMContentLoaded, load) — в тот миг,
-  // когда событие случилось; до того в записи нули, как у браузера.
+  // Document marks (domInteractive, DOMContentLoaded, load) are set when the
+  // event happens; zeros until then, as in the browser.
   const NAV_MARKS = {};
   let NAV_ENTRY = null;
   const __ptSyncTimingMarks = () => {
@@ -6907,25 +6769,24 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
     let list;
     const fresh = [];
     try { list = __ptJSON.parse(json); } catch (e) { return 0; }
-    // Сдвиг с часов страницы на часы этого окна (у кадра timeOrigin позже).
+    // Shift from the page clock to this window's clock (a frame's timeOrigin is later).
     const shift = pageEpoch ? pageEpoch - ORIGIN : 0;
     for (const r of list) {
       const Ctor = r.entryType === 'navigation' ? PerformanceNavigationTiming : PerformanceResourceTiming;
       const e = new Ctor();
       const start = r.entryType === 'navigation' ? (Number(r.start) || 0) : Math.max(0, (Number(r.start) || 0) + shift);
       const end = start + (Number(r.duration) || 0);
-      // Поля — в том порядке, в каком их отдаёт браузер (`toJSON` идёт по
-      // собственным именам): его запись api.js Turnstile пересылает виджету
-      // целиком, и она уходит в тело первого POST. Недостающих полей у нас
-      // было семь, `contentType` не «сокращался», порядок был свой.
-      // Перенаправление: запись начинается с первого запроса, а выборка —
-      // с конца последнего перенаправления.
+      // Fields in the browser's order (`toJSON` follows own names): Turnstile's
+      // api.js forwards its entry to the widget whole, and it goes into the
+      // first POST body.
+      // Redirects: the entry starts at the first request, fetchStart at the
+      // end of the last redirect.
       const hop = r.redirect != null && Number(r.redirect) > 0 ? Math.min(Number(r.redirect), Number(r.duration) || 0) : 0;
       const isNav = r.entryType === 'navigation';
       const net = Math.max(0, (Number(r.duration) || 0) - hop);
-      // У навигации выборка начинается не в нуле, а соединение, запрос и
-      // первый байт идут своими шагами: у кадра виджета в Chrome это
-      // 56 → 58…147 → 147 → 204 → 242. У нас все они стояли в одной точке.
+      // For navigation fetchStart is not at zero, and connect, request and
+      // first byte are separate steps: Chrome's widget frame shows
+      // 56 -> 58...147 -> 147 -> 204 -> 242.
       const fs = start + hop + (isNav ? Math.min(net * 0.02, 5) : 0);
       const span = Math.max(0, end - fs);
       const cEnd = isNav && span > 120 ? fs + span * 0.45 : fs;
@@ -6937,8 +6798,8 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
         const had = ENTRY_ORDER.get(o);
         ENTRY_ORDER.set(o, had ? had.concat(keys.filter((k) => had.indexOf(k) < 0)) : keys);
       };
-      // Чужой ресурс без `Timing-Allow-Origin` для нашего origin: браузер
-      // прячет размеры, статус, протокол и промежуточные отметки (TAO).
+      // Cross-origin resource without `Timing-Allow-Origin` for our origin: the
+      // browser hides sizes, status, protocol and intermediate marks (TAO).
       const taoPass = (() => {
         try {
           if (isNav) return true;
@@ -6979,8 +6840,8 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
         });
       }
       if (r.entryType === 'navigation') {
-        // Отметки документа — нули, пока событие не случилось, как у браузера;
-        // их ставит __pt_markNav. Длительность навигации — до конца `load`.
+        // Document marks are zero until the event happens, as in the browser;
+        // __pt_markNav sets them. Navigation duration runs to the end of `load`.
         const m = NAV_MARKS;
         put(e, {
           unloadEventStart: 0, unloadEventEnd: 0, domInteractive: m.interactive || 0,
@@ -6993,7 +6854,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
       if (r.entryType === 'navigation') {
         __pt_write(e, 'duration', NAV_MARKS.loadEnd || 0);
         NAV_ENTRY = e;
-        // `performance.timing` — те же отметки, в миллисекундах эпохи.
+        // `performance.timing`: the same marks in epoch milliseconds.
         const at = (v) => (v ? Math.round(ORIGIN + v) : 0);
         Object.assign(TIMING, {
           fetchStart: at(e.fetchStart), domainLookupStart: at(e.domainLookupStart),
@@ -7006,7 +6867,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
       }
       entries.push(e);
       fresh.push(e);
-      // Запись видимости — сразу за навигацией: у Chrome она есть всегда.
+      // Visibility entry right after navigation: Chrome always has one.
       if (isNav && !globalThis.__ptVisEntry) {
         try {
           Object.defineProperty(globalThis, '__ptVisEntry', { value: true, configurable: true });
@@ -7016,18 +6877,17 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
           fresh.push(v);
         } catch (e2) {}
       }
-      // Отрисовка: у браузера рядом с переходом стоят две записи — первая
-      // краска и первая содержательная, — и страницы их читают. У нас их не
-      // было вовсе, и `getEntriesByType('paint')` возвращал пустоту.
-      // Кадр без коробки (0×0 у api.js Turnstile до первого ответа, или
-      // 1×1) не красится: у Chrome в таком окне записей краски нет.
+      // Paint: the browser has two entries next to navigation (first paint
+      // and first contentful paint), and pages read them.
+      // A frame without a box (0x0 for Turnstile's api.js before the first
+      // response, or 1x1) is not painted: Chrome has no paint entries there.
       const painted = (globalThis.innerWidth | 0) > 1 && (globalThis.innerHeight | 0) > 1;
       if (r.entryType === 'navigation' && painted && !entries.some((x) => x.entryType === 'paint')) {
         const at = Math.round((start + (Number(r.duration) || 0) * 0.92) * 10) / 10;
         for (const name of ['first-paint', 'first-contentful-paint']) {
           const p = new PerformancePaintTiming();
-          // Chrome: startTime = presentationTime (показ кадра), paintTime —
-          // раньше, когда кадр отрисован.
+          // Chrome: startTime = presentationTime (frame shown), paintTime
+          // earlier, when the frame was drawn.
           const painted_at = Math.round(at * 0.3 * 10) / 10;
           put(p, { name, entryType: 'paint', startTime: at, duration: 0, navigationId: NAV_ID, paintTime: painted_at, presentationTime: at });
           entries.push(p);
@@ -7039,10 +6899,9 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
     return entries.length;
   };
 
-  // PerformanceObserver — не заглушка: страница подписывается на записи и ждёт
-  // колбэка. Пустой `supportedEntryTypes` — сам по себе улика (у браузера там
-  // дюжина имён), а наблюдатель, который никогда не срабатывает, подвешивает
-  // любой код, который на него рассчитывает.
+  // PerformanceObserver: pages subscribe and wait for callbacks. An empty
+  // `supportedEntryTypes` is a tell (the browser lists a dozen), and an
+  // observer that never fires hangs code relying on it.
   const observers = [];
   class PerformanceObserverEntryList {
     constructor(list) { Object.defineProperty(this, '__ptList', { value: list, enumerable: false }); }
@@ -7064,7 +6923,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
                   : opts.type ? [String(opts.type)] : [];
       for (const t of types) if (this.__ptTypes.indexOf(t) < 0) this.__ptTypes.push(t);
       if (!this.__ptOn) { this.__ptOn = true; observers.push(this); }
-      // `buffered` — то, что уже случилось до подписки.
+      // `buffered`: what happened before subscribing.
       if (opts.buffered) {
         const past = entries.filter((e) => this.__ptTypes.indexOf(e.entryType) >= 0);
         if (past.length) { this.__ptQueue.push(...past); __ptFlush(this); }
@@ -7077,7 +6936,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
     takeRecords() { return this.__ptQueue.splice(0); }
   }
   tag(PerformanceObserver.prototype, 'PerformanceObserver');
-  // Порядок и состав — как у Chrome 148.
+  // Order and contents as in Chrome 148.
   PerformanceObserver.supportedEntryTypes = Object.freeze(['element', 'event', 'first-input',
     'interaction-contentful-paint', 'largest-contentful-paint', 'layout-shift',
     'long-animation-frame', 'longtask', 'mark', 'measure', 'navigation', 'paint',
@@ -7085,7 +6944,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   globalThis.PerformanceObserver = PerformanceObserver;
   globalThis.PerformanceObserverEntryList = PerformanceObserverEntryList;
 
-  // Колбэк приходит задачей, а не по ходу записи — как в браузере.
+  // The callback arrives as a task, not during recording, as in the browser.
   const __ptFlush = (obs) => {
     Promise.resolve().then(() => {
       const batch = obs.__ptQueue.splice(0);
@@ -7099,11 +6958,11 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
       if (mine.length) { obs.__ptQueue.push(...mine); __ptFlush(obs); }
     }
   };
-  // long-animation-frame: у Chrome 151 такие записи лежат в общей ленте
-  // (getEntries) — кадр, чья работа длилась больше 50 мс. Без отрисовки
-  // (renderStart 0) это одна длинная задача: таймер, кадр анимации, скрипт
-  // документа, обработчик сообщения. В записи — скрипт-виновник со ссылкой
-  // на место функции в исходнике. Отчёт Turnstile перечисляет ленту целиком.
+  // long-animation-frame: Chrome 151 puts these in the main timeline
+  // (getEntries) for frames whose work exceeded 50 ms. Without rendering
+  // (renderStart 0) it is one long task: a timer, animation frame, document
+  // script or message handler. The entry names the culprit script with a
+  // source location. The Turnstile report lists the whole timeline.
   let loafCount = 0;
   Object.defineProperty(globalThis, '__pt_noteLoaf', { value: (start, dur, invoker, invokerType, fn, url) => {
     try {
@@ -7119,8 +6978,8 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
           if (loc) {
             if (!src) src = String(loc[0] || '');
             pos = loc[2];
-            // Вписанный скрипт: у Chrome позиция — от начала текста этого
-            // <script>; строки у нас считаются от начала разметки документа.
+            // Inline script: Chrome counts the position from the start of that
+            // <script>'s text; our lines count from the document markup start.
             const m = globalThis.document && document.__ptMarkup;
             if (typeof m === 'string' && String(loc[0]) === String(document.URL)) {
               const lineOf = (idx) => { let n = 0; for (let k = m.indexOf('\n'); k >= 0 && k < idx; k = m.indexOf('\n', k + 1)) n++; return n; };
@@ -7163,8 +7022,8 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   const __ptByStart = (list) => list.map((e, i) => [e, i]).sort((a, b) => ((Number(a[0].startTime) || 0) - (Number(b[0].startTime) || 0)) || (a[1] - b[1])).map((x) => x[0]);
   class Performance {
     now() { return nowMs(); }
-    // По времени начала, как у Chrome (записи о ресурсах приходят позже,
-    // чем начались; сортировка устойчивая).
+    // By start time, as in Chrome (resource entries arrive after they
+    // started; the sort is stable).
     getEntries() { return __ptByStart(entries.slice()); }
     getEntriesByType(type) { return __ptByStart(entries.filter((e) => e.entryType === String(type))); }
     getEntriesByName(name, type) {
@@ -7195,29 +7054,29 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
     clearMeasures() {}
     clearResourceTimings() { __pt_write(entries, 'length', 0); }
     setResourceTimingBufferSize() {}
-    // Слушателей объявляет `EventTarget`, от которого `Performance` наследует, —
-    // одна пустышка здесь давала три лишних имени на прототипе против браузера.
+    // Listeners come from `EventTarget`, which `Performance` inherits; a
+    // dummy here gave three extra prototype names vs the browser.
     toJSON() {
       return { timeOrigin: ORIGIN, timing: timing.toJSON(), navigation: navigation.toJSON() };
     }
   }
   const PERF_BAG = { timeOrigin: ORIGIN, timing, navigation, memory };
-  // performance.memory — новый MemoryInfo на каждое обращение, со значениями,
-  // снятыми в этот миг (из кэша на 50 мс).
+  // performance.memory: a new MemoryInfo per access with values sampled at
+  // that moment (cached for 50 ms).
   Object.defineProperty(PERF_BAG, 'memory', {
     get() { const m = new MemoryInfo(); MEM_OF.set(m, memSnap()); return m; },
     enumerable: true, configurable: true,
   });
   onProto(Performance.prototype, PERF_BAG);
-  // Запасной реалм строится заранее, а выдаётся, когда страница вставит
-  // пустой кадр: его часы должны начаться в миг выдачи, как у нового окна.
+  // The spare realm is built ahead and handed out when the page inserts an
+  // empty frame: its clock must start at hand-out, like a new window.
   {
     const offsets = {};
     for (const k of Object.keys(TIMING)) offsets[k] = TIMING[k] ? TIMING[k] - ORIGIN : 0;
-    // Начало часов документа — начало его навигации. Контекст кадра строится
-    // уже после того, как документ скачан, и без сдвига навигация кадра
-    // начиналась с готового ответа: её длительность выходила втрое короче
-    // хромовской, а виджет Turnstile кладёт её в тело первого POST.
+    // The document clock starts at its navigation start. A frame context is
+    // built after the document is downloaded; without the shift the frame's
+    // navigation started from a ready response and came out three times
+    // shorter than Chrome's, and the Turnstile widget puts it in the first POST.
     Object.defineProperty(globalThis, '__pt_shiftOrigin', {
       value: (ms) => {
         const d = Math.max(0, Number(ms) || 0);
@@ -7454,10 +7313,10 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       });
     }
     const id = fid++;
-    // Трасса реализации (`NOKK_TRACE_ENC=1`): запросы fetch челленджа.
-    if (globalThis.__pt_encTrace) { try { (globalThis.__pt_parentConsole || console).error('[fetch] ' + Math.round(performance.now()) + 'мс #' + id + ' ' + (opts.method || 'GET') + ' ' + String(url).slice(0, 120) + ' opts=' + JSON.stringify({ mode: opts.mode, credentials: opts.credentials, cache: opts.cache, redirect: opts.redirect, headers: headerObj(opts.headers), signal: !!opts.signal, keepalive: opts.keepalive })); } catch (e) {} }
-    // `cache` у браузера превращается в заголовки: no-cache → max-age=0,
-    // no-store/reload → no-cache + Pragma. Сервер челленджа видит их.
+    // Implementation trace (`NOKK_TRACE_ENC=1`): the challenge's fetch requests.
+    if (globalThis.__pt_encTrace) { try { (globalThis.__pt_parentConsole || console).error('[fetch] ' + Math.round(performance.now()) + 'ms #' + id + ' ' + (opts.method || 'GET') + ' ' + String(url).slice(0, 120) + ' opts=' + JSON.stringify({ mode: opts.mode, credentials: opts.credentials, cache: opts.cache, redirect: opts.redirect, headers: headerObj(opts.headers), signal: !!opts.signal, keepalive: opts.keepalive })); } catch (e) {} }
+    // The browser turns `cache` into headers: no-cache -> max-age=0,
+    // no-store/reload -> no-cache + Pragma. The challenge server sees them.
     const hdrs = headerObj(opts.headers);
     const cacheMode = String(opts.cache || 'default');
     if (cacheMode === 'no-cache' && !('cache-control' in hdrs)) hdrs['cache-control'] = 'max-age=0';
@@ -7466,11 +7325,11 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       id, url: String(url),
       method: (opts.method || 'GET').toUpperCase(),
       headers: hdrs,
-      // Воркер из blob: реферера у его запросов нет.
+      // A blob worker's requests carry no referrer.
       noReferrer: !!globalThis.__ptNoReferrer,
       body: opts.body != null ? String(opts.body) : null,
-      // Кадр, которому дали доступ к своим кукам, помечает этим свои
-      // запросы: браузер добавляет к ним отдельный заголовок.
+      // A frame granted access to its cookies marks its requests: the browser
+      // adds a separate header to them.
       storageAccess: !!globalThis.__ptStorageAccess,
     };
     return new Promise((resolve, reject) => {
@@ -7479,9 +7338,9 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     });
   };
 
-  // Подресурс страницы — картинка, стиль, предзагрузка. Идёт той же дорогой,
-  // что и `fetch`, но мимо страничного `fetch`: браузер такие запросы делает
-  // сам, и код, который подменил `window.fetch`, их не видит.
+  // Page subresources (images, styles, preloads) take the same road as
+  // `fetch` but bypass the page's `fetch`: the browser makes these requests
+  // itself, and code that replaced `window.fetch` does not see them.
   // The document's memory of what it has already fetched. A page routinely asks
   // for one address twice — a `<link rel=preload as=image>` and then the `<img>`
   // that uses it — and a browser answers the second from memory, so one address
@@ -7512,8 +7371,8 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     if (cors) imageCors.add(String(url));
   };
   globalThis.__pt_imageSizeOf = (url) => imageSizes.get(String(url)) || null;
-  // Позволил ли сервер читать эту картинку кому-то ещё: от этого зависит,
-  // испортит ли она холст, на который её нарисуют.
+  // Whether the server lets others read this image: decides whether it
+  // taints a canvas it is drawn on.
   globalThis.__pt_imageCorsOk = (url) => imageCors.has(String(url));
 
   // Rust hooks -------------------------------------------------------------
@@ -7522,13 +7381,12 @@ const FETCH_TEMPLATE: &str = r#"(() => {
 
   globalThis.__pt_fetchResolve = (id, status, statusText, headers, body, finalUrl) => {
     const p = pending.get(id); if (!p) return; pending.delete(id);
-    if (globalThis.__pt_encTrace) { try { (globalThis.__pt_parentConsole || console).error('[fetch] ' + Math.round(performance.now()) + 'мс #' + id + ' resp ' + status + ' len=' + (body == null ? 0 : (body.byteLength || body.length || 0)) + ' ' + String(p.url).slice(-60) + ' hdrs=' + JSON.stringify(headers).slice(0, 300) + ((body && (body.byteLength || body.length || 0) < 500) ? ' body=' + JSON.stringify(typeof body === 'string' ? body : new TextDecoder().decode(body)).slice(0, 400) : '')); } catch (e) {} }
+    if (globalThis.__pt_encTrace) { try { (globalThis.__pt_parentConsole || console).error('[fetch] ' + Math.round(performance.now()) + 'ms #' + id + ' resp ' + status + ' len=' + (body == null ? 0 : (body.byteLength || body.length || 0)) + ' ' + String(p.url).slice(-60) + ' hdrs=' + JSON.stringify(headers).slice(0, 300) + ((body && (body.byteLength || body.length || 0) < 500) ? ' body=' + JSON.stringify(typeof body === 'string' ? body : new TextDecoder().decode(body)).slice(0, 400) : '')); } catch (e) {} }
     const lower = {}; for (const k in headers) lower[k.toLowerCase()] = headers[k];
     const resp = {
       ok: status >= 200 && status < 300, status, statusText: statusText || '',
       url: finalUrl || p.url, redirected: false, type: 'basic', bodyUsed: false, _body: body,
-      // Настоящий Headers: страница перебирает `[...r.headers]` и `for…of`,
-      // а голый объект с пятью методами на это бросал TypeError.
+      // A real Headers: pages iterate `[...r.headers]` and `for...of`.
       headers: (typeof globalThis.Headers === 'function' ? (() => { try { return new Headers(lower); } catch (e) { return null; } })() : null) || {
         get: (k) => (k.toLowerCase() in lower ? lower[k.toLowerCase()] : null),
         has: (k) => k.toLowerCase() in lower,
@@ -7545,7 +7403,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   };
   globalThis.__pt_fetchReject = (id, msg) => {
     const p = pending.get(id); if (!p) return; pending.delete(id);
-    if (globalThis.__pt_encTrace) { try { (globalThis.__pt_parentConsole || console).error('[fetch] ' + Math.round(performance.now()) + 'мс #' + id + ' FAIL ' + String(msg).slice(0, 80) + ' ' + String(p.url).slice(-60)); } catch (e) {} }
+    if (globalThis.__pt_encTrace) { try { (globalThis.__pt_parentConsole || console).error('[fetch] ' + Math.round(performance.now()) + 'ms #' + id + ' FAIL ' + String(msg).slice(0, 80) + ' ' + String(p.url).slice(-60)); } catch (e) {} }
     // Chrome says exactly `Failed to fetch` and nothing else, whatever went
     // wrong underneath. Ours used to append the transport's own words — and a
     // page that stringifies the error sends them onward: Cloudflare's worker
@@ -7565,10 +7423,10 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   // own timeout and reported failure (300010). A missing `EventTarget` global is
   // also a one-line tell in its own right.
   if (!globalThis.EventTarget) {
-    // Без получателя — окно: `addEventListener('x', f)` без префикса даёт
-    // `this === undefined` (методы класса всегда строгие), и браузер в этом
-    // случае берёт глобальный объект. Проверено на Chrome 148: голый вызов,
-    // строгий режим и даже `.call(undefined)` там работают.
+    // No receiver means the window: `addEventListener('x', f)` unprefixed gives
+    // `this === undefined` (class methods are strict), and the browser uses
+    // the global object then. Verified on Chrome 148: a bare call, strict mode
+    // and even `.call(undefined)` work.
     const __ptSelf = (t) => (t === undefined || t === null ? globalThis : t);
     globalThis.EventTarget = class EventTarget {
       constructor() { Object.defineProperty(this, '__ptLis', { value: Object.create(null), enumerable: false, writable: true }); }
@@ -7588,12 +7446,12 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         const t = __ptSelf(this);
         const type = ev && ev.type;
         const l = (t.__ptLis && t.__ptLis[type]) || [];
-        // `window.event` — событие, которое обрабатывается прямо сейчас: в
-        // браузере внутри обработчика там лежит оно, а снаружи ничего.
-        // У воркера имени `event` нет вовсе, и возврат «как было» не должен
-        // его заводить: присваивание `undefined` создаёт собственное свойство.
-        const былоСобственным = Object.prototype.hasOwnProperty.call(globalThis, 'event');
-        const outer = былоСобственным ? globalThis.event : undefined;
+        // `window.event` is the event being handled right now: inside a handler
+        // it holds the event, outside nothing. Workers have no `event` at all,
+        // and restoring must not create it: assigning `undefined` creates an
+        // own property.
+        const wasOwn = Object.prototype.hasOwnProperty.call(globalThis, 'event');
+        const outer = wasOwn ? globalThis.event : undefined;
         if (typeof importScripts === 'undefined') { try { globalThis.event = ev; } catch (x) {} }
         try {
           for (const e of l.slice()) {
@@ -7603,14 +7461,14 @@ const FETCH_TEMPLATE: &str = r#"(() => {
           const on = t['on' + type];
           if (typeof on === 'function') { try { on.call(t, ev); } catch (x) {} }
         } finally {
-          try { if (былоСобственным) globalThis.event = outer; else delete globalThis.event; } catch (x) {}
+          try { if (wasOwn) globalThis.event = outer; else delete globalThis.event; } catch (x) {}
         }
         return !ev || !ev.defaultPrevented;
       }
     };
-    // Прототип EventTarget у Chrome неизменяем (цепочка окна): берём его из
-    // шаблона V8 (`__pt_protoTemplates`), члены класса переносим туда, а
-    // снаружи ставим строгую функцию, строящую экземпляр тем же классом.
+    // Chrome's EventTarget prototype is immutable (window chain): take it from
+    // the V8 template (`__pt_protoTemplates`), move class members there, and
+    // expose a strict function that builds instances with the same class.
     const T = (globalThis.__pt_protos !== undefined ? globalThis.__pt_protos : (() => { let t = null; try { if (typeof __pt_protoTemplates === 'function') t = __pt_protoTemplates() || null; } catch (e) {} try { Object.defineProperty(globalThis, '__pt_protos', { value: t, configurable: true }); } catch (e) {} return t; })());
     if (T && T.et) {
       const C = globalThis.EventTarget, P = T.et, old = C.prototype;
@@ -7631,12 +7489,10 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     }
   }
 
-  // XHR так, как он устроен в браузере: состояние — в скрытой сумке, всё
-  // остальное на прототипе. Держать `readyState`, `response` и методы прямо на
-  // экземпляре — не мелочь: у настоящего XHR собственных свойств нет вовсе, а
-  // код Cloudflare зовёт `XMLHttpRequest.prototype.open.call(x, …)` — это их
-  // штатный обход перехвата. У нас `XMLHttpRequest.prototype.open` было
-  // undefined, и вызов падал внутри их интерпретатора.
+  // XHR shaped like the browser's: state in a hidden bag, everything else on
+  // the prototype. A real XHR has no own properties, and Cloudflare's code
+  // calls `XMLHttpRequest.prototype.open.call(x, ...)` as its standard way
+  // around interception.
   {
     const xmask = (f, n) => {
       if (n) { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} }
@@ -7655,7 +7511,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     globalThis.XMLHttpRequestUpload = xmask(XHRUpload, 'XMLHttpRequestUpload');
 
     const EVENTS = ['abort', 'error', 'load', 'loadend', 'loadstart', 'progress', 'timeout'];
-    // `on…` живут на XMLHttpRequestEventTarget — и у запроса, и у его upload.
+    // `on...` handlers live on XMLHttpRequestEventTarget, for both the request and its upload.
     for (const name of EVENTS) {
       const key = 'on' + name;
       Object.defineProperty(XHRET.prototype, key, {
@@ -7665,8 +7521,8 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       });
     }
 
-    // Сумка слушателей — то, что заводит конструктор EventTarget; мы его не
-    // зовём (прототип строим руками), поэтому заводим её сами.
+    // The listener bag is created by the EventTarget constructor; we do not
+    // call it (the prototype is built by hand), so create it ourselves.
     const seedTarget = (o) => {
       try { Object.defineProperty(o, '__ptLis', { value: Object.create(null), enumerable: false, writable: true }); } catch (e) {}
       return o;
@@ -7723,8 +7579,8 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       }, extra || {});
       self.dispatchEvent(ev);
     };
-    // Порядок важен: `readystatechange` доходит и до свойства-обработчика, и до
-    // слушателей, — ради этого класс и существует.
+    // Order matters: `readystatechange` reaches both the handler property and
+    // the listeners.
     const setState = (self, n) => { __pt_write(self.__ptX, 'readyState', n); fire(self, 'readystatechange'); };
 
     meth('open', function (method, url) {
@@ -7736,8 +7592,8 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     meth('overrideMimeType', function () {});
     meth('setAttributionReporting', function () {});
     meth('setPrivateToken', function () {});
-    // Каждая строка кончается CRLF, включая последнюю: код, который делит по
-    // '\r\n', в браузере получает пустой хвостовой элемент, а у нас не получал.
+    // Every line ends with CRLF, including the last: code splitting on '\r\n'
+    // gets an empty trailing element in the browser.
     meth('getAllResponseHeaders', function () {
       return Object.entries(this.__ptX.respHeaders).map(([k, v]) => k + ': ' + v + '\r\n').join('');
     });
@@ -7753,11 +7609,10 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     meth('send', function (body) {
       const self = this, b = this.__ptX;
       fire(this, 'loadstart');
-      // Помечаем запрос как XHR: в перечне ресурсов браузер называет его
-      // `xmlhttprequest`, а не `fetch`, и это видно снаружи.
-      // Тип содержимого браузер ставит сам, если страница его не задала:
-      // строка уходит как `text/plain;charset=UTF-8`, форма — своим типом.
-      // Мы не ставили ничего, и запрос выглядел не как из браузера.
+      // Mark the request as XHR: the browser's resource list calls it
+      // `xmlhttprequest`, not `fetch`, visible from outside.
+      // The browser sets the content type itself when the page did not: a
+      // string goes as `text/plain;charset=UTF-8`, a form with its own type.
       const headers = Object.assign({}, b.headers, { 'x-pt-kind': 'xhr' });
       if (body != null && !Object.keys(headers).some((k) => k.toLowerCase() === 'content-type')) {
         if (typeof body === 'string') headers['Content-Type'] = 'text/plain;charset=UTF-8';
@@ -7769,11 +7624,11 @@ const FETCH_TEMPLATE: &str = r#"(() => {
           headers['Content-Type'] = 'text/html;charset=UTF-8';
         }
       }
-      // Трасса реализации (`NOKK_TRACE_ENC=1`): XHR челленджа — адрес, размер
-      // тела и ответа; странице невидима.
+      // Implementation trace (`NOKK_TRACE_ENC=1`): the challenge's XHRs (URL,
+      // body and response sizes); invisible to the page.
       const encTrace = !!globalThis.__pt_encTrace;
       const bodyLen = body == null ? 0 : (typeof body === 'string' ? body.length : (body.byteLength || body.size || 0));
-      if (encTrace) { try { (globalThis.__pt_parentConsole || console).error('[xhr] ' + Math.round(performance.now()) + 'мс ' + b.method + ' ' + String(b.url).slice(0, 110) + ' body=' + bodyLen); } catch (e) {} }
+      if (encTrace) { try { (globalThis.__pt_parentConsole || console).error('[xhr] ' + Math.round(performance.now()) + 'ms ' + b.method + ' ' + String(b.url).slice(0, 110) + ' body=' + bodyLen); } catch (e) {} }
       fetch(b.url, { method: b.method, headers, body })
         .then(async (r) => {
           if (b.aborted) return;
@@ -7781,7 +7636,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
           r.headers.forEach((v, k) => { b.respHeaders[k] = v; });
           setState(self, 2); setState(self, 3);
           b.responseText = await r.text();
-          if (encTrace) { try { (globalThis.__pt_parentConsole || console).error('[xhr] ' + Math.round(performance.now()) + 'мс resp ' + r.status + ' ' + String(b.url).slice(-40) + ' body=' + bodyLen + ' resp=' + b.responseText.length); } catch (e) {} }
+          if (encTrace) { try { (globalThis.__pt_parentConsole || console).error('[xhr] ' + Math.round(performance.now()) + 'ms resp ' + r.status + ' ' + String(b.url).slice(-40) + ' body=' + bodyLen + ' resp=' + b.responseText.length); } catch (e) {} }
           try { b.response = b.responseType === 'json' ? __ptJSON.parse(b.responseText || 'null') : b.responseText; }
           catch (e) { b.response = null; }
           setState(self, 4);
@@ -7799,33 +7654,31 @@ const FETCH_TEMPLATE: &str = r#"(() => {
 
   // Minimal Headers/TextEncoder if missing.
   if (!globalThis.TextEncoder) {
-    // Кодировщик отдавал младший байт каждого кода вместо UTF-8: «€» выходил
-    // одним байтом 0xAC там, где браузер даёт три, а эмодзи — мусором. Всё, что
-    // считает хеш от закодированного текста, считало его не от того.
+    // UTF-8 encoder: anything hashing encoded text depends on it (the old
+    // version emitted the low byte of each code unit).
     globalThis.TextEncoder = class TextEncoder {
       get encoding() { return 'utf-8'; }
       encode(input) {
         const s = input === undefined ? '' : String(input);
-        // Трасса реализации (`NOKK_TRACE_ENC=1`): куски отчёта челленджа в
-        // открытом виде, без крючков, видимых странице, — длина, число
-        // ненулевых знаков и та же сумма, что печатает `scratchpad/cencbp.js`
-        // у Chrome.
+        // Implementation trace (`NOKK_TRACE_ENC=1`): challenge report chunks in
+        // plain text, without hooks visible to the page: length, count of
+        // non-zero chars and the same sum as measured in Chrome.
         if (globalThis.__pt_encTrace && s.length > 4) {
           try {
             let nz = 0, sum = 0;
             for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c) { nz++; sum = (sum * 31 + c) >>> 0; } }
             let host = '?'; try { host = String(globalThis.location && globalThis.location.host).slice(0, 18); } catch (e) {}
-            (globalThis.__pt_parentConsole || console).error('[enc] ' + Math.round(performance.now()) + 'мс ' + host + ' len=' + s.length + ' nz=' + nz + ' sum=' + sum + ' ' + (s.length < 200 ? JSON.stringify(s.slice(0, 80)) : JSON.stringify(s.slice(0, 40))));
-            // Диапазоны длин `lo-hi,lo-hi` в значении флага — кусок целиком.
+            (globalThis.__pt_parentConsole || console).error('[enc] ' + Math.round(performance.now()) + 'ms ' + host + ' len=' + s.length + ' nz=' + nz + ' sum=' + sum + ' ' + (s.length < 200 ? JSON.stringify(s.slice(0, 80)) : JSON.stringify(s.slice(0, 40))));
+            // Length ranges `lo-hi,lo-hi` in the flag value dump the whole chunk.
             const dump = String(globalThis.__pt_encTrace).split(',').some((r) => { const m = /^(\d+)-(\d+)$/.exec(r.trim()); return m && s.length >= +m[1] && s.length <= +m[2]; });
-            // Консоль режет строки за 600 знаков — кусок уходит ломтями по 500 знаков JSON.
+            // The console truncates lines past 600 chars: dump in 500-char JSON slices.
             if (dump) { const j = JSON.stringify(s).replace(/[^\x21-\x7e]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0')), k = Math.ceil(j.length / 500); for (let i = 0; i < k; i++) (globalThis.__pt_parentConsole || console).error('[encdump] len=' + s.length + ' part=' + i + '/' + k + ' ' + j.slice(i * 500, (i + 1) * 500)); }
           } catch (e) {}
         }
         const out = [];
         for (let i = 0; i < s.length; i++) {
           let cp = s.charCodeAt(i);
-          // Суррогатная пара — один символ; одинокий суррогат браузер заменяет.
+          // A surrogate pair is one character; the browser replaces a lone surrogate.
           if (cp >= 0xd800 && cp <= 0xdbff) {
             const next = s.charCodeAt(i + 1);
             if (next >= 0xdc00 && next <= 0xdfff) { cp = 0x10000 + ((cp - 0xd800) << 10) + (next - 0xdc00); i++; }
@@ -7844,7 +7697,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         }
         const s = input === undefined ? '' : String(input);
         const bytes = this.encode(s);
-        // Пишем только целые символы: браузер не оставляет в буфере половину.
+        // Only whole characters are written: the browser never leaves half in the buffer.
         let written = 0, read = 0, i = 0;
         while (i < s.length) {
           const cp = s.codePointAt(i);
@@ -7907,13 +7760,14 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       return out;
     };
   }
-  // Структурное клонирование по правилам HTML (StructuredSerializeInternal),
-  // сверено с Chrome 151 на 30 видах значений (scratchpad/sclone_probe.js):
-  // обёртки Boolean/Number/String/BigInt, ошибки (имя из семи родных, иначе
-  // Error; message, cause и stack — свои), дыры и нечисловые свойства
-  // массивов, геттеры читаются в данные, прототип не переносится; Symbol,
-  // функции, WeakMap/Promise и платформенные объекты — DataCloneError с
-  // текстом Chrome. Блоб, файл, ImageData и DOMException клонируются.
+  // Structured clone per HTML (StructuredSerializeInternal), verified against
+  // Chrome 151 on 30 kinds of values:
+  // Boolean/Number/String/BigInt wrappers, errors (name from the seven native
+  // ones, otherwise Error; own message, cause and stack), holes and
+  // non-index array properties, getters read into data, prototype not
+  // carried; Symbol, functions, WeakMap/Promise and platform objects throw
+  // DataCloneError with Chrome's text. Blob, File, ImageData and
+  // DOMException are cloned.
   if (!globalThis.structuredClone) {
     const ERR_NAMES = new Set(['Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError', 'URIError']);
     const JS_UNCLONEABLE = new Set(['WeakMap', 'WeakSet', 'WeakRef', 'FinalizationRegistry', 'Promise', 'Generator', 'AsyncGenerator', 'Module']);
@@ -7927,8 +7781,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       if (arguments.length < 1) throw __pt_mkErr(TypeError, "Failed to execute 'structuredClone' on 'Window': 1 argument required, but only 0 present.");
       const opts = arguments[1];
       const seen = new Map();
-      // Перенос — это отцепление: у браузера исходный буфер после него
-      // нулевой длины, а у нас оставался целым.
+      // Transfer detaches: in the browser the source buffer has zero length afterwards.
       const moved = [];
       try {
         const list = opts && opts.transfer ? Array.from(opts.transfer) : [];
@@ -7956,7 +7809,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
           case 'Error': {
             let name = 'Error'; try { const n = x.name; if (ERR_NAMES.has(n)) name = n; } catch (e) {}
             const C = globalThis[name] || Error;
-            // Настоящая ошибка (внутренний слот [[ErrorData]]), не Object.create.
+            // A real error (internal [[ErrorData]] slot), not Object.create.
             const e = keep(new C());
             const d = Object.getOwnPropertyDescriptor(x, 'message');
             if (d && 'value' in d) Object.defineProperty(e, 'message', { value: String(d.value), writable: true, enumerable: false, configurable: true });
@@ -7983,14 +7836,14 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         return o;
       };
       const out = walk(v);
-      // Отцепляем после копии: браузер делает это же и в том же порядке.
+      // Detach after copying: the browser does the same, in the same order.
       for (const b of moved) { try { b.transfer(0); } catch (e) {} }
       return out;
     };
   }
   if (!globalThis.reportError) globalThis.reportError = function reportError(e) { try { console.error(e); } catch (x) {} };
   if (!globalThis.AbortController) {
-    // Класс держим сами: снаружи фасад, у которого `new AbortSignal()` — отказ.
+    // We keep the class; outside sits a facade where `new AbortSignal()` is refused.
     const __AbortSignal = globalThis.AbortSignal = globalThis.AbortSignal || class AbortSignal {
       constructor() { __pt_write(this, 'aborted', false); __pt_write(this, 'reason', undefined); this.onabort = null; this._ls = []; }
       addEventListener(t, fn) { if (t === 'abort' && typeof fn === 'function') this._ls.push(fn); }
@@ -8018,22 +7871,21 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   // quietest possible way: a widget that opens a `MessageChannel` to talk to its
   // embedder, or constructs a `Request`, simply stops — no error, no output.
   if (!globalThis.DOMException) {
-    // Собственное свойство у исключения одно — `stack`; `message` и `name`
-    // читаются с прототипа, как в браузере (у нас они были собственными, и
-    // `getOwnPropertyNames` это показывал).
+    // An exception has a single own property, `stack`; `message` and `name`
+    // are read from the prototype, as in the browser.
     const __dx = new WeakMap();
     const __ErrC = Error;
     globalThis.DOMException = class DOMException extends Error {
       constructor(message, name) {
-        // Стек захватывается здесь, в `super()`: с запасом на свои кадры
-        // (см. `__pt_mkErr`), иначе странице не хватает лимита.
+        // The stack is captured here in `super()` with headroom for our frames
+        // (see `__pt_mkErr`), otherwise the page's limit falls short.
         let lim; try { lim = __ErrC.stackTraceLimit; } catch (e) {}
         const bump = typeof lim === 'number' && lim >= 0 && lim < Infinity;
         if (bump) { try { __ErrC.stackTraceLimit = lim + 16; } catch (e) {} }
         try { super(); } finally { if (bump) { try { __ErrC.stackTraceLimit = lim; } catch (e) {} } }
         __dx.set(this, { message: message === undefined ? '' : String(message), name: name === undefined ? 'Error' : String(name) });
-        // `new DOMException(…)` из скрипта страницы у Chrome без `stack`:
-        // собственное свойство появляется только у брошенного привязкой.
+        // Chrome's `new DOMException(...)` from page script has no `stack`: the
+        // own property appears only on binding-thrown ones.
         try { if (!(typeof globalThis.__pt_errDepth === 'function' && globalThis.__pt_errDepth() > 0)) delete this.stack; } catch (e) {}
       }
       get message() { const st = __dx.get(this); return st ? st.message : ''; }
@@ -8082,8 +7934,8 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         const peer = this.__pt.peer;
         if (!peer) return;
         const ev = { type: 'message', data, origin: '', lastEventId: '', source: null, ports: [], isTrusted: true, target: peer, currentTarget: peer };
-        // Сообщение по порту — задача, а не микрозадача: у браузера оно идёт
-        // после уже поставленных нулевых таймеров.
+        // A port message is a task, not a microtask: in the browser it comes
+        // after already queued zero-delay timers.
         setTimeout(() => {
           const st = peer.__pt;
           if (!st.started) { st.queue.push(ev); return; }
@@ -8098,8 +7950,8 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     };
     globalThis.MessageChannel = class MessageChannel {
       constructor() {
-        // Класс, а не имя окна: снаружи стоит фасад, у которого `new MessagePort()`
-        // — «Illegal constructor», как в браузере.
+        // The class, not the window name: outside sits a facade where
+        // `new MessagePort()` is "Illegal constructor", as in the browser.
         const a = new __MessagePort(), b = new __MessagePort();
         a.__pt.peer = b; b.__pt.peer = a;
         Object.defineProperty(this, 'port1', { value: a, enumerable: true });
@@ -8149,9 +8001,9 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         __pt_write(this, 'signal', init.signal || null);
         Object.defineProperty(this, '__body', { value: init.body === undefined ? null : init.body, enumerable: false });
         __pt_write(this, 'bodyUsed', false);
-        // Тело само задаёт свой тип, если его не задали явно: строка —
-        // `text/plain;charset=UTF-8`, форма — `multipart/form-data`, blob —
-        // свой. Браузер так и делает, а мы оставляли заголовок пустым.
+        // The body sets its own type unless given: a string is
+        // `text/plain;charset=UTF-8`, a form `multipart/form-data`, a blob its
+        // own. The browser does this.
         try {
           const b = this.__body;
           if (b != null && !this.headers.has('content-type')) {
@@ -8184,10 +8036,9 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         __pt_write(this, 'type', 'default');
         __pt_write(this, 'url', '');
         __pt_write(this, 'bodyUsed', false);
-        // Тело хранится байтами, если пришло байтами: `new Response(u8)` у
-        // браузера отдаёт те же байты в `arrayBuffer()`, а у нас массив
-        // превращался в текст «0,97,115…» — и WebAssembly.instantiateStreaming
-        // спотыкался о «магическое слово».
+        // A body given as bytes is stored as bytes: the browser's
+        // `new Response(u8)` returns the same bytes from `arrayBuffer()`
+        // (stringifying it to "0,97,115..." broke WebAssembly.instantiateStreaming).
         let raw = body == null ? '' : body;
         try {
           if (raw instanceof ArrayBuffer) raw = new Uint8Array(raw.slice(0));
@@ -8361,8 +8212,8 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         if (!peers) return;
         for (const p of peers) {
           if (p === this || p.__pt.closed) continue;   // never echoes to the sender
-          // Широковещание у браузера идёт через другой поток и приходит позже
-          // таймеров на несколько миллисекунд.
+          // The browser's broadcast goes through another thread and arrives a
+          // few milliseconds after timers.
           setTimeout(() => {
             const ev = { type: 'message', data, origin: (globalThis.location && location.origin) || '', lastEventId: '', source: null, ports: [], isTrusted: true, target: p, currentTarget: p };
             try { if (typeof p.onmessage === 'function') p.onmessage(ev); } catch (e) {}
@@ -8383,9 +8234,9 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       // Answering `true` to everything would be its own giveaway; a real engine
       // rejects nonsense. This accepts a well-formed declaration and no more.
       supports: (a, b) => {
-        // Имя свойства сверяется со списком движка: браузер отвечает `false`
-        // на выдуманное, а «что угодно с двоеточием» — само по себе улика.
-        // Своё свойство страницы (`--x`) браузер принимает всегда.
+        // Property names are checked against the engine's list: the browser
+        // answers `false` for made-up ones, and "anything with a colon" is a
+        // tell. Custom properties (`--x`) are always accepted.
         const known = (n) => (String(n).lastIndexOf('--', 0) === 0
           || (globalThis.__pt_cssKnown ? __pt_cssKnown(n) : /^[-a-zA-Z]+$/.test(n)));
         if (b !== undefined) return /^[-a-zA-Z]+$/.test(String(a)) && String(b).length > 0 && known(a);
@@ -8399,9 +8250,9 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   // for storage at all, and `undefined` is the loudest possible answer.
   if (!globalThis.indexedDB) {
     const __idbData = new Map();   // dbName -> { version, stores: Map<name, Map> }
-    // Базы живут у origin, а не у документа: при переходе движок забирает их
-    // у уходящего документа и отдаёт следующему того же origin. Значения — через
-    // JSON: строки, числа и простые объекты переезжают как есть.
+    // Databases belong to the origin, not the document: on navigation the
+    // engine takes them from the old document and gives them to the next one
+    // of the same origin. Values go through JSON.
     (globalThis.__pt_carryParts || (globalThis.__pt_carryParts = {})).idb = {
       out: () => [...__idbData].map(([name, e]) => [name, e.version,
         [...e.stores].map(([sn, m]) => [sn, [...m].filter(([, v]) => {
@@ -8648,12 +8499,11 @@ const IFACE_STATICS: &str = r#"{"AbortSignal":{"f":{"any":1,"timeout":1}},"Audio
 /// How many arguments each WebGL call insists on, measured from Chrome 148.
 /// A call made with fewer is a refusal there, with the method named in the
 /// message; ours answered `undefined` and carried on.
-/// Прототипы расширений WebGL у Chrome 151: константы, методы, флаги
-/// (снято `scratchpad/extshape.js`).
+/// Chrome 151 WebGL extension prototypes: constants, methods, flags.
 const WEBGL_EXT_SHAPES: &str = include_str!("webgl_ext_shapes.json");
 const GL_ARITY: &str = r#"{"activeTexture":1,"attachShader":2,"bindAttribLocation":3,"bindRenderbuffer":2,"blendColor":4,"blendEquation":1,"blendEquationSeparate":2,"blendFunc":2,"blendFuncSeparate":4,"bufferData":3,"bufferSubData":3,"checkFramebufferStatus":1,"compileShader":1,"compressedTexImage2D":7,"compressedTexSubImage2D":8,"copyTexImage2D":8,"copyTexSubImage2D":8,"createShader":1,"cullFace":1,"deleteBuffer":1,"deleteFramebuffer":1,"deleteProgram":1,"deleteRenderbuffer":1,"deleteShader":1,"deleteTexture":1,"depthFunc":1,"depthMask":1,"depthRange":2,"detachShader":2,"disable":1,"enable":1,"framebufferRenderbuffer":4,"framebufferTexture2D":5,"frontFace":1,"generateMipmap":1,"getActiveAttrib":2,"getActiveUniform":2,"getAttachedShaders":1,"getAttribLocation":2,"getBufferParameter":2,"getExtension":1,"getFramebufferAttachmentParameter":3,"getParameter":1,"getProgramInfoLog":1,"getProgramParameter":2,"getRenderbufferParameter":2,"getShaderInfoLog":1,"getShaderParameter":2,"getShaderPrecisionFormat":2,"getShaderSource":1,"getTexParameter":2,"getUniform":2,"getUniformLocation":2,"getVertexAttrib":2,"getVertexAttribOffset":2,"hint":2,"isBuffer":1,"isEnabled":1,"isFramebuffer":1,"isProgram":1,"isRenderbuffer":1,"isShader":1,"isTexture":1,"lineWidth":1,"linkProgram":1,"pixelStorei":2,"polygonOffset":2,"readPixels":7,"renderbufferStorage":4,"sampleCoverage":2,"shaderSource":2,"stencilFunc":3,"stencilFuncSeparate":4,"stencilMask":1,"stencilMaskSeparate":2,"stencilOp":3,"stencilOpSeparate":4,"texImage2D":6,"texParameterf":3,"texParameteri":3,"texSubImage2D":7,"useProgram":1,"validateProgram":1,"bindBuffer":2,"bindFramebuffer":2,"bindTexture":2,"clear":1,"clearColor":4,"clearDepth":1,"clearStencil":1,"colorMask":4,"disableVertexAttribArray":1,"drawArrays":3,"drawElements":4,"enableVertexAttribArray":1,"scissor":4,"uniform1f":2,"uniform1fv":2,"uniform1i":2,"uniform1iv":2,"uniform2f":3,"uniform2fv":2,"uniform2i":3,"uniform2iv":2,"uniform3f":4,"uniform3fv":2,"uniform3i":4,"uniform3iv":2,"uniform4f":5,"uniform4fv":2,"uniform4i":5,"uniform4iv":2,"uniformMatrix2fv":3,"uniformMatrix3fv":3,"uniformMatrix4fv":3,"vertexAttrib1f":2,"vertexAttrib1fv":2,"vertexAttrib2f":3,"vertexAttrib2fv":2,"vertexAttrib3f":4,"vertexAttrib3fv":2,"vertexAttrib4f":5,"vertexAttrib4fv":2,"vertexAttribPointer":6,"viewport":4,"drawingBufferStorage":3,"beginQuery":2,"beginTransformFeedback":1,"bindBufferBase":3,"bindBufferRange":5,"bindSampler":2,"bindTransformFeedback":2,"bindVertexArray":1,"blitFramebuffer":10,"clientWaitSync":3,"compressedTexImage3D":8,"compressedTexSubImage3D":10,"copyBufferSubData":5,"copyTexSubImage3D":9,"deleteQuery":1,"deleteSampler":1,"deleteSync":1,"deleteTransformFeedback":1,"deleteVertexArray":1,"drawArraysInstanced":4,"drawElementsInstanced":5,"drawRangeElements":6,"endQuery":1,"fenceSync":2,"framebufferTextureLayer":5,"getActiveUniformBlockName":2,"getActiveUniformBlockParameter":3,"getActiveUniforms":3,"getBufferSubData":3,"getFragDataLocation":2,"getIndexedParameter":2,"getInternalformatParameter":3,"getQuery":2,"getQueryParameter":2,"getSamplerParameter":2,"getSyncParameter":2,"getTransformFeedbackVarying":2,"getUniformBlockIndex":2,"getUniformIndices":2,"invalidateFramebuffer":2,"invalidateSubFramebuffer":6,"isQuery":1,"isSampler":1,"isSync":1,"isTransformFeedback":1,"isVertexArray":1,"readBuffer":1,"renderbufferStorageMultisample":5,"samplerParameterf":3,"samplerParameteri":3,"texImage3D":10,"texStorage2D":5,"texStorage3D":6,"texSubImage3D":11,"transformFeedbackVaryings":3,"uniform1ui":2,"uniform2ui":3,"uniform3ui":4,"uniform4ui":5,"uniformBlockBinding":3,"vertexAttribDivisor":2,"vertexAttribI4i":5,"vertexAttribI4ui":5,"vertexAttribIPointer":5,"waitSync":3,"clearBufferfi":4,"clearBufferfv":3,"clearBufferiv":3,"clearBufferuiv":3,"drawBuffers":1,"uniform1uiv":2,"uniform2uiv":2,"uniform3uiv":2,"uniform4uiv":2,"uniformMatrix2x3fv":3,"uniformMatrix2x4fv":3,"uniformMatrix3x2fv":3,"uniformMatrix3x4fv":3,"uniformMatrix4x2fv":3,"uniformMatrix4x3fv":3,"vertexAttribI4iv":2,"vertexAttribI4uiv":2}"#;
 
-/// Снятое у Chrome 151: разделы предложения WebRTC и getCapabilities.
+/// Captured from Chrome 151: WebRTC offer sections and getCapabilities.
 const RTC_CHROME: &str = include_str!("rtc_chrome.json");
 
 // The windows-1250 byte table below carries literal C1 control bytes on
@@ -8662,11 +8512,9 @@ const RTC_CHROME: &str = include_str!("rtc_chrome.json");
 // template exists to reproduce.
 #[allow(clippy::invisible_characters)]
 const FINGERPRINT_TEMPLATE: &str = r#"(() => {
-  // Форма интерфейсного объекта. Обычная функция несёт собственные `arguments`
-  // и `caller` — у браузерного интерфейса их нет, и обход графа видит два лишних
-  // имени на каждом из девятисот имён. Строгая функция несёт ровно
-  // `length, name, prototype`, и, в отличие от класса, бросает «Illegal
-  // constructor» и на вызов без `new` — как настоящий интерфейс.
+  // Interface object shape: a strict function has exactly `length, name,
+  // prototype` (no `arguments`/`caller`, which browser interfaces lack) and,
+  // unlike a class, throws "Illegal constructor" when called without `new` too.
   const __ptIllegal = (function () {
     'use strict';
     return function () { return function () { throw __pt_mkErr(TypeError, 'Illegal constructor'); }; };
@@ -8688,12 +8536,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // `Function.prototype.toString.toString()` reads native too, and `.name`/
   // `.length` are forwarded from the original (both preserved).
   const __ptNative = new WeakSet();
-  // Всё, чем пользуется ловушка, взято заранее: страница, обернувшая
-  // Reflect.apply или повесившая геттер `name` на функцию, иначе видела бы,
-  // что toString зовёт её код (у Chrome он не зовёт ничего).
+  // Everything the trap uses is captured up front: a page that wrapped
+  // Reflect.apply or put a `name` getter on a function would otherwise see
+  // toString calling its code (Chrome's calls nothing).
   const __ptRApply = Reflect.apply, __ptGOPD = Object.getOwnPropertyDescriptor;
-  // Для журналов холста/GL: склейка и хэш без единого вызова того, что
-  // страница может обернуть (Array.prototype.join, String.prototype.charCodeAt).
+  // For canvas/GL logs: join and hash without calling anything the page can
+  // wrap (Array.prototype.join, String.prototype.charCodeAt).
   const __ptRA = Reflect.apply, __ptCCA = String.prototype.charCodeAt, __ptCCA1 = [0], __ptImul = Math.imul;
   const __ptJ = function () {
     let out = '';
@@ -8730,22 +8578,22 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
   // Register a function as native, optionally renaming it. No longer sets an own
   // `toString` (the global patch above handles every call route).
-  // Отдаём наружу под __pt-именем (фильтр интроспекции его прячет): поверхность
-  // из WEB_SURFACE_TEMPLATE помечает свои функции нативными через него.
+  // Exported under a __pt name (hidden by the introspection filter): the
+  // WEB_SURFACE_TEMPLATE surface marks its functions native through it.
   globalThis.__pt_native = (fn) => { if (typeof fn === 'function') __ptNative.add(fn); return fn; };
-  // Проверка без прохода через toString-прокси — для поздних слоёв формы.
+  // Check without going through the toString proxy, for late shape layers.
   globalThis.__pt_isNative = (fn) => __ptNative.has(fn);
 
-  // Метод браузера — не конструктор: у него нет `prototype`, и `new` по нему
-  // бросает. Обычная функция несёт и то и другое, а `prototype` у неё удалить
-  // нельзя — значит функцию надо не чинить, а пересоздать методом. Проверка
-  // `'prototype' in el.getAttribute` стоит ровно ничего и отличает нас сразу.
+  // A browser method is not a constructor: no `prototype`, and `new` throws.
+  // A plain function has both and its `prototype` cannot be deleted, so the
+  // function must be recreated as a method. `'prototype' in el.getAttribute`
+  // costs nothing and exposes us at once.
   const asMethod = (fn, name) => {
     if (typeof fn !== 'function') return fn;
-    if (!Object.getOwnPropertyDescriptor(fn, 'prototype')) return fn;   // уже метод
+    if (!Object.getOwnPropertyDescriptor(fn, 'prototype')) return fn;   // already a method
     const key = name || fn.name || 'anonymous';
-    // Интерфейс методом не делаем: у класса имя с большой буквы, а на его
-    // прототипе есть члены — по этим двум приметам он и отличается.
+    // Interfaces are not turned into methods: a class has a capitalized name
+    // and members on its prototype.
     const looksLikeMethod = /^[a-z_$]/.test(key)
       && Object.getOwnPropertyNames(fn.prototype || {}).length <= 1;
     if (!looksLikeMethod) return fn;
@@ -8772,8 +8620,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       try {
         const d = Object.getOwnPropertyDescriptor(proto, k);
         if (!d) continue;
-        // Функция на прототипе — это метод: пересоздаём её методом, если она
-        // ещё несёт `prototype`, и только потом помечаем нативной.
+        // A function on a prototype is a method: recreate it as one if it still
+        // has `prototype`, then mark it native.
         if (typeof d.value === 'function' && k !== 'constructor' && d.configurable
             && /^[a-z_$]/.test(k)
             && Object.getOwnPropertyNames(d.value.prototype || {}).length <= 1
@@ -8792,8 +8640,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   };
 
   const noop = () => {};
-  // Свои значения по именам, которые браузер объявляет только на чтение:
-  // присваивание такому имени бросает, а объявление — нет.
+  // Own values for names the browser declares read-only: assigning throws,
+  // defining does not.
   const own = (o, k, v) => {
     try { Object.defineProperty(o, k, { value: v, writable: true, enumerable: true, configurable: true }); }
     catch (e) {}
@@ -8839,9 +8687,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // plus the per-session seed. Different drawings therefore differ, an identical
   // drawing is stable, and results vary across sessions the way device text
   // rendering does.
-  // Все именованные цвета CSS, снятые с Chrome: страница называет цвет словом
-  // куда чаще, чем шестнадцатеричным кодом, а мы знали восемь имён из ста
-  // сорока восьми и красили остальное чёрным.
+  // All CSS named colors, captured from Chrome: pages name colors far more
+  // often than they use hex codes.
   const CSS_NAMES = Object.create(null);
   for (const pair of 'aliceblue:f0f8ff,antiquewhite:faebd7,aqua:00ffff,aquamarine:7fffd4,azure:f0ffff,beige:f5f5dc,bisque:ffe4c4,black:000000,blanchedalmond:ffebcd,blue:0000ff,blueviolet:8a2be2,brown:a52a2a,burlywood:deb887,cadetblue:5f9ea0,chartreuse:7fff00,chocolate:d2691e,coral:ff7f50,cornflowerblue:6495ed,cornsilk:fff8dc,crimson:dc143c,cyan:00ffff,darkblue:00008b,darkcyan:008b8b,darkgoldenrod:b8860b,darkgray:a9a9a9,darkgreen:006400,darkgrey:a9a9a9,darkkhaki:bdb76b,darkmagenta:8b008b,darkolivegreen:556b2f,darkorange:ff8c00,darkorchid:9932cc,darkred:8b0000,darksalmon:e9967a,darkseagreen:8fbc8f,darkslateblue:483d8b,darkslategray:2f4f4f,darkslategrey:2f4f4f,darkturquoise:00ced1,darkviolet:9400d3,deeppink:ff1493,deepskyblue:00bfff,dimgray:696969,dimgrey:696969,dodgerblue:1e90ff,firebrick:b22222,floralwhite:fffaf0,forestgreen:228b22,fuchsia:ff00ff,gainsboro:dcdcdc,ghostwhite:f8f8ff,gold:ffd700,goldenrod:daa520,gray:808080,green:008000,greenyellow:adff2f,grey:808080,honeydew:f0fff0,hotpink:ff69b4,indianred:cd5c5c,indigo:4b0082,ivory:fffff0,khaki:f0e68c,lavender:e6e6fa,lavenderblush:fff0f5,lawngreen:7cfc00,lemonchiffon:fffacd,lightblue:add8e6,lightcoral:f08080,lightcyan:e0ffff,lightgoldenrodyellow:fafad2,lightgray:d3d3d3,lightgreen:90ee90,lightgrey:d3d3d3,lightpink:ffb6c1,lightsalmon:ffa07a,lightseagreen:20b2aa,lightskyblue:87cefa,lightslategray:778899,lightslategrey:778899,lightsteelblue:b0c4de,lightyellow:ffffe0,lime:00ff00,limegreen:32cd32,linen:faf0e6,magenta:ff00ff,maroon:800000,mediumaquamarine:66cdaa,mediumblue:0000cd,mediumorchid:ba55d3,mediumpurple:9370db,mediumseagreen:3cb371,mediumslateblue:7b68ee,mediumspringgreen:00fa9a,mediumturquoise:48d1cc,mediumvioletred:c71585,midnightblue:191970,mintcream:f5fffa,mistyrose:ffe4e1,moccasin:ffe4b5,navajowhite:ffdead,navy:000080,oldlace:fdf5e6,olive:808000,olivedrab:6b8e23,orange:ffa500,orangered:ff4500,orchid:da70d6,palegoldenrod:eee8aa,palegreen:98fb98,paleturquoise:afeeee,palevioletred:db7093,papayawhip:ffefd5,peachpuff:ffdab9,peru:cd853f,pink:ffc0cb,plum:dda0dd,powderblue:b0e0e6,purple:800080,rebeccapurple:663399,red:ff0000,rosybrown:bc8f8f,royalblue:4169e1,saddlebrown:8b4513,salmon:fa8072,sandybrown:f4a460,seagreen:2e8b57,seashell:fff5ee,sienna:a0522d,silver:c0c0c0,skyblue:87ceeb,slateblue:6a5acd,slategray:708090,slategrey:708090,snow:fffafa,springgreen:00ff7f,steelblue:4682b4,tan:d2b48c,teal:008080,thistle:d8bfd8,tomato:ff6347,turquoise:40e0d0,violet:ee82ee,wheat:f5deb3,white:ffffff,whitesmoke:f5f5f5,yellow:ffff00,yellowgreen:9acd32'.split(',')) {
     const i = pair.indexOf(':');
@@ -8853,13 +8700,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const f = (n) => { const k = (n + h / 30) % 12; return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)); };
     return [f(0), f(8), f(4)];
   };
-  // Lab и Oklab — через XYZ D50 и D65 соответственно; матрицы стандартные.
+  // Lab via XYZ D50, Oklab via XYZ D65; standard matrices.
   const lab2srgb = (L, a, b) => {
     const fy = (L + 16) / 116, fx = fy + a / 500, fz = fy - b / 200;
     const e = 216 / 24389, k = 24389 / 27;
     const f3 = (t) => (t * t * t > e ? t * t * t : (116 * t - 16) / k);
     const X = f3(fx) * 0.3457 / 0.3585, Y = (L > k * e ? Math.pow(fy, 3) : L / k), Z = f3(fz) * (1 - 0.3457 - 0.3585) / 0.3585;
-    // D50 → D65 (Брэдфорд) и XYZ → линейный sRGB, свёрнуто в одну матрицу.
+    // D50 -> D65 (Bradford) and XYZ -> linear sRGB folded into one matrix.
     const M = [3.1341359569958707, -1.6173863321612538, -0.4906619460083532,
       -0.978795502912089, 1.916142228104716, 0.03344668406522899,
       0.07195537988411677, -0.2289768264158322, 1.405386058324125];
@@ -8876,7 +8723,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       LIN_TO_SRGB(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s2),
     ];
   };
-  // Разбор одного числа доводом: проценты, доли, углы и ключевое `none`.
+  // Parses one numeric argument: percentages, fractions, angles and the keyword `none`.
   const num = (t, scale, isHue) => {
     t = String(t).trim();
     if (t === 'none') return 0;
@@ -8895,11 +8742,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const alpha = slash < 0 ? null : t.slice(slash + 1).trim();
     return [head.split(/[\s,]+/).filter(Boolean), alpha];
   };
-  // Цвет в четыре байта. Всё, что браузер понимает записью, понимаем и мы;
-  // непонятое — не чёрный, а отказ: в браузере `fillStyle` тогда не меняется.
+  // Color to four bytes. Anything the browser parses we parse; unparsable
+  // input is a refusal, not black: the browser then leaves `fillStyle` unchanged.
   const parseColorRaw = (c) => {
-    // Градиент или узор — не цвет; приводить объект к строке значило бы звать
-    // его toString (страница это видит).
+    // A gradient or pattern is not a color; stringifying the object would call
+    // its toString (visible to the page).
     if (c !== null && (typeof c === 'object' || typeof c === 'function')) return null;
     let t = String(c == null ? '' : c).trim().toLowerCase();
     if (!t) return null;
@@ -8923,7 +8770,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const b255 = (v) => Math.max(0, Math.min(255, Math.round(v)));
     const unit = (v) => Math.max(0, Math.min(255, Math.round(v * 255)));
     if (fn === 'color-mix') {
-      // Смешение в sRGB: только эта форма и встречается на страницах.
+      // Mixing in sRGB: the only form seen on pages.
       const body = m[2].replace(/^in\s+[a-z0-9-]+\s*,?/, '');
       const parts = body.split(',').map((x) => x.trim()).filter(Boolean);
       if (parts.length !== 2) return null;
@@ -8940,8 +8787,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       wa /= sum; wb /= sum;
       const out = [b255(A.col[0] * wa + B.col[0] * wb), b255(A.col[1] * wa + B.col[1] * wb),
         b255(A.col[2] * wa + B.col[2] * wb), b255(A.col[3] * wa + B.col[3] * wb)];
-      // Смесь браузер записывает уже посчитанной, долями в sRGB — и берёт
-      // долю до округления в байт, иначе половина стала бы «0.502».
+      // The browser serializes the mix computed, as sRGB fractions, taking the
+      // fraction before byte rounding (otherwise a half would be "0.502").
       const mix = (i) => (A.col[i] * wa + B.col[i] * wb) / 255;
       const f = (i) => String(Math.round(mix(i) * 10000) / 10000);
       out.css = 'color(srgb ' + f(0) + ' ' + f(1) + ' ' + f(2) +
@@ -8982,8 +8829,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       }
       const rgb = ok ? oklab2srgb(L, a, b) : lab2srgb(L, a, b);
       const out = [unit(rgb[0]), unit(rgb[1]), unit(rgb[2]), A255];
-      // Современные записи браузер не переводит в шестнадцатеричную: он
-      // отдаёт их в своём же пространстве, только с приведёнными числами.
+      // The browser does not convert modern notations to hex: it keeps their
+      // own space, with normalized numbers.
       const nn = (x) => String(/%$/.test(String(x)) ? parseFloat(x) : (parseFloat(x) || 0));
       out.css = fn + '(' + [nn(args[0]), nn(args[1]), nn(args[2])].join(' ') +
         (alpha >= 1 ? '' : ' / ' + alpha) + ')';
@@ -9003,11 +8850,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     return null;
   };
   const parseColor = (c) => parseColorRaw(c) || [0, 0, 0, 255];
-  // Цвет так, как его печатает `getComputedStyle`: браузер приводит всякую
-  // запись sRGB к `rgb(r, g, b)` (или `rgba(…)` с долей), а записи в своих
-  // пространствах — `lab`, `oklch`, `color()` — оставляет как есть. Доля
-  // берётся из самой записи, а не из округлённого байта: `0.9` у браузера так
-  // и остаётся `0.9`, а не превращается в `0.902`.
+  // Color as `getComputedStyle` prints it: the browser turns any sRGB
+  // notation into `rgb(r, g, b)` (or `rgba(...)` with alpha) and leaves its own
+  // spaces (`lab`, `oklch`, `color()`) as is. Alpha comes from the notation,
+  // not the rounded byte: `0.9` stays `0.9`, not `0.902`.
   try {
     Object.defineProperty(globalThis, '__pt_cssColour', {
       value: (v) => {
@@ -9040,8 +8886,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       enumerable: false, configurable: true, writable: true,
     });
   } catch (e) {}
-  // Запись цвета обратно: браузер отдаёт `#rrggbb`, а полупрозрачный —
-  // `rgba(r, g, b, a)`. Мы возвращали строку страницы как есть.
+  // Color serialization: the browser gives `#rrggbb`, or `rgba(r, g, b, a)`
+  // when translucent.
   const serializeColor = (rgba) => {
     if (!rgba) return '#000000';
     if (rgba.css) return rgba.css;
@@ -9049,8 +8895,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       const h = (v) => (v | 0).toString(16).padStart(2, '0');
       return '#' + h(rgba[0]) + h(rgba[1]) + h(rgba[2]);
     }
-    // Альфа пишется кратчайшей дробью, которая возвращается в тот же байт:
-    // 128 из 255 браузер называет «0.5», а не «0.502».
+    // Alpha is written as the shortest fraction mapping back to the same byte:
+    // the browser calls 128/255 "0.5", not "0.502".
     const n = rgba[3] | 0;
     let a = String(n / 255);
     for (let places = 1; places <= 3; places++) {
@@ -9060,14 +8906,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     return 'rgba(' + (rgba[0] | 0) + ', ' + (rgba[1] | 0) + ', ' + (rgba[2] | 0) + ', ' + a + ')';
   };
 
-  // Цветовые пространства холста. Страница заливает холст цветом в записи
-  // `color(display-p3 …)` и читает его обратно во всех сочетаниях пространства
-  // и точности — по тому, как браузер пересчитывает, её и узнают. Мы этой
-  // записи не понимали вовсе и отдавали чёрный.
+  // Canvas color spaces. Pages fill with `color(display-p3 ...)` and read it
+  // back in every combination of space and precision; the browser's
+  // conversion identifies it.
   const SRGB_TO_LIN = (v) => (v <= 0.04045 ? v / 12.92 : Math.sign(v) * Math.pow((Math.abs(v) + 0.055) / 1.055, 2.4));
   const LIN_TO_SRGB = (v) => (Math.abs(v) <= 0.0031308 ? v * 12.92
     : Math.sign(v) * (1.055 * Math.pow(Math.abs(v), 1 / 2.4) - 0.055));
-  // Матрицы линейных пространств, обе через XYZ D65 и свёрнутые заранее.
+  // Linear space matrices, both via XYZ D65, pre-folded.
   const P3_TO_SRGB = [1.2249401762805587, -0.2249401762805586, 0,
     -0.04205697751790907, 1.0420569775179091, 0,
     -0.019636239203287, -0.07863715131854902, 1.0982734115802371];
@@ -9078,15 +8923,15 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     m[3] * r + m[4] * g + m[5] * b,
     m[6] * r + m[7] * g + m[8] * b,
   ];
-  // Пересчёт между пространствами идёт по линейному свету, а не по кодам.
+  // Conversion between spaces goes through linear light, not codes.
   const convertSpace = (rgb, from, to) => {
     if (from === to) return rgb.slice();
     const lin = rgb.map(SRGB_TO_LIN);
     const out = applyM(from === 'display-p3' ? P3_TO_SRGB : SRGB_TO_P3, lin[0], lin[1], lin[2]);
     return out.map(LIN_TO_SRGB);
   };
-  // `color(<пространство> r g b / a)` и всё привычное — числами от нуля до
-  // единицы в названном пространстве.
+  // `color(<space> r g b / a)` and all the usual notations as numbers from 0
+  // to 1 in the named space.
   const parseColorFloat = (c) => {
     const t = String(c == null ? '#000000' : c).trim().toLowerCase();
     const m = /^color\(\s*([a-z0-9-]+)\s+([^)\/]+?)(?:\s*\/\s*([^)]+))?\s*\)$/.exec(t);
@@ -9127,8 +8972,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         s = '' + s;
         for (let i = 0; i < s.length; i++) { __ptCCA1[0] = i; ops ^= __ptRA(__ptCCA, s, __ptCCA1); ops = __ptImul(ops, 16777619) >>> 0; }
       },
-      // Настоящая картинка на холсте. Байты остались в Rust — сюда едет только
-      // адрес; если по нему ничего не декодировано, зовущий ставит свой штамп.
+      // A real image on the canvas. The bytes stay in Rust, only the URL comes
+      // here; if nothing was decoded for it, the caller stamps its own.
       image(url, dx, dy, dw, dh) {
         sync();
         if (typeof __pt_canvasDrawImage !== 'function') return false;
@@ -9148,11 +8993,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // Real vector paths: JS tessellates curves/arcs to a move/line/close verb
       // stream, tiny-skia fills or strokes it.
       fillPath(verbs, evenOdd, rgba, sh, mode) { sync(); __pt_canvasFillPath(id, new Float32Array(verbs), evenOdd ? 1 : 0, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(sh || []), mode | 0); },
-      // Заливка по операциям пути в координатах страницы и матрице холста:
-      // дуги, коники и сглаживание считает движок, как Skia у Chrome.
+      // Fill from path ops in page coordinates and the canvas matrix: the
+      // engine computes arcs, conics and antialiasing, like Chrome's Skia.
       fillOps(ops, m, evenOdd, rgba, sh, mode) { sync(); __pt_canvasFillOps(id, new Float32Array(ops), new Float32Array(m), evenOdd ? 1 : 0, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(sh || []), mode | 0); },
       fillOpsGradient(ops, m, evenOdd, grad, sh, mode) { sync(); __pt_canvasFillOpsGradient(id, new Float32Array(ops), new Float32Array(m), evenOdd ? 1 : 0, new Float32Array(grad), new Float32Array(sh || []), mode | 0); },
-      // Штрих по операциям: true — нарисован (волосяной), false — толще пикселя.
+      // Stroke from ops: true if drawn (hairline), false if thicker than a pixel.
       strokeOps(ops, m, lw, rgba, grad, sh, mode, cap, join, miter) { sync(); return !!__pt_canvasStrokeOps(id, new Float32Array(ops), new Float32Array(m), +lw || 0, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(grad || []), new Float32Array(sh || []), mode | 0, cap | 0, join | 0, +miter || 10); },
       fillPathGradient(verbs, evenOdd, grad, sh, mode) { sync(); __pt_canvasFillPathGradient(id, new Float32Array(verbs), evenOdd ? 1 : 0, new Float32Array(grad), new Float32Array(sh || []), mode | 0); },
       strokePath(verbs, lw, rgba, sh, mode) { sync(); __pt_canvasStrokePath(id, new Float32Array(verbs), lw, rgba[0], rgba[1], rgba[2], rgba[3], new Float32Array(sh || []), mode | 0); },
@@ -9166,8 +9011,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       },
       put(data, x, y, w, h) { sync(); __pt_canvasPutImageData(id, x, y, w, h, data); },
       id() { sync(); return id; },
-      // Один холст на другом: пиксели переносит движок, с масштабированием и
-      // наложением по альфе, как это делает браузер.
+      // Canvas onto canvas: the engine copies pixels with scaling and alpha
+      // blending, as the browser does.
       blit(srcId, sx, sy, sw, sh, dx, dy, dw, dh) {
         sync();
         if (typeof __pt_canvasBlit !== 'function' || !srcId) return false;
@@ -9242,25 +9087,22 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
   };
 
-  // Форма контекста, снятая с Chrome 148: 45 методов и 28 аксессоров, все — на
-  // прототипе, а у самого контекста собственных свойств нет ни одного. У нас
-  // было наоборот: `CanvasRenderingContext2D.prototype.fillRect` — undefined, а
-  // семь десятков имён висели на объекте. Сборщик отпечатка идёт по прототипу,
-  // и такую разницу видно с первого шага.
+  // Context shape captured from Chrome 148: 45 methods and 28 accessors, all
+  // on the prototype; the context itself has no own properties.
+  // Fingerprinters walk the prototype.
   //
-  // Реализацию не трогаем: она остаётся тем же объектом, только уезжает за
-  // WeakMap, а страница получает пустышку на настоящем прототипе, чьи члены
-  // зовут реализацию.
+  // The implementation stays the same object behind a WeakMap; the page gets
+  // a dummy on the real prototype whose members call the implementation.
   const CTX2D_METHODS = ['clip','createConicGradient','createImageData','createLinearGradient','createPattern','createRadialGradient','drawFocusIfNeeded','drawImage','fill','fillText','getContextAttributes','getImageData','getLineDash','getTransform','isContextLost','isPointInPath','isPointInStroke','measureText','reset','roundRect','setLineDash','strokeText','arc','arcTo','beginPath','bezierCurveTo','clearRect','closePath','ellipse','fillRect','lineTo','moveTo','putImageData','quadraticCurveTo','rect','resetTransform','restore','rotate','save','scale','setTransform','stroke','strokeRect','transform','translate'];
   const CTX2D_ATTRS = ['canvas','lang','font','textAlign','textBaseline','direction','fontKerning','fontStretch','fontVariantCaps','letterSpacing','textRendering','wordSpacing','globalCompositeOperation','filter','imageSmoothingQuality','strokeStyle','fillStyle','shadowColor','lineCap','lineJoin','globalAlpha','imageSmoothingEnabled','shadowOffsetX','shadowOffsetY','shadowBlur','lineWidth','miterLimit','lineDashOffset'];
   const CTX_IMPL = new WeakMap();
-  // Член контекста, позванный не на контексте: у браузера это `TypeError:
-  // Illegal invocation`. У нас переходник на прототипе находил самого себя
-  // (свой же аксессор — собственное свойство прототипа) и звал себя без
-  // конца, пока не кончался стек. Обход глобального графа зовёт каждый
-  // геттер на каждом прототипе — и ловил RangeError вместо TypeError.
-  // Сами переходники (в масках) — чтобы узнать прототип и по его копии:
-  // реалм получает OffscreenCanvasRenderingContext2D переносом тех же членов.
+  // A context member called on something else: the browser throws
+  // `TypeError: Illegal invocation`. Our prototype trampoline used to find
+  // itself (its accessor is an own property of the prototype) and recurse
+  // until the stack ran out; a global graph walk calls every getter on every
+  // prototype and caught RangeError instead of TypeError.
+  // The trampolines themselves (masked) identify the prototype, also via its
+  // copy: a realm gets OffscreenCanvasRenderingContext2D by moving the same members.
   const CTX_STUBS = new WeakSet();
   const ctxOf = (self, P, name) => {
     const t = CTX_IMPL.get(self);
@@ -9269,7 +9111,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       throw __pt_mkErr(TypeError, 'Illegal invocation');
     }
     const own = Object.getOwnPropertyDescriptor(self, name);
-    // Прототип (свой `constructor`, а член — сам переходник) — не контекст.
+    // A prototype (own `constructor`, member is the trampoline itself) is not a context.
     if (!own || Object.prototype.hasOwnProperty.call(self, 'constructor') ||
         (own.get && CTX_STUBS.has(own.get)) || (own.set && CTX_STUBS.has(own.set)) ||
         (own.value && CTX_STUBS.has(own.value))) {
@@ -9277,18 +9119,18 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     }
     return self;
   };
-  // `save()`/`restore()` в браузере откатывают не только матрицу, но и всё
-  // состояние рисования. Мы не откатывали ничего.
+  // In the browser `save()`/`restore()` roll back the whole drawing state,
+  // not just the matrix.
   const SAVED = ['fillStyle', 'strokeStyle', 'globalAlpha', 'globalCompositeOperation',
     'lineWidth', 'lineCap', 'lineJoin', 'miterLimit', 'lineDashOffset', 'font',
     'textAlign', 'textBaseline', 'direction', 'letterSpacing', 'wordSpacing',
     'fontKerning', 'fontStretch', 'fontVariantCaps', 'textRendering',
     'shadowBlur', 'shadowColor', 'shadowOffsetX', 'shadowOffsetY', 'filter',
     'imageSmoothingEnabled', 'imageSmoothingQuality'];
-  // Движку нужна внутренняя сторона контекста (снять пиксели), а странице — нет.
+  // The engine needs the context's internal side (to read pixels); the page does not.
   globalThis.__pt_ctxImpl = (pub) => CTX_IMPL.get(pub) || pub;
-  // Значения, которые браузер принимает у перечислимых свойств контекста:
-  // недопустимое он молча отвергает, оставляя прежнее, а мы записывали что дали.
+  // Allowed values of enumerated context properties: the browser silently
+  // rejects invalid ones and keeps the previous value.
   const CTX2D_ENUMS = {
     globalCompositeOperation: ['source-over','source-in','source-out','source-atop','destination-over',
       'destination-in','destination-out','destination-atop','lighter','copy','xor','multiply','screen',
@@ -9304,8 +9146,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     lineJoin: ['round','bevel','miter'],
   };
 
-  // Трасса холста (NOKK_TRACE_CANVAS=1): каждый вызов и присваивание
-  // контекста, с меткой холста — изнутри переходника, невидимо странице.
+  // Canvas trace (NOKK_TRACE_CANVAS=1): every context call and assignment,
+  // tagged with the canvas, from inside the trampoline, invisible to the page.
   const CTX_IDS = new WeakMap();
   let ctxSeq = 0;
   const ctrace = (t, what) => {
@@ -9314,7 +9156,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       let id = CTX_IDS.get(t);
       if (!id) { id = ++ctxSeq; CTX_IDS.set(t, id); }
       const c = t.canvas; const size = c ? (c.width | 0) + 'x' + (c.height | 0) : '?';
-      (globalThis.__pt_parentConsole || console).error('[холст ' + id + ' ' + size + '] ' + what);
+      (globalThis.__pt_parentConsole || console).error('[canvas ' + id + ' ' + size + '] ' + what);
     } catch (e) {}
   };
   const cshow = (v) => {
@@ -9323,12 +9165,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     if (v == null || typeof v !== 'object') return String(v);
     try { return '<' + (Object.prototype.toString.call(v).slice(8, -1)) + (v.width ? ' ' + v.width + 'x' + v.height : '') + '>'; } catch (e) { return '<obj>'; }
   };
-  // Привязка WebIDL, как у Chrome: каждый довод преобразуется ровно один раз,
-  // по порядку, до вызова реализации; ошибки преобразования — с приставкой
-  // «Failed to execute 'x' on 'Y': ». Наша реализация звала toString/valueOf
-  // доводов по нескольку раз и не в том порядке, пропускала NaN там, где
-  // браузер бросает, и не проверяла перегрузки. Проверка родных функций в
-  // челлендже (секция oebe1) зовёт методы холста именно так.
+  // WebIDL binding as in Chrome: each argument is converted exactly once, in
+  // order, before calling the implementation; conversion errors carry the
+  // "Failed to execute 'x' on 'Y': " prefix; NaN throws where the browser
+  // throws; overloads are checked. The challenge's native function check
+  // (section oebe1) calls canvas methods exactly this way.
   const IDL = (() => {
     const symMsg = (e) => e && (e.message === 'Cannot convert a Symbol value to a number' || e.message === 'Cannot convert a BigInt value to a number' || e.message === 'Cannot convert a Symbol value to a string');
     const num = (x, pre) => { try { return +x; } catch (e) { if (e instanceof TypeError && symMsg(e)) throw __pt_mkErr(TypeError, pre + e.message); throw e; } };
@@ -9344,9 +9185,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
     const rule = (x, pre) => { const v = str(x, pre); if (v !== 'nonzero' && v !== 'evenodd') throw __pt_mkErr(TypeError, pre + "The provided value '" + v + "' is not a valid enum value of type CanvasFillRule."); return v; };
     const T = { u: num, d: dbl, L: lng, s: str, b: (x) => !!x, r: rule, a: (x) => x };
-    // Копия без Array.prototype.slice — его страница может обернуть.
+    // Copy without Array.prototype.slice, which the page may wrap.
     const copy = (a) => { const o = []; for (let i = 0; i < a.length; i++) o[i] = a[i]; return o; };
-    // Сигнатура: буквы типов; `?` — необязательный (undefined не трогаем).
+    // Signature: type letters; `?` marks optional (undefined left alone).
     const run = (sig, args, pre) => {
       const out = copy(args);
       for (let i = 0, k = 0; k < sig.length; k++) {
@@ -9369,7 +9210,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const isPath = (v) => isA(v, ['Path2D']);
     const isImageData = (v) => isA(v, ['ImageData']);
     const idx = (msg) => __pt_mkErr(DOMException, msg, 'IndexSizeError');
-    // fill/clip: при двух доводах и больше перегрузка одна — (Path2D, правило).
+    // fill/clip: with two or more args there is one overload, (Path2D, rule).
     const fillLike = (a, pre) => {
       if (a.length >= 2) {
         if (!isPath(a[0])) throw __pt_mkErr(TypeError, pre + "parameter 1 is not of type 'Path2D'.");
@@ -9476,11 +9317,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     if (!P.__ptPublished) {
       try { Object.defineProperty(P, '__ptPublished', { value: true }); } catch (e) {}
       for (const name of methods) {
-        // Метод, а не функция: у метода браузера нет `prototype` и его нельзя
-        // позвать через `new`, а обычная функция и то и другое умеет — разница
-        // видна первой же проверкой. Заодно только собственный метод
-        // реализации: иначе имя, которого у неё нет, найдёт на прототипе этот
-        // же переходник и позовёт сам себя.
+        // A method, not a function: browser methods have no `prototype` and
+        // cannot be called with `new`. Also only the implementation's own
+        // method: otherwise a name it lacks would find this same trampoline on
+        // the prototype and call itself.
         const IFACE = C.name;
         const f = ({
           [name](...args) {
@@ -9506,13 +9346,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           set [name](v) {
             const t = ctxOf(this, P, name);
             if (globalThis.__pt_canvasTrace) ctrace(t, name + ' = ' + cshow(v));
-            // Недопустимое значение перечислимого свойства браузер отвергает
-            // молча, оставляя прежнее; мы записывали что угодно.
+            // The browser silently rejects an invalid enum value and keeps the
+            // previous one.
             const allowed = CTX2D_ENUMS[name];
             if (allowed && allowed.indexOf(String(v)) < 0) return;
-            // Цвет хранится не строкой страницы, а разобранным и записанным
-            // обратно: браузер отдаёт `#rrggbb`, полупрозрачный — `rgba(…)`,
-            // а нераспознанное значение оставляет прежним.
+            // Colors are stored parsed and reserialized, not as the page's
+            // string: the browser returns `#rrggbb`, translucent as `rgba(...)`,
+            // and keeps the old value for unrecognized input.
             if ((name === 'fillStyle' || name === 'strokeStyle' || name === 'shadowColor') &&
                 (v === null || typeof v !== 'object')) {
               const rgba = parseColorRaw(v);
@@ -9532,18 +9372,18 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         } catch (e) {}
       }
     }
-    if (!impl) return null;                    // только объявить интерфейс
+    if (!impl) return null;                    // only declare the interface
     const pub = Object.create(P);
     CTX_IMPL.set(pub, impl);
     return pub;
   };
 
-  // Пиксели возвращают не литералом: в браузере это ImageData, и по нему
-  // спрашивают `Object.prototype.toString`. `data` у него — собственное
-  // свойство, остальное с прототипа.
+  // Pixels are returned as an ImageData, not a literal: pages call
+  // `Object.prototype.toString` on it. `data` is an own property, the rest
+  // comes from the prototype.
   const IMAGE_DATA = new WeakMap();
-  // Конструктор `ImageData` ставится позже — таблица форм ещё не создала его
-  // класс, когда этот слой выполняется, — поэтому сборщик виден снаружи.
+  // The `ImageData` constructor is installed later (the shape table has not
+  // created its class when this layer runs), so the builder is visible here.
   const makeImageData = (data, w, h, space, format) => {
     const C = globalThis.ImageData;
     if (typeof C !== 'function' || !C.prototype) return { data, width: w, height: h, colorSpace: 'srgb' };
@@ -9571,7 +9411,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const o = Object.create(P);
     IMAGE_DATA.set(o, { w, h, cs: space === 'display-p3' ? 'display-p3' : 'srgb',
       pf: format === 'rgba-float16' ? 'rgba-float16' : 'rgba-unorm8' });
-    // `data` — единственное собственное свойство: так и в браузере.
+    // `data` is the only own property, as in the browser.
     try { Object.defineProperty(o, 'data', { value: data, enumerable: true }); } catch (e) {}
     return o;
   };
@@ -9604,9 +9444,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     } catch (e) { return false; }
   };
 
-  // Неверный вызов — тоже ответ, и он у браузера очень определённый. Челлендж
-  // зовёт `getImageData()` без единого аргумента и смотрит, что будет: у Chrome
-  // это TypeError с точным текстом, у нас выходил пустой набор пикселей.
+  // A wrong call is an answer too, and the browser's is precise: the challenge
+  // calls `getImageData()` with no arguments and expects Chrome's TypeError
+  // with its exact text.
   const needArgs = (got, want, method, iface) => {
     if (got >= want) return;
     throw __pt_mkErr(TypeError, "Failed to execute '" + method + "' on '" + iface + "': " +
@@ -9618,10 +9458,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   };
 
   const make2DContext = (canvas, attrs) => {
-    // Настройки, с которыми контекст попросили, браузер помнит и отдаёт
-    // обратно — вместе с цветовым пространством пикселей. Мы отвечали
-    // выдуманным набором, и проба, сверяющая запрошенное с полученным,
-    // обрывалась на четвёртом холсте.
+    // The browser remembers the settings a context was requested with and
+    // returns them, along with the pixel color space; a probe compares
+    // requested vs received.
     const A = attrs && typeof attrs === 'object' ? attrs : {};
     const CS = A.colorSpace === 'display-p3' ? 'display-p3' : 'srgb';
     const CT = A.colorType === 'float16' ? 'float16' : 'unorm8';
@@ -9629,19 +9468,17 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const ALPHA = A.alpha === undefined ? true : !!A.alpha;
     const DESYNC = !!A.desynchronized;
     const S = makeSurface(canvas);
-    // Пометка для `drawImage`: по холсту надо уметь найти его пиксели. Скрытая,
-    // как и всё наше, — страница её не перечислит.
+    // Marker for `drawImage` to find a canvas's pixels. Hidden like all of
+    // ours, so the page cannot enumerate it.
     try { Object.defineProperty(canvas, '__ptSurf', { value: S, configurable: true }); } catch (e) {}
-    // Однородная заливка запоминается точным цветом: восемь бит на канал не
-    // вмещают ни значений шире единицы, ни разницы в третьем знаке, а
-    // пересчёт между пространствами их даёт. Любое другое рисование эту
-    // запись отменяет — тогда пиксели читаются с поверхности, как обычно.
+    // A uniform fill is remembered as the exact color: 8 bits per channel hold
+    // neither values above one nor third-decimal differences, which
+    // cross-space conversion produces. Any other drawing clears this, and
+    // pixels are read from the surface as usual.
     let uniform = null;
-    // Смена размера холста сбрасывает контекст: браузер возвращает матрицу,
-    // цвета, тень, наложение, шрифт и путь к исходным значениям и очищает
-    // растр. Мы этого не делали, и следующее рисование шло поверх прежней
-    // матрицы — на холсте, который перед этим уже масштабировали, всё
-    // выходило вчетверо мельче.
+    // Resizing a canvas resets the context: the browser restores the matrix,
+    // colors, shadow, compositing, font and path to defaults and clears the
+    // bitmap. Without it later drawing used the stale matrix.
     let lastW = canvas.width | 0, lastH = canvas.height | 0;
     const DEFAULTS = {
       fillStyle: '#000000', strokeStyle: '#000000', font: '10px sans-serif',
@@ -9665,9 +9502,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       tainted = false;
       for (const k of Object.keys(DEFAULTS)) impl[k] = DEFAULTS[k];
     };
-    // Тень рисуется, когда её цвет непрозрачен и есть размытие или снос —
-    // ровно как в браузере. Описание: [размытие, сносX, сносY, r, g, b, a].
-    // Порядок совпадает с таблицей в движке.
+    // A shadow is drawn when its color is non-transparent and there is blur or
+    // offset, as in the browser. Descriptor: [blur, offsetX, offsetY, r, g, b,
+    // a], in the same order as the engine's table.
     const GCO = ['source-over','source-in','source-out','source-atop','destination-over',
       'destination-in','destination-out','destination-atop','lighter','copy','xor','multiply',
       'screen','overlay','darken','lighten','color-dodge','color-burn','hard-light','soft-light',
@@ -9676,17 +9513,17 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const shadowOf = function (ctx) {
       const col = parseColorRaw(ctx.shadowColor);
       if (!col || !col[3]) return null;
-      // Ни размытие, ни снос матрица не трогает: тень живёт в координатах
-      // холста, а не страницы. Масштабируя её вместе с фигурой, мы делали
-      // размытие на масштабе 0.384 втрое уже, чем у браузера.
+      // The matrix affects neither blur nor offset: shadows live in canvas
+      // space, not page space (scaling them made blur at scale 0.384 three
+      // times narrower than the browser's).
       const blur = Math.max(0, +ctx.shadowBlur || 0);
       const dx = (+ctx.shadowOffsetX || 0), dy = (+ctx.shadowOffsetY || 0);
       if (blur <= 0 && dx === 0 && dy === 0) return null;
       return [blur, dx, dy, col[0], col[1], col[2], col[3]];
     };
     const note = (m) => { checkResize(); uniform = null; S.note(m); };
-    // Холст зовёт это, когда ему меняют размер: сброс должен случиться сразу,
-    // а не при следующем рисовании — страница читает состояние и без него.
+    // The canvas calls this on resize: the reset must happen immediately, not
+    // at the next draw, since the page reads state without drawing.
     try { Object.defineProperty(canvas, '__ptCtxResize', { value: checkResize, configurable: true }); } catch (e) {}
     const solid = S.solid, stamp = S.stamp;
     let bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;     // current path bounding box
@@ -9703,12 +9540,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // rasterizer: curves and arcs are tessellated to line segments here so the
     // Rust side stays a trivial, robust decoder. Built only when the surface is
     // native; the JS fallback keeps using the bounding-box stamp above.
-    // Матрица холста. `translate`/`scale`/`rotate` были заметками в журнале и
-    // ничего не двигали: страница, которая масштабирует холст и рисует по
-    // крупным координатам — а так рисует всякий сборщик отпечатков, — получала
-    // пустую картинку, потому что всё уезжало за край. Точки пути ложатся в
-    // список уже преобразованными, как и в браузере: матрица применяется в тот
-    // миг, когда точка добавлена, а не когда путь рисуется.
+    // Canvas matrix. Pages that scale the canvas and draw at large coordinates
+    // (as every fingerprinter does) need `translate`/`scale`/`rotate` to
+    // really move things. Path points are stored already transformed, as in
+    // the browser: the matrix applies when a point is added, not when the
+    // path is drawn.
     let M = [1, 0, 0, 1, 0, 0];
     const mStack = [];
     const tX = (x, y) => M[0] * x + M[2] * y + M[4];
@@ -9724,11 +9560,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
 
     let verbs = [], cx = 0, cy = 0, sub = false;
-    // Операции пути как их получил холст (в координатах страницы, до
-    // матрицы): по ним движок строит путь по правилам Blink.
+    // Path ops as the canvas received them (page coordinates, before the
+    // matrix): the engine builds the path from them per Blink's rules.
     let ops = [];
-    // Текущая точка хранится в координатах страницы, а в список идут
-    // преобразованные: иначе кривая считалась бы по смешанным системам.
+    // The current point is kept in page coordinates while transformed points
+    // go to the list; otherwise curves would mix coordinate systems.
     const moveV = (x, y) => { x = +x || 0; y = +y || 0; verbs.push(0, tX(x, y), tY(x, y)); cx = x; cy = y; sub = true; };
     const lineV = (x, y) => { x = +x || 0; y = +y || 0; if (!sub) return moveV(x, y); verbs.push(1, tX(x, y), tY(x, y)); cx = x; cy = y; };
     const closeV = () => { if (sub) { verbs.push(4); sub = false; } };
@@ -9759,12 +9595,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
 
     const fontSize = (f) => { const m = /(\d+(?:\.\d+)?)px/.exec(String(f)); return m ? parseFloat(m[1]) : 10; };
-    // Семейства из `ctx.font`: всё, что стоит после кегля. Меряет и рисует их
-    // движок настоящими файлами шрифтов, поэтому список надо донести целиком —
-    // браузер идёт по нему до первого, который в системе есть.
-    // Начертание: жирное и наклонное — отдельные файлы шрифта, и ширины у них
-    // свои. `bold 20px Times New Roman` без этого мерился обычным начертанием и
-    // расходился с браузером на четыре процента.
+    // Families from `ctx.font`: everything after the size. The engine measures
+    // and draws with real font files, so the whole list must be passed: the
+    // browser walks it to the first one installed.
+    // Style: bold and italic are separate font files with their own widths
+    // (`bold 20px Times New Roman` measured as regular was 4% off).
     const fontBold = (f) => /(^|\s)(bold|bolder|[5-9]00)(\s|$)/i.test(String(f));
     const fontItalic = (f) => /(^|\s)(italic|oblique)(\s|$)/i.test(String(f));
     const fontFamily = (f) => {
@@ -9772,13 +9607,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       const m = /(?:\d+(?:\.\d+)?)(?:px|pt|em|%)\s*(?:\/\s*\S+\s*)?(.*)$/.exec(t);
       return (m ? m[1] : t).trim();
     };
-    // Коды концов и стыков штриха как у Skia: butt/round/square, miter/round/bevel.
+    // Stroke cap and join codes as in Skia: butt/round/square, miter/round/bevel.
     const capCode = (c) => c === 'round' ? 1 : c === 'square' ? 2 : 0;
     const joinCode = (j) => j === 'round' ? 1 : j === 'bevel' ? 2 : 0;
     const drawText = function (t, x, y, rgba, stroke, style) {
       const size = fontSize(this.font);
-      // Текст как у Chrome: раскладка Blink, глифы Skia/Fontations, тень по
-      // глифам. Штрих движок пока рисует прежним путём (false).
+      // Text as in Chrome: Blink layout, Skia/Fontations glyphs, glyph-based
+      // shadow. Strokes still use the old path (false).
       if (S.native && S.textOps) {
         const a = this.textAlign, b = this.textBaseline;
         const ai = a === 'center' ? 1 : (a === 'right' || a === 'end') ? 2 : 0;
@@ -9796,9 +9631,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       if (b === 'top' || b === 'hanging') oy += size * 0.8;
       else if (b === 'middle') oy += size * 0.3;
       else if (b === 'bottom' || b === 'ideographic') oy -= size * 0.2;
-      // Текст тоже живёт в преобразованных координатах, и кегль растёт вместе
-      // с масштабом. Наклон и поворот здесь приближаются равномерным
-      // масштабом — глифы движок кладёт по горизонтали.
+      // Text lives in transformed coordinates too, and the font size scales.
+      // Skew and rotation are approximated with uniform scale: the engine
+      // lays glyphs horizontally.
       if (S.native) {
         S.text(t, tX(ox, oy), tY(ox, oy), size * tScale(), rgba,
           fontFamily(this.font), fontBold(this.font), fontItalic(this.font), shadowOf(this));
@@ -9808,14 +9643,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // Gradient fillStyle/strokeStyle: real objects carrying coords + stops, flattened
     // to the [type,x0,y0,x1,y1,r0,r1,n,(pos,r,g,b,a)…] descriptor the native decoder
     // reads. A gradient object is detected by its `__ptGrad` marker.
-    // Состояние градиента — за WeakMap, а не собственным свойством объекта: у
-    // браузерного `CanvasGradient` собственных свойств ноль, а наша метка
-    // `__ptGrad` торчала наружу и называла себя сама.
+    // Gradient state lives behind a WeakMap, not an own property: the
+    // browser's `CanvasGradient` has zero own properties.
     const GRAD = new WeakMap();
     const makeGradient = (type, coords) => {
       const state = { type, coords, stops: [] };
       const add = (pos, color) => {
-        // Проверки Chrome, в его порядке: число, диапазон, потом цвет.
+        // Chrome's checks in its order: number, range, then color.
         const head = "Failed to execute 'addColorStop' on 'CanvasGradient': ";
         const at = Number(pos);
         if (!Number.isFinite(at)) throw __pt_mkErr(TypeError, head + 'The provided double value is non-finite.');
@@ -9832,17 +9666,17 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
     const gradOf = (v) => (v && GRAD.get(v)) || null;
     const encodeGrad = (g) => {
-      // Точки и радиусы — в координатах пользователя: движок сам ставит
-      // матрицу холста в конвейер шейдера (MatrixRec: ptsToUnit · CTM⁻¹),
-      // как Skia; заранее переводить их на холст нельзя.
+      // Points and radii stay in user space: the engine puts the canvas
+      // matrix into the shader pipeline itself (MatrixRec: ptsToUnit * CTM^-1),
+      // like Skia; they must not be converted to canvas space up front.
       const c = g.coords;
       const co = [+c[0] || 0, +c[1] || 0, +c[2] || 0, +c[3] || 0, +c[4] || 0, +c[5] || 0];
       const a = [g.type, co[0], co[1], co[2], co[3], co[4], co[5], g.stops.length];
       for (let k = 0; k < g.stops.length; k++) { const s = g.stops[k]; a.push(s[0], s[1][0], s[1][1], s[1][2], s[1][3]); }
       return a;
     };
-    // Углы прямоугольника тоже проходят через матрицу: под поворотом это уже
-    // не прямоугольник, и браузер рисует ромб.
+    // Rect corners go through the matrix too: rotated, it is no longer a
+    // rectangle and the browser draws a rhombus.
     const rectVerbs = (x, y, w, h) => {
       const X = +x || 0, Y = +y || 0, W2 = +w || 0, H2 = +h || 0;
       const p = (px, py) => [tX(px, py), tY(px, py)];
@@ -9850,32 +9684,31 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       return [0, a[0], a[1], 1, b[0], b[1], 1, c[0], c[1], 1, d[0], d[1], 4];
     };
 
-    // Холст без документа — offscreen, и контекст у него свой интерфейс:
-    // в воркере `CanvasRenderingContext2D` не существует вовсе, там есть
-    // OffscreenCanvasRenderingContext2D, как и у браузера.
+    // A canvas without a document is offscreen and its context is a separate
+    // interface: workers have no `CanvasRenderingContext2D` at all, only
+    // OffscreenCanvasRenderingContext2D, as in the browser.
     const C2D = (canvas && canvas.ownerDocument && globalThis.CanvasRenderingContext2D)
       || globalThis.OffscreenCanvasRenderingContext2D
       || globalThis.CanvasRenderingContext2D;
-    // Заглушка интерфейса могла приехать без своего имени — тогда ставим его,
-    // иначе контекст называет себя [object Object].
+    // An interface stub may have arrived without its name: set it, or the
+    // context tags as [object Object].
     try {
       if (C2D && !Object.getOwnPropertyDescriptor(C2D.prototype, Symbol.toStringTag)) {
         Object.defineProperty(C2D.prototype, Symbol.toStringTag, { value: C2D.name, configurable: true });
       }
     } catch (e) {}
-    // Реализация — обычный объект, а не наследник интерфейса: страница её не
-    // видит, а вот присваивание в `Object.assign` попало бы в аксессоры
-    // прототипа (они как раз переадресуют сюда) и закрутилось бы само на себя.
+    // The implementation is a plain object, not an interface instance: the
+    // page never sees it, and `Object.assign` into it would otherwise hit the
+    // prototype accessors (which forward here) and loop.
     const impl = maskProto(Object.assign({}, {
       canvas,
       fillStyle: '#000000', strokeStyle: '#000000', font: '10px sans-serif',
       globalAlpha: 1.0, lineWidth: 1.0, textBaseline: 'alphabetic', textAlign: 'start',
       shadowColor: 'rgba(0, 0, 0, 0)', shadowBlur: 0, globalCompositeOperation: 'source-over',
-      // Из 3051 вопроса, что задаёт кадр челленджа, только на один мы отвечали
-      // пустотой: у браузера фильтр холста — строка `none`, а не `undefined`.
+      // The browser's canvas filter is the string `none`, not `undefined`
+      // (the challenge frame reads it).
       filter: 'none',
-      // Остальные умолчания контекста: их не было вовсе, и страница читала
-      // `undefined` там, где браузер называет значение. Сняты с Chrome 151.
+      // Other context defaults, captured from Chrome 151.
       imageSmoothingEnabled: true, imageSmoothingQuality: 'low',
       letterSpacing: '0px', wordSpacing: '0px',
       fontKerning: 'auto', fontStretch: 'normal', fontVariantCaps: 'normal',
@@ -9888,8 +9721,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const fs = this.fillStyle;
         const sh = shadowOf(this);
         const md = modeOf(this);
-        // ValidateRectForCanvas + AdjustRectForCanvas (в double), затем
-        // drawRect — маршрут SkScan::AntiFillRect, не путь (код операции 8).
+        // ValidateRectForCanvas + AdjustRectForCanvas (in double), then
+        // drawRect: the SkScan::AntiFillRect route, not a path (op code 8).
         let X = +x, Y = +y, W2 = +w, H2 = +h;
         if (!(isFinite(X) && isFinite(Y) && isFinite(W2) && isFinite(H2))) return;
         if (W2 < 0) { W2 = -W2; X -= W2; }
@@ -10025,16 +9858,15 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
       drawImage(img, a1, a2, a3, a4, a5, a6, a7, a8) {
         needArgs(arguments.length, 3, 'drawImage', 'CanvasRenderingContext2D');
-        // Три формы: (img,dx,dy), (img,dx,dy,dw,dh) и вырезка из источника
-        // (img,sx,sy,sw,sh,dx,dy,dw,dh). Девятиаргументную мы молча читали как
-        // пятиаргументную — спрайт рисовался целиком и не туда.
+        // Three forms: (img,dx,dy), (img,dx,dy,dw,dh) and a source crop
+        // (img,sx,sy,sw,sh,dx,dy,dw,dh).
         const crop = arguments.length >= 9;
         const sx = crop ? +a1 || 0 : 0, sy = crop ? +a2 || 0 : 0;
         const sw = crop ? +a3 || 0 : 0, sh = crop ? +a4 || 0 : 0;
         const x = crop ? +a5 || 0 : +a1 || 0, y = crop ? +a6 || 0 : +a2 || 0;
         const w = crop ? +a7 || 0 : +a3 || 0, h = crop ? +a8 || 0 : +a4 || 0;
-        // Рисовать можно только тем, чем умеет браузер; всё прочее — отказ, и
-        // текст у него длинный и дословный.
+        // Only what the browser can draw is accepted; anything else is
+        // refused with its long verbatim message.
         const drawable = img && (img.localName === 'img' || img.localName === 'canvas' ||
           img.localName === 'video' || img.__ptC2d || img.__ptGl1 || img.__ptGl2 ||
           typeof img.src === 'string' || img.__ptImageBitmap || img.__ptO || img.__ptSurf);
@@ -10046,12 +9878,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         }
         note('drawImage|' + __ptJ(sx, sy, sw, sh, x, y, w, h, img && (img.src || img.localName)));
         if (taints(img)) tainted = true;
-        // Сперва настоящие пиксели: страница, которая рисует картинку и читает
-        // холст обратно, должна увидеть картинку. Челлендж именно так читает
-        // присланный им маячок. Штамп остаётся на случай, когда декодировать
-        // нечего — чужой формат, `blob:`, другой холст.
-        // Другой холст рисуется своими пикселями, а не штампом: `OffscreenCanvas`
-        // держит настоящий элемент внутри, `ImageBitmap` — свою поверхность.
+        // Real pixels first: a page that draws an image and reads the canvas
+        // back must see the image (the challenge reads its beacon this way).
+        // The stamp is a fallback when there is nothing to decode (foreign
+        // format, `blob:`, another canvas).
+        // Another canvas is drawn with its own pixels: `OffscreenCanvas` holds
+        // a real element inside, `ImageBitmap` its own surface.
         const from = img && (img.__ptSurf
           || (img.__ptO && img.__ptO.c && img.__ptO.c.__ptSurf)
           || (img.__ptImageBitmap && img.__ptImageBitmap.surf));
@@ -10078,16 +9910,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       isPointInPath() { return false; },
       measureText(t) {
         const size = fontSize(this.font);
-        // Метрики были долями кегля: 0.7 на подъём, 0.2 на спуск, а ширина
-        // одна и та же для любого семейства. Страница, перебирающая шрифты
-        // измерением — самый ходовой способ снять отпечаток, — видела машину,
-        // на которой все шрифты одинаковы. Теперь их меряет движок по
-        // настоящему файлу.
+        // Metrics are measured by the engine from the real font file: font
+        // enumeration by measuring text is the most common fingerprinting
+        // method, so per-family metrics must differ as in the browser.
         const m = S.native
           ? S.width(t, size, fontFamily(this.font), fontBold(this.font), fontItalic(this.font))
           : null;
-        // Не литерал, а `TextMetrics`: страница читает имя объекта, а у
-        // литерала его нет. Базовые линии считает сам конструктор.
+        // A `TextMetrics`, not a literal: the page reads the object's name.
+        // The constructor computes the baselines.
         const mk = globalThis.__pt_makeMetrics || ((v) => v);
         if (!m) {
           const w = String(t).length * 6.7;
@@ -10099,8 +9929,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       },
       getImageData(x, y, w, h) {
         needArgs(arguments.length, 4, 'getImageData', 'CanvasRenderingContext2D');
-        // Пятый довод — словарь ImageDataSettings; привязка Chrome проверяет его
-        // раньше всего остального: тип, затем перечисления по алфавиту.
+        // The fifth arg is an ImageDataSettings dict; Chrome's binding checks it
+        // before anything else: type, then enums alphabetically.
         if (arguments.length > 4) {
           const st = arguments[4];
           const head = "Failed to execute 'getImageData' on 'CanvasRenderingContext2D': ";
@@ -10120,7 +9950,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         if (tainted) throw securityError('getImageData', 'CanvasRenderingContext2D',
           'The canvas has been tainted by cross-origin data.');
         w = w | 0; h = h | 0;
-        // Отрицательная ширина — прямоугольник в другую сторону, как у Chrome.
+        // Negative width means a rectangle in the other direction, as in Chrome.
         if (w < 0) { x = (x | 0) + w; w = -w; }
         if (h < 0) { y = (y | 0) + h; h = -h; }
         if (w === 0) throw sizeError('getImageData', 'The source width is 0.');
@@ -10130,8 +9960,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           : ((o && o.colorSpace === 'srgb') ? 'srgb' : CS);
         const half = o && o.pixelFormat === 'rgba-float16' && globalThis.Float16Array;
         if (uniform) {
-          // Холст залит ровным цветом — значение известно точно, и пересчёт
-          // в запрошенное пространство считается по нему, а не по байтам.
+          // The canvas is a uniform color: the exact value is known, and
+          // conversion to the requested space uses it rather than bytes.
           const v = convertSpace(uniform.rgb, CS, want);
           const n = Math.max(0, w * h * 4);
           if (half) {
@@ -10140,19 +9970,18 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
             return makeImageData(f, w, h, want, 'rgba-float16');
           }
           const u = new Uint8ClampedArray(n);
-          // Округление у браузера зависит от пространства, и это измерено, а
-          // не выведено: на холсте sRGB 0.5 читается как 128, на display-p3 —
-          // как 127, при этом 0.25 в обоих даёт 64. То есть в p3 половина
-          // уходит вниз, в sRGB — вверх.
+          // The browser's rounding depends on the space (measured, not
+          // derived): on an sRGB canvas 0.5 reads as 128, on display-p3 as 127,
+          // while 0.25 gives 64 in both. So in p3 half rounds down, in sRGB up.
           const down = want === 'display-p3';
           const b8 = (t) => {
             const x = Math.max(0, Math.min(1, t)) * 255;
             return down ? Math.floor(x + 0.5 - 1e-9) : Math.round(x);
           };
           const al = b8(uniform.a);
-          // Полупрозрачный цвет холст хранит помноженным на альфу, и обратно
-          // выходит уже не тем: 136 при альфе 128 читается как 135. Быстрый
-          // путь обязан повторить и это, иначе он честнее самого браузера.
+          // The canvas stores translucent colors premultiplied, so they come
+          // back changed: 136 at alpha 128 reads as 135. The fast path must
+          // reproduce this too.
           const trip = (t) => {
             const c = b8(t);
             if (al >= 255 || al === 0) return al === 0 ? 0 : c;
@@ -10165,8 +9994,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           return makeImageData(u, w, h, want, o && o.pixelFormat);
         }
         const out = S.read(x, y, w, h, new Uint8ClampedArray(Math.max(0, w * h * 4)));
-        // Половинная точность: браузер отдаёт те же пиксели долями единицы, а
-        // не байтами. Холст с `colorType: float16` только этого чтения и ждёт.
+        // Half precision: the browser returns the same pixels as fractions,
+        // not bytes. A `colorType: float16` canvas expects exactly this read.
         if (want !== CS) {
           for (let i = 0; i < out.length; i += 4) {
             const v = convertSpace([out[i] / 255, out[i + 1] / 255, out[i + 2] / 255], CS, want);
@@ -10184,12 +10013,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       },
       createImageData(w, h) {
         needArgs(arguments.length, 1, 'createImageData', 'CanvasRenderingContext2D');
-        // Перегрузка с ImageData: пустая картинка того же размера и пространства.
+        // ImageData overload: an empty image of the same size and space.
         if (arguments.length === 1 && w !== null && typeof w === 'object') {
           const W = w.width | 0, H = w.height | 0;
           return makeImageData(new Uint8ClampedArray(Math.max(0, W * H * 4)), W, H, w.colorSpace || CS, w.pixelFormat);
         }
-        // Знак размера браузер отбрасывает: (-2, 3) — картинка 2×3.
+        // The browser drops the size sign: (-2, 3) is a 2x3 image.
         if (typeof w === 'number' && w < 0) w = -w;
         if (typeof h === 'number' && h < 0) h = -h;
         if ((w | 0) === 0) throw sizeError('createImageData', 'The source width is zero or not a number.');
@@ -10211,8 +10040,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         note('pattern|' + rep);
         return globalThis.__pt_makePattern ? __pt_makePattern({ img, repetition: rep }) : {};
       },
-      // Конического градиента у нас не было вовсе — `undefined` там, где
-      // браузер отдаёт объект.
+      // Conic gradient: the browser returns an object.
       createConicGradient(angle, x, y) {
         note('conicGradient|' + __ptJ(angle, x, y));
         return makeGradient(2, [+x || 0, +y || 0, 0, 0, +angle || 0, 0]);
@@ -10238,52 +10066,46 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     'WEBGL_compressed_texture_s3tc','WEBGL_compressed_texture_s3tc_srgb','WEBGL_debug_renderer_info',
     'WEBGL_debug_shaders','WEBGL_depth_texture','WEBGL_draw_buffers','WEBGL_lose_context',
     'WEBGL_multi_draw'];
-  // Форма контекста WebGL, снятая с Chrome 148: константы, методы и аксессоры —
-  // всё на прототипе, у самого контекста своих свойств нет. У нас было ровно
-  // наоборот: 132 имени на объекте и пустой прототип. WebGL сборщики отпечатка
-  // читают внимательнее всего, а идут по прототипу.
+  // WebGL context shape captured from Chrome 148: constants, methods and
+  // accessors all on the prototype, no own properties on the context.
+  // Fingerprinters read WebGL most closely, and they walk the prototype.
   const GL1_CONSTS = 'DEPTH_BUFFER_BIT=256,STENCIL_BUFFER_BIT=1024,COLOR_BUFFER_BIT=16384,POINTS=0,LINES=1,LINE_LOOP=2,LINE_STRIP=3,TRIANGLES=4,TRIANGLE_STRIP=5,TRIANGLE_FAN=6,ZERO=0,ONE=1,SRC_COLOR=768,ONE_MINUS_SRC_COLOR=769,SRC_ALPHA=770,ONE_MINUS_SRC_ALPHA=771,DST_ALPHA=772,ONE_MINUS_DST_ALPHA=773,DST_COLOR=774,ONE_MINUS_DST_COLOR=775,SRC_ALPHA_SATURATE=776,FUNC_ADD=32774,BLEND_EQUATION=32777,BLEND_EQUATION_RGB=32777,BLEND_EQUATION_ALPHA=34877,FUNC_SUBTRACT=32778,FUNC_REVERSE_SUBTRACT=32779,BLEND_DST_RGB=32968,BLEND_SRC_RGB=32969,BLEND_DST_ALPHA=32970,BLEND_SRC_ALPHA=32971,CONSTANT_COLOR=32769,ONE_MINUS_CONSTANT_COLOR=32770,CONSTANT_ALPHA=32771,ONE_MINUS_CONSTANT_ALPHA=32772,BLEND_COLOR=32773,ARRAY_BUFFER=34962,ELEMENT_ARRAY_BUFFER=34963,ARRAY_BUFFER_BINDING=34964,ELEMENT_ARRAY_BUFFER_BINDING=34965,STREAM_DRAW=35040,STATIC_DRAW=35044,DYNAMIC_DRAW=35048,BUFFER_SIZE=34660,BUFFER_USAGE=34661,CURRENT_VERTEX_ATTRIB=34342,FRONT=1028,BACK=1029,FRONT_AND_BACK=1032,TEXTURE_2D=3553,CULL_FACE=2884,BLEND=3042,DITHER=3024,STENCIL_TEST=2960,DEPTH_TEST=2929,SCISSOR_TEST=3089,POLYGON_OFFSET_FILL=32823,SAMPLE_ALPHA_TO_COVERAGE=32926,SAMPLE_COVERAGE=32928,NO_ERROR=0,INVALID_ENUM=1280,INVALID_VALUE=1281,INVALID_OPERATION=1282,OUT_OF_MEMORY=1285,CW=2304,CCW=2305,LINE_WIDTH=2849,ALIASED_POINT_SIZE_RANGE=33901,ALIASED_LINE_WIDTH_RANGE=33902,CULL_FACE_MODE=2885,FRONT_FACE=2886,DEPTH_RANGE=2928,DEPTH_WRITEMASK=2930,DEPTH_CLEAR_VALUE=2931,DEPTH_FUNC=2932,STENCIL_CLEAR_VALUE=2961,STENCIL_FUNC=2962,STENCIL_FAIL=2964,STENCIL_PASS_DEPTH_FAIL=2965,STENCIL_PASS_DEPTH_PASS=2966,STENCIL_REF=2967,STENCIL_VALUE_MASK=2963,STENCIL_WRITEMASK=2968,STENCIL_BACK_FUNC=34816,STENCIL_BACK_FAIL=34817,STENCIL_BACK_PASS_DEPTH_FAIL=34818,STENCIL_BACK_PASS_DEPTH_PASS=34819,STENCIL_BACK_REF=36003,STENCIL_BACK_VALUE_MASK=36004,STENCIL_BACK_WRITEMASK=36005,VIEWPORT=2978,SCISSOR_BOX=3088,COLOR_CLEAR_VALUE=3106,COLOR_WRITEMASK=3107,UNPACK_ALIGNMENT=3317,PACK_ALIGNMENT=3333,MAX_TEXTURE_SIZE=3379,MAX_VIEWPORT_DIMS=3386,SUBPIXEL_BITS=3408,RED_BITS=3410,GREEN_BITS=3411,BLUE_BITS=3412,ALPHA_BITS=3413,DEPTH_BITS=3414,STENCIL_BITS=3415,POLYGON_OFFSET_UNITS=10752,POLYGON_OFFSET_FACTOR=32824,TEXTURE_BINDING_2D=32873,SAMPLE_BUFFERS=32936,SAMPLES=32937,SAMPLE_COVERAGE_VALUE=32938,SAMPLE_COVERAGE_INVERT=32939,COMPRESSED_TEXTURE_FORMATS=34467,DONT_CARE=4352,FASTEST=4353,NICEST=4354,GENERATE_MIPMAP_HINT=33170,BYTE=5120,UNSIGNED_BYTE=5121,SHORT=5122,UNSIGNED_SHORT=5123,INT=5124,UNSIGNED_INT=5125,FLOAT=5126,DEPTH_COMPONENT=6402,ALPHA=6406,RGB=6407,RGBA=6408,LUMINANCE=6409,LUMINANCE_ALPHA=6410,UNSIGNED_SHORT_4_4_4_4=32819,UNSIGNED_SHORT_5_5_5_1=32820,UNSIGNED_SHORT_5_6_5=33635,FRAGMENT_SHADER=35632,VERTEX_SHADER=35633,MAX_VERTEX_ATTRIBS=34921,MAX_VERTEX_UNIFORM_VECTORS=36347,MAX_VARYING_VECTORS=36348,MAX_COMBINED_TEXTURE_IMAGE_UNITS=35661,MAX_VERTEX_TEXTURE_IMAGE_UNITS=35660,MAX_TEXTURE_IMAGE_UNITS=34930,MAX_FRAGMENT_UNIFORM_VECTORS=36349,SHADER_TYPE=35663,DELETE_STATUS=35712,LINK_STATUS=35714,VALIDATE_STATUS=35715,ATTACHED_SHADERS=35717,ACTIVE_UNIFORMS=35718,ACTIVE_ATTRIBUTES=35721,SHADING_LANGUAGE_VERSION=35724,CURRENT_PROGRAM=35725,NEVER=512,LESS=513,EQUAL=514,LEQUAL=515,GREATER=516,NOTEQUAL=517,GEQUAL=518,ALWAYS=519,KEEP=7680,REPLACE=7681,INCR=7682,DECR=7683,INVERT=5386,INCR_WRAP=34055,DECR_WRAP=34056,VENDOR=7936,RENDERER=7937,VERSION=7938,NEAREST=9728,LINEAR=9729,NEAREST_MIPMAP_NEAREST=9984,LINEAR_MIPMAP_NEAREST=9985,NEAREST_MIPMAP_LINEAR=9986,LINEAR_MIPMAP_LINEAR=9987,TEXTURE_MAG_FILTER=10240,TEXTURE_MIN_FILTER=10241,TEXTURE_WRAP_S=10242,TEXTURE_WRAP_T=10243,TEXTURE=5890,TEXTURE_CUBE_MAP=34067,TEXTURE_BINDING_CUBE_MAP=34068,TEXTURE_CUBE_MAP_POSITIVE_X=34069,TEXTURE_CUBE_MAP_NEGATIVE_X=34070,TEXTURE_CUBE_MAP_POSITIVE_Y=34071,TEXTURE_CUBE_MAP_NEGATIVE_Y=34072,TEXTURE_CUBE_MAP_POSITIVE_Z=34073,TEXTURE_CUBE_MAP_NEGATIVE_Z=34074,MAX_CUBE_MAP_TEXTURE_SIZE=34076,TEXTURE0=33984,TEXTURE1=33985,TEXTURE2=33986,TEXTURE3=33987,TEXTURE4=33988,TEXTURE5=33989,TEXTURE6=33990,TEXTURE7=33991,TEXTURE8=33992,TEXTURE9=33993,TEXTURE10=33994,TEXTURE11=33995,TEXTURE12=33996,TEXTURE13=33997,TEXTURE14=33998,TEXTURE15=33999,TEXTURE16=34000,TEXTURE17=34001,TEXTURE18=34002,TEXTURE19=34003,TEXTURE20=34004,TEXTURE21=34005,TEXTURE22=34006,TEXTURE23=34007,TEXTURE24=34008,TEXTURE25=34009,TEXTURE26=34010,TEXTURE27=34011,TEXTURE28=34012,TEXTURE29=34013,TEXTURE30=34014,TEXTURE31=34015,ACTIVE_TEXTURE=34016,REPEAT=10497,CLAMP_TO_EDGE=33071,MIRRORED_REPEAT=33648,FLOAT_VEC2=35664,FLOAT_VEC3=35665,FLOAT_VEC4=35666,INT_VEC2=35667,INT_VEC3=35668,INT_VEC4=35669,BOOL=35670,BOOL_VEC2=35671,BOOL_VEC3=35672,BOOL_VEC4=35673,FLOAT_MAT2=35674,FLOAT_MAT3=35675,FLOAT_MAT4=35676,SAMPLER_2D=35678,SAMPLER_CUBE=35680,VERTEX_ATTRIB_ARRAY_ENABLED=34338,VERTEX_ATTRIB_ARRAY_SIZE=34339,VERTEX_ATTRIB_ARRAY_STRIDE=34340,VERTEX_ATTRIB_ARRAY_TYPE=34341,VERTEX_ATTRIB_ARRAY_NORMALIZED=34922,VERTEX_ATTRIB_ARRAY_POINTER=34373,VERTEX_ATTRIB_ARRAY_BUFFER_BINDING=34975,IMPLEMENTATION_COLOR_READ_TYPE=35738,IMPLEMENTATION_COLOR_READ_FORMAT=35739,COMPILE_STATUS=35713,LOW_FLOAT=36336,MEDIUM_FLOAT=36337,HIGH_FLOAT=36338,LOW_INT=36339,MEDIUM_INT=36340,HIGH_INT=36341,FRAMEBUFFER=36160,RENDERBUFFER=36161,RGBA4=32854,RGB5_A1=32855,RGB565=36194,DEPTH_COMPONENT16=33189,STENCIL_INDEX8=36168,DEPTH_STENCIL=34041,RENDERBUFFER_WIDTH=36162,RENDERBUFFER_HEIGHT=36163,RENDERBUFFER_INTERNAL_FORMAT=36164,RENDERBUFFER_RED_SIZE=36176,RENDERBUFFER_GREEN_SIZE=36177,RENDERBUFFER_BLUE_SIZE=36178,RENDERBUFFER_ALPHA_SIZE=36179,RENDERBUFFER_DEPTH_SIZE=36180,RENDERBUFFER_STENCIL_SIZE=36181,FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE=36048,FRAMEBUFFER_ATTACHMENT_OBJECT_NAME=36049,FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL=36050,FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE=36051,COLOR_ATTACHMENT0=36064,DEPTH_ATTACHMENT=36096,STENCIL_ATTACHMENT=36128,DEPTH_STENCIL_ATTACHMENT=33306,NONE=0,FRAMEBUFFER_COMPLETE=36053,FRAMEBUFFER_INCOMPLETE_ATTACHMENT=36054,FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT=36055,FRAMEBUFFER_INCOMPLETE_DIMENSIONS=36057,FRAMEBUFFER_UNSUPPORTED=36061,FRAMEBUFFER_BINDING=36006,RENDERBUFFER_BINDING=36007,MAX_RENDERBUFFER_SIZE=34024,INVALID_FRAMEBUFFER_OPERATION=1286,UNPACK_FLIP_Y_WEBGL=37440,UNPACK_PREMULTIPLY_ALPHA_WEBGL=37441,CONTEXT_LOST_WEBGL=37442,UNPACK_COLORSPACE_CONVERSION_WEBGL=37443,BROWSER_DEFAULT_WEBGL=37444,RGB8=32849,RGBA8=32856';
   const GL1_METHODS = 'activeTexture,attachShader,bindAttribLocation,bindRenderbuffer,blendColor,blendEquation,blendEquationSeparate,blendFunc,blendFuncSeparate,bufferData,bufferSubData,checkFramebufferStatus,compileShader,compressedTexImage2D,compressedTexSubImage2D,copyTexImage2D,copyTexSubImage2D,createBuffer,createFramebuffer,createProgram,createRenderbuffer,createShader,createTexture,cullFace,deleteBuffer,deleteFramebuffer,deleteProgram,deleteRenderbuffer,deleteShader,deleteTexture,depthFunc,depthMask,depthRange,detachShader,disable,enable,finish,flush,framebufferRenderbuffer,framebufferTexture2D,frontFace,generateMipmap,getActiveAttrib,getActiveUniform,getAttachedShaders,getAttribLocation,getBufferParameter,getContextAttributes,getError,getExtension,getFramebufferAttachmentParameter,getParameter,getProgramInfoLog,getProgramParameter,getRenderbufferParameter,getShaderInfoLog,getShaderParameter,getShaderPrecisionFormat,getShaderSource,getSupportedExtensions,getTexParameter,getUniform,getUniformLocation,getVertexAttrib,getVertexAttribOffset,hint,isBuffer,isContextLost,isEnabled,isFramebuffer,isProgram,isRenderbuffer,isShader,isTexture,lineWidth,linkProgram,pixelStorei,polygonOffset,readPixels,renderbufferStorage,sampleCoverage,shaderSource,stencilFunc,stencilFuncSeparate,stencilMask,stencilMaskSeparate,stencilOp,stencilOpSeparate,texImage2D,texParameterf,texParameteri,texSubImage2D,useProgram,validateProgram,bindBuffer,bindFramebuffer,bindTexture,clear,clearColor,clearDepth,clearStencil,colorMask,disableVertexAttribArray,drawArrays,drawElements,enableVertexAttribArray,scissor,uniform1f,uniform1fv,uniform1i,uniform1iv,uniform2f,uniform2fv,uniform2i,uniform2iv,uniform3f,uniform3fv,uniform3i,uniform3iv,uniform4f,uniform4fv,uniform4i,uniform4iv,uniformMatrix2fv,uniformMatrix3fv,uniformMatrix4fv,vertexAttrib1f,vertexAttrib1fv,vertexAttrib2f,vertexAttrib2fv,vertexAttrib3f,vertexAttrib3fv,vertexAttrib4f,vertexAttrib4fv,vertexAttribPointer,viewport,drawingBufferStorage,makeXRCompatible';
   const GL2_CONSTS = 'DEPTH_BUFFER_BIT=256,STENCIL_BUFFER_BIT=1024,COLOR_BUFFER_BIT=16384,POINTS=0,LINES=1,LINE_LOOP=2,LINE_STRIP=3,TRIANGLES=4,TRIANGLE_STRIP=5,TRIANGLE_FAN=6,ZERO=0,ONE=1,SRC_COLOR=768,ONE_MINUS_SRC_COLOR=769,SRC_ALPHA=770,ONE_MINUS_SRC_ALPHA=771,DST_ALPHA=772,ONE_MINUS_DST_ALPHA=773,DST_COLOR=774,ONE_MINUS_DST_COLOR=775,SRC_ALPHA_SATURATE=776,FUNC_ADD=32774,BLEND_EQUATION=32777,BLEND_EQUATION_RGB=32777,BLEND_EQUATION_ALPHA=34877,FUNC_SUBTRACT=32778,FUNC_REVERSE_SUBTRACT=32779,BLEND_DST_RGB=32968,BLEND_SRC_RGB=32969,BLEND_DST_ALPHA=32970,BLEND_SRC_ALPHA=32971,CONSTANT_COLOR=32769,ONE_MINUS_CONSTANT_COLOR=32770,CONSTANT_ALPHA=32771,ONE_MINUS_CONSTANT_ALPHA=32772,BLEND_COLOR=32773,ARRAY_BUFFER=34962,ELEMENT_ARRAY_BUFFER=34963,ARRAY_BUFFER_BINDING=34964,ELEMENT_ARRAY_BUFFER_BINDING=34965,STREAM_DRAW=35040,STATIC_DRAW=35044,DYNAMIC_DRAW=35048,BUFFER_SIZE=34660,BUFFER_USAGE=34661,CURRENT_VERTEX_ATTRIB=34342,FRONT=1028,BACK=1029,FRONT_AND_BACK=1032,TEXTURE_2D=3553,CULL_FACE=2884,BLEND=3042,DITHER=3024,STENCIL_TEST=2960,DEPTH_TEST=2929,SCISSOR_TEST=3089,POLYGON_OFFSET_FILL=32823,SAMPLE_ALPHA_TO_COVERAGE=32926,SAMPLE_COVERAGE=32928,NO_ERROR=0,INVALID_ENUM=1280,INVALID_VALUE=1281,INVALID_OPERATION=1282,OUT_OF_MEMORY=1285,CW=2304,CCW=2305,LINE_WIDTH=2849,ALIASED_POINT_SIZE_RANGE=33901,ALIASED_LINE_WIDTH_RANGE=33902,CULL_FACE_MODE=2885,FRONT_FACE=2886,DEPTH_RANGE=2928,DEPTH_WRITEMASK=2930,DEPTH_CLEAR_VALUE=2931,DEPTH_FUNC=2932,STENCIL_CLEAR_VALUE=2961,STENCIL_FUNC=2962,STENCIL_FAIL=2964,STENCIL_PASS_DEPTH_FAIL=2965,STENCIL_PASS_DEPTH_PASS=2966,STENCIL_REF=2967,STENCIL_VALUE_MASK=2963,STENCIL_WRITEMASK=2968,STENCIL_BACK_FUNC=34816,STENCIL_BACK_FAIL=34817,STENCIL_BACK_PASS_DEPTH_FAIL=34818,STENCIL_BACK_PASS_DEPTH_PASS=34819,STENCIL_BACK_REF=36003,STENCIL_BACK_VALUE_MASK=36004,STENCIL_BACK_WRITEMASK=36005,VIEWPORT=2978,SCISSOR_BOX=3088,COLOR_CLEAR_VALUE=3106,COLOR_WRITEMASK=3107,UNPACK_ALIGNMENT=3317,PACK_ALIGNMENT=3333,MAX_TEXTURE_SIZE=3379,MAX_VIEWPORT_DIMS=3386,SUBPIXEL_BITS=3408,RED_BITS=3410,GREEN_BITS=3411,BLUE_BITS=3412,ALPHA_BITS=3413,DEPTH_BITS=3414,STENCIL_BITS=3415,POLYGON_OFFSET_UNITS=10752,POLYGON_OFFSET_FACTOR=32824,TEXTURE_BINDING_2D=32873,SAMPLE_BUFFERS=32936,SAMPLES=32937,SAMPLE_COVERAGE_VALUE=32938,SAMPLE_COVERAGE_INVERT=32939,COMPRESSED_TEXTURE_FORMATS=34467,DONT_CARE=4352,FASTEST=4353,NICEST=4354,GENERATE_MIPMAP_HINT=33170,BYTE=5120,UNSIGNED_BYTE=5121,SHORT=5122,UNSIGNED_SHORT=5123,INT=5124,UNSIGNED_INT=5125,FLOAT=5126,DEPTH_COMPONENT=6402,ALPHA=6406,RGB=6407,RGBA=6408,LUMINANCE=6409,LUMINANCE_ALPHA=6410,UNSIGNED_SHORT_4_4_4_4=32819,UNSIGNED_SHORT_5_5_5_1=32820,UNSIGNED_SHORT_5_6_5=33635,FRAGMENT_SHADER=35632,VERTEX_SHADER=35633,MAX_VERTEX_ATTRIBS=34921,MAX_VERTEX_UNIFORM_VECTORS=36347,MAX_VARYING_VECTORS=36348,MAX_COMBINED_TEXTURE_IMAGE_UNITS=35661,MAX_VERTEX_TEXTURE_IMAGE_UNITS=35660,MAX_TEXTURE_IMAGE_UNITS=34930,MAX_FRAGMENT_UNIFORM_VECTORS=36349,SHADER_TYPE=35663,DELETE_STATUS=35712,LINK_STATUS=35714,VALIDATE_STATUS=35715,ATTACHED_SHADERS=35717,ACTIVE_UNIFORMS=35718,ACTIVE_ATTRIBUTES=35721,SHADING_LANGUAGE_VERSION=35724,CURRENT_PROGRAM=35725,NEVER=512,LESS=513,EQUAL=514,LEQUAL=515,GREATER=516,NOTEQUAL=517,GEQUAL=518,ALWAYS=519,KEEP=7680,REPLACE=7681,INCR=7682,DECR=7683,INVERT=5386,INCR_WRAP=34055,DECR_WRAP=34056,VENDOR=7936,RENDERER=7937,VERSION=7938,NEAREST=9728,LINEAR=9729,NEAREST_MIPMAP_NEAREST=9984,LINEAR_MIPMAP_NEAREST=9985,NEAREST_MIPMAP_LINEAR=9986,LINEAR_MIPMAP_LINEAR=9987,TEXTURE_MAG_FILTER=10240,TEXTURE_MIN_FILTER=10241,TEXTURE_WRAP_S=10242,TEXTURE_WRAP_T=10243,TEXTURE=5890,TEXTURE_CUBE_MAP=34067,TEXTURE_BINDING_CUBE_MAP=34068,TEXTURE_CUBE_MAP_POSITIVE_X=34069,TEXTURE_CUBE_MAP_NEGATIVE_X=34070,TEXTURE_CUBE_MAP_POSITIVE_Y=34071,TEXTURE_CUBE_MAP_NEGATIVE_Y=34072,TEXTURE_CUBE_MAP_POSITIVE_Z=34073,TEXTURE_CUBE_MAP_NEGATIVE_Z=34074,MAX_CUBE_MAP_TEXTURE_SIZE=34076,TEXTURE0=33984,TEXTURE1=33985,TEXTURE2=33986,TEXTURE3=33987,TEXTURE4=33988,TEXTURE5=33989,TEXTURE6=33990,TEXTURE7=33991,TEXTURE8=33992,TEXTURE9=33993,TEXTURE10=33994,TEXTURE11=33995,TEXTURE12=33996,TEXTURE13=33997,TEXTURE14=33998,TEXTURE15=33999,TEXTURE16=34000,TEXTURE17=34001,TEXTURE18=34002,TEXTURE19=34003,TEXTURE20=34004,TEXTURE21=34005,TEXTURE22=34006,TEXTURE23=34007,TEXTURE24=34008,TEXTURE25=34009,TEXTURE26=34010,TEXTURE27=34011,TEXTURE28=34012,TEXTURE29=34013,TEXTURE30=34014,TEXTURE31=34015,ACTIVE_TEXTURE=34016,REPEAT=10497,CLAMP_TO_EDGE=33071,MIRRORED_REPEAT=33648,FLOAT_VEC2=35664,FLOAT_VEC3=35665,FLOAT_VEC4=35666,INT_VEC2=35667,INT_VEC3=35668,INT_VEC4=35669,BOOL=35670,BOOL_VEC2=35671,BOOL_VEC3=35672,BOOL_VEC4=35673,FLOAT_MAT2=35674,FLOAT_MAT3=35675,FLOAT_MAT4=35676,SAMPLER_2D=35678,SAMPLER_CUBE=35680,VERTEX_ATTRIB_ARRAY_ENABLED=34338,VERTEX_ATTRIB_ARRAY_SIZE=34339,VERTEX_ATTRIB_ARRAY_STRIDE=34340,VERTEX_ATTRIB_ARRAY_TYPE=34341,VERTEX_ATTRIB_ARRAY_NORMALIZED=34922,VERTEX_ATTRIB_ARRAY_POINTER=34373,VERTEX_ATTRIB_ARRAY_BUFFER_BINDING=34975,IMPLEMENTATION_COLOR_READ_TYPE=35738,IMPLEMENTATION_COLOR_READ_FORMAT=35739,COMPILE_STATUS=35713,LOW_FLOAT=36336,MEDIUM_FLOAT=36337,HIGH_FLOAT=36338,LOW_INT=36339,MEDIUM_INT=36340,HIGH_INT=36341,FRAMEBUFFER=36160,RENDERBUFFER=36161,RGBA4=32854,RGB5_A1=32855,RGB565=36194,DEPTH_COMPONENT16=33189,STENCIL_INDEX8=36168,DEPTH_STENCIL=34041,RENDERBUFFER_WIDTH=36162,RENDERBUFFER_HEIGHT=36163,RENDERBUFFER_INTERNAL_FORMAT=36164,RENDERBUFFER_RED_SIZE=36176,RENDERBUFFER_GREEN_SIZE=36177,RENDERBUFFER_BLUE_SIZE=36178,RENDERBUFFER_ALPHA_SIZE=36179,RENDERBUFFER_DEPTH_SIZE=36180,RENDERBUFFER_STENCIL_SIZE=36181,FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE=36048,FRAMEBUFFER_ATTACHMENT_OBJECT_NAME=36049,FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL=36050,FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE=36051,COLOR_ATTACHMENT0=36064,DEPTH_ATTACHMENT=36096,STENCIL_ATTACHMENT=36128,DEPTH_STENCIL_ATTACHMENT=33306,NONE=0,FRAMEBUFFER_COMPLETE=36053,FRAMEBUFFER_INCOMPLETE_ATTACHMENT=36054,FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT=36055,FRAMEBUFFER_INCOMPLETE_DIMENSIONS=36057,FRAMEBUFFER_UNSUPPORTED=36061,FRAMEBUFFER_BINDING=36006,RENDERBUFFER_BINDING=36007,MAX_RENDERBUFFER_SIZE=34024,INVALID_FRAMEBUFFER_OPERATION=1286,UNPACK_FLIP_Y_WEBGL=37440,UNPACK_PREMULTIPLY_ALPHA_WEBGL=37441,CONTEXT_LOST_WEBGL=37442,UNPACK_COLORSPACE_CONVERSION_WEBGL=37443,BROWSER_DEFAULT_WEBGL=37444,READ_BUFFER=3074,UNPACK_ROW_LENGTH=3314,UNPACK_SKIP_ROWS=3315,UNPACK_SKIP_PIXELS=3316,PACK_ROW_LENGTH=3330,PACK_SKIP_ROWS=3331,PACK_SKIP_PIXELS=3332,COLOR=6144,DEPTH=6145,STENCIL=6146,RED=6403,RGB8=32849,RGBA8=32856,RGB10_A2=32857,TEXTURE_BINDING_3D=32874,UNPACK_SKIP_IMAGES=32877,UNPACK_IMAGE_HEIGHT=32878,TEXTURE_3D=32879,TEXTURE_WRAP_R=32882,MAX_3D_TEXTURE_SIZE=32883,UNSIGNED_INT_2_10_10_10_REV=33640,MAX_ELEMENTS_VERTICES=33000,MAX_ELEMENTS_INDICES=33001,TEXTURE_MIN_LOD=33082,TEXTURE_MAX_LOD=33083,TEXTURE_BASE_LEVEL=33084,TEXTURE_MAX_LEVEL=33085,MIN=32775,MAX=32776,DEPTH_COMPONENT24=33190,MAX_TEXTURE_LOD_BIAS=34045,TEXTURE_COMPARE_MODE=34892,TEXTURE_COMPARE_FUNC=34893,CURRENT_QUERY=34917,QUERY_RESULT=34918,QUERY_RESULT_AVAILABLE=34919,STREAM_READ=35041,STREAM_COPY=35042,STATIC_READ=35045,STATIC_COPY=35046,DYNAMIC_READ=35049,DYNAMIC_COPY=35050,MAX_DRAW_BUFFERS=34852,DRAW_BUFFER0=34853,DRAW_BUFFER1=34854,DRAW_BUFFER2=34855,DRAW_BUFFER3=34856,DRAW_BUFFER4=34857,DRAW_BUFFER5=34858,DRAW_BUFFER6=34859,DRAW_BUFFER7=34860,DRAW_BUFFER8=34861,DRAW_BUFFER9=34862,DRAW_BUFFER10=34863,DRAW_BUFFER11=34864,DRAW_BUFFER12=34865,DRAW_BUFFER13=34866,DRAW_BUFFER14=34867,DRAW_BUFFER15=34868,MAX_FRAGMENT_UNIFORM_COMPONENTS=35657,MAX_VERTEX_UNIFORM_COMPONENTS=35658,SAMPLER_3D=35679,SAMPLER_2D_SHADOW=35682,FRAGMENT_SHADER_DERIVATIVE_HINT=35723,PIXEL_PACK_BUFFER=35051,PIXEL_UNPACK_BUFFER=35052,PIXEL_PACK_BUFFER_BINDING=35053,PIXEL_UNPACK_BUFFER_BINDING=35055,FLOAT_MAT2x3=35685,FLOAT_MAT2x4=35686,FLOAT_MAT3x2=35687,FLOAT_MAT3x4=35688,FLOAT_MAT4x2=35689,FLOAT_MAT4x3=35690,SRGB=35904,SRGB8=35905,SRGB8_ALPHA8=35907,COMPARE_REF_TO_TEXTURE=34894,RGBA32F=34836,RGB32F=34837,RGBA16F=34842,RGB16F=34843,VERTEX_ATTRIB_ARRAY_INTEGER=35069,MAX_ARRAY_TEXTURE_LAYERS=35071,MIN_PROGRAM_TEXEL_OFFSET=35076,MAX_PROGRAM_TEXEL_OFFSET=35077,MAX_VARYING_COMPONENTS=35659,TEXTURE_2D_ARRAY=35866,TEXTURE_BINDING_2D_ARRAY=35869,R11F_G11F_B10F=35898,UNSIGNED_INT_10F_11F_11F_REV=35899,RGB9_E5=35901,UNSIGNED_INT_5_9_9_9_REV=35902,TRANSFORM_FEEDBACK_BUFFER_MODE=35967,MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS=35968,TRANSFORM_FEEDBACK_VARYINGS=35971,TRANSFORM_FEEDBACK_BUFFER_START=35972,TRANSFORM_FEEDBACK_BUFFER_SIZE=35973,TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN=35976,RASTERIZER_DISCARD=35977,MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS=35978,MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS=35979,INTERLEAVED_ATTRIBS=35980,SEPARATE_ATTRIBS=35981,TRANSFORM_FEEDBACK_BUFFER=35982,TRANSFORM_FEEDBACK_BUFFER_BINDING=35983,RGBA32UI=36208,RGB32UI=36209,RGBA16UI=36214,RGB16UI=36215,RGBA8UI=36220,RGB8UI=36221,RGBA32I=36226,RGB32I=36227,RGBA16I=36232,RGB16I=36233,RGBA8I=36238,RGB8I=36239,RED_INTEGER=36244,RGB_INTEGER=36248,RGBA_INTEGER=36249,SAMPLER_2D_ARRAY=36289,SAMPLER_2D_ARRAY_SHADOW=36292,SAMPLER_CUBE_SHADOW=36293,UNSIGNED_INT_VEC2=36294,UNSIGNED_INT_VEC3=36295,UNSIGNED_INT_VEC4=36296,INT_SAMPLER_2D=36298,INT_SAMPLER_3D=36299,INT_SAMPLER_CUBE=36300,INT_SAMPLER_2D_ARRAY=36303,UNSIGNED_INT_SAMPLER_2D=36306,UNSIGNED_INT_SAMPLER_3D=36307,UNSIGNED_INT_SAMPLER_CUBE=36308,UNSIGNED_INT_SAMPLER_2D_ARRAY=36311,DEPTH_COMPONENT32F=36012,DEPTH32F_STENCIL8=36013,FLOAT_32_UNSIGNED_INT_24_8_REV=36269,FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING=33296,FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE=33297,FRAMEBUFFER_ATTACHMENT_RED_SIZE=33298,FRAMEBUFFER_ATTACHMENT_GREEN_SIZE=33299,FRAMEBUFFER_ATTACHMENT_BLUE_SIZE=33300,FRAMEBUFFER_ATTACHMENT_ALPHA_SIZE=33301,FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE=33302,FRAMEBUFFER_ATTACHMENT_STENCIL_SIZE=33303,FRAMEBUFFER_DEFAULT=33304,UNSIGNED_INT_24_8=34042,DEPTH24_STENCIL8=35056,UNSIGNED_NORMALIZED=35863,DRAW_FRAMEBUFFER_BINDING=36006,READ_FRAMEBUFFER=36008,DRAW_FRAMEBUFFER=36009,READ_FRAMEBUFFER_BINDING=36010,RENDERBUFFER_SAMPLES=36011,FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER=36052,MAX_COLOR_ATTACHMENTS=36063,COLOR_ATTACHMENT1=36065,COLOR_ATTACHMENT2=36066,COLOR_ATTACHMENT3=36067,COLOR_ATTACHMENT4=36068,COLOR_ATTACHMENT5=36069,COLOR_ATTACHMENT6=36070,COLOR_ATTACHMENT7=36071,COLOR_ATTACHMENT8=36072,COLOR_ATTACHMENT9=36073,COLOR_ATTACHMENT10=36074,COLOR_ATTACHMENT11=36075,COLOR_ATTACHMENT12=36076,COLOR_ATTACHMENT13=36077,COLOR_ATTACHMENT14=36078,COLOR_ATTACHMENT15=36079,FRAMEBUFFER_INCOMPLETE_MULTISAMPLE=36182,MAX_SAMPLES=36183,HALF_FLOAT=5131,RG=33319,RG_INTEGER=33320,R8=33321,RG8=33323,R16F=33325,R32F=33326,RG16F=33327,RG32F=33328,R8I=33329,R8UI=33330,R16I=33331,R16UI=33332,R32I=33333,R32UI=33334,RG8I=33335,RG8UI=33336,RG16I=33337,RG16UI=33338,RG32I=33339,RG32UI=33340,VERTEX_ARRAY_BINDING=34229,R8_SNORM=36756,RG8_SNORM=36757,RGB8_SNORM=36758,RGBA8_SNORM=36759,SIGNED_NORMALIZED=36764,COPY_READ_BUFFER=36662,COPY_WRITE_BUFFER=36663,COPY_READ_BUFFER_BINDING=36662,COPY_WRITE_BUFFER_BINDING=36663,UNIFORM_BUFFER=35345,UNIFORM_BUFFER_BINDING=35368,UNIFORM_BUFFER_START=35369,UNIFORM_BUFFER_SIZE=35370,MAX_VERTEX_UNIFORM_BLOCKS=35371,MAX_FRAGMENT_UNIFORM_BLOCKS=35373,MAX_COMBINED_UNIFORM_BLOCKS=35374,MAX_UNIFORM_BUFFER_BINDINGS=35375,MAX_UNIFORM_BLOCK_SIZE=35376,MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS=35377,MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS=35379,UNIFORM_BUFFER_OFFSET_ALIGNMENT=35380,ACTIVE_UNIFORM_BLOCKS=35382,UNIFORM_TYPE=35383,UNIFORM_SIZE=35384,UNIFORM_BLOCK_INDEX=35386,UNIFORM_OFFSET=35387,UNIFORM_ARRAY_STRIDE=35388,UNIFORM_MATRIX_STRIDE=35389,UNIFORM_IS_ROW_MAJOR=35390,UNIFORM_BLOCK_BINDING=35391,UNIFORM_BLOCK_DATA_SIZE=35392,UNIFORM_BLOCK_ACTIVE_UNIFORMS=35394,UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES=35395,UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER=35396,UNIFORM_BLOCK_REFERENCED_BY_FRAGMENT_SHADER=35398,INVALID_INDEX=4294967295,MAX_VERTEX_OUTPUT_COMPONENTS=37154,MAX_FRAGMENT_INPUT_COMPONENTS=37157,MAX_SERVER_WAIT_TIMEOUT=37137,OBJECT_TYPE=37138,SYNC_CONDITION=37139,SYNC_STATUS=37140,SYNC_FLAGS=37141,SYNC_FENCE=37142,SYNC_GPU_COMMANDS_COMPLETE=37143,UNSIGNALED=37144,SIGNALED=37145,ALREADY_SIGNALED=37146,TIMEOUT_EXPIRED=37147,CONDITION_SATISFIED=37148,WAIT_FAILED=37149,SYNC_FLUSH_COMMANDS_BIT=1,VERTEX_ATTRIB_ARRAY_DIVISOR=35070,ANY_SAMPLES_PASSED=35887,ANY_SAMPLES_PASSED_CONSERVATIVE=36202,SAMPLER_BINDING=35097,RGB10_A2UI=36975,INT_2_10_10_10_REV=36255,TRANSFORM_FEEDBACK=36386,TRANSFORM_FEEDBACK_PAUSED=36387,TRANSFORM_FEEDBACK_ACTIVE=36388,TRANSFORM_FEEDBACK_BINDING=36389,TEXTURE_IMMUTABLE_FORMAT=37167,MAX_ELEMENT_INDEX=36203,TEXTURE_IMMUTABLE_LEVELS=33503,TIMEOUT_IGNORED=-1,MAX_CLIENT_WAIT_TIMEOUT_WEBGL=37447';
   const GL2_METHODS = 'activeTexture,attachShader,beginQuery,beginTransformFeedback,bindAttribLocation,bindBufferBase,bindBufferRange,bindRenderbuffer,bindSampler,bindTransformFeedback,bindVertexArray,blendColor,blendEquation,blendEquationSeparate,blendFunc,blendFuncSeparate,blitFramebuffer,bufferData,bufferSubData,checkFramebufferStatus,clientWaitSync,compileShader,compressedTexImage2D,compressedTexImage3D,compressedTexSubImage2D,compressedTexSubImage3D,copyBufferSubData,copyTexImage2D,copyTexSubImage2D,copyTexSubImage3D,createBuffer,createFramebuffer,createProgram,createQuery,createRenderbuffer,createSampler,createShader,createTexture,createTransformFeedback,createVertexArray,cullFace,deleteBuffer,deleteFramebuffer,deleteProgram,deleteQuery,deleteRenderbuffer,deleteSampler,deleteShader,deleteSync,deleteTexture,deleteTransformFeedback,deleteVertexArray,depthFunc,depthMask,depthRange,detachShader,disable,drawArraysInstanced,drawElementsInstanced,drawRangeElements,enable,endQuery,endTransformFeedback,fenceSync,finish,flush,framebufferRenderbuffer,framebufferTexture2D,framebufferTextureLayer,frontFace,generateMipmap,getActiveAttrib,getActiveUniform,getActiveUniformBlockName,getActiveUniformBlockParameter,getActiveUniforms,getAttachedShaders,getAttribLocation,getBufferParameter,getBufferSubData,getContextAttributes,getError,getExtension,getFragDataLocation,getFramebufferAttachmentParameter,getIndexedParameter,getInternalformatParameter,getParameter,getProgramInfoLog,getProgramParameter,getQuery,getQueryParameter,getRenderbufferParameter,getSamplerParameter,getShaderInfoLog,getShaderParameter,getShaderPrecisionFormat,getShaderSource,getSupportedExtensions,getSyncParameter,getTexParameter,getTransformFeedbackVarying,getUniform,getUniformBlockIndex,getUniformIndices,getUniformLocation,getVertexAttrib,getVertexAttribOffset,hint,invalidateFramebuffer,invalidateSubFramebuffer,isBuffer,isContextLost,isEnabled,isFramebuffer,isProgram,isQuery,isRenderbuffer,isSampler,isShader,isSync,isTexture,isTransformFeedback,isVertexArray,lineWidth,linkProgram,pauseTransformFeedback,pixelStorei,polygonOffset,readBuffer,readPixels,renderbufferStorage,renderbufferStorageMultisample,resumeTransformFeedback,sampleCoverage,samplerParameterf,samplerParameteri,shaderSource,stencilFunc,stencilFuncSeparate,stencilMask,stencilMaskSeparate,stencilOp,stencilOpSeparate,texImage2D,texImage3D,texParameterf,texParameteri,texStorage2D,texStorage3D,texSubImage2D,texSubImage3D,transformFeedbackVaryings,uniform1ui,uniform2ui,uniform3ui,uniform4ui,uniformBlockBinding,useProgram,validateProgram,vertexAttribDivisor,vertexAttribI4i,vertexAttribI4ui,vertexAttribIPointer,waitSync,bindBuffer,bindFramebuffer,bindTexture,clear,clearBufferfi,clearBufferfv,clearBufferiv,clearBufferuiv,clearColor,clearDepth,clearStencil,colorMask,disableVertexAttribArray,drawArrays,drawBuffers,drawElements,enableVertexAttribArray,scissor,uniform1f,uniform1fv,uniform1i,uniform1iv,uniform1uiv,uniform2f,uniform2fv,uniform2i,uniform2iv,uniform2uiv,uniform3f,uniform3fv,uniform3i,uniform3iv,uniform3uiv,uniform4f,uniform4fv,uniform4i,uniform4iv,uniform4uiv,uniformMatrix2fv,uniformMatrix2x3fv,uniformMatrix2x4fv,uniformMatrix3fv,uniformMatrix3x2fv,uniformMatrix3x4fv,uniformMatrix4fv,uniformMatrix4x2fv,uniformMatrix4x3fv,vertexAttrib1f,vertexAttrib1fv,vertexAttrib2f,vertexAttrib2fv,vertexAttrib3f,vertexAttrib3fv,vertexAttrib4f,vertexAttrib4fv,vertexAttribI4iv,vertexAttribI4uiv,vertexAttribPointer,viewport,drawingBufferStorage,makeXRCompatible';
   const GL_ATTRS = 'canvas,drawingBufferWidth,drawingBufferHeight,drawingBufferColorSpace,unpackColorSpace,drawingBufferFormat'.split(',');
-  // Пределы и форматы WebGL, снятые с Chrome 148 на этой же машине: на
-  // половину вопросов мы отвечали нулём, а у живой видеокарты нулей там не
-  // бывает. Наши собственные строки (вендор, рендерер, версии) остаются
-  // нашими — таблица заполняет только то, чего не было.
+  // WebGL limits and formats captured from Chrome 148 on this machine (a real
+  // GPU never reports zeros there). Our own strings (vendor, renderer,
+  // versions) stay ours; the table only fills what was missing.
   const GL1_PARAMS = {2849:1,2884:false,2885:1029,2886:2305,2928:[0,1],2929:false,2930:true,2931:1,2932:513,2960:false,2961:0,2962:519,2963:4294967295,2964:7680,2965:7680,2966:7680,2967:0,2968:4294967295,2978:[0,0,300,150],3024:true,3042:false,3088:[0,0,300,150],3089:false,3106:[0,0,0,0],3107:[true,true,true,true],3317:4,3333:4,3379:16384,3386:[16384,16384],3408:4,3410:8,3411:8,3412:8,3413:8,3414:24,3415:0,7936:"WebKit",7937:"WebKit WebGL",7938:"WebGL 1.0 (OpenGL ES 2.0 Chromium)",10752:0,32773:[0,0,0,0],32777:32774,32823:false,32824:0,32926:false,32928:false,32936:1,32937:4,32938:1,32939:false,32968:0,32969:1,32970:0,32971:1,33170:4352,33901:[1,255],33902:[1,7.375],34016:33984,34024:16384,34076:16384,34467:[],34816:519,34817:7680,34818:7680,34819:7680,34877:32774,34921:16,34930:32,35660:32,35661:64,35724:"WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)",35738:5121,35739:6408,36003:0,36004:4294967295,36005:4294967295,36347:1024,36348:32,36349:1024,37440:false,37441:false,37443:37444};
   const GL2_PARAMS = {2849:1,2884:false,2885:1029,2886:2305,2928:[0,1],2929:false,2930:true,2931:1,2932:513,2960:false,2961:0,2962:519,2963:4294967295,2964:7680,2965:7680,2966:7680,2967:0,2968:4294967295,2978:[0,0,300,150],3024:true,3042:false,3074:1029,3088:[0,0,300,150],3089:false,3106:[0,0,0,0],3107:[true,true,true,true],3314:0,3315:0,3316:0,3317:4,3330:0,3331:0,3332:0,3333:4,3379:16384,3386:[16384,16384],3408:4,3410:8,3411:8,3412:8,3413:8,3414:24,3415:0,7936:"WebKit",7937:"WebKit WebGL",7938:"WebGL 2.0 (OpenGL ES 3.0 Chromium)",10752:0,32773:[0,0,0,0],32777:32774,32823:false,32824:0,32877:0,32878:0,32883:2048,32926:false,32928:false,32936:1,32937:4,32938:1,32939:false,32968:0,32969:1,32970:0,32971:1,33000:3000,33001:3000,33170:4352,33901:[1,255],33902:[1,7.375],34016:33984,34024:16384,34045:15,34076:16384,34467:[],34816:519,34817:7680,34818:7680,34819:7680,34852:8,34853:1029,34854:1029,34855:1029,34856:1029,34857:1029,34858:1029,34859:1029,34860:1029,34877:32774,34921:16,34930:32,35071:2048,35076:-8,35077:7,35371:15,35373:15,35374:45,35375:72,35376:65536,35377:262144,35379:262144,35380:32,35657:4096,35658:4096,35659:128,35660:32,35661:64,35723:4352,35724:"WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)",35738:5121,35739:6408,35968:4,35977:false,35978:64,35979:4,36003:0,36004:4294967295,36005:4294967295,36063:8,36183:16,36203:4294967294,36347:1024,36348:32,36349:1024,36387:false,36388:false,37137:9223372034707292000,37154:128,37157:128,37440:false,37441:false,37443:37444,37447:0};
-  // Точность шейдерных типов: диапазон и число значащих бит.
+  // Shader type precision: range and significant bits.
   const GL_PRECISION = {"35633:36336":[127,127,23],"35633:36337":[127,127,23],"35633:36338":[127,127,23],"35633:36339":[31,30,0],"35633:36340":[31,30,0],"35633:36341":[31,30,0],"35632:36336":[127,127,23],"35632:36337":[127,127,23],"35632:36338":[127,127,23],"35632:36339":[31,30,0],"35632:36340":[31,30,0],"35632:36341":[31,30,0]};
-  // Сколько сглаживаний поддерживает каждый внутренний формат буфера.
+  // Supported sample counts per internal renderbuffer format.
   const GL_FORMAT_SAMPLES = {32849:[16,8,4,2],32854:[16,8,4,2],32855:[16,8,4,2],32856:[16,8,4,2],32857:[16,8,4,2],33189:[16,8,4,2],33190:[16,8,4,2],33321:[16,8,4,2],33323:[16,8,4,2],33329:[],33330:[],33331:[],33332:[],33333:[],33334:[],33335:[],33336:[],33337:[],33338:[],33339:[],33340:[],35056:[16,8,4,2],35907:[16,8,4,2],36012:[16,8,4,2],36013:[16,8,4,2],36168:[16,8,4,2],36194:[16,8,4,2],36208:[],36214:[],36220:[],36226:[],36232:[],36238:[],36975:[]};
   const GL1_EXTS = ["ANGLE_instanced_arrays", "EXT_blend_minmax", "EXT_clip_control", "EXT_color_buffer_half_float", "EXT_depth_clamp", "EXT_disjoint_timer_query", "EXT_float_blend", "EXT_frag_depth", "EXT_polygon_offset_clamp", "EXT_texture_compression_bptc", "EXT_texture_compression_rgtc", "EXT_texture_filter_anisotropic", "EXT_sRGB", "KHR_parallel_shader_compile", "OES_element_index_uint", "OES_fbo_render_mipmap", "OES_standard_derivatives", "OES_texture_float", "OES_texture_float_linear", "OES_texture_half_float", "OES_texture_half_float_linear", "OES_vertex_array_object", "WEBGL_blend_func_extended", "WEBGL_color_buffer_float", "WEBGL_compressed_texture_astc", "WEBGL_compressed_texture_etc", "WEBGL_compressed_texture_etc1", "WEBGL_compressed_texture_s3tc", "WEBGL_compressed_texture_s3tc_srgb", "WEBGL_debug_renderer_info", "WEBGL_debug_shaders", "WEBGL_depth_texture", "WEBGL_draw_buffers", "WEBGL_lose_context", "WEBGL_multi_draw"];
   const GL2_EXTS = ["EXT_clip_control", "EXT_color_buffer_float", "EXT_color_buffer_half_float", "EXT_depth_clamp", "EXT_disjoint_timer_query_webgl2", "EXT_float_blend", "EXT_polygon_offset_clamp", "EXT_texture_compression_bptc", "EXT_texture_compression_rgtc", "EXT_texture_filter_anisotropic", "EXT_texture_norm16", "KHR_parallel_shader_compile", "NV_shader_noperspective_interpolation", "OES_draw_buffers_indexed", "OES_sample_variables", "OES_shader_multisample_interpolation", "OES_texture_float_linear", "WEBGL_blend_func_extended", "WEBGL_compressed_texture_astc", "WEBGL_compressed_texture_etc", "WEBGL_compressed_texture_etc1", "WEBGL_compressed_texture_s3tc", "WEBGL_compressed_texture_s3tc_srgb", "WEBGL_debug_renderer_info", "WEBGL_debug_shaders", "WEBGL_lose_context", "WEBGL_multi_draw", "WEBGL_stencil_texturing"];
 
-  // Расширения WebGL, как их отдаёт Chrome 148: у каждого свой интерфейс и свой
-  // набор членов. Мы отдавали пустой объект `{}` на любое имя — то есть
-  // `Object.prototype.toString` по нему говорил `[object Object]` там, где
-  // браузер называет `[object EXTTextureFilterAnisotropic]`, а члены
-  // отсутствовали вовсе.
+  // WebGL extensions as Chrome 148 returns them: each has its own interface
+  // and members, and `Object.prototype.toString` names it
+  // (`[object EXTTextureFilterAnisotropic]`).
   const GL1_EXT_SHAPE = {"ANGLE_instanced_arrays":["ANGLEInstancedArrays","VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE,drawArraysInstancedANGLE,drawElementsInstancedANGLE,vertexAttribDivisorANGLE"],"EXT_blend_minmax":["EXTBlendMinMax","MIN_EXT,MAX_EXT"],"EXT_clip_control":["EXTClipControl","LOWER_LEFT_EXT,UPPER_LEFT_EXT,NEGATIVE_ONE_TO_ONE_EXT,ZERO_TO_ONE_EXT,CLIP_ORIGIN_EXT,CLIP_DEPTH_MODE_EXT,clipControlEXT"],"EXT_color_buffer_half_float":["EXTColorBufferHalfFloat","RGBA16F_EXT,RGB16F_EXT,FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE_EXT,UNSIGNED_NORMALIZED_EXT"],"EXT_depth_clamp":["EXTDepthClamp","DEPTH_CLAMP_EXT"],"EXT_disjoint_timer_query":["EXTDisjointTimerQuery","QUERY_COUNTER_BITS_EXT,CURRENT_QUERY_EXT,QUERY_RESULT_EXT,QUERY_RESULT_AVAILABLE_EXT,TIME_ELAPSED_EXT,TIMESTAMP_EXT,GPU_DISJOINT_EXT,beginQueryEXT,createQueryEXT,deleteQueryEXT,endQueryEXT,getQueryEXT,getQueryObjectEXT,isQueryEXT,queryCounterEXT"],"EXT_float_blend":["EXTFloatBlend",""],"EXT_frag_depth":["EXTFragDepth",""],"EXT_polygon_offset_clamp":["EXTPolygonOffsetClamp","POLYGON_OFFSET_CLAMP_EXT,polygonOffsetClampEXT"],"EXT_texture_compression_bptc":["EXTTextureCompressionBPTC","COMPRESSED_RGBA_BPTC_UNORM_EXT,COMPRESSED_SRGB_ALPHA_BPTC_UNORM_EXT,COMPRESSED_RGB_BPTC_SIGNED_FLOAT_EXT,COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT_EXT"],"EXT_texture_compression_rgtc":["EXTTextureCompressionRGTC","COMPRESSED_RED_RGTC1_EXT,COMPRESSED_SIGNED_RED_RGTC1_EXT,COMPRESSED_RED_GREEN_RGTC2_EXT,COMPRESSED_SIGNED_RED_GREEN_RGTC2_EXT"],"EXT_texture_filter_anisotropic":["EXTTextureFilterAnisotropic","TEXTURE_MAX_ANISOTROPY_EXT,MAX_TEXTURE_MAX_ANISOTROPY_EXT"],"EXT_sRGB":["EXTsRGB","SRGB_EXT,SRGB_ALPHA_EXT,SRGB8_ALPHA8_EXT,FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING_EXT"],"KHR_parallel_shader_compile":["KHRParallelShaderCompile","COMPLETION_STATUS_KHR"],"OES_element_index_uint":["OESElementIndexUint",""],"OES_fbo_render_mipmap":["OESFboRenderMipmap",""],"OES_standard_derivatives":["OESStandardDerivatives","FRAGMENT_SHADER_DERIVATIVE_HINT_OES"],"OES_texture_float":["OESTextureFloat",""],"OES_texture_float_linear":["OESTextureFloatLinear",""],"OES_texture_half_float":["OESTextureHalfFloat","HALF_FLOAT_OES"],"OES_texture_half_float_linear":["OESTextureHalfFloatLinear",""],"OES_vertex_array_object":["OESVertexArrayObject","VERTEX_ARRAY_BINDING_OES,bindVertexArrayOES,createVertexArrayOES,deleteVertexArrayOES,isVertexArrayOES"],"WEBGL_blend_func_extended":["WebGLBlendFuncExtended","SRC1_COLOR_WEBGL,SRC1_ALPHA_WEBGL,ONE_MINUS_SRC1_COLOR_WEBGL,ONE_MINUS_SRC1_ALPHA_WEBGL,MAX_DUAL_SOURCE_DRAW_BUFFERS_WEBGL"],"WEBGL_color_buffer_float":["WebGLColorBufferFloat","RGBA32F_EXT,FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE_EXT,UNSIGNED_NORMALIZED_EXT"],"WEBGL_compressed_texture_astc":["WebGLCompressedTextureASTC","COMPRESSED_RGBA_ASTC_4x4_KHR,COMPRESSED_RGBA_ASTC_5x4_KHR,COMPRESSED_RGBA_ASTC_5x5_KHR,COMPRESSED_RGBA_ASTC_6x5_KHR,COMPRESSED_RGBA_ASTC_6x6_KHR,COMPRESSED_RGBA_ASTC_8x5_KHR,COMPRESSED_RGBA_ASTC_8x6_KHR,COMPRESSED_RGBA_ASTC_8x8_KHR,COMPRESSED_RGBA_ASTC_10x5_KHR,COMPRESSED_RGBA_ASTC_10x6_KHR,COMPRESSED_RGBA_ASTC_10x8_KHR,COMPRESSED_RGBA_ASTC_10x10_KHR,COMPRESSED_RGBA_ASTC_12x10_KHR,COMPRESSED_RGBA_ASTC_12x12_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_6x5_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_8x5_KHR"],"WEBGL_compressed_texture_etc":["WebGLCompressedTextureETC","COMPRESSED_R11_EAC,COMPRESSED_SIGNED_R11_EAC,COMPRESSED_RG11_EAC,COMPRESSED_SIGNED_RG11_EAC,COMPRESSED_RGB8_ETC2,COMPRESSED_SRGB8_ETC2,COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2,COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2,COMPRESSED_RGBA8_ETC2_EAC,COMPRESSED_SRGB8_ALPHA8_ETC2_EAC"],"WEBGL_compressed_texture_etc1":["WebGLCompressedTextureETC1","COMPRESSED_RGB_ETC1_WEBGL"],"WEBGL_compressed_texture_s3tc":["WebGLCompressedTextureS3TC","COMPRESSED_RGB_S3TC_DXT1_EXT,COMPRESSED_RGBA_S3TC_DXT1_EXT,COMPRESSED_RGBA_S3TC_DXT3_EXT,COMPRESSED_RGBA_S3TC_DXT5_EXT"],"WEBGL_compressed_texture_s3tc_srgb":["WebGLCompressedTextureS3TCsRGB","COMPRESSED_SRGB_S3TC_DXT1_EXT,COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT,COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT,COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT"],"WEBGL_debug_renderer_info":["WebGLDebugRendererInfo","UNMASKED_VENDOR_WEBGL,UNMASKED_RENDERER_WEBGL"],"WEBGL_debug_shaders":["WebGLDebugShaders","getTranslatedShaderSource"],"WEBGL_depth_texture":["WebGLDepthTexture","UNSIGNED_INT_24_8_WEBGL"],"WEBGL_draw_buffers":["WebGLDrawBuffers","COLOR_ATTACHMENT0_WEBGL,COLOR_ATTACHMENT1_WEBGL,COLOR_ATTACHMENT2_WEBGL,COLOR_ATTACHMENT3_WEBGL,COLOR_ATTACHMENT4_WEBGL,COLOR_ATTACHMENT5_WEBGL,COLOR_ATTACHMENT6_WEBGL,COLOR_ATTACHMENT7_WEBGL,COLOR_ATTACHMENT8_WEBGL,COLOR_ATTACHMENT9_WEBGL,COLOR_ATTACHMENT10_WEBGL,COLOR_ATTACHMENT11_WEBGL,COLOR_ATTACHMENT12_WEBGL,COLOR_ATTACHMENT13_WEBGL,COLOR_ATTACHMENT14_WEBGL,COLOR_ATTACHMENT15_WEBGL,DRAW_BUFFER0_WEBGL,DRAW_BUFFER1_WEBGL,DRAW_BUFFER2_WEBGL,DRAW_BUFFER3_WEBGL"],"WEBGL_lose_context":["WebGLLoseContext","loseContext,restoreContext"],"WEBGL_multi_draw":["WebGLMultiDraw","multiDrawArraysInstancedWEBGL,multiDrawArraysWEBGL,multiDrawElementsInstancedWEBGL,multiDrawElementsWEBGL"]};
   const GL2_EXT_SHAPE = {"EXT_clip_control":["EXTClipControl","LOWER_LEFT_EXT,UPPER_LEFT_EXT,NEGATIVE_ONE_TO_ONE_EXT,ZERO_TO_ONE_EXT,CLIP_ORIGIN_EXT,CLIP_DEPTH_MODE_EXT,clipControlEXT"],"EXT_color_buffer_float":["EXTColorBufferFloat",""],"EXT_color_buffer_half_float":["EXTColorBufferHalfFloat","RGBA16F_EXT,RGB16F_EXT,FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE_EXT,UNSIGNED_NORMALIZED_EXT"],"EXT_depth_clamp":["EXTDepthClamp","DEPTH_CLAMP_EXT"],"EXT_disjoint_timer_query_webgl2":["EXTDisjointTimerQueryWebGL2","QUERY_COUNTER_BITS_EXT,TIME_ELAPSED_EXT,TIMESTAMP_EXT,GPU_DISJOINT_EXT,queryCounterEXT"],"EXT_float_blend":["EXTFloatBlend",""],"EXT_polygon_offset_clamp":["EXTPolygonOffsetClamp","POLYGON_OFFSET_CLAMP_EXT,polygonOffsetClampEXT"],"EXT_texture_compression_bptc":["EXTTextureCompressionBPTC","COMPRESSED_RGBA_BPTC_UNORM_EXT,COMPRESSED_SRGB_ALPHA_BPTC_UNORM_EXT,COMPRESSED_RGB_BPTC_SIGNED_FLOAT_EXT,COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT_EXT"],"EXT_texture_compression_rgtc":["EXTTextureCompressionRGTC","COMPRESSED_RED_RGTC1_EXT,COMPRESSED_SIGNED_RED_RGTC1_EXT,COMPRESSED_RED_GREEN_RGTC2_EXT,COMPRESSED_SIGNED_RED_GREEN_RGTC2_EXT"],"EXT_texture_filter_anisotropic":["EXTTextureFilterAnisotropic","TEXTURE_MAX_ANISOTROPY_EXT,MAX_TEXTURE_MAX_ANISOTROPY_EXT"],"EXT_texture_norm16":["EXTTextureNorm16","R16_EXT,RG16_EXT,RGB16_EXT,RGBA16_EXT,R16_SNORM_EXT,RG16_SNORM_EXT,RGB16_SNORM_EXT,RGBA16_SNORM_EXT"],"KHR_parallel_shader_compile":["KHRParallelShaderCompile","COMPLETION_STATUS_KHR"],"NV_shader_noperspective_interpolation":["NVShaderNoperspectiveInterpolation",""],"OES_draw_buffers_indexed":["OESDrawBuffersIndexed","blendEquationSeparateiOES,blendEquationiOES,blendFuncSeparateiOES,blendFunciOES,colorMaskiOES,disableiOES,enableiOES"],"OES_sample_variables":["OESSampleVariables",""],"OES_shader_multisample_interpolation":["OESShaderMultisampleInterpolation","MIN_FRAGMENT_INTERPOLATION_OFFSET_OES,MAX_FRAGMENT_INTERPOLATION_OFFSET_OES,FRAGMENT_INTERPOLATION_OFFSET_BITS_OES"],"OES_texture_float_linear":["OESTextureFloatLinear",""],"WEBGL_blend_func_extended":["WebGLBlendFuncExtended","SRC1_COLOR_WEBGL,SRC1_ALPHA_WEBGL,ONE_MINUS_SRC1_COLOR_WEBGL,ONE_MINUS_SRC1_ALPHA_WEBGL,MAX_DUAL_SOURCE_DRAW_BUFFERS_WEBGL"],"WEBGL_compressed_texture_astc":["WebGLCompressedTextureASTC","COMPRESSED_RGBA_ASTC_4x4_KHR,COMPRESSED_RGBA_ASTC_5x4_KHR,COMPRESSED_RGBA_ASTC_5x5_KHR,COMPRESSED_RGBA_ASTC_6x5_KHR,COMPRESSED_RGBA_ASTC_6x6_KHR,COMPRESSED_RGBA_ASTC_8x5_KHR,COMPRESSED_RGBA_ASTC_8x6_KHR,COMPRESSED_RGBA_ASTC_8x8_KHR,COMPRESSED_RGBA_ASTC_10x5_KHR,COMPRESSED_RGBA_ASTC_10x6_KHR,COMPRESSED_RGBA_ASTC_10x8_KHR,COMPRESSED_RGBA_ASTC_10x10_KHR,COMPRESSED_RGBA_ASTC_12x10_KHR,COMPRESSED_RGBA_ASTC_12x12_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_6x5_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR,COMPRESSED_SRGB8_ALPHA8_ASTC_8x5_KHR"],"WEBGL_compressed_texture_etc":["WebGLCompressedTextureETC","COMPRESSED_R11_EAC,COMPRESSED_SIGNED_R11_EAC,COMPRESSED_RG11_EAC,COMPRESSED_SIGNED_RG11_EAC,COMPRESSED_RGB8_ETC2,COMPRESSED_SRGB8_ETC2,COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2,COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2,COMPRESSED_RGBA8_ETC2_EAC,COMPRESSED_SRGB8_ALPHA8_ETC2_EAC"],"WEBGL_compressed_texture_etc1":["WebGLCompressedTextureETC1","COMPRESSED_RGB_ETC1_WEBGL"],"WEBGL_compressed_texture_s3tc":["WebGLCompressedTextureS3TC","COMPRESSED_RGB_S3TC_DXT1_EXT,COMPRESSED_RGBA_S3TC_DXT1_EXT,COMPRESSED_RGBA_S3TC_DXT3_EXT,COMPRESSED_RGBA_S3TC_DXT5_EXT"],"WEBGL_compressed_texture_s3tc_srgb":["WebGLCompressedTextureS3TCsRGB","COMPRESSED_SRGB_S3TC_DXT1_EXT,COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT,COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT,COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT"],"WEBGL_debug_renderer_info":["WebGLDebugRendererInfo","UNMASKED_VENDOR_WEBGL,UNMASKED_RENDERER_WEBGL"],"WEBGL_debug_shaders":["WebGLDebugShaders","getTranslatedShaderSource"],"WEBGL_lose_context":["WebGLLoseContext","loseContext,restoreContext"],"WEBGL_multi_draw":["WebGLMultiDraw","multiDrawArraysInstancedWEBGL,multiDrawArraysWEBGL,multiDrawElementsInstancedWEBGL,multiDrawElementsWEBGL"],"WEBGL_stencil_texturing":["WebGLStencilTexturing","DEPTH_STENCIL_TEXTURE_MODE_WEBGL,STENCIL_INDEX_WEBGL"]};
   const GL1_SUPPORTED = ["ANGLE_instanced_arrays", "EXT_blend_minmax", "EXT_clip_control", "EXT_color_buffer_half_float", "EXT_depth_clamp", "EXT_disjoint_timer_query", "EXT_float_blend", "EXT_frag_depth", "EXT_polygon_offset_clamp", "EXT_texture_compression_bptc", "EXT_texture_compression_rgtc", "EXT_texture_filter_anisotropic", "EXT_sRGB", "KHR_parallel_shader_compile", "OES_element_index_uint", "OES_fbo_render_mipmap", "OES_standard_derivatives", "OES_texture_float", "OES_texture_float_linear", "OES_texture_half_float", "OES_texture_half_float_linear", "OES_vertex_array_object", "WEBGL_blend_func_extended", "WEBGL_color_buffer_float", "WEBGL_compressed_texture_astc", "WEBGL_compressed_texture_etc", "WEBGL_compressed_texture_etc1", "WEBGL_compressed_texture_s3tc", "WEBGL_compressed_texture_s3tc_srgb", "WEBGL_debug_renderer_info", "WEBGL_debug_shaders", "WEBGL_depth_texture", "WEBGL_draw_buffers", "WEBGL_lose_context", "WEBGL_multi_draw"];
   const GL2_SUPPORTED = ["EXT_clip_control", "EXT_color_buffer_float", "EXT_color_buffer_half_float", "EXT_depth_clamp", "EXT_disjoint_timer_query_webgl2", "EXT_float_blend", "EXT_polygon_offset_clamp", "EXT_texture_compression_bptc", "EXT_texture_compression_rgtc", "EXT_texture_filter_anisotropic", "EXT_texture_norm16", "KHR_parallel_shader_compile", "NV_shader_noperspective_interpolation", "OES_draw_buffers_indexed", "OES_sample_variables", "OES_shader_multisample_interpolation", "OES_texture_float_linear", "WEBGL_blend_func_extended", "WEBGL_compressed_texture_astc", "WEBGL_compressed_texture_etc", "WEBGL_compressed_texture_etc1", "WEBGL_compressed_texture_s3tc", "WEBGL_compressed_texture_s3tc_srgb", "WEBGL_debug_renderer_info", "WEBGL_debug_shaders", "WEBGL_lose_context", "WEBGL_multi_draw", "WEBGL_stencil_texturing"];
 
-  // Константы расширений, значения которых важны: остальным хватает наличия.
-  // Диапазоны и точки — дробные, список сжатых форматов — беззнаковый.
+  // Extension constants whose values matter; for the rest presence is enough.
+  // Ranges and points are floats, the compressed format list unsigned.
   const GL_F32 = [2928, 3106, 32824, 33901, 33902, 2849, 32777];
   const GL_U32 = [34467];
-  // Параметры, которые появляются только вместе с расширением: их нет среди
-  // констант интерфейса, но спрашивают их наравне со всеми.
-  // Значения, которые появляются только вместе с расширением. Браузер отдаёт
-  // по ним `null`, пока страница не попросила расширение через `getExtension`,
-  // и по этому легко отличить подделку: настоящий Chrome не назовёт видеокарту
-  // тому, кто не спросил `WEBGL_debug_renderer_info`. Мы называли всегда.
+  // Parameters that exist only with an extension: the browser returns `null`
+  // until the page requests the extension via `getExtension`. A real Chrome
+  // never names the GPU to someone who did not ask for
+  // `WEBGL_debug_renderer_info`.
   const EXT_PARAMS = {
     34047: [16, 'EXT_texture_filter_anisotropic'],
-    // В WebGL2 подсказка о производных — обычный параметр; расширение
-    // нужно только первой версии.
+    // In WebGL2 the derivative hint is a regular parameter; only version 1
+    // needs the extension.
     35723: [4352, 'OES_standard_derivatives', 1],
     36795: [false, 'EXT_disjoint_timer_query'],
     37445: [null, 'WEBGL_debug_renderer_info'],
@@ -10300,10 +10122,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   };
 
   const GL_ARITY = __GL_ARITY__;
-  // Потерянный контекст WebGL (WEBGL_lose_context.loseContext): у Chrome
-  // событие webglcontextlost приходит сразу, isContextLost — true, getError
-  // один раз отвечает CONTEXT_LOST_WEBGL (0x9242), запросы — null, остальное
-  // ничего не делает. У нас loseContext был пустым.
+  // Lost WebGL context (WEBGL_lose_context.loseContext): in Chrome
+  // webglcontextlost fires immediately, isContextLost is true, getError
+  // returns CONTEXT_LOST_WEBGL (0x9242) once, queries return null, and
+  // everything else does nothing.
   const GL_LOST = new WeakMap();
   const glLostAnswer = (name, lost) => {
     if (name === 'isContextLost') return true;
@@ -10327,7 +10149,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     if (!impl || GL_LOST.has(impl)) return;
     const lost = { pending: true, restorable: false };
     GL_LOST.set(impl, lost);
-    // Отменённое событие разрешает restoreContext (как в спецификации).
+    // A cancelled event allows restoreContext (per spec).
     lost.restorable = !glFire(impl, 'webglcontextlost');
   };
   const glRestore = (impl) => {
@@ -10340,8 +10162,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const P = C.prototype;
     if (!P.__ptPublished) {
       try { Object.defineProperty(P, '__ptPublished', { value: true }); } catch (e) {}
-      // Константы — данные, а не функции, и в Chrome их не переписать и не
-      // удалить: дескриптор снят оттуда же.
+      // Constants are data, not functions, and in Chrome cannot be rewritten
+      // or deleted: the descriptor is captured from there.
       for (const pair of constsStr.split(',')) {
         const eq = pair.indexOf('=');
         if (eq < 0) continue;
@@ -10352,8 +10174,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         } catch (e) {}
       }
       for (const name of methodsStr.split(',')) {
-        // Столько доводов, сколько требует браузер: вызов с меньшим числом —
-        // отказ с названным методом, а не тихое `undefined`.
+        // As many args as the browser requires: fewer is a refusal naming the
+        // method, not a silent `undefined`.
         const need = GL_ARITY[name] | 0;
         const f = ({
           [name](...args) {
@@ -10391,17 +10213,16 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         try { Object.defineProperty(P, name, { get: mg, set: ms, enumerable: true, configurable: true }); } catch (e) {}
       }
     }
-    if (!impl) return null;                    // только объявить интерфейс
+    if (!impl) return null;                    // only declare the interface
     const pub = Object.create(P);
     CTX_IMPL.set(pub, impl);
     return pub;
   };
 
-  // Интерфейсы объявляем сразу, а не при первом `getContext`: в браузере члены
-  // лежат на прототипе с самого начала, и сборщик, который перечисляет
-  // `CanvasRenderingContext2D.prototype` до всякого холста, у нас видел пустоту
-  // (а заодно её видел и наш собственный трассировщик, отчего целая фаза
-  // сбора — вся работа с WebGL — не попадала в ленту).
+  // Interfaces are declared up front, not at the first `getContext`: in the
+  // browser members are on the prototype from the start, and a collector
+  // enumerating `CanvasRenderingContext2D.prototype` before any canvas must
+  // see them (so must our own tracer).
   try {
     publishContext(null, globalThis.CanvasRenderingContext2D, CTX2D_METHODS, CTX2D_ATTRS);
     publishContext(null, globalThis.OffscreenCanvasRenderingContext2D, CTX2D_METHODS, CTX2D_ATTRS);
@@ -10409,8 +10230,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     publishGL(null, globalThis.WebGL2RenderingContext, GL2_CONSTS, GL2_METHODS);
   } catch (e) {}
 
-  // Прототипы расширений WebGL — по снятой с Chrome форме
-  // (webgl_ext_shapes.json): имена, значения констант, длины методов, флаги.
+  // WebGL extension prototypes per the shape captured from Chrome
+  // (webgl_ext_shapes.json): names, constant values, method lengths, flags.
   const EXT_TABLE = __WEBGL_EXT_SHAPES__;
   const EXT_CACHE = new WeakMap(), EXT_OWNER = new WeakMap(), EXT_PROTOS = new Map();
   const EXT_METHODS = {
@@ -10456,8 +10277,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     return P;
   };
   const makeGL = (canvas, ver, want) => {
-    // Что положили в uniform — то и вернёт getUniform: числа с плавающей
-    // точкой уже в float32, как у браузера.
+    // getUniform returns what was stored, with floats already float32 as in
+    // the browser.
     const US = new Map();
     const P = {
       0x1F00: 'WebKit',                                   // VENDOR
@@ -10467,10 +10288,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       0x9245: WEBGL_VENDOR,                               // UNMASKED_VENDOR_WEBGL
       0x9246: WEBGL_RENDERER,                             // UNMASKED_RENDERER_WEBGL
     };
-    // Числовые пределы раньше стояли здесь горстью догадок — и половина из них
-    // расходилась с тем, что на этой же машине отдаёт Chrome. Теперь их берут
-    // из измеренной таблицы (`GL1_PARAMS`/`GL2_PARAMS`), а здесь остаётся
-    // только то, чем мы представляемся: вендор, рендерер и версии.
+    // Numeric limits come from the measured table (`GL1_PARAMS`/`GL2_PARAMS`);
+    // only our identity stays here: vendor, renderer and versions.
     // WebGL enum constants — fingerprinters read `gl.VENDOR` etc., not literals.
     const C = {
       VENDOR: 0x1F00, RENDERER: 0x1F01, VERSION: 0x1F02, SHADING_LANGUAGE_VERSION: 0x8B8C,
@@ -10491,19 +10310,15 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       MAX_3D_TEXTURE_SIZE: 0x8073, MAX_ARRAY_TEXTURE_LAYERS: 0x88FF,
       MAX_DRAW_BUFFERS: 0x8824, MAX_COLOR_ATTACHMENTS: 0x8CDF,
     };
-    // Пределы больше не выдумываем: они сняты с Chrome на этой же машине и
-    // лежат в `GL1_PARAMS`/`GL2_PARAMS`. Прежние «правдоподобные» значения
-    // расходились с настоящими в половине случаев — 8 сглаживаний против 16,
-    // 2048 слоёв против 2048 у одних и нули у полутора десятков других.
+    // Limits are not invented: captured from Chrome on this machine into
+    // `GL1_PARAMS`/`GL2_PARAMS`.
     const glProto = (ver === 2 ? globalThis.WebGL2RenderingContext : globalThis.WebGLRenderingContext).prototype;
-    // То же и здесь: реализация живёт отдельно от интерфейса (см. publishGL).
-    // Какие расширения страница успела попросить: часть значений видна только
-    // после этого.
+    // Here too the implementation lives apart from the interface (see publishGL).
+    // Extensions the page has requested: some values are visible only after that.
     const asked = new Set();
-    // Буфер рисования следует за размером холста: страница ставит холст 1×1,
-    // берёт контекст, потом растит его до 16×16 и читает — у нас читался
-    // прежний один пиксель, а дальше поле нулей. Окно вывода при этом не
-    // трогается, как и требует спецификация: его задаёт сама страница.
+    // The drawing buffer follows the canvas size: a page sets a 1x1 canvas,
+    // gets a context, grows it to 16x16 and reads. The viewport is left
+    // alone, as the spec requires: the page sets it.
     let vp = [0, 0, canvas.width || 300, canvas.height || 150];
     let bw = canvas.width || 300, bh = canvas.height || 150;
     const syncSize = () => {
@@ -10528,17 +10343,16 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const T = ver === 2 ? GL2_PARAMS : GL1_PARAMS;
         if (Object.prototype.hasOwnProperty.call(T, p)) {
           const v = T[p];
-          // Вид массива у каждого параметра свой, и он читается: диапазоны —
-          // Float32Array, список сжатых форматов — Uint32Array, размеры —
-          // Int32Array, маска цвета — обычный массив булевых.
+          // Each parameter has its own array type, and it is observable: ranges
+          // are Float32Array, compressed formats Uint32Array, sizes Int32Array,
+          // the color mask a plain boolean array.
           if (!Array.isArray(v)) return v;
           if (typeof v[0] === 'boolean') return v.slice();
           if (GL_F32.indexOf(p) >= 0) return new Float32Array(v);
           if (GL_U32.indexOf(p) >= 0) return new Uint32Array(v);
           return new Int32Array(v);
         }
-        // Неизвестное перечисление — `null`, а не ноль: браузер так и делает,
-        // а ноль означал бы, что мы знаем ответ.
+        // An unknown enum gives `null`, not zero, as in the browser.
         return null;
       },
       getShaderPrecisionFormat(st, pt){
@@ -10560,10 +10374,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const shape = (ver === 2 ? GL2_EXT_SHAPE : GL1_EXT_SHAPE)[name];
         if (!shape) return null;
         asked.add(name);
-        // Как у Chrome: объект расширения один на контекст, собственных
-        // свойств у него нет — константы, методы и метка лежат на скрытом
-        // прототипе интерфейса (без собственного constructor). У нас члены
-        // висели на самом объекте, а getSupportedProfiles не было вовсе.
+        // As in Chrome: one extension object per context, with no own
+        // properties; constants, methods and tag live on a hidden interface
+        // prototype (without its own constructor).
         let cache = EXT_CACHE.get(this);
         if (!cache) { cache = new Map(); EXT_CACHE.set(this, cache); }
         if (cache.has(name)) return cache.get(name);
@@ -10575,12 +10388,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       getSupportedExtensions(){ return (ver === 2 ? GL2_SUPPORTED : GL1_SUPPORTED).slice(); },
       getAttribLocation(){ return 0; },
       getContextAttributes(){
-        // Запрошенное отражается, как у браузера: `powerPreference: 'low-power'`
-        // возвращается словом, а не «default».
+        // Requested values are reflected as in the browser:
+        // `powerPreference: 'low-power'` comes back as is, not as "default".
         const w = (want && typeof want === 'object') ? want : {};
         const b = (k, d) => (k in w ? !!w[k] : d);
         const pp = String(w.powerPreference || 'default');
-        // В стороннем кадре Chrome отдаёт «default» как «low-power» (в воркере — нет).
+        // In a cross-site frame Chrome reports "default" as "low-power" (not in workers).
         const dflt = globalThis.__pt_crossSite && typeof document !== 'undefined' ? 'low-power' : 'default';
         return { alpha: b('alpha', true), antialias: b('antialias', true), depth: b('depth', true), desynchronized: b('desynchronized', false),
           failIfMajorPerformanceCaveat: b('failIfMajorPerformanceCaveat', false),
@@ -10591,8 +10404,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
       getContextAttributes_: null,
     });
-    // Размеры буфера — живые: `Object.assign` вызвал бы геттер и запомнил
-    // число, поэтому они ставятся отдельно, уже после сборки объекта.
+    // Buffer sizes are live: `Object.assign` would call the getter and store
+    // a number, so they are defined separately after the object is built.
     for (const [name, get] of [['drawingBufferWidth', () => { syncSize(); return bw; }],
                                ['drawingBufferHeight', () => { syncSize(); return bh; }]]) {
       Object.defineProperty(gl, name, { get, enumerable: true, configurable: true });
@@ -10637,8 +10450,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const h = (s.naturalHeight || s.height || s.videoHeight || 0) | 0;
         return { w, h, data: EMPTY };
       };
-      // Столько доводов, сколько требует браузер. Оборачиваем после сборки —
-      // сразу под `Object.assign` ниже.
+      // As many args as the browser requires; wrapped after assembly, right
+      // under `Object.assign` below.
       Object.assign(gl, {
         createShader(type) { const o = obj(shProto, __pt_glCreateShader(gid, type >>> 0)); o.__type = type; return o; },
         shaderSource(sh, src) { if (sh) sh.__src = String(src); },
@@ -10670,8 +10483,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         uniformMatrix4fv(l, transpose, v) { const a = new Float32Array(v); US.set(L(l), a); __pt_glUniformMatrix4(gid, L(l), transpose ? 1 : 0, a); },
         getUniform(p, l) { const v = US.get(L(l)); if (!v) return null; return v.length === 1 ? v[0] : v.slice(); },
         clearColor(r, g, b, a) { const q = (v) => Math.max(0, Math.min(255, Math.round((+v || 0) * 255))); clearRGBA = [q(r), q(g), q(b), q(a)]; P[0x0C22] = new Float32Array([+r || 0, +g || 0, +b || 0, +a || 0]); },
-        // Состояние, которое читается обратно через getParameter — уже в float32,
-        // как у браузера: 11.2 возвращается как 11.199999809265137.
+        // State read back via getParameter is already float32, as in the
+        // browser: 11.2 comes back as 11.199999809265137.
         lineWidth(w) { P[0x0B21] = Math.fround(+w || 0); },
         polygonOffset(f, u) { P[0x8038] = Math.fround(+f || 0); P[0x2A00] = Math.fround(+u || 0); },
         depthRange(n, f) { P[0x0B70] = new Float32Array([Math.max(0, Math.min(1, +n || 0)), Math.max(0, Math.min(1, +f || 0))]); },
@@ -10745,8 +10558,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           const px = __pt_glReadPixels(gid, x | 0, y | 0, w | 0, h | 0, 0);
           const n = Math.min(dst.length === undefined ? px.length : dst.length, px.length);
           for (let i = 0; i < n; i++) dst[i] = px[i];
-          // Ничего не возвращает: пиксели кладут в переданный массив, а сам
-          // вызов в браузере отдаёт undefined.
+          // Returns nothing: pixels go into the given array, and the call
+          // returns undefined in the browser.
         },
         // toDataURL is the *canvas*, so read the drawing buffer even mid-pass
         // with an offscreen framebuffer bound, then put the binding back.
@@ -10759,8 +10572,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       });
       // WebGL 1 reaches vertex arrays through the extension object, not the
       // context — hand back a working one instead of the usual empty stub.
-      // (Методы OES_vertex_array_object теперь идут через общий прототип
-      // расширения и зовут createVertexArray/bindVertexArray контекста.)
+      // (OES_vertex_array_object methods now go through the shared extension
+      // prototype and call the context's createVertexArray/bindVertexArray.)
     } else {
       // Fallback synthesis (no `webgl` feature): back the readback with the shared
       // surface — clears are exact, draws stamp a pattern keyed by the op log.
@@ -10795,7 +10608,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           S.note('readPixels|' + __ptJ(x, y, w, h, format, type));
           w = w | 0; h = h | 0;
           if (dst && dst.length >= w * h * 4) S.read(x, y, w, h, dst);
-          // Пиксели уходят в переданный массив; сам вызов — undefined.
+          // Pixels go into the given array; the call itself returns undefined.
         },
         __ptPixels() { return S.pixels(); },
       });
@@ -10837,11 +10650,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // and stops a page (or tells a fingerprinter it is not talking to Chrome).
     if (!gl.getShaderParameter) gl.getShaderParameter = function (sh, pn) { return pn === 0x8B4F ? (sh && sh.__type) : true; };
     if (!gl.getProgramParameter) gl.getProgramParameter = function (p, pn) { return pn === C.LINK_STATUS ? true : 0; };
-    // Состояние, которое читается обратно, — как у Chrome 151 (сверено на
-    // scratchpad/gl_probe.js): текущее значение атрибута вершины (float32),
-    // параметры текстуры и сэмплера с умолчаниями GL (LOD — float32;
-    // неизвестное или не своё для WebGL1 — null), blendColor у WebGL1
-    // зажимается в [0, 1].
+    // Read-back state as in Chrome 151:
+    // current vertex attribute value (float32), texture and sampler params
+    // with GL defaults (LOD in float32; unknown or non-WebGL1 -> null),
+    // WebGL1 blendColor clamped to [0, 1].
     {
       const after = (name, fn) => { const f = gl[name]; gl[name] = function () { const r = typeof f === 'function' ? f.apply(this, arguments) : undefined; try { fn.apply(this, arguments); } catch (e) {} return r; }; };
       const VA = new Map();
@@ -10912,9 +10724,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   };
 
   // --- patch canvas element methods -------------------------------------
-  // Методы холста живут у браузера на HTMLCanvasElement, а не на HTMLElement:
+  // Canvas methods live on HTMLCanvasElement, not HTMLElement:
   // `Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'getContext')`
-  // читают напрямую, и лишний этаж здесь так же заметен, как недостающий.
+  // is read directly, and an extra level shows as much as a missing one.
   const proto = (globalThis.HTMLCanvasElement && globalThis.HTMLCanvasElement.prototype)
     || (globalThis.HTMLElement && globalThis.HTMLElement.prototype);
   if (proto) {
@@ -10924,9 +10736,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // returns null for a conflicting request rather than a second context.
       const t = type === 'experimental-webgl' ? 'webgl' : String(type);
       if (this.__ptCtxType && this.__ptCtxType !== t) return null;
-      // WebGPU: у Chrome холст отдаёт контекст, а не null, — и на нём висит
-      // `canvas`, `configure`, `getCurrentTexture` и прочее. Мы отвечали null,
-      // а `navigator.gpu` при этом был на месте: сочетание само по себе примета.
+      // WebGPU: Chrome's canvas returns a context, not null, with `canvas`,
+      // `configure`, `getCurrentTexture` etc. Null alongside a present
+      // `navigator.gpu` would itself be a tell.
       if (t === 'webgpu') {
         if (this.__ptGpuCtx) return this.__ptGpuCtx;
         const C = globalThis.GPUCanvasContext;
@@ -10945,8 +10757,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
               enumerable: true, configurable: true,
             });
           } catch (e) {}
-          // Настоящие `configure`/`getConfiguration` уже стоят на прототипе —
-          // заглушка ставится только если их там нет.
+          // Real `configure`/`getConfiguration` are already on the prototype;
+          // the stub is only added if they are missing.
           if (typeof P.configure !== 'function') put('configure', function configure() {});
           if (typeof P.unconfigure !== 'function') put('unconfigure', function unconfigure() {});
           if (typeof P.getConfiguration !== 'function') {
@@ -10967,9 +10779,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         try { Object.defineProperty(this, '__ptGpuCtx', { value: ctx, configurable: true, enumerable: false }); } catch (e) {}
         return ctx;
       }
-      // `bitmaprenderer` — двенадцатый контекст, за которым сборщик и приходит:
-      // в паре с `transferToImageBitmap` он показывает снимок. Мы отвечали
-      // null, и вся эта ветка не давала ничего.
+      // `bitmaprenderer`: together with `transferToImageBitmap` it shows a
+      // bitmap, and collectors use it.
       if (t === 'bitmaprenderer') {
         if (this.__ptBmpCtx) return this.__ptBmpCtx;
         const C = globalThis.ImageBitmapRenderingContext;
@@ -10988,7 +10799,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           try {
             Object.defineProperty(P, 'transferFromImageBitmap', {
               value: mask(function transferFromImageBitmap(bm) {
-                // Снимок ложится на холст: страница потом читает его обратно.
+                // The bitmap lands on the canvas; the page reads it back later.
                 const el = globalThis.__pt_bmpCtxOwner.get(this);
                 if (!el || !bm) return;
                 try {
@@ -11031,9 +10842,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       if (!p || !p.w || !p.h) return 'data:,';
       return __pt_pngDataUrl(p.w, p.h, p.data) || 'data:,';
     }, 'toDataURL');
-    // Data-URL в настоящий `Blob`: тело раскодировано, тип взят из самой
-    // ссылки. Один и тот же путь у `toBlob` элемента и у `convertToBlob`
-    // офскрина.
+    // Data URL to a real `Blob`: body decoded, type taken from the URL. Shared
+    // by the element's `toBlob` and the offscreen `convertToBlob`.
     if (!globalThis.__pt_blobFromDataUrl) {
       globalThis.__pt_blobFromDataUrl = (url) => {
         let type = 'image/png', body = '';
@@ -11052,10 +10862,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           '1 argument required, but only 0 present.');
       }
       if (typeof cb !== 'function') return;
-      // Настоящий `Blob` с настоящим PNG внутри: раньше отдавался литерал с
-      // выдуманным размером, и всё, что читает снимок байтами — `arrayBuffer`,
-      // `FileReader`, отправка на сервер — получало пустоту. И зовут обратно
-      // не сразу: в браузере кодирование уходит в задачу.
+      // A real `Blob` with a real PNG inside, for anything that reads the
+      // bitmap as bytes (`arrayBuffer`, `FileReader`, upload). The callback is
+      // not immediate: the browser encodes in a task.
       const url = this.toDataURL(type, quality);
       Promise.resolve().then(() => { cb(globalThis.__pt_blobFromDataUrl(url)); });
     }, 'toBlob');
@@ -11063,9 +10872,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
   // --- Image (new Image(); img.src = ... fires onload) ------------------
   if (globalThis.document) {
-    // Конструктор `Image` живёт в слое DOM: там он делает настоящий элемент, и
-    // запрос уходит по любому адресу, а не только по абсолютному `http(s)` —
-    // относительный `/pixel.png` прежняя реализация молча не отправляла вовсе.
+    // The `Image` constructor lives in the DOM layer: it creates a real
+    // element, and the request goes to any URL, including relative ones.
     if (!globalThis.HTMLImageElement) globalThis.HTMLImageElement = globalThis.Element;
   }
 
@@ -11089,11 +10897,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     setTargetAtTime() { return this; }, setValueCurveAtTime() { return this; },
     cancelScheduledValues() { return this; }, cancelAndHoldAtTime() { return this; },
   });
-  // Узел графа — это интерфейс: у браузера общие члены лежат на `AudioNode`,
-  // свои — на прототипе своего вида (`AnalyserNode`, `GainNode`…), а у самого
-  // объекта собственных свойств нет. У нас всё лежало на объекте, и
-  // `AnalyserNode.prototype` был пуст — при том что аудио читают наравне с
-  // канвасом.
+  // An audio node is an interface: in the browser shared members live on
+  // `AudioNode`, kind-specific ones on the kind's prototype (`AnalyserNode`,
+  // `GainNode`...), and the object has no own properties. Audio is
+  // fingerprinted as closely as canvas.
   const NODE_IFACE = {
     analyser: 'AnalyserNode', gain: 'GainNode', oscillator: 'OscillatorNode',
     compressor: 'DynamicsCompressorNode', biquad: 'BiquadFilterNode',
@@ -11139,8 +10946,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       channelCountMode: 'max', channelInterpretation: 'speakers', __ptKind: kind,
       connect(dst) {
         ctx.__ptEdges.push(kind + '>' + (dst && dst.__ptKind || 'destination'));
-        // Ребро запоминается ссылкой, а не именем вида: иначе граф из двух
-        // усилителей неотличим от графа с одним, и считать его нечем.
+        // Edges are stored by reference, not kind name: otherwise a graph of
+        // two gain nodes is indistinguishable from one.
         try {
           const to = (globalThis.__pt_audioState && __pt_audioState.get(dst)) || dst;
           if (to && typeof to === 'object') state.__ptOut.push(to);
@@ -11152,17 +10959,17 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
     }, extra || {});
     const iface = NODE_IFACE[kind];
-    // Общие члены — на `AudioNode`, свои — на прототипе своего вида: у Chrome
-    // на `AnalyserNode` ровно девять имён плюс `constructor`, а `connect` и
-    // `channelCount` лежат уровнем выше.
+    // Shared members on `AudioNode`, own ones on the kind's prototype: Chrome's
+    // `AnalyserNode` has exactly nine names plus `constructor`, while
+    // `connect` and `channelCount` sit a level higher.
     shapeNodeProto('AudioNode', 'EventTarget',
       ['context', 'numberOfInputs', 'numberOfOutputs', 'channelCount', 'channelCountMode',
        'channelInterpretation', 'connect', 'disconnect']);
     const SHARED = new Set(['context', 'numberOfInputs', 'numberOfOutputs', 'channelCount',
       'channelCountMode', 'channelInterpretation', 'connect', 'disconnect',
       'addEventListener', 'removeEventListener', 'dispatchEvent',
-      // `start`/`stop`/`onended` — не у каждого узла, а только у источников, и
-      // в браузере они на своём уровне: AudioScheduledSourceNode.
+      // `start`/`stop`/`onended` belong only to sources, on their own level
+      // in the browser: AudioScheduledSourceNode.
       'start', 'stop']);
     const scheduled = kind === 'oscillator' || kind === 'buffersource';
     if (scheduled) {
@@ -11170,14 +10977,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       if (S && globalThis[NODE_IFACE[kind]]) {
         try { Object.setPrototypeOf(globalThis[NODE_IFACE[kind]].prototype, S); } catch (e) {}
       } else {
-        // Имени нет в таблице — кладём на сам вид, лишь бы не на объект.
+        // Name not in the table: put it on the kind itself, just not on the object.
         shapeNodeProto(NODE_IFACE[kind], 'AudioNode', ['start', 'stop', 'onended']);
       }
     }
     const ownMembers = Object.keys(state).filter(
       (k) => k.lastIndexOf('__pt', 0) !== 0 && !SHARED.has(k));
-    // База у источника своя: OscillatorNode наследует AudioScheduledSourceNode,
-    // а не AudioNode напрямую — иначе `start` теряется вместе со ступенью.
+    // Sources have their own base: OscillatorNode inherits
+    // AudioScheduledSourceNode, not AudioNode directly, or `start` is lost.
     const P = iface ? shapeNodeProto(iface, scheduled ? 'AudioScheduledSourceNode' : 'AudioNode', ownMembers) : null;
     if (!P) { ctx.__ptNodes.push(state); return state; }
     const node = Object.create(P);
@@ -11206,17 +11013,18 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     note(ctx.__ptEdges.join(','));
     return h >>> 0;
   };
-  // Осциллятор в браузере не считает ряд Фурье на каждом отсчёте: он строит
-  // набор таблиц по 4096 точек — по одной на треть октавы, с обрезанными
-  // гармониками, — и читает две соседние с линейной интерполяцией, смешивая их.
-  // Разница с точным рядом мала, но она есть: 258,047 против 258,098 у Chrome
-  // на канонической проверке. Перенос PeriodicWave/OscillatorNode из
-  // WebKit/Blink, с их же размерами: 3 полосы на октаву, 400 центов на полосу.
+  // The browser's oscillator does not sum the Fourier series per sample: it
+  // builds 4096-point tables, one per third of an octave with truncated
+  // harmonics, and reads two neighbours with linear interpolation, blending
+  // them. The difference from the exact series is small but real (258.047 vs
+  // Chrome's 258.098 on the canonical test). Port of WebKit/Blink
+  // PeriodicWave/OscillatorNode with their sizes: 3 bands per octave, 400
+  // cents per band.
   const OSC_BANDS = 3, OSC_CENTS = 1200 / OSC_BANDS;
   const oscTableSize = (rate) => (rate <= 24000 ? 2048 : rate <= 88200 ? 4096 : 8192);
   const OSC_CACHE = new Map();
 
-  // Коэффициенты ряда — те же, что в браузере: все формы нечётные, косинусов нет.
+  // Series coefficients as in the browser: all shapes odd, no cosines.
   const oscPartial = (type, n) => {
     const pi = Math.PI, piFactor = 2 / (n * pi);
     if (type === 'square') return (n & 1) ? 2 * piFactor : 0;
@@ -11232,10 +11040,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const size = oscTableSize(rate);
     const maxPartials = size / 2;
     const ranges = Math.round(0.5 + OSC_BANDS * Math.log2(size));
-    // Гармоника набирается поворотом, а не вызовом синуса на каждый отсчёт:
-    // самая полная таблица — это две тысячи гармоник на четыре тысячи точек, и
-    // восемь миллионов синусов заняли бы секунды. Поворот даёт то же с точностью
-    // двойного числа за десятки миллисекунд.
+    // Harmonics are accumulated by rotation instead of a sine per sample: the
+    // fullest table is 2000 harmonics over 4000 points, and eight million
+    // sines would take seconds. Rotation gives the same to double precision
+    // in tens of milliseconds.
     const build = (partials) => {
       const t = new Float64Array(size);
       const step = 2 * Math.PI / size;
@@ -11253,12 +11061,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       }
       return t;
     };
-    // Масштаб нормировки браузер берёт с самой полной таблицы — со всеми
-    // гармониками, и обрезать их здесь нельзя: ряд треугольника сходится как
-    // 1/n², и уже на пятистах гармониках масштаб уходит на шесть сотых процента,
-    // а это ровно то, на сколько наш отпечаток расходился с браузерным.
-    // Самая полная таблица нужна только своему расчёту — ради множителя
-    // нормировки; движок нормирует сам.
+    // The browser takes the normalization scale from the fullest table, with
+    // all harmonics, so they cannot be truncated here: the triangle series
+    // converges as 1/n^2, and at 500 harmonics the scale is already off by
+    // 0.06%, exactly our former fingerprint error.
+    // The fullest table is only needed by our own computation, for the
+    // normalization factor; the engine normalizes itself.
     let scale = 1;
     if (typeof __pt_waveTable !== 'function') {
       const full = build(maxPartials);
@@ -11268,10 +11076,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     }
     const tables = new Array(ranges);
     const partialsFor = (r) => Math.floor(Math.pow(2, -r * OSC_CENTS / 1200) * maxPartials);
-    // Таблицу строит движок тем же обратным преобразованием, что браузер, и
-    // в той же одинарной точности: отпечаток по звуку — это её содержимое до
-    // последнего разряда, и считать её честно в двойной точности мало.
-    // Запасной путь — свой расчёт поворотом — остаётся для лёгкой сборки.
+    // The engine builds the table with the same inverse transform as the
+    // browser, in the same single precision: an audio fingerprint is the
+    // table's content to the last bit. The rotation-based path remains as a
+    // fallback for the light build.
     const native = typeof __pt_waveTable === 'function';
     const made = { size, ranges, scale, lowest: (rate / 2) / maxPartials,
                    get(r) {
@@ -11291,8 +11099,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     return made;
   };
 
-  // Один отсчёт осциллятора: выбор пары таблиц по высоте тона и две
-  // интерполяции — внутри таблицы и между таблицами.
+  // One oscillator sample: choose a table pair by pitch and interpolate twice,
+  // within a table and between tables.
   const oscWaveAt = (type, phase, freq, rate) => {
     const T = oscTables(type, rate);
     const f = Math.abs(freq);
@@ -11307,10 +11115,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const i0 = Math.floor(virt) % T.size;
     const i1 = (i0 + 1) % T.size;
     const frac = Math.fround(Math.fround(virt) - Math.fround(Math.floor(virt)));
-    // Именно так, как в браузере: `a + f*(b-a)` в одинарной точности, а не
-    // `(1-f)*a + f*b` — на хромовской таблице первая запись даёт все
-    // шестьдесят четыре отсчёта бит в бит, вторая ошибается на единицу
-    // младшего разряда в каждом четвёртом.
+    // Exactly as the browser: `a + f*(b-a)` in single precision, not
+    // `(1-f)*a + f*b`; on Chrome's table the former matches all 64 samples
+    // bit for bit, the latter is off by one ulp in every fourth.
     const f32 = Math.fround;
     const lerp = (a, b, t) => f32(a + f32(t * f32(b - a)));
     const sHigher = lerp(higher[i0], higher[i1], frac);
@@ -11318,21 +11125,18 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     return lerp(sHigher, sLower, between);
   };
 
-  // Компрессор. Здесь стояло «выше порога делим на степень сжатия», и это
-  // давало не тот звук: сумма отсчётов канонического отпечатка выходила 11,9
-  // против 124,0 у Chrome. Настоящий узел — это следящий детектор с коленом,
-  // предзадержкой и, главное, компенсирующим усилением, которого у нас не было
-  // вовсе; из-за него всё и было вдесятеро тише.
+  // Compressor. A real node is a tracking detector with a knee, pre-delay and,
+  // crucially, makeup gain (without it the canonical fingerprint sum was 11.9
+  // vs Chrome's 124.0).
   //
-  // Перенос алгоритма Google из WebKit/Blink (DynamicsCompressorKernel), с его
-  // же значениями по умолчанию: предзадержка 6 мс, зоны отпускания
-  // 0.09/0.16/0.42/0.98, добавочное усиление 0 дБ, смешивание 1.
-  // У браузера это одинарная точность: `powf(10, 0.05f*db)` и `20*log10f(x)`.
-  // От их округления зависит, куда попадёт двоичный поиск коэффициента колена,
-  // а он определён лишь до трёх десятитысячных — и уезжает на весь выход.
-  // Множитель у браузера — `float`-постоянная: `0.05f` это
-  // 0.0500000007450580596923828125, и произведение с ним округляется иначе,
-  // чем с двойным 0.05.
+  // Port of Google's WebKit/Blink algorithm (DynamicsCompressorKernel) with
+  // its defaults: 6 ms pre-delay, release zones 0.09/0.16/0.42/0.98, 0 dB
+  // post gain, wet mix 1.
+  // The browser uses single precision: `powf(10, 0.05f*db)` and
+  // `20*log10f(x)`. Their rounding decides where the knee coefficient binary
+  // search lands, which is determined only to 3e-4 and shifts the whole
+  // output. The browser's factor is a `float` constant: `0.05f` is
+  // 0.0500000007450580596923828125, which rounds differently than double 0.05.
   const dbToLin = (db) => Math.fround(Math.pow(10, Math.fround(Math.fround(0.05) * db)));
   const linToDb = (x) => (x ? Math.fround(20 * Math.fround(Math.log10(x))) : -1000);
 
@@ -11342,10 +11146,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const linearThreshold = f1(dbToLin(dbThreshold));
     const slope = f1(1 / ratio);
 
-    // Поиск коэффициента колена идёт одинарной точностью: пятнадцать
-    // делений оставляют его определённым лишь до трёх десятитысячных, и
-    // именно на этом уровне двойной счёт расходится с браузерным. Разница
-    // выходит постоянным множителем на весь выход — полторы десятитысячных.
+    // The knee coefficient search runs in single precision: fifteen bisections
+    // determine it only to 3e-4, exactly where double precision diverges
+    // from the browser; the difference is a constant factor of 1.5e-4 on the
+    // whole output.
     const kneeCurve = (x, k) => x < linearThreshold
       ? x
       : f1(linearThreshold + f1(f1(1 - f1(Math.exp(f1(-k * f1(x - linearThreshold))))) / k));
@@ -11356,10 +11160,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       const yDb = f1(linToDb(kneeCurve(x, k))), y2Db = f1(linToDb(kneeCurve(x2, k)));
       return f1(f1(y2Db - yDb) / f1(x2Db - xDb));
     };
-    // Коэффициент колена ищется двоичным поиском по наклону — пятнадцать шагов,
-    // как в исходнике.
-    // Границы поиска — тоже одинарной точности: у браузера это `float`, и
-    // десятая доля в нём не ровная.
+    // The knee coefficient is found by bisection on the slope, fifteen steps,
+    // as in the source. Search bounds are single precision too: in the
+    // browser they are `float`, and 0.1 is inexact there.
     let minK = f1(0.1), maxK = f1(10000), k = f1(5);
     {
       const x = f1(dbToLin(f1(dbThreshold + dbKnee)));
@@ -11375,18 +11178,17 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       ? kneeCurve(x, k)
       : f1(dbToLin(f1(ykneeThresholdDb + f1(slope * f1(f1(linToDb(x)) - kneeThresholdDb)))));
 
-    // Компенсирующее усиление: без него компрессор с порогом −50 дБ душит сигнал
-    // на два порядка, а браузер его возвращает — в степени 0,6, «на слух».
-    // Степень у браузера — `float`-постоянная: `0.6f` это
-    // 0.60000002384185791015625, и возведение в неё даёт другое число, чем в
-    // ровную шесть десятых. Множитель общий на весь выход, и ошибка в нём
-    // видна в каждом отсчёте.
+    // Makeup gain: without it a compressor at -50 dB threshold crushes the
+    // signal by two orders of magnitude; the browser restores it with power
+    // 0.6. The exponent is a `float` constant: `0.6f` is
+    // 0.60000002384185791015625, giving a different result than an even 0.6.
+    // The factor applies to the whole output, so an error shows in every sample.
     const masterLinearGain = f1(Math.pow(f1(1 / f1(saturate(1))), f1(0.6)));
 
-    // Все постоянные и все действия — одинарной точности и в том же порядке,
-    // что у браузера: там это `constexpr float`, посчитанный из долей зоны
-    // отпускания, а не двойное число, округлённое в конце. Разница выходит на
-    // седьмом знаке каждого отсчёта — ровно там, где страница и смотрит.
+    // All constants and operations in single precision and in the browser's
+    // order: there they are `constexpr float` computed from release zone
+    // fractions, not doubles rounded at the end. The difference lands in the
+    // seventh digit of every sample, exactly where pages look.
     const PI_OVER_TWO = f1(Math.PI / 2);
     const z1 = f1(0.09), z2 = f1(0.16), z3 = f1(0.42), z4 = f1(0.98);
     const mul = (c, z) => f1(f1(c) * z);
@@ -11422,8 +11224,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     for (let d = 0; d < nDivisions; d++) {
       if (!Number.isFinite(detectorAverage)) detectorAverage = 1;
       const desiredGain = detectorAverage;
-      // Обратный синус берётся одинарной точностью и делится на половину
-      // числа «пи» — тоже одинарной: у браузера это `asinf` и `float`-делитель.
+      // Arcsine in single precision divided by a single-precision pi/2: the
+      // browser uses `asinf` and a `float` divisor.
       const scaledDesiredGain = f1(f1(Math.asin(desiredGain)) / PI_OVER_TWO);
 
       let envelopeRate;
@@ -11449,9 +11251,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         envelopeRate = f1(1 - f1(Math.pow(x, f1(1 / attackFrames))));
       }
 
-      // Всё это в браузере считается одинарной точностью, и накопитель
-      // за сорок тысяч отсчётов уходит от двойного счёта на пять
-      // стотысячных. Округляем каждый шаг так же, как он.
+      // The browser computes all of this in single precision, and over forty
+      // thousand samples the accumulator drifts 5e-5 from double. Round every
+      // step as it does.
       const f = Math.fround;
       for (let n = 0; n < nDivisionFrames; n++) {
         const undelayed = input[frame];
@@ -11471,17 +11273,16 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           compressorGain = f(Math.min(1, f(compressorGain * envelopeRate)));
         }
 
-        // Довод синуса — произведение одинарной точности: у браузера половина
-        // числа «пи» лежит отдельной `float`-постоянной, а не считается в
-        // двойной и округляется потом.
+        // The sine argument is a single-precision product: the browser keeps
+        // pi/2 as a separate `float` constant, not a rounded double.
         const postWarp = f(Math.sin(f(PI_OVER_TWO * compressorGain)));
-        // Сперва перемножаются усиления, и только потом на них множится
-        // отсчёт: порядок виден в последнем разряде каждого числа.
+        // Gains are multiplied first, then the sample: the order shows in the
+        // last digit of every number.
         const totalGain = f(masterLinearGain * postWarp);
         out[frame] = f(delay[readIndex] * totalGain);
-        // Показание затухания: браузер держит не последнее значение, а
-        // сглаженный минимум в децибелах — падает мгновенно, отпускает с
-        // постоянной 0,325 с. Страница читает его как `compressor.reduction`.
+        // Reduction meter: the browser keeps a smoothed minimum in dB, not the
+        // last value; it drops instantly and releases with a 0.325 s constant.
+        // Pages read it as `compressor.reduction`.
         const dbRealGain = f(20 * Math.log10(postWarp));
         if (dbRealGain < meteringGain) meteringGain = dbRealGain;
         else meteringGain = f(meteringGain + f(f(dbRealGain - meteringGain) * meteringReleaseK));
@@ -11491,8 +11292,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         writeIndex = (writeIndex + 1) & MASK;
       }
     }
-    // Затухание, которое страница читает у самого узла: браузер держит там
-    // последнее значение в децибелах — отрицательное, когда сжиматель работал.
+    // The reduction the page reads on the node: the browser keeps the last
+    // value in dB there, negative when the compressor acted.
     compressorKernel.lastReduction = meteringGain;
     return out;
   }
@@ -11509,13 +11310,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
   class BaseAudioContext {
     constructor() {
-      // Частота живого контекста у Chrome — та, что у звуковой карты, и это
-      // 48 кГц, а не 44,1. Задержка вывода — размер буфера, делённый на неё.
-      // И контекст без действия пользователя браузер держит остановленным.
+      // Chrome's live context rate is the sound card's, 48 kHz, not 44.1.
+      // Output latency is the buffer size divided by it. Without user
+      // activation the browser keeps the context suspended.
       __pt_write(this, 'sampleRate', 48000); __pt_write(this, 'currentTime', 0); __pt_write(this, 'state', 'suspended');
       this.__ptNodes = []; this.__ptEdges = [];
-      // У приёмника нет выхода, и число каналов у него задано явно, а не
-      // «сколько придёт»: снято с Chrome 151.
+      // The destination has no output and an explicit channel count rather
+      // than "whatever arrives": captured from Chrome 151.
       __pt_write(this, 'destination', makeNode(this, 'destination',
         { maxChannelCount: 2, numberOfOutputs: 0, channelCountMode: 'explicit' }));
       __pt_write(this, 'listener', { positionX: audioParam(0), positionY: audioParam(0), positionZ: audioParam(0), setPosition() {}, setOrientation() {} });
@@ -11523,8 +11324,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       this.onstatechange = null;
     }
     createOscillator() {
-      // Частоту выше половины частоты дискретизации воспроизвести нечем, и
-      // браузер объявляет этот предел в самом параметре.
+      // Frequencies above Nyquist cannot be reproduced, and the browser
+      // declares that limit on the parameter itself.
       const nyq = this.sampleRate / 2;
       return makeNode(this, 'oscillator', {
         type: 'sine', frequency: audioParam(440, -nyq, nyq), detune: audioParam(0),
@@ -11572,22 +11373,19 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     suspend() { __pt_write(this, 'state', 'suspended'); return Promise.resolve(); }
     close() { __pt_write(this, 'state', 'closed'); return Promise.resolve(); }
     addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
-    // Граф считается обходом от приёмника, а не подменяется синтезом.
-    // Раньше здесь всегда рисовался осциллятор со сжимателем, чем бы страница
-    // ни соединила узлы: источник из буфера отдавал чужие числа, а
-    // `compressor.reduction` — ноль там, где браузер даёт −20 дБ.
+    // The graph is rendered by walking from the destination, not replaced by a
+    // fixed synthesis: buffer sources must produce their own numbers and
+    // `compressor.reduction` the browser's -20 dB.
     __ptRender(chans, want) {
       const rate = this.sampleRate;
-      // Браузер считает целыми квантами по сто двадцать восемь кадров, а в
-      // буфер отдаёт сколько просили: последние кадры незаконченного кванта
-      // всё равно посчитаны. Без этого у нас хвост оставался тишиной, а у
-      // браузера там обычный звук.
+      // The browser renders whole 128-frame quanta but returns as many frames
+      // as requested: the tail of an unfinished quantum is still computed.
       const len = Math.ceil(want / 128) * 128;
       const zero = () => new Float32Array(len);
       const pv = (p, dflt) => (p && typeof p.value === 'number' ? p.value : dflt);
       const stateOf = (n) => (globalThis.__pt_audioState && __pt_audioState.get(n)) || n;
       const dest = stateOf(this.destination);
-      // Кто во что входит.
+      // Who feeds into what.
       const inputsOf = new Map();
       for (const n of this.__ptNodes) {
         for (const to of (n.__ptOut || [])) {
@@ -11606,18 +11404,16 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         }
         return out;
       };
-      // Осциллятор: шаг фазы в одинарной точности копится в двойном счётчике,
-      // как в браузере.
-      // Осциллятор считает не отсчёт за отсчётом в двойной точности, а так,
-      // как считает браузер на этой машине: указатель в таблице идёт
-      // четвёрками в одинарной точности, а раз в квант из ста двадцати восьми
-      // кадров пересчитывается из двойной — «чтобы накопленная ошибка не
-      // уходила дальше». Без этого к тысячному отсчёту расходится седьмой
-      // знак, а страница складывает все сорок четыре тысячи.
+      // Oscillator: computed the way the browser does on this machine, not
+      // sample by sample in double precision: the table index advances in
+      // groups of four in single precision and is recomputed from double once
+      // per 128-frame quantum ("so the accumulated error stays bounded").
+      // Without this the seventh digit diverges by sample 1000, and pages sum
+      // all 44 thousand.
       const f32 = Math.fround;
-      // Приведение указателя в пределы таблицы теми же действиями, что в
-      // `WrapVirtualIndexVector`: деление, отсечение к нулю, поправка на
-      // единицу, если отсекли не в ту сторону.
+      // Wraps the index into the table with the same operations as
+      // `WrapVirtualIndexVector`: division, truncation toward zero, and a
+      // correction by one if truncated the wrong way.
       const wrap32 = (x, size, invSize) => {
         const r = f32(x * invSize);
         let fl = Math.trunc(r) | 0;
@@ -11633,12 +11429,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const invSize32 = f32(1 / tsize);
         const incr = f32(f32(freq) * f32(tsize / rate));
         const out = zero();
-        // Пара таблиц и доля между ними — одна на весь прогон: частота
-        // постоянная.
-        // Полоса высот считается в одинарной точности — как в браузере, где
-        // и частота, и логарифм, и доля между таблицами `float`. В двойной
-        // доля выходила на единицу младшего разряда другой, и с ней
-        // расходился каждый отсчёт, где таблицы отличаются.
+        // Table pair and blend factor are fixed for the run: constant frequency.
+        // The pitch band is computed in single precision as in the browser,
+        // where frequency, log and the blend factor are all `float`; in double
+        // the factor differed by one ulp and every sample where the tables
+        // differ diverged.
         const af = f32(Math.abs(freq));
         const ratio = af > 0 ? f32(af / f32(T.lowest)) : 0.5;
         let pitch = f32(1 + f32(f32(f32(Math.log2(ratio)) * 1200) / OSC_CENTS));
@@ -11647,12 +11442,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const r2 = r1 < T.ranges - 1 ? r1 + 1 : r1;
         const between = f32(pitch - r1);
         const higher = T.get(r1), lower = T.get(r2);
-        let vri = 0;                      // двойная точность, между квантами
-        // Первый квант браузер считает иначе, чем остальные: пока у частоты
-        // есть запись во времени (её оставляет присваивание `value`), идёт
-        // «пооткрытный» путь с двойным указателем; дальше — четвёрками в
-        // одинарной. Видно это сразу: в первом кванте отсчёты сходятся с
-        // двойным счётом до бита, а со второго — только с четвёрочным.
+        let vri = 0;                      // double precision, between quanta
+        // The browser computes the first quantum differently: while the
+        // frequency has a timeline event (left by assigning `value`), it takes
+        // the per-sample path with a double index; afterwards groups of four in
+        // single precision. Visible directly: in the first quantum samples match
+        // double to the bit, from the second only the grouped computation does.
         const invSize = f32(1 / tsize);
         const wrap32 = (x) => {
           const r = f32(x * invSize);
@@ -11679,8 +11474,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
               v -= Math.floor(v / tsize) * tsize;
             }
           } else {
-            // Четыре указателя идут вместе, каждый шаг — четыре приращения,
-            // и после каждого шага все четыре приводятся в пределы таблицы.
+            // Four indices advance together, four increments per step, and
+            // all four are wrapped after each step.
             let v0 = wrap32(f32(vri));
             let v1 = wrap32(f32(vri + incr));
             let v2 = wrap32(f32(vri + f32(2 * incr)));
@@ -11698,7 +11493,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
               v2 = wrap32(f32(v2 + step));
               v3 = wrap32(f32(v3 + step));
             }
-            // Хвост кванта — по одному, в двойной точности.
+            // Quantum tail: one by one, in double precision.
             let tail = vri + f32(k * incr);
             tail -= Math.floor(tail / tsize) * tsize;
             for (; k < n; k++) {
@@ -11707,7 +11502,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
               tail -= Math.floor(tail / tsize) * tsize;
             }
           }
-          // Между квантами указатель пересчитывается от начала кванта.
+          // Between quanta the index is recomputed from the quantum start.
           vri += f32(n * incr);
           vri -= Math.floor(vri / tsize) * tsize;
         }
@@ -11725,7 +11520,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         }
         return out;
       };
-      // Двухполюсный фильтр: коэффициенты те же, что в `biquad.cc`.
+      // Biquad filter: same coefficients as `biquad.cc`.
       const biquad = (node, input) => {
         const out = zero();
         const nyq = rate / 2;
@@ -11822,15 +11617,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
             ratio: pv(node.ratio, 12), attack: pv(node.attack, 0.003),
             release: pv(node.release, 0.25),
           };
-          // Считает движок: у браузера степени и логарифмы берутся из
-          // системной библиотеки, а здешняя математика округляет иначе — и
-          // расходится весь звук, начиная с коэффициента колена. Свой расчёт
-          // остаётся для лёгкой сборки.
+          // The engine computes it: the browser takes powers and logs from the
+          // system library, and JS math rounds differently, diverging from the
+          // knee coefficient on. The JS version remains for the light build.
           if (typeof __pt_compress === 'function') {
             const got = __pt_compress(input, rate, opts.threshold, opts.knee,
                                       opts.ratio, opts.attack, opts.release);
             if (got && got.length === input.length + 1) {
-              // `reduction` страница читает прямо: последнее число — оно.
+              // The page reads `reduction` directly: the last number is it.
               try { node.reduction = got[input.length]; } catch (e) {}
               return got.subarray(0, input.length);
             }
@@ -11846,7 +11640,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           for (let i = 0; i < len; i++) out[i] = Math.fround(input[i] * g);
           return out;
         }
-        // Всё прочее — сквозной проход: анализатор, свёртка, обработчик.
+        // Everything else passes through: analyser, convolver, processor.
         return input;
       };
       const pull = (node, depth) => {
@@ -11866,28 +11660,29 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         return out;
       };
       const data = sumInputs(dest, 0);
-      // Наружу — ровно столько кадров, сколько просили.
+      // Output exactly as many frames as requested.
       return bufferOf(data.length === want ? data : data.subarray(0, want), chans, want, rate);
     }
   }
   const audioTag = (Ctor, name) => { try { Object.defineProperty(Ctor.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {} return Ctor; };
-  // Базу надо объявить на окне самой: иначе имя `BaseAudioContext` достаётся
-  // заглушке из таблицы графа, и в цепочке оказывается другой объект с тем же
-  // именем — `Object.getPrototypeOf(AudioContext.prototype) !== BaseAudioContext.prototype`.
+  // The base must be declared on window itself, otherwise the name
+  // `BaseAudioContext` goes to a graph table stub and the chain holds a
+  // different object of that name:
+  // `Object.getPrototypeOf(AudioContext.prototype) !== BaseAudioContext.prototype`.
   globalThis.BaseAudioContext = audioTag(mask(BaseAudioContext, 'BaseAudioContext'), 'BaseAudioContext');
   globalThis.AudioContext = audioTag(mask(class AudioContext extends BaseAudioContext {
     constructor() {
       super();
-      // Задержки живого вывода: у Chrome это буфер в 512 отсчётов на частоте
-      // карты, а выходную он на этой машине не знает и говорит ноль. Их
-      // отсутствие само по себе примета — у офлайнового контекста их нет, у
-      // живого есть.
+      // Live output latencies: Chrome's is a 512-sample buffer at the card's
+      // rate; the output latency is unknown on this machine and reported as
+      // zero. Their absence is a tell: offline contexts lack them, live ones
+      // have them.
       __pt_write(this, 'baseLatency', 512 / this.sampleRate);
       __pt_write(this, 'outputLatency', 0);
     }
   }, 'AudioContext'), 'AudioContext');
-  // `close`/`resume`/`suspend` браузер объявляет на самих контекстах, а не на
-  // общей базе: наследование то же, уровень другой — и обход графа это читает.
+  // The browser declares `close`/`resume`/`suspend` on the concrete contexts,
+  // not the shared base; graph walks read the level.
   globalThis.__pt_sinkAudioMethods = () => {
     const B = globalThis.BaseAudioContext && globalThis.BaseAudioContext.prototype;
     if (!B) return;
@@ -11897,7 +11692,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       for (const n of ['AudioContext', 'OfflineAudioContext']) {
         const C = globalThis[n];
         if (!C || !C.prototype || Object.prototype.hasOwnProperty.call(C.prototype, k)) continue;
-        if (n === 'OfflineAudioContext' && k === 'close') continue;   // у офлайнового его нет
+        if (n === 'OfflineAudioContext' && k === 'close') continue;   // offline contexts lack it
         try { Object.defineProperty(C.prototype, k, d); } catch (e) {}
       }
       try { delete B[k]; } catch (e) {}
@@ -11965,13 +11760,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   } catch (e) {}
 
   // --- permissions ------------------------------------------------------
-  // Таблица снята с Chrome 151: часть имён он отдаёт готовыми, часть спрашивает
-  // у человека, а имени вне перечня отвечает броском — и `push` особым. Мы
-  // отвечали `prompt` на что угодно, включая выдуманное, и это само по себе
-  // ответ не браузера.
-  // Имена, которые Chrome 151 принимает: как он их называет в ответе, что
-  // отвечает наверху и что — в стороннем кадре (сверено на chess.com).
-  // Прочие имена — ошибка с его же текстом.
+  // Table captured from Chrome 151: some names it answers outright, some it
+  // asks the user about, unknown names throw (and `push` specially).
+  // Names Chrome 151 accepts: how it names them in the result, what it
+  // answers at top level and in a cross-site frame (verified on chess.com).
+  // Other names are an error with Chrome's own text.
   const PERMS = {
     'geolocation': ['geolocation', 'prompt', 'denied'], 'notifications': ['notifications', 'prompt', 'denied'],
     'midi': ['midi', 'prompt', 'denied'], 'camera': ['video_capture', 'prompt', 'denied'],
@@ -12012,8 +11805,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         "' is not a valid enum value of type PermissionName."));
     }
     const state = globalThis.__pt_crossSite ? row[2] : row[1];
-    // Ответ — настоящий PermissionStatus, а не голый объект: по нему смотрят
-    // `Object.prototype.toString` и конструктор.
+    // The result is a real PermissionStatus, not a bare object: pages check
+    // `Object.prototype.toString` and the constructor.
     const PS = globalThis.PermissionStatus;
     const status = PS && PS.prototype ? Object.create(PS.prototype) : { addEventListener(){}, removeEventListener(){} };
     __pt_write(status, 'name', row[0]);
@@ -12026,8 +11819,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // --- window.chrome (its absence/shape is a classic headless tell) -----
   if (!globalThis.chrome) {
     const ts = () => performance.now() / 1000;
-    // У Chrome `loadTimes`/`csi` безымянные, `runtime` без расширений нет,
-    // порядок членов — loadTimes, csi, app; в `app` есть `installState`.
+    // Chrome's `loadTimes`/`csi` are anonymous, `runtime` is absent without
+    // extensions, member order is loadTimes, csi, app; `app` has `installState`.
     const anon = (f) => { try { Object.defineProperty(f, 'name', { value: '', configurable: true }); } catch (e) {} return f; };
     globalThis.chrome = {
       loadTimes: anon(function () { return { requestTime: ts(), startLoadTime: ts(), commitLoadTime: ts(), finishDocumentLoadTime: ts(), finishLoadTime: ts(), firstPaintTime: ts(), firstPaintAfterLoadTime: 0, navigationType: 'Other', wasFetchedViaSpdy: true, wasNpnNegotiated: true, npnNegotiatedProtocol: 'h2', wasAlternateProtocolAvailable: false, connectionInfo: 'h2' }; }),
@@ -12046,9 +11839,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
   // --- extra navigator surface -----------------------------------------
   const navExtra = (name, value) => { try { Object.defineProperty(navProto, name, { value, enumerable: true, configurable: true, writable: true }); } catch (e) {} };
-  // Список устройств у браузера не пуст даже без разрешения: три записи с
-  // пустыми именами и пустым `deviceId` — вход звука, вход видео, выход
-  // звука. Пустой список выдаёт машину без звуковой карты, то есть не машину.
+  // The browser's device list is not empty even without permission: three
+  // entries with empty labels and `deviceId` (audio in, video in, audio out).
+  // An empty list means a machine without a sound card.
   const mediaDevice = (kind) => {
     const d = { deviceId: '', kind, label: '', groupId: '' };
     d.toJSON = function toJSON() { return { deviceId: '', kind, label: '', groupId: '' }; };
@@ -12068,25 +11861,22 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   });
   // Desktop Chrome's NetworkInformation omits `type` (it's mobile-only) — its
   // presence is a tell, so we leave it off.
-  // Сеть браузер не выдумывает: `rtt` он округляет до двадцати пяти
-  // миллисекунд, `downlink` — до двадцати пяти килобит и не выше десяти
-  // мегабит. У нас стояли постоянные 50 и 10 — «очень быстро», что бы ни
-  // показывали собственные сроки запросов. Считаем по ним же.
+  // Network info is derived from our own request timings, rounded like the
+  // browser: `rtt` to 25 ms, `downlink` to 25 kbit/s and capped at 10 Mbit/s.
   const netFromTiming = () => {
     try {
       const nav = performance.getEntriesByType('navigation')[0];
       if (!nav) return null;
-      // Берём и переход, и всё, что он потянул: одного документа мало, а
-      // браузер усредняет по многим запросам.
+      // The navigation plus everything it pulled in: the browser averages over
+      // many requests.
       const all = [nav].concat(performance.getEntriesByType('resource'));
       const rtts = all.map((e) => Math.max(0, (e.responseStart || 0) - (e.requestStart || 0)))
         .filter((x) => x > 0).sort((a, b) => a - b);
-      // Оценка у браузера транспортная (TCP/QUIC), а не HTTP: ближе всего к
-      // ней самый быстрый из наших ответов, не середина.
+      // The browser's estimate is transport-level (TCP/QUIC), not HTTP: our
+      // fastest response is closest to it, not the median.
       const mid = rtts.length ? rtts[0] : 50;
-      // Не ниже пятидесяти и не выше трёхсот: в этих пределах живёт домашняя
-      // сеть, а нули и тысячи браузер на ней не печатает.
-      // Быстрая сеть у Chrome — ровно 50: всё, что быстрее сотни, туда же.
+      // Between 50 and 300: the home network range. Chrome reports a fast
+      // network as exactly 50: anything under 100 maps there.
       const rtt = mid < 100 ? 50 : Math.min(300, Math.round(mid / 25) * 25);
       let bytes = 0, secs = 0;
       for (const e of all) {
@@ -12103,21 +11893,19 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     get rtt() { const n = netFromTiming(); return n ? n.rtt : 50; },
     get downlink() { const n = netFromTiming(); return n ? n.downlink : 1.55; },
   });
-  // Настольная машина у браузера всегда «заряжена и в сети»: заряд ровно
-  // единица, время до полного нуль, время разряда бесконечно. Доля вроде 0.71
-  // описывает ноутбук, а наш облик — настольный.
+  // A desktop is always "charged and plugged in": level exactly 1, charging
+  // time 0, discharging time Infinity. A fraction like 0.71 means a laptop.
   const batteryLevel = 1;
   navExtra('getBattery', mask(function getBattery() { return Promise.resolve({ charging: true, chargingTime: 0, dischargingTime: Infinity, level: Math.round(batteryLevel * 100) / 100, onchargingchange: null, onchargingtimechange: null, ondischargingtimechange: null, onlevelchange: null, addEventListener: noop, removeEventListener: noop }); }, 'getBattery'));
   navExtra('storage', { estimate: () => Promise.resolve({ quota: 10737418240, usage: 0, usageDetails: {} }), persist: () => Promise.resolve(false), persisted: () => Promise.resolve(false) });
-  // До первого жеста браузер отвечает ложью на оба: страница, открытая
-  // движком, ничего ещё не нажимала. Нажатие поднимает флаг само.
+  // Before the first gesture the browser answers false to both; a click
+  // raises the flag itself.
   navExtra('userActivation', {
     get hasBeenActive() { return !!globalThis.__pt_userActivated; },
     get isActive() { return !!globalThis.__pt_userActive; },
   });
-  // `navigator.mediaSession` у нас был пустым объектом из таблицы имён: ни
-  // состояния воспроизведения, ни методов. Браузер держит там шесть членов на
-  // прототипе, и `playbackState` читают.
+  // `navigator.mediaSession`: the browser has six members on the prototype,
+  // and `playbackState` is read.
   {
     const proto = (globalThis.MediaSession && MediaSession.prototype) || {};
     const state = { metadata: null, playbackState: 'none' };
@@ -12143,7 +11931,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       navExtra('mediaSession', Object.create(proto));
     } catch (e) {}
   }
-  // Планировщик: `isInputPending` есть у настольного Chrome, и его спрашивают.
+  // Scheduling: desktop Chrome has `isInputPending`, and it gets asked.
   navExtra('scheduling', {
     isInputPending: mask(function isInputPending() { return false; }, 'isInputPending'),
   });
@@ -12162,11 +11950,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   navExtra('setAppBadge', mask(function setAppBadge() { return Promise.resolve(); }, 'setAppBadge'));
 
   // --- WebRTC present but leak-free -------------------------------------
-  // WebRTC не декоративный: анти-бот открывает канал данных, делает предложение
-  // и слушает `icecandidate`. Настоящий Chrome отвечает предложением с ufrag,
-  // паролем и отпечатком DTLS, потом одним-двумя хостовыми кандидатами с mDNS-
-  // именем (реальный адрес он прячет с 2019 года) и завершающим null. Пустышка,
-  // которая молчит, — это браузер без сети, и вердикт по нему выносится сразу.
+  // WebRTC is not decorative: anti-bots open a data channel, create an offer
+  // and listen for `icecandidate`. Real Chrome answers with an offer with
+  // ufrag, password and DTLS fingerprint, then one or two host candidates
+  // with an mDNS name (it hides the real address since 2019) and a final
+  // null. A silent dummy is a browser without network.
   const hex = (n) => {
     const out = [];
     const bytes = new Uint8Array(n);
@@ -12186,20 +11974,20 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     return [...bytes].map((b) => b.toString(16).padStart(2, '0').toUpperCase()).join(':');
   };
 
-  // WebRTC как у Chrome 151 (сверено на scratchpad/rtc_cap.html, секция
-  // cHOXt5 отчёта): предложение — из снятых у Chrome разделов (audio, video,
-  // application; BUNDLE), сбор — по разделу на семейство адресов: хост под
-  // именем mDNS на настоящем порту сокета и srflx по ответу STUN (натив
-  // __pt_rtcStart / __pt_rtcPoll). localDescription дополняется так же, как у
-  // Chrome: кандидаты за `a=rtcp`, порт `m=` и адрес `c=` — от srflx IPv4.
+  // WebRTC as in Chrome 151 (report section cHOXt5): the offer is built from
+  // sections captured from Chrome (audio, video, application; BUNDLE);
+  // gathering yields one section per address family: an mDNS host on the
+  // real socket port and srflx from the STUN reply (native __pt_rtcStart /
+  // __pt_rtcPoll). localDescription is completed as in Chrome: candidates
+  // after `a=rtcp`, `m=` port and `c=` address from the srflx IPv4.
   const RTC_CHROME = __RTC_CHROME__;
   const rtcUuid = () => {
     const h = (n) => Array.from({ length: n }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('');
     return h(8) + '-' + h(4) + '-4' + h(3) + '-' + '89ab'[Math.floor(Math.random() * 4)] + h(3) + '-' + h(12);
   };
   const rtcFoundation = () => String(Math.floor(1e9 + Math.random() * 3.2e9));
-  // Поля событий, кандидатов и описаний — на прототипах, как у Chrome: свои
-  // свойства у объекта были видны getOwnPropertyNames.
+  // Event, candidate and description fields live on prototypes, as in Chrome:
+  // own properties would show in getOwnPropertyNames.
   const RTC_EV = new WeakMap();
   const rtcProtoOnce = () => {
     if (rtcProtoOnce.done) return; rtcProtoOnce.done = true;
@@ -12231,7 +12019,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   const rtcCandidate = (line, mid, idx, ufrag, f) => {
     const C = globalThis.RTCIceCandidate;
     const o = Object.create(C && C.prototype ? C.prototype : Object.prototype);
-    // В полях объекта Chrome берёт IPv6 в скобки (в строке кандидата — нет).
+    // In object fields Chrome brackets IPv6 (not in the candidate string).
     const br = (a) => (typeof a === 'string' && a.indexOf(':') >= 0 ? '[' + a + ']' : a);
     const bag = { candidate: line, sdpMid: String(mid), sdpMLineIndex: idx, foundation: f.foundation, component: 'rtp', priority: f.priority,
       address: br(f.address), protocol: 'udp', port: f.port, type: f.type, tcpType: null, relatedAddress: f.raddr === undefined ? null : br(f.raddr),
@@ -12347,12 +12135,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           if (opts[key] && !st.tx.some((t) => t.receiver.track.kind === kind)) st.tx.push(rtcTransceiver(kind));
         }
       }
-      // Порядок разделов: аудио, видео, данные (так кладёт Chrome при
-      // устаревших опциях предложения).
+      // Section order: audio, video, data (as Chrome lays them out with legacy
+      // offer options).
       st.tx.sort((a, b) => (a.receiver.track.kind === 'audio' ? 0 : 1) - (b.receiver.track.kind === 'audio' ? 0 : 1));
       if (!st.kinds.length) st.kinds = this.__ptKinds();
-      // Chrome строит предложение на своём потоке (~25 мс) и отдаёт словарь
-      // RTCSessionDescriptionInit, а не RTCSessionDescription.
+      // Chrome builds the offer on its own thread (~25 ms) and returns an
+      // RTCSessionDescriptionInit dict, not an RTCSessionDescription.
       const sdp = this.__ptSdp(false);
       await new Promise((r) => setTimeout(r, 20 + Math.random() * 8));
       return { sdp, type: 'offer' };
@@ -12464,9 +12252,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     }
   }, 'RTCPeerConnection');
 
-  // Кодеки и расширения заголовка — список Chrome 151 (getCapabilities).
-  // Интерфейсы RTCRtp* появляются позже этого слоя — ставит поздний проход
-  // (SHAPE_FIXES зовёт __pt_installRtcCaps).
+  // Codecs and header extensions: Chrome 151's list (getCapabilities).
+  // RTCRtp* interfaces appear after this layer, so a late pass installs them
+  // (SHAPE_FIXES calls __pt_installRtcCaps).
   Object.defineProperty(globalThis, '__pt_installRtcCaps', { configurable: true, value: () => {
   for (const n of ['RTCRtpReceiver', 'RTCRtpSender']) {
     const C = globalThis[n];
@@ -12485,8 +12273,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // --- extra Web APIs so real sites' scripts run (and their trackers fire) --
   // A bare V8 has none of these; their absence makes analytics/framework code
   // throw before it does anything (incl. its network beacons).
-  // `localStorage` — интерфейс Storage, а не литерал: страница читает
-  // `Object.prototype.toString.call(localStorage)` наравне со всем остальным.
+  // `localStorage` is a Storage interface, not a literal: pages read
+  // `Object.prototype.toString.call(localStorage)` like everything else.
   const StorageData = new WeakMap();
   const Storage = __ptName(__ptIllegal(), 'Storage');
   {
@@ -12495,8 +12283,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       try { Object.defineProperty(f, 'name', { value: name, configurable: true }); } catch (e) {}
       Object.defineProperty(P, name, { value: mask(f, name), writable: true, enumerable: true, configurable: true });
     };
-    // Столько же доводов, сколько требует браузер: вызов без них — отказ с
-    // точным текстом, а не тихое ничего.
+    // As many args as the browser requires: a call without them is refused
+    // with the exact text.
     const need = (got, want, method) => {
       if (got >= want) return;
       throw __pt_mkErr(TypeError, "Failed to execute '" + method + "' on 'Storage': " + want +
@@ -12525,39 +12313,38 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   }
   const makeStorage = () => {
     const m = new Map();
-    // У самого хранилища собственных свойств нет — только ключи страницы;
-    // всё остальное на прототипе, как в браузере.
+    // The storage itself has no own properties except page keys; everything
+    // else is on the prototype, as in the browser.
     const api = Object.create(Storage.prototype);
     StorageData.set(api, m);
-    // Символ — обычное свойство объекта, не ключ хранилища: у Chrome
-    // `localStorage[sym] = 1; delete localStorage[sym]` не трогает данные и
-    // не оставляет следа (у нас удаление символа молча ничего не делало).
+    // A symbol is an ordinary object property, not a storage key: in Chrome
+    // `localStorage[sym] = 1; delete localStorage[sym]` leaves data untouched
+    // and no trace.
     const sym = (p) => typeof p === 'symbol';
     const proxy = __pt_proxy(api, {
       get: (t, p) => (p in t || sym(p) ? t[p] : (m.has(p) ? m.get(p) : undefined)),
       set: (t, p, v, r) => { if (sym(p)) return Reflect.set(t, p, v); if (p in t) return true; m.set(String(p), String(v)); return true; },
       has: (t, p) => p in t || (!sym(p) && m.has(p)),
       deleteProperty: (t, p) => { if (sym(p)) return Reflect.deleteProperty(t, p); m.delete(String(p)); return true; },
-      // Ключи хранилища — собственные свойства объекта: `Object.keys(localStorage)`
-      // в браузере перечисляет то, что записано.
+      // Storage keys are own properties: in the browser `Object.keys(localStorage)`
+      // lists what is stored.
       ownKeys: (t) => [...new Set([...m.keys(), ...Reflect.ownKeys(t)])],
       getOwnPropertyDescriptor: (t, p) => (!sym(p) && m.has(p)
         ? { value: m.get(String(p)), writable: true, enumerable: true, configurable: true }
         : Reflect.getOwnPropertyDescriptor(t, p)),
     });
-    // Методы вызывают с `this` — самим хранилищем, а страница держит в руках
-    // Proxy, не его цель. Без этой строки `data(this)` не находил ничего и
-    // отдавал каждый раз новую пустую карту: страница писала и читала обратно
-    // `null`, а `length` навсегда оставался нулём.
+    // Methods are called with `this` being the Proxy the page holds, not its
+    // target; without this `data(this)` found nothing and returned a fresh
+    // empty map each time.
     StorageData.set(proxy, m);
     return proxy;
   };
   if (!globalThis.localStorage) globalThis.localStorage = makeStorage();
   if (!globalThis.sessionStorage) globalThis.sessionStorage = makeStorage();
   {
-    // Хранилища — у origin (localStorage) и у вкладки с origin (sessionStorage),
-    // а контекст у каждого документа свой: движок забирает их при уходе со
-    // страницы и отдаёт следующему документу того же origin.
+    // Storage belongs to the origin (localStorage) and to the tab plus origin
+    // (sessionStorage), while each document has its own context: the engine
+    // takes them on navigation and hands them to the next same-origin document.
     const local = StorageData.get(globalThis.localStorage), session = StorageData.get(globalThis.sessionStorage);
     const fill = (m, o) => { if (m && o && typeof o === 'object') for (const k of Object.keys(o)) m.set(k, String(o[k])); };
     (globalThis.__pt_carryParts || (globalThis.__pt_carryParts = {})).storage = {
@@ -12565,28 +12352,26 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       in: (v) => { if (v) { fill(local, v.local); fill(session, v.session); } },
     };
     const parts = globalThis.__pt_carryParts;
-    // Что уходящий документ передаёт следующему: строка JSON для движка.
+    // What the leaving document passes on: a JSON string for the engine.
     globalThis.__pt_carryOut = () => {
       const out = {};
       for (const k of Object.keys(parts)) { try { out[k] = parts[k].out(); } catch (e) {} }
       return __ptJSON.stringify(out);
     };
-    // До первого скрипта нового документа: что движок сохранил для его origin.
+    // Before the new document's first script: what the engine kept for its origin.
     globalThis.__pt_carryIn = (json) => {
       let v; try { v = __ptJSON.parse(json); } catch (e) { return; }
       for (const k of Object.keys(parts)) { try { if (k in v) parts[k].in(v[k]); } catch (e) {} }
     };
   }
 
-  // Не `||`: таблица имён уже положила сюда пустую функцию, и настоящая
-  // реализация до глобали не доезжала — `observe()` молча не звал колбэк
-  // никогда, а браузер доставляет первое наблюдение сразу. Код, который ждёт
-  // его, ждал вечно.
+  // Not `||`: the name table already put an empty function here, and the
+  // browser delivers the first observation immediately; code waits for it.
   globalThis.IntersectionObserver = class IntersectionObserver {
     constructor(cb, opts) {
       this._cb = cb;
-      // Пороги и поля наблюдатель показывает сам, и их читают: у браузера
-      // это список чисел и четыре стороны через пробел, а у нас было пусто.
+      // The observer exposes thresholds and margins, and they are read: a list
+      // of numbers and four space-separated sides.
       const t = opts && opts.threshold;
       const list = t === undefined ? [0] : (Array.isArray(t) ? t.slice() : [Number(t) || 0]);
       const margin = String((opts && opts.rootMargin) || '0px').trim().split(/\s+/);
@@ -12645,8 +12430,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     else if (/pointer\s*:\s*coarse|hover\s*:\s*none/i.test(query)) matches = false;
     else if (/orientation\s*:\s*landscape/i.test(query)) matches = w >= h;
     else if (/orientation\s*:\s*portrait/i.test(query)) matches = w < h;
-    // Обычная вкладка — это `display-mode: browser`; мы отвечали «нет», то
-    // есть «страница открыта не в браузере». Остальные режимы — приложения.
+    // A normal tab is `display-mode: browser`; other modes are apps.
     else if (/display-mode\s*:\s*browser/i.test(query)) matches = true;
     else if (/display-mode\s*:\s*(standalone|fullscreen|minimal-ui|window-controls-overlay|picture-in-picture)/i.test(query)) matches = false;
     else if (/scripting\s*:\s*enabled/i.test(query)) matches = true;
@@ -12663,13 +12447,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       }
     }
     const listeners = [];
-    // Возвращаем не литерал, а объект интерфейса: страница читает
-    // `Object.prototype.toString.call(matchMedia(...))` наравне со всем
-    // остальным, и `[object Object]` там — готовая примета.
+    // An interface object, not a literal: pages read
+    // `Object.prototype.toString.call(matchMedia(...))`.
     const MQL = globalThis.MediaQueryList;
     const proto = MQL && MQL.prototype ? MQL.prototype : Object.prototype;
-    // `matches` и `media` у браузера только читаются — кладём их через запись
-    // изнутри, иначе `Object.assign` падает о собственный же интерфейс.
+    // The browser's `matches` and `media` are read-only: set them via internal
+    // write, otherwise `Object.assign` fails on our own interface.
     const mql = Object.create(proto);
     __pt_write(mql, 'matches', matches);
     __pt_write(mql, 'media', query);
@@ -12683,7 +12466,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     });
   };
   globalThis.getComputedStyle = globalThis.getComputedStyle || (() => ({ getPropertyValue: () => '', getPropertyPriority: () => '', length: 0, cssText: '', item: () => '', display: '', visibility: 'visible' }));
-  // Простой у браузера наступает после ближайшего кадра, не через миллисекунду.
+  // The browser's idle period comes after the next frame, not after a millisecond.
   globalThis.requestIdleCallback = globalThis.requestIdleCallback || ((cb) => setTimeout(() => cb({ didTimeout: false, timeRemaining: () => 50 }), 18));
   globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || ((id) => clearTimeout(id));
 
@@ -12699,25 +12482,21 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // On the *prototype*, not the instance: a real `document` has no own
     // properties, so defining these on it would be a tell.
     const dproto = (globalThis.Document && globalThis.Document.prototype) || document;
-    // Окно вынутого из документа кадра — скрыто, как у браузера.
+    // A frame removed from the document is hidden, as in the browser.
     Object.defineProperty(dproto, 'visibilityState', { get: () => (globalThis.__ptDetached ? 'hidden' : 'visible'), configurable: true });
     Object.defineProperty(dproto, 'hidden', { get: () => !!globalThis.__ptDetached, configurable: true });
   } catch (e) {}
 
   if (!globalThis.TextDecoder) {
-    // Раскодировщик был один на все случаи и всегда читал байты как latin-1.
-    // Две ошибки сразу: `utf-8` не разбирался вовсе (там, где браузер ставит
-    // U+FFFD, у нас выходил другой символ), а `latin1` в браузере — это
-    // windows-1252, где байт 0x80 даёт «€», а не невидимый управляющий знак.
-    // Челлендж собирает из байтов строку именно так, и каждый байт верхней
-    // половины давал у нас другой символ — а значит другую строку и другой хеш.
-    // Верхняя половина однобайтовых кодировок — по индексам Encoding
-    // Standard (encoding.spec.whatwg.org/index-*.txt), включая windows-1252,
-    // куда челлендж складывает байты холста. Раньше таблицы шли из кодеков
-    // Python: там байты 0x81/0x8D/0x8F/0x90/0x9D «не определены» и давали
-    // U+FFFD, а браузер по стандарту отдаёт управляющие U+0081… — пять
-    // разных знаков на блок холста, и другой хеш у отчёта.
-    const HIGH = JSON.parse("{\"windows-1250\": \"€‚„…†‡‰Š‹ŚŤŽŹ‘’“”•–—™š›śťžź ˇ˘Ł¤Ą¦§¨©Ş«¬­®Ż°±˛ł´µ¶·¸ąş»Ľ˝ľżŔÁÂĂÄĹĆÇČÉĘËĚÍÎĎĐŃŇÓÔŐÖ×ŘŮÚŰÜÝŢßŕáâăäĺćçčéęëěíîďđńňóôőö÷řůúűüýţ˙\", \"windows-1251\": \"ЂЃ‚ѓ„…†‡€‰Љ‹ЊЌЋЏђ‘’“”•–—™љ›њќћџ ЎўЈ¤Ґ¦§Ё©Є«¬­®Ї°±Ііґµ¶·ё№є»јЅѕїАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюя\", \"windows-1252\": \"€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ\", \"windows-1253\": \"€‚ƒ„…†‡‰‹‘’“”•–—™› ΅Ά£¤¥¦§¨©�«¬­®―°±²³΄µ¶·ΈΉΊ»Ό½ΎΏΐΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡ�ΣΤΥΦΧΨΩΪΫάέήίΰαβγδεζηθικλμνξοπρςστυφχψωϊϋόύώ�\", \"windows-1254\": \"€‚ƒ„…†‡ˆ‰Š‹Œ‘’“”•–—˜™š›œŸ ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏĞÑÒÓÔÕÖ×ØÙÚÛÜİŞßàáâãäåæçèéêëìíîïğñòóôõö÷øùúûüışÿ\", \"windows-1255\": \"€‚ƒ„…†‡ˆ‰‹‘’“”•–—˜™› ¡¢£₪¥¦§¨©×«¬­®¯°±²³´µ¶·¸¹÷»¼½¾¿ְֱֲֳִֵֶַָֹֺֻּֽ־ֿ׀ׁׂ׃װױײ׳״�������אבגדהוזחטיךכלםמןנסעףפץצקרשת��‎‏�\", \"windows-1256\": \"€پ‚ƒ„…†‡ˆ‰ٹ‹Œچژڈگ‘’“”•–—ک™ڑ›œ‌‍ں ،¢£¤¥¦§¨©ھ«¬­®¯°±²³´µ¶·¸¹؛»¼½¾؟ہءآأؤإئابةتثجحخدذرزسشصض×طظعغـفقكàلâمنهوçèéêëىيîïًٌٍَôُِ÷ّùْûü‎‏ے\", \"windows-1257\": \"€‚„…†‡‰‹¨ˇ¸‘’“”•–—™›¯˛ �¢£¤�¦§Ø©Ŗ«¬­®Æ°±²³´µ¶·ø¹ŗ»¼½¾æĄĮĀĆÄÅĘĒČÉŹĖĢĶĪĻŠŃŅÓŌÕÖ×ŲŁŚŪÜŻŽßąįāćäåęēčéźėģķīļšńņóōõö÷ųłśūüżž˙\", \"windows-1258\": \"€‚ƒ„…†‡ˆ‰‹Œ‘’“”•–—˜™›œŸ ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂĂÄÅÆÇÈÉÊË̀ÍÎÏĐÑ̉ÓÔƠÖ×ØÙÚÛÜỮßàáâăäåæçèéêë́íîïđṇ̃óôơö÷øùúûüư₫ÿ\", \"iso-8859-2\": \" Ą˘Ł¤ĽŚ§¨ŠŞŤŹ­ŽŻ°ą˛ł´ľśˇ¸šşťź˝žżŔÁÂĂÄĹĆÇČÉĘËĚÍÎĎĐŃŇÓÔŐÖ×ŘŮÚŰÜÝŢßŕáâăäĺćçčéęëěíîďđńňóôőö÷řůúűüýţ˙\", \"iso-8859-3\": \" Ħ˘£¤�Ĥ§¨İŞĞĴ­�Ż°ħ²³´µĥ·¸ışğĵ½�żÀÁÂ�ÄĊĈÇÈÉÊËÌÍÎÏ�ÑÒÓÔĠÖ×ĜÙÚÛÜŬŜßàáâ�äċĉçèéêëìíîï�ñòóôġö÷ĝùúûüŭŝ˙\", \"iso-8859-4\": \" ĄĸŖ¤ĨĻ§¨ŠĒĢŦ­Ž¯°ą˛ŗ´ĩļˇ¸šēģŧŊžŋĀÁÂÃÄÅÆĮČÉĘËĖÍÎĪĐŅŌĶÔÕÖ×ØŲÚÛÜŨŪßāáâãäåæįčéęëėíîīđņōķôõö÷øųúûüũū˙\", \"iso-8859-5\": \" ЁЂЃЄЅІЇЈЉЊЋЌ­ЎЏАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюя№ёђѓєѕіїјљњћќ§ўџ\", \"iso-8859-6\": \" ���¤�������،­�������������؛���؟�ءآأؤإئابةتثجحخدذرزسشصضطظعغ�����ـفقكلمنهوىيًٌٍَُِّْ�������������\", \"iso-8859-7\": \" ‘’£€₯¦§¨©ͺ«¬­�―°±²³΄΅Ά·ΈΉΊ»Ό½ΎΏΐΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡ�ΣΤΥΦΧΨΩΪΫάέήίΰαβγδεζηθικλμνξοπρςστυφχψωϊϋόύώ�\", \"iso-8859-8\": \" �¢£¤¥¦§¨©×«¬­®¯°±²³´µ¶·¸¹÷»¼½¾��������������������������������‗אבגדהוזחטיךכלםמןנסעףפץצקרשת��‎‏�\", \"iso-8859-10\": \" ĄĒĢĪĨĶ§ĻĐŠŦŽ­ŪŊ°ąēģīĩķ·ļđšŧž―ūŋĀÁÂÃÄÅÆĮČÉĘËĖÍÎÏÐŅŌÓÔÕÖŨØŲÚÛÜÝÞßāáâãäåæįčéęëėíîïðņōóôõöũøųúûüýþĸ\", \"iso-8859-13\": \" ”¢£¤„¦§Ø©Ŗ«¬­®Æ°±²³“µ¶·ø¹ŗ»¼½¾æĄĮĀĆÄÅĘĒČÉŹĖĢĶĪĻŠŃŅÓŌÕÖ×ŲŁŚŪÜŻŽßąįāćäåęēčéźėģķīļšńņóōõö÷ųłśūüżž’\", \"iso-8859-14\": \" Ḃḃ£ĊċḊ§Ẁ©ẂḋỲ­®ŸḞḟĠġṀṁ¶ṖẁṗẃṠỳẄẅṡÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏŴÑÒÓÔÕÖṪØÙÚÛÜÝŶßàáâãäåæçèéêëìíîïŵñòóôõöṫøùúûüýŷÿ\", \"iso-8859-15\": \" ¡¢£€¥Š§š©ª«¬­®¯°±²³Žµ¶·ž¹º»ŒœŸ¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ\", \"iso-8859-16\": \" ĄąŁ€„Š§š©Ș«Ź­źŻ°±ČłŽ”¶·žčș»ŒœŸżÀÁÂĂÄĆÆÇÈÉÊËÌÍÎÏĐŃÒÓÔŐÖŚŰÙÚÛÜĘȚßàáâăäćæçèéêëìíîïđńòóôőöśűùúûüęțÿ\", \"koi8-r\": \"─│┌┐└┘├┤┬┴┼▀▄█▌▐░▒▓⌠■∙√≈≤≥ ⌡°²·÷═║╒ё╓╔╕╖╗╘╙╚╛╜╝╞╟╠╡Ё╢╣╤╥╦╧╨╩╪╫╬©юабцдефгхийклмнопярстужвьызшэщчъЮАБЦДЕФГХИЙКЛМНОПЯРСТУЖВЬЫЗШЭЩЧЪ\", \"koi8-u\": \"─│┌┐└┘├┤┬┴┼▀▄█▌▐░▒▓⌠■∙√≈≤≥ ⌡°²·÷═║╒ёє╔ії╗╘╙╚╛ґў╞╟╠╡ЁЄ╣ІЇ╦╧╨╩╪ҐЎ©юабцдефгхийклмнопярстужвьызшэщчъЮАБЦДЕФГХИЙКЛМНОПЯРСТУЖВЬЫЗШЭЩЧЪ\", \"macintosh\": \"ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø¿¡¬√ƒ≈∆«»… ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄€‹›ﬁﬂ‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ\", \"ibm866\": \"АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмноп░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀рстуфхцчшщъыьэюяЁёЄєЇїЎў°∙·√№¤■ \"}");
+  // The challenge builds strings from bytes with TextDecoder, and every
+  // upper-half byte must decode exactly as in the browser or the hash
+  // differs. `latin1` in the browser is windows-1252 (0x80 is the euro sign).
+  // Upper halves of single-byte encodings follow the Encoding Standard
+  // indexes (encoding.spec.whatwg.org/index-*.txt), including windows-1252,
+  // where the challenge puts canvas bytes. Python codec tables are wrong here:
+  // they leave 0x81/0x8D/0x8F/0x90/0x9D undefined (U+FFFD), while the
+  // standard maps them to the C1 controls U+0081...
+    const HIGH = JSON.parse("{\"windows-1250\": \"€‚„…†‡‰Š‹ŚŤŽŹ‘’“”•–—™š›śťžź ˇ˘Ł¤Ą¦§¨©Ş«¬­®Ż°±˛ł´µ¶·¸ąş»Ľ˝ľżŔÁÂĂÄĹĆÇČÉĘËĚÍÎĎĐŃŇÓÔŐÖ×ŘŮÚŰÜÝŢßŕáâăäĺćçčéęëěíîďđńňóôőö÷řůúűüýţ˙\", \"windows-1251\": \"\u0402\u0403‚\u0453„…†‡€‰\u0409‹\u040a\u040c\u040b\u040f\u0452‘’“”•–—™\u0459›\u045a\u045c\u045b\u045f \u040e\u045e\u0408¤\u0490¦§\u0401©\u0404«¬­®\u0407°±\u0406\u0456\u0491µ¶·\u0451№\u0454»\u0458\u0405\u0455\u0457\u0410\u0411\u0412\u0413\u0414\u0415\u0416\u0417\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u0420\u0421\u0422\u0423\u0424\u0425\u0426\u0427\u0428\u0429\u042a\u042b\u042c\u042d\u042e\u042f\u0430\u0431\u0432\u0433\u0434\u0435\u0436\u0437\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u0440\u0441\u0442\u0443\u0444\u0445\u0446\u0447\u0448\u0449\u044a\u044b\u044c\u044d\u044e\u044f\", \"windows-1252\": \"€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ\", \"windows-1253\": \"€‚ƒ„…†‡‰‹‘’“”•–—™› ΅Ά£¤¥¦§¨©�«¬­®―°±²³΄µ¶·ΈΉΊ»Ό½ΎΏΐΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡ�ΣΤΥΦΧΨΩΪΫάέήίΰαβγδεζηθικλμνξοπρςστυφχψωϊϋόύώ�\", \"windows-1254\": \"€‚ƒ„…†‡ˆ‰Š‹Œ‘’“”•–—˜™š›œŸ ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏĞÑÒÓÔÕÖ×ØÙÚÛÜİŞßàáâãäåæçèéêëìíîïğñòóôõö÷øùúûüışÿ\", \"windows-1255\": \"€‚ƒ„…†‡ˆ‰‹‘’“”•–—˜™› ¡¢£₪¥¦§¨©×«¬­®¯°±²³´µ¶·¸¹÷»¼½¾¿ְֱֲֳִֵֶַָֹֺֻּֽ־ֿ׀ׁׂ׃װױײ׳״�������אבגדהוזחטיךכלםמןנסעףפץצקרשת��‎‏�\", \"windows-1256\": \"€پ‚ƒ„…†‡ˆ‰ٹ‹Œچژڈگ‘’“”•–—ک™ڑ›œ‌‍ں ،¢£¤¥¦§¨©ھ«¬­®¯°±²³´µ¶·¸¹؛»¼½¾؟ہءآأؤإئابةتثجحخدذرزسشصض×طظعغـفقكàلâمنهوçèéêëىيîïًٌٍَôُِ÷ّùْûü‎‏ے\", \"windows-1257\": \"€‚„…†‡‰‹¨ˇ¸‘’“”•–—™›¯˛ �¢£¤�¦§Ø©Ŗ«¬­®Æ°±²³´µ¶·ø¹ŗ»¼½¾æĄĮĀĆÄÅĘĒČÉŹĖĢĶĪĻŠŃŅÓŌÕÖ×ŲŁŚŪÜŻŽßąįāćäåęēčéźėģķīļšńņóōõö÷ųłśūüżž˙\", \"windows-1258\": \"€‚ƒ„…†‡ˆ‰‹Œ‘’“”•–—˜™›œŸ ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂĂÄÅÆÇÈÉÊË̀ÍÎÏĐÑ̉ÓÔƠÖ×ØÙÚÛÜỮßàáâăäåæçèéêë́íîïđṇ̃óôơö÷øùúûüư₫ÿ\", \"iso-8859-2\": \" Ą˘Ł¤ĽŚ§¨ŠŞŤŹ­ŽŻ°ą˛ł´ľśˇ¸šşťź˝žżŔÁÂĂÄĹĆÇČÉĘËĚÍÎĎĐŃŇÓÔŐÖ×ŘŮÚŰÜÝŢßŕáâăäĺćçčéęëěíîďđńňóôőö÷řůúűüýţ˙\", \"iso-8859-3\": \" Ħ˘£¤�Ĥ§¨İŞĞĴ­�Ż°ħ²³´µĥ·¸ışğĵ½�żÀÁÂ�ÄĊĈÇÈÉÊËÌÍÎÏ�ÑÒÓÔĠÖ×ĜÙÚÛÜŬŜßàáâ�äċĉçèéêëìíîï�ñòóôġö÷ĝùúûüŭŝ˙\", \"iso-8859-4\": \" ĄĸŖ¤ĨĻ§¨ŠĒĢŦ­Ž¯°ą˛ŗ´ĩļˇ¸šēģŧŊžŋĀÁÂÃÄÅÆĮČÉĘËĖÍÎĪĐŅŌĶÔÕÖ×ØŲÚÛÜŨŪßāáâãäåæįčéęëėíîīđņōķôõö÷øųúûüũū˙\", \"iso-8859-5\": \" \u0401\u0402\u0403\u0404\u0405\u0406\u0407\u0408\u0409\u040a\u040b\u040c­\u040e\u040f\u0410\u0411\u0412\u0413\u0414\u0415\u0416\u0417\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u0420\u0421\u0422\u0423\u0424\u0425\u0426\u0427\u0428\u0429\u042a\u042b\u042c\u042d\u042e\u042f\u0430\u0431\u0432\u0433\u0434\u0435\u0436\u0437\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u0440\u0441\u0442\u0443\u0444\u0445\u0446\u0447\u0448\u0449\u044a\u044b\u044c\u044d\u044e\u044f№\u0451\u0452\u0453\u0454\u0455\u0456\u0457\u0458\u0459\u045a\u045b\u045c§\u045e\u045f\", \"iso-8859-6\": \" ���¤�������،­�������������؛���؟�ءآأؤإئابةتثجحخدذرزسشصضطظعغ�����ـفقكلمنهوىيًٌٍَُِّْ�������������\", \"iso-8859-7\": \" ‘’£€₯¦§¨©ͺ«¬­�―°±²³΄΅Ά·ΈΉΊ»Ό½ΎΏΐΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡ�ΣΤΥΦΧΨΩΪΫάέήίΰαβγδεζηθικλμνξοπρςστυφχψωϊϋόύώ�\", \"iso-8859-8\": \" �¢£¤¥¦§¨©×«¬­®¯°±²³´µ¶·¸¹÷»¼½¾��������������������������������‗אבגדהוזחטיךכלםמןנסעףפץצקרשת��‎‏�\", \"iso-8859-10\": \" ĄĒĢĪĨĶ§ĻĐŠŦŽ­ŪŊ°ąēģīĩķ·ļđšŧž―ūŋĀÁÂÃÄÅÆĮČÉĘËĖÍÎÏÐŅŌÓÔÕÖŨØŲÚÛÜÝÞßāáâãäåæįčéęëėíîïðņōóôõöũøųúûüýþĸ\", \"iso-8859-13\": \" ”¢£¤„¦§Ø©Ŗ«¬­®Æ°±²³“µ¶·ø¹ŗ»¼½¾æĄĮĀĆÄÅĘĒČÉŹĖĢĶĪĻŠŃŅÓŌÕÖ×ŲŁŚŪÜŻŽßąįāćäåęēčéźėģķīļšńņóōõö÷ųłśūüżž’\", \"iso-8859-14\": \" Ḃḃ£ĊċḊ§Ẁ©ẂḋỲ­®ŸḞḟĠġṀṁ¶ṖẁṗẃṠỳẄẅṡÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏŴÑÒÓÔÕÖṪØÙÚÛÜÝŶßàáâãäåæçèéêëìíîïŵñòóôõöṫøùúûüýŷÿ\", \"iso-8859-15\": \" ¡¢£€¥Š§š©ª«¬­®¯°±²³Žµ¶·ž¹º»ŒœŸ¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ\", \"iso-8859-16\": \" ĄąŁ€„Š§š©Ș«Ź­źŻ°±ČłŽ”¶·žčș»ŒœŸżÀÁÂĂÄĆÆÇÈÉÊËÌÍÎÏĐŃÒÓÔŐÖŚŰÙÚÛÜĘȚßàáâăäćæçèéêëìíîïđńòóôőöśűùúûüęțÿ\", \"koi8-r\": \"─│┌┐└┘├┤┬┴┼▀▄█▌▐░▒▓⌠■∙√≈≤≥ ⌡°²·÷═║╒\u0451╓╔╕╖╗╘╙╚╛╜╝╞╟╠╡\u0401╢╣╤╥╦╧╨╩╪╫╬©\u044e\u0430\u0431\u0446\u0434\u0435\u0444\u0433\u0445\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u044f\u0440\u0441\u0442\u0443\u0436\u0432\u044c\u044b\u0437\u0448\u044d\u0449\u0447\u044a\u042e\u0410\u0411\u0426\u0414\u0415\u0424\u0413\u0425\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u042f\u0420\u0421\u0422\u0423\u0416\u0412\u042c\u042b\u0417\u0428\u042d\u0429\u0427\u042a\", \"koi8-u\": \"─│┌┐└┘├┤┬┴┼▀▄█▌▐░▒▓⌠■∙√≈≤≥ ⌡°²·÷═║╒\u0451\u0454╔\u0456\u0457╗╘╙╚╛\u0491\u045e╞╟╠╡\u0401\u0404╣\u0406\u0407╦╧╨╩╪\u0490\u040e©\u044e\u0430\u0431\u0446\u0434\u0435\u0444\u0433\u0445\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u044f\u0440\u0441\u0442\u0443\u0436\u0432\u044c\u044b\u0437\u0448\u044d\u0449\u0447\u044a\u042e\u0410\u0411\u0426\u0414\u0415\u0424\u0413\u0425\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u042f\u0420\u0421\u0422\u0423\u0416\u0412\u042c\u042b\u0417\u0428\u042d\u0429\u0427\u042a\", \"macintosh\": \"ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø¿¡¬√ƒ≈∆«»… ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄€‹›ﬁﬂ‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ\", \"ibm866\": \"\u0410\u0411\u0412\u0413\u0414\u0415\u0416\u0417\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u0420\u0421\u0422\u0423\u0424\u0425\u0426\u0427\u0428\u0429\u042a\u042b\u042c\u042d\u042e\u042f\u0430\u0431\u0432\u0433\u0434\u0435\u0436\u0437\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀\u0440\u0441\u0442\u0443\u0444\u0445\u0446\u0447\u0448\u0449\u044a\u044b\u044c\u044d\u044e\u044f\u0401\u0451\u0404\u0454\u0407\u0457\u040e\u045e°∙·√№¤■ \"}");
     const LABELS = {
       'utf-8': 'utf-8', 'utf8': 'utf-8', 'unicode-1-1-utf-8': 'utf-8', 'unicode11utf8': 'utf-8',
       'x-unicode20utf8': 'utf-8', 'unicode20utf8': 'utf-8',
@@ -12750,9 +12529,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       'koi8-u': 'koi8-u', 'koi8-ru': 'koi8-u',
       'macintosh': 'macintosh', 'mac': 'macintosh', 'x-mac-roman': 'macintosh',
       'ibm866': 'ibm866', '866': 'ibm866', 'cp866': 'ibm866', 'csibm866': 'ibm866',
-      // Многобайтовые браузер тоже знает; метку принимаем, разбираем как
-      // однобайтовую — страницы, которые ими пользуются, в отпечатке не
-      // встречаются, а отказ на метку виден сразу.
+      // The browser knows multi-byte encodings too; the label is accepted and
+      // decoded as single-byte: pages using them do not show up in
+      // fingerprinting, while a refused label shows immediately.
       'gbk': 'gbk', 'gb18030': 'gb18030', 'gb2312': 'gbk', 'big5': 'big5',
       'euc-jp': 'euc-jp', 'shift_jis': 'shift_jis', 'sjis': 'shift_jis',
       'euc-kr': 'euc-kr', 'iso-2022-jp': 'iso-2022-jp', 'replacement': 'replacement',
@@ -12794,7 +12573,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           for (let i = 0; i + 1 < a.length; i += 2) s += String.fromCharCode(a[i] | (a[i + 1] << 8));
           return s;
         }
-        // utf-8, с заменой на U+FFFD там же, где её ставит браузер.
+        // utf-8, with U+FFFD replacement exactly where the browser puts it.
         let i = 0;
         if (!this.__ptBOM && a.length >= 3 && a[0] === 0xef && a[1] === 0xbb && a[2] === 0xbf) i = 3;
         const bad = () => { if (this.__ptFatal) throw __pt_mkErr(TypeError, 'Failed to execute \'decode\' on \'TextDecoder\': The encoded data was not valid.'); return '\ufffd'; };
@@ -12829,19 +12608,18 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
   }
   if (!globalThis.Blob) {
-    // Части блоба — не только строки: браузер принимает буферы и их представления,
-    // и склеивает байты. `String(new Uint8Array([104,105]))` даёт «104,105», а не
-    // «hi», — и воркер, собранный из байтов, получал бы вместо кода список чисел.
+    // Blob parts are not only strings: the browser accepts buffers and views
+    // and concatenates bytes. `String(new Uint8Array([104,105]))` is "104,105",
+    // not "hi", so a worker built from bytes would get a list of numbers.
     const blobPart = (x) => {
       try {
         if (x instanceof ArrayBuffer || ArrayBuffer.isView(x)) return new TextDecoder().decode(x);
       } catch (e) {}
       return String(x);
     };
-    // Части, тип и размер живут не собственными свойствами объекта: у
-    // настоящего Blob их нет вовсе (`Object.getOwnPropertyNames(blob)` пуст),
-    // всё читается с прототипа. Ключ — символ, потому что символов в этом
-    // перечислении не видно.
+    // Parts, type and size are not own properties: a real Blob has none
+    // (`Object.getOwnPropertyNames(blob)` is empty), everything is read from
+    // the prototype. The key is a symbol, which that enumeration does not show.
     const BLOB = Symbol('blob');
     globalThis.Blob = class Blob {
       constructor(parts, opts) {
@@ -12905,8 +12683,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     globalThis.FormData = class FormData { constructor() { this.__ptD = []; } append(k, v) { this.__ptD.push([String(k), v]); } set(k, v) { this.delete(k); this.append(k, v); } get(k) { const e = this.__ptD.find((x) => x[0] === k); return e ? e[1] : null; } getAll(k) { return this.__ptD.filter((x) => x[0] === k).map((x) => x[1]); } has(k) { return this.__ptD.some((x) => x[0] === k); } delete(k) { this.__ptD = this.__ptD.filter((x) => x[0] !== k); } forEach(f) { for (const [k, v] of this.__ptD) f(v, k, this); } keys() { return this.__ptD.map((x) => x[0])[Symbol.iterator](); } values() { return this.__ptD.map((x) => x[1])[Symbol.iterator](); } entries() { return this.__ptD.map((x) => [x[0], x[1]])[Symbol.iterator](); } [Symbol.iterator]() { return this.entries(); } toString() { return this.__ptD.map(([k, v]) => k + '=' + v).join('&'); } };
   }
 
-  // Параметры, принадлежащие адресу (`url.searchParams`), после правки
-  // переписывают его запрос — связь скрытая, не свойством на объекте.
+  // Params owned by a URL (`url.searchParams`) rewrite its query when edited;
+  // a hidden link, not a property on the object.
   const PARAMS_OWNER = new WeakMap();
   const syncOwner = (p) => { const st = PARAMS_OWNER.get(p); if (!st) return; const q = p.toString(); st.query = q ? '?' + q : ''; };
   if (!globalThis.URLSearchParams) {
@@ -12924,9 +12702,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       keys() { return this.__ptD.map((x) => x[0])[Symbol.iterator](); }
       values() { return this.__ptD.map((x) => x[1])[Symbol.iterator](); }
       entries() { return this.__ptD.map((x) => [x[0], x[1]])[Symbol.iterator](); }
-      // Перебор и счёт браузер даёт на самом объекте: `[...params]` и
-      // `params.size` — обычные строки на любой странице, а у нас первая
-      // бросала, второй не было вовсе.
+      // The browser provides iteration and count on the object itself:
+      // `[...params]` and `params.size` are common on any page.
       [Symbol.iterator]() { return this.entries(); }
       get size() { return this.__ptD.length; }
       sort() { this.__ptD.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); syncOwner(this); }
@@ -12936,8 +12713,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   if (!globalThis.URL || !globalThis.URL.prototype || !('searchParams' in (globalThis.URL.prototype || {}))) {
     const parse = (s) => { const m = /^([a-zA-Z][a-zA-Z0-9+.-]*:)?([/][/]([^/?#]*))?([^?#]*)([?][^#]*)?([#].*)?$/.exec(String(s)) || []; return { protocol: m[1] || '', authority: m[3] || '', path: m[4] || '', search: m[5] || '', hash: m[6] || '' }; };
     let blobSeq = 1;
-    // UUID той же формы, что печатает браузер (версия 4, вариант 8..b), но
-    // выведенный из семени профиля: один и тот же профиль — один и тот же ряд.
+    // UUID of the browser's form (version 4, variant 8..b), but derived from
+    // the profile seed: the same profile yields the same sequence.
     const uuid4 = (n) => {
       let x = (SEED ^ (n * 0x9e3779b1)) >>> 0;
       const hex = [];
@@ -12950,14 +12727,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       const s = hex.join('');
       return s.slice(0, 8) + '-' + s.slice(8, 12) + '-' + s.slice(12, 16) + '-' + s.slice(16, 20) + '-' + s.slice(20);
     };
-    // Разбор адреса был выражением на одну строку, и расходился с браузером в
-    // шестнадцати случаях из двадцати пяти: не приводил схему и хост к нижнему
-    // регистру, не убирал порт по умолчанию, не сворачивал `..` в пути, не
-    // кодировал пробел, не знал пуникода, а `mailto:` превращал в
-    // `mailto://`. Адрес читают отовсюду — из `<a>`, из `location`, из самого
-    // `URL`, — так что это переписано по правилам, а не подогнано.
+    // URL parsing per the URL standard rules: lowercase scheme and host, drop
+    // the default port, collapse `..` in paths, percent-encode spaces,
+    // punycode, and `mailto:` stays without `//`. URLs are read from
+    // everywhere (`<a>`, `location`, `URL` itself).
     const SPECIAL = { 'http:': '80', 'https:': '443', 'ws:': '80', 'wss:': '443', 'ftp:': '21', 'file:': '' };
-    // Пуникод: имя с не-ASCII браузер записывает как `xn--…`.
+    // Punycode: the browser writes non-ASCII hostnames as `xn--...`.
     const punyEncode = (label) => {
       if (!/[^\x00-\x7f]/.test(label)) return label;
       const base = 36, tmin = 1, tmax = 26, skew = 38, damp = 700, initialBias = 72, initialN = 128;
@@ -13001,12 +12776,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       return 'xn--' + (delim ? out : out);
     };
     const encHost = (h) => h.split('.').map(punyEncode).join('.');
-    // Пробел и не-ASCII в пути браузер записывает процентами; уже записанное
-    // не трогает.
+    // The browser percent-encodes spaces and non-ASCII in paths; already
+    // encoded sequences are left alone.
     const encPath = (p) => p.replace(/[^\x21-\x7e]|[\\"<>^`{|}]/g, (c) =>
       Array.from(new TextEncoder().encode(c)).map((b) => '%' + b.toString(16).toUpperCase().padStart(2, '0')).join(''));
-    // Запрос и фрагмент браузер тоже записывает процентами: пробел, кавычка,
-    // угловые скобки, не-ASCII; у фрагмента ещё обратный апостроф.
+    // Query and fragment are percent-encoded too: space, quote, angle
+    // brackets, non-ASCII; the fragment also backtick.
     const pct = (c) => Array.from(new TextEncoder().encode(c)).map((b) => '%' + b.toString(16).toUpperCase().padStart(2, '0')).join('');
     const encQuery = (q, special) => q.replace(special ? /[^\x21-\x7e]|[#"<>']/g : /[^\x21-\x7e]|[#"<>]/g, pct);
     const encFrag = (f) => f.replace(/[^\x21-\x7e]|["<>`]/g, pct);
@@ -13024,8 +12799,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       return r || (abs ? '/' : '');
     };
     const URL_STATE = new WeakMap();
-    // Параметры адреса: их правка (`append`, `set`, `delete`, `sort`) меняет
-    // строку запроса самого адреса — так связаны URL и URLSearchParams у браузера.
+    // URL params: editing them (`append`, `set`, `delete`, `sort`) changes the
+    // URL's own query string, as URL and URLSearchParams are linked in the browser.
     const linkParams = (st) => {
       const p = new globalThis.URLSearchParams(st.query);
       PARAMS_OWNER.set(p, st);
@@ -13041,10 +12816,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const b = URL_STATE.get(base) || base;
         scheme = b.scheme;
         if (!s.startsWith('//')) {
-          // Относительный адрес: схема, доступ и хост берутся у основы как
-          // есть. Пересобирать их обратно в строку нельзя — порт при этом
-          // терялся, и страница, ушедшая на `/dest` с базы с портом, никуда
-          // не приходила.
+          // Relative URL: scheme, credentials and host are taken from the base
+          // as is. Rebuilding them into a string lost the port, so navigating
+          // to `/dest` from a base with a port went nowhere.
           st.scheme = scheme;
           st.username = b.username; st.password = b.password;
           st.host = b.host; __pt_write(st, 'port', b.port);
@@ -13067,7 +12841,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       const special = Object.prototype.hasOwnProperty.call(SPECIAL, scheme);
       st.opaque = !special && !s.startsWith('//');
       if (st.opaque) {
-        // `mailto:`, `data:`, `about:`, `blob:` — путь целиком, без хоста.
+        // `mailto:`, `data:`, `about:`, `blob:`: the whole path, no host.
         const hi = s.indexOf('#'); const frag = hi >= 0 ? s.slice(hi) : '';
         if (hi >= 0) s = s.slice(0, hi);
         const qi = s.indexOf('?'); const q = qi >= 0 ? s.slice(qi) : '';
@@ -13076,8 +12850,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         st.path = s; st.query = q; st.fragment = frag;
         return true;
       }
-      // Особая схема терпит любое число косых после двоеточия (`http:/a`,
-      // `http:///a`) — всё это `http://a/`.
+      // A special scheme tolerates any number of slashes after the colon
+      // (`http:/a`, `http:///a`): all are `http://a/`.
       if (special && scheme !== 'file:') s = s.replace(/^[\/\\]*/, '');
       else if (s.startsWith('//')) s = s.slice(2);
       const cut = s.search(/[/?#\\]/);
@@ -13090,7 +12864,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         st.username = ci < 0 ? ui : ui.slice(0, ci);
         st.password = ci < 0 ? '' : ui.slice(ci + 1);
       } else { st.username = st.username || ''; st.password = st.password || ''; }
-      // IPv6 — в скобках, и двоеточия внутри к порту не относятся.
+      // IPv6 is bracketed, and colons inside are not the port.
       let hostPart = auth, portPart = '';
       if (auth.startsWith('[')) {
         const close = auth.indexOf(']');
@@ -13102,8 +12876,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         const ci = auth.lastIndexOf(':');
         if (ci >= 0) { hostPart = auth.slice(0, ci); portPart = auth.slice(ci + 1); }
       }
-      // Особая схема без хоста (`http://`), запрещённые знаки в хосте и
-      // нечисловой порт у браузера — не адрес вовсе.
+      // A special scheme without a host (`http://`), forbidden host code points
+      // or a non-numeric port: not a URL for the browser.
       if (special && scheme !== 'file:' && !hostPart) return false;
       if (special && /[\x00-\x1f#/<>?@\\^|]/.test(hostPart.replace(/^\[.*\]$/, ''))) return false;
       if (portPart && (!/^\d+$/.test(portPart) || +portPart > 65535)) return false;
@@ -13155,9 +12929,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       }
       get pathname() { return URL_STATE.get(this).path; }
       set pathname(v) { const st = URL_STATE.get(this); if (!st.opaque) st.path = encPath(normPath(String(v) || '/')); }
-      // `search` — строка запроса как записана (`?x` остаётся `?x`), а не
-      // пересборка через URLSearchParams, которая дописывала `=` к каждому
-      // ключу. Правки через `searchParams` пишут обратно в адрес.
+      // `search` is the query as written (`?x` stays `?x`), not a
+      // URLSearchParams rebuild, which appended `=` to every key. Edits via
+      // `searchParams` write back into the URL.
       get search() { const st = URL_STATE.get(this); return st.query === '?' ? '' : st.query; }
       set search(v) { const st = URL_STATE.get(this); const t = encQuery(String(v), Object.prototype.hasOwnProperty.call(SPECIAL, st.scheme)); st.query = t && t[0] !== '?' ? '?' + t : t; st.params = linkParams(st); }
       get searchParams() { return URL_STATE.get(this).params; }
@@ -13168,7 +12942,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         if (st.scheme === 'blob:') {
           try { return new URL(st.path).origin; } catch (e) { return 'null'; }
         }
-        // У файлового адреса происхождение есть, но без хоста: `file://`.
+        // A file URL has an origin, but without a host: `file://`.
         if (st.scheme === 'file:') return 'file://';
         if (st.opaque || !Object.prototype.hasOwnProperty.call(SPECIAL, st.scheme)) return 'null';
         return st.scheme + '//' + this.host;
@@ -13198,9 +12972,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // fetches its URL (or runs it as a Worker) expects its own bytes back, and
       // handing out a URL that resolves to nothing breaks that silently.
       static createObjectURL(obj) {
-        // Форма адреса — часть отпечатка: в браузере это `blob:<origin>/<uuid>`,
-        // а не короткий счётчик. Воркер видит этот адрес своим `location.href`,
-        // и страница отправляет его сборщику вместе с остальным.
+        // The URL shape is part of the fingerprint: the browser uses
+        // `blob:<origin>/<uuid>`, not a short counter. A worker sees it as its
+        // `location.href`, and pages send it to the collector.
         const u = 'blob:' + (globalThis.location ? location.origin : 'null') + '/' + uuid4(blobSeq++);
         (globalThis.__pt_blobs || (globalThis.__pt_blobs = new Map())).set(u, obj);
         return u;
@@ -13210,9 +12984,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     globalThis.URL = URL;
   }
 
-  // Интерфейсы, определённые нами как классы, обязаны читаться нативными: в
-  // браузере это `[native code]`, и сборщик отпечатка кладёт их в корзину `N`,
-  // а пользовательскую функцию — в `f`. Разница видна одной строкой.
+  // Interfaces we define as classes must read as native: in the browser they
+  // are `[native code]`, which fingerprinters bucket as `N`, user functions as `f`.
   for (const n of ['EventTarget', 'IntersectionObserver', 'MutationObserver', 'ResizeObserver',
     'PerformanceObserver', 'PerformanceObserverEntryList', 'PerformanceEntry',
     'PerformanceResourceTiming', 'PerformanceNavigationTiming',
@@ -13223,10 +12996,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     'AbortController', 'AbortSignal', 'XMLHttpRequest', 'Node', 'Element', 'HTMLElement',
     'Document', 'Text', 'Comment', 'DocumentFragment', 'Event', 'UIEvent', 'MouseEvent',
     'PointerEvent', 'KeyboardEvent', 'InputEvent', 'FocusEvent', 'MessageEvent', 'CustomEvent',
-    // Найдены коллектором самого челленджа: эти четыре читались как
-    // пользовательские функции, то есть попадали в корзину `f` там, где браузер
-    // даёт `N`. Четыре имени из тысячи — ровно тот разряд, которым отпечаток и
-    // отличается.
+    // Found by the challenge's own collector: these four read as user
+    // functions (bucket `f` where the browser gives `N`).
     'PerformanceEntry', 'PerformanceResourceTiming', 'PerformanceNavigationTiming',
     'CustomElementRegistry']) {
     const c = globalThis[n];
@@ -13236,15 +13007,15 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     'addEventListener', 'removeEventListener', 'queueMicrotask', 'structuredClone']) {
     if (typeof globalThis[n] === 'function') __ptNative.add(globalThis[n]);
   }
-  // Лестница интерфейсов элементов строится в DOM-рантайме, до того как здесь
-  // появляется реестр нативных, — поэтому забираем их все по имени.
+  // The element interface ladder is built in the DOM runtime before the
+  // native registry exists here, so collect all of them by name.
   for (const n of Object.getOwnPropertyNames(globalThis)) {
     if (!/^(HTML|SVG)[A-Za-z]*Element$/.test(n)) continue;
     const c = globalThis[n];
     if (typeof c === 'function') { __ptNative.add(c); maskProto(c.prototype); }
   }
 
-  // `console.log.toString()` читают так же, как всё остальное.
+  // `console.log.toString()` is read like everything else.
   try {
     for (const k of Object.getOwnPropertyNames(globalThis.console || {})) {
       const f = console[k];
@@ -13252,15 +13023,15 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     }
   } catch (e) {}
 
-  // `NodeFilter` — интерфейсный объект, то есть функция с константами на себе,
-  // а не словарь: в браузере он попадает в ту же корзину `N`.
+  // `NodeFilter` is an interface object (a function holding constants), not a
+  // dict: in the browser it lands in the same `N` bucket.
   try {
     const F = globalThis.NodeFilter;
     if (F && typeof F !== 'function') {
-      // У Chrome `NodeFilter` — единственный интерфейс без `prototype`: он
-      // только держит константы обхода, инстанцировать нечего. `prototype`
-      // функции не удаляется, поэтому берём краткую запись метода: у неё его
-      // нет вовсе, а имя и бросок — те же.
+      // In Chrome `NodeFilter` is the only interface without `prototype`: it
+      // only holds traversal constants. A function's `prototype` cannot be
+      // deleted, so use method shorthand, which has none, with the same name
+      // and throw.
       const ctor = ({ NodeFilter() { throw __pt_mkErr(TypeError, 'Illegal constructor'); } }).NodeFilter;
       for (const k of Object.keys(F)) {
         Object.defineProperty(ctor, k, { value: F[k], enumerable: true, configurable: true });
@@ -13270,10 +13041,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     }
   } catch (e) {}
 
-  // `origin` есть у окна, `valueOf` — у location.
+  // `origin` on window, `valueOf` on location.
   if (!('origin' in globalThis)) {
-    // У `about:blank` origin окна унаследован от создателя (location.origin при
-    // этом остаётся "null", как у браузера); подсказку кладёт родитель.
+    // For `about:blank` the window origin is inherited from the creator
+    // (location.origin stays "null", as in the browser); the parent leaves a hint.
     try { Object.defineProperty(globalThis, 'origin', { get: () => ((globalThis.location && location.href === 'about:blank' && globalThis.__pt_inheritedOrigin) || (globalThis.location && location.origin) || 'null'), enumerable: true, configurable: true }); } catch (e) {}
   }
   try {
@@ -13332,8 +13103,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // non-enumerable AND filter them out at every introspection choke point. They
   // stay callable by bare name (the Rust driver's only need), which lookups by
   // name still resolve. The filters themselves are marked native (#1).
-  // `__out*` — имена одноразовой пробы движка (`--eval` кладёт туда ответ);
-  // прятать надо всё семейство, иначе `__outDone` торчит на окне лишним именем.
+  // `__out*` are names of the engine's one-shot probe (`--eval` puts its
+  // answer there); the whole family must be hidden, or `__outDone` shows on window.
   const __ptHidden = (k) => typeof k === 'string' && (k.lastIndexOf('__pt', 0) === 0 || k.lastIndexOf('__out', 0) === 0);
   for (const k of Object.getOwnPropertyNames(globalThis)) {
     if (__ptHidden(k)) {
@@ -13364,7 +13135,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     value: mask(function hasOwnProperty(k) { return __ptHidden(k) ? false : origHOP.call(this, k); }, 'hasOwnProperty'),
     configurable: true, writable: true,
   });
-  // Object.hasOwn тоже: он видел служебные поля узлов.
+  // Object.hasOwn too: it saw internal node fields.
   const origHasOwn = Object.hasOwn;
   if (typeof origHasOwn === 'function') {
     Object.defineProperty(Object, 'hasOwn', {
@@ -13372,8 +13143,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       configurable: true, writable: true,
     });
   }
-  // Сырые версии — для последнего прохода загрузчика (прячет перечислимость
-  // служебных методов прототипов); сами под скрытым именем.
+  // Raw versions for the loader's last pass (which hides enumerability of
+  // internal prototype methods); themselves under a hidden name.
   Object.defineProperty(globalThis, '__pt_rawGOPN', { value: origGOPN, configurable: true });
   Object.defineProperty(globalThis, '__pt_rawGOPD', { value: origGOPD, configurable: true });
 })();"#;
@@ -13641,10 +13412,9 @@ mod tests {
 
 #[cfg(test)]
 mod dump_scripts {
-    /// Скрипты слоёв — текстом на диск, когда задан `NOKK_DUMP_DIR`. Нужен он
-    /// для одного: проверить синтаксис тем же `node --check`, каким проверяется
-    /// `dom_runtime.js`. Внутри строк Rust опечатка видна только так — движок
-    /// на неё отвечает одним `SyntaxError` без места.
+    /// Dumps layer scripts to disk when `NOKK_DUMP_DIR` is set, so their syntax
+    /// can be checked with `node --check` like `dom_runtime.js`: inside Rust
+    /// strings a typo otherwise surfaces only as a `SyntaxError` with no location.
     #[test]
     fn dump_scripts() {
         let dir = std::env::var("NOKK_DUMP_DIR").unwrap_or_default();

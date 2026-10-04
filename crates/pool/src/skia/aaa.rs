@@ -1,6 +1,6 @@
-//! Аналитическое сглаживание Skia — порт `SkScan_AAAPath.cpp` той
-//! ревизии, что в Chrome 151: аддитивные блиттеры (маска и RLE), доли
-//! трапеций, обход выпуклых и произвольных рёбер, `AAAFillPath`.
+//! Skia analytic anti-aliasing: port of `SkScan_AAAPath.cpp` at the
+//! Chrome 151 revision: additive blitters (mask and RLE), trapezoid
+//! coverage, convex and general edge walking, `AAAFillPath`.
 
 use super::blit::Blitter;
 use super::edge::{Edge, EdgeBuilder, IRectF, EdgeType, NIL};
@@ -35,7 +35,7 @@ impl AlphaRuns {
     pub fn is_empty(&self) -> bool {
         self.alpha[0] == 0 && self.runs[self.runs[0] as usize] == 0
     }
-    /// `SkAlphaRuns::Break(runs, alpha, x, count)` от смещения `off`.
+    /// `SkAlphaRuns::Break(runs, alpha, x, count)` from offset `off`.
     fn break_run(runs: &mut [i16], alpha: &mut [u8], off: usize, x: usize, count: usize) {
         let mut ri = off;
         let mut x = x;
@@ -68,7 +68,7 @@ impl AlphaRuns {
             ri += n;
         }
     }
-    /// `SkAlphaRuns::add` — возвращает новый offsetX.
+    /// `SkAlphaRuns::add`: returns the new offsetX.
     pub fn add(&mut self, x: usize, start_alpha: u8, mut middle_count: usize, stop_alpha: u8, max_value: u8, offset_x: usize) -> usize {
         let mut off = offset_x;
         let mut last_alpha = off;
@@ -105,7 +105,7 @@ impl AlphaRuns {
     }
 }
 
-// ── Аддитивные блиттеры ──────────────────────────────────────────────────
+// ── Additive blitters ────────────────────────────────────────────────────
 
 #[inline]
 fn add_alpha(a: &mut u8, delta: u8) {
@@ -122,12 +122,12 @@ enum Kind {
     SafeRun,
 }
 
-/// Три аддитивных блиттера Skia в одном: `MaskAdditiveBlitter`,
-/// `RunBasedAdditiveBlitter` и `SafeRLEAdditiveBlitter`.
+/// Skia's three additive blitters in one: `MaskAdditiveBlitter`,
+/// `RunBasedAdditiveBlitter` and `SafeRLEAdditiveBlitter`.
 pub struct Additive<'a> {
     kind: Kind,
     real: &'a mut dyn Blitter,
-    // маска
+    // mask
     mask: Vec<u8>,
     mask_bounds: IRect,
     mask_row_bytes: usize,
@@ -158,8 +158,8 @@ impl<'a> Additive<'a> {
     pub fn mask(real: &'a mut dyn Blitter, ir: &IRect, clip_bounds: &IRect) -> Additive<'a> {
         let clip_rect = ir.intersect(clip_bounds).unwrap_or_default();
         let row_bytes = ir.width() as usize;
-        // +2: по байту с каждого края на ошибку округления, как в Skia
-        // (fStorage + 1 и запас).
+        // +2: one byte on each side for rounding error, as in Skia
+        // (fStorage + 1 plus slack).
         let mask = vec![0u8; ir.height() as usize * row_bytes + 2];
         Additive {
             kind: Kind::Mask,
@@ -202,9 +202,9 @@ impl<'a> Additive<'a> {
         matches!(self.kind, Kind::Mask)
     }
 
-    /// Смещение строки `y` в маске так, что `row + x` — пиксель (x, y).
-    /// Индекс считается с поправкой в +1 байт (как `fStorage + 1`), чтобы
-    /// запись в x = left − 1 не выходила за буфер.
+    /// Offset of row `y` in the mask such that `row + x` is pixel (x, y).
+    /// The index carries a +1 byte bias (like `fStorage + 1`) so that
+    /// writing at x = left − 1 stays inside the buffer.
     #[inline]
     fn row_index(&self, y: i32) -> isize {
         1 + (y - self.mask_bounds.top) as isize * self.mask_row_bytes as isize - self.mask_bounds.left as isize
@@ -215,7 +215,7 @@ impl<'a> Additive<'a> {
         &mut self.mask[i as usize]
     }
 
-    // ── общий интерфейс AdditiveBlitter ──
+    // ── shared AdditiveBlitter interface ──
 
     pub fn blit_anti_h_run(&mut self, x: i32, y: i32, alphas: &[u8], len: i32) {
         match self.kind {
@@ -325,8 +325,8 @@ impl<'a> Additive<'a> {
         }
     }
 
-    // «Настоящий» блиттер для маски — она же сама (blitV/blitRect/blitAntiRect
-    // пишут в маску напрямую), для RLE — нижележащий.
+    // The "real" blitter for the mask is the mask itself (blitV/blitRect/blitAntiRect
+    // write into it directly); for RLE it is the underlying one.
 
     pub fn real_blit_v(&mut self, x: i32, y: i32, height: i32, alpha: u8) {
         match self.kind {
@@ -372,9 +372,9 @@ impl<'a> Additive<'a> {
     pub fn real_blit_anti_h2(&mut self, x: i32, y: i32, a0: u8, a1: u8) {
         match self.kind {
             Kind::Mask => {
-                // У маски «настоящий» блиттер — она сама, а blitAntiH2 у
-                // SkBlitter по умолчанию идёт через blitAntiH: для маски это
-                // прямое добавление.
+                // For the mask the "real" blitter is itself, and the default
+                // SkBlitter::blitAntiH2 goes through blitAntiH: for the mask that
+                // is a direct add.
                 add_alpha(self.mask_at(y, x), a0);
                 add_alpha(self.mask_at(y, x + 1), a1);
             }
@@ -453,14 +453,14 @@ impl<'a> Additive<'a> {
         }
     }
 
-    /// Завершение: маска отдаётся настоящему блиттеру, RLE — сбрасывается.
+    /// Flush: the mask goes to the real blitter, RLE is flushed.
     pub fn finish(mut self) {
         match self.kind {
             Kind::Mask => {
                 let bounds = self.mask_bounds;
                 let clip = self.clip_rect;
                 if !clip.is_empty() {
-                    // Маска хранится с поправкой +1 (см. row_index).
+                    // The mask is stored with a +1 bias (see row_index).
                     let mask = &self.mask[1..];
                     self.real.blit_mask(mask, &bounds, self.mask_row_bytes, &clip);
                 }
@@ -470,7 +470,7 @@ impl<'a> Additive<'a> {
     }
 }
 
-// ── Доли покрытия ────────────────────────────────────────────────────────
+// ── Coverage fractions ───────────────────────────────────────────────────
 
 #[inline]
 fn trapezoid_to_alpha(l1: Fixed, l2: Fixed) -> u8 {
@@ -749,7 +749,7 @@ fn blit_trapezoid_row(
     }
 }
 
-// ── Список рёбер ─────────────────────────────────────────────────────────
+// ── Edge list ────────────────────────────────────────────────────────────
 
 struct EdgeList {
     e: Vec<Edge>,
@@ -833,7 +833,7 @@ impl EdgeList {
     }
 }
 
-// ── Выпуклый обход ───────────────────────────────────────────────────────
+// ── Convex walk ──────────────────────────────────────────────────────────
 
 fn is_smooth_enough_edge(l: &mut EdgeList, this_e: usize, next_e: usize, _stop_y: i32) -> bool {
     let e = &l.e[this_e];
@@ -1072,7 +1072,7 @@ fn aaa_walk_convex_edges(
     }
 }
 
-// ── Общий обход ──────────────────────────────────────────────────────────
+// ── General walk ─────────────────────────────────────────────────────────
 
 #[inline]
 fn update_next_next_y(y: Fixed, next_y: Fixed, next_next_y: &mut Fixed) {
@@ -1310,7 +1310,7 @@ fn aaa_walk_edges(
     }
 }
 
-// ── Точка входа ──────────────────────────────────────────────────────────
+// ── Entry point ──────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
 fn aaa_fill_path(
@@ -1392,7 +1392,7 @@ pub fn aaa_fill_path_entry(path: &Path, blitter: &mut dyn Blitter, ir: &IRect, c
     }
 }
 
-/// `SkScan::AntiFillPath(path, clip, blitter)` для прямоугольной области.
+/// `SkScan::AntiFillPath(path, clip, blitter)` for a rect clip.
 pub fn anti_fill_path(path: &Path, clip: &IRect, blitter: &mut dyn Blitter) {
     if clip.is_empty() {
         return;
@@ -1402,9 +1402,9 @@ pub fn anti_fill_path(path: &Path, clip: &IRect, blitter: &mut dyn Blitter) {
         return;
     }
     let Some(_clipped) = ir.intersect(clip) else { return };
-    // SkScanClipper: если границы пути выходят за окно по горизонтали,
-    // блиттер заворачивается в SkRectClipBlitter — и это меняет арифметику
-    // (blitAntiH2/V2 идут через blitAntiH с пробегами).
+    // SkScanClipper: when the path bounds exceed the window horizontally,
+    // the blitter is wrapped in SkRectClipBlitter, which changes the arithmetic
+    // (blitAntiH2/V2 go through blitAntiH with runs).
     if !clip.contains(&ir) && (clip.left > ir.left || clip.right < ir.right) {
         let mut wrapped = super::blit::RectClipBlitter::new(blitter, *clip);
         aaa_fill_path_entry(path, &mut wrapped, &ir, clip);

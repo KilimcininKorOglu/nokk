@@ -1,7 +1,7 @@
-//! Аналитические рёбра (`SkAnalyticEdge.cpp`) и их построение из пути
+//! Analytic edges (`SkAnalyticEdge.cpp`) and building them from a path
 //! (`SkEdgeBuilder.cpp`, `SkEdgeClipper.cpp`, `SkLineClipper.cpp`).
-//! Фикс-поинт 16.16 и порядок операций — как в Skia: от них зависят
-//! доли покрытия на краях фигур.
+//! 16.16 fixed point and operation order match Skia: edge coverage
+//! fractions depend on them.
 
 use super::fixed::*;
 use super::geometry::{
@@ -153,8 +153,8 @@ pub enum EdgeType {
     Cubic,
 }
 
-/// `SkAnalyticEdge` вместе с полями квадрики и кубика (одна структура —
-/// проще держать в векторе).
+/// `SkAnalyticEdge` plus the quad and cubic fields (one struct, so it
+/// fits in one vector).
 #[derive(Clone, Debug)]
 pub struct Edge {
     pub next: usize,
@@ -326,7 +326,7 @@ impl Edge {
         true
     }
 
-    /// `SkAnalyticEdge::update(last_y)` — true, если ребро ещё не кончилось.
+    /// `SkAnalyticEdge::update(last_y)`: true while the edge continues.
     pub fn update(&mut self) -> bool {
         if self.curve_count < 0 {
             self.update_cubic()
@@ -337,7 +337,7 @@ impl Edge {
         }
     }
 
-    // ── квадрика ──
+    // ── quad ──
 
     fn set_quadratic_without_update(pts: &[Point; 3], shift_in: i32) -> Option<Edge> {
         let scale = (1i32 << (shift_in + 6)) as f32;
@@ -489,7 +489,7 @@ impl Edge {
         self.snapped_y = self.y;
     }
 
-    // ── кубик ──
+    // ── cubic ──
 
     fn set_cubic_without_update(pts: &[Point; 4], shift_in: i32) -> Option<Edge> {
         let scale = (1i32 << (shift_in + 6)) as f32;
@@ -668,7 +668,7 @@ fn cubic_delta_from_line(a: FDot6, b: FDot6, c: FDot6, d: FDot6) -> FDot6 {
     abs32(one_third).max(abs32(two_third))
 }
 
-// ── Построение списка рёбер (SkAnalyticEdgeBuilder) ──────────────────────
+// ── Edge list building (SkAnalyticEdgeBuilder) ───────────────────────────
 
 #[derive(PartialEq, Eq)]
 enum Combine {
@@ -765,8 +765,8 @@ impl EdgeBuilder {
         }
     }
 
-    /// `SkEdgeBuilder::buildEdges(path, clip)`: `clip` — None, если путь
-    /// целиком внутри области отсечения.
+    /// `SkEdgeBuilder::buildEdges(path, clip)`: `clip` is None when the path
+    /// lies entirely inside the clip.
     pub fn build(path: &Path, clip: Option<&IRectF>) -> EdgeBuilder {
         let mut b = EdgeBuilder { edges: Vec::new() };
         let can_cull_to_the_right = !path.convexity.is_convex();
@@ -863,7 +863,7 @@ impl EdgeBuilder {
     }
 }
 
-/// Область отсечения во float (`recoverClip`).
+/// Clip rect in float (`recoverClip`).
 pub struct IRectF(pub Rect);
 
 // ── SkPathEdgeIter ────────────────────────────────────────────────────────
@@ -1008,7 +1008,7 @@ fn sect_clamp_with_vertical(src: &[Point; 2], x: f32) -> f32 {
     pin_unsorted_f(y, src[0].y, src[1].y)
 }
 
-/// `SkLineClipper::ClipLine`: до 3 отрезков, точки `lines[0..=n]`.
+/// `SkLineClipper::ClipLine`: up to 3 segments, points `lines[0..=n]`.
 pub fn clip_line(pts: [Point; 2], clip: &Rect, can_cull_to_the_right: bool) -> ([Point; 4], usize) {
     let mut lines = [Point::default(); 4];
     let (index0, index1) = if pts[0].y < pts[1].y { (0, 1) } else { (1, 0) };
@@ -1355,7 +1355,7 @@ fn chop_quad_in_y(pts: &mut [Point; 3], clip: &Rect) {
     }
 }
 
-/// `mono_cubic_closestT` — запасной путь Skia, если точный корень не нашёлся.
+/// `mono_cubic_closestT`: Skia's fallback when the exact root is not found.
 fn mono_cubic_closest_t(src: &[f32; 4], mut x: f32) -> f32 {
     let mut t = 0.5f32;
     let mut best_t = t;
@@ -1383,8 +1383,8 @@ fn mono_cubic_closest_t(src: &[f32; 4], mut x: f32) -> f32 {
     best_t
 }
 
-/// `SkChopMonoCubicAtY` через double-корень (`SkBezierCubic`): корень
-/// первого пересечения с y на [0,1], разбиение в double.
+/// `SkChopMonoCubicAtY` via the double root (`SkBezierCubic`): first
+/// crossing with y on [0,1], split in double.
 fn chop_mono_cubic_at_axis(src: &[Point; 4], vertical_axis: bool, value: f32) -> [Point; 7] {
     let coord = |p: &Point| if vertical_axis { p.y as f64 } else { p.x as f64 };
     let p0 = coord(&src[0]);
@@ -1392,7 +1392,7 @@ fn chop_mono_cubic_at_axis(src: &[Point; 4], vertical_axis: bool, value: f32) ->
     let p2 = coord(&src[2]);
     let p3 = coord(&src[3]);
     let v = value as f64;
-    // Монотонный кубик: одно пересечение; ищем бисекцией/Ньютоном в double.
+    // Monotonic cubic: one crossing; bisection/Newton in double.
     let f = |t: f64| -> f64 {
         let mt = 1.0 - t;
         mt * mt * mt * p0 + 3.0 * mt * mt * t * p1 + 3.0 * mt * t * t * p2 + t * t * t * p3 - v

@@ -1,8 +1,8 @@
-//! Конвейер `SkRasterPipeline` в точности highp (float) — тот вариант, что
-//! Chrome берёт для градиентов (стадии коники и dither есть только в нём).
-//! Арифметика повторяет `SkRasterPipeline_opts.h` для AVX2: `mad` — это
-//! настоящий fma, округление в байты — к ближайшему чётному, `1/255` —
-//! умножение на константу.
+//! `SkRasterPipeline` in exact highp (float), the variant Chrome uses for
+//! gradients (the conic and dither stages exist only there).
+//! Arithmetic follows `SkRasterPipeline_opts.h` for AVX2: `mad` is a real
+//! fma, byte rounding is round-half-even, `1/255` is a multiply by a
+//! constant.
 
 use super::blit::{BlendMode, Blitter};
 use super::geometry::IRect;
@@ -21,7 +21,7 @@ fn from_byte(b: u8) -> f32 {
 }
 #[inline]
 fn to_unorm(v: f32) -> u8 {
-    // round(min(max(0, mad(v, 255, 0)), 255)) — cvtps_epi32: к ближайшему чётному.
+    // round(min(max(0, mad(v, 255, 0)), 255)): cvtps_epi32, round-half-even.
     let s = mad(v, 255.0, 0.0).max(0.0).min(255.0);
     s.round_ties_even() as u8
 }
@@ -30,7 +30,7 @@ fn clamp_01(v: f32) -> f32 {
     v.max(0.0).min(1.0)
 }
 
-/// Стадии, которые нам нужны (имена — как у Skia).
+/// The stages we need (named as in Skia).
 #[derive(Clone, Debug)]
 pub enum Stage {
     SeedShader,
@@ -61,7 +61,7 @@ pub enum Stage {
     Unpremul,
     Scale1Float(f32),
     Lerp1Float(f32),
-    /// Покрытие из маски (значение подставляется при вызове).
+    /// Coverage from the mask (value supplied at call time).
     ScaleU8,
     LerpU8,
     LoadDst,
@@ -76,7 +76,7 @@ pub struct Px {
     pub a: f32,
 }
 
-/// Состояние одной «полосы» конвейера для пикселя (dx, dy).
+/// State of one pipeline lane for pixel (dx, dy).
 struct Lane {
     r: f32,
     g: f32,
@@ -89,7 +89,7 @@ struct Lane {
     mask: bool,
 }
 
-/// `SkBlendMode_AppendStages` в highp: смешение premul-цветов.
+/// `SkBlendMode_AppendStages` in highp: blending premul colors.
 fn blend_highp(mode: BlendMode, l: &mut Lane) {
     let (s, d) = ([l.r, l.g, l.b, l.a], [l.dr, l.dg, l.db, l.da]);
     let sa = s[3];
@@ -135,14 +135,14 @@ fn blend_highp(mode: BlendMode, l: &mut Lane) {
     l.a = out[3];
 }
 
-/// Конвейер, собранный один раз для блиттера, и выполняемый по пикселям.
+/// Pipeline built once per blitter and run per pixel.
 pub struct Pipeline {
     pub stages: Vec<Stage>,
 }
 
 impl Pipeline {
-    /// Прогнать пиксель (dx, dy). `dst` — premul RGBA8 назначения (для LoadDst),
-    /// `cov` — байт покрытия для ScaleU8/LerpU8. Возвращает байты для Store.
+    /// Run pixel (dx, dy). `dst` is the premul RGBA8 destination (for LoadDst),
+    /// `cov` the coverage byte for ScaleU8/LerpU8. Returns the bytes for Store.
     pub fn run_px(&self, dx: i32, dy: i32, dst: [u8; 4], cov: u8) -> [u8; 4] {
         let mut l = Lane { r: 0.0, g: 0.0, b: 0.0, a: 0.0, dr: 0.0, dg: 0.0, db: 0.0, da: 0.0, mask: true };
         for st in &self.stages {
@@ -324,8 +324,8 @@ impl Pipeline {
     }
 }
 
-/// `SkRasterPipelineBlitter` с произвольным цветовым конвейером (шейдер,
-/// цветовой фильтр, dither) в highp.
+/// `SkRasterPipelineBlitter` with an arbitrary color pipeline (shader,
+/// color filter, dither) in highp.
 pub struct PipelineBlitter<'a> {
     data: &'a mut [u8],
     width: i32,
@@ -338,8 +338,8 @@ pub struct PipelineBlitter<'a> {
 }
 
 impl<'a> PipelineBlitter<'a> {
-    /// `color` — стадии цвета (после них Skia ставит `clamp_01`), `mode` —
-    /// режим наложения краски; `is_opaque` сводит srcover к src.
+    /// `color`: color stages (Skia appends `clamp_01` after them); `mode`:
+    /// paint blend mode; `is_opaque` reduces srcover to src.
     pub fn new(data: &'a mut [u8], width: i32, height: i32, color: Vec<Stage>, mode: BlendMode, is_opaque: bool) -> Self {
         let mut mode = mode;
         if is_opaque && mode == BlendMode::SrcOver {
@@ -350,9 +350,9 @@ impl<'a> PipelineBlitter<'a> {
                 p.push(Stage::Blend(mode));
             }
         };
-        // blitRect: цвет, clamp, [load dst, blend], store. Быстрый путь
-        // srcover_rgba_8888 у Chrome отключён (у холста есть colorSpace), так
-        // что и для srcover идёт общий путь.
+        // blitRect: color, clamp, [load dst, blend], store. Chrome disables the
+        // srcover_rgba_8888 fast path (the canvas has a colorSpace), so srcover
+        // takes the general path too.
         let mut rect_p = color.clone();
         rect_p.push(Stage::Clamp01);
         if mode != BlendMode::Src {
@@ -360,7 +360,7 @@ impl<'a> PipelineBlitter<'a> {
             blend(&mut rect_p);
         }
         rect_p.push(Stage::Store);
-        // blitAntiH: покрытие как float.
+        // blitAntiH: coverage as float.
         let mut anti_h_p = color.clone();
         anti_h_p.push(Stage::Clamp01);
         if mode.should_pre_scale_coverage() {
@@ -373,7 +373,7 @@ impl<'a> PipelineBlitter<'a> {
             anti_h_p.push(Stage::Lerp1Float(0.0));
         }
         anti_h_p.push(Stage::Store);
-        // blitMask (A8): покрытие из маски.
+        // blitMask (A8): coverage from the mask.
         let mut mask_p = color.clone();
         mask_p.push(Stage::Clamp01);
         if mode.should_pre_scale_coverage() {
@@ -442,7 +442,7 @@ impl<'a> PipelineBlitter<'a> {
         }
         let Some((x0, x1)) = self.xr(x, w) else { return };
         let cov = aa as f32 * (1.0 / 255.0);
-        // Подставить покрытие в стадии Scale1Float/Lerp1Float.
+        // Plug the coverage into the Scale1Float/Lerp1Float stages.
         for st in self.anti_h_p.stages.iter_mut() {
             match st {
                 Stage::Scale1Float(c) | Stage::Lerp1Float(c) => *c = cov,

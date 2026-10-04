@@ -30,7 +30,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
-# Граф модулей тянется волнами, параллельно.
+# The module graph is fetched in parallel waves.
 futures-util = "0.3"
 
 [dev-dependencies]

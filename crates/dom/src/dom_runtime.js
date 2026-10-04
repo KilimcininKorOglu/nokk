@@ -10,17 +10,16 @@
 // [attr=val], *, plus descendant (space) and child (>) combinators and comma
 // lists.
 (() => {
-  // Снимок JSON, снятый до единой строки страницы. Движок сериализует свои
-  // очереди сам, и если делать это через `JSON.stringify` страницы, то страница,
-  // подменив его, увидит внутренности эмулятора — трафика такого вида в браузере
-  // нет вовсе, и это улика не хуже отсутствующего свойства.
+  // JSON captured before any page code runs. The engine serializes its own
+  // queues; using the page's `JSON.stringify` would let a page that wraps it
+  // see the emulator's internals.
   const __ptJSON = globalThis.__ptJSON || { stringify: JSON.stringify, parse: JSON.parse };
   const ELEMENT_NODE = 1, TEXT_NODE = 3, COMMENT_NODE = 8,
         DOCUMENT_NODE = 9, DOCUMENT_FRAGMENT_NODE = 11;
 
   const __pt_soon = (f) => { try { queueMicrotask(f); } catch (e) { setTimeout(f, 0); } };
-  // Задача движка (load по готовности, нарушение CSP, ошибка скрипта) — не
-  // таймер страницы: у браузера она не занимает номер в её счёте setTimeout.
+  // An engine task (load on readiness, CSP violation, script error) is not a
+  // page timer: it must not consume a setTimeout id.
   const __ptLater = (f, d) => (typeof globalThis.__pt_addTask === 'function' ? __pt_addTask(f, d || 0) : setTimeout(f, d || 0));
   const VOID = new Set(['area','base','br','col','embed','hr','img','input',
     'link','meta','param','source','track','wbr']);
@@ -48,8 +47,8 @@
   const __connectSubtree = (node) => __walkTree(node, (n) => {
     if (n.__ptLocal === 'iframe') n.__ptConnectFrame();
     else if (n.__ptLocal === 'script') n.__ptRunScript();
-    // Стиль и предзагрузка тоже начинают грузиться с попадания в документ, а
-    // не с присваивания `href`: порядок бывает любой.
+    // Stylesheets and preloads start loading on insertion, not on `href`
+    // assignment: the order can be either.
     else if (n.__ptLocal === 'link' && n.__ptLoadLink) n.__ptLoadLink();
     else if (n.__ptLocal === 'img' && n.__ptLoadImage) n.__ptLoadImage();
     if (n.nodeType === ELEMENT_NODE && __customs.has(n.__ptLocal)) {
@@ -58,28 +57,26 @@
     }
   });
 
-  // Массив в обёртке HTMLCollection: length/item/namedItem/итератор, но не Array.
-  // Страницы читают `.length` и перебирают — этого достаточно, а `Array.isArray`
-  // на настоящей коллекции ложен, как и должно быть.
+  // An array wrapped as HTMLCollection: length/item/namedItem/iterator, not an
+  // Array (`Array.isArray` is false on a real collection).
   function __collection(arr) {
     const list = Object.create(__link('HTMLCollection', __collectionProto));
     for (let i = 0; i < arr.length; i++) list[i] = arr[i];
     Object.defineProperty(list, '__ptLen', { value: arr.length, enumerable: false, configurable: true });
     return list;
   }
-  // `querySelectorAll` отдаёт NodeList — не живой, как у childNodes, а слепок;
-  // это разные вещи в браузере и разные ответы на `Object.prototype.toString`.
+  // `querySelectorAll` returns a static NodeList, unlike live childNodes; they
+  // answer `Object.prototype.toString` differently.
   function __staticNodeList(arr) {
     const list = Object.create(__link('NodeList', __nodeListProto));
     for (let i = 0; i < arr.length; i++) list[i] = arr[i];
     Object.defineProperty(list, '__ptLen', { value: arr.length, enumerable: false, configurable: true });
     return list;
   }
-  // childNodes отдаёт NodeList, а не массив: `Array.isArray(node.childNodes)`
-  // на платформе ложен, и сборщик отпечатков Turnstile метит массив отдельной
-  // категорией. Список живой и тождественный самому себе — виджеты сравнивают
-  // `a.childNodes === a.childNodes`, — поэтому он кэшируется на узле, а индексы
-  // пересобираются при каждом обращении.
+  // childNodes is a NodeList, not an array: Turnstile's fingerprinter buckets
+  // arrays separately. The list is live and identical to itself (widgets
+  // compare `a.childNodes === a.childNodes`), so it is cached on the node and
+  // indices are rebuilt on each access.
   function __nodeList(node) {
     const proto = __link('NodeList', __nodeListProto);
     let list = node.__ptList;
@@ -93,15 +90,13 @@
     Object.defineProperty(list, '__ptLen', { value: kids.length, enumerable: false, configurable: true });
     return list;
   }
-  // Прототип связывается со своим интерфейсом при первом обращении: интерфейсы
-  // объявляются позже этого файла, а список создаётся уже на странице. Члены
-  // переезжают на `Iface.prototype`, а наш объект становится его наследником —
-  // так `list instanceof NodeList` истинно, и `constructor` тот, что нужно.
-  // Возвращает прототип, на котором надо строить сам список. Раньше члены
-  // переезжали на интерфейс, а пустая заготовка оставалась в цепочке лишним
-  // уровнем: у Chrome `Object.getPrototypeOf(document.querySelectorAll('*'))`
-  // это сам `NodeList.prototype`, а у нас — пустой объект перед ним. Так было у
-  // всех списков разом, и любой обход прототипов это видел.
+  // A prototype is linked to its interface on first use: interfaces are
+  // declared after this file, lists are created later by the page. Members move
+  // to `Iface.prototype` and our object inherits from it, so
+  // `list instanceof NodeList` holds and `constructor` is right. Returns the
+  // prototype to build the list on: in Chrome
+  // `Object.getPrototypeOf(document.querySelectorAll('*'))` is
+  // `NodeList.prototype` itself, with no empty level in between.
   const __ptHiddenFrame = () => {
     if (!globalThis.__pt_crossSite) return false;
     let w = globalThis;
@@ -115,7 +110,7 @@
     }
     return false;
   };
-  // Прокси с проверкой цикла прототипов (см. __pt_proxy в прологе).
+  // Proxy with a prototype-cycle check (see __pt_proxy in the prologue).
   const __ptProxy = (target, handler) => {
     if (typeof globalThis.__pt_proxy === 'function') return globalThis.__pt_proxy(target, handler);
     const px = new Proxy(target, handler);
@@ -133,16 +128,16 @@
     if (!I || !I.prototype) return proto;
     if (proto.__ptLinked) return I.prototype;
     proto.__ptLinked = true;
-    // Связывание идёт уже после натурализации бутстрапа — перенесённые члены
-    // маскируем сами, иначе `HTMLCollection.prototype.item` показывал исходник.
+    // Linking happens after bootstrap naturalisation, so moved members are
+    // masked here, or `HTMLCollection.prototype.item` would show its source.
     const nat = globalThis.__pt_native || ((f) => f);
     const named = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return nat(f); };
     for (const k of Reflect.ownKeys(proto)) {
       if (k === '__ptLinked') continue;
       const d = Object.getOwnPropertyDescriptor(proto, k);
       const label = typeof k === 'symbol' ? '[' + (k.description || '') + ']' : k;
-      // Под символом часто стоит чужая встроенная функция (итератор списков —
-      // сам Array.prototype.values): у Chrome её имя остаётся «values».
+      // A symbol often holds another builtin (the list iterator is
+      // Array.prototype.values itself); Chrome keeps its name "values".
       if (typeof d.value === 'function' && !(typeof k === 'symbol' && d.value.name && d.value.name.charCodeAt(0) !== 91)) d.value = named(d.value, label);
       if (typeof d.get === 'function') d.get = named(d.get, 'get ' + label);
       if (typeof d.set === 'function') d.set = named(d.set, 'set ' + label);
@@ -156,8 +151,8 @@
   };
   const __nodeListProto = {
     get [Symbol.toStringTag]() { return 'NodeList'; },
-    // `length` у браузера на прототипе: собственные свойства списка — индексы
-    // и только они, и это видно первым же getOwnPropertyNames.
+    // `length` is on the prototype: a list's own properties are indices only,
+    // as getOwnPropertyNames shows.
     get length() { return this.__ptLen | 0; },
     item(i) { return this[i] != null ? this[i] : null; },
     forEach(fn, thisArg) { for (let i = 0; i < this.length; i++) fn.call(thisArg, this[i], i, this); },
@@ -177,15 +172,13 @@
       }
       return null;
     },
-  };  // Как у Chrome: метка типа — данные, перебор — Array.prototype.values, оба неперечислимы.
+  };  // As in Chrome: the tag is a data property, the iterator Array.prototype.values, both non-enumerable.
   Object.defineProperty(__collectionProto, Symbol.toStringTag, { value: 'HTMLCollection', configurable: true });
   Object.defineProperty(__collectionProto, Symbol.iterator, { value: Array.prototype.values, writable: true, configurable: true });
 
 
-  // `document.all` — HTMLAllCollection: те же члены, что у HTMLCollection, но
-  // на своём интерфейсе. Раньше коллекция строилась как HTMLCollection, а
-  // потом ей подменяли прототип — и `length` с `item` терялись: страница
-  // читала `document.all.length` и получала undefined.
+  // `document.all` is an HTMLAllCollection: HTMLCollection's members on its
+  // own interface (swapping the prototype afterwards lost `length` and `item`).
   const __allProto = {
     get length() { return this.__ptLen | 0; },
     item(i) {
@@ -203,7 +196,7 @@
       if (!found.length) return null;
       return found.length === 1 ? found[0] : __collection(found);
     },
-  };  // Как у Chrome: метка типа — данные, перебор — Array.prototype.values, оба неперечислимы.
+  };  // As in Chrome: the tag is a data property, the iterator Array.prototype.values, both non-enumerable.
   Object.defineProperty(__allProto, Symbol.toStringTag, { value: 'HTMLAllCollection', configurable: true });
   Object.defineProperty(__allProto, Symbol.iterator, { value: Array.prototype.values, writable: true, configurable: true });
 
@@ -214,9 +207,8 @@
     return list;
   }
 
-  // `el.attributes` — NamedNodeMap из Attr, а не массив объектов: сборщик
-  // отпечатка читает и `Object.prototype.toString`, и цепочку прототипов, и
-  // массив там виден сразу.
+  // `el.attributes` is a NamedNodeMap of Attr, not an array: fingerprinters
+  // read `Object.prototype.toString` and the prototype chain.
   const __attrProto = {
     get [Symbol.toStringTag]() { return 'Attr'; },
     get localName() { return this.__ptName; },
@@ -263,8 +255,8 @@
     return map;
   }
 
-  // `classList` — DOMTokenList: живой, пишет обратно в атрибут, и это интерфейс,
-  // а не литерал с методами.
+  // `classList` is a live DOMTokenList that writes back to the attribute; an
+  // interface, not a literal with methods.
   const __tokenListProto = {
     get [Symbol.toStringTag]() { return 'DOMTokenList'; },
     get value() { return __ptGetA(this.__ptEl, 'class') || ''; },
@@ -307,7 +299,7 @@
       });
       Object.defineProperty(el, '__ptTokenList', { value: list, enumerable: false, writable: true });
     }
-    // Индексы — собственные свойства, как у браузера: `list[0]` работает.
+    // Indices are own properties, as in Chrome: `list[0]` works.
     const t = list.__ptTokens(), prev = list.__ptCount | 0;
     for (let i = 0; i < t.length; i++) list[i] = t[i];
     for (let i = t.length; i < prev; i++) delete list[i];
@@ -343,7 +335,7 @@
     contains(n) { for (; n; n = n.parentNode) if (n === this) return true; return false; }
     // Walks out through a shadow host too: a node inside an attached shadow tree
     // is connected, even though the root itself has no parent.
-    // Базовый адрес — у документа: у `about:blank` он от создателя.
+    // The base URL is the document's; for `about:blank` it is the creator's.
     get baseURI() {
       const d = this.nodeType === 9 ? this : (this.ownerDocument || null);
       if (d && typeof d.__ptBaseURI === 'function') return d.__ptBaseURI();
@@ -365,7 +357,7 @@
     appendChild(child) {
       __needArgs(arguments.length, 1, 'appendChild', 'Node');
       __needNode(child, 1, 'appendChild');
-      // Узел не может содержать сам себя — и своего предка тоже.
+      // A node cannot contain itself or its ancestor.
       for (let p = this; p; p = p.parentNode) {
         if (p === child) {
           throw __pt_mkErr(globalThis.DOMException || Error, 
@@ -378,8 +370,8 @@
     insertBefore(child, ref) {
       __needArgs(arguments.length, 2, 'insertBefore', 'Node');
       __needNode(child, 1, 'insertBefore');
-      // Второй параметр у браузера — `Node?`: `undefined` для него та же
-      // пустота, что и `null`, и означает «в конец».
+      // The second parameter is `Node?`: `undefined` is the same as `null`,
+      // meaning "append".
       if (ref !== null && ref !== undefined) {
         __needNode(ref, 2, 'insertBefore');
         __needChild(this, ref, 'insertBefore',
@@ -390,8 +382,8 @@
         return child;
       }
       if (child.parentNode) __ptDrop.call(child.parentNode, child);
-      // Узел из другого документа усыновляется: ownerDocument у него и у всего
-      // поддерева становится документом нового родителя, как в браузере.
+      // A node from another document is adopted: it and its subtree get the
+      // new parent's ownerDocument, as in Chrome.
       try {
         const doc = this.nodeType === 9 ? this : this.__ptDoc;
         if (doc && child.__ptDoc !== doc) __walkTree(child, (n) => { if (n.__ptDoc !== doc) n.__ptDoc = doc; });
@@ -428,8 +420,8 @@
       // whole subtree goes, for the same reason it connects as a whole.
       __walkTree(child, (f) => {
         if (f.__ptFrameId) __ptDisconnectFrame(f);
-        // Кадр с песочницей: его окно остаётся у страницы в руках, но контекст
-        // закрыт — размеры нулевые, `closed`, без `frameElement`.
+        // A sandboxed frame: the page keeps its window, but the context is
+        // closed (zero sizes, `closed`, no `frameElement`).
         if (f.__ptRealm) { try { if (typeof f.__ptRealm.__pt_detach === 'function') f.__ptRealm.__pt_detach(); } catch (e) {} try { __realmFrames.delete(f); } catch (e) {} }
         if (f.__ptUpgraded) __customCallback(f, 'disconnectedCallback');
       });
@@ -446,9 +438,9 @@
     }
     cloneNode(deep) {
       const c = this.__ptShallowClone();
-      // Копия несёт точные числа инлайнового стиля, а не напечатанные
-      // шестью знаками: браузер клонирует разобранное объявление, и
-      // `scale(1.000998)` у копии остаётся 1.000998, хотя в атрибуте 1.001.
+      // A clone carries the exact inline style numbers, not the six-digit
+      // printed ones: Chrome clones the parsed declaration, so
+      // `scale(1.000998)` stays 1.000998 though the attribute says 1.001.
       try {
         if (this.__ptStyle && c.style) {
           const sr = __declRaw.get(this.__ptStyle), sm = sr && sr();
@@ -467,10 +459,9 @@
     }
 
     get textContent() {
-      // У документа и doctype его нет вовсе — браузер отвечает null, а не
-      // склеенным текстом страницы.
+      // A document and doctype have none: null, not the page's joined text.
       if (this.nodeType === 9 || this.nodeType === 10) return null;
-      // Текст, комментарий, инструкция — их данные (у Chrome это Node.textContent).
+      // Text, comment, processing instruction: their data (Chrome's Node.textContent).
       if (this.nodeType === 3 || this.nodeType === 4 || this.nodeType === 7) return this.data;
       if (this.nodeType === 8) return this.data;
       let s = ''; for (const c of this.__ptKids) s += c.textContent; return s;
@@ -488,10 +479,10 @@
       __needArgs(arguments.length, 2, 'addEventListener', 'EventTarget');
       if (!fn) return;
       const cap = !!(opts && (opts === true || opts.capture));
-      // Обработчик-свойство встаёт в очередь там, где его присвоили: если
-      // `onload` был задан раньше первого слушателя, браузер зовёт его первым.
-      // Присваивание нам не перехватить — `on…` у элемента обычное свойство, —
-      // но здесь видно, было ли оно уже занято.
+      // A handler property is queued where it was assigned: if `onload` was
+      // set before the first listener, Chrome calls it first. The assignment
+      // cannot be intercepted (`on…` is a plain property), but here we can see
+      // whether it was already set.
       if (!this.__ptOnFirst) {
         Object.defineProperty(this, '__ptOnFirst', { value: {}, enumerable: false, configurable: true });
       }
@@ -507,18 +498,16 @@
     }
     __ptDispatch(event) {
       __ptEvSet(event, 'target', this);
-      // `window.event` — событие, которое обрабатывается прямо сейчас. Старое,
-      // но живое свойство: у нас оно было `undefined` всегда, а в Chrome внутри
-      // обработчика там лежит само событие.
-      const снимок = __ptTakeEvent(event);
-      // Путь события, как в браузере: вверх по parentNode, из теневого дерева —
-      // через хозяина (для composed), от документа — к окну (кроме load).
-      // Для узлов снаружи тени цель подменяется хозяином. Раньше путь кончался
-      // на корне тени и никогда не доходил до окна: слушатели мыши на window и
-      // document у виджета не слышали ни одного нашего движения.
+      // `window.event` is the event being handled right now; inside a handler
+      // Chrome has the event there.
+      const savedEvent = __ptTakeEvent(event);
+      // Event path as in Chrome: up parentNode, out of a shadow tree through
+      // the host (for composed), from the document to the window (except
+      // load). For nodes outside the shadow the target is retargeted to the
+      // host. Widgets listen for mouse events on window and document.
       const path = [], targets = [];
       let tgt = this;
-      // enter/leave у Chrome слушатели предков (и окна) не слышат вовсе.
+      // In Chrome ancestor (and window) listeners never hear enter/leave.
       const local = event.type === 'mouseenter' || event.type === 'mouseleave' || event.type === 'pointerenter' || event.type === 'pointerleave';
       for (let n = this; n; ) {
         if (local && n !== this) break;
@@ -539,7 +528,7 @@
         const node = path[i];
         const l = node.__ptLis && node.__ptLis[event.type];
         __ptEvSet(event, 'target', targets[i]);
-        // Хозяин тени после подмены цели сам и есть цель: фаза «у цели».
+        // After retargeting the shadow host is the target: the at-target phase.
         __ptEvSet(event, 'eventPhase', targets[i] === node ? 2 : phase);
         if (l) {
           for (const e of l.slice()) {
@@ -550,8 +539,8 @@
             try { e.fn.call(node, event); } catch (x) { __pt_reportError(x, 'listener ' + event.type); }
           }
         }
-        // Обработчик-свойство предка (`document.onmousemove`, `window.onclick`)
-        // — тоже слушатель всплытия.
+        // An ancestor's handler property (`document.onmousemove`,
+        // `window.onclick`) is a bubbling listener too.
         if (phase === 3 && !event.__ptStopImm) {
           let on; try { on = node['on' + event.type]; } catch (x) {}
           if (typeof on === 'function') {
@@ -563,9 +552,9 @@
       for (let i = path.length - 1; i >= 1; i--) { if (event.__ptStop) break; fireAt(i, 1); }
       __ptEvSet(event, 'target', this);
       __ptEvSet(event, 'eventPhase', 2);
-      // Обработчик-свойство (`onclick`, `onload`, `onmessage`) — такой же
-      // слушатель цели, и вызывает его тот же dispatch, а не вызывающий код.
-      // Порядок — тот, в котором его завели: раньше слушателей или позже.
+      // A handler property (`onclick`, `onload`, `onmessage`) is a target
+      // listener called by the same dispatch, in the order it was set relative
+      // to the listeners.
       const onFirst = !!(this.__ptOnFirst && this.__ptOnFirst[event.type]);
       const callOn = () => {
         if (event.__ptStopImm) return;
@@ -575,7 +564,7 @@
           try { on.call(this, event); } catch (e) { __pt_reportError(e, 'listener ' + event.type); }
         }
       };
-      // У цели — сначала слушатели захвата, потом остальные (Chrome ≥ 89).
+      // At the target, capture listeners first, then the rest (Chrome >= 89).
       const atTarget = (capture) => {
         const l = this.__ptLis && this.__ptLis[event.type]; if (!l) return;
         for (const e of l.slice()) {
@@ -592,18 +581,16 @@
       if (event.bubbles) for (let i = 1; i < path.length; i++) { if (event.__ptStop) break; fireAt(i, 3); }
       __ptEvSet(event, 'eventPhase', 0);
       __ptEvSet(event, 'currentTarget', null);
-      // Снаружи после рассылки видна цель со стороны документа (хозяин тени).
+      // After dispatch the target as seen from the document (the shadow host).
       __ptEvSet(event, 'target', targets[targets.length - 1]);
       __ptEvSet(event, '__ptPathNow', null);
-      // Возвращаем `window.event` как было: вне обработки его нет.
-      __ptDropEvent(снимок);
+      // Restore `window.event`: outside handling it is absent.
+      __ptDropEvent(savedEvent);
       return !event.defaultPrevented;
     }
   }
-  // Исключение из обработчика в браузере не пропадает: оно уходит в
-  // `window.onerror`, поднимает событие `error` на окне и печатается в консоль.
-  // Мы его молча глотали — из-за чего страница, у которой обработчик падает,
-  // выглядела как страница, которая просто чего-то ждёт.
+  // A handler exception is not lost: it goes to `window.onerror`, fires
+  // `error` on the window and is printed to the console.
   globalThis.__pt_reportError = (e, where) => {
     const msg = 'Uncaught ' + String((e && e.name ? e.name + ': ' + e.message : e));
     try {
@@ -627,11 +614,9 @@
     for (const e of l.slice()) { if (!e.cap) continue; if (event.__ptStopImm) break; __ptEvSet(event, 'currentTarget', node); try { e.fn.call(node, event); } catch (x) { __pt_reportError(x, 'capture ' + event.type); } }
   }
 
-  // В браузере эти три метода живут на `EventTarget.prototype` — один раз, для
-  // всех целей, и они же разносят событие по дереву, когда цель в дереве. У нас
-  // они стояли на `Node.prototype` (лишние имена там, где браузер их не держит)
-  // плюс отдельная копия на EventTarget. Теперь реализация одна, а имена — там,
-  // где им положено.
+  // These three methods live on `EventTarget.prototype`, once for all targets,
+  // and also propagate events through the tree when the target is in one.
+  // One implementation, names where Chrome has them.
   {
     const ET = globalThis.EventTarget;
     if (ET && ET.prototype) {
@@ -642,8 +627,8 @@
         }
         return t.__ptLis;
       };
-      // Без получателя цель — окно: голый `addEventListener(...)` даёт
-      // `this === undefined`, и браузер подставляет глобальный объект.
+      // With no receiver the target is the window: a bare
+      // `addEventListener(...)` has `this === undefined`, and Chrome uses the global.
       const self_ = (t) => (t === undefined || t === null ? globalThis : t);
       const proto = ET.prototype;
       for (const [name, fn] of [
@@ -651,8 +636,8 @@
           __needArgs(arguments.length, 2, 'addEventListener', 'EventTarget');
           const t = self_(this); if (!fn) return;
           const cap = !!(opts && (opts === true || opts.capture));
-          // Тот же учёт порядка, что и у узла: был ли `on…` занят раньше
-          // первого слушателя. Присваивание не перехватить — здесь видно.
+          // Same ordering bookkeeping as for nodes: was `on…` set before the
+          // first listener.
           try {
             if (!t.__ptOnFirst) {
               Object.defineProperty(t, '__ptOnFirst', { value: {}, enumerable: false, configurable: true });
@@ -680,7 +665,7 @@
                                                writable: true, enumerable: true, configurable: true });
         } catch (e) {}
       }
-      // Узел наследует их оттуда же, откуда и браузерный.
+      // Node inherits them from the same place as in Chrome.
       try { Object.setPrototypeOf(Node.prototype, proto); } catch (e) {}
       for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) {
         try { delete Node.prototype[name]; } catch (e) {}
@@ -697,8 +682,8 @@
     try { Object.defineProperty(set, 'name', { value: 'set ' + name, configurable: true }); } catch (e) {}
     return { get, set, configurable: true, enumerable: false };
   };
-  // Имена кодировок Chrome отдаёт каноническими: utf-8 → UTF-8, latin1 →
-  // windows-1252. Прочие проходят как есть, в нижнем регистре.
+  // Chrome returns canonical encoding names: utf-8 -> UTF-8, latin1 ->
+  // windows-1252. Others pass through lowercased.
   const __ENCODINGS = {
     'utf-8': 'UTF-8', 'utf8': 'UTF-8', 'unicode-1-1-utf-8': 'UTF-8',
     'iso-8859-1': 'windows-1252', 'latin1': 'windows-1252', 'ascii': 'windows-1252',
@@ -710,44 +695,42 @@
     return __ENCODINGS[k] || k;
   };
 
-  // ChildNode.remove живёт на элементах и текстовых узлах — у документа его нет,
-  // и лишнее имя на `document` заметно ровно так же, как недостающее.
-  // Событие движок метит сам: цель, текущую цель и стадию у браузера читают,
-  // но не пишут, и установщиков у них нет. Свои события держат это в `__ptE`,
-  // а пришедшие с другого этажа — собственным свойством.
-  // `window.event` — событие, которое обрабатывается прямо сейчас. У воркера
-  // такого имени нет вовсе, и восстановление «как было» не должно его
-  // заводить: присваивание `undefined` создаёт собственное свойство, и в
-  // воркере появлялось лишнее имя, которого у браузера там нет.
-  // Признак окна — не `document` (движок строит его и в воркере, просто
-  // прячет), а `importScripts`: он есть только у воркера.
+  // ChildNode.remove lives on elements and text nodes, not on the document;
+  // an extra name on `document` is as visible as a missing one.
+  // The engine sets target, currentTarget and phase itself: pages read them
+  // but have no setters. Own events keep them in `__ptE`, events from another
+  // realm as an own property.
+  // `window.event` is the event currently being handled. Workers have no such
+  // name, and restoring must not create it (assigning `undefined` creates an
+  // own property). The window marker is `importScripts` (worker only), not
+  // `document`, which the engine builds in workers too and hides.
   const __ptEventSlot = () => typeof importScripts === 'undefined';
   const __ptTakeEvent = (ev) => {
-    const было = Object.prototype.hasOwnProperty.call(globalThis, 'event');
-    const прежнее = было ? globalThis.event : undefined;
+    const hadEvent = Object.prototype.hasOwnProperty.call(globalThis, 'event');
+    const prevEvent = hadEvent ? globalThis.event : undefined;
     if (__ptEventSlot()) { try { globalThis.event = ev; } catch (e) {} }
-    return { было, прежнее };
+    return { hadEvent, prevEvent };
   };
-  const __ptDropEvent = (снимок) => {
+  const __ptDropEvent = (savedEvent) => {
     try {
-      if (снимок.было) globalThis.event = снимок.прежнее;
+      if (savedEvent.hadEvent) globalThis.event = savedEvent.prevEvent;
       else delete globalThis.event;
     } catch (e) {}
   };
 
-  // Событие фокуса: у браузера это `FocusEvent` со вторым участником и с
-  // доверием — его шлёт он сам, даже когда фокус попросили из скрипта.
+  // Focus event: a trusted `FocusEvent` with a related target, sent by the
+  // browser even when a script requested focus.
   const __ptFocusEvent = (type, related, bubbles) => {
     const C = globalThis.FocusEvent || globalThis.Event;
     let ev;
-    // focus/blur/focusin/focusout у браузера composed — проходят сквозь тень.
+    // focus/blur/focusin/focusout are composed: they cross shadow boundaries.
     try { ev = new C(type, { bubbles: !!bubbles, cancelable: false, composed: true, relatedTarget: related || null }); }
     catch (e) { ev = new Event(type, { bubbles: !!bubbles }); }
     if (!('relatedTarget' in ev)) {
       try { Object.defineProperty(ev, 'relatedTarget', { value: related || null, enumerable: true, configurable: true }); }
       catch (e) {}
     }
-    // Фокус от нажатия мыши несёт устройство ввода, как у Chrome.
+    // Focus from a mouse press carries the input device, as in Chrome.
     if (globalThis.__ptFocusCaps && ev.__ptE) ev.__ptE.sourceCapabilities = globalThis.__ptFocusCaps;
     return __ptTrust(ev);
   };
@@ -797,14 +780,12 @@
   /// A shadow root: a fragment that carries the query surface of an element and
   /// remembers its host, so a subtree can live outside the document tree while
   /// still being connected through it.
-  // DocumentFragment — свой интерфейс, а не псевдоним Node: у браузера на нём
-  // ровно одиннадцать членов, и `t.content.querySelector(...)` работает именно
-  // благодаря им. У нас фрагмент был голым Node, и запрос по нему падал.
+  // DocumentFragment is its own interface, not an alias of Node: Chrome has
+  // eleven members on it, and `t.content.querySelector(...)` relies on them.
   class DocumentFragment extends Node {
     constructor() { super(DOCUMENT_FRAGMENT_NODE); }
     get [Symbol.toStringTag]() { return 'DocumentFragment'; }
-    // Обрывок тоже копируется: без этого `cloneNode` на нём падал, а через
-    // него ходят `importNode` и содержимое `<template>`.
+    // Fragments are cloneable too; `importNode` and `<template>` content need it.
     __ptShallowClone() { const f = new DocumentFragment(); f.__ptDoc = this.ownerDocument; return f; }
     get children() { return __collection(this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE)); }
     get childElementCount() { return this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE).length; }
@@ -860,25 +841,23 @@
     }
     set innerHTML(html) {
       html = __pt_ttSink('TrustedHTML', 'ShadowRoot innerHTML', html, "Failed to set the 'innerHTML' property on 'ShadowRoot'");
-      // Разметка шаблона разбирается в его содержимое — таков разбор у него.
+      // Template markup is parsed into its content.
       const host = this.__ptLocal === 'template' ? __templateContent(this) : this;
       __ptDropKids(host);
       for (const n of parseFragment(String(html))) __ptAdd.call(host, n);
     }
-    // Коллекция, а не массив: `document.children` у браузера — HTMLCollection,
-    // и `Object.prototype.toString` на нём отвечает именно так.
+    // A collection, not an array: `document.children` is an HTMLCollection,
+    // and `Object.prototype.toString` says so.
     get children() { return __collection(this.__ptKids.filter(n => n.nodeType === ELEMENT_NODE)); }
     get firstElementChild() { return this.children[0] || null; }
     get lastElementChild() { const c = this.children; return c[c.length - 1] || null; }
     get childElementCount() { return this.children.length; }
-    // В браузере это `<body>`, как только тело есть, — не null. И это
-    // свойство присваивают (`focus()`), так что одного геттера мало:
-    // присваивание в него молча пропадало.
+    // `<body>` once there is a body, not null. It is also assigned (by
+    // `focus()`), so a getter alone is not enough.
     get activeElement() { return this.__ptActive || this.body || null; }
     set activeElement(v) { this.__ptActive = v; }
-    // Список таблиц стилей — не массив: у браузера это `StyleSheetList`, и
-    // `Array.isArray(sr.styleSheets)` там ложно. Мы отдавали литерал массива, а
-    // виджет живёт как раз в теневом корне и читает его оттуда.
+    // Not an array: Chrome returns a `StyleSheetList`, `Array.isArray` is
+    // false. The widget lives in a shadow root and reads it there.
     get styleSheets() { return __styleSheetList(__sheetOwners(this)); }
     get adoptedStyleSheets() { return this.__ptAdopted || (this.__ptAdopted = []); }
     set adoptedStyleSheets(v) { this.__ptAdopted = v; }
@@ -902,34 +881,32 @@
     }
     append(...ns) { for (const n of ns) this.appendChild(typeof n === 'string' ? new Text(n) : n); }
     prepend(...ns) { for (const n of ns.reverse()) this.insertBefore(typeof n === 'string' ? new Text(n) : n, this.firstChild); }
-    // DocumentOrShadowRoot: у теневого корня — те же ответы, что у документа
-    // (Chrome отдаёт стопку до <html>), а не пустота.
+    // DocumentOrShadowRoot: a shadow root answers like the document (Chrome
+    // returns the stack up to <html>).
     elementFromPoint(x, y) { const d = globalThis.document; return d ? d.elementFromPoint(x, y) : null; }
     elementsFromPoint(x, y) { const d = globalThis.document; return d ? d.elementsFromPoint(x, y) : []; }
     getSelection() { return typeof globalThis.getSelection === 'function' ? globalThis.getSelection() : null; }
     getAnimations() { return []; }
   }
 
-  // --- пользовательские элементы -------------------------------------------
-  // `customElements` был объектом без методов: `customElements.get` роняло любой
-  // бандл, который просто спрашивает, определён ли компонент. Реестр настоящий:
-  // определение, обновление уже стоящих в документе узлов и три обратных вызова
-  // жизненного цикла.
-  const __customs = new Map();          // имя → класс
-  const __customPending = new Map();    // имя → { promise, resolve }
+  // --- custom elements -------------------------------------------------------
+  // A real registry: definition, upgrade of nodes already in the document, and
+  // the three lifecycle callbacks (`customElements.get` is common in bundles).
+  const __customs = new Map();          // name -> class
+  const __customPending = new Map();    // name -> { promise, resolve }
   const __customName = (ctor) => {
     for (const [name, C] of __customs) if (C === ctor) return name;
     return null;
   };
   const __customCallback = (el, name, args) => {
     const fn = el[name];
-    if (typeof fn === 'function') { try { fn.apply(el, args || []); } catch (e) { /* компонент бросил */ } }
+    if (typeof fn === 'function') { try { fn.apply(el, args || []); } catch (e) { /* component threw */ } }
   };
   const __customUpgrade = (el, Ctor) => {
     if (el.__ptUpgraded) return;
     Object.defineProperty(el, '__ptUpgraded', { value: true, configurable: true, enumerable: false });
-    // Повторно выполнить тело конструктора над готовым узлом нельзя, поэтому
-    // элемент получает прототип класса — методы и обратные вызовы на месте.
+    // A constructor body cannot be rerun on an existing node, so the element
+    // gets the class prototype: methods and callbacks are in place.
     try { Object.setPrototypeOf(el, Ctor.prototype); } catch (e) { return; }
     const watched = Ctor.observedAttributes;
     if (Array.isArray(watched)) {
@@ -986,8 +963,8 @@
   class Element extends Node {
     constructor(tag) {
       super(ELEMENT_NODE);
-      // `new MyElement()` не передаёт имя тега — его знает реестр, по классу,
-      // от которого элемент произошёл. Так работает и настоящий HTMLElement.
+      // `new MyElement()` passes no tag name; the registry knows it by the
+      // class. Real HTMLElement works the same way.
       if (tag === undefined && new.target) tag = __customName(new.target) || 'unknown';
       this.__ptTag = String(tag).toUpperCase();
       this.__ptLocal = String(tag).toLowerCase();
@@ -996,14 +973,11 @@
     get nodeName() { return this.tagName; }
     get tagName() { return this.__ptTag; }
     get localName() { return this.__ptLocal; }
-    // Пространство имён элемента: заглушка таблицы форм отвечала XHTML всем,
-    // в том числе SVG из createElementNS.
+    // Element namespace, including SVG from createElementNS.
     get namespaceURI() { return this.__ptNS === undefined ? 'http://www.w3.org/1999/xhtml' : this.__ptNS; }
     get prefix() { return this.__ptPrefix || null; }
-    // Объявление стиля строится при первом обращении, а не при создании
-    // узла: у него семьсот собственных свойств, и на страницу с тысячей
-    // элементов это полсекунды на пустом месте. Браузер создаёт узел за
-    // полмикросекунды, у нас выходило полмиллисекунды.
+    // The style declaration is built on first access, not at node creation:
+    // it has 700 own properties, ~0.5 ms per node.
     get style() {
       if (!this.__ptStyle) {
         Object.defineProperty(this, '__ptStyle', {
@@ -1013,8 +987,8 @@
       return this.__ptStyle;
     }
 
-    // Attributes. Имена в нижний регистр — только у HTML-элементов; у SVG и
-    // прочих чужих имена регистрозависимы (`viewBox`), как в спецификации.
+    // Attributes. Names are lowercased for HTML elements only; SVG and other
+    // foreign names are case-sensitive (`viewBox`), per spec.
     getAttribute(n) { const v = this.__ptAttrs.get(__attrName(this, n)); return v === undefined ? null : v; }
     setAttribute(n, v) {
       __needArgs(arguments.length, 2, 'setAttribute', 'Element');
@@ -1063,10 +1037,10 @@
       if (this.__ptLocal === 'script') v = __pt_ttSink('TrustedScriptURL', 'HTMLScriptElement src', v, "Failed to set the 'src' property on 'HTMLScriptElement'");
       __csp.ttSkip = true;
       try { __ptSetA(this, 'src', v); } finally { __csp.ttSkip = false; }
-      // Картинка идёт в сеть от одного присваивания, без всякого документа:
-      // `new Image().src = …` — обычный способ послать GET, и у нас он не
-      // посылал ничего. Запрос делает браузер сам, поэтому мимо страничного
-      // `fetch`, а по готовности бросаем `load` или `error`, как он.
+      // An image hits the network on assignment alone, no document needed
+      // (`new Image().src = …` is a common way to send a GET). The browser
+      // makes the request, so it bypasses the page's `fetch`; then `load` or
+      // `error` fires.
       if (this.__ptLocal === 'img') { this.__ptLoadImage(); return; }
       if (!this.isConnected) return;
       // The src can arrive after the element is in the document, in either order:
@@ -1080,12 +1054,12 @@
       if (!raw) return;
       let url = raw;
       try { url = new URL(raw, document.baseURI || location.href).href; } catch (e) {}
-      if (this.__ptImgAt === url) return;                 // тот же адрес — не грузим дважды
+      if (this.__ptImgAt === url) return;                 // same URL: do not load twice
       Object.defineProperty(this, '__ptImgAt', { value: url, configurable: true, enumerable: false });
       Object.defineProperty(this, '__ptImgDone', { value: false, writable: true, configurable: true, enumerable: false });
       if (url.slice(0, 5) === 'data:' || url.slice(0, 5) === 'blob:') {
         this.__ptImgDone = true;
-        // Не картинка (`data:,x`, текстовый blob) — у браузера это `error`.
+        // Not an image (`data:,x`, a text blob): Chrome fires `error`.
         let isImage = true;
         try {
           if (url.slice(0, 5) === 'data:') {
@@ -1104,8 +1078,8 @@
             if (b && !/^image\//.test(String(b.type || ''))) isImage = false;
           }
         } catch (e) {}
-        // Итог декодирования — задача после уже поставленных сообщений, как в
-        // браузере (декодер отвечает из другого потока).
+        // The decode result is a task after already queued messages, as in
+        // Chrome (the decoder answers from another thread).
         __ptLater(() => this.__ptFireLoad(isImage), 0);
         return;
       }
@@ -1118,19 +1092,15 @@
 
     __ptFireLoad(ok) {
       const type = ok ? 'load' : 'error';
-      // Рассылки достаточно: она сама зовёт и `onload`, и слушателей. Мы звали
-      // обработчик ещё и напрямую, и он срабатывал дважды на каждой картинке и
-      // каждом кадре — счётчик загрузок у страницы получался вдвое больше.
-      // Событие шлёт движок, а движок здесь — браузер: `isTrusted` у него
-      // истина. Недоверенная загрузка кадра или картинки — примета не хуже
-      // недоверенного `load` у окна.
+      // dispatchEvent alone is enough: it calls both `onload` and listeners
+      // (calling the handler directly too fired it twice). The engine sends
+      // the event, so `isTrusted` is true; an untrusted frame or image load is
+      // a tell.
       try { this.dispatchEvent && this.dispatchEvent(__ptTrust(new Event(type))); } catch (e) {}
     }
-    // `script.text` — тот же текст, что и textContent, и присвоение ему
-    // запускает скрипт. Мы его молча проглатывали: у нас это было обычное
-    // свойство, а `s.text = <исходник>; head.appendChild(s)` — как раз то, чем
-    // челлендж объявляет свои функции верхнего уровня. Одна такая пропажа
-    // роняла его интерпретатор на вызове несуществующей глобали.
+    // `script.text` is the same text as textContent, and assigning it runs the
+    // script: `s.text = <source>; head.appendChild(s)` is how the challenge
+    // declares its top-level functions.
     get text() {
       const t = this.tagName;
       if (t === 'SCRIPT' || t === 'TITLE' || t === 'OPTION' || t === 'A') return this.textContent || '';
@@ -1142,9 +1112,9 @@
       try { this.textContent = String(v); } finally { __csp.ttSkip = false; }
       if (this.__ptLocal === 'script' && this.isConnected && this.__ptRunScript) this.__ptRunScript();
     }
-    // `srcdoc` — документ, написанный прямо в атрибуте: у него нет адреса, и
-    // отражается он как есть. Присвоение после вставки в документ означает
-    // новый документ в этом окне, как навигация.
+    // `srcdoc` is a document written in the attribute: no URL, reflected as is.
+    // Assigning it after insertion means a new document in this window, like a
+    // navigation.
     get srcdoc() { const v = __ptGetA(this, 'srcdoc'); return v === null ? '' : v; }
     set srcdoc(v) {
       if (this.__ptLocal === 'iframe') v = __pt_ttSink('TrustedHTML', 'HTMLIFrameElement srcdoc', v, "Failed to set the 'srcdoc' property on 'HTMLIFrameElement'");
@@ -1163,16 +1133,14 @@
     get href() { return this.__ptUrlAttr('href'); }
     set href(v) {
       __ptSetA(this, 'href', v);
-      // `<link>` — тоже запрос: предзагрузка, стиль, значок. Браузер идёт за
-      // ними сам, а мы не ходили ни за одним, и `rel=preload` не отправлял
-      // ничего вовсе.
+      // `<link>` is a request too: preload, stylesheet, icon.
       if (this.__ptLocal === 'link' && this.__ptLoadLink) this.__ptLoadLink();
     }
 
     __ptLoadLink() {
       const rel = String(__ptGetA(this, 'rel') || '').toLowerCase();
-      // Загружаемые виды: остальные (`alternate`, `canonical`, `dns-prefetch`)
-      // в браузере запроса не делают.
+      // Kinds that load; others (`alternate`, `canonical`, `dns-prefetch`)
+      // make no request.
       if (!/^(stylesheet|preload|prefetch|modulepreload|icon|shortcut icon|apple-touch-icon|manifest|prerender)$/.test(rel)) return;
       const raw = __ptGetA(this, 'href');
       if (!raw) return;
@@ -1180,8 +1148,8 @@
       try { url = new URL(raw, document.baseURI || location.href).href; } catch (e) {}
       if (this.__ptLinkAt === url) return;
       Object.defineProperty(this, '__ptLinkAt', { value: url, configurable: true, enumerable: false });
-      // Таблица стилей, записанная прямо в адрес, — тоже таблица: браузер её
-      // разбирает, не выходя в сеть.
+      // A stylesheet in a data URL is still a stylesheet, parsed without the
+      // network.
       if (url.slice(0, 5) === 'data:') {
         if (rel === 'stylesheet') {
           try {
@@ -1198,13 +1166,12 @@
         return;
       }
       if (url.slice(0, 5) === 'blob:' || typeof globalThis.__pt_subresource !== 'function') return;
-      // Всё, что пришло через `<link>`, браузер называет `link` в перечне
-      // ресурсов — и предзагрузку, и значок, и таблицу стилей.
+      // Resource timing names everything loaded via `<link>` as `link`:
+      // preload, icon, stylesheet.
       const kind = rel === 'stylesheet' ? 'stylesheet' : 'link';
-      // Таблица из разметки задерживает скрипты, что идут за ней: браузер не
-      // исполнит их, пока её не разберёт. У нас скрипты шли сразу, и всё, что
-      // они мерили при запуске, мерилось по голой странице — api.js Turnstile
-      // отдавал виджету место обёртки у правого края окна вместо центра.
+      // A markup stylesheet blocks the scripts after it until parsed; otherwise
+      // they measure an unstyled page (Turnstile's api.js reported the
+      // wrapper at the right edge instead of centred).
       const blocking = rel === 'stylesheet' && !document.__ptCurScript
         && this.ownerDocument === document && document.__ptReady === 'loading';
       if (blocking) {
@@ -1220,10 +1187,8 @@
       };
       __pt_subresource(url, kind).then(
         (res) => {
-          // Внешняя таблица стилей — это правила, а не просто запрос: у нас
-          // её тело выбрасывалось, и `document.styleSheets[i].cssRules` был
-          // пуст на любой настоящей странице (у Chrome их там три тысячи), а
-          // каскад не видел ни одного правила из внешнего файла.
+          // An external stylesheet is rules, not just a request: they go into
+          // `document.styleSheets[i].cssRules` and the cascade.
           const wanted = rel === 'stylesheet';
           const take = (text) => {
             if (wanted && typeof text === 'string') {
@@ -1279,10 +1244,9 @@
     }
     get action() { return this.__ptUrlAttr('action') || ((this.ownerDocument || document).URL || ''); }
     set action(v) { __ptSetA(this, 'action', v); }
-    // Форма: `method`/`enctype` — перечисления, `elements` — её поля,
-    // `submit()` уходит на адрес действия без события, `requestSubmit()` —
-    // после события submit. У нас всё это было заглушками, и страница заставы
-    // Cloudflare, отправляющая форму с замком, стояла на месте.
+    // Form: `method`/`enctype` are enumerated, `elements` are its fields,
+    // `submit()` goes to the action URL without an event, `requestSubmit()`
+    // after a submit event. The Cloudflare interstitial submits a form.
     get method() { const m = String(__ptGetA(this, 'method') || '').toLowerCase(); return m === 'post' ? 'post' : m === 'dialog' ? 'dialog' : 'get'; }
     set method(v) { __ptSetA(this, 'method', v); }
     get enctype() { const e = String(__ptGetA(this, 'enctype') || '').toLowerCase(); return e === 'multipart/form-data' || e === 'text/plain' ? e : 'application/x-www-form-urlencoded'; }
@@ -1328,8 +1292,8 @@
     requestSubmit(submitter) {
       if (this.__ptLocal !== 'form') return;
       if (submitter !== undefined && submitter !== null && !(submitter && submitter.nodeType === ELEMENT_NODE)) throw __pt_mkErr(TypeError, "Failed to execute 'requestSubmit' on 'HTMLFormElement': parameter 1 is not of type 'HTMLElement'.");
-      // `submit` шлёт сам браузер — оно доверенное, даже когда отправку
-      // попросил скрипт (у Chrome `isTrusted` здесь true).
+      // The browser sends `submit`, so it is trusted even when a script asked
+      // for submission (`isTrusted` true in Chrome).
       const ev = __ptTrust(new (globalThis.SubmitEvent || Event)('submit', { bubbles: true, cancelable: true, submitter: submitter || null }));
       if (!this.dispatchEvent(ev)) return;
       this.__ptSubmit(submitter || null);
@@ -1337,8 +1301,8 @@
     __ptUrlAttr(n) {
       const raw = __ptGetA(this, n);
       if (raw == null) return '';
-      // Пустой кадр берёт основу адреса у создателя: `s.src = 'x.js'` в нём
-      // отвечает адресом родителя, а не `about://x.js`.
+      // An empty frame takes its base URL from the creator: `s.src = 'x.js'`
+      // resolves against the parent, not `about://x.js`.
       const base = (this.ownerDocument || document).baseURI || (globalThis.location && location.href) || 'about:blank';
       try { return new URL(raw, base).href; } catch (e) { return raw; }
     }
@@ -1352,9 +1316,9 @@
     set alt(v) { __ptSetA(this, 'alt', v); }
     get integrity() { return __ptGetA(this, 'integrity') || ''; }
     set integrity(v) { __ptSetA(this, 'integrity', v); }
-    // Отражения HTMLElement, которые были заглушками: `dir` (перечисление),
-    // `lang`, `title`, `accessKey`. Оркестратор заставы Cloudflare ставит
-    // `document.documentElement.dir`, и слепок DOM это видит.
+    // HTMLElement reflections: `dir` (enumerated), `lang`, `title`,
+    // `accessKey`. The Cloudflare interstitial sets
+    // `document.documentElement.dir`, and the DOM snapshot sees it.
     get dir() { const v = String(__ptGetA(this, 'dir') || '').toLowerCase(); return v === 'ltr' || v === 'rtl' || v === 'auto' ? v : ''; }
     set dir(v) { __ptSetA(this, 'dir', v); }
     get lang() { return __ptGetA(this, 'lang') || ''; }
@@ -1363,8 +1327,8 @@
     set title(v) { __ptSetA(this, 'title', v); }
     get accessKey() { return __ptGetA(this, 'accesskey') || ''; }
     set accessKey(v) { __ptSetA(this, 'accesskey', v); }
-    // Nonce под CSP из заголовка браузер прячет: атрибут отвечает пустой
-    // строкой, значение живёт только в свойстве `nonce`.
+    // Chrome hides a header-CSP nonce: the attribute reads empty, the value
+    // lives only in the `nonce` property.
     get nonce() { return this.__ptNonce !== undefined ? this.__ptNonce : (__ptGetA(this, 'nonce') || ''); }
     set nonce(v) { this.__ptNonce = String(v); }
     __ptHideNonce() {
@@ -1382,9 +1346,8 @@
     set async(v) { v ? __ptSetA(this, 'async', '') : __ptDelA(this, 'async'); }
     get defer() { return __ptHasA(this, 'defer'); }
     set defer(v) { v ? __ptSetA(this, 'defer', '') : __ptDelA(this, 'defer'); }
-    // `'noModule' in script` — как страница спрашивает, умеет ли браузер модули.
-    // Без этого свойства мы для любой сборки Vite — браузер из позапрошлой эпохи,
-    // и нам присылают legacy-половину.
+    // `'noModule' in script` is how pages detect module support; without it
+    // Vite builds serve their legacy half.
     get noModule() { return __ptHasA(this, 'nomodule'); }
     set noModule(v) { v ? __ptSetA(this, 'nomodule', '') : __ptDelA(this, 'nomodule'); }
     get hreflang() { return __ptGetA(this, 'hreflang') || ''; }
@@ -1401,16 +1364,16 @@
     set minLength(v) { __ptSetA(this, 'minlength', String(v)); }
     get defaultValue() { return __ptGetA(this, 'value') || ''; }
     set defaultValue(v) { __ptSetA(this, 'value', v); }
-    // Поля, которые участвуют в проверке формы: у неотключённой кнопки или
-    // поля это `true`, и страницы это читают.
+    // Fields taking part in form validation: `true` on an enabled button or
+    // field; pages read it.
     get willValidate() {
       const t = String(__ptGetA(this, 'type') || '').toLowerCase();
       if (this.__ptLocal !== 'input' && this.__ptLocal !== 'textarea' && this.__ptLocal !== 'select') return undefined;
       return !__ptHasA(this, 'disabled') && !__ptHasA(this, 'readonly')
              && t !== 'hidden' && t !== 'button' && t !== 'reset';
     }
-    // Список маркеров, а не строка: `rel`, `sandbox`, `relList` в браузере
-    // это `DOMTokenList`, и страница читает у них `length` и перебирает.
+    // A token list, not a string: `rel`, `sandbox`, `relList` are
+    // `DOMTokenList`, and pages read `length` and iterate.
     get relList() { return makeClassList(this, 'rel'); }
     get sandbox() { return makeClassList(this, 'sandbox'); }
     get htmlFor() { return __ptGetA(this, 'for') || ''; }
@@ -1433,7 +1396,7 @@
     }
 
     // Queries (scoped to this subtree)
-    // getElementById у Element браузер не имеет — только у документа и фрагмента.
+    // Element has no getElementById; only document and fragment do.
     getElementsByTagName(t) { return __collection(__tags(this, t)); }
     getElementsByTagNameNS(ns, local) { return __collection(__tagsNS(this, ns, local)); }
     getElementsByClassName(c) {
@@ -1504,10 +1467,10 @@
       if (typeof globalThis.__pt_makeRealm !== 'function') return null;
       const w = globalThis.__pt_makeRealm();
       if (!w) return null;
-      // Таймеры реалма крутит очередь родителя: у самого реалма водителя нет.
+      // The parent's queue drives the realm's timers; the realm has no driver.
       try { if (typeof globalThis.__pt_addChildRealm === 'function') __pt_addChildRealm(w); } catch (e) {}
-      // Трассы реализации (холст, WebGPU) из реалма пишут в консоль родителя:
-      // консоль реалма движок не читает. Только под флагом трассы.
+      // Implementation traces (canvas, WebGPU) from a realm go to the parent's
+      // console, which the engine reads. Trace flag only.
       if (globalThis.__pt_canvasTrace || globalThis.__pt_gpuTrace || globalThis.__pt_encTrace) {
         try { Object.defineProperty(w, '__pt_parentConsole', { value: globalThis.__pt_parentConsole || console, configurable: true }); } catch (e) {}
       }
@@ -1516,26 +1479,23 @@
         ['frameElement', this], ['self', w], ['window', w]]) {
         try { Object.defineProperty(w, k, { value: v, configurable: true }); } catch (e) {}
       }
-      // Песочница наследует стороннесть кадра: разрешения и Notification в ней
-      // отвечают как в нём.
+      // The sandbox inherits the frame's cross-site status: permissions and
+      // Notification answer as in the frame.
       try { Object.defineProperty(w, '__pt_crossSite', { value: !!globalThis.__pt_crossSite, configurable: true }); } catch (e) {}
-      // И политику безопасности: about:blank и about:srcdoc наследуют CSP
-      // создателя (nonce, 'unsafe-eval', Trusted Types) — eval в таком кадре
-      // отвечает тем же, чем в родителе.
+      // And the security policy: about:blank and about:srcdoc inherit the
+      // creator's CSP (nonce, 'unsafe-eval', Trusted Types).
       try { if (typeof w.__pt_applyCsp === 'function') for (const p of __csp.policies) w.__pt_applyCsp(p.raw, 'inherited'); } catch (e) {}
-      // Окно пустого кадра внутри стороннего кадра у Chrome не знает ни
-      // внешнего размера, ни положения на экране: outerWidth/outerHeight и
-      // screenX/screenY там нули (так отвечает отчёт челленджа).
-      // Уточнено 27.09 по эталону без пробников: внешний размер у такого окна —
-      // размер окна браузера (как у окна кадра), положение на экране — 0.
+      // In Chrome an empty frame's window inside a cross-site frame has
+      // screenX/screenY 0, and outerWidth/outerHeight equal to the browser
+      // window size (checked against a probe-free reference).
       if (globalThis.__pt_crossSite) {
         const outer = { outerWidth: globalThis.outerWidth | 0, outerHeight: globalThis.outerHeight | 0 };
         for (const k of ['outerWidth', 'outerHeight', 'screenX', 'screenY', 'screenLeft', 'screenTop']) {
           try { const d = Object.getOwnPropertyDescriptor(w, k); Object.defineProperty(w, k, { value: k in outer ? outer[k] : 0, writable: true, enumerable: d ? d.enumerable : true, configurable: true }); } catch (e) {}
         }
       }
-      // Происхождение `about:blank` — от создателя: origin и document.domain
-      // отвечают его словами, адрес остаётся about:blank.
+      // `about:blank` takes its creator's origin: origin and document.domain
+      // answer as the creator, the URL stays about:blank.
       try {
         Object.defineProperty(w, '__pt_inheritedOrigin', { value: (globalThis.location && location.origin) || 'null', configurable: true });
         Object.defineProperty(w, '__pt_inheritedBase', { value: (globalThis.document && document.baseURI) || (globalThis.location && location.href) || 'about:blank', configurable: true });
@@ -1543,31 +1503,28 @@
       } catch (e) {}
       Object.defineProperty(this, '__ptRealm', { value: w, configurable: true, enumerable: false });
       try { __realmFrames.add(this); } catch (e) {}
-      // Окно кадра — его собственная коробка, а не окно страницы. Кадр
-      // 300×150 внутри так и отвечает, и тело в нём шириной 284, как в
-      // браузере; мы отдавали ширину страницы.
-      // Размер — заявленный, без раскладки: строить её ради окна пустого
-      // кадра стоило 7–11 мс на каждую вставку и 87 мс на первую, а программа
-      // челленджа вставляет такие кадры подряд и меряет себя часами. Точный
-      // размер кадр получит с ближайшей раскладкой — её итог раздаётся всем
-      // окнам кадров.
+      // A frame's viewport is its own box, not the page's (a 300x150 frame has
+      // a 284px-wide body, as in Chrome). Declared size only, no layout:
+      // building layout for an empty frame's window cost 7-11 ms per insertion
+      // (87 ms the first), and the challenge inserts such frames in a row while
+      // timing itself. The exact size arrives with the next layout.
       try {
-        // Скрыт сам или любым предком (через хозяев теневых корней): окно
-        // такого кадра у Chrome 0×0.
+        // Hidden itself or by any ancestor (through shadow hosts): Chrome
+        // gives such a frame's window 0x0.
         let hidden = false;
         for (let p = this; p && p.nodeType === ELEMENT_NODE; p = p.parentNode && p.parentNode.nodeType === 11 && p.parentNode.__ptHost ? p.parentNode.__ptHost : p.parentNode) {
           if (String((p.style && p.style.display) || '') === 'none' || __ptHasA(p, 'hidden')) { hidden = true; break; }
         }
-        // Сторонний кадр без коробки (0×0) Chrome не раскладывает вовсе:
-        // его пустые кадры остаются без размера — innerWidth 0.
+        // Chrome does not lay out a boxless (0x0) cross-site frame: its empty
+        // frames stay unsized, innerWidth 0.
         if (!hidden && __ptHiddenFrame()) hidden = true;
-        // Сторонний кадр размером не больше 1×1 (виджет Turnstile в режиме
-        // «невидимый») Chrome не отрисовывает: раскладка в нём не идёт, и
-        // только что вставленные пустые кадры остаются без размера — 0×0
-        // (эталон без пробников, секция Mrvi5). Видимость документа — прежняя.
+        // Chrome does not render a cross-site frame of at most 1x1 (Turnstile
+        // in invisible mode): no layout inside, freshly inserted empty frames
+        // stay 0x0 (probe-free reference, section Mrvi5). Document visibility
+        // is unchanged.
         if (!hidden && globalThis.__pt_crossSite && (globalThis.innerWidth | 0) <= 1 && (globalThis.innerHeight | 0) <= 1) hidden = true;
         const [dw, dh] = __ptJSON.parse(__pt_frameBoxOf(this));
-        // Трасса NOKK_TRACE_SRCDOC=1: чем окружён пустой кадр в миг создания.
+        // Trace NOKK_TRACE_SRCDOC=1: the empty frame's surroundings at creation.
         if (globalThis.__pt_srcdocTrace) {
           try {
             const chain = [];
@@ -1581,16 +1538,16 @@
         }
         __ptTellFrame(this, hidden ? null : { cw: dw, ch: dh });
       } catch (e) {}
-      // Реферер и базовый адрес пустого кадра — документ-создатель, как у Chrome;
-      // ставится до записи разметки: её скрипты уже читают document.referrer.
+      // An empty frame's referrer and base URL are the creator document's, as
+      // in Chrome; set before writing markup, whose scripts read document.referrer.
       try { Object.defineProperty(w, '__pt_creatorURL', { value: (globalThis.location && location.href) || '', configurable: true }); } catch (e) {}
-      // Пустое окно — не пустой документ: у браузера там html/head/body, и
-      // страница туда пишет. `srcdoc` кладётся тем же путём.
+      // An empty window has html/head/body, and pages write into it. `srcdoc`
+      // goes the same way.
       try {
         const markup = __ptGetA(this, 'srcdoc');
-        // Трасса NOKK_TRACE_SRCDOC=1: разметка srcdoc-кадра в консоль родителя.
+        // Trace NOKK_TRACE_SRCDOC=1: srcdoc frame markup to the parent console.
         if (globalThis.__pt_srcdocTrace && markup != null) { try { (globalThis.__pt_parentConsole || console).error('[srcdoc] ' + String(markup).slice(0, 4000)); } catch (e) {} }
-        // Адрес srcdoc-кадра у браузера — about:srcdoc.
+        // A srcdoc frame's URL is about:srcdoc.
         if (markup != null && typeof w.__pt_setLocation === 'function') w.__pt_setLocation({ href: 'about:srcdoc', protocol: 'about:', pathname: 'srcdoc', host: '', hostname: '', port: '', search: '', hash: '' });
         if (typeof w.__pt_writeDocument === 'function') w.__pt_writeDocument(markup || '');
       } catch (e) {}
@@ -1606,21 +1563,20 @@
       // Anything that is not classic JS — a JSON island, a template, an importmap
       // — is data the page reads itself, not code to run.
       if (type && !/^(text|application)\/(java|ecma)script$|^module$/.test(type)) return;
-      // `nomodule` — «это для браузера без модулей». Мы с модулями, значит мимо.
+      // `nomodule` is for browsers without modules; we have modules, so skip.
       if (type !== 'module' && __ptHasA(this, 'nomodule')) return;
       const src = __ptGetA(this, 'src');
       // Nothing to run *yet*: an element appended empty starts when its `src`
       // arrives, so the flag must not be set until there is something to do.
       if (!src && !this.textContent) return;
       Object.defineProperty(this, '__ptRan', { value: true, configurable: true, enumerable: false });
-      // CSP: инлайн без nonce и чужой адрес не исполняются.
+      // CSP: inline without nonce and foreign URLs do not run.
       if (globalThis.__pt_cspActive && __pt_cspActive()) {
         if (!src && __pt_cspBlocksInline(this)) return;
         if (src && __pt_cspBlocksScriptUrl(this, String(src))) return;
       }
-      // Модуль исполняется не как обычный скрипт: у него свой разбор, свои
-      // `import` и своя область. Такой отдаём движку — и со ссылкой, и вписанный
-      // прямо в страницу.
+      // A module has its own parsing, `import` and scope; the engine runs it,
+      // both external and inline.
       const isModule = type === 'module';
       if (src) {
         const id = __nextScriptId++;
@@ -1636,14 +1592,13 @@
         __scriptOps.push({ op: 'load', id, src: '', code: String(code), module: true });
         return;
       }
-      // Не `eval`, а настоящий скрипт: V8 приписывает каждому кадру стека
-      // «eval at <имя вызвавшей функции>», и наше внутреннее имя торчало в
-      // следе вызовов любой страницы — метка, видная с первой же ошибки.
-      // Запасной путь остаётся на случай сборки без этого встроенного.
+      // A real script, not `eval`: V8 tags every stack frame with
+      // "eval at <caller name>", leaking our internal name into any page's
+      // stack trace. The fallback stays for builds without this builtin.
       try {
-        // Адрес — документа: у встроенного скрипта своего нет, и браузер
-        // называет его кадры стека адресом страницы. Пустое имя превращало их
-        // в `<anonymous>` — метку, видную всякому, кто читает `Error().stack`.
+        // URL of the document: an inline script has none of its own and Chrome
+        // names its stack frames with the page URL. An empty name would show as
+        // `<anonymous>` in `Error().stack`.
         let where_ = '';
         try { where_ = String((this.ownerDocument && this.ownerDocument.URL) || location.href || ''); } catch (e) {}
         const line = typeof __pt_markupLine === 'function' ? __pt_markupLine(String(code)) : 0;
@@ -1655,26 +1610,23 @@
     __ptConnectFrame() {
       if (this.__ptFrameId || this.__ptLocal !== 'iframe') return;
       const src = __ptGetA(this, 'src');
-      // `about:blank` — не адрес, за которым идут в сеть: у браузера это тот же
-      // начальный пустой документ, что и у кадра без src, и реалм в нём готов
-      // сразу. Отличать их — значит ронять `f.src='about:blank';
-      // body.appendChild(f); f.contentWindow.eval(…)`, а это штатный способ
-      // взять нетронутые встроенные функции, которым челленджи и пользуются.
+      // `about:blank` is not fetched: it is the same initial empty document as
+      // a frame without src, and its realm is ready at once. Pages do
+      // `f.src='about:blank'; body.appendChild(f); f.contentWindow.eval(…)` to
+      // get pristine builtins, and challenges rely on it.
       const blank = !src || /^about:blank(\?|#|$)/.test(src.trim());
       if (blank) {
-        // Кадр с `srcdoc` грузится сам, как только попал в документ, — ждать,
-        // пока кто-нибудь прочитает `contentWindow`, браузер не заставляет.
+        // A `srcdoc` frame loads as soon as it is in the document, without
+        // waiting for `contentWindow` to be read.
         if (src || __ptGetA(this, 'srcdoc') !== null) { try { this.__ptRealmWindow(); } catch (e) {} }
-        // Пустой документ тоже загружается: браузер сообщает `load` следующим
-        // же оборотом. Мы молчали, и страница, ждущая `iframe.onload`, ждала
-        // вечно — а это обычный способ дождаться готового кадра.
+        // An empty document loads too: Chrome fires `load`, and pages wait for
+        // `iframe.onload`.
         if (!this.__ptBlankLoaded) {
           Object.defineProperty(this, '__ptBlankLoaded', { value: true, configurable: true, enumerable: false });
-          // Пустой кадр у Chrome загружен уже при вставке: `load` уходит тут же,
-          // в том же такте. Челлендж вставляет песочницу, ждёт load, снимает
-          // окно и вынимает кадр за один оборот — у нас на это уходило полсекунды,
-          // и окно мерилось ещё вставленным (300×150 вместо 0×0). Кадр с srcdoc
-          // разбирается, и его load — следующим оборотом.
+          // In Chrome an empty frame is already loaded on insertion: `load`
+          // fires right away, in the same task. The challenge inserts a
+          // sandbox, waits for load, grabs the window and removes the frame in
+          // one turn. A srcdoc frame is parsed and loads on the next turn.
           if (__ptGetA(this, 'srcdoc') === null) { try { this.__ptFireLoad(true); } catch (e) {} }
           else __pt_soon(() => { try { this.__ptFireLoad(true); } catch (e) {} });
         }
@@ -1682,10 +1634,9 @@
       }
       const id = __nextFrameId++;
       Object.defineProperty(this, '__ptFrameId', { value: id, configurable: true, enumerable: false });
-      // Размер элемента едет вместе с запросом: контекст кадра должен знать своё
-      // окно до того, как в нём выполнится первая строка. Спрашивать раскладку
-      // здесь нельзя — вставка идёт посреди разбора, и построенная в этот момент
-      // раскладка застынет недостроенной; берём заявленный размер.
+      // The element size travels with the request: the frame context must know
+      // its viewport before its first line runs. Layout cannot be queried here
+      // (mid-parse it would freeze half-built); use the declared size.
       const box = __ptJSON.parse(globalThis.__pt_frameBoxOf ? __pt_frameBoxOf(this) : '[300,150]');
       const st = { el: this, ready: false, sameOrigin: false, win: null, doc: null, pending: [] };
       st.win = __frameWindow(id, st);
@@ -1730,7 +1681,7 @@
     }
     set innerHTML(html) {
       html = __pt_ttSink('TrustedHTML', 'Element innerHTML', html, "Failed to set the 'innerHTML' property on 'Element'");
-      // Разметка шаблона разбирается в его содержимое — таков разбор у него.
+      // Template markup is parsed into its content.
       const host = this.__ptLocal === 'template' ? __templateContent(this) : this;
       __ptDropKids(host);
       const nodes = parseFragment(String(html));
@@ -1788,15 +1739,14 @@
     get parentElement() { const p = this.parentNode; return p && p.nodeType === ELEMENT_NODE ? p : null; }
     // Layout-metric accessors derived from the synthetic box. `documentElement`'s
     // client size is the viewport (drivers clamp click boxes to it).
-    // `clientWidth` — поле содержимого вместе с отступами, но без рамок, и
-    // целым числом; `offsetWidth` — то же с рамками. Раньше оба отдавали одну
-    // и ту же коробку, и элемент с рамкой отвечал на них одинаково.
+    // `clientWidth` is the content box plus padding, no borders, as an
+    // integer; `offsetWidth` includes borders.
     get clientWidth() { const d = this.ownerDocument || globalThis.document; if (d && this === d.documentElement) return LAYOUT.W; const b = __boxOf(this); return b ? Math.round(b.w - b.bx - (b.bar ? b.bar[0] : 0)) : 0; }
     get clientHeight() { const d = this.ownerDocument || globalThis.document; if (d && this === d.documentElement) return LAYOUT.H; const b = __boxOf(this); return b ? Math.round(b.h - b.by - (b.bar ? b.bar[1] : 0)) : 0; }
     get clientTop() { return 0; }
     get clientLeft() { return 0; }
-    // Область прокрутки — по содержимому: `scrollWidth` у блока со скрытым
-    // переполнением больше видимой части, и страницы это читают.
+    // Scroll area is the content extent: `scrollWidth` of a block with hidden
+    // overflow exceeds its visible part.
     get scrollWidth() { const b = __boxOf(this); return b ? Math.round(Math.max(this.clientWidth, b.sw)) : this.clientWidth; }
     get scrollHeight() { const b = __boxOf(this); return b ? Math.round(Math.max(this.clientHeight, b.sh)) : this.clientHeight; }
     get scrollTop() { return 0; }
@@ -1811,21 +1761,19 @@
       const doc = this.ownerDocument || globalThis.document;
       if (!doc || doc.activeElement === this) return;
       const prev = doc.activeElement;
-      // Порядок у браузера такой: `blur` и `focusout` на прежнем, потом `focus`
-      // и `focusin` на новом; у каждого — второй участник в `relatedTarget`.
-      // Событие шлёт сам браузер, поэтому `isTrusted` у него истина, даже когда
-      // фокус попросили из скрипта. У нас были два события из четырёх, без
-      // `relatedTarget` и недоверенные — а это читают.
+      // Chrome's order: `blur` and `focusout` on the old element, then `focus`
+      // and `focusin` on the new, each with the other in `relatedTarget`.
+      // The browser sends them, so `isTrusted` is true even when a script
+      // asked for focus.
       if (prev && prev !== doc.body && prev.dispatchEvent) {
         prev.dispatchEvent(__ptFocusEvent('blur', this));
         prev.dispatchEvent(__ptFocusEvent('focusout', this, true));
       }
       doc.__ptActive = this;
-      // Тело — это «фокуса ни на ком»: у браузера в `relatedTarget` тогда
-      // пусто, а не сам `<body>`.
-      const откуда = prev && prev !== doc.body ? prev : null;
-      this.dispatchEvent(__ptFocusEvent('focus', откуда));
-      this.dispatchEvent(__ptFocusEvent('focusin', откуда, true));
+      // Body means "nothing focused": `relatedTarget` is then null, not `<body>`.
+      const relatedFrom = prev && prev !== doc.body ? prev : null;
+      this.dispatchEvent(__ptFocusEvent('focus', relatedFrom));
+      this.dispatchEvent(__ptFocusEvent('focusin', relatedFrom, true));
     }
     blur() {
       const doc = this.ownerDocument || globalThis.document;
@@ -1841,8 +1789,7 @@
     // Common form-field surface, reflected from attributes — drivers gate `fill`
     // and `select` on these (an input with no `type`/`disabled`/`readOnly` fails
     // Playwright's fillability check).
-    // Неизвестное значение `type` у поля браузер сводит к `text`: страница,
-    // которая ставит выдуманный тип и читает его назад, получает `text`.
+    // An unknown `type` value reads back as `text`.
     get type() {
       const t = (__ptGetA(this, 'type') || '').toLowerCase();
       if (this.tagName !== 'INPUT') return t;
@@ -1866,12 +1813,12 @@
       const v = parseInt(__ptGetA(this, 'width'), 10);
       if (Number.isFinite(v)) return v;
       if (this.tagName === 'CANVAS') return 300;
-      // Без атрибута ширина картинки — её собственная, та, что в файле.
+      // Without the attribute an image's width is its intrinsic width.
       return this.tagName === 'IMG' ? this.naturalWidth : 0;
     }
     set width(v) {
       __ptSetA(this, 'width', String(Math.max(0, v | 0)));
-      // Смена размера холста сбрасывает состояние его контекста.
+      // Resizing a canvas resets its context state.
       if (this.__ptCtxResize) this.__ptCtxResize();
     }
     get height() {
@@ -1884,9 +1831,7 @@
       __ptSetA(this, 'height', String(Math.max(0, v | 0)));
       if (this.__ptCtxResize) this.__ptCtxResize();
     }
-    // Собственный размер картинки: ноль, пока она не загружена, и настоящий —
-    // после. У нас его не было вовсе, и всё, что меряет нарисованное, видело
-    // картинку нулевого размера.
+    // Intrinsic image size: zero until loaded, real afterwards.
     get naturalWidth() { const s = this.__ptImgSize(); return s ? s[0] : 0; }
     get naturalHeight() { const s = this.__ptImgSize(); return s ? s[1] : 0; }
     __ptImgSize() {
@@ -1909,10 +1854,8 @@
     __ptShallowClone() {
       const e = new Element(this.localName);
       e.__ptAttrs = new Map(this.__ptAttrs);
-      // Клон стоит на той же ступени лестницы интерфейсов, что и оригинал:
-      // копия `<template>` — тоже HTMLTemplateElement, а копия `<div>` —
-      // HTMLDivElement. Без этого клон был просто Element, и всё, что живёт на
-      // его интерфейсе, у копии пропадало.
+      // A clone sits on the same interface step as the original: a copy of
+      // `<template>` is an HTMLTemplateElement, of `<div>` an HTMLDivElement.
       try {
         if (this.__ptNS && globalThis.__pt_svgProto) {
           const p = __pt_svgProto(this.localName);
@@ -1941,17 +1884,16 @@
     set defaultView(v) { this.__ptView = v; }
     get currentScript() { return this.__ptCurScript; }
     set currentScript(v) { this.__ptCurScript = v; }
-    // Сторонний кадр без коробки (0×0) у Chrome скрыт: его окно ещё не
-    // показано, и `visibilityState` в нём и в его пустых кадрах — hidden.
+    // In Chrome a boxless (0x0) cross-site frame is hidden: its window is not
+    // shown yet, and `visibilityState` there and in its empty frames is hidden.
     get visibilityState() { return globalThis.__ptDetached || __ptHiddenFrame() ? 'hidden' : 'visible'; }
     get hidden() { return !!globalThis.__ptDetached || __ptHiddenFrame(); }
-    // `document.dir` отражает `dir` корневого элемента.
+    // `document.dir` reflects the root element's `dir`.
     get dir() { const h = this.documentElement; return h ? h.dir : ''; }
     set dir(v) { const h = this.documentElement; if (h) h.dir = v; }
     get documentElement() { return this.__ptDocEl; }
-    // ParentNode у документа — своё, а не наследованное: у браузера
-    // `children` лежит на `Document.prototype`, и без него поверхность
-    // ставила заглушку, отвечавшую пустым объектом вместо коллекции.
+    // The document's ParentNode members are its own: `children` lives on
+    // `Document.prototype` (otherwise the surface installs an empty stub).
     get children() { return __collection(this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE)); }
     get childElementCount() { return this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE).length; }
     get firstElementChild() { return this.__ptKids.find((n) => n.nodeType === ELEMENT_NODE) || null; }
@@ -1961,19 +1903,17 @@
     }
     set documentElement(v) { this.__ptDocEl = v; }
     get readyState() { return this.__ptReady; }
-    // Окно у человека в фокусе; DevTools-окно Chrome отвечает false, живое — true.
+    // A user's window is focused; a Chrome DevTools window answers false, a live one true.
     hasFocus() { return !globalThis.__ptDetached; }
     set readyState(v) { this.__ptReady = v; }
-    // В браузере это `<body>`, как только тело есть, и никогда не null у
-    // загруженного документа: сборщик отпечатка кладёт его в корзину объектов,
-    // а null — в корзину «x».
+    // `<body>` as soon as there is one, never null in a loaded document:
+    // fingerprinters bucket the value by type.
     get activeElement() { return this.__ptActive || this.body || null; }
     set activeElement(v) { this.__ptActive = v; }
     elementFromPoint(x, y) { return __elementFromPoint(x, y); }
     getAnimations() { return []; }
-    // DOMImplementation: у нас была заглушка без методов, а
-    // `document.implementation.createHTMLDocument()` — обычный способ взять
-    // чистый документ.
+    // DOMImplementation: `document.implementation.createHTMLDocument()` is a
+    // common way to get a clean document.
     get implementation() {
       if (this.__ptImpl) return this.__ptImpl;
       const self = this;
@@ -1995,20 +1935,17 @@
       Object.defineProperty(this, '__ptImpl', { value: impl, configurable: true });
       return impl;
     }
-    // `document.all` — коллекция всех элементов в порядке дерева (у Chrome
-    // она «необнаружима» — typeof undefined; этого V8 нам не даёт, зато по
-    // индексу она отвечает, а не роняет читающего).
-    // Только светлое дерево: теневые корни в document.all не входят (у нас
-    // кадр виджета отвечал 96 элементов против 12 у Chrome).
+    // `document.all`: all elements in tree order. Chrome's is "undetectable"
+    // (typeof undefined), which V8 does not give us, but indexing works.
+    // Light tree only: shadow roots are excluded (the widget frame gave 96
+    // elements vs Chrome's 12).
     get all() { return __allCollection(collect(this, () => true)); }
     get applets() { return __collection([]); }
-    // Не один элемент, а вся стопка под точкой: браузер отдаёт цепочку от
-    // самого глубокого до `<html>`.
+    // The whole stack under the point, from the deepest to `<html>`.
     elementsFromPoint(x, y) {
       const out = [];
       for (let e = __elementFromPoint(x, y); e && e.nodeType === ELEMENT_NODE; e = e.parentNode) out.push(e);
-      // Точка в окне всегда попадает хотя бы в <html>: пустой стопки у
-      // браузера не бывает, пока точка внутри вида.
+      // A point inside the viewport always hits at least <html>.
       if (!out.length && this.documentElement && x >= 0 && y >= 0 && x < (globalThis.innerWidth || 0) && y < (globalThis.innerHeight || 0)) out.push(this.documentElement);
       return out;
     }
@@ -2027,9 +1964,8 @@
     // the reply — which the widget waits for forever, silently, because a listener
     // that throws is swallowed by the event dispatch. `referrer` is read on the
     // same line and must be a string ('' for a direct load), not `undefined`.
-    // Коллекции документа — это HTMLCollection, а не массив: `Array.isArray`
-    // на них ложен, а сборщик отпечатка кладёт массив в корзину по его
-    // строковому значению, из-за чего пустой список выглядел как пустая строка.
+    // Document collections are HTMLCollection, not arrays: `Array.isArray` is
+    // false, and fingerprinters bucket arrays by their string value.
     get scripts() { return __collection(__docTags(this, 'script')); }
     get forms() { return __collection(__docTags(this, 'form')); }
     get images() { return __collection(__docTags(this, 'img')); }
@@ -2042,12 +1978,11 @@
     }
     get anchors() { return __collection(__docTags(this, 'a').filter(e => __ptHasA(e, 'name'))); }
     get styleSheets() { return __styleSheetList(__sheetOwners(this)); }
-    // Кодировка — объявленная, а не всегда UTF-8: страница без объявления
-    // разбирается как windows-1252, и Chrome именно это и сообщает. Отвечать
-    // «UTF-8» на документ, который ничего не объявил, — заметная разница.
+    // The declared charset, not always UTF-8: a page without a declaration is
+    // parsed as windows-1252, and Chrome reports that.
     get characterSet() {
       if (this.__ptCharset) return this.__ptCharset;
-      // Документы из строки (DOMParser) — всегда UTF-8.
+      // Documents from a string (DOMParser) are always UTF-8.
       if (this.__ptContentType) return 'UTF-8';
       for (const m of __docTags(this, 'meta')) {
         const c = __ptGetA(m, 'charset');
@@ -2057,21 +1992,20 @@
           if (hit) return __normEncoding(hit[1]);
         }
       }
-      // Пустой документ (`about:blank`, песочница челленджа) у браузера в UTF-8.
+      // An empty document (`about:blank`, the challenge sandbox) is UTF-8.
       return this.URL === 'about:blank' ? 'UTF-8' : 'windows-1252';
     }
     get charset() { return this.characterSet; }
     get inputEncoding() { return this.characterSet; }
     get contentType() { return this.__ptContentType || 'text/html'; }
     get xmlVersion() { return this.__ptXml ? '1.0' : null; }
-    // Страница без `<!DOCTYPE>` живёт в режиме совместимости, и браузер это
-    // говорит: `BackCompat` и `doctype === null`. Мы отвечали «стандартный
-    // режим» всегда и выдавали объект-заглушку вместо узла.
+    // A page without `<!DOCTYPE>` is in quirks mode: `BackCompat` and
+    // `doctype === null`.
     get compatMode() { return this.__ptDoctype || this.__ptXml ? 'CSS1Compat' : 'BackCompat'; }
     get doctype() { return this.__ptDoctype || null; }
     get designMode() { return 'off'; }
     set designMode(v) {}
-    // Формат браузера — MM/DD/YYYY HH:MM:SS, а не локализованная строка.
+    // Chrome's format is MM/DD/YYYY HH:MM:SS, not a localised string.
     get lastModified() {
       const d = new Date(), p2 = (n) => String(n).padStart(2, '0');
       return `${p2(d.getMonth() + 1)}/${p2(d.getDate())}/${d.getFullYear()} ` +
@@ -2080,12 +2014,12 @@
     get webkitVisibilityState() { return this.visibilityState; }
     get adoptedStyleSheets() { return this.__ptAdopted || (this.__ptAdopted = []); }
     set adoptedStyleSheets(v) { this.__ptAdopted = v; }
-    // В браузере у документа textContent равен null — узла-контейнера нет.
+    // A document's textContent is null.
     get textContent() { return null; }
     set textContent(v) {}
 
-    // У `about:blank` в кадре реферер — документ-создатель.
-    // У srcdoc-кадра Chrome отвечает только источником создателя («http://host/»).
+    // In a frame, `about:blank`'s referrer is the creator document.
+    // For a srcdoc frame Chrome gives only the creator's origin ("http://host/").
     get referrer() { return this.__ptReferrer || (this.URL === 'about:blank' && globalThis.__pt_creatorURL) || (this.URL === 'about:srcdoc' && globalThis.__pt_creatorURL && (() => { try { return new URL(globalThis.__pt_creatorURL).origin + '/'; } catch (e) { return globalThis.__pt_creatorURL; } })()) || (this === globalThis.document && globalThis.__pt_referrer) || ''; }
     set referrer(v) { this.__ptReferrer = String(v); }
 
@@ -2094,12 +2028,12 @@
     // deal of code asks where it is, and against `undefined` that throws. It is
     // what stopped Cloudflare's full-page challenge here, inside its own timer,
     // where nothing surfaced the error.
-    // У документа без окна (DOMParser, XHR) `location` — null.
+    // A windowless document (DOMParser, XHR) has `location` null.
     get location() { return this === globalThis.document ? globalThis.location : null; }
     set location(v) { try { globalThis.location.href = String(v); } catch (e) {} }
     get URL() { return (globalThis.location && globalThis.location.href) || 'about:blank'; }
     get documentURI() { return this.URL; }
-    // У `about:blank` базовый адрес — адрес создателя (запасной по спецификации).
+    // `about:blank`'s base URL is the creator's (the spec fallback).
     __ptBaseURI() { return (this.URL === 'about:blank' || this.URL === 'about:srcdoc') && globalThis.__pt_creatorURL ? globalThis.__pt_creatorURL : this.URL; }
     get domain() { return (globalThis.location && globalThis.location.hostname) || globalThis.__pt_inheritedHost || ''; }
     set domain(v) { /* only ever narrowed to a parent domain; nothing to do here */ }
@@ -2117,13 +2051,13 @@
     }
 
     createElement(tag) {
-      // Имя тега — по правилам XML: `1x` и `a b` браузер отвергает словами
-      // InvalidCharacterError, а мы строили элемент с любым именем.
+      // Tag name per XML rules: Chrome rejects `1x` and `a b` with
+      // InvalidCharacterError.
       const raw = String(tag);
       if (!/^[A-Za-z_:\u00C0-\u{10FFFF}][A-Za-z0-9_:.\-\u00B7\u00C0-\u{10FFFF}]*$/u.test(raw)) {
         throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'createElement' on 'Document': The tag name provided ('" + raw + "') is not a valid name.", 'InvalidCharacterError');
       }
-      // В XML-документе имя хранится как есть, а элемент — просто Element.
+      // In an XML document the name is kept as is and the element is a plain Element.
       if (this.__ptXml) {
         const e = new Element(raw);
         e.__ptTag = raw; e.__ptLocal = raw;
@@ -2135,8 +2069,8 @@
       if (globalThis.__pt_setPendingTag) __pt_setPendingTag(tag);
       const e = C ? new C() : new Element(tag);
       if (C) Object.defineProperty(e, '__ptUpgraded', { value: true, configurable: true, enumerable: false });
-      // Элемент стоит на своей ступени лестницы интерфейсов: `<canvas>` — на
-      // HTMLCanvasElement, неизвестный тег — на HTMLUnknownElement.
+      // The element sits on its interface step: `<canvas>` on
+      // HTMLCanvasElement, an unknown tag on HTMLUnknownElement.
       if (!C && globalThis.__pt_elementProto) {
         try { Object.setPrototypeOf(e, __pt_elementProto(tag)); } catch (x) {}
       }
@@ -2150,12 +2084,12 @@
       const e = this.createElement(tag);
       e.__ptNS = NS;
       if (prefix) { e.__ptPrefix = prefix; e.__ptTag = q; }
-      // Не-HTML элемент: имя как написано, без перевода в заглавные.
+      // Non-HTML element: name as written, not uppercased.
       if (NS !== 'http://www.w3.org/1999/xhtml') { e.__ptLocal = tag; e.__ptTag = q; }
       if (NS === 'http://www.w3.org/2000/svg' && globalThis.__pt_svgProto) {
         const proto = __pt_svgProto(String(tag));
-        // Имя тега в SVG регистрозависимо: `clipPath`, не `clippath`.
-        // И `tagName` у SVG — как написано (`text`, `clipPath`), а не заглавными.
+        // SVG tag names are case-sensitive (`clipPath`, not `clippath`), and
+        // SVG `tagName` is as written, not uppercase.
         if (proto) { try { Object.setPrototypeOf(e, proto); e.__ptNS = String(ns); e.__ptLocal = String(tag); e.__ptTag = q; } catch (x) {} }
       } else if (NS === 'http://www.w3.org/1998/Math/MathML' && typeof globalThis.MathMLElement === 'function') {
         try { Object.setPrototypeOf(e, MathMLElement.prototype); } catch (x) {}
@@ -2168,10 +2102,9 @@
     createComment(t) { const n = new Comment(t); n.__ptDoc = this; return n; }
     createDocumentFragment() { const f = new DocumentFragment(); f.__ptDoc = this; return f; }
     createEvent() { return new Event(''); }
-    // Копия чужого узла для этого документа. Имени хватало в перечне свойств,
-    // а вызов возвращал пустоту — и страница, которая кладёт содержимое
-    // шаблона в тело (челлендж Cloudflare делает ровно это), спотыкалась на
-    // следующей строке: `replaceChild(undefined, …)`.
+    // A copy of a foreign node for this document. The Cloudflare challenge
+    // puts template content into the body this way and then calls
+    // `replaceChild` with the result.
     importNode(node, deep) {
       __needArgs(arguments.length, 1, 'importNode', 'Document');
       __needNode(node, 1, 'importNode', 'Document');
@@ -2184,7 +2117,7 @@
       __walkTree(copy, (n) => { n.__ptDoc = this; });
       return copy;
     }
-    // Тот же узел, но уже наш: у прежнего родителя его больше нет.
+    // The same node, now ours: its old parent no longer has it.
     adoptNode(node) {
       __needArgs(arguments.length, 1, 'adoptNode', 'Document');
       __needNode(node, 1, 'adoptNode', 'Document');
@@ -2198,9 +2131,8 @@
       return node;
     }
 
-    // Обход — от самого документа: <html> тоже его потомок. Прежде корнем был
-    // documentElement, и он сам в выборку не попадал (getElementsByTagName('*')
-    // давал на один меньше, чем querySelectorAll, id на <html> не находился).
+    // Walk from the document itself: <html> is a descendant too (otherwise
+    // getElementsByTagName('*') was one short and an id on <html> was not found).
     getElementById(id) { return firstMatch(this, (e) => e.id === String(id)); }
     getElementsByTagName(t) { return __collection(__tags(this, t)); }
     getElementsByClassName(c) {
@@ -2262,9 +2194,9 @@
     }
   };
 
-  // `isTrusted` у браузера — собственное свойство каждого события
-  // ([LegacyUnforgeable]), а не аксессор прототипа: перечисление прототипа
-  // Event его не показывает, а у экземпляра оно неперенастраиваемое.
+  // `isTrusted` is an own property of each event ([LegacyUnforgeable]), not a
+  // prototype accessor: Event.prototype enumeration does not show it, and on
+  // the instance it is non-configurable.
   const __ptIsTrustedGet = (() => {
     const g = function () { return !!(this.__ptE && this.__ptE.isTrusted); };
     try { Object.defineProperty(g, 'name', { value: 'get isTrusted', configurable: true }); } catch (e) {}
@@ -2276,12 +2208,11 @@
       Object.defineProperty(this, 'isTrusted', { get: __ptIsTrustedGet, set: undefined, enumerable: true, configurable: false });
       this.__ptE = {
         type, bubbles: !!init.bubbles, cancelable: !!init.cancelable,
-        // `composed` — обычное поле события, и у браузера оно false, а не
-        // пустота: читают его наравне с `bubbles`.
+        // `composed` is a regular field, false (not undefined) in Chrome.
         composed: !!init.composed,
         defaultPrevented: false, target: null, currentTarget: null,
-        // Событие, созданное страницей, не доверенное — доверенные приходят
-        // только от движка (ввод, load, message), и он метит их __ptTrust.
+        // Page-created events are untrusted; trusted ones come only from the
+        // engine (input, load, message), which marks them with __ptTrust.
         eventPhase: 0, timeStamp: (globalThis.performance && performance.now()) || 0, isTrusted: false,
       };
       this.__ptStop = false; this.__ptStopImm = false;
@@ -2289,8 +2220,8 @@
     preventDefault() { if (this.cancelable) this.__ptE.defaultPrevented = true; }
     stopPropagation() { this.__ptStop = true; }
     stopImmediatePropagation() { this.__ptStop = true; this.__ptStopImm = true; }
-    // Путь той же рассылки; вне её — пусто, как у Chrome. Узлы закрытой тени
-    // не видны слушателю снаружи неё.
+    // The path of the current dispatch; empty outside it, as in Chrome. Nodes
+    // in a closed shadow tree are hidden from listeners outside it.
     composedPath() {
       const p = this.__ptE ? this.__ptE.__ptPathNow : this.__ptPathNow; if (!p) return [];
       const cur = this.currentTarget; const out = [];
@@ -2304,19 +2235,19 @@
       return out;
     }
   }
-  // Пометить событие как пришедшее от движка. Страница до этого не дотянется:
-  // имя __pt-скрыто из любого перечисления, а слепок делается один раз.
+  // Mark an event as engine-originated. Out of the page's reach: the __pt name
+  // is hidden from enumeration and the getter is captured once.
   const __ptTrust = (ev) => {
     if (ev && ev.__ptE) ev.__ptE.isTrusted = true;
     else if (ev) { try { Object.defineProperty(ev, 'isTrusted', { value: true, configurable: true }); } catch (e) {} }
     return ev;
   };
-  // Воркерная область объявляется отдельным скриптом и метит свои доставки этим.
+  // The worker scope is set up by a separate script and marks its deliveries with this.
   try { Object.defineProperty(globalThis, '__pt_trustEvent', { value: __ptTrust, enumerable: false, configurable: true }); } catch (e) {}
 
   evtAccessors(Event, ['type', 'bubbles', 'cancelable', 'composed', 'defaultPrevented', 'target',
     'currentTarget', 'eventPhase', 'timeStamp']);
-  // `srcElement` — то же, что `target` (у нас была заглушка с undefined).
+  // `srcElement` is the same as `target`.
   try { const g = function () { return this.__ptE.target; }; Object.defineProperty(g, 'name', { value: 'get srcElement', configurable: true }); Object.defineProperty(Event.prototype, 'srcElement', { get: g, configurable: true, enumerable: false }); } catch (e) {}
 
   class CustomEvent extends Event {
@@ -2324,8 +2255,8 @@
   }
   evtAccessors(CustomEvent, ['detail']);
 
-  // Событие потери/восстановления контекста WebGL: заглушка таблицы форм
-  // падала на словаре параметров ('statusMessage').
+  // WebGL context lost/restored event: the shape-table stub failed on the
+  // init dictionary ('statusMessage').
   class WebGLContextEvent extends Event {
     constructor(type, init) { super(type, init); this.__ptE.statusMessage = init && init.statusMessage !== undefined ? String(init.statusMessage) : ''; }
   }
@@ -2336,8 +2267,8 @@
       super(type, init); init = init || {};
       this.__ptE.detail = init.detail || 0;
       this.__ptE.view = globalThis;
-      // Устройство, породившее событие: у собранного страницей — null; ввод
-      // мыши движок помечает сам (InputDeviceCapabilities, см. __pt_mouse).
+      // The device that produced the event: null for page-built events; engine
+      // mouse input sets it (InputDeviceCapabilities, see __pt_mouse).
       this.__ptE.sourceCapabilities = init.sourceCapabilities || null;
       this.__ptE.which = init.which || 0;
     }
@@ -2362,8 +2293,8 @@
         ctrlKey: !!init.ctrlKey, shiftKey: !!init.shiftKey,
         altKey: !!init.altKey, metaKey: !!init.metaKey,
         relatedTarget: init.relatedTarget || null,
-        // x/y — те же clientX/Y; layerX/Y и сдвиг у собранного страницей
-        // события — от его координат; which — кнопка плюс один (легаси Blink).
+        // x/y equal clientX/Y; layerX/Y and offsets of a page-built event come
+        // from its coordinates; which is button + 1 (legacy Blink).
         x, y, layerX: Math.trunc(x), layerY: Math.trunc(y),
         movementX: init.movementX || 0, movementY: init.movementY || 0,
         which: (init.button || 0) + 1,
@@ -2380,9 +2311,8 @@
   class PointerEvent extends MouseEvent {
     constructor(type, init) {
       super(type, init); init = init || {};
-      // Умолчания — по спецификации, а не «как удобнее»: событие, собранное
-      // страницей вручную, у Chrome отвечает `pointerId` 0, `pointerType` пустой
-      // строкой и нулевым нажимом. Настоящие значения ставит тот, кто вводит.
+      // Spec defaults: a page-built event in Chrome has `pointerId` 0, empty
+      // `pointerType` and zero pressure. The input source sets real values.
       Object.assign(this.__ptE, {
         pointerId: init.pointerId === undefined ? 0 : init.pointerId,
         pointerType: init.pointerType === undefined ? '' : init.pointerType,
@@ -2399,7 +2329,7 @@
         persistentDeviceId: init.persistentDeviceId || 0,
       });
     }
-    // Список слитых событий у ненастоящего события пуст — это его и выдаёт.
+    // An untrusted event has no coalesced events, which gives it away.
     getCoalescedEvents() { return this.isTrusted ? [this] : []; }
     getPredictedEvents() { return []; }
   }
@@ -2465,9 +2395,9 @@
   // Worker === "function"` holds and compute-style workers (message in → work →
   // postMessage back) function. Not real parallelism, and blob: scripts need
   // URL.createObjectURL support to load.
-  // Воркер — отдельный контекст V8, который строит движок: своя область, свои
-  // прототипы, свой `self`. Здесь остаётся только порт: очередь операций наружу
-  // и доставка сообщений обратно.
+  // A worker is a separate V8 context built by the engine (own scope,
+  // prototypes, `self`). Only the port lives here: an outbound op queue and
+  // message delivery back.
   const __workerOps = [];
   const __workers = new Map();
   let __nextWorkerId = 1;
@@ -2479,8 +2409,8 @@
     try { data = __pt_cloneDecode(json); } catch (e) {}
     const ev = __ptTrust(new MessageEvent('message', { data, origin: '', source: null }));
     try { __ptEvSet(ev, 'target', W.worker); __ptEvSet(ev, 'currentTarget', W.worker); } catch (e) {}
-    // Внутри обработчика `window.event` — это событие, снаружи ничего.
-    const снимок = __ptTakeEvent(ev);
+    // Inside the handler `window.event` is the event; outside, nothing.
+    const savedEvent = __ptTakeEvent(ev);
     let t0 = 0; try { t0 = performance.now(); } catch (e) {}
     try {
       try { if (typeof W.onmessage === 'function') W.onmessage.call(W.worker, ev); } catch (e) {}
@@ -2493,7 +2423,7 @@
           __pt_noteLoaf(t0, dt, typeof W.onmessage === 'function' ? 'Worker.onmessage' : 'Worker.addEventListener:message', 'event-listener', h);
         }
       } catch (e) {}
-      __ptDropEvent(снимок);
+      __ptDropEvent(savedEvent);
     }
   };
   globalThis.__pt_workerFailed = (id, message) => {
@@ -2520,10 +2450,8 @@
       let body = null;
       if (src.slice(0, 5) === 'blob:' || src.slice(0, 5) === 'data:') {
         try { body = globalThis.__pt_localSource ? __pt_localSource(src) : null; } catch (e) {}
-        // Blob-адрес, за которым ничего нет, — чужой: браузер отказывает ещё
-        // в конструкторе.
-        // Blob-адрес чужого (или никакого) происхождения — отказ ещё в
-        // конструкторе; свой, но пустой, падает позже событием error.
+        // A blob URL of a foreign (or no) origin is refused in the
+        // constructor; an own but empty one fails later with an error event.
         if (src.slice(0, 5) === 'blob:') {
           let o = 'null'; try { o = new URL(src).origin; } catch (e) {}
           const mine = (globalThis.location && location.origin) || 'null';
@@ -2536,8 +2464,8 @@
       const W = this.__ptW;
       if (W.closed) return;
       let json = 'null';
-      // Как в браузере: структурный клон, а не JSON, — иначе воркер получит
-      // вместо байтов объект, а вместо даты строку.
+      // Structured clone, not JSON, as in Chrome: bytes stay bytes, dates
+      // stay dates.
       json = __pt_cloneEncode(data);
       __workerOps.push({ op: 'post', id: W.id, data: json });
     }
@@ -2558,8 +2486,7 @@
       set(v) { this.__ptW[p] = v; },
     });
   }
-  // `Object.prototype.toString.call(new Worker(...))` — «[object Worker]», как у
-  // всякого интерфейса; без тега объект называет себя простым Object.
+  // `Object.prototype.toString.call(new Worker(...))` is "[object Worker]".
   try { Object.defineProperty(Worker.prototype, Symbol.toStringTag, { value: 'Worker', configurable: true }); } catch (e) {}
 
   class SharedWorker {
@@ -2579,21 +2506,18 @@
   // OffscreenCanvas maps to a detached <canvas>, reusing its 2D/WebGL contexts.
   class OffscreenCanvas {
     constructor(width, height) {
-      // Через снятые заранее ссылки, а не через имена, которые видит
-      // страница: в браузере `new OffscreenCanvas` не трогает ни
-      // `document.createElement`, ни `HTMLCanvasElement.prototype.getContext`,
-      // а у нас каждый офскрин тянул за собой лишний, видимый вызов.
+      // Through references captured in advance, not page-visible names:
+      // Chrome's `new OffscreenCanvas` touches neither
+      // `document.createElement` nor `HTMLCanvasElement.prototype.getContext`.
       let c = globalThis.__pt_privateCanvas
         ? globalThis.__pt_privateCanvas(width, height)
         : (globalThis.document ? globalThis.document.createElement('canvas') : null);
-      // В воркере документа нет вовсе, а OffscreenCanvas там есть и рисует —
-      // ради него он в воркере и существует. Холст без документа: методы те же,
-      // что у элемента, размеры свои. Без этого `getContext('2d')` в воркере
-      // отдавал null, и сборщик, который снимает там отпечаток холста, молча
-      // оставался ни с чем.
+      // Workers have no document but do have OffscreenCanvas (that is what it
+      // is for there): a document-less canvas with the element's methods and
+      // its own size, so `getContext('2d')` in a worker is not null.
       if (!c) {
-        // Холст-подставка наследует прототип элемента: методы холста
-        // проверяют бренд, и чужой объект они отвергают, как и в браузере.
+        // The stand-in inherits the element prototype: canvas methods check the
+        // brand and reject foreign objects, as in Chrome.
         const proto = globalThis.__pt_canvasProto;
         c = Object.create(proto || null);
         Object.defineProperty(c, 'localName', { value: 'canvas', writable: true, configurable: true });
@@ -2611,23 +2535,23 @@
     get height() { return this.__ptO.h; }
     set height(v) { this.__ptO.h = v | 0; if (this.__ptO.c) this.__ptO.c.height = v | 0; }
     getContext(type, attrs) {
-      try { if (globalThis.__pt_canvasTrace) (globalThis.__pt_parentConsole || console).error('[холст getContext offscreen ' + (this.width | 0) + 'x' + (this.height | 0) + '] ' + String(type) + ' ' + JSON.stringify(attrs === undefined ? null : attrs)); } catch (e) {}
-      // У офскрина свой набор имён: `experimental-webgl` и прочие браузер здесь
-      // не принимает вовсе, а отвечает отказом.
+      try { if (globalThis.__pt_canvasTrace) (globalThis.__pt_parentConsole || console).error('[canvas getContext offscreen ' + (this.width | 0) + 'x' + (this.height | 0) + '] ' + String(type) + ' ' + JSON.stringify(attrs === undefined ? null : attrs)); } catch (e) {}
+      // Offscreen accepts its own set of names: `experimental-webgl` and the
+      // like are refused.
       const t = String(type);
       if (t !== '2d' && t !== 'webgl' && t !== 'webgl2' && t !== 'bitmaprenderer' && t !== 'webgpu') {
         throw __pt_mkErr(TypeError, "Failed to execute 'getContext' on 'OffscreenCanvas': The provided value '"
           + t + "' is not a valid enum value of type OffscreenRenderingContextType.");
       }
       const c = this.__ptO.c;
-      // Внутренний холст знает своего офскрина: `ctx.canvas` отдаёт его, а не
-      // спрятанный <canvas>, и события контекста (потеря WebGL) идут ему.
+      // The inner canvas knows its offscreen: `ctx.canvas` returns it, not the
+      // hidden <canvas>, and context events (WebGL loss) go to it.
       if (c && !c.__ptOwner) { try { Object.defineProperty(c, '__ptOwner', { value: this, configurable: true }); } catch (e) {} }
       const orig = globalThis.__pt_canvasOrig;
       const get = (orig && orig.getContext) || (c && c.getContext);
       const g = c && get ? get.call(c, t, attrs) : null;
-      // Двумерный контекст офскрина — отдельный интерфейс, и страница читает
-      // его имя: `OffscreenCanvasRenderingContext2D`, не `CanvasRenderingContext2D`.
+      // Offscreen 2D is a separate interface and pages read its name:
+      // `OffscreenCanvasRenderingContext2D`, not `CanvasRenderingContext2D`.
       if (g && t === '2d' && globalThis.OffscreenCanvasRenderingContext2D) {
         try {
           const P = globalThis.OffscreenCanvasRenderingContext2D.prototype;
@@ -2636,8 +2560,8 @@
               const src = Object.getPrototypeOf(g);
               Object.setPrototypeOf(P, src);
               Object.defineProperty(P, '__ptLinked', { value: true });
-              // Заглушки формы на месте настоящих членов уступают им: у
-              // Chrome эти члены — собственные у офскринного контекста.
+              // Shape stubs give way to the real members: in Chrome they are
+              // own members of the offscreen context.
               try {
                 const S = globalThis.__pt_stubMembers;
                 for (const k of Object.getOwnPropertyNames(P)) {
@@ -2657,8 +2581,7 @@
       }
       return g;
     }
-    // Настоящая картинка, а не пустой `Blob`: страница, которая снимает холст
-    // и меряет длину снимка, получала ноль.
+    // A real image, not an empty `Blob`: pages measure the snapshot's length.
     convertToBlob(opts) {
       const c = this.__ptO.c;
       const type = (opts && opts.type) || 'image/png';
@@ -2672,13 +2595,12 @@
       } catch (e) { return Promise.reject(e); }
       return Promise.resolve(new Blob([], { type }));
     }
-    // Настоящий ImageBitmap: он должен нести пиксели холста, иначе `drawImage`
-    // им рисует пустоту. Возвращался пустой объект — сборщик отпечатков
-    // получал из него ничего.
+    // A real ImageBitmap carrying the canvas pixels; otherwise `drawImage`
+    // with it draws nothing.
     transferToImageBitmap() {
       const c = this.__ptO.c;
-      // Снимок собирается тем же помощником, что и `createImageBitmap`: у него
-      // размеры на прототипе, тег имени и рабочий `close`, как в браузере.
+      // Built by the same helper as `createImageBitmap`: sizes on the
+      // prototype, name tag and a working `close`, as in Chrome.
       if (globalThis.__pt_makeBitmap) {
         return globalThis.__pt_makeBitmap(c && c.__ptSurf, this.__ptO.w, this.__ptO.h);
       }
@@ -2691,18 +2613,16 @@
     }
   }
 
-  // Свои же методы, снятые до страницы. Внутренние вставки не должны идти
-  // через имена, которые страница может подменить: в браузере ни
-  // `appendChild` изнутри `innerHTML`, ни `setAttribute` изнутри `new Image`
-  // не видны никому, а у нас каждая такая мелочь всплывала в чужом крючке.
+  // Own methods captured before the page runs. Internal insertions must not go
+  // through names a page can wrap: in Chrome neither `appendChild` inside
+  // `innerHTML` nor `setAttribute` inside `new Image` is visible.
   const __ptInsert = Node.prototype.insertBefore;
   const __ptAdd = Node.prototype.appendChild;
   const __ptDrop = Node.prototype.removeChild;
   const __ptSetAttr = Element.prototype.setAttribute;
-  // Чтение и запись атрибутов изнутри движка. Свойства, отражающие атрибут
-  // (`el.src`, `el.id`, `style.color`, `classList`), в браузере не зовут
-  // `getAttribute`/`setAttribute` — это нативная работа, и крючок страницы её
-  // не видит. У нас каждое такое присваивание всплывало чужим вызовом.
+  // Internal attribute access. Reflecting properties (`el.src`, `el.id`,
+  // `style.color`, `classList`) do not call `getAttribute`/`setAttribute` in
+  // Chrome; it is native work a page hook does not see.
   const __ptAttrGet = Element.prototype.getAttribute;
   const __ptAttrSet = Element.prototype.setAttribute;
   const __ptAttrHas = Element.prototype.hasAttribute;
@@ -2712,11 +2632,10 @@
   const __ptHasA = (el, n) => __ptAttrHas.call(el, n);
   const __ptDelA = (el, n) => __ptAttrDel.call(el, n);
 
-  // Холст для собственных нужд движка. Ни `document.createElement`, ни
-  // `getContext` со страницы здесь не участвуют: всякий, кто их обернул — а
-  // сборщики отпечатков оборачивают, — иначе видит нашу кухню
-  // (`createImageBitmap`, WebGPU поверх GL) как свои вызовы, которых в
-  // браузере на этом месте нет.
+  // A canvas for the engine's own use. Neither the page's
+  // `document.createElement` nor `getContext` is involved: fingerprinters wrap
+  // them and would see internal calls (`createImageBitmap`, WebGPU over GL)
+  // that Chrome does not make.
   globalThis.__pt_privateCanvas = (w, h) => {
     const orig = globalThis.__pt_canvasOrig;
     let c = null;
@@ -2725,7 +2644,7 @@
         ? orig.createElement.call(globalThis.document, 'canvas')
         : globalThis.document.createElement('canvas');
     } else {
-      // Подставка наследует прототип элемента: его методы проверяют бренд.
+      // The stand-in inherits the element prototype: its methods check the brand.
       const proto = globalThis.__pt_canvasProto;
       c = Object.create(proto || null);
       Object.defineProperty(c, 'localName', { value: 'canvas', writable: true, configurable: true });
@@ -2742,8 +2661,8 @@
     return get ? get.call(c, type, attrs) : null;
   };
 
-  // Передача холста воркеру: сам метод ставится позже, из слоя невидимости —
-  // таблица форм интерфейсов затирает его заглушкой, если поставить здесь.
+  // Transfer to a worker: the method itself is installed later by the stealth
+  // layer; the interface shape table would overwrite it with a stub here.
   globalThis.__pt_makeTransferred = (canvas) => {
     const off = Object.create(OffscreenCanvas.prototype);
     Object.defineProperty(off, '__ptO', {
@@ -2761,9 +2680,8 @@
     const name = attr || 'class';
     const get = () => (__ptGetA(el, name) || '').split(/\s+/).filter(Boolean);
     const set = (arr) => __ptSetA(el, name, arr.join(' '));
-    // Настоящий `DOMTokenList`, а не литерал: он перебирается, индексируется и
-    // называет себя. `[...el.classList]` у нас бросал — а это одна из самых
-    // ходовых строк на любой странице.
+    // A real `DOMTokenList`, not a literal: iterable, indexable, named
+    // (`[...el.classList]` is common).
     const proto = (globalThis.DOMTokenList && globalThis.DOMTokenList.prototype) || Object.prototype;
     try {
       if (proto !== Object.prototype && !Object.getOwnPropertyDescriptor(proto, Symbol.toStringTag)) {
@@ -2792,7 +2710,7 @@
     Object.defineProperty(api, 'value', {
       get: () => get().join(' '), set: (v) => __ptSetA(el, name, String(v)), configurable: true,
     });
-    // Числовые ключи живые: список читается из атрибута при каждом обращении.
+    // Live indexed keys: the list is read from the attribute on every access.
     return __ptProxy(api, {
       get(t, k, r) {
         if (typeof k === 'string' && /^\d+$/.test(k)) return get()[+k];
@@ -2815,14 +2733,13 @@
     });
   }
   // ---- CSSOM ---------------------------------------------------------------
-  // Настоящие таблицы стилей: `document.styleSheets` был списком литералов с
-  // пустым `cssRules`, а сборщик Cloudflare читает его сотнями обращений в
-  // начале второй стадии — правила, селекторы, cssText. Формы интерфейсов и
-  // сериализация сняты с Chrome 148.
+  // Real stylesheets: Cloudflare's collector reads `document.styleSheets`
+  // hundreds of times early in stage two (rules, selectors, cssText).
+  // Interface shapes and serialization from Chrome 148.
   //
-  // Значения приводятся так же, как приводит браузер там, где это видно
-  // невооружённым глазом: `0` в свойстве длины становится `0px`, комбинаторы
-  // селектора разделяются пробелами, после двоеточия в условии @media — пробел.
+  // Values are normalised where Chrome visibly does: `0` in a length property
+  // becomes `0px`, selector combinators get spaces, a space follows the colon
+  // in an @media condition.
   const CSS_LENGTH_PROPS = new Set([
     'width', 'height', 'min-width', 'min-height', 'max-width', 'max-height',
     'top', 'right', 'bottom', 'left', 'margin', 'margin-top', 'margin-right',
@@ -2833,9 +2750,9 @@
     'outline-width', 'column-gap', 'row-gap', 'gap', 'inset', 'border-spacing',
     'border', 'outline',
   ]);
-  // Цвет в браузере не остаётся тем, чем его написали: `#f2f2f2` в cssText
-  // возвращается как `rgb(242, 242, 242)`. Сверено с Chrome на таблице стилей
-  // виджета Cloudflare — из 183 правил 73 расходились только этим.
+  // Colours are not kept as written: `#f2f2f2` in cssText comes back as
+  // `rgb(242, 242, 242)`. Checked against the Cloudflare widget stylesheet
+  // (73 of 183 rules differed only by this).
   const __cssHex = (v) => v.replace(/#([0-9a-fA-F]{3,8})\b/g, (m, h) => {
     const wide = h.length > 4;
     if (h.length !== 3 && h.length !== 4 && h.length !== 6 && h.length !== 8) return m;
@@ -2848,14 +2765,13 @@
     }
     return 'rgb(' + r + ', ' + g + ', ' + b + ')';
   });
-  // `.9` браузер печатает как `0.9`, и внутри функций тоже:
-  // `cubic-bezier(.55, .085, …)` → `cubic-bezier(0.55, 0.085, …)`.
+  // `.9` prints as `0.9`, inside functions too:
+  // `cubic-bezier(.55, .085, …)` -> `cubic-bezier(0.55, 0.085, …)`.
   const __cssZero = (v) => v.replace(/(^|[\s(,])(-?)\.(\d)/g, '$1$20.$3');
 
-  // Сокращённая запись `animation` разбирается на восемь составляющих и
-  // печатается всегда полностью, в порядке спецификации, с подставленными
-  // начальными значениями: `spin 5s linear infinite` →
-  // `5s linear 0s infinite normal none running spin`.
+  // The `animation` shorthand is split into eight parts and always printed in
+  // full, in spec order, with initial values filled in:
+  // `spin 5s linear infinite` -> `5s linear 0s infinite normal none running spin`.
   const ANIM_TIMING = new Set(['ease', 'linear', 'ease-in', 'ease-out', 'ease-in-out',
                                'step-start', 'step-end']);
   const ANIM_DIR = new Set(['normal', 'reverse', 'alternate', 'alternate-reverse']);
@@ -2874,7 +2790,7 @@
     return out;
   };
   const __cssAnimation = (v) => v.split(',').map((part) => {
-    // Запятые внутри `cubic-bezier(…)` не делят список — склеиваем обратно.
+    // Commas inside `cubic-bezier(…)` do not split the list; rejoin.
     return part;
   }).reduce((acc, part) => {
     const prev = acc[acc.length - 1];
@@ -2896,16 +2812,15 @@
       if (state === null && ANIM_STATE.has(low)) { state = low; continue; }
       if (name === null) name = tok;
     }
-    // Начальная длительность у браузера — `auto`, а не ноль секунд:
-    // `animation: none` он печатает как `auto ease 0s 1 normal none running none`.
+    // The initial duration is `auto`, not 0s: `animation: none` prints as
+    // `auto ease 0s 1 normal none running none`.
     return [dur || 'auto', timing || 'ease', delay || '0s', count || '1',
             dir || 'normal', fill || 'none', state || 'running', name || 'none'].join(' ');
   }).join(', ');
 
-  // Как браузер печатает тень: сперва цвет, потом четыре длины с единицами,
-  // и `inset` в конце. Автор пишет как придётся, а в CSSOM выходит всегда так.
-  // Разбить список по запятым верхнего уровня: запятые внутри `rgb(…)` не
-  // делят его.
+  // Shadow serialization: colour first, then four lengths with units, `inset`
+  // last, however the author wrote it.
+  // Split a list on top-level commas (commas inside `rgb(…)` do not split).
   const __cssCommaParts = (v) => {
     const out = [];
     let depth = 0, cur = '';
@@ -2929,10 +2844,9 @@
       colour = t;
     }
     if (!lens.length) return one.trim();
-    // Число длин — как у автора: `1px 2px` браузер не дополняет размытием.
-    // Слово браузер оставляет словом: `red` в правиле так и печатается, а вот
-    // запись функцией приводится к своему виду — `rgba(0,0,0,.1)` становится
-    // `rgba(0, 0, 0, 0.1)`.
+    // Length count as written: `1px 2px` gets no blur added. A colour keyword
+    // stays a keyword (`red`), but function notation is normalised:
+    // `rgba(0,0,0,.1)` becomes `rgba(0, 0, 0, 0.1)`.
     const norm = colour && /^(rgba?|hsla?|hwb|color|lab|lch|oklab|oklch)\(/i.test(colour)
       && globalThis.__pt_cssColour ? globalThis.__pt_cssColour(colour) : colour;
     const out = [norm || colour || 'currentcolor', ...lens];
@@ -2940,7 +2854,7 @@
     return out.join(' ');
   }).join(', ');
 
-  // Обводка: цвет, начертание, толщина — в этом порядке.
+  // Outline: colour, style, width, in that order.
   const __cssOutline = (v) => {
     const parts = __ptCssParts(v.trim());
     let colour = null, style = null, width = null;
@@ -2954,8 +2868,8 @@
     return [colour || 'currentcolor', style || 'none', width || 'medium'].join(' ');
   };
 
-  // Нули внутри преобразования получают единицы: `rotate(0)` браузер печатает
-  // как `rotate(0deg)`, `translateY(0)` — как `translateY(0px)`.
+  // Zeros inside transforms get units: `rotate(0)` prints as `rotate(0deg)`,
+  // `translateY(0)` as `translateY(0px)`.
   const __cssTransform = (v) => v.replace(/([a-zA-Z]+)\(([^()]*)\)/g, (m, fn, args) => {
     const low = fn.toLowerCase();
     const unit = /^(rotate|rotatex|rotatey|rotatez|rotate3d|skew|skewx|skewy)$/.test(low) ? 'deg'
@@ -2965,7 +2879,7 @@
     const out = args.split(',').map((a, i) => {
       const t = a.trim();
       if (!/^-?\d+(?:\.\d+)?$/.test(t)) return t;
-      // У `rotate3d` первые три числа — ось, без единиц.
+      // The first three numbers of `rotate3d` are the axis, unitless.
       if (low === 'rotate3d' && i < 3) return t;
       if (low === 'translate3d' && i === 2) return t + 'px';
       return t + unit;
@@ -2973,8 +2887,8 @@
     return fn + '(' + out.join(', ') + ')';
   });
 
-  /// Список семейств так, как его печатает браузер: имя с пробелами берётся
-  /// в двойные кавычки, одинарные переводятся в двойные, остальное как есть.
+  /// Family list as Chrome prints it: names with spaces in double quotes,
+  /// single quotes turned to double, the rest as is.
   const __cssFamilies = (v) => __cssCommaParts(v).map((one) => {
     const t = one.trim();
     if (!t) return t;
@@ -2986,23 +2900,21 @@
     return /\s/.test(t) ? '"' + t + '"' : t;
   }).join(', ');
 
-  // Имя свойства: встроенные — без регистра, собственные (`--*`) — с ним.
-  // Мы приводили к строчным и те и другие, и `var(--Wide)` на chess.com не
-  // находил объявленного `--Wide`: вся раскладка формы входа съезжала.
+  // Property names: built-ins are case-insensitive, custom ones (`--*`) are
+  // not (`var(--Wide)` must find `--Wide`).
   const __cssKey = (p) => {
     const s = String(p).trim();
     return s.charCodeAt(0) === 45 && s.charCodeAt(1) === 45 ? s : s.toLowerCase();
   };
-  // Числа в значениях браузер печатает шестью значащими цифрами:
-  // `scale(1.000998)` становится `scale(1.001)`, `138.828125px` — `138.828px`.
-  // Строки в кавычках и адреса не трогаются, как и знаки внутри слов
-  // (`translate3d`, `#ff8800`).
+  // Numbers in values print with six significant digits: `scale(1.000998)`
+  // becomes `scale(1.001)`, `138.828125px` becomes `138.828px`. Quoted strings,
+  // URLs and digits inside words (`translate3d`, `#ff8800`) are untouched.
   const __cssNum1 = (t) => {
     const n = Number(t);
     if (!isFinite(n)) return t;
     return String(Number(n.toPrecision(6)));
   };
-  // Преобразование как матрица: `scale(1.000998)` → [a, b, c, d, e, f].
+  // Transform as a matrix: `scale(1.000998)` -> [a, b, c, d, e, f].
   const __parseTransform = (str) => {
     const src = String(str || '').trim();
     if (!src || src === 'none') return null;
@@ -3047,27 +2959,27 @@
     try { return __cssNumbers(r); } catch (e) { return r; }
   };
   const __cssValueRaw = (prop, value) => {
-    // Значение собственного свойства браузер хранит как написано.
+    // Custom property values are stored as written.
     if (prop.charCodeAt(0) === 45 && prop.charCodeAt(1) === 45) return String(value).trim();
     let v = __cssZero(__cssHex(String(value).trim().replace(/\s+/g, ' ')));
     if (prop === 'animation') return __cssAnimation(v);
     if (prop === 'box-shadow' || prop === 'text-shadow') return __cssShadow(v);
     if (prop === 'outline') return __cssOutline(v);
     if (prop === 'transform') return __cssTransform(v);
-    // Косая черта в сетке печатается с пробелами по бокам.
+    // A slash in grid shorthands prints with spaces around it.
     if (prop === 'grid-area' || prop === 'grid-row' || prop === 'grid-column') {
       return v.replace(/\s*\/\s*/g, ' / ');
     }
-    // Одно слово в точке преобразования браузер дополняет вторым.
+    // A single-keyword transform-origin gets a second value.
     if (prop === 'transform-origin' && /^[a-z%\d.-]+$/i.test(v) && !/\s/.test(v)) {
       return v + ' center';
     }
-    // Список через запятую печатается с пробелом после запятой.
+    // A comma list prints with a space after each comma.
     if (prop === 'stroke-dasharray') return v.replace(/\s*,\s*/g, ', ');
-    // Начальное значение `transition-property` браузер не печатает.
+    // The initial `transition-property` is not printed.
     if (prop === 'transition') return v.replace(/^all\s+/i, '');
-    // Фон печатается в своём порядке: сперва картинка, цвет последним, а
-    // голый адрес берётся в кавычки.
+    // Background prints in its own order: image first, colour last; a bare
+    // URL gets quoted.
     if (prop === 'background') {
       const parts = __ptCssParts(v);
       const image = [], rest = [];
@@ -3082,8 +2994,8 @@
       if (!image.length && !colour) return v;
       return [...image, ...rest, ...(colour ? [colour] : [])].join(' ');
     }
-    // В сокращении шрифта косая черта отделяется пробелами, а список
-    // семейств печатается по тем же правилам, что и отдельное свойство.
+    // In the font shorthand the slash gets spaces, and the family list follows
+    // the same rules as the longhand.
     if (prop === 'font') {
       const spaced = v.replace(/\s*\/\s*/g, ' / ');
       const at = spaced.search(/(?:^|\s)(?:[\d.]+[a-z%]*|smaller|larger|x?x-(?:small|large)|small|medium|large)(?:\s*\/\s*\S+)?\s+/);
@@ -3092,15 +3004,15 @@
       const head = spaced.slice(0, m.index + m[0].length);
       return head + __cssFamilies(spaced.slice(m.index + m[0].length));
     }
-    // Список семейств: пробел после запятой, а имя из нескольких слов — в
-    // двойных кавычках, как печатает браузер. Одинарные он переводит в двойные.
+    // Family list: space after commas, multi-word names in double quotes
+    // (single quotes become double).
     if (prop === 'font-family') return __cssFamilies(v);
-    // Составляющие сокращённой записи, равные начальному значению, браузер не
-    // печатает: `flex-flow: column nowrap` возвращается как `column`.
+    // Shorthand parts equal to their initial value are not printed:
+    // `flex-flow: column nowrap` comes back as `column`.
     if (prop === 'flex-flow') v = v.replace(/\s+nowrap$/, '');
     if (!CSS_LENGTH_PROPS.has(prop)) return v;
-    // Только на верхнем уровне: голый ноль в `border: 0` — это длина, а тройка
-    // внутри `rgb(178, 15, 3)` — нет, и приписанный ей `px` ломает цвет.
+    // Top level only: a bare 0 in `border: 0` is a length, but the 3 in
+    // `rgb(178, 15, 3)` is not, and adding `px` breaks the colour.
     let depth = 0, out = '', tok = '';
     const flush = () => {
       if (tok && depth === 0 && /^-?\d+(?:\.\d+)?$/.test(tok)) out += tok + 'px';
@@ -3122,12 +3034,11 @@
     .replace(/\s*,\s*/g, ', ');
   const __cssPrelude = (p) => String(p).trim().replace(/\s+/g, ' ').replace(/:\s*/g, ': ');
 
-  // Разбор: пролог до `{` или `;`, затем тело со счётом вложенности. Строки и
-  // комментарии не считаются — иначе `content: "}"` рвёт правило пополам.
-  // Экранирована ли кавычка: считать надо идущие подряд обратные косые, а не
-  // одну. `content:"\\"` — это строка из одной косой, и кавычка после неё
-  // закрывающая; мы считали её экранированной и теряли весь остаток файла
-  // (на chess.com — семьсот шестьдесят правил из тысячи).
+  // Parsing: prelude up to `{` or `;`, then the body with nesting depth.
+  // Strings and comments are skipped, or `content: "}"` splits the rule.
+  // Whether a quote is escaped: count consecutive backslashes, not one.
+  // `content:"\\"` is a one-backslash string and the quote after it closes it
+  // (getting this wrong lost 760 of ~1000 chess.com rules).
   const __cssEscaped = (text, i) => {
     let n = 0;
     while (i - 1 - n >= 0 && text[i - 1 - n] === '\\') n++;
@@ -3156,7 +3067,7 @@
       const prelude = text.slice(start, i).trim();
       if (i >= n) { if (prelude) out.push({ prelude, statement: true }); break; }
       if (text[i] === ';') { i++; if (prelude) out.push({ prelude, statement: true }); continue; }
-      i++;                                    // за '{'
+      i++;                                    // past '{'
       const bodyStart = i;
       let d = 1;
       q = null;
@@ -3195,8 +3106,8 @@
       const colon = decl.indexOf(':');
       if (colon <= 0) continue;
       const prop = __cssKey(decl.slice(0, colon));
-      // Написанное дважды встаёт на второе место, а не остаётся на первом:
-      // браузер при перезаписи убирает свойство и дописывает в конец.
+      // A property written twice moves to the later position: Chrome removes
+      // and re-appends on overwrite.
       if (prop) {
         map.delete(prop);
         map.set(prop, __cssValue(prop, decl.slice(colon + 1)));
@@ -3205,33 +3116,27 @@
     return map;
   }
 
-  // Блок объявлений правила: тот же интерфейс, что у `el.style`, но за ним
-  // стоит карта правила, а не атрибут элемента.
-  // Имена свойств CSS, как их держит Chrome 148 у каждого объявления стиля:
-  // собственными свойствами объекта и в этом порядке. Их перечисляет любой
-  // сборщик отпечатка — по ним видно и движок, и его версию.
-  // Имена -epub-* Chrome убрал: их перечисление у нас давало девять лишних
-  // свойств у вычисленного стиля, а челлендж перебирает его целиком.
+  // A rule's declaration block: the same interface as `el.style`, backed by
+  // the rule's map instead of an element attribute.
+  // CSS property names as Chrome 148 has them on every style declaration: own
+  // properties, in this order. Every fingerprinter enumerates them; they
+  // reveal the engine and version. Chrome dropped the -epub-* names; the
+  // challenge enumerates computed style whole.
   const CSS_PROPS = ["accentColor","additiveSymbols","alignContent","alignItems","alignSelf","alignmentBaseline","all","anchorName","anchorScope","animation","animationComposition","animationDelay","animationDirection","animationDuration","animationFillMode","animationIterationCount","animationName","animationPlayState","animationRange","animationRangeEnd","animationRangeStart","animationTimeline","animationTimingFunction","animationTrigger","appRegion","appearance","ascentOverride","aspectRatio","backdropFilter","backfaceVisibility","background","backgroundAttachment","backgroundBlendMode","backgroundClip","backgroundColor","backgroundImage","backgroundOrigin","backgroundPosition","backgroundPositionX","backgroundPositionY","backgroundRepeat","backgroundSize","basePalette","baselineShift","baselineSource","blockSize","border","borderBlock","borderBlockColor","borderBlockEnd","borderBlockEndColor","borderBlockEndStyle","borderBlockEndWidth","borderBlockStart","borderBlockStartColor","borderBlockStartStyle","borderBlockStartWidth","borderBlockStyle","borderBlockWidth","borderBottom","borderBottomColor","borderBottomLeftRadius","borderBottomRightRadius","borderBottomStyle","borderBottomWidth","borderCollapse","borderColor","borderEndEndRadius","borderEndStartRadius","borderImage","borderImageOutset","borderImageRepeat","borderImageSlice","borderImageSource","borderImageWidth","borderInline","borderInlineColor","borderInlineEnd","borderInlineEndColor","borderInlineEndStyle","borderInlineEndWidth","borderInlineStart","borderInlineStartColor","borderInlineStartStyle","borderInlineStartWidth","borderInlineStyle","borderInlineWidth","borderLeft","borderLeftColor","borderLeftStyle","borderLeftWidth","borderRadius","borderRight","borderRightColor","borderRightStyle","borderRightWidth","borderShape","borderSpacing","borderStartEndRadius","borderStartStartRadius","borderStyle","borderTop","borderTopColor","borderTopLeftRadius","borderTopRightRadius","borderTopStyle","borderTopWidth","borderWidth","bottom","boxDecorationBreak","boxShadow","boxSizing","breakAfter","breakBefore","breakInside","bufferedRendering","captionSide","caretAnimation","caretColor","caretShape","clear","clip","clipPath","clipRule","color","colorInterpolation","colorInterpolationFilters","colorRendering","colorScheme","columnCount","columnFill","columnGap","columnHeight","columnRule","columnRuleBreak","columnRuleColor","columnRuleInset","columnRuleInsetCap","columnRuleInsetCapEnd","columnRuleInsetCapStart","columnRuleInsetEnd","columnRuleInsetJunction","columnRuleInsetJunctionEnd","columnRuleInsetJunctionStart","columnRuleInsetStart","columnRuleStyle","columnRuleVisibilityItems","columnRuleWidth","columnSpan","columnWidth","columnWrap","columns","contain","containIntrinsicBlockSize","containIntrinsicHeight","containIntrinsicInlineSize","containIntrinsicSize","containIntrinsicWidth","container","containerName","containerType","content","contentVisibility","cornerBlockEndShape","cornerBlockStartShape","cornerBottomLeftShape","cornerBottomRightShape","cornerBottomShape","cornerEndEndShape","cornerEndStartShape","cornerInlineEndShape","cornerInlineStartShape","cornerLeftShape","cornerRightShape","cornerShape","cornerStartEndShape","cornerStartStartShape","cornerTopLeftShape","cornerTopRightShape","cornerTopShape","counterIncrement","counterReset","counterSet","cursor","cx","cy","d","descentOverride","direction","display","dominantBaseline","dynamicRangeLimit","emptyCells","fallback","fieldSizing","fill","fillOpacity","fillRule","filter","flex","flexBasis","flexDirection","flexFlow","flexGrow","flexLineCount","flexShrink","flexWrap","float","floodColor","floodOpacity","font","fontDisplay","fontFamily","fontFeatureSettings","fontKerning","fontLanguageOverride","fontOpticalSizing","fontPalette","fontSize","fontSizeAdjust","fontStretch","fontStyle","fontSynthesis","fontSynthesisSmallCaps","fontSynthesisStyle","fontSynthesisWeight","fontVariant","fontVariantAlternates","fontVariantCaps","fontVariantEastAsian","fontVariantEmoji","fontVariantLigatures","fontVariantNumeric","fontVariantPosition","fontVariationSettings","fontWeight","forcedColorAdjust","gap","grid","gridArea","gridAutoColumns","gridAutoFlow","gridAutoRows","gridColumn","gridColumnEnd","gridColumnGap","gridColumnStart","gridGap","gridRow","gridRowEnd","gridRowGap","gridRowStart","gridTemplate","gridTemplateAreas","gridTemplateColumns","gridTemplateRows","height","hyphenateCharacter","hyphenateLimitChars","hyphens","imageOrientation","imageRendering","inherits","initialLetter","initialValue","inlineSize","inset","insetBlock","insetBlockEnd","insetBlockStart","insetInline","insetInlineEnd","insetInlineStart","interactivity","interestDelay","interestDelayEnd","interestDelayStart","interpolateSize","isolation","justifyContent","justifyItems","justifySelf","left","letterSpacing","lightingColor","lineBreak","lineGapOverride","lineHeight","listStyle","listStyleImage","listStylePosition","listStyleType","margin","marginBlock","marginBlockEnd","marginBlockStart","marginBottom","marginInline","marginInlineEnd","marginInlineStart","marginLeft","marginRight","marginTop","marker","markerEnd","markerMid","markerStart","mask","maskClip","maskComposite","maskImage","maskMode","maskOrigin","maskPosition","maskRepeat","maskSize","maskType","mathDepth","mathShift","mathStyle","maxBlockSize","maxHeight","maxInlineSize","maxWidth","minBlockSize","minHeight","minInlineSize","minWidth","mixBlendMode","navigation","negative","objectFit","objectPosition","objectViewBox","offset","offsetAnchor","offsetDistance","offsetPath","offsetPosition","offsetRotate","opacity","order","orphans","outline","outlineColor","outlineOffset","outlineStyle","outlineWidth","overflow","overflowAnchor","overflowBlock","overflowClipMargin","overflowInline","overflowWrap","overflowX","overflowY","overlay","overrideColors","overscrollBehavior","overscrollBehaviorBlock","overscrollBehaviorInline","overscrollBehaviorX","overscrollBehaviorY","pad","padding","paddingBlock","paddingBlockEnd","paddingBlockStart","paddingBottom","paddingInline","paddingInlineEnd","paddingInlineStart","paddingLeft","paddingRight","paddingTop","page","pageBreakAfter","pageBreakBefore","pageBreakInside","pageMarginSafety","pageOrientation","paintOrder","perspective","perspectiveOrigin","placeContent","placeItems","placeSelf","pointerEvents","position","positionAnchor","positionArea","positionTry","positionTryFallbacks","positionTryOrder","positionVisibility","prefix","printColorAdjust","quotes","r","range","readingFlow","readingOrder","resize","result","right","rotate","rowGap","rowRule","rowRuleBreak","rowRuleColor","rowRuleInset","rowRuleInsetCap","rowRuleInsetCapEnd","rowRuleInsetCapStart","rowRuleInsetEnd","rowRuleInsetJunction","rowRuleInsetJunctionEnd","rowRuleInsetJunctionStart","rowRuleInsetStart","rowRuleStyle","rowRuleVisibilityItems","rowRuleWidth","rubyAlign","rubyOverhang","rubyPosition","rule","ruleBreak","ruleColor","ruleInset","ruleInsetCap","ruleInsetEnd","ruleInsetJunction","ruleInsetStart","ruleOverlap","ruleStyle","ruleVisibilityItems","ruleWidth","rx","ry","scale","scrollBehavior","scrollInitialTarget","scrollMargin","scrollMarginBlock","scrollMarginBlockEnd","scrollMarginBlockStart","scrollMarginBottom","scrollMarginInline","scrollMarginInlineEnd","scrollMarginInlineStart","scrollMarginLeft","scrollMarginRight","scrollMarginTop","scrollMarkerGroup","scrollPadding","scrollPaddingBlock","scrollPaddingBlockEnd","scrollPaddingBlockStart","scrollPaddingBottom","scrollPaddingInline","scrollPaddingInlineEnd","scrollPaddingInlineStart","scrollPaddingLeft","scrollPaddingRight","scrollPaddingTop","scrollSnapAlign","scrollSnapStop","scrollSnapType","scrollTargetGroup","scrollTimeline","scrollTimelineAxis","scrollTimelineName","scrollbarColor","scrollbarGutter","scrollbarWidth","shapeImageThreshold","shapeMargin","shapeOutside","shapeRendering","size","sizeAdjust","speak","speakAs","src","stopColor","stopOpacity","stroke","strokeDasharray","strokeDashoffset","strokeLinecap","strokeLinejoin","strokeMiterlimit","strokeOpacity","strokeWidth","suffix","symbols","syntax","system","tabSize","tableLayout","textAlign","textAlignLast","textAnchor","textAutospace","textBox","textBoxEdge","textBoxTrim","textCombineUpright","textDecoration","textDecorationColor","textDecorationLine","textDecorationSkipInk","textDecorationStyle","textDecorationThickness","textEmphasis","textEmphasisColor","textEmphasisPosition","textEmphasisStyle","textFit","textIndent","textJustify","textOrientation","textOverflow","textRendering","textShadow","textSizeAdjust","textSpacingTrim","textTransform","textUnderlineOffset","textUnderlinePosition","textWrap","textWrapMode","textWrapStyle","timelineScope","timelineTrigger","timelineTriggerActivationRange","timelineTriggerActivationRangeEnd","timelineTriggerActivationRangeStart","timelineTriggerActiveRange","timelineTriggerActiveRangeEnd","timelineTriggerActiveRangeStart","timelineTriggerName","timelineTriggerSource","top","touchAction","transform","transformBox","transformOrigin","transformStyle","transition","transitionBehavior","transitionDelay","transitionDuration","transitionProperty","transitionTimingFunction","translate","triggerScope","types","unicodeBidi","unicodeRange","userSelect","vectorEffect","verticalAlign","viewTimeline","viewTimelineAxis","viewTimelineInset","viewTimelineName","viewTransitionClass","viewTransitionGroup","viewTransitionName","viewTransitionScope","visibility","webkitAlignContent","webkitAlignItems","webkitAlignSelf","webkitAnimation","webkitAnimationDelay","webkitAnimationDirection","webkitAnimationDuration","webkitAnimationFillMode","webkitAnimationIterationCount","webkitAnimationName","webkitAnimationPlayState","webkitAnimationTimingFunction","webkitAppRegion","webkitAppearance","webkitBackfaceVisibility","webkitBackgroundClip","webkitBackgroundOrigin","webkitBackgroundSize","webkitBorderAfter","webkitBorderAfterColor","webkitBorderAfterStyle","webkitBorderAfterWidth","webkitBorderBefore","webkitBorderBeforeColor","webkitBorderBeforeStyle","webkitBorderBeforeWidth","webkitBorderBottomLeftRadius","webkitBorderBottomRightRadius","webkitBorderEnd","webkitBorderEndColor","webkitBorderEndStyle","webkitBorderEndWidth","webkitBorderHorizontalSpacing","webkitBorderImage","webkitBorderRadius","webkitBorderStart","webkitBorderStartColor","webkitBorderStartStyle","webkitBorderStartWidth","webkitBorderTopLeftRadius","webkitBorderTopRightRadius","webkitBorderVerticalSpacing","webkitBoxAlign","webkitBoxDecorationBreak","webkitBoxDirection","webkitBoxFlex","webkitBoxOrdinalGroup","webkitBoxOrient","webkitBoxPack","webkitBoxReflect","webkitBoxShadow","webkitBoxSizing","webkitClipPath","webkitColumnBreakAfter","webkitColumnBreakBefore","webkitColumnBreakInside","webkitColumnCount","webkitColumnGap","webkitColumnRule","webkitColumnRuleColor","webkitColumnRuleStyle","webkitColumnRuleWidth","webkitColumnSpan","webkitColumnWidth","webkitColumns","webkitFilter","webkitFlex","webkitFlexBasis","webkitFlexDirection","webkitFlexFlow","webkitFlexGrow","webkitFlexShrink","webkitFlexWrap","webkitFontFeatureSettings","webkitFontSmoothing","webkitHyphenateCharacter","webkitJustifyContent","webkitLineBreak","webkitLineClamp","webkitLocale","webkitLogicalHeight","webkitLogicalWidth","webkitMarginAfter","webkitMarginBefore","webkitMarginEnd","webkitMarginStart","webkitMask","webkitMaskBoxImage","webkitMaskBoxImageOutset","webkitMaskBoxImageRepeat","webkitMaskBoxImageSlice","webkitMaskBoxImageSource","webkitMaskBoxImageWidth","webkitMaskClip","webkitMaskComposite","webkitMaskImage","webkitMaskOrigin","webkitMaskPosition","webkitMaskPositionX","webkitMaskPositionY","webkitMaskRepeat","webkitMaskSize","webkitMaxLogicalHeight","webkitMaxLogicalWidth","webkitMinLogicalHeight","webkitMinLogicalWidth","webkitOpacity","webkitOrder","webkitPaddingAfter","webkitPaddingBefore","webkitPaddingEnd","webkitPaddingStart","webkitPerspective","webkitPerspectiveOrigin","webkitPerspectiveOriginX","webkitPerspectiveOriginY","webkitPrintColorAdjust","webkitRtlOrdering","webkitRubyPosition","webkitShapeImageThreshold","webkitShapeMargin","webkitShapeOutside","webkitTapHighlightColor","webkitTextCombine","webkitTextDecorationsInEffect","webkitTextEmphasis","webkitTextEmphasisColor","webkitTextEmphasisPosition","webkitTextEmphasisStyle","webkitTextFillColor","webkitTextOrientation","webkitTextSecurity","webkitTextSizeAdjust","webkitTextStroke","webkitTextStrokeColor","webkitTextStrokeWidth","webkitTransform","webkitTransformOrigin","webkitTransformOriginX","webkitTransformOriginY","webkitTransformOriginZ","webkitTransformStyle","webkitTransition","webkitTransitionDelay","webkitTransitionDuration","webkitTransitionProperty","webkitTransitionTimingFunction","webkitUserDrag","webkitUserModify","webkitUserSelect","webkitWritingMode","whiteSpace","whiteSpaceCollapse","widows","width","willChange","wordBreak","wordSpacing","wordWrap","writingMode","x","y","zIndex","zoom"];
 
   const __cssMaps = new WeakMap();
-  // Объявление → его карта как написано: сокращения — сокращениями. Каскаду
-  // она нужна, чтобы `padding: var(--p)` раскладывался после подстановки,
-  // а не до неё.
+  // Declaration -> its map as written (shorthands kept). The cascade needs it
+  // so `padding: var(--p)` is expanded after substitution, not before.
   const __declRaw = new WeakMap();
-  // Методы и `length` живут на прототипе, а собственными свойствами объявления
-  // идут имена свойств CSS — все семьсот три, в порядке браузера. У нас было
-  // наоборот: методы собственными, имён не было вовсе, и перечисление стиля
-  // выглядело как что угодно, только не как браузер.
-  // Построитель у объявления один — `__inlineStyleProto`. Раньше их было два,
-  // и прототип у правила, атрибута и вычисленного стиля общий: чей построитель
-  // успевал позже, того и члены, а половина работы первого пропадала. Отсюда
-  // и брались нулевая длина у правила, и `item` с именами не из того набора.
+  // Methods and `length` live on the prototype; own properties are the CSS
+  // property names, all 703, in Chrome's order. There is one builder,
+  // `__inlineStyleProto`: rule, attribute and computed style share a
+  // prototype, and two builders overwrote each other's members.
   const __shapeStyleProto = () => __inlineStyleProto();
 
-  // Во что браузер разворачивает сокращённые записи. `style.length` считает
-  // длинные свойства, а не написанные: у `border: none` их семнадцать, у
-  // `font` — девятнадцать. Снято с Chrome 151 перечислением самого объявления.
+  // What shorthands expand to. `style.length` counts longhands, not written
+  // names: `border: none` has 17, `font` 19. From Chrome 151 by enumerating the
+  // declaration.
   const CSS_LONGHANDS = {
     'margin': ['margin-top','margin-right','margin-bottom','margin-left'],
     'padding': ['padding-top','padding-right','padding-bottom','padding-left'],
@@ -3261,11 +3166,10 @@
     'mask': ['mask-image','-webkit-mask-position-x','-webkit-mask-position-y','mask-size','mask-repeat','mask-origin','mask-clip','mask-composite','mask-mode'],
     'columns': ['column-width','column-count','column-height','column-wrap'],
   };
-  // Сокращение браузер собирает обратно, когда может, — но `border`, у которого
-  // все составляющие остались начальными, он собрать не может: отличить
-  // «задано начальным» от «не задано» нечем, и он печатает длинные. Проверено
-  // на одиннадцати значениях: разворачиваются ровно `none` и
-  // `medium none currentcolor`, а `0`, `solid`, `red`, `1px solid red` — нет.
+  // Chrome reassembles shorthands when it can, but not a `border` whose parts
+  // are all initial: it cannot tell "set to initial" from "unset" and prints
+  // longhands. Checked on eleven values: exactly `none` and
+  // `medium none currentcolor` expand; `0`, `solid`, `red`, `1px solid red` do not.
   const BORDER_INITIAL = { width: 'medium', style: 'none', color: 'currentcolor' };
   const __borderParts = (v) => {
     const out = { width: null, style: null, color: null };
@@ -3283,10 +3187,10 @@
         && (p.style || BORDER_INITIAL.style) === BORDER_INITIAL.style
         && (p.color || BORDER_INITIAL.color) === BORDER_INITIAL.color;
   };
-  /// Пары «имя: значение» на печать: то же, что в объявлении, но с раскрытым
-  /// `border`, если раскрыть его пришлось.
-  // Четыре стороны, свёрнутые как у браузера: одно значение, если все равны,
-  // два — если совпадают противоположные, и так далее.
+  /// Name/value pairs for printing: as in the declaration, with `border`
+  /// expanded if it had to be.
+  // Four sides collapsed as Chrome does: one value if all equal, two if
+  // opposites match, and so on.
   const __cssFour = (t, r, b, l) => {
     if (t === r && r === b && b === l) return t;
     if (t === b && r === l) return t + ' ' + r;
@@ -3294,7 +3198,7 @@
     return t + ' ' + r + ' ' + b + ' ' + l;
   };
 
-  // Семейства, которые браузер собирает обратно из длинных имён.
+  // Families Chrome reassembles from longhands.
   const __CSS_BOX_FAMILIES = [
     ['margin', ['margin-top', 'margin-right', 'margin-bottom', 'margin-left']],
     ['padding', ['padding-top', 'padding-right', 'padding-bottom', 'padding-left']],
@@ -3303,21 +3207,20 @@
     ['border-color', ['border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color']],
   ];
 
-  /// Объявления так, как их печатает браузер. Он держит длинные свойства, а
-  /// сокращение собирает при печати — поэтому `padding: 1px` с отдельным
-  /// `padding-left: 9px` выходит одной записью `padding: 1px 1px 1px 9px`, а
-  /// `border` с перебитой стороной распадается на составляющие. Мы печатали
-  /// написанное автором, и правило расходилось с браузерным.
-  // Набор имён с `!important` живёт при карте объявления: карта строится
-  // заново при каждой правке атрибута, и набор вместе с ней.
+  /// Declarations as Chrome serializes them: it stores longhands and rebuilds
+  /// shorthands on output, so `padding: 1px` plus `padding-left: 9px` prints
+  /// as `padding: 1px 1px 1px 9px`, and a `border` with one side overridden
+  /// splits into its parts.
+  // The `!important` name set lives with the declaration map, which is rebuilt
+  // on every attribute change.
   const __cssImp = (m) => {
     if (!m.__ptImp) { try { Object.defineProperty(m, '__ptImp', { value: new Set(), enumerable: false, configurable: true }); } catch (e) { return new Set(); } }
     return m.__ptImp;
   };
   const __cssImportantIn = (v) => typeof v === 'string' && /!\s*important\s*$/i.test(v);
-  // Точное значение — рядом с напечатанным: браузер хранит число как разобрал,
-  // а шестью знаками только печатает. Раскладка и масштаб текста считают по
-  // точному; страница читает напечатанное.
+  // The exact value is kept next to the printed one: Chrome stores the parsed
+  // number and only prints six digits. Layout and text scaling use the exact
+  // value; the page reads the printed one.
   const __cssPrecise = (m) => {
     if (!m.__ptPrecise) { try { Object.defineProperty(m, '__ptPrecise', { value: new Map(), enumerable: false, configurable: true }); } catch (e) { return new Map(); } }
     return m.__ptPrecise;
@@ -3343,11 +3246,9 @@
     return __styleEntries(m).map(([k, v]) => `${k}: ${v}${important(k) ? ' !important' : ''};`).join(' ');
   };
   const __styleEntries = (m) => {
-    // Какие длинные имена написаны отдельно: только из-за них сокращение
-    // разбирают.
-    // Что написано отдельно — с учётом того, что и само написанное бывает
-    // сокращением: `border` разбирают и тогда, когда рядом стоит
-    // `border-width`, а не только `border-top-width`.
+    // Which longhands are written separately (the only reason to split a
+    // shorthand), counting written shorthands too: `border` is split when
+    // `border-width` is present, not only `border-top-width`.
     const written = new Set();
     for (const k of m.keys()) {
       written.add(k);
@@ -3369,7 +3270,7 @@
       const list = CSS_LONGHANDS[k];
       const overridden = list && list.some((n) => {
         if (!written.has(n)) return false;
-        // Своё собственное разложение переписью не считается.
+        // Its own expansion does not count.
         return ![...m.keys()].every((other) => other === k
           || !(other === n || (CSS_LONGHANDS[other] || []).includes(n)));
       });
@@ -3382,7 +3283,7 @@
       put(k, v);
     }
     let live = order.filter(Boolean);
-    // Собрать обратно: сокращение встаёт на место первой своей части.
+    // Reassemble: the shorthand takes the place of its first part.
     for (const [short, parts] of __CSS_BOX_FAMILIES) {
       const at = parts.map((n) => live.findIndex(([k]) => k === short || k === n));
       if (at.some((i) => i < 0)) continue;
@@ -3396,14 +3297,11 @@
     return live;
   };
 
-  /// Значение длинного свойства, написанного сокращением. Браузер хранит
-  /// разложенное: после `style.border = '1px solid'` он отвечает `1px` на
-  /// `style.borderTopWidth`, а мы держали только саму запись и отвечали
-  /// пустотой — вместе с ней пропадала и рамка из раскладки.
-  // Обратный указатель: в каких сокращениях встречается это длинное
-  // свойство. Без него поиск шёл перебором всей карты — у вычисленного стиля
-  // это четыре с половиной сотни записей на каждое спрошенное имя, и перебор
-  // стиля целиком стоил лишних две с половиной миллисекунды.
+  /// Value of a longhand written via a shorthand: after
+  /// `style.border = '1px solid'`, `style.borderTopWidth` is `1px`.
+  // Reverse index: which shorthands contain this longhand. Without it each
+  // lookup scanned the whole map (~450 entries for computed style), costing
+  // ~2.5 ms per full style enumeration.
   let __SHORTS_OF = null;
   const __shortsOf = (key) => {
     if (!__SHORTS_OF) {
@@ -3428,9 +3326,9 @@
         for (const [k, v] of pairs) if (k === key) return v;
       }
     }
-    // И наоборот: сокращение, собранное из длинных. `border: 1px solid`
-    // отвечает `solid` на `borderStyle`, потому что все четыре стороны
-    // одинаковы; разнобой браузер сокращением не печатает.
+    // And the reverse: a shorthand assembled from longhands. `border: 1px
+    // solid` gives `solid` for `borderStyle` since all four sides match;
+    // mismatched sides are not printed as a shorthand.
     const own = CSS_LONGHANDS[key];
     if (own && !m.has(key)) {
       let same = null;
@@ -3445,8 +3343,8 @@
     return '';
   };
 
-  /// Имена, которые перечисляет объявление: сокращения раскрыты, порядок как у
-  /// браузера — в порядке появления, без повторов.
+  /// Names a declaration enumerates: shorthands expanded, in order of
+  /// appearance, no duplicates, as in Chrome.
   const __styleNames = (m) => {
     const out = [];
     for (const k of m.keys()) for (const n of (CSS_LONGHANDS[k] || [k])) if (!out.includes(n)) out.push(n);
@@ -3457,7 +3355,7 @@
     const dash = (p) => String(p).replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
     const target = Object.create(__shapeStyleProto(__styleProto()));
     __cssMaps.set(target, map);
-    // Имена свойств — собственные, как в браузере, и в его порядке.
+    // Property names are own properties, in Chrome's order.
     for (const name of CSS_PROPS) {
       const key = dash(name).toLowerCase();
       Object.defineProperty(target, name, {
@@ -3518,7 +3416,7 @@
     return m;
   }
 
-  // Правила. Числа типов — те же, что у CSSRule в браузере.
+  // Rules. Type numbers match CSSRule in Chrome.
   const RULE_TYPE = { style: 1, charset: 2, import: 3, media: 4, 'font-face': 5,
                       page: 6, keyframes: 7, keyframe: 8, supports: 12 };
   const __ruleProtos = new Map();
@@ -3535,9 +3433,9 @@
     __ruleProtos.set(name, p);
     return p;
   };
-  // Правило с потомками браузер печатает в несколько строк, по строке на
-  // потомка с отступом в два пробела. `@keyframes` при этом оставляет пробел
-  // после открывающей скобки, а `@media` — нет; так в Chrome, и так здесь.
+  // A rule with children prints on several lines, one per child, indented two
+  // spaces. `@keyframes` keeps a space after the opening brace, `@media` does
+  // not, as in Chrome.
   const __cssGroup = (prelude, kids, pad) => prelude + ' {' + (pad ? ' ' : '') + '\n'
     + kids.map((k) => '  ' + String(k.cssText).replace(/\n/g, '\n  ')).join('\n')
     + '\n}';
@@ -3588,9 +3486,7 @@
                         + __styleEntries(decls).map(([a2, b2]) => a2 + ': ' + b2 + ';').join(' ') + ' }' });
     }
     if (at) {
-      // `@charset` браузер в перечень правил не кладёт вовсе — он читает его и
-      // забывает. У нас он торчал лишней записью в каждой таблице, которая с
-      // него начинается.
+      // Chrome reads `@charset` and drops it; it is not in the rule list.
       if (/^@charset\b/i.test(prelude)) return null;
       const r = common(Object.create(__ruleProto('CSSRule')), RULE_TYPE.charset);
       return own(r, { cssText: prelude + (parsed.statement ? ';' : ' { }') });
@@ -3600,11 +3496,9 @@
     const sel = __cssSelector(prelude);
     const body = __styleEntries(decls).map(([k, v]) => k + ': ' + v + ';').join(' ');
     own(r, { selectorText: sel });
-    // Объявление правила — семьсот свойств на объекте — строится, только
-    // когда его попросят. Строить его на каждое из тысяч правил стоило
-    // восьмисот миллисекунд на таблицу: страница с двумя крупными таблицами
-    // запускала первый скрипт на две секунды позже браузера. Каскаду оно не
-    // нужно — он читает карту объявлений напрямую.
+    // A rule's declaration (~700 properties) is built lazily: building it for
+    // thousands of rules cost ~800 ms per stylesheet. The cascade reads the
+    // declaration map directly.
     Object.defineProperty(r, 'style', {
       get() {
         const d = __cssDeclaration(decls);
@@ -3643,9 +3537,9 @@
     },
     replace(text) { this.replaceSync(text); return Promise.resolve(this); },
   };
-  // Таблица живёт на своём элементе: страницы сравнивают
-  // `document.styleSheets[0] === document.styleSheets[0]`, и правила
-  // пересобираются только когда сменился текст.
+  // A sheet lives on its element: pages compare
+  // `document.styleSheets[0] === document.styleSheets[0]`, and rules are
+  // rebuilt only when the text changes.
   globalThis.__pt_sheetFor = (owner) => __sheetFor(owner);
   function __sheetFor(owner) {
     const proto = __link('CSSStyleSheet', __sheetProto);
@@ -3699,13 +3593,9 @@
   }
   const camel = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
   const dash = (s) => s.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
-  // `el.style` и атрибут `style` — два вида на одно и то же. У нас это были два
-  // независимых хранилища: `setAttribute('style','width:300px')` не доходил до
-  // `el.style.width`, а `el.style.width = …` не доходил до атрибута. Отсюда же
-  // и кадр, который не знал своего размера: раскладка читает одно, страница
-  // пишет другое.
-  // Инлайновый стиль тоже CSSStyleDeclaration: `el.style` в браузере и
-  // `getComputedStyle(el)` — один интерфейс, и сборщик читает его имя.
+  // `el.style` and the `style` attribute are two views of one store.
+  // The inline style is a CSSStyleDeclaration too: `el.style` and
+  // `getComputedStyle(el)` share an interface, and fingerprinters read its name.
   const __styleProto = () => {
     const proto = (globalThis.CSSStyleDeclaration && CSSStyleDeclaration.prototype) || Object.prototype;
     try {
@@ -3716,18 +3606,15 @@
     return proto;
   };
   const __cssReaders = new WeakMap();
-  // Прототип инлайнового объявления: те же десять членов, что у браузера.
+  // Inline declaration prototype: the same ten members as Chrome.
   const __inlineStyleProto = () => {
     const proto = __styleProto();
     if (proto.__ptInlineShaped) return proto;
     try { Object.defineProperty(proto, '__ptInlineShaped', { value: true }); } catch (e) {}
-    // Объявление бывает двух видов: инлайновое (за ним атрибут элемента) и
-    // правило таблицы (за ним карта разобранных объявлений). Члены у них
-    // общие — они лежат на одном прототипе, — поэтому здесь понимаются оба.
-    // Пока понимался один, порядок сборки решал: если первым успевало
-    // правило, у инлайнового пропадали чтения, а если первым инлайновое —
-    // у правила выходила нулевая длина, и каскад не брал ни одного
-    // объявления.
+    // A declaration is either inline (backed by the element's attribute) or a
+    // stylesheet rule (backed by a parsed declaration map). Both share members
+    // on one prototype, so both are handled here; handling only one made the
+    // result depend on which was built first.
     const st = (o) => {
       const own = __cssReaders.get(o);
       if (own) return own;
@@ -3748,10 +3635,10 @@
       const s = st(this); if (!s) return '';
       const k = __cssKey(p);
       const m = s.computed ? s.map : s.read();
-      // Имена с приставкой поставщика спрашивают и с дефисом впереди, а
-      // длинное свойство может быть записано сокращением: `border-top-width`
-      // отвечает из `border`. А `-epub-…` — просто другое имя: у вычисленного
-      // стиля `-epub-word-break` отвечает тем же, чем `word-break`.
+      // Vendor-prefixed names are also asked with a leading dash, and a
+      // longhand may be written via a shorthand (`border-top-width` from
+      // `border`). `-epub-…` is just another name: computed
+      // `-epub-word-break` answers like `word-break`.
       const alias = s.computed ? EPUB_ALIAS[k] : null;
       if (alias) return m.get(alias) || __longhandFrom(m, alias) || '';
       return m.get(k) || (k.charCodeAt(0) === 45 ? m.get(k.slice(1)) || '' : '')
@@ -3768,16 +3655,15 @@
     def('setProperty', function setProperty(p, v, prio) {
       const s = st(this); if (!s) return;
       if (s.computed) throw __pt_mkErr(TypeError, 'Cannot modify computed style');
-      // Приоритет — либо пусто, либо `important`; иное браузер молча
-      // отвергает вместе со всем вызовом. И `!important` внутри значения —
-      // тоже отказ.
+      // Priority is either empty or `important`; anything else makes Chrome
+      // silently reject the whole call, as does `!important` inside the value.
       const pr = prio == null ? '' : String(prio).trim().toLowerCase();
       if (pr !== '' && pr !== 'important') return;
       if (__cssImportantIn(v)) return;
       const m = s.read(), k = __cssKey(p);
-      // Пустое значение свойство удаляет, а не оставляет пустым. Мы писали
-      // `opacity: ` без значения — строки, которой браузер не производит; кадр
-      // виджета читает свой `style` десятками тысяч раз и видел именно её.
+      // An empty value removes the property rather than leaving `opacity: `,
+      // a string Chrome never produces (the widget frame reads its `style`
+      // tens of thousands of times).
       if (v === '' || v == null) __cssDrop(m, k);
       else { __cssStore(m, k, v); if (pr === 'important') __cssImp(m).add(k); else __cssImp(m).delete(k); }
       s.write(m);
@@ -3803,7 +3689,7 @@
     acc('cssText',
       function cssText() {
         const s = st(this); if (!s) return '';
-        // У вычисленного стиля он пуст, как в браузере.
+        // Empty for computed style, as in Chrome.
         if (s.computed) return '';
         return __styleText(s.read());
       },
@@ -3821,22 +3707,19 @@
     return proto;
   };
 
-  // Описания семисот с лишним свойств CSS строятся один раз на всех: они
-  // ходят за своим объявлением через `this`, и потому одинаковы. Объявление
-  // у каждого элемента своё, и когда каждое строило себе семьсот
-  // акцессоров заново, одно только чтение `el.style` стоило полмиллисекунды —
-  // страница, которая трогает стиль у тысячи узлов, теряла на этом полсекунды.
-  // Девять имён с приставкой -epub-: браузер показывает их в списке
-  // собственных свойств объявления, но описания у них нет, `in` отвечает
-  // «нет», а чтение даёт `undefined`. Так выглядит перехватчик V8 изнутри, и
-  // повторить это можно только ловушками: если завести свойства всерьёз,
-  // разойдутся и `in`, и описание.
+  // Descriptors for the 700+ CSS properties are built once and shared: they
+  // reach their declaration through `this`. Per-element accessors made each
+  // `el.style` read cost ~0.5 ms.
+  // Nine -epub- names: Chrome lists them among the declaration's own keys, but
+  // they have no descriptor, `in` says no and reading gives `undefined`. That
+  // is a V8 interceptor's shape, reproducible only with traps; real properties
+  // would break both `in` and the descriptor.
   const EPUB_NAMES = ['epubCaptionSide', 'epubTextCombine', 'epubTextEmphasis',
     'epubTextEmphasisColor', 'epubTextEmphasisStyle', 'epubTextOrientation',
     'epubTextTransform', 'epubWordBreak', 'epubWritingMode'];
   const EPUB_SET = new Set(EPUB_NAMES);
-  // Чем каждое из них отвечает на `getPropertyValue('-epub-…')` у вычисленного
-  // стиля: это другие имена для обычных свойств.
+  // What each answers for computed `getPropertyValue('-epub-…')`: they are
+  // aliases of ordinary properties.
   const EPUB_ALIAS = {
     '-epub-caption-side': 'caption-side', '-epub-text-combine': 'text-combine-upright',
     '-epub-text-emphasis': 'text-emphasis', '-epub-text-emphasis-color': 'text-emphasis-color',
@@ -3844,18 +3727,16 @@
     '-epub-text-transform': 'text-transform', '-epub-word-break': 'word-break',
     '-epub-writing-mode': 'writing-mode',
   };
-  // Имена вставляются туда же, где они у браузера, — следом за `emptyCells`.
+  // Names are inserted where Chrome has them, right after `emptyCells`.
   const __withEpub = (keys) => {
     const at = keys.indexOf('emptyCells');
     if (at < 0) return keys;
     return keys.slice(0, at + 1).concat(EPUB_NAMES, keys.slice(at + 1));
   };
-  // Свойства объявления браузер отдаёт значениями, а не акцессорами: в
-  // описании `color` лежит `value: "red"`, и ни `get`, ни `set` там нет. У нас
-  // они были акцессорами — первое, что видно тому, кто читает описания.
-  // Имена свойств CSS — множеством: описание у них одинаковой формы, и
-  // спрашивают их тысячами (перебор объявления — тысяча двести имён), так что
-  // разбираться, чьё это имя, надо за один поиск, а не через `Reflect`.
+  // Declaration properties are data properties, not accessors: `color`'s
+  // descriptor holds `value: "red"`, no `get`/`set`. CSS property names are
+  // kept as a set: they are asked thousands of times (1200 names per
+  // enumeration), so identifying a name must be one lookup, not `Reflect`.
   let __CSS_PROP_SET = null;
   const __cssPropSet = () => (__CSS_PROP_SET || (__CSS_PROP_SET = new Set(CSS_PROPS)));
   const __declTraps = (valueOf) => ({
@@ -3910,8 +3791,8 @@
         if (i < 0) continue;
         const k = __cssKey(part.slice(0, i));
         let v = part.slice(i + 1).trim();
-        // Приоритет хранится рядом со значением, а не в нём: `getPropertyValue`
-        // отвечает без `!important`, `getPropertyPriority` — им.
+        // Priority is stored beside the value: `getPropertyValue` answers
+        // without `!important`, `getPropertyPriority` with it.
         const im = /!\s*important\s*$/i.exec(v);
         if (im) v = v.slice(0, im.index).trim();
         if (k) { m.set(k, v); if (im) __cssImp(m).add(k); }
@@ -3920,10 +3801,8 @@
       return m;
     };
     let indexed = 0;
-    // Числовые свойства объявления: у браузера они собственные, как и имена, и
-    // перечисляются первыми — у элемента с двумя объявлениями это `0`, `1`, а
-    // потом уже `accentColor`. У нас их не было вовсе. Порядок доставать не
-    // приходится: целочисленные ключи в JavaScript и так идут впереди.
+    // Indexed properties are own and enumerated first (`0`, `1`, then
+    // `accentColor`); integer keys come first in JS anyway.
     const reindex = (names) => {
       for (let i = 0; i < names.length; i++) {
         try { Object.defineProperty(target, String(i), { value: names[i], enumerable: true, configurable: true }); } catch (e) {}
@@ -3932,17 +3811,15 @@
       indexed = names.length;
     };
     const write = (m) => {
-      // Точка с запятой в конце обязательна: браузер её ставит.
+      // The trailing semicolon is required; Chrome adds it.
       const text = __styleText(m);
       cachedText = text; cachedMap = m;
       if (el && el.setAttribute) __ptSetA(el, 'style', text);
       reindex(__styleNames(m));
       __markDirty();
     };
-    // Форма как у браузера: методы и `length` — на прототипе, а собственными
-    // свойствами объявления идут имена свойств CSS, все семьсот три и в том же
-    // порядке. У нас собственными были методы, а имён не было вовсе — и всякий,
-    // кто перечисляет стиль (а его перечисляют), видел это сразу.
+    // Chrome's shape: methods and `length` on the prototype; own properties are
+    // the CSS property names, all 703, in the same order.
     const target = Object.create(__inlineStyleProto(), __styleDescs());
     __cssReaders.set(target, { read, write, el });
     reindex(__styleNames(read()));
@@ -3959,10 +3836,10 @@
       },
       set: (t, p, v) => {
         if (p === 'cssText') { t.cssText = v; return true; }
-        // Через перехватчик — те же правила, что через установщик: пустое
-        // значение удаляет свойство. Раньше он писал мимо и оставлял `opacity: `.
+        // Through the setter trap, same rules as the setter: an empty value
+        // removes the property.
         const m = read(), k = dash(String(p));
-        // Значение с `!important` через свойство браузер отвергает целиком.
+        // Chrome rejects a value with `!important` set via a property.
         if (__cssImportantIn(v)) return true;
         if (v === '' || v == null) __cssDrop(m, k); else { __cssStore(m, k, v); __cssImp(m).delete(k); }
         write(m); return true;
@@ -3973,12 +3850,11 @@
   }
 
   // ---- tree walking ---------------------------------------------------------
-  // Внутри движка нужен массив (concat/filter), наружу — коллекция.
+  // The engine uses an array internally (concat/filter); pages get a collection.
   function __docTags(doc, t) { return doc.documentElement ? __tags(doc.documentElement, t) : []; }
   function __tags(root, t) {
-    // По внутреннему имени, не через `tagName`: свой обход не должен ходить
-    // через акцессоры, которые страница видит (и может подменить), — иначе
-    // один `document.body` оставляет в её ленте десяток чужих чтений.
+    // By internal name, not `tagName`: internal walks must not use
+    // page-visible accessors, which a page can wrap and log.
     const local = String(t).toLowerCase();
     return collect(root, (e) => t === '*' || e.__ptLocal === local);
   }
@@ -3991,11 +3867,10 @@
     const out = []; walk(root, e => { if (pred(e)) out.push(e); });
     out.item = (i) => out[i] || null; return out;
   }
-  /// Есть ли у элемента таблица. У `<link>` — только со словом `stylesheet`
-  /// в `rel` и с непустым `href`: chess.com держит в разметке
-  /// `<link rel="stylesheet" data-href=…>` про запас, и у браузера такой
-  /// ссылки в `document.styleSheets` нет, а у нас она была — и счёт таблиц,
-  /// который api.js Turnstile отправляет виджету, выходил на одну больше.
+  /// Whether an element has a stylesheet. A `<link>` only with `stylesheet` in
+  /// `rel` and a non-empty `href`: chess.com keeps
+  /// `<link rel="stylesheet" data-href=…>` in reserve, which Chrome does not
+  /// list, and Turnstile's api.js sends the sheet count to the widget.
   function __ptHasSheet(e) {
     if (e.__ptLocal === 'style') return true;
     if (e.__ptLocal !== 'link') return false;
@@ -4003,7 +3878,7 @@
     if (rel.indexOf('stylesheet') < 0 || rel.indexOf('alternate') >= 0) return false;
     return !!String(__ptGetA(e, 'href') || '').trim();
   }
-  /// Владельцы таблиц в порядке документа.
+  /// Stylesheet owners in document order.
   function __sheetOwners(root) {
     const own = [];
     const visit = (n) => {
@@ -4027,16 +3902,13 @@
   }
 
   // ---- selector engine ------------------------------------------------------
-  // Разбор селектора целиком: простые, составные, все четыре комбинатора и
-  // псевдоклассы. Прежний движок знал только теги, классы, `#id`, атрибуты и
-  // два комбинатора, а псевдокласс читал как имя тега: `:root` искал элемент
-  // `<root>`. На chess.com все переменные стоят в `:root { … }` — и ни одна
-  // не доходила до страницы, а с ними вся раскладка формы входа.
+  // Full selector parsing: simple, compound, all four combinators and
+  // pseudo-classes (chess.com puts all its variables in `:root { … }`).
   const __selCache = new Map();
   const __SEL_NEVER = () => false;
 
-  /// Список селекторов → части верхнего уровня (запятые внутри скобок,
-  /// квадратных скобок и кавычек не делят).
+  /// Selector list -> top-level parts (commas inside parens, brackets and
+  /// quotes do not split).
   function __selSplit(s) {
     const out = [];
     let depth = 0, q = null, start = 0;
@@ -4073,7 +3945,7 @@
       return out;
     };
     const fail = () => { throw new SyntaxError('selector'); };
-    // Содержимое скобок как строка, с учётом вложенности и кавычек.
+    // Paren content as a string, respecting nesting and quotes.
     const paren = () => {
       if (s[i] !== '(') fail();
       let depth = 1, q = null; const a = ++i;
@@ -4159,7 +4031,7 @@
           continue;
         }
         if (c === ':' && s[i + 1] === ':') {
-          // Псевдоэлемент: элемент им не бывает.
+          // Pseudo-element: never matches an element.
           i += 2; ident(); if (s[i] === '(') paren();
           spec[2]++; any = true; tests.push(__SEL_NEVER);
           continue;
@@ -4168,7 +4040,7 @@
           i++;
           const name = ident().toLowerCase();
           if (!name) fail();
-          // Старые псевдоэлементы с одним двоеточием.
+          // Legacy single-colon pseudo-elements.
           if (/^(before|after|first-line|first-letter)$/.test(name)) { spec[2]++; any = true; tests.push(__SEL_NEVER); continue; }
           const arg = s[i] === '(' ? paren() : null;
           const r = __selPseudo(name, arg);
@@ -4185,8 +4057,8 @@
         : (e, ctx) => { for (let k = 0; k < n; k++) if (!tests[k](e, ctx)) return false; return true; };
       return { test, spec };
     };
-    // Сложный селектор; `relative` — для `:has()`, где он может начинаться с
-    // комбинатора.
+    // Complex selector; `relative` is for `:has()`, which may start with a
+    // combinator.
     const complex = (relative) => {
       const comps = [], combs = [];
       const spec = [0, 0, 0];
@@ -4229,7 +4101,7 @@
     if (!cx.comps[idx](el, ctx)) return false;
     if (idx === 0) {
       if (!cx.lead && !cx.anchored) return true;
-      // `:has(> a)`: слева — сам якорь.
+      // `:has(> a)`: the anchor itself is on the left.
       const a = ctx.hasAnchor;
       const comb = cx.lead || ' ';
       if (comb === '>') return __parentEl(el) === a;
@@ -4266,8 +4138,8 @@
     const a = cx.spec, b = m;
     return (a[0] - b[0] || a[1] - b[1] || a[2] - b[2]) > 0 ? a : b;
   }, [0, 0, 0]);
-  // Список внутри `:is()`/`:where()` прощающий: непонятная часть просто
-  // выпадает, а не губит всё.
+  // The list in `:is()`/`:where()` is forgiving: an invalid part drops out
+  // instead of failing the whole.
   const __selForgiving = (arg) => {
     const out = [];
     for (const part of __selSplit(arg)) {
@@ -4277,7 +4149,7 @@
     }
     return out;
   };
-  // An+B из `:nth-child()`.
+  // An+B from `:nth-child()`.
   function __nthParse(t) {
     t = t.trim().toLowerCase().replace(/\s+/g, '');
     if (t === 'odd') return [2, 1];
@@ -4304,7 +4176,7 @@
     if (__ptHasA(e, 'disabled')) return true;
     for (let p = __parentEl(e); p; p = __parentEl(p)) {
       if (p.localName === 'fieldset' && __ptHasA(p, 'disabled')) {
-        // Кроме того, что лежит в первой легенде.
+        // Except what is inside the first legend.
         const legend = [...p.children].find((k) => k.localName === 'legend');
         if (!(legend && legend.contains(e))) return true;
       }
@@ -4455,14 +4327,14 @@
       case 'host': case 'host-context': case 'state':
         return { spec: B, test: __SEL_NEVER };
     }
-    // Всё прочее — состояния, которых у нас не бывает (`:hover`,
-    // `:active`, `:visited`, `:autofill`, `:fullscreen`, `:modal`…), и
-    // приставочные имена. Совпадения нет, но и ошибки тоже.
+    // Anything else is a state we never have (`:hover`, `:active`,
+    // `:visited`, `:autofill`, `:fullscreen`, `:modal`…) or a prefixed name:
+    // no match, but no error either.
     return { spec: B, test: __SEL_NEVER };
   }
   function __selParseRelative(src) {
-    // Относительный селектор: тот же разбор, но с комбинатором впереди и
-    // привязкой к якорю слева.
+    // Relative selector: same parse, with a leading combinator anchored on
+    // the left.
     const t = String(src).trim();
     const lead = /^[>+~]/.test(t) ? t[0] : null;
     const body = lead ? t.slice(1) : t;
@@ -4473,23 +4345,21 @@
     return cx;
   }
 
-  // Селектор, который браузер разобрать не может, — это отказ, а не пустой
-  // ответ: `document.querySelector('<<<')` бросает SyntaxError с точным текстом.
-  // У нас же он что-то находил — движок молча пропускал непонятное, и `<<<`
-  // отвечал первым элементом, а `matches('###')` отвечал «да».
-  // Разбор по грамматике селекторов, как у браузера: имя после `#`/`.` —
-  // идентификатор (не цифра), псевдокласс и псевдоэлемент — из известных
-  // браузеру, `:nth-*` — an+b, `:has()` не пустой, два комбинатора подряд
-  // и неизвестная приставка пространства имён — отказ; незакрытый `[` в
-  // конце строки браузер закрывает сам.
+  // A selector Chrome cannot parse is an error, not an empty result:
+  // `document.querySelector('<<<')` throws SyntaxError with an exact text.
+  // Parsed per the selector grammar: a name after `#`/`.` is an identifier
+  // (not a digit), pseudo-classes and pseudo-elements from Chrome's known set,
+  // `:nth-*` is an+b, `:has()` non-empty; two combinators in a row and an
+  // unknown namespace prefix are errors; an unclosed `[` at the end is closed
+  // implicitly.
   const __SEL_IDENT = /^(?:-?(?:[_a-zA-Z\u00A0-\uFFFF]|\\[^\n]|\\$)(?:[-_a-zA-Z0-9\u00A0-\uFFFF]|\\[^\n]|\\$)*|--(?:[-_a-zA-Z0-9\u00A0-\uFFFF]|\\[^\n]|\\$)*)/;
   const __SEL_PC_PLAIN = new Set(['-webkit-any-link', '-webkit-autofill', '-webkit-drag', '-webkit-full-page-media', '-webkit-full-screen', '-webkit-full-screen-ancestor', '-webkit-scrollbar', 'active', 'active-view-transition', 'any-link', 'autofill', 'checked', 'corner-present', 'current', 'decrement', 'default', 'defined', 'disabled', 'double-button', 'empty', 'enabled', 'end', 'first-child', 'first-of-type', 'focus', 'focus-visible', 'focus-within', 'fullscreen', 'future', 'horizontal', 'host', 'hover', 'in-range', 'increment', 'indeterminate', 'interest-source', 'interest-target', 'invalid', 'last-child', 'last-of-type', 'link', 'modal', 'no-button', 'only-child', 'only-of-type', 'open', 'optional', 'out-of-range', 'past', 'picture-in-picture', 'placeholder-shown', 'popover-open', 'read-only', 'read-write', 'required', 'root', 'scope', 'single-button', 'start', 'target', 'target-current', 'user-invalid', 'user-valid', 'valid', 'vertical', 'visited', 'window-inactive', 'xr-overlay']);
   const __SEL_PC_FUNC = new Set(['active-view-transition-type', 'dir', 'has', 'host', 'host-context', 'is', 'lang', 'not', 'nth-child', 'nth-last-child', 'nth-last-of-type', 'nth-of-type', 'state', 'where', '-webkit-any']);
   const __SEL_PE_PLAIN = new Set(['after', 'backdrop', 'before', 'checkmark', 'column', 'cue', 'details-content', 'file-selector-button', 'first-letter', 'first-line', 'grammar-error', 'marker', 'picker-icon', 'placeholder', 'scroll-marker', 'scroll-marker-group', 'search-text', 'selection', 'spelling-error', 'target-text', 'view-transition', '-webkit-calendar-picker-indicator', '-webkit-color-swatch', '-webkit-color-swatch-wrapper', '-webkit-date-and-time-value', '-webkit-datetime-edit', '-webkit-datetime-edit-ampm-field', '-webkit-datetime-edit-day-field', '-webkit-datetime-edit-fields-wrapper', '-webkit-datetime-edit-hour-field', '-webkit-datetime-edit-millisecond-field', '-webkit-datetime-edit-minute-field', '-webkit-datetime-edit-month-field', '-webkit-datetime-edit-second-field', '-webkit-datetime-edit-text', '-webkit-datetime-edit-week-field', '-webkit-datetime-edit-year-field', '-webkit-details-marker', '-webkit-file-upload-button', '-webkit-inner-spin-button', '-webkit-input-placeholder', '-webkit-media-controls', '-webkit-media-controls-current-time-display', '-webkit-media-controls-enclosure', '-webkit-media-controls-fullscreen-button', '-webkit-media-controls-mute-button', '-webkit-media-controls-overlay-enclosure', '-webkit-media-controls-overlay-play-button', '-webkit-media-controls-panel', '-webkit-media-controls-play-button', '-webkit-media-controls-time-remaining-display', '-webkit-media-controls-timeline', '-webkit-media-controls-toggle-closed-captions-button', '-webkit-media-controls-volume-slider', '-webkit-media-slider-container', '-webkit-media-slider-thumb', '-webkit-media-text-track-container', '-webkit-media-text-track-display', '-webkit-media-text-track-region', '-webkit-media-text-track-region-container', '-webkit-meter-bar', '-webkit-meter-even-less-good-value', '-webkit-meter-inner-element', '-webkit-meter-optimum-value', '-webkit-meter-suboptimum-value', '-webkit-progress-bar', '-webkit-progress-inner-element', '-webkit-progress-value', '-webkit-resizer', '-webkit-scrollbar', '-webkit-scrollbar-button', '-webkit-scrollbar-corner', '-webkit-scrollbar-thumb', '-webkit-scrollbar-track', '-webkit-scrollbar-track-piece', '-webkit-search-cancel-button', '-webkit-search-decoration', '-webkit-slider-container', '-webkit-slider-runnable-track', '-webkit-slider-thumb', '-webkit-textfield-decoration-container']);
   const __SEL_PE_FUNC = new Set(['cue', 'highlight', 'part', 'picker', 'scroll-button', 'slotted', 'view-transition-group', 'view-transition-image-pair', 'view-transition-new', 'view-transition-old']);
   const __SEL_LEGACY_PE = new Set(['before', 'after', 'first-line', 'first-letter']);
-  // Доводы в скобках — до парной закрывающей (строки и вложенные скобки
-  // учитываются); null, если скобка не закрыта.
+  // Arguments in parentheses up to the matching close (strings and nesting
+  // respected); null if unclosed.
   const __selArg = (t, i) => {
     let depth = 0, q = null;
     for (let k = i; k < t.length; k++) {
@@ -4499,7 +4369,7 @@
       if (ch === '(') depth++;
       else if (ch === ')') { if (--depth === 0) return { arg: t.slice(i + 1, k), end: k + 1 }; }
     }
-    // Незакрытая скобка в конце строки: браузер закрывает её сам.
+    // An unclosed paren at the end of the string is closed implicitly.
     return { arg: t.slice(i + 1), end: t.length };
   };
   const __selAnb = (a, allowOf) => {
@@ -4509,7 +4379,7 @@
     return true;
   };
   const __selStringOrIdent = (x) => /^\s*(?:"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|(?:-?(?:[_a-zA-Z\u00A0-\uFFFF]|\\.)(?:[-_a-zA-Z0-9\u00A0-\uFFFF]|\\.)*|--[-_a-zA-Z0-9\u00A0-\uFFFF\\]*))\s*$/.test(x);
-  // Один сложный селектор (без запятых); `relative` — допускает ведущий комбинатор.
+  // One complex selector (no commas); `relative` allows a leading combinator.
   const __selValidOne = (t, relative, ctx) => {
     ctx = ctx || {};
     let i = 0; const n = t.length;
@@ -4520,9 +4390,9 @@
     let expectCompound = true;
     if (/^[>+~]/.test(t.slice(i))) { if (!relative) return false; i += 1; ws(); }
     while (i < n) {
-      // Составной селектор.
+      // Compound selector.
       let any = false;
-      // Тип с возможным пространством имён: `*`, `ident`, `*|x`, `|x`; чужая приставка — отказ.
+      // Type with optional namespace: `*`, `ident`, `*|x`, `|x`; a foreign prefix fails.
       const save = i;
       let nsPrefix = null;
       if (t[i] === '&') { i++; any = true; }
@@ -4544,9 +4414,9 @@
           i++; ws();
           if (t[i] === '*' && t[i + 1] === '|') i += 2; else if (t[i] === '|') i++;
           if (ident() === null) return false;
-          if (t[i] === '|' && t[i + 1] !== '=') return false;   // чужая приставка пространства имён
+          if (t[i] === '|' && t[i + 1] !== '=') return false;   // foreign namespace prefix
           ws();
-          if (i >= n) return true;            // `a[b` — браузер закрывает сам
+          if (i >= n) return true;            // `a[b` is closed implicitly
           if (t[i] !== ']') {
             if (!/^[~|^$*]?=/.test(t.slice(i))) return false;
             i += t[i] === '=' ? 1 : 2; ws();
@@ -4581,7 +4451,7 @@
               afterPE = true;
             } else {
               if (!__SEL_PC_FUNC.has(low)) return false;
-              // :is/:where — прощающий список: негодные части отбрасываются, пустой допустим.
+              // :is/:where take a forgiving list: invalid parts dropped, empty allowed.
               if (low === 'is' || low === 'where') { for (const p of __selSplit(arg)) { if (!p.trim()) continue; try { if (!__selValidOne(p, false, inner)) { if (/::|\bhas\(/.test(p)) {} } } catch (e) {} } }
               else if (low === 'not' || low === '-webkit-any') { if (!__selValid(arg, false, inner)) return false; }
               else if (low === 'has') { if (ctx.noHas || !arg.trim() || !__selValid(arg, true, inner)) return false; }
@@ -4605,15 +4475,15 @@
       }
       if (!any) return false;
       expectCompound = false;
-      // Комбинатор.
+      // Combinator.
       const before = i; ws();
       if (i >= n) return true;
-      if (afterPE) return false;               // после псевдоэлемента ничего не бывает
+      if (afterPE) return false;               // nothing may follow a pseudo-element
       if (t[i] === '>' || t[i] === '+' || t[i] === '~') { i++; ws(); expectCompound = true; }
-      else if (i === before) return false;     // символ, которого в селекторе не бывает
-      else expectCompound = true;              // потомок через пробел
-      if (i >= n) return false;                // комбинатор в конце
-      if (/^[>+~]/.test(t.slice(i))) return false; // два подряд
+      else if (i === before) return false;     // a character no selector allows
+      else expectCompound = true;              // descendant (whitespace)
+      if (i >= n) return false;                // trailing combinator
+      if (/^[>+~]/.test(t.slice(i))) return false; // two in a row
     }
     return !expectCompound;
   };
@@ -4623,7 +4493,7 @@
     for (const part of __selSplit(s)) { if (!__selValidOne(part, !!relative, ctx)) return false; }
     return true;
   };
-  // Только составной селектор (без комбинаторов): :host(), ::slotted().
+  // Compound selector only (no combinators): :host(), ::slotted().
   const __selCompoundOnly = (sel) => {
     const t = String(sel).trim();
     if (!t || /[>+~]|\s/.test(t.replace(/\[[^\]]*\]|\([^)]*\)/g, ''))) return false;
@@ -4636,26 +4506,24 @@
       String(sel) + "' is not a valid selector.";
     throw __pt_mkErr(globalThis.DOMException || Error, msg, 'SyntaxError');
   };
-  // Столько же доводов, сколько требует браузер, и тот же текст отказа.
+  // Same argument count Chrome requires, and the same error text.
   const __needArgs = (got, want, method, iface) => {
     if (got >= want) return;
     throw __pt_mkErr(TypeError, "Failed to execute '" + method + "' on '" + iface + "': " +
       want + " argument" + (want === 1 ? '' : 's') + " required, but only " + got + " present.");
   };
 
-  // Не узел там, где нужен узел. Браузер отвечает своим `TypeError` ещё до
-  // всякой работы, и текст у него слово в слово такой; у нас вместо него
-  // вылезало внутреннее «Cannot read properties of undefined», то есть
-  // подпись движка. Чужой код это читает: челлендж Cloudflare нарочно зовёт
-  // `replaceChild` не тем и сверяет, что ему ответили.
+  // Not a node where a node is required: Chrome throws its own `TypeError`
+  // before doing anything, with this exact text. The Cloudflare challenge
+  // calls `replaceChild` with bad arguments and checks the answer.
   const __needNode = (v, n, method, iface) => {
     if (v !== null && typeof v === 'object' && typeof v.nodeType === 'number') return;
     throw __pt_mkErr(TypeError, "Failed to execute '" + method + "' on '" + (iface || 'Node') + "': " +
       "parameter " + n + " is not of type 'Node'.");
   };
 
-  // Узел, перед которым (или вместо которого) просят вставить, обязан быть
-  // ребёнком. Браузер на чужом узле бросает `NotFoundError` своими словами.
+  // The reference node must be a child; otherwise Chrome throws `NotFoundError`
+  // with its own words.
   const __needChild = (parent, ref, method, what) => {
     if (parent.__ptKids.indexOf(ref) >= 0) return;
     throw __pt_mkErr(globalThis.DOMException || Error, 
@@ -4667,9 +4535,8 @@
     const list = __selCompiled(selector);
     return !!list && __selAny(list, el, { scope: scope || null });
   }
-  // Ответ — в порядке документа: `querySelectorAll('input, button')` у
-  // браузера отдаёт элементы так, как они стоят в дереве (api.js Turnstile
-  // описывает форму именно этим запросом).
+  // Results in document order: `querySelectorAll('input, button')` returns
+  // elements in tree order (Turnstile's api.js describes the form this way).
   function query(root, selector) {
     const results = [];
     const list = __selCompiled(selector);
@@ -4692,8 +4559,8 @@
     let attrs = '';
     for (const { name, value } of n.attributes) attrs += ` ${name}="${esc(value, true)}"`;
     if (VOID.has(tag)) return `<${tag}${attrs}>`;
-    // `<template>` сериализует своё содержимое; сериализуемый теневой корень
-    // (getHTML с serializableShadowRoots) — как <template shadowrootmode>.
+    // `<template>` serializes its content; a serializable shadow root
+    // (getHTML with serializableShadowRoots) as <template shadowrootmode>.
     let inner = '';
     if (withShadow && n.__ptShadow && n.__ptShadow.__ptSerializable) {
       const sr = n.__ptShadow;
@@ -4723,11 +4590,9 @@
     });
   }
 
-  // Классы элемента — множеством, разобранным один раз на значение атрибута.
-  // Проверка `.x` в селекторе прогоняла строку `class` через replace с
-  // регуляркой при каждом вызове, а каскад раскладки зовёт её на каждое
-  // правило для каждого элемента: на тяжёлой заставе это было две трети всего
-  // времени процессора.
+  // Element classes as a set, parsed once per attribute value. The layout
+  // cascade checks `.x` for every rule on every element; running the `class`
+  // string through a regex each time was two thirds of CPU on a heavy page.
   const __ptClassCache = new WeakMap();
   function __ptClassSet(e) {
     const v = __ptGetA(e, 'class');
@@ -4740,11 +4605,10 @@
     return c.set;
   }
 
-  // Действие по умолчанию у неотменённого щелчка (activation behavior): его
-  // несёт ближайший к цели предок, у которого оно есть. Кнопка отправки
-  // отправляет форму, кнопка сброса сбрасывает, ссылка ведёт по адресу. У нас
-  // это делал только `button.click()`, а щелчок мышью (доверенный, тот, что
-  // жмёт решатель и `--click`) не отправлял форм и не открывал ссылок вовсе.
+  // Default action of an uncancelled click (activation behavior), carried by
+  // the nearest ancestor of the target that has one: submit button submits,
+  // reset resets, link navigates. Applies to trusted mouse clicks too (the
+  // solver and `--click`), not just `button.click()`.
   function __ptActivate(target) {
     for (let el = target; el && el.nodeType === 1; el = el.parentNode) {
       const tag = el.__ptLocal;
@@ -4771,7 +4635,7 @@
         let url;
         try { url = new URL(raw, document.baseURI || location.href); } catch (e) { return; }
         const here = String(location.href);
-        // Только фрагмент — прокрутка и hashchange, не переход.
+        // Fragment only: scroll and hashchange, no navigation.
         if (url.href.split('#')[0] === here.split('#')[0] && url.hash) { location.hash = url.hash; return; }
         location.assign(url.href);
         return;
@@ -4784,7 +4648,7 @@
   // text, comments, and void/self-closing elements. Not spec-perfect, but
   // covers the markup scripts typically inject.
   const __SVG_NS = 'http://www.w3.org/2000/svg', __MATH_NS = 'http://www.w3.org/1998/Math/MathML';
-  // Таблицы регистра из спецификации HTML (adjust SVG tag/attribute names).
+  // Case tables from the HTML spec (adjust SVG tag/attribute names).
   const __SVG_CASE = {};
   for (const n of ['altGlyph', 'altGlyphDef', 'altGlyphItem', 'animateColor', 'animateMotion', 'animateTransform', 'clipPath', 'feBlend', 'feColorMatrix', 'feComponentTransfer', 'feComposite', 'feConvolveMatrix', 'feDiffuseLighting', 'feDisplacementMap', 'feDistantLight', 'feDropShadow', 'feFlood', 'feFuncA', 'feFuncB', 'feFuncG', 'feFuncR', 'feGaussianBlur', 'feImage', 'feMerge', 'feMergeNode', 'feMorphology', 'feOffset', 'fePointLight', 'feSpecularLighting', 'feSpotLight', 'feTile', 'feTurbulence', 'foreignObject', 'glyphRef', 'linearGradient', 'radialGradient', 'textPath']) __SVG_CASE[n.toLowerCase()] = n;
   const __SVG_ATTR_CASE = {};
@@ -4796,10 +4660,9 @@
   };
   function parseFragment(html) {
     const doc = globalThis.document;
-    // Разбор идёт мимо имён, которые видит страница: в браузере присваивание
-    // `innerHTML` не зовёт ни `createElement`, ни `appendChild`, ни
-    // `setAttribute`, а у нас каждая вставка разметки показывала их десятками
-    // всякому, кто эти методы обернул.
+    // Parsing bypasses page-visible names: in Chrome `innerHTML` does not call
+    // `createElement`, `appendChild` or `setAttribute`, and anyone wrapping
+    // them would see the calls.
     const O = globalThis.__pt_orig || {};
     const mk = (name, self, args) => (O[name] ? O[name].apply(self, args) : self[name].apply(self, args));
     const frag = () => mk('createDocumentFragment', doc, []);
@@ -4833,22 +4696,19 @@
         if (close) {
           for (let s = stack.length - 1; s > 0; s--) if (String(stack[s].localName).toLowerCase() === tag) { stack.length = s; break; }
         } else if (tag === 'html' || tag === 'head' || tag === 'body') {
-          // Разбор куска разметки: браузер такие теги внутрь не вставляет —
-          // их содержимое просто переезжает в текущего родителя. Мы делали
-          // из них узлы, и `div.innerHTML = '<html><body></body></html>'`
-          // давал двух детей там, где у браузера пусто.
+          // Fragment parsing: Chrome does not insert these tags, their content
+          // moves into the current parent (`div.innerHTML =
+          // '<html><body></body></html>'` leaves it empty).
         } else {
-          // Подразумеваемое закрытие, как у разбора HTML: новый блочный тег
-          // закрывает открытый <p>, `<li>` — открытый <li>, и т. п. Без этого
-          // `<p>a<p>b` вкладывался, а Chrome даёт двух соседей.
+          // Implied end tags as in HTML parsing: a new block tag closes an open
+          // <p>, `<li>` closes an open <li>, etc. (`<p>a<p>b` gives two siblings).
           const CLOSES_P = new Set(['address', 'article', 'aside', 'blockquote', 'details', 'dialog', 'div', 'dl', 'fieldset', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hgroup', 'hr', 'main', 'menu', 'nav', 'ol', 'p', 'pre', 'section', 'table', 'ul']);
           const SELF_CLOSES = { li: ['li'], dt: ['dt', 'dd'], dd: ['dt', 'dd'], option: ['option', 'optgroup'], optgroup: ['optgroup'], tr: ['tr', 'td', 'th'], td: ['td', 'th'], th: ['td', 'th'], thead: ['tbody', 'tfoot', 'thead'], tbody: ['tbody', 'tfoot', 'thead'], tfoot: ['tbody', 'tfoot', 'thead'] };
           if (CLOSES_P.has(tag)) { for (let s = stack.length - 1; s > 0; s--) { if (stack[s].localName === 'p') { stack.length = s; break; } if (CLOSES_P.has(stack[s].localName) && stack[s].localName !== 'p') break; } }
           const closes = SELF_CLOSES[tag];
           if (closes) { for (let s = stack.length - 1; s > 0; s--) { const ln = stack[s].localName; if (closes.indexOf(ln) >= 0) { stack.length = s; break; } if (ln === 'table' || ln === 'ul' || ln === 'ol' || ln === 'select' || ln === 'dl') break; } }
-          // Подразумеваемые обёртки таблицы: `<table><tr>` получает `<tbody>`,
-          // а `<td>` без строки — `<tr>`; браузер вставляет их сам, и
-          // `table.tBodies[0].rows` у него есть всегда.
+          // Implied table wrappers: `<table><tr>` gets a `<tbody>`, a `<td>`
+          // without a row gets a `<tr>`; `table.tBodies[0].rows` always exists.
           if (tag === 'tr' || tag === 'td' || tag === 'th') {
             const tl = top().localName;
             if (tag === 'tr' && tl === 'table') { const tb = elem('tbody'); put(top(), tb); stack.push(tb); }
@@ -4857,10 +4717,9 @@
               const row = elem('tr'); put(top(), row); stack.push(row);
             }
           }
-          // Чужое содержимое, как у разбора HTML: внутри <svg> — элементы SVG
-          // (с регистром имён по таблице спецификации), внутри <math> — MathML,
-          // внутри foreignObject/desc/title у SVG — снова HTML. Раньше <svg> из
-          // innerHTML становился HTMLUnknownElement, а значки виджета — с ним.
+          // Foreign content as in HTML parsing: SVG elements inside <svg> (name
+          // case per the spec table), MathML inside <math>, HTML again inside
+          // SVG foreignObject/desc/title.
           const parentNS = (() => {
             const t = top(); const pns = t && t.__ptNS;
             if (pns === __SVG_NS && (t.__ptLocal === 'foreignObject' || t.__ptLocal === 'desc' || t.__ptLocal === 'title')) return null;
@@ -4872,8 +4731,8 @@
           for (const am of m[2].matchAll(/([\w:-]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g)) {
             let v = am[2] || '';
             if (v && (v[0] === '"' || v[0] === "'")) v = v.slice(1, -1);
-            // Ссылки на знаки в значении разбираются, как и в тексте: `&quot;`
-            // становится кавычкой, а при сериализации — снова `&quot;`, не `&amp;quot;`.
+            // Character references in attribute values are decoded like text:
+            // `&quot;` becomes a quote and serializes back as `&quot;`.
             const an = am[1].toLowerCase();
             attr(el, ns === __SVG_NS ? (__SVG_ATTR_CASE[an] || an) : an, unescapeEntities(v));
           }
@@ -4906,10 +4765,8 @@
   }
 
   // ---- build DOM from the Rust-parsed tree ----------------------------------
-  // `<template>` держит разобранное содержимое не в себе, а в отдельном
-  // DocumentFragment: `t.content`. У нас его не было вовсе, разобранные дети
-  // терялись, и код, который строит узлы через шаблон — а так делает и
-  // челлендж Cloudflare — получал undefined там, где ждал фрагмент.
+  // `<template>` keeps its parsed content in a separate DocumentFragment,
+  // `t.content`. The Cloudflare challenge builds nodes through templates.
   function __templateContent(el) {
     let f = el.__ptContent;
     if (!f) {
@@ -4931,8 +4788,8 @@
       Object.defineProperty(el, '__ptRan', { value: true, configurable: true, enumerable: false });
     }
     for (const [name, value] of spec.attrs) __ptSetA(el, name, value);
-    // Разбор кладёт детей шаблона в его содержимое, а сам элемент оставляет
-    // пустым — `t.childNodes.length === 0` и в браузере тоже.
+    // The parser puts template children into its content and leaves the
+    // element empty (`t.childNodes.length === 0` in Chrome too).
     const into = spec.tag === 'template' ? __templateContent(el) : el;
     for (const child of spec.children) into.appendChild(buildNode(doc, child));
     return el;
@@ -4945,8 +4802,8 @@
   // check `node.nodeType !== Node.ELEMENT_NODE` before acting on a node.
   const NODE_TYPES = {
     ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4,
-    // Пятый и шестой типы давно не создаются, но константы у Node остались, и
-    // их пересчитывают: у Chrome на `Node.prototype` ровно 48 имён.
+    // Types 5 and 6 are no longer created, but Node keeps the constants and
+    // they are counted: Chrome's `Node.prototype` has exactly 48 names.
     ENTITY_REFERENCE_NODE: 5, ENTITY_NODE: 6,
     PROCESSING_INSTRUCTION_NODE: 7, COMMENT_NODE: 8, DOCUMENT_NODE: 9,
     DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11, NOTATION_NODE: 12,
@@ -4957,9 +4814,8 @@
   Object.assign(Node, NODE_TYPES);
   Object.assign(Node.prototype, NODE_TYPES);
 
-  // Члены Node, которых у нас не было вовсе или которые лежали этажом ниже, на
-  // Element. В браузере они все здесь, и сборщик отпечатка считает именно этот
-  // этаж.
+  // Node members that belong on Node, not Element; the fingerprinter counts
+  // this level.
   const __nodeName = function () {
     switch (this.nodeType) {
       case 1: return this.tagName;
@@ -5054,23 +4910,21 @@
 
   globalThis.Node = Node;
   globalThis.Element = Element;
-  // В браузере интерфейсы элементов — лестница: Element → HTMLElement →
-  // HTMLCanvasElement и так далее, и у каждой ступени свои члены. У нас все они
-  // были **одним объектом**: `HTMLCanvasElement.prototype === HTMLDivElement
-  // .prototype === Element.prototype`, поэтому `div instanceof HTMLCanvasElement`
-  // отвечало true, а `constructor.name` любого элемента — `Element`. Строим
-  // лестницу; сами члены пока живут на Element, их развес — следующим шагом.
+  // Element interfaces form a ladder: Element -> HTMLElement ->
+  // HTMLCanvasElement and so on, each step with its own members, so
+  // `div instanceof HTMLCanvasElement` is false and `constructor.name` is
+  // right. Members still live on Element; their distribution comes later.
   const __ifaceProto = new Map();
   let __pendingTag = 'div';
-  // Строгий контекст здесь не украшение: у обычной функции есть собственные
-  // `arguments` и `caller`, а у интерфейса браузера их нет — и обход графа
-  // видел два лишних свойства у каждого из сотни имён `HTML*Element`.
+  // Strict mode matters: a sloppy function has own `arguments` and `caller`,
+  // a browser interface does not, and the graph walk would see two extra
+  // properties on each of ~100 `HTML*Element` names.
   const __mkIface = (function () {
     'use strict';
     return (name, parentProto) => {
     const C = function () {
-      // `new HTMLElement()` в браузере бросает, но `super()` из класса
-      // кастомного элемента обязан работать — это его штатный путь.
+      // `new HTMLElement()` throws in Chrome, but `super()` from a custom
+      // element class must work.
       if (new.target && new.target !== C) return Reflect.construct(Element, [__pendingTag], new.target);
       throw __pt_mkErr(TypeError, "Illegal constructor");
     };
@@ -5083,7 +4937,7 @@
     };
   })();
   const __htmlProto = __mkIface('HTMLElement', Element.prototype);
-  // Тег → интерфейс, снято с Chrome 148.
+  // Tag -> interface, from Chrome 148.
   const TAG_IFACE = {
     a: 'HTMLAnchorElement', area: 'HTMLAreaElement', audio: 'HTMLAudioElement',
     br: 'HTMLBRElement', base: 'HTMLBaseElement', body: 'HTMLBodyElement',
@@ -5111,14 +4965,14 @@
     textarea: 'HTMLTextAreaElement', time: 'HTMLTimeElement', title: 'HTMLTitleElement',
     track: 'HTMLTrackElement', ul: 'HTMLUListElement', video: 'HTMLVideoElement',
   };
-  // Теги без своего интерфейса, но известные HTML: у них HTMLElement.
+  // Tags known to HTML without their own interface: HTMLElement.
   const PLAIN_TAGS = new Set(['abbr', 'address', 'article', 'aside', 'b', 'bdi', 'bdo',
     'cite', 'code', 'dd', 'dfn', 'dt', 'em', 'figcaption', 'figure', 'footer', 'header',
     'hgroup', 'i', 'kbd', 'main', 'mark', 'nav', 'noscript', 'rp', 'rt', 'ruby', 's',
     'samp', 'search', 'section', 'small', 'strong', 'sub', 'summary', 'sup', 'u', 'var',
     'wbr', 'center', 'font', 'big', 'strike', 'tt', 'nobr']);
   for (const name of new Set(Object.values(TAG_IFACE))) __ifaceProto.set(name, __mkIface(name, __htmlProto));
-  // Мультимедиа наследует HTMLMediaElement, как в браузере.
+  // Media elements inherit HTMLMediaElement.
   const __mediaProto = __mkIface('HTMLMediaElement', __htmlProto);
   for (const n of ['HTMLVideoElement', 'HTMLAudioElement']) {
     try { Object.setPrototypeOf(globalThis[n].prototype, __mediaProto); } catch (e) {}
@@ -5128,9 +4982,8 @@
                    'HTMLDirectoryElement', 'HTMLFontElement', 'HTMLParamElement']) {
     if (!globalThis[n]) __mkIface(n, __htmlProto);
   }
-  // Коллекции форм и таблиц: `table.rows`, `tr.cells`, `select.options`,
-  // `form.elements`… Их не было вовсе, и `table.rows[0]` ронял страницу
-  // (челлендж Cloudflare разбирает так свою тестовую разметку).
+  // Form and table collections: `table.rows`, `tr.cells`, `select.options`,
+  // `form.elements`… (the Cloudflare challenge parses its test markup this way).
   {
     const proto = (n) => __ifaceProto.get(n);
     const defGet = (P, k, get) => { if (!P) return; try { Object.defineProperty(P, k, { get, enumerable: true, configurable: true }); } catch (e) {} };
@@ -5143,7 +4996,7 @@
       try { const I = globalThis[name]; if (I && I.prototype) Object.setPrototypeOf(c, I.prototype); } catch (e) {}
       return c;
     };
-    // Таблица.
+    // Table.
     const tableRows = (t) => {
       const out = [];
       const heads = kids(t).filter((k) => isTag(k, 'thead'));
@@ -5193,7 +5046,7 @@
       if (!p || !isTag(p, 'tr')) return -1;
       return kids(p).filter((k) => isTag(k, 'td', 'th')).indexOf(this);
     });
-    // Список выбора.
+    // Select.
     const selOptions = (sel) => {
       const out = [];
       for (const k of kids(sel)) {
@@ -5205,7 +5058,7 @@
     const isSelected = (o) => !!(o.__ptSelected != null ? o.__ptSelected : __ptHasA(o, 'selected'));
     const SEL = proto('HTMLSelectElement');
     defGet(SEL, 'options', function () { const c = branded(selOptions(this), 'HTMLOptionsCollection'); try { Object.defineProperty(c, '__ptSelect', { value: this, configurable: true }); } catch (e) {} return c; });
-    // Сеттеры selectedIndex и length, как у HTMLSelectElement/HTMLOptionsCollection Chrome.
+    // selectedIndex and length setters, as Chrome's HTMLSelectElement/HTMLOptionsCollection.
     const selSetIndex = (sel, i) => {
       const opts = selOptions(sel); i = i | 0;
       opts.forEach((o, j) => { o.__ptSelected = (j === i); });
@@ -5217,7 +5070,7 @@
     };
     globalThis.__pt_selSetLength = selSetLength;
     globalThis.__pt_selSetIndex = selSetIndex;
-    // `value` списка — значение выбранного пункта; `selected`/`value`/`text` пункта.
+    // A select's `value` is the selected option's; option `selected`/`value`/`text`.
     const optValue = (o) => { const v = __ptGetA(o, 'value'); return v != null ? String(v) : String(o.textContent || '').replace(/\s+/g, ' ').trim(); };
     defAcc(SEL, 'value', function () {
       const opts = selOptions(this); const multiple = __ptHasA(this, 'multiple');
@@ -5255,7 +5108,7 @@
     defFn(SEL, 'namedItem', function namedItem(n) { return selOptions(this).find((o) => o.id === n || __ptGetA(o, 'name') === n) || null; });
     const DL = proto('HTMLDataListElement');
     defGet(DL, 'options', function () { const out = []; __walkTree(this, (n) => { if (isTag(n, 'option')) out.push(n); }); return __collection(out); });
-    // Форма и её элементы.
+    // Forms and their elements.
     const LISTED = new Set(['button', 'fieldset', 'input', 'object', 'output', 'select', 'textarea']);
     const formOf = (el) => {
       const id = __ptGetA(el, 'form');
@@ -5326,13 +5179,12 @@
     const iface = TAG_IFACE[tag];
     if (iface) return __ifaceProto.get(iface) || __htmlProto;
     if (PLAIN_TAGS.has(tag)) return __htmlProto;
-    // Всё, чего в HTML нет, — HTMLUnknownElement, как у браузера.
+    // Anything not in HTML is HTMLUnknownElement, as in Chrome.
     return /^[a-z][a-z0-9]*(-[a-z0-9]+)+$/.test(tag) ? __htmlProto : __ifaceProto.get('HTMLUnknownElement');
   };
   globalThis.__pt_setPendingTag = (tag) => { __pendingTag = String(tag || 'div'); };
-  // `sheet` — таблица стилей самого элемента, та же, что лежит в
-  // `document.styleSheets`. Мы построили список, но с элементом его не связали,
-  // а читают чаще именно так: `document.querySelector('style').sheet.cssRules`.
+  // `sheet` is the element's own stylesheet, the same one in
+  // `document.styleSheets` (`document.querySelector('style').sheet.cssRules`).
   for (const iface of ['HTMLStyleElement', 'HTMLLinkElement']) {
     const proto = globalThis[iface] && globalThis[iface].prototype;
     if (!proto) continue;
@@ -5345,10 +5197,9 @@
       enumerable: true, configurable: true,
     });
   }
-  // `complete` истинно, когда грузить нечего или загрузка уже завершилась —
-  // и ложно, пока она в полёте. Мы отвечали «истина» всегда, в том числе сразу
-  // после присвоения `src`, чего браузер не делает: там сначала `false`, а
-  // `true` приходит вместе с событием.
+  // `complete` is true when there is nothing to load or loading finished, and
+  // false while in flight: right after setting `src` it is `false`, and turns
+  // `true` with the event.
   {
     const proto = globalThis.HTMLImageElement && HTMLImageElement.prototype;
     if (proto) {
@@ -5362,8 +5213,8 @@
       });
     }
   }
-  // Члены HTMLTemplateElement, снятые с Chrome 148. `content` — сам фрагмент,
-  // остальные отражают атрибуты объявленного теневого корня.
+  // HTMLTemplateElement members from Chrome 148. `content` is the fragment;
+  // the rest reflect the declarative shadow root attributes.
   {
     const proto = globalThis.HTMLTemplateElement && HTMLTemplateElement.prototype;
     if (proto) {
@@ -5385,23 +5236,22 @@
       });
     }
   }
-  // Ссылка на прототип холста переживает обрезку глобалей воркерной области:
-  // OffscreenCanvas берёт методы отсюда, когда документа нет.
+  // The canvas prototype reference survives the worker-scope global trim:
+  // OffscreenCanvas takes its methods from here when there is no document.
   try {
     Object.defineProperty(globalThis, '__pt_canvasProto', {
       value: globalThis.HTMLCanvasElement && HTMLCanvasElement.prototype,
       enumerable: false, configurable: true, writable: true,
     });
   } catch (e) {}
-  // SVG — своя лестница, и она глубже HTML: `<path>` это SVGPathElement →
-  // SVGGeometryElement → SVGGraphicsElement → SVGElement → Element. У нас любой
-  // `createElementNS('…/svg', 'path')` был HTMLUnknownElement, и виджет, который
-  // рисует свою галочку из path/line/circle, отдавал сборщику чужие имена.
-  // Цепочки сняты с Chrome 148.
+  // SVG has its own, deeper ladder: `<path>` is SVGPathElement ->
+  // SVGGeometryElement -> SVGGraphicsElement -> SVGElement -> Element. A widget
+  // drawing its checkmark from path/line/circle exposes these names to the
+  // fingerprinter. Chains from Chrome 148.
   const SVG_CHAIN = {"svg":["SVGSVGElement","SVGGraphicsElement","SVGElement"],"path":["SVGPathElement","SVGGeometryElement","SVGGraphicsElement","SVGElement"],"line":["SVGLineElement","SVGGeometryElement","SVGGraphicsElement","SVGElement"],"circle":["SVGCircleElement","SVGGeometryElement","SVGGraphicsElement","SVGElement"],"g":["SVGGElement","SVGGraphicsElement","SVGElement"],"rect":["SVGRectElement","SVGGeometryElement","SVGGraphicsElement","SVGElement"],"text":["SVGTextElement","SVGTextPositioningElement","SVGTextContentElement","SVGGraphicsElement","SVGElement"],"tspan":["SVGTSpanElement","SVGTextPositioningElement","SVGTextContentElement","SVGGraphicsElement","SVGElement"],"defs":["SVGDefsElement","SVGGraphicsElement","SVGElement"],"use":["SVGUseElement","SVGGraphicsElement","SVGElement"],"polygon":["SVGPolygonElement","SVGGeometryElement","SVGGraphicsElement","SVGElement"],"polyline":["SVGPolylineElement","SVGGeometryElement","SVGGraphicsElement","SVGElement"],"ellipse":["SVGEllipseElement","SVGGeometryElement","SVGGraphicsElement","SVGElement"],"image":["SVGImageElement","SVGGraphicsElement","SVGElement"],"clipPath":["SVGClipPathElement","SVGElement"],"mask":["SVGMaskElement","SVGElement"],"pattern":["SVGPatternElement","SVGElement"],"filter":["SVGFilterElement","SVGElement"],"marker":["SVGMarkerElement","SVGElement"],"symbol":["SVGSymbolElement","SVGGraphicsElement","SVGElement"],"title":["SVGTitleElement","SVGElement"],"desc":["SVGDescElement","SVGElement"],"style":["SVGStyleElement","SVGElement"],"a":["SVGAElement","SVGGraphicsElement","SVGElement"],"foreignObject":["SVGForeignObjectElement","SVGGraphicsElement","SVGElement"],"linearGradient":["SVGLinearGradientElement","SVGGradientElement","SVGElement"],"radialGradient":["SVGRadialGradientElement","SVGGradientElement","SVGElement"],"stop":["SVGStopElement","SVGElement"],"animate":["SVGAnimateElement","SVGAnimationElement","SVGElement"],"textPath":["SVGTextPathElement","SVGTextContentElement","SVGGraphicsElement","SVGElement"],"switch":["SVGSwitchElement","SVGGraphicsElement","SVGElement"],"metadata":["SVGMetadataElement","SVGElement"],"view":["SVGViewElement","SVGElement"],"set":["SVGSetElement","SVGAnimationElement","SVGElement"],"script":["SVGScriptElement","SVGElement"]};
   {
     const svgProto = new Map();
-    // Строим снизу вверх: каждая ступень наследует следующей за ней в цепочке.
+    // Built bottom-up: each step inherits from the next one in the chain.
     const protoFor = (chain, i) => {
       const name = chain[i];
       if (svgProto.has(name)) return svgProto.get(name);
@@ -5411,7 +5261,7 @@
       return proto;
     };
     for (const chain of Object.values(SVG_CHAIN)) protoFor(chain, 0);
-    // Промежуточные интерфейсы, которых нет первым звеном ни у одного тега.
+    // Intermediate interfaces that are no tag's first link.
     for (const n of ['SVGGeometryElement', 'SVGGraphicsElement', 'SVGElement',
                      'SVGTextPositioningElement', 'SVGTextContentElement',
                      'SVGGradientElement', 'SVGAnimationElement', 'SVGComponentTransferFunctionElement']) {
@@ -5419,18 +5269,16 @@
     }
     globalThis.__pt_svgProto = (tag) => svgProto.get((SVG_CHAIN[tag] || [])[0]) ||
                                         svgProto.get('SVGElement') || null;
-    // По имени интерфейса, а не тега: измерительные члены должны лечь на
-    // `SVGTextContentElement`, а не на общий `SVGElement`, — страница ходит по
-    // цепочке прототипов и видит, у кого что лежит.
+    // By interface name, not tag: measuring members must sit on
+    // `SVGTextContentElement`, not on `SVGElement`; pages walk the prototype
+    // chain and see where each member lives.
     globalThis.__pt_svgIface = (name) => svgProto.get(name) || null;
   }
 
 
-  // Измерительные члены SVG. Интерфейсы у нас были правильные, а методов не
-  // было ни одного: `getBBox`, `getTotalLength`, `getPointAtLength`,
-  // `getScreenCTM`, `circle.cx` — всё бросало или отдавало пустоту. Это
-  // отдельный измерительный тракт, и им тоже снимают отпечаток: текст меряют
-  // не только холстом, но и рамкой `<text>`.
+  // SVG measuring members (`getBBox`, `getTotalLength`, `getPointAtLength`,
+  // `getScreenCTM`, `circle.cx`). A separate measuring path that is also
+  // fingerprinted: text is measured by canvas and by the `<text>` bbox.
   {
     const P = (n) => (globalThis.__pt_svgIface && __pt_svgIface(n))
       || (globalThis.__pt_svgProto ? __pt_svgProto(n) : null);
@@ -5470,9 +5318,8 @@
       return Number.isFinite(v) ? v : (dflt || 0);
     };
 
-    // Разбор атрибута `d`: точки контура, по которым считаются и рамка, и
-    // длина. Кривые разбиваются на отрезки — так же поступает и браузер, только
-    // с меньшим шагом.
+    // Parse the `d` attribute into contour points used for both bbox and
+    // length. Curves are split into segments, as Chrome does (with a finer step).
     const pathPoints = (d) => {
       const out = [];
       const toks = String(d || '').match(/[MmLlHhVvCcSsQqTtAaZz]|-?[\d.]+(?:e-?\d+)?/g) || [];
@@ -5554,33 +5401,28 @@
     };
 
     def(graphics, 'getBBox', function getBBox() {
-      // Рамку спрашивают у разложенного дерева: без этого правила таблиц
-      // ещё не собраны, и текст меряется не той гарнитурой.
+      // The bbox needs a laid-out tree; otherwise stylesheet rules are not
+      // collected yet and text is measured in the wrong face.
       __relayout();
       const t = (this.localName || '').toLowerCase();
       if (t === 'text' || t === 'tspan') {
-        // Рамка текста: ширина — измеренная и округлённая вверх до
-        // шестьдесят четвёртой пикселя, подъём и высота — из метрик гарнитуры.
-        // Проверено на трёх кеглях.
-        // Кегль и гарнитура берутся из каскада, а не из вычисленного стиля:
-        // тот строит все четыре с лишним сотни свойств, и рамка одного
-        // `<text>` обходилась в восьмую долю секунды.
+        // Text bbox: width measured and rounded up to 1/64 px, ascent and
+        // height from font metrics (verified at three sizes). Size and face come
+        // from the cascade, not computed style, which builds 400+ properties
+        // and cost ~1/8 s per `<text>` bbox.
         if (!__svgLaidOut(this)) return svgRect(0, 0, 0, 0);
         const s = __svgScale(this);
         const fs = __svgSizeEff(__usedFontSize(this) || 16, s);
         const { fam, bold, italic } = __svgFont(this);
-        // Рамка — объединение двух: коробки чернил и коробки раскладки.
-        // Вправо берётся дальняя из них (у «W» чернила вылезают за ширину
-        // знака), влево — только если чернила уходят левее начала («jjj» у
-        // Arial начинается на пиксель левее). Проверено на пяти сочетаниях
-        // гарнитуры с кеглем.
+        // The bbox is the union of the ink box and the layout box: rightward
+        // the farther one ("W" ink overflows its advance), leftward only if
+        // ink starts before the origin (Arial "jjj" starts a pixel left).
+        // Verified on five face/size combinations.
         const txt = __svgText(this);
-        // Текста нет — и рамки нет: браузер отдаёт нули, а не полоску высотой
-        // в строку.
+        // No text, no box: Chrome returns zeros, not a line-high strip.
         if (!txt) return svgRect(0, 0, 0, 0);
-        // Текст под преобразованием браузер раскладывает в кегле, умноженном
-        // на масштаб (усечённом до сотых), ширину округляет вверх до 1/64, а
-        // потом делит обратно — в одинарной точности.
+        // Transformed text is laid out at size * scale (truncated to
+        // hundredths), width rounded up to 1/64, then divided back in float32.
         const m = __textMetrics(txt, fs, fam, bold, italic);
         const adv = m[0] || 0;
         const over = Math.max(m[1] || 0, 0);
@@ -5588,16 +5430,16 @@
         const { asc, desc } = __svgAscDesc(txt, fs, fam);
         const x = num(this, 'x'), y = num(this, 'y');
         if (s === 1) return svgRect(x - over, y - asc, w, asc + desc);
-        // Обратно из масштабированного пространства браузер идёт умножением
-        // на обратный масштаб в одинарной точности, а не делением.
+        // Back from scaled space Chrome multiplies by the inverse scale in
+        // float32 rather than dividing.
         const fr = Math.fround;
         const s32 = fr(s), inv = fr(1 / s32);
         return svgRect(fr(fr(fr(x * s32) - over) * inv), fr(fr(fr(y * s32) - asc) * inv), fr(w * inv), fr((asc + desc) * inv));
       }
       const kids = [...(this.__ptKids || [])].filter((k) => k.nodeType === ELEMENT_NODE);
       if (!outline(this).length && kids.length) {
-        // Рамка группы — объединение рамок детей, каждая в её собственном
-        // преобразовании; числа одинарной точности, как у браузера.
+        // A group's bbox is the union of its children's, each in its own
+        // transform; float32 numbers, as in Chrome.
         const fr = Math.fround;
         let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
         for (const k of kids) {
@@ -5643,10 +5485,9 @@
     });
     def(geometry, 'isPointInStroke', function isPointInStroke(pt) { return this.isPointInFill(pt); });
     acc(geometry, 'pathLength', function pathLength() { return animLength(() => num(this, 'pathLength')); });
-    // Длина строки — это её ширина при раскладке, а не рамка: у рамки бывают
-    // чернила шире знака, и тогда числа расходятся.
-    // Гарнитура и начертание текста SVG — из каскада, а без них — то, что у
-    // документа по умолчанию (Times New Roman у Chrome), а не sans-serif.
+    // Text length is the layout advance, not the bbox (ink can be wider than
+    // the glyph). SVG text face and style come from the cascade, else the
+    // document default (Times New Roman in Chrome), not sans-serif.
     const __svgFont = (el) => {
       const c = __cascadeFor(el);
       let famRaw = c.get('font-family');
@@ -5659,9 +5500,9 @@
       const bold = w === 'bold' || w === 'bolder' || (Number(w) >= 600);
       return { fam, bold, italic };
     };
-    // Масштаб текста: произведение равномерных масштабов преобразований
-    // самого элемента и предков до корня svg — так браузер выбирает кегль
-    // раскладки (`CalculateScreenFontSizeScalingFactor`).
+    // Text scale: product of uniform scales of the element's and ancestors'
+    // transforms up to the svg root; Chrome picks the layout font size this
+    // way (`CalculateScreenFontSizeScalingFactor`).
     const __svgOwnMatrix = (n) => {
       let t = null;
       try { t = __cascadeFor(n).get('transform'); } catch (e) {}
@@ -5683,25 +5524,25 @@
       return s;
     };
     const __svgSizeEff = (fs, s) => (s === 1 ? fs : Math.floor(fs * s * 100 + 1e-7) / 100);
-    // Подъём и спуск строки — из гарнитуры прогона: эмодзи набираются Noto
-    // Color Emoji, и рамка у них по её метрикам (1900/512 на 2048).
+    // Line ascent/descent come from the run's face: emoji use Noto Color
+    // Emoji, with its metrics (1900/512 per 2048).
     const EMOJI_RE = /\p{Extended_Pictographic}/u;
     const __svgAscDesc = (txt, fs, fam) => {
       const fb = __fontBox(fs, fam);
       let asc = fb.asc, desc = fb.desc;
       if (EMOJI_RE.test(txt)) {
         const rest = txt.replace(/\p{Extended_Pictographic}|\uFE0F|\u200D|[\u{1F3FB}-\u{1F3FF}]|\s/gu, '');
-        // У растровой гарнитуры эмодзи подъём и спуск — это границы самой
-        // картинки: то же, что actualBoundingBox у холста (15/4 на 16px,
-        // 23/6 на 24px, 139/38 на 150px).
+        // For the bitmap emoji face ascent and descent are the image bounds,
+        // same as canvas actualBoundingBox (15/4 at 16px, 23/6 at 24px,
+        // 139/38 at 150px).
         const m = __textMetrics(txt, fs, fam, false, false);
         const ea = Math.round(m[3] || fs * 1900 / 2048), ed = Math.round(m[4] || fs * 512 / 2048);
         if (!rest) { asc = ea; desc = ed; } else { asc = Math.max(asc, ea); desc = Math.max(desc, ed); }
       }
       return { asc, desc };
     };
-    // Без раскладки (документ без окна, оторванный узел, дитя хозяина без
-    // слота) длины и рамки у браузера нулевые.
+    // Without layout (windowless document, detached node, unslotted host
+    // child) Chrome returns zero lengths and boxes.
     const __svgLaidOut = (el) => {
       if (!el || !el.isConnected) return false;
       if (el.ownerDocument && el.ownerDocument !== document && !el.ownerDocument.defaultView) return false;
@@ -5717,8 +5558,8 @@
       const txt = __svgText(this);
       if (!txt) return 0;
       const w = Math.ceil(__textWidth(txt, fs, fam, bold, italic) * 64) / 64;
-      // Длина — деление на масштаб в одинарной точности (рамка, напротив,
-      // умножается на обратный: у браузера это два разных пути).
+      // Length divides by the scale in float32 (the bbox multiplies by the
+      // inverse: two different paths in Chrome).
       return s === 1 ? w : Math.fround(w / Math.fround(s));
     });
     def(textContent, 'getSubStringLength', function getSubStringLength(start, n) {
@@ -5732,12 +5573,12 @@
       const txt = full.slice(from, from + len);
       if (!txt) return 0;
       const w = Math.ceil(__textWidth(txt, fs, fam, bold, italic) * 64) / 64;
-      // Длина — деление на масштаб в одинарной точности (рамка, напротив,
-      // умножается на обратный: у браузера это два разных пути).
+      // Length divides by the scale in float32 (the bbox multiplies by the
+      // inverse: two different paths in Chrome).
       return s === 1 ? w : Math.fround(w / Math.fround(s));
     });
-    // Протяжённость знака: рамка строки гарнитуры элемента (подъём и спуск
-    // основного шрифта) шириной в продвижение самого знака.
+    // Char extent: the line box of the element's face (primary font ascent and
+    // descent), as wide as the glyph's advance.
     def(textContent, 'getExtentOfChar', function getExtentOfChar(i) {
       __relayout();
       if (!__svgLaidOut(this)) return svgRect(0, 0, 0, 0);
@@ -5749,8 +5590,8 @@
       if (!full || idx >= full.length) {
         throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'getExtentOfChar' on 'SVGTextContentElement': The index provided (" + idx + ") is outside the range of characters.", 'IndexSizeError');
       }
-      // Знак — вместе с парным суррогатом и модификаторами: у эмодзи одно
-      // продвижение на всю последовательность.
+      // A char includes its surrogate pair and modifiers: an emoji sequence has
+      // one advance.
       const cps = Array.from(full);
       let at = 0, ci = 0;
       for (; ci < cps.length && at + cps[ci].length <= idx; ci++) at += cps[ci].length;
@@ -5766,7 +5607,7 @@
     });
     def(textContent, 'getNumberOfChars', function getNumberOfChars() { return String(this.textContent || '').length; });
 
-    // Геометрические атрибуты — не строки, а `SVGAnimatedLength`.
+    // Geometry attributes are `SVGAnimatedLength`, not strings.
     const GEOM_ATTRS = {
       SVGCircleElement: ['cx', 'cy', 'r'],
       SVGEllipseElement: ['cx', 'cy', 'rx', 'ry'],
@@ -5792,13 +5633,11 @@
     def(svgEl, 'createSVGLength', function createSVGLength() { return svgLength(0); });
   }
 
-  // Опрос кодеков — стандартный блок отпечатка, и он идёт в отчёт челленджа
-  // целиком. Прежнее правило («известный контейнер плюс известный кодек —
-  // significa probably») было втрое шире браузерного: Chrome сверяет кодек
-  // именно с контейнером, и 220 ответов из 597 у нас расходились. Таблица
-  // снята с Chrome 151 на этой машине перебором 597 строк; `audio/mpeg`,
-  // `audio/aac` и `audio/flac` сами себе кодек, поэтому без списка кодеков
-  // отвечают `probably`, остальные известные — `maybe`.
+  // Codec probing is a standard fingerprint block sent whole in the
+  // challenge's report. Chrome matches the codec against the container. Table
+  // from Chrome 151 on this machine, 597 strings; `audio/mpeg`, `audio/aac`
+  // and `audio/flac` are their own codec, so without a codec list they answer
+  // `probably`; other known ones `maybe`.
   {
     const FAMILY = {
       'video/mp4': ['avc1.', 'avc3.', 'hev1.', 'hvc1.', 'av01.', 'vp09.', 'mp4a.40.',
@@ -5820,7 +5659,7 @@
       'audio/aac': [],
       'audio/flac': [],
     };
-    // Эти типы сами себе кодек: контейнер и содержимое одно и то же.
+    // These types are their own codec: container and content are the same.
     const SINGLE = new Set(['audio/mpeg', 'audio/aac', 'audio/flac']);
     const canPlay = function canPlayType(type) {
       const t = String(type == null ? '' : type).trim();
@@ -5839,8 +5678,7 @@
     if (M) {
       try { Object.defineProperty(M, 'canPlayType', { value: canPlay, writable: true, enumerable: true, configurable: true }); } catch (e) {}
     }
-    // Джойстики: браузер отдаёт четыре пустых гнезда, а не пустоту. Заглушка
-    // возвращала `undefined`, и всякий, кто читал `.length`, получал исключение.
+    // Gamepads: Chrome returns four empty slots, not nothing; pages read `.length`.
     const N = globalThis.Navigator && globalThis.Navigator.prototype;
     if (N) {
       const fn = function getGamepads() { return [null, null, null, null]; };
@@ -5851,7 +5689,7 @@
         });
       } catch (e) {}
     }
-    // `MediaSource.isTypeSupported` отвечает тем же знанием, только логическим.
+    // `MediaSource.isTypeSupported` answers from the same table, as a boolean.
     const MS = globalThis.MediaSource;
     if (MS) {
       try {
@@ -5863,24 +5701,23 @@
     }
   }
 
-  // `hidden` — отражаемый атрибут HTMLElement: мы его читали внутри себя, но
-  // наружу не отдавали вовсе, хотя в браузере он есть у каждого элемента.
+  // `hidden` is a reflected HTMLElement attribute present on every element.
   Object.defineProperty(__htmlProto, 'hidden', {
     get() { return __ptHasA(this, 'hidden'); },
     set(v) { if (v) __ptSetA(this, 'hidden', ''); else __ptDelA(this, 'hidden'); },
     enumerable: true, configurable: true,
   });
 
-  // Развес членов по ступеням — списки сняты с Chrome 148. Наши реализации
-  // универсальны (читают атрибуты), поэтому член, который в браузере есть у
-  // нескольких интерфейсов, кладётся на каждый из них тем же дескриптором.
+  // Member distribution per interface, lists from Chrome 148. Our
+  // implementations are generic (they read attributes), so a member present on
+  // several interfaces is installed on each with the same descriptor.
 const CHROME_ELEMENT = ["activeViewTransition","after","animate","append","ariaActiveDescendantElement","ariaAtomic","ariaAutoComplete","ariaBrailleLabel","ariaBrailleRoleDescription","ariaBusy","ariaChecked","ariaColCount","ariaColIndex","ariaColIndexText","ariaColSpan","ariaControlsElements","ariaCurrent","ariaDescribedByElements","ariaDescription","ariaDetailsElements","ariaDisabled","ariaErrorMessageElements","ariaExpanded","ariaFlowToElements","ariaHasPopup","ariaHidden","ariaInvalid","ariaKeyShortcuts","ariaLabel","ariaLabelledByElements","ariaLevel","ariaLive","ariaModal","ariaMultiLine","ariaMultiSelectable","ariaNotify","ariaOrientation","ariaPlaceholder","ariaPosInSet","ariaPressed","ariaReadOnly","ariaRelevant","ariaRequired","ariaRoleDescription","ariaRowCount","ariaRowIndex","ariaRowIndexText","ariaRowSpan","ariaSelected","ariaSetSize","ariaSort","ariaValueMax","ariaValueMin","ariaValueNow","ariaValueText","assignedSlot","attachShadow","attributes","before","checkVisibility","childElementCount","children","classList","className","clientHeight","clientLeft","clientTop","clientWidth","closest","computedStyleMap","currentCSSZoom","customElementRegistry","elementTiming","firstElementChild","getAnimations","getAttribute","getAttributeNS","getAttributeNames","getAttributeNode","getAttributeNodeNS","getBoundingClientRect","getClientRects","getElementsByClassName","getElementsByTagName","getElementsByTagNameNS","getHTML","hasAttribute","hasAttributeNS","hasAttributes","hasPointerCapture","id","innerHTML","insertAdjacentElement","insertAdjacentHTML","insertAdjacentText","lastElementChild","localName","matches","moveBefore","namespaceURI","nextElementSibling","onbeforecopy","onbeforecut","onbeforepaste","onfullscreenchange","onfullscreenerror","onsearch","onwebkitfullscreenchange","onwebkitfullscreenerror","outerHTML","part","prefix","prepend","previousElementSibling","querySelector","querySelectorAll","releasePointerCapture","remove","removeAttribute","removeAttributeNS","removeAttributeNode","replaceChildren","replaceWith","requestFullscreen","requestPointerLock","role","scroll","scrollBy","scrollHeight","scrollIntoView","scrollIntoViewIfNeeded","scrollLeft","scrollTo","scrollTop","scrollWidth","setAttribute","setAttributeNS","setAttributeNode","setAttributeNodeNS","setHTML","setHTMLUnsafe","setPointerCapture","shadowRoot","slot","startViewTransition","tagName","toggleAttribute","webkitMatchesSelector","webkitRequestFullScreen","webkitRequestFullscreen"];
 const CHROME_HTMLELEMENT = ["accessKey","attachInternals","attributeStyleMap","autocapitalize","autofocus","blur","click","contentEditable","dataset","dir","draggable","editContext","enterKeyHint","focus","hidden","hidePopover","inert","innerText","inputMode","isContentEditable","lang","nonce","offsetHeight","offsetLeft","offsetParent","offsetTop","offsetWidth","onabort","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","onauxclick","onbeforeinput","onbeforematch","onbeforetoggle","onbeforexrselect","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncopy","oncuechange","oncut","ondblclick","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","ongotpointercapture","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onload","onloadeddata","onloadedmetadata","onloadstart","onlostpointercapture","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onpaste","onpause","onplay","onplaying","onpointercancel","onpointerdown","onpointerenter","onpointerleave","onpointermove","onpointerout","onpointerover","onpointerrawupdate","onpointerup","onprogress","onratechange","onreset","onresize","onscroll","onscrollend","onscrollsnapchange","onscrollsnapchanging","onsecuritypolicyviolation","onseeked","onseeking","onselect","onselectionchange","onselectstart","onslotchange","onstalled","onsubmit","onsuspend","ontimeupdate","ontoggle","ontransitioncancel","ontransitionend","ontransitionrun","ontransitionstart","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkittransitionend","onwheel","outerText","popover","showPopover","spellcheck","style","tabIndex","title","togglePopover","translate","virtualKeyboardPolicy","writingSuggestions"];
 const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","coords","download","hash","host","hostname","href","hrefTranslate","hreflang","interestForElement","name","origin","password","pathname","ping","port","protocol","referrerPolicy","rel","relList","rev","search","shape","target","text","toString","type","username"],"HTMLBRElement":["clear"],"HTMLBodyElement":["aLink","background","bgColor","link","onafterprint","onbeforeprint","onbeforeunload","onblur","onerror","onfocus","ongamepadconnected","ongamepaddisconnected","onhashchange","onlanguagechange","onload","onmessage","onmessageerror","onoffline","ononline","onpagehide","onpageshow","onpopstate","onrejectionhandled","onresize","onscroll","onstorage","onunhandledrejection","onunload","text","vLink"],"HTMLButtonElement":["checkValidity","command","commandForElement","disabled","form","formAction","formEnctype","formMethod","formNoValidate","formTarget","interestForElement","labels","name","popoverTargetAction","popoverTargetElement","reportValidity","setCustomValidity","type","validationMessage","validity","value","willValidate"],"HTMLCanvasElement":["captureStream","getContext","height","toBlob","toDataURL","transferControlToOffscreen","width"],"HTMLDivElement":["align"],"HTMLFormElement":["acceptCharset","action","autocomplete","checkValidity","elements","encoding","enctype","length","method","name","noValidate","rel","relList","reportValidity","requestSubmit","reset","submit","target"],"HTMLHeadingElement":["align"],"HTMLHtmlElement":["version"],"HTMLIFrameElement":["adAuctionHeaders","align","allow","allowFullscreen","allowPaymentRequest","browsingTopics","contentDocument","contentWindow","credentialless","csp","featurePolicy","frameBorder","getSVGDocument","height","loading","longDesc","marginHeight","marginWidth","name","privateToken","referrerPolicy","sandbox","scrolling","sharedStorageWritable","src","srcdoc","width"],"HTMLImageElement":["align","alt","attributionSrc","border","browsingTopics","complete","crossOrigin","currentSrc","decode","decoding","fetchPriority","height","hspace","isMap","loading","longDesc","lowsrc","name","naturalHeight","naturalWidth","referrerPolicy","sharedStorageWritable","sizes","src","srcset","useMap","vspace","width","x","y"],"HTMLInputElement":["accept","align","alt","autocomplete","checkValidity","checked","defaultChecked","defaultValue","dirName","disabled","files","form","formAction","formEnctype","formMethod","formNoValidate","formTarget","height","incremental","indeterminate","labels","list","max","maxLength","min","minLength","multiple","name","pattern","placeholder","popoverTargetAction","popoverTargetElement","readOnly","reportValidity","required","select","selectionDirection","selectionEnd","selectionStart","setCustomValidity","setRangeText","setSelectionRange","showPicker","size","src","step","stepDown","stepUp","type","useMap","validationMessage","validity","value","valueAsDate","valueAsNumber","webkitEntries","webkitdirectory","width","willValidate"],"HTMLLIElement":["type","value"],"HTMLLabelElement":["control","form","htmlFor"],"HTMLLinkElement":["as","blocking","charset","crossOrigin","disabled","fetchPriority","href","hreflang","imageSizes","imageSrcset","integrity","media","referrerPolicy","rel","relList","rev","sheet","sizes","target","type"],"HTMLMetaElement":["content","httpEquiv","media","name","scheme"],"HTMLOptionElement":["defaultSelected","disabled","form","index","label","selected","text","value"],"HTMLParagraphElement":["align"],"HTMLScriptElement":["async","attributionSrc","blocking","charset","crossOrigin","defer","event","fetchPriority","htmlFor","innerText","integrity","noModule","referrerPolicy","src","text","textContent","type"],"HTMLSelectElement":["add","autocomplete","checkValidity","disabled","form","item","labels","length","multiple","name","namedItem","options","remove","reportValidity","required","selectedIndex","selectedOptions","setCustomValidity","showPicker","size","type","validationMessage","validity","value","willValidate"],"HTMLStyleElement":["blocking","disabled","media","sheet","type"],"HTMLTableElement":["align","bgColor","border","caption","cellPadding","cellSpacing","createCaption","createTBody","createTFoot","createTHead","deleteCaption","deleteRow","deleteTFoot","deleteTHead","frame","insertRow","rows","rules","summary","tBodies","tFoot","tHead","width"],"HTMLTextAreaElement":["autocomplete","checkValidity","cols","defaultValue","dirName","disabled","form","labels","maxLength","minLength","name","placeholder","readOnly","reportValidity","required","rows","select","selectionDirection","selectionEnd","selectionStart","setCustomValidity","setRangeText","setSelectionRange","textLength","type","validationMessage","validity","value","willValidate","wrap"],"HTMLTitleElement":["text"],"HTMLUListElement":["compact","type"],"HTMLVideoElement":["cancelVideoFrameCallback","disablePictureInPicture","getVideoPlaybackQuality","height","onenterpictureinpicture","onleavepictureinpicture","playsInline","poster","requestPictureInPicture","requestVideoFrameCallback","videoHeight","videoWidth","webkitDecodedFrameCount","webkitDroppedFrameCount","width"]};
   {
     const onElement = new Set(CHROME_ELEMENT);
     const onHtml = new Set(CHROME_HTMLELEMENT);
-    const owners = new Map();   // имя -> [прототипы интерфейсов]
+    const owners = new Map();   // name -> [interface prototypes]
     for (const [iface, members] of Object.entries(CHROME_IFACE_MEMBERS)) {
       const proto = __ifaceProto.get(iface);
       if (!proto) continue;
@@ -5895,17 +5732,16 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const d = Object.getOwnPropertyDescriptor(Element.prototype, name);
       if (!d || !d.configurable) continue;
       const targets = onHtml.has(name) ? [__htmlProto] : (owners.get(name) || []);
-      if (!targets.length) continue;   // наше собственное — оставляем как есть
+      if (!targets.length) continue;   // our own member: leave it as is
       for (const proto of targets) {
         if (Object.getOwnPropertyDescriptor(proto, name)) continue;
         try { Object.defineProperty(proto, name, d); } catch (e) {}
       }
       try { delete Element.prototype[name]; } catch (e) {}
     }
-    // Часть членов браузер кладёт и в SVG — они приходят из общей примеси.
-    // Без них у SVG-узла не было ни объявления стиля, ни каскада: `<text
-    // font-size="150">` мерился шестнадцатью пикселями, а `style.fontSize`
-    // не доходил до атрибута.
+    // Some members also go on SVG through a shared mixin; without them an SVG
+    // node had no style declaration or cascade (`<text font-size="150">`
+    // measured at 16px).
     const svgRoot = globalThis.SVGElement && SVGElement.prototype;
     if (svgRoot) {
       for (const name of ['style', 'dataset', 'attributeStyleMap', 'nonce',
@@ -5919,11 +5755,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
   }
 
-  // Форма интерфейсов, снятая с Chrome 148: имя → категория → имена членов.
-  // `Element.prototype` у нас нёс 47 имён против 151, `HTMLElement` — 16 против
-  // 141, у SVGElement не было ни одного. Сборщик отпечатка идёт по цепочке
-  // прототипов перечислимыми ключами, так что каждая недостающая ступень видна
-  // ему сразу. Заполняем только то, чего нет: реализованное не трогаем.
+  // Interface shape from Chrome 148: name -> category -> member names. The
+  // fingerprinter walks the prototype chain by enumerable keys, so any missing
+  // step is visible. Only missing members are filled; implemented ones are
+  // left alone.
   const CHROME_IFACE_SHAPE = {"AudioContext":{"N":["close","createMediaElementSource","createMediaStreamDestination","createMediaStreamSource","getOutputTimestamp","resume","suspend","setSinkId"],"x":["baseLatency","outputLatency","onerror","playbackStats","sinkId","onsinkchange"]},"BaseAudioContext":{"N":["createAnalyser","createBiquadFilter","createBuffer","createBufferSource","createChannelMerger","createChannelSplitter","createConstantSource","createConvolver","createDelay","createDynamicsCompressor","createGain","createIIRFilter","createOscillator","createPanner","createPeriodicWave","createScriptProcessor","createStereoPanner","createWaveShaper","decodeAudioData"],"x":["destination","sampleRate","currentTime","listener","state","onstatechange","audioWorklet"]},"CSSStyleDeclaration":{"#0":["length"],"N":["getPropertyPriority","getPropertyValue","item","removeProperty","setProperty"],"e":["cssText","cssFloat"],"x":["parentRule"]},"DOMTokenList":{"#2":["length"],"N":["entries","keys","values","forEach","add","contains","item","remove","replace","supports","toggle","toString"],"s:a b":["value"]},"Element":{"#0":["scrollTop","scrollLeft","clientTop","clientLeft"],"#1":["childElementCount","currentCSSZoom"],"#18":["scrollHeight","clientHeight"],"#764":["scrollWidth","clientWidth"],"N":["after","animate","append","attachShadow","before","checkVisibility","closest","computedStyleMap","getAnimations","getAttribute","getAttributeNS","getAttributeNames","getAttributeNode","getAttributeNodeNS","getBoundingClientRect","getClientRects","getElementsByClassName","getElementsByTagName","getElementsByTagNameNS","getHTML","hasAttribute","hasAttributeNS","hasAttributes","hasPointerCapture","insertAdjacentElement","insertAdjacentHTML","insertAdjacentText","matches","moveBefore","prepend","querySelector","querySelectorAll","releasePointerCapture","remove","removeAttribute","removeAttributeNS","removeAttributeNode","replaceChildren","replaceWith","requestFullscreen","requestPointerLock","scroll","scrollBy","scrollIntoView","scrollIntoViewIfNeeded","scrollTo","setAttribute","setAttributeNS","setAttributeNode","setAttributeNodeNS","setHTMLUnsafe","setPointerCapture","toggleAttribute","webkitMatchesSelector","webkitRequestFullScreen","webkitRequestFullscreen","ariaNotify","setHTML","startViewTransition"],"e":["slot","elementTiming"],"o":["classList","attributes","part","children","firstElementChild","lastElementChild","nextElementSibling","customElementRegistry"],"s:<div id=\"d\" class=\"a b\"><span>x</span></div>":["outerHTML"],"s:<span>x</span>":["innerHTML"],"s:DIV":["tagName"],"s:a b":["className"],"s:d":["id"],"s:div":["localName"],"s:http://www.w3.org/1999/xhtml":["namespaceURI"],"x":["prefix","shadowRoot","assignedSlot","onbeforecopy","onbeforecut","onbeforepaste","onsearch","onfullscreenchange","onfullscreenerror","onwebkitfullscreenchange","onwebkitfullscreenerror","role","ariaAtomic","ariaAutoComplete","ariaBusy","ariaBrailleLabel","ariaBrailleRoleDescription","ariaChecked","ariaColCount","ariaColIndex","ariaColSpan","ariaCurrent","ariaDescription","ariaDisabled","ariaExpanded","ariaHasPopup","ariaHidden","ariaInvalid","ariaKeyShortcuts","ariaLabel","ariaLevel","ariaLive","ariaModal","ariaMultiLine","ariaMultiSelectable","ariaOrientation","ariaPlaceholder","ariaPosInSet","ariaPressed","ariaReadOnly","ariaRelevant","ariaRequired","ariaRoleDescription","ariaRowCount","ariaRowIndex","ariaRowSpan","ariaSelected","ariaSetSize","ariaSort","ariaValueMax","ariaValueMin","ariaValueNow","ariaValueText","previousElementSibling","activeViewTransition","ariaColIndexText","ariaRowIndexText","ariaActiveDescendantElement","ariaControlsElements","ariaDescribedByElements","ariaDetailsElements","ariaErrorMessageElements","ariaFlowToElements","ariaLabelledByElements"]},"HTMLCanvasElement":{"#150":["height"],"#300":["width"],"N":["captureStream","getContext","toBlob","toDataURL","transferControlToOffscreen"]},"HTMLCollection":{"#1":["length"],"N":["item","namedItem"]},"HTMLElement":{"#-1":["tabIndex"],"#18":["offsetHeight"],"#764":["offsetWidth"],"#8":["offsetTop","offsetLeft"],"F":["hidden","inert","draggable","isContentEditable","autofocus"],"N":["attachInternals","blur","click","focus","hidePopover","showPopover","togglePopover"],"T":["translate","spellcheck"],"e":["title","lang","dir","accessKey","autocapitalize","enterKeyHint","inputMode","virtualKeyboardPolicy","nonce"],"o":["offsetParent","dataset","style","attributeStyleMap"],"s:inherit":["contentEditable"],"s:true":["writingSuggestions"],"s:x":["innerText","outerText"],"x":["editContext","popover","onabort","onbeforeinput","onbeforematch","onbeforetoggle","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncuechange","ondblclick","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onload","onloadeddata","onloadedmetadata","onloadstart","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onpause","onplay","onplaying","onprogress","onratechange","onreset","onresize","onscroll","onscrollend","onsecuritypolicyviolation","onseeked","onseeking","onselect","onslotchange","onstalled","onsubmit","onsuspend","ontimeupdate","ontoggle","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkittransitionend","onwheel","onauxclick","ongotpointercapture","onlostpointercapture","onpointerdown","onpointermove","onpointerup","onpointercancel","onpointerover","onpointerout","onpointerenter","onpointerleave","onselectstart","onselectionchange","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","ontransitionrun","ontransitionstart","ontransitionend","ontransitioncancel","onbeforexrselect","oncopy","oncut","onpaste","onscrollsnapchange","onscrollsnapchanging","onpointerrawupdate"]},"NamedNodeMap":{"#2":["length"],"N":["getNamedItem","getNamedItemNS","item","removeNamedItem","removeNamedItemNS","setNamedItem","setNamedItemNS"]},"NodeList":{"#1":["length"],"N":["entries","keys","values","forEach","item"]},"OfflineAudioContext":{"N":["resume","startRendering","suspend"],"x":["oncomplete","length"]},"Performance":{"#0":["interactionCount"],"#1786865974979.1":["timeOrigin"],"N":["clearMarks","clearMeasures","clearResourceTimings","getEntries","getEntriesByName","getEntriesByType","mark","measure","setResourceTimingBufferSize","toJSON","now"],"o":["timing","navigation","memory","eventCounts"],"x":["onresourcetimingbufferfull"]},"SVGAnimatedLength":{"x":["baseVal","animVal"]},"SVGAnimatedRect":{"x":["baseVal","animVal"]},"SVGAnimatedString":{"x":["baseVal","animVal"]},"SVGAnimatedTransformList":{"x":["baseVal","animVal"]},"SVGCircleElement":{"o":["cx","cy","r"]},"SVGElement":{"#-1":["tabIndex"],"F":["autofocus"],"N":["blur","focus"],"e":["nonce"],"o":["className","ownerSVGElement","viewportElement","dataset","style","attributeStyleMap"],"x":["onabort","onbeforeinput","onbeforematch","onbeforetoggle","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncuechange","ondblclick","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onload","onloadeddata","onloadedmetadata","onloadstart","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onpause","onplay","onplaying","onprogress","onratechange","onreset","onresize","onscroll","onscrollend","onsecuritypolicyviolation","onseeked","onseeking","onselect","onslotchange","onstalled","onsubmit","onsuspend","ontimeupdate","ontoggle","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkittransitionend","onwheel","onauxclick","ongotpointercapture","onlostpointercapture","onpointerdown","onpointermove","onpointerup","onpointercancel","onpointerover","onpointerout","onpointerenter","onpointerleave","onselectstart","onselectionchange","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","ontransitionrun","ontransitionstart","ontransitionend","ontransitioncancel","onbeforexrselect","oncopy","oncut","onpaste","onscrollsnapchange","onscrollsnapchanging","onpointerrawupdate"]},"SVGGeometryElement":{"N":["getPointAtLength","getTotalLength","isPointInFill","isPointInStroke"],"o":["pathLength"]},"SVGGraphicsElement":{"N":["getBBox","getCTM","getScreenCTM"],"o":["transform","nearestViewportElement","farthestViewportElement","requiredExtensions","systemLanguage"]},"SVGLength":{"N":["convertToSpecifiedUnits","newValueSpecifiedUnits"],"#0":["SVG_LENGTHTYPE_UNKNOWN"],"#1":["SVG_LENGTHTYPE_NUMBER"],"#2":["SVG_LENGTHTYPE_PERCENTAGE"],"#3":["SVG_LENGTHTYPE_EMS"],"#4":["SVG_LENGTHTYPE_EXS"],"#5":["SVG_LENGTHTYPE_PX"],"#6":["SVG_LENGTHTYPE_CM"],"#7":["SVG_LENGTHTYPE_MM"],"#8":["SVG_LENGTHTYPE_IN"],"#9":["SVG_LENGTHTYPE_PT"],"#10":["SVG_LENGTHTYPE_PC"],"x":["unitType","value","valueInSpecifiedUnits","valueAsString"]},"SVGLineElement":{"o":["x1","y1","x2","y2"]},"SVGMatrix":{"N":["flipX","flipY","inverse","multiply","rotate","rotateFromVector","scale","scaleNonUniform","skewX","skewY","translate"],"x":["a","b","c","d","e","f"]},"SVGPoint":{"N":["matrixTransform"],"x":["x","y"]},"SVGPointList":{"N":["appendItem","clear","getItem","initialize","insertItemBefore","removeItem","replaceItem"],"x":["length","numberOfItems"]},"SVGRect":{"x":["x","y","width","height"]},"SVGRectElement":{"o":["x","y","width","height","rx","ry"]},"SVGSVGElement":{"#0":["SVG_ZOOMANDPAN_UNKNOWN"],"#1":["currentScale","SVG_ZOOMANDPAN_DISABLE"],"#2":["zoomAndPan","SVG_ZOOMANDPAN_MAGNIFY"],"N":["animationsPaused","checkEnclosure","checkIntersection","createSVGAngle","createSVGLength","createSVGMatrix","createSVGNumber","createSVGPoint","createSVGRect","createSVGTransform","createSVGTransformFromMatrix","deselectAll","forceRedraw","getCurrentTime","getElementById","getEnclosureList","getIntersectionList","pauseAnimations","setCurrentTime","suspendRedraw","unpauseAnimations","unsuspendRedraw","unsuspendRedrawAll"],"o":["x","y","width","height","currentTranslate","viewBox","preserveAspectRatio"]},"SVGStringList":{"N":["appendItem","clear","getItem","initialize","insertItemBefore","removeItem","replaceItem"],"x":["length","numberOfItems"]},"SVGTransformList":{"N":["appendItem","clear","consolidate","createSVGTransformFromMatrix","getItem","initialize","insertItemBefore","removeItem","replaceItem"],"x":["length","numberOfItems"]},"ShadowRoot":{"F":["delegatesFocus","serializable","clonable"],"N":["elementFromPoint","elementsFromPoint","getAnimations","getHTML","getSelection","setHTMLUnsafe","setHTML"],"a":["adoptedStyleSheets"],"e":["innerHTML"],"o":["host","styleSheets","customElementRegistry"],"s:named":["slotAssignment"],"s:open":["mode"],"x":["onslotchange","activeElement","pointerLockElement","fullscreenElement","pictureInPictureElement"]},"SpeechSynthesis":{"F":["pending","speaking","paused"],"N":["cancel","getVoices","pause","resume","speak"],"x":["onvoiceschanged"]},"Storage":{"#0":["length"],"N":["clear","getItem","key","removeItem","setItem"]}};
   globalThis.__pt_fillShapes = () => {
     const native = globalThis.__pt_native || ((f) => f);
@@ -5949,8 +5784,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const C = globalThis[iface];
       const proto = C && C.prototype;
       if (!proto) continue;
-      // "Уже есть" — значит есть на самом интерфейсе или ниже по цепочке DOM,
-      // а не унаследовано от Object.prototype.
+      // "Already present" means on the interface or lower in the DOM chain,
+      // not inherited from Object.prototype.
       const has = (name) => {
         for (let o = proto; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
           if (Object.prototype.hasOwnProperty.call(o, name)) return true;
@@ -5972,10 +5807,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   __pt_fillShapes();
 
 
-  // Доступ к своим кукам в стороннем кадре. Виджет Turnstile его просит, и
-  // браузер после этого помечает запросы кадра отдельным заголовком; у нас
-  // вызов возвращал пустоту, `.then` падал с TypeError, и виджет шёл другой
-  // дорогой.
+  // Storage access in a third-party frame: the Turnstile widget requests it,
+  // and Chrome then marks the frame's requests with a separate header. It must
+  // return a promise.
   try {
     const D = Document.prototype;
     const def = (name, fn) => {
@@ -6020,16 +5854,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   let scriptNodes = [];
 
   // Called by the loader with the Rust-parsed <html> tree.
-  // Документ дочернего окна, построенный на месте — без сети и без движка.
-  // Пустой iframe в браузере получает `<html><head></head><body></body></html>`,
-  // а `srcdoc` — разобранную разметку; и в обоих случаях скрипты внутри
-  // исполняются в этом окне. У нас документ реалма был пуст, поэтому и
-  // `contentDocument.body` был null, и класть туда было некуда.
-  // `DOMParser` и `XMLSerializer` — обычные места в сборе отпечатка, и у нас
-  // это были пустые классы из таблицы имён: вызов бросал `TypeError`. Разбор
-  // идёт тем же разбором, что и присваивание `innerHTML`, а запись — тем же
-  // сериализатором, что и `outerHTML`, только с пространством имён на корне,
-  // как это делает браузер.
+  // A child window's document built in place, no network, no engine: an empty
+  // iframe gets `<html><head></head><body></body></html>`, `srcdoc` gets the
+  // parsed markup, and scripts inside run in that window.
+  // `DOMParser` and `XMLSerializer` are common fingerprint probes. Parsing uses
+  // the `innerHTML` parser, serializing the `outerHTML` serializer plus a
+  // namespace on the root, as Chrome does.
   const VOID_XML = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
     'link', 'meta', 'param', 'source', 'track', 'wbr']);
   globalThis.__pt_lateDom = {
@@ -6043,8 +5873,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         const r = this.parseXml(doc, String(markup == null ? '' : markup));
         let root = r.nodes.find((n) => n.nodeType === ELEMENT_NODE);
         if (r.error) {
-          // Ошибка разбора у Chrome (libxml2): <parsererror> первым ребёнком
-          // корня, а без корня — html/body/parsererror.
+          // Chrome's parse error (libxml2): <parsererror> as the root's first
+          // child, or html/body/parsererror without a root.
           const pe = this.parseErrorNode(doc, r.error);
           if (root) __ptInsert.call(root, pe, root.firstChild);
           else {
@@ -6072,8 +5902,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       __ptAdd.call(doc, root);
       doc.__ptDocEl = root;
       __walkTree(doc, (n) => { n.__ptDoc = doc; });
-      // Документ из строки готов сразу, окна у него нет (`location` — своё
-      // свойство, null), а класс — HTMLDocument или XMLDocument, как у Chrome.
+      // A document from a string is complete immediately and has no window
+      // (`location` own property, null); class HTMLDocument or XMLDocument.
       doc.__ptReady = 'complete';
       try {
         const g = function () { return null; };
@@ -6091,8 +5921,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       } catch (e) {}
       return doc;
     },
-    // ---- XML: разбор по правилам XML с ошибками в словах libxml2 — так их
-    // показывает Chrome (`error on line L at column C: …`).
+    // ---- XML: parsed by XML rules with libxml2-worded errors, as Chrome
+    // shows them (`error on line L at column C: …`).
     parseXml(doc, src) {
       const out = { nodes: [], error: null };
       let i = 0; const n = src.length; let line = 1, ls = 0;
@@ -6167,14 +5997,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       return pe;
     },
     serializeXml(node) {
-      // Документ целиком — это его корневой элемент с xmlns.
+      // A whole document serializes as its root element with xmlns.
       if (node && node.nodeType === 9 && node.documentElement) node = node.documentElement;
       const one = (n, root) => {
         if (n.nodeType === TEXT_NODE) return esc(String(n.data), false);
         if (n.nodeType === COMMENT_NODE) return '<!--' + n.data + '-->';
         if (n.nodeType !== ELEMENT_NODE) {
-          // Дети обрывка (в том числе теневого корня) — каждый сам себе корень:
-          // xmlns у каждого элемента верхнего уровня, как у Chrome.
+          // Fragment children (shadow root included) are each a root: xmlns on
+          // every top-level element, as in Chrome.
           return (n.__ptKids || []).map((c) => one(c, root)).join('');
         }
         const tag = n.localName;
@@ -6185,22 +6015,19 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         if (!kids && VOID_XML.has(tag)) return '<' + tag + attrs + ' />';
         return '<' + tag + attrs + '>' + kids + '</' + tag + '>';
       };
-      // Обрывок и теневой корень: их дети верхнего уровня — корни (xmlns).
+      // Fragment and shadow root: their top-level children are roots (xmlns).
       return one(node, node && (node.nodeType === ELEMENT_NODE || node.nodeType === DOCUMENT_FRAGMENT_NODE));
     },
   };
 
-  // `window.length` и `window.frames[i]` — счёт живых кадров. У нас там
-  // стоял ноль при любом числе рамок, а это первое, что спрашивают о
-  // странице: у браузера длина равна числу кадров, а по номеру лежит их
-  // окно. Пересчитывается по дереву, чтобы не разъезжаться со вставками.
+  // `window.length` and `window.frames[i]` count live frames, recomputed from
+  // the tree so they stay in sync with insertions.
   {
     const frameEls = () => {
       const out = [];
       const doc = globalThis.document;
       if (!doc || !doc.documentElement) return out;
-      // Только светлое дерево: кадры внутри теневых корней в `window.length`
-      // у Chrome не считаются.
+      // Light tree only: Chrome does not count frames inside shadow roots.
       const walk = (n) => {
         if (n.nodeType === ELEMENT_NODE && (n.__ptLocal === 'iframe' || n.__ptLocal === 'frame')) out.push(n);
         for (const k of (n.__ptKids || [])) walk(k);
@@ -6217,10 +6044,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         enumerable: true, configurable: true,
       });
     } catch (e) {}
-    // Номерные свойства окна: браузер держит ровно столько, сколько кадров,
-    // и держит их значениями — не переписываемыми, перечислимыми. У нас
-    // стояло шестнадцать акцессоров всегда, и страница без единого кадра
-    // показывала шестнадцать номеров, которых у браузера нет.
+    // Indexed window properties: exactly one per frame, as data properties
+    // (non-writable, enumerable), not a fixed set of accessors.
     globalThis.__pt_frameAt = (i) => {
       const els = frameEls();
       return i >= 0 && i < els.length ? windowOf(els[i]) : undefined;
@@ -6245,13 +6070,13 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
 
   // ---- Content Security Policy ---------------------------------------------
-  // Политика документа — из заголовка ответа (движок зовёт `__pt_applyCsp`) и
-  // из `<meta http-equiv="content-security-policy">`. Считается только
-  // `script-src` (с откатом к `default-src`): без 'unsafe-eval' строка в
-  // eval/Function/setTimeout бросает EvalError с текстом Chrome, WebAssembly
-  // без 'wasm-unsafe-eval' — CompileError, воркер с blob:/data: — SecurityError,
-  // инлайн-скрипт без nonce не исполняется, и документ получает
-  // securitypolicyviolation.
+  // Document policy from the response header (the engine calls
+  // `__pt_applyCsp`) and `<meta http-equiv="content-security-policy">`. Only
+  // `script-src` (falling back to `default-src`) is enforced: without
+  // 'unsafe-eval' a string in eval/Function/setTimeout throws EvalError with
+  // Chrome's text, WebAssembly without 'wasm-unsafe-eval' a CompileError, a
+  // blob:/data: worker a SecurityError; an inline script without nonce does
+  // not run, and the document gets securitypolicyviolation.
   const __csp = { policies: [] };
   const __cspParse = (text) => {
     const out = {};
@@ -6266,7 +6091,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   const __cspScriptDirective = (p) => (p.dirs['script-src'] ? ['script-src', p.dirs['script-src']] : (p.dirs['default-src'] ? ['default-src', p.dirs['default-src']] : null));
   const __cspHas = (list, kw) => list.some((t) => t.toLowerCase() === kw);
   const __cspDirectiveText = (name, list) => name + (list.length ? ' ' + list.join(' ') : '');
-  // Строка и столбец места вызова — из стека, первый кадр страницы.
+  // Line and column of the call site, from the stack's first page frame.
   const __cspSite = () => {
     try {
       const st = String(new Error().stack || '').split('\n');
@@ -6277,8 +6102,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     } catch (e) {}
     return { file: '', line: 0, column: 0 };
   };
-  // SecurityPolicyViolationEvent с полями из init: заглушка интерфейса их не
-  // отражала (blockedURI отвечал undefined).
+  // SecurityPolicyViolationEvent with fields from init (the interface stub
+  // did not reflect them).
   const __spveState = new WeakMap();
   const __SPVE_FIELDS = [['documentURI', ''], ['referrer', ''], ['blockedURI', ''], ['effectiveDirective', ''], ['violatedDirective', ''], ['originalPolicy', ''], ['sourceFile', ''], ['sample', ''], ['disposition', 'enforce'], ['statusCode', 0], ['lineNumber', 0], ['columnNumber', 0]];
   const __spveEnsure = () => {
@@ -6311,8 +6136,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     try { Object.defineProperty(globalThis, 'SecurityPolicyViolationEvent', { value: nat(C, 'SecurityPolicyViolationEvent'), writable: true, enumerable: false, configurable: true }); } catch (e) {}
     return C;
   };
-  // Адрес в отчёте о нарушении: у http(s) — без учётных данных и якоря, у
-  // остальных схем (about:srcdoc, blob:) — одна схема, как у браузера.
+  // URL in a violation report: http(s) without credentials and fragment,
+  // other schemes (about:srcdoc, blob:) just the scheme, as in Chrome.
   const __cspStripURL = (u) => {
     u = String(u || ''); if (!u) return '';
     if (/^https?:|^wss?:/.test(u)) { try { const x = new URL(u); x.username = ''; x.password = ''; x.hash = ''; return x.href; } catch (e) { return u; } }
@@ -6336,28 +6161,28 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     for (const p of __csp.policies) {
       const d = __cspScriptDirective(p);
       if (!d || __cspHas(d[1], "'unsafe-eval'")) continue;
-      // Текст Chrome 151 — с его же висячей кавычкой в конце.
+      // Chrome 151's text, trailing quote included.
       return { name: d[0], list: d[1], msg: "Evaluating a string as JavaScript violates the following Content Security Policy directive because 'unsafe-eval' is not an allowed source of script: " + __cspDirectiveText(d[0], d[1]) + "\".\n" };
     }
     return null;
   };
   // ---- Trusted Types ---------------------------------------------------
-  // `require-trusted-types-for 'script'`: строка в стоке кода (eval, Function,
-  // таймер со строкой, text у <script>, innerHTML, srcdoc, document.write)
-  // идёт через политику по умолчанию, а без неё — отказ словами Chrome и
-  // нарушение `trusted-types-sink`. Проверка TT идёт раньше CSP-проверки
-  // 'unsafe-eval': у Chrome в документе с обеими eval отвечает ошибкой TT.
+  // `require-trusted-types-for 'script'`: a string reaching a code sink (eval,
+  // Function, string timer, <script> text, innerHTML, srcdoc, document.write)
+  // goes through the default policy; without one it is refused with Chrome's
+  // words and a `trusted-types-sink` violation. TT is checked before CSP
+  // 'unsafe-eval': with both, Chrome's eval throws the TT error.
   const __ttRequired = () => __csp.policies.some((p) => (p.dirs['require-trusted-types-for'] || []).some((t) => t.replace(/'/g, '').toLowerCase() === 'script'));
   globalThis.__pt_ttRequired = __ttRequired;
   globalThis.__pt_ttNames = () => { for (const p of __csp.policies) { const l = p.dirs['trusted-types']; if (l) return l.slice(); } return null; };
   const __ttViolation = (sink, value) => __cspViolation('require-trusted-types-for', ["'script'"], 'trusted-types-sink', sink + '|' + String(value), {});
   const __TT_MEMBER = { TrustedHTML: 'createHTML', TrustedScript: 'createScript', TrustedScriptURL: 'createScriptURL' };
-  // Доверенное значение узнаётся и из другого реалма (у Chrome проверка по
-  // типу обёртки, не по прототипу этого окна): по бренду toStringTag.
+  // A trusted value is recognised across realms (Chrome checks the wrapper
+  // type, not this window's prototype): by its toStringTag brand.
   const __ttIs = (kind, v) => { try { if (!v || typeof v !== 'object') return false; const tt = globalThis.trustedTypes; if (tt && (kind === 'TrustedHTML' ? tt.isHTML(v) : kind === 'TrustedScript' ? tt.isScript(v) : tt.isScriptURL(v))) return true; return Object.prototype.toString.call(v) === '[object ' + kind + ']'; } catch (e) { return false; } };
-  // Строка, пригодная для стока: Trusted-объект — его текст; без требования
-  // TT — значение как есть (сток сам приводит к строке); иначе — через
-  // политику по умолчанию, с отказом по правилам Chrome.
+  // A string fit for a sink: a Trusted object gives its text; without TT the
+  // value as is (the sink stringifies); otherwise via the default policy,
+  // refused per Chrome's rules.
   globalThis.__pt_ttSink = (kind, sink, value, prefix, strict) => {
     if (__ttIs(kind, value)) return String(value);
     if (!__ttRequired() || __csp.ttSkip) return value;
@@ -6368,16 +6193,15 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (typeof rule !== 'function') throw fail(" and no 'default' policy for '" + kind + "' has been defined");
     const r = rule.call(undefined, String(value), kind, sink);
     if (r === null || r === undefined) throw fail(" and the 'default' policy failed to execute");
-    // Ответ политики приводится к строке (Symbol — отказ привязки); для
-    // eval он обязан совпасть с исходной строкой — политика там может
-    // только разрешить, не переписать.
+    // The policy result is stringified (a Symbol fails the binding); for eval
+    // it must equal the input: there the policy may only allow, not rewrite.
     if (typeof r === 'symbol') throw __pt_mkErr(TypeError, "Failed to execute 'invoke' on '" + __TT_MEMBER[kind].replace('create', 'Create') + "Callback': Failed to convert value to 'String'.");
     const out = String(r);
     if (strict && out !== String(value)) throw fail(" and the 'default' policy failed to execute");
     return out;
   };
-  // eval / new Function: зовётся из крючка порождения кода (modify_codegen в
-  // pool) — строка кода после политики по умолчанию или null (EvalError).
+  // eval / new Function: called from the codegen hook (modify_codegen in
+  // pool); returns the code after the default policy, or null (EvalError).
   globalThis.__pt_ttEval = (source) => {
     const src = String(source);
     if (!__ttRequired() || __csp.ttBypass) return src;
@@ -6392,7 +6216,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     return null;
   };
-  // Разрешён ли адрес скрипта по списку источников (без учёта nonce/hash).
+  // Whether a script URL is allowed by a source list (ignoring nonce/hash).
   const __cspAllowsUrl = (list, url, nonce) => {
     const u = String(url || '');
     if (nonce && list.some((t) => t.toLowerCase() === "'nonce-" + nonce.toLowerCase() + "'" || t === "'nonce-" + nonce + "'")) return true;
@@ -6405,7 +6229,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (low === "'self'") { if (self_ && u.indexOf(self_ + '/') === 0) return true; continue; }
       if (/^[a-z][a-z0-9+.-]*:$/i.test(low)) { if (scheme && low === scheme.toLowerCase() + ':') return true; continue; }
       if (low.charAt(0) === "'") continue;
-      // host-source: сравнить схему+хост(+порт), звёздочка в начале хоста.
+      // host-source: compare scheme+host(+port), leading wildcard in host.
       try {
         const hs = low.indexOf('://') > 0 ? low : ((globalThis.location && location.protocol) || 'https:') + '//' + low;
         const want = new URL(hs.replace(/\*\./g, 'wild.')), got = new URL(u, (globalThis.location && location.href) || undefined);
@@ -6420,7 +6244,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     return false;
   };
-  // Инлайн-скрипт: nonce/hash/'unsafe-inline' (последний отменяется nonce/hash).
+  // Inline script: nonce/hash/'unsafe-inline' (the last is voided by nonce/hash).
   const __cspAllowsInline = (el) => {
     for (const p of __csp.policies) {
       const d = __cspScriptDirective(p);
@@ -6443,7 +6267,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __cspViolation(v.name, v.list, 'inline', '', { violatedDirective: 'script-src-elem', effectiveDirective: 'script-src-elem', sourceFile: __cspStripURL(String((globalThis.location && location.href) || '')), lineNumber: (typeof __pt_markupLine === 'function' ? __pt_markupLine(String(el.textContent || '')) : 0) || 0, columnNumber: 0, noSite: true });
     return true;
   };
-  // Обработчик в атрибуте (`onclick="…"`): script-src-attr.
+  // Attribute handler (`onclick="…"`): script-src-attr.
   globalThis.__pt_cspBlocksHandler = (el, name, code) => {
     const v = __cspAllowsInline(null);
     if (!v) return false;
@@ -6465,8 +6289,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     return false;
   };
-  // Нарушение от прямого eval/Function: зовётся из подменённого источника
-  // (см. modify_codegen в pool) перед броском EvalError.
+  // Violation from a direct eval/Function: called from the codegen hook
+  // (modify_codegen in pool) before the EvalError is thrown.
   try { Object.defineProperty(globalThis, '__pt_cspEvalViolation', { value: () => { const e = __cspEvalMessage(); if (e) __cspViolation(e.name, e.list, 'eval'); }, writable: true, enumerable: false, configurable: true }); } catch (e) {}
   const __cspWrapEval = () => {
     const ev = __cspEvalMessage();
@@ -6477,12 +6301,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if ((!ev && !tt) || __csp.wrapped) return;
     __csp.wrapped = true;
     const nat = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
-    // Конструкторы функций из строки: Function и его async/generator-родня,
-    // в том числе через `.constructor` у прототипов.
+    // String function constructors: Function and its async/generator kin,
+    // including via prototypes' `.constructor`.
     try {
       const evalErr = () => { const e = __cspEvalMessage(); __cspViolation(e.name, e.list, 'eval'); return new EvalError(e.msg); };
-      // Под Trusted Types строку конструктора собирает сам V8:
-      // `(function anonymous(a\n) {\nbody\n})` — так её и видит политика.
+      // Under Trusted Types V8 builds the constructor source itself:
+      // `(function anonymous(a\n) {\nbody\n})`, and the policy sees that.
       const ttFn = (real, a) => {
         const kind = real.name === 'AsyncGeneratorFunction' ? 'async function*' : real.name === 'GeneratorFunction' ? 'function*' : real.name === 'AsyncFunction' ? 'async function' : 'function';
         const params = a.length > 1 ? a.slice(0, -1).map(String).join(',') : '';
@@ -6508,8 +6332,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         if (real === globalThis.Function) { try { Object.defineProperty(globalThis, 'Function', { value: masked, writable: true, enumerable: false, configurable: true }); } catch (e) {} }
       }
     } catch (e) {}
-    // Таймеры со строкой: у Chrome вызов отвечает номером, строка не
-    // исполняется, документ получает нарушение с blockedURI 'eval'.
+    // String timers: Chrome returns an id, does not run the string, and
+    // reports a violation with blockedURI 'eval'.
     for (const name of ['setTimeout', 'setInterval']) {
       try {
         const real = globalThis[name]; if (typeof real !== 'function') continue;
@@ -6518,7 +6342,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         Object.defineProperty(globalThis, name, { value: nat(w, name), writable: true, enumerable: true, configurable: true });
       } catch (e) {}
     }
-    // WebAssembly: компиляция и инстанцирование.
+    // WebAssembly: compile and instantiate.
     if (ev) try {
       const W = globalThis.WebAssembly;
       if (W) {
@@ -6540,21 +6364,21 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         }
       }
     } catch (e) {}
-    // Воркеры: адрес скрипта против script-src (blob:/data: без явной схемы — нет).
+    // Workers: script URL against script-src (blob:/data: only if listed).
     for (const name of ['Worker', 'SharedWorker']) {
       try {
         const real = globalThis[name]; if (typeof real !== 'function') continue;
         const w = function (url, opts) {
           if (!new.target) throw __pt_mkErr(TypeError, "Failed to construct '" + name + "': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
           const u = String(url);
-          // Происхождение раньше политики: чужой blob-адрес — SecurityError.
+          // Origin before policy: a foreign blob URL is a SecurityError.
           if (u.slice(0, 5) === 'blob:') {
             let o = 'null'; try { o = new URL(u).origin; } catch (e) {}
             const mine = (globalThis.location && location.origin) || 'null';
             if (o === 'null' || o !== mine) throw __pt_mkErr(globalThis.DOMException || Error, "Failed to construct '" + name + "': Script at '" + u + "' cannot be accessed from origin '" + mine + "'.", 'SecurityError');
           }
           for (const p of __csp.policies) {
-            // Для воркера: worker-src, иначе child-src, иначе script-src/default-src.
+            // For workers: worker-src, else child-src, else script-src/default-src.
             const d = p.dirs['worker-src'] ? ['worker-src', p.dirs['worker-src']] : (p.dirs['child-src'] ? ['child-src', p.dirs['child-src']] : __cspScriptDirective(p));
             if (!d) continue;
             if (__cspAllowsUrl(d[1], u, '')) continue;
@@ -6562,8 +6386,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
             __cspReport("Refused to create a worker from '" + u + "' because it violates the following Content Security Policy directive: \"" + text + "\"." + (d[0] === 'worker-src' ? '\n' : " Note that 'worker-src' was not explicitly set, so '" + d[0] + "' is used as a fallback.\n"));
             const scheme = (u.match(/^([a-z][a-z0-9+.-]*):/i) || [])[1];
             __cspViolation(d[0], d[1], /^(blob|data|filesystem)$/i.test(scheme || '') ? scheme.toLowerCase() : u, '', { violatedDirective: 'worker-src', effectiveDirective: 'worker-src' });
-            // У браузера конструктор отвечает объектом, а скрипт не грузится:
-            // воркер получает событие error.
+            // Chrome returns an object but does not load the script; the
+            // worker gets an error event.
             const dead = Reflect.construct(real, ['data:text/javascript,', opts], new.target);
             try { dead.terminate(); } catch (e) {}
             __ptLater(() => { try { dead.dispatchEvent(new ErrorEvent('error', { message: 'Failed to load worker script' })); } catch (e) {} }, 0);
@@ -6589,7 +6413,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __cspWrapEval();
   };
   globalThis.__pt_cspActive = () => __csp.policies.length > 0;
-  // Мета-политика документа: применяется, как только разметка разобрана.
+  // Document meta policy: applied as soon as the markup is parsed.
   globalThis.__pt_cspFromMeta = (root) => {
     try {
       if (__csp.headerDelivered) __walkTree(root, (n) => { try { if (n && n.nodeType === ELEMENT_NODE && typeof n.__ptHideNonce === 'function') n.__ptHideNonce(); } catch (e) {} });
@@ -6598,8 +6422,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       for (const m of metas) { const c = __ptGetA(m, 'content'); if (c) __pt_applyCsp(c, 'meta'); }
     } catch (e) {}
   };
-  // Строка разметки, с которой начинается текст: для номеров строк стека и
-  // нарушений CSP (браузер считает их от начала документа).
+  // The markup line a text starts at, for stack and CSP line numbers (Chrome
+  // counts from the start of the document).
   globalThis.__pt_markupLine = (text) => {
     try {
       const m = document.__ptMarkup; if (typeof m !== 'string' || !text) return 0;
@@ -6620,7 +6444,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     let body = __tags(root, 'body')[0];
     if (!body) {
       body = document.createElement('body');
-      // Всё, что разметка положила мимо head, — содержимое тела.
+      // Anything the markup put outside head is body content.
       const head = __tags(root, 'head')[0];
       for (const n of root.childNodes.slice ? root.childNodes.slice() : Array.from(root.childNodes)) {
         if (n !== head) { root.removeChild(n); body.appendChild(n); }
@@ -6629,12 +6453,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     document.__ptKids = [];
     document.__ptDocEl = null;
-    // Политика — до подключения дерева: скрипты исполняются при подключении.
+    // Policy before attaching the tree: scripts run on attach.
     __pt_cspFromMeta(root);
     document.appendChild(root);
     document.__ptDocEl = root;
     document.__ptReady = 'complete';
-    // Скрипты разметки исполняются здесь и сейчас, в этом окне.
+    // Markup scripts run here and now, in this window.
     for (const el of __tags(root, 'script')) {
       try { el.__ptRunScript(); } catch (e) {}
     }
@@ -6646,11 +6470,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     document.__ptKids = [];
     document.__ptDocEl = null;
     document.__ptCurScript = null;
-    // `<!DOCTYPE html>` — это узел документа, первый его ребёнок, а не флаг.
+    // `<!DOCTYPE html>` is a node, the document's first child, not a flag.
     document.__ptDoctype = null;
     if (dt) {
-      // Узел обязан называть себя: `Object.prototype.toString.call(doctype)` —
-      // `[object DocumentType]`, как у всякого интерфейса.
+      // `Object.prototype.toString.call(doctype)` must be `[object DocumentType]`.
       try {
         if (globalThis.DocumentType && !Object.getOwnPropertyDescriptor(DocumentType.prototype, Symbol.toStringTag)) {
           Object.defineProperty(DocumentType.prototype, Symbol.toStringTag, { value: 'DocumentType', configurable: true });
@@ -6674,20 +6497,18 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       document.__ptDocEl = html;
     }
     scriptNodes = __docTags(document, 'script');
-    // Пока идут собственные скрипты документа, браузер отвечает 'loading', и
-    // код это читает: «если не loading — запускайся сразу, иначе жди
-    // DOMContentLoaded». Мы отвечали 'interactive' с самого начала, то есть
-    // всегда первую ветку.
+    // While the document's own scripts run, readyState is 'loading'; code
+    // branches on it ("not loading: start now, else wait for DOMContentLoaded").
     document.__ptReady = 'loading';
   };
 
   // The loader brackets each page script with these so `document.currentScript`
   // (and therefore document.write's insertion point) is correct while it runs.
   // The index matches the loader's document-order script list.
-  // Скрипт документа — задача; дольше 50 мс — запись long-animation-frame.
+  // A document script is a task; over 50 ms it gets a long-animation-frame entry.
   let __ptScriptT0 = 0;
   globalThis.__pt_beginScript = (i) => { document.__ptCurScript = scriptNodes[i] || null; try { __ptScriptT0 = performance.now(); } catch (e) {} };
-  // Скрипт документа под CSP: заблокирован ли (инлайн без nonce, чужой адрес).
+  // Whether a document script is blocked by CSP (inline without nonce, foreign URL).
   globalThis.__pt_cspScriptBlocked = (i) => {
     try {
       if (!__pt_cspActive()) return false;
@@ -6712,12 +6533,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   };
 
   // Called after all page scripts have run: fire DOMContentLoaded then load.
-  // Разбор кончился: дальше идут отложенные скрипты, и видят они уже
-  // `interactive`, как в браузере.
-  // Отметки навигации (domInteractive, DOMContentLoaded, load) — в тот
-  // миг, когда событие и правда случилось. Мы ставили их все равными концу
-  // ответа, и длительность навигации кадра выходила в два-три раза короче
-  // хромовской: у браузера туда входит разбор документа и его скрипты.
+  // Parsing is done: deferred scripts run next and see `interactive`.
+  // Navigation marks (domInteractive, DOMContentLoaded, load) are taken when
+  // each event really happens; Chrome's navigation timing includes document
+  // parsing and its scripts.
   const __ptMark = (n) => { try { globalThis.__pt_markNav && __pt_markNav(n); } catch (e) {} };
   globalThis.__pt_parseDone = () => {
     if (document.__ptReady !== 'loading') return;
@@ -6726,23 +6545,23 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     try { document.dispatchEvent(__ptTrust(new Event('readystatechange'))); } catch (e) {}
   };
   globalThis.__pt_finishLoad = () => {
-    // Смена готовности видна страницам: `readystatechange` браузер шлёт на
-    // каждом шаге, и слушают его наравне с `DOMContentLoaded`.
-    const готовность = (v) => {
+    // readyState changes are visible: Chrome fires `readystatechange` at each
+    // step.
+    const setReadyState = (v) => {
       document.__ptReady = v;
       try { document.dispatchEvent(__ptTrust(new Event('readystatechange'))); } catch (e) {}
     };
-    // Разбор мог кончиться раньше — перед отложенными скриптами.
-    if (document.__ptReady === 'loading') { __ptMark('interactive'); готовность('interactive'); }
+    // Parsing may have finished earlier, before deferred scripts.
+    if (document.__ptReady === 'loading') { __ptMark('interactive'); setReadyState('interactive'); }
     __ptMark('dclStart');
-    // События жизненного цикла приходят от движка, а движок здесь — браузер:
-    // у настоящего `e.isTrusted` истина, и это читают первой же строкой.
+    // Lifecycle events come from the browser: `e.isTrusted` is true, and
+    // pages check it first.
     const dcl = __ptTrust(new Event('DOMContentLoaded', { bubbles: true }));
     document.dispatchEvent(dcl);
-    // Событие всплывает с документа на окно, и слушают его чаще именно там:
-    // `window.addEventListener('DOMContentLoaded', …)` — так api.js Turnstile
-    // ставит свой авторендер. Наш всплыть не мог: окно и документ у нас разные
-    // цели, — и виджет на странице с `.cf-turnstile` не появлялся вовсе.
+    // The event bubbles from document to window, where it is most often
+    // listened for: Turnstile's api.js sets up auto-render via
+    // `window.addEventListener('DOMContentLoaded', …)`. Window and document are
+    // separate targets here, so dispatch it on the window explicitly.
     try {
       if (globalThis.dispatchEvent) {
         try { dcl.target = document; dcl.currentTarget = globalThis; } catch (e) {}
@@ -6751,16 +6570,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     } catch (e) {}
     __ptMark('dclEnd');
     __ptMark('complete');
-    готовность('complete');
+    setReadyState('complete');
     __ptMark('loadStart');
     const load = __ptTrust(new Event('load'));
     globalThis.dispatchEvent && globalThis.dispatchEvent(load);
-    // `load` в браузере доходит и до документа, и до тела.
+    // In Chrome `load` reaches the document and the body too.
     try { document.dispatchEvent(__ptTrust(new Event('load'))); } catch (e) {}
     __ptMark('loadEnd');
-    // `pageshow` идёт следом за `load` — с `persisted: false` у обычной
-    // загрузки. Его слушают те, кто отличает переход «назад» от свежей
-    // загрузки; у нас его не было вовсе.
+    // `pageshow` follows `load`, with `persisted: false` on a normal load.
     try {
       const ps = __ptTrust(new Event('pageshow'));
       try { Object.defineProperty(ps, 'persisted', { value: false, enumerable: true, configurable: true }); }
@@ -6769,9 +6586,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     } catch (e) {}
   };
 
-  // window is an EventTarget too. Таблица слушателей нужна окну всегда: с
-  // цепочкой из шаблона V8 методы окно наследует от EventTarget.prototype
-  // сразу, и ветка ниже не срабатывает.
+  // window is an EventTarget too. The window always needs its listener table:
+  // with the V8 template chain it inherits from EventTarget.prototype at once,
+  // and the branch below does not run.
   if (!Object.prototype.hasOwnProperty.call(globalThis, '__ptLis')) {
     try { Object.defineProperty(globalThis, '__ptLis', { value: Object.create(null), enumerable: false, writable: true, configurable: true }); } catch (e) {}
   }
@@ -6842,21 +6659,18 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // things drivers need: (a) a non-empty box + coordinates for visibility and
   // click-point computation, and (b) a reversible point→element mapping so an
   // Input mouse event at a computed coordinate hits the intended element.
-  // Окно документа — то же окно, что и `innerWidth`/`innerHeight`: у браузера
-  // `documentElement.clientWidth` и `innerWidth` описывают один прямоугольник.
-  // Мы держали здесь 1280×720 независимо от них, и страница видела два разных
-  // окна сразу — несостыковка, которую ищут первым делом.
+  // The document viewport is the same as `innerWidth`/`innerHeight`: in Chrome
+  // `documentElement.clientWidth` and `innerWidth` describe one rectangle.
   const LAYOUT = {
     W: (globalThis.innerWidth | 0) || 1280,
     H: (globalThis.innerHeight | 0) || 720,
     ROW: 20,
   };
-  // Окно кадра — это его собственный `<iframe>`, а не страница: у виджета
-  // Turnstile внутри 300×65, и он этот размер читает. Движок сообщает его сюда
-  // сразу после создания контекста.
-  // Кадр с `display: none` браузер не раскладывает вовсе: у тела внутри
-  // ширина остаётся `auto`, а не числом. Признак ставит хозяйская страница,
-  // когда видит, что у её `<iframe>` коробки нет.
+  // A frame's viewport is its own `<iframe>`, not the page (the Turnstile
+  // widget is 300x65 and reads it). The engine reports it right after
+  // creating the context.
+  // Chrome does not lay out a `display: none` frame: the body width inside
+  // stays `auto`. The host page sets the flag when its `<iframe>` has no box.
   let __rendered = true;
   globalThis.__pt_setRendered = (on) => {
     on = !!on;
@@ -6865,12 +6679,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __layoutBuilt = -1;
   };
 
-  // Пересчитать раскладку этого документа. Зовёт соседний реалм: окно
-  // страницы меряет узлы своего кадра, а раскладывает их кадр сам.
+  // Relayout this document. Called from another realm: the page measures its
+  // frame's nodes, and the frame lays them out itself.
   globalThis.__pt_relayout = () => { try { __relayout(); } catch (e) {} };
 
-  // Окно кадра, вынутого из документа: у браузера это закрытый контекст.
-  // Страница, оставившая себе ссылку на окно, читает нули и `closed`.
+  // The window of a frame removed from the document: a closed context in
+  // Chrome. A page holding the window reference reads zeros and `closed`.
   globalThis.__pt_detach = () => {
     try { Object.defineProperty(globalThis, '__ptDetached', { value: true, configurable: true }); } catch (e) {}
     try { globalThis.__pt_setViewport(0, 0); } catch (e) {}
@@ -6893,19 +6707,19 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         });
       } catch (e) {}
     }
-    __layoutBuilt = -1;   // пересчитать коробки под новый размер
+    __layoutBuilt = -1;   // recompute boxes for the new size
   };
   let __layoutSeq = 0;      // bumped on every DOM mutation
   let __layoutBuilt = -1;   // __layoutSeq the current boxes were built at
-  let __rows = [];          // элементы в порядке наложения
-  let __boxes = [];         // то же, для поиска попадания в точку
+  let __rows = [];          // elements in paint order
+  let __boxes = [];         // same, for hit testing
   let __mouseDownEl = null;
   let __hoverEl = null; // element the pointer is currently over
 
   function __markDirty() {
     __layoutSeq++;
-    // Номерные свойства окна ходят за кадрами: их ровно столько, сколько
-    // рамок в дереве, и правка дерева их меняет.
+    // Indexed window properties track frames: one per frame in the tree, so
+    // mutations change them.
     if (globalThis.__pt_syncFrameSlots) { try { __pt_syncFrameSlots(); } catch (e) {} }
   }
 
@@ -7029,22 +6843,21 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   };
 
   globalThis.__pt_drainFrameQueue = () => __frameOps.splice(0);
-  // Коробка элемента кадра на момент запроса: при вставке раскладки ещё нет, а
-  // движок спрашивает уже после разбора документа.
+  // A frame element's box at request time: no layout exists at insertion, and
+  // the engine asks after the document is parsed.
   globalThis.__pt_frameBoxOf = (el) => {
-    // Заданный размер важнее посчитанного: у виджета он стоит в стиле или в
-    // атрибутах, а раскладка к моменту вопроса может быть ещё прошлой.
-    // Заявленный ноль — ноль (у Chrome окно такого кадра 0×0), не заявлено — -1.
+    // A set size beats a computed one: the widget sets it in style or
+    // attributes, and layout may still be stale. A declared 0 is 0 (Chrome's
+    // window for such a frame is 0x0); undeclared is -1.
     const px = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? Math.max(0, Math.round(n)) : -1; };
     let w = -1, h = -1;
     try { w = px(el.style && el.style.width); if (w < 0) w = px(__ptGetA(el, 'width')); } catch (e) {}
     try { h = px(el.style && el.style.height); if (h < 0) h = px(__ptGetA(el, 'height')); } catch (e) {}
     if (w >= 0 || h >= 0) return __ptJSON.stringify([w < 0 ? 300 : w, h < 0 ? 150 : h]);
     w = 0; h = 0;
-    // Только заявленный размер: спросить раскладку значит построить её прямо
-    // сейчас, посреди загрузки, и заморозить в недостроенном виде — страница
-    // потом получала нулевые коробки. Не заявлен — размер по умолчанию, как у
-    // браузера для кадра без размеров.
+    // Declared size only: asking layout would build it mid-load and freeze it
+    // half-built (pages then got zero boxes). Undeclared means the default
+    // frame size.
     return __ptJSON.stringify([w || 300, h || 150]);
   };
   globalThis.__pt_frameBox = (id) => {
@@ -7063,11 +6876,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   globalThis.__pt_drainScriptQueue = () => __scriptOps.splice(0);
 
-  // Пока исполняется скрипт, вставленный страницей, `document.currentScript` —
-  // он сам, как у встроенного в разметку. У нас там было пусто, и api.js
-  // Turnstile не находил собственный адрес, а с ним — свою запись Resource
-  // Timing: у браузера она уходит виджету целиком, у нас не уходила вовсе.
-  // У модуля `currentScript` пуст и у браузера — его не ставим.
+  // While a page-inserted script runs, `document.currentScript` is that script,
+  // as for markup scripts. Turnstile's api.js uses it to find its own URL and
+  // its Resource Timing entry, which goes to the widget. For modules
+  // `currentScript` is null in Chrome too; not set.
   globalThis.__pt_scriptStart = (id) => {
     const el = __scriptEls.get(id);
     if (el) document.__ptCurScript = el;
@@ -7075,14 +6887,13 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   globalThis.__pt_scriptDone = (id, ok) => {
     const el = __scriptEls.get(id);
-    // Скрипт отработал — `currentScript` снова пуст, и `onload` его уже не
-    // видит, как и у браузера.
+    // After the script runs `currentScript` is null again; `onload` does not
+    // see it, as in Chrome.
     if (el && document.__ptCurScript === el) document.__ptCurScript = null;
     if (!el) return;
     __scriptEls.delete(id);
     const ev = { type: ok ? 'load' : 'error', target: el, currentTarget: el, isTrusted: true };
-    // Рассылка сама зовёт `on…`; вызывать его ещё и отдельно — значит сработать
-    // дважды на каждом скрипте.
+    // dispatchEvent calls `on…` itself; calling it separately fires twice.
     try { el.dispatchEvent && el.dispatchEvent(ev); } catch (e) {}
   };
 
@@ -7136,7 +6947,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   // A `message` event arriving from the other side of a frame boundary.
   globalThis.__pt_deliverMessage = (raw, origin, fromFrameId) => {
-    // Значение приезжает разобранным литералом — оживляем из него те же типы.
+    // The value arrives as a parsed literal; revive the same types from it.
     let data = raw;
     try { data = globalThis.__pt_cloneRevive ? __pt_cloneRevive(raw) : raw; } catch (e) {}
     const source = fromFrameId ? (__frames.get(fromFrameId) || {}).win || null : (globalThis.parent === globalThis ? null : globalThis.parent);
@@ -7167,8 +6978,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       Object.defineProperty(globalThis, 'parent', { value: up, configurable: true });
       Object.defineProperty(globalThis, 'top', { value: up, configurable: true });
     } catch (e) {}
-    // Из стороннего кадра свой `<iframe>` не виден: `frameElement` — null, как
-    // и `opener`; у нас их не было вовсе, и страница читала undefined.
+    // A cross-origin frame cannot see its `<iframe>`: `frameElement` is null,
+    // and so is `opener`.
     for (const k of ['frameElement', 'opener']) {
       try {
         const g = function () { return null; };
@@ -7324,10 +7135,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // document present there is a real tree to watch.
   globalThis.CustomElementRegistry = CustomElementRegistry;
   globalThis.customElements = new CustomElementRegistry();
-  // `document.createRange()` был именем без тела и отдавал undefined. Полный
-  // Range нам не нужен, но объект должен быть объектом своего интерфейса:
-  // страницы меряют текст через `range.getBoundingClientRect()`, а сборщики
-  // отпечатка спрашивают у него имя.
+  // `document.createRange()`: not a full Range, but an object of its interface;
+  // pages measure text with `range.getBoundingClientRect()` and fingerprinters
+  // read its name.
   const __range = () => {
     const R = globalThis.Range;
     const r = Object.create(R && R.prototype ? R.prototype : Object.prototype);
@@ -7353,10 +7163,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       cloneRange() { const c = __range(); c.setStart(start, startOff); c.setEnd(end, endOff); return c; },
       detach() {},
       toString() { return ''; },
-      // Страницы меряют текст через диапазон — это второй по ходовости способ
-      // после `measureText`, — а он отвечал нулями, то есть «текста нет».
-      // Прямоугольник тут не один: браузер отдаёт по одному на каждую строку,
-      // и по ним видно, как текст разложился.
+      // Pages measure text through a range (second only to `measureText`).
+      // Chrome returns one rect per line, which shows how the text wrapped.
       getClientRects() {
         const node = start;
         const el = node && node.nodeType === ELEMENT_NODE ? node
@@ -7387,9 +7195,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   };
   Document.prototype.createRange = function createRange() { return __range(); };
 
-  // Таблица формы интерфейсов кладёт на `HTMLImageElement.prototype` свой
-  // отражатель `src`, и он перебивает наш — тот, что отправляет запрос. Ставим
-  // настоящий обратно, поверх заглушки.
+  // The interface shape table puts its own `src` reflector on
+  // `HTMLImageElement.prototype`, overriding ours (which issues the request).
+  // Put the real one back.
   try {
     const IP = globalThis.HTMLImageElement && globalThis.HTMLImageElement.prototype;
     if (IP) {
@@ -7404,11 +7212,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
   } catch (e) {}
 
-  // `new Image()` — фабрика, как и `Audio`: браузер отдаёт настоящий элемент
-  // `<img>`. У нас под этим именем лежала заготовка из таблицы имён — с
-  // правильной меткой, но без нашего класса, — поэтому `img.src = …` был
-  // обычным присваиванием и в сеть не шёл ничего.
-  // Строгие: у фабрики браузера нет собственных `arguments`/`caller`.
+  // `new Image()` is a factory, like `Audio`: Chrome returns a real `<img>`, so
+  // `img.src = …` must go to the network.
+  // Strict: the browser's factory has no own `arguments`/`caller`.
   const __ptImageCtor = (function () {
     'use strict';
     return function Image(w, h) {
@@ -7429,8 +7235,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     });
   } catch (e) {}
 
-  // `new Audio()` — это не свой интерфейс, а фабрика: браузер отдаёт
-  // HTMLAudioElement, и `Object.prototype.toString` по нему говорит именно это.
+  // `new Audio()` is a factory, not its own interface: Chrome returns an
+  // HTMLAudioElement, and `Object.prototype.toString` says so.
   globalThis.Audio = (function () {
     'use strict';
     return function Audio(src) {
@@ -7452,10 +7258,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   globalThis.MutationObserver = MutationObserver;
   globalThis.ResizeObserver = ResizeObserver;
 
-  // Каждый элемент называет свой интерфейс: в браузере `<canvas>` — это
-  // `[object HTMLCanvasElement]`, а не `[object Object]`. Классов на тег у нас
-  // нет, поэтому имя выводится из тега — этого хватает и для toString, и для
-  // проверок, которые на нём построены.
+  // Each element names its interface (`[object HTMLCanvasElement]`). There are
+  // no per-tag classes, so the name is derived from the tag.
   const __IFACE = {
     a: 'HTMLAnchorElement', area: 'HTMLAreaElement', audio: 'HTMLAudioElement',
     base: 'HTMLBaseElement', body: 'HTMLBodyElement', br: 'HTMLBRElement',
@@ -7481,8 +7285,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   const __tagFor = (el) => {
     const local = el.__ptLocal || '';
     if (__IFACE[local]) return __IFACE[local];
-    // Имя с дефисом — пользовательский элемент (HTMLElement); неизвестный
-    // одиночный тег браузер считает HTMLUnknownElement.
+    // A dashed name is a custom element (HTMLElement); an unknown single-word
+    // tag is HTMLUnknownElement.
     if (local.indexOf('-') > 0) return 'HTMLElement';
     return /^(abbr|address|article|aside|b|bdi|bdo|cite|code|dd|dfn|dt|em|figcaption|figure|footer|h1|h2|h3|h4|h5|h6|header|hgroup|i|ins|del|kbd|main|mark|nav|noscript|rp|rt|ruby|s|samp|section|small|strong|sub|summary|sup|time|u|var|wbr|details|blockquote|caption|colgroup|col)$/.test(local)
       ? 'HTMLElement' : 'HTMLUnknownElement';
@@ -7491,8 +7295,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     [Document, 'Document'], [DocumentFragment, 'DocumentFragment'], [ShadowRoot, 'ShadowRoot']]) {
     if (!C) continue;
     try {
-      // На самом прототипе — его имя (`[object Element]`), на экземпляре —
-      // имя интерфейса тега.
+      // The prototype itself gets its own name (`[object Element]`), instances
+      // the tag's interface name.
       Object.defineProperty(C.prototype, Symbol.toStringTag, name
         ? { value: name, configurable: true }
         : { get: function () { if (this === C.prototype) return C === Element ? 'Element' : 'Node'; return this.nodeType === ELEMENT_NODE ? __tagFor(this) : 'Node'; }, configurable: true });
@@ -7545,20 +7349,18 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __webidl(globalThis[name]);
   }
 
-  // Теги, которые не рисуют ничего: занимать место в раскладке они не вправе.
-  // Пока занимали, содержимое фрейма съезжало на их высоту, и точка попадала
-  // в <style> вместо кнопки.
+  // Tags that render nothing must take no space in layout, or frame content
+  // shifts and hits land on <style> instead of a button.
   const __UNRENDERED = new Set(['HEAD', 'META', 'STYLE', 'SCRIPT', 'LINK', 'TITLE',
     'BASE', 'NOSCRIPT', 'TEMPLATE', 'PARAM', 'SOURCE', 'TRACK']);
 
-  // Коробки нет вовсе: `display: none` и то, что браузер не раскладывает
-  // никогда. Не путать с невидимым — `visibility: hidden` место занимает, и
-  // браузер отдаёт у такого элемента настоящий прямоугольник.
+  // No box at all: `display: none` and what is never laid out. Not the same
+  // as invisible: `visibility: hidden` takes space and has a real rect.
   function __isUnboxed(el) {
     if (__UNRENDERED.has(el.tagName)) return true;
     if (__noneBySheet.has(el)) return true;
     if (el.hasAttribute && __ptHasA(el, 'hidden')) return true;
-    // Скрытое поле формы ничего не занимает — и строки тоже.
+    // A hidden input takes no space, nor a line.
     if (el.tagName === 'INPUT' && /^hidden$/i.test(__ptGetA(el, 'type') || '')) return true;
     const s = el.style;
     if (s && String(s.display || '').toLowerCase() === 'none') return true;
@@ -7576,12 +7378,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return false;
   }
 
-  // Каскад. Раньше из таблиц вычитывались одним регулярным выражением только
-  // правила, которые прячут, — всё остальное страница объявляла впустую:
-  // `getComputedStyle` элемента с `width: 200px` в таблице отвечал шириной
-  // окна, противореча собственному CSS страницы. Теперь правила разбираются
-  // по-настоящему: селекторы сопоставляются, специфичность считается, а
-  // объявления накладываются в порядке возрастания веса.
+  // Cascade: selectors are matched, specificity computed, and declarations
+  // applied in increasing weight.
   const __SPEC_ATTR = /\[[^\]]*\]/g;
   function __specificity(sel) {
     const list = __selCompiled(sel);
@@ -7597,8 +7395,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return ids * 10000 + cls * 100 + tags;
   }
 
-  // Условие @media: считаем то, что действительно влияет на размеры, — ширину
-  // и высоту окна. Про остальное честнее ответить «нет», чем применить наугад.
+  // @media: only viewport width and height are evaluated; anything else
+  // answers "no" rather than guessing.
   function __mediaApplies(cond) {
     const c = String(cond || '').toLowerCase().trim();
     if (!c || c === 'all' || c === 'screen') return true;
@@ -7615,21 +7413,18 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   }
 
   let __rules = [];                       // {root, sel, spec, order, style}
-  let __foreignRules = new WeakMap();     // документ → его правила
+  let __foreignRules = new WeakMap();     // document -> its rules
   let __styleCache = new WeakMap();
-  // Кегль и наследуемое значение считаются обходом предков, а спрашивают их
-  // у каждого узла по нескольку раз за проход: на три сотни узлов выходило
-  // под полторы тысячи обходов. Живут эти ответы ровно столько же, сколько
-  // каскад, — до следующей сборки правил.
+  // Font size and inherited values walk the ancestors and are asked many
+  // times per pass; cache them for the cascade's lifetime.
   let __passFont = new WeakMap();
   let __passInherit = new WeakMap();
   let __passCustom = new WeakMap();
   let __hiddenBySheet = new WeakSet();
   let __noneBySheet = new WeakSet();
 
-  // Правила одного дерева: таблицы стилей, которые в нём лежат, разобранные
-  // в плоский список. Вынесено из сбора, потому что документов бывает больше
-  // одного — см. `__rulesFor`.
+  // Rules of one tree: its stylesheets flattened into a list. Separate because
+  // there can be more than one document (see `__rulesFor`).
   function __gatherRules(docEl, out) {
     const state = { order: out.length };
     const take = (root, rules) => {
@@ -7660,16 +7455,13 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return out;
   }
 
-  // Чьи правила касаются этого элемента. Документ бывает не один: страница
-  // делает `document.implementation.createHTMLDocument()` — или заводит
-  // разборщик разметки — и меряет вычисленный стиль тела там. Стили хозяйской
-  // страницы туда не достают, и браузер отвечает умолчаниями: чёрным цветом и
-  // шестнадцатью пикселями. Мы отвечали цветом и кеглем страницы, и весь
-  // перечисленный стиль расходился с браузерным — челлендж снимает его целиком.
-  /// Ключ правила — по самому правому составному: id, класс или тег. Каскад
-  /// спрашивает только правила со «своими» ключами, как браузер: сверять
-  /// каждое из трёх тысяч правил chess.com с каждым элементом стоило по сотне
-  /// миллисекунд на всякую перераскладку.
+  // Whose rules apply to this element. A page may create another document
+  // (`createHTMLDocument()`, DOMParser) and read computed style there; the
+  // host page's styles do not reach it and Chrome answers with defaults. The
+  // challenge captures the whole enumerated style.
+  /// Rule key from the rightmost compound: id, class or tag. The cascade only
+  /// checks rules with matching keys, as browsers do; matching all ~3000
+  /// chess.com rules against every element cost ~100 ms per relayout.
   function __ruleKey(sel) {
     let depth = 0, q = null, start = 0;
     for (let i = 0; i < sel.length; i++) {
@@ -7713,11 +7505,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __ruleIndexes.set(rules, ix);
     return ix;
   }
-  /// Правила, которые могут подойти элементу.
-  // Корень дерева элемента: теневой корень или элемент документа. Таблицы
-  // стилей действуют только в своём дереве — стили документа в теневое не
-  // достают, и наоборот (у Chrome div в теневом корне не видит `.x{display:flex}`
-  // из <style> страницы).
+  /// Rules that may match an element.
+  // Tree root of an element: a shadow root or the document element.
+  // Stylesheets apply only within their tree (in Chrome a div in a shadow root
+  // does not see the page's `.x{display:flex}`).
   function __treeRootOf(el) {
     let n = el;
     while (n) {
@@ -7746,7 +7537,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return out;
   }
 
-  /// Карта объявлений правила как написано.
+  /// A rule's declarations as written.
   function __ruleMap(rr) {
     const rule = rr.rule;
     if (!rule) return null;
@@ -7777,8 +7568,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const doc = globalThis.document;
     if (!doc || !doc.documentElement) return;
     __gatherRules(doc.documentElement, __rules);
-    // Спрятанное собирается тем же проходом: скрытие — просто одно из
-    // объявлений, и отдельного правила для него больше не нужно.
+    // Hiding is collected in the same pass; it is just another declaration.
     for (const r of __rules) {
       const d = __ruleMap(r);
       if (!d) continue;
@@ -7794,9 +7584,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
   }
 
-  /// Объявления, дошедшие до элемента: сначала таблицы по весу, потом его
-  /// собственный атрибут `style`.
-  /// Свойства, которые в SVG пишут атрибутами. Список Chrome 151.
+  /// Declarations reaching the element: stylesheets by weight, then its own
+  /// `style` attribute.
+  /// Properties SVG writes as attributes. Chrome 151 list.
   const SVG_PRESENTATION = ['alignment-baseline', 'baseline-shift', 'clip-path', 'clip-rule',
     'color', 'color-interpolation', 'color-interpolation-filters', 'cursor', 'direction',
     'display', 'dominant-baseline', 'fill', 'fill-opacity', 'fill-rule', 'filter',
@@ -7817,15 +7607,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const hit = __styleCache.get(el);
     if (hit) return hit;
     const out = new Map();
-    // В SVG свойства пишут атрибутами, и браузер считает их объявлениями
-    // самого низкого веса: `<text font-size="150">` меряется полутора сотнями
-    // пикселей, а не шестнадцатью.
+    // SVG presentation attributes are declarations of the lowest weight:
+    // `<text font-size="150">` measures at 150px, not 16.
     if (el.__ptNS === 'http://www.w3.org/2000/svg' && el.hasAttribute) {
       for (const name of SVG_PRESENTATION) {
         const raw = __ptGetA(el, name);
         if (raw == null) continue;
         const v = String(raw).trim();
-        // Голое число в SVG — это пользовательские единицы, то есть пиксели.
+        // A bare number in SVG is user units, i.e. pixels.
         const norm = SVG_LENGTH_ATTRS.has(name) && /^-?[\d.]+$/.test(v) ? v + 'px' : v;
         out.set(name, norm);
       }
@@ -7833,9 +7622,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const won = [];
     for (const r of __candidateRules(el)) {
       let ok = false;
-      // Селектор правила разбирается один раз и живёт на самом правиле. Через
-      // общий кэш (5000 записей, сброс целиком) страница со 128 таблицами
-      // разбирала свои селекторы заново на каждом элементе каждой раскладки.
+      // A rule's selector is parsed once and cached on the rule; a shared
+      // cache (5000 entries, cleared whole) made a page with 128 stylesheets
+      // reparse selectors per element per layout.
       try {
         if (r.__ptSel === undefined) r.__ptSel = __selCompiled(r.sel) || null;
         ok = !!r.__ptSel && __selAny(r.__ptSel, el, { scope: null });
@@ -7843,18 +7632,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (ok) won.push(r);
     }
     won.sort((a, b) => (a.spec - b.spec) || (a.order - b.order));
-    // Сокращения раскладываются здесь, а не при выдаче: на каскад смотрят и
-    // раскладка, и использованный кегль, и вычисленный стиль — и каждый из них
-    // раньше не видел, что `font: 14px/1.5 Georgia` задаёт `font-size`.
+    // Shorthands are expanded here, not on output: layout, used font size and
+    // computed style all need `font: 14px/1.5 Georgia` to set `font-size`.
     const take = (n, v) => {
       const pairs = typeof __ptExpand === 'function' ? __ptExpand(n, v) : null;
       if (pairs) { for (const [k, val] of pairs) out.set(k, val); return; }
       out.set(n, v);
     };
-    // Собственные свойства (`--*`) и подстановка `var()`. Раньше `var()`
-    // доходил до раскладки как есть, и всякая длина, записанная через
-    // переменную, не значила ничего — а современные таблицы так пишут почти
-    // всё.
+    // Custom properties (`--*`) and `var()` substitution.
     const decls = [];
     const mine = new Map();
     const note = (n, v) => {
@@ -7876,9 +7661,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const own = el.style;
     if (own) noteAll(own);
     const vars = __customsFor(el, mine);
-    // `inherit` — значение родителя, как оно у него в каскаде; `initial` и
-    // `unset` — как будто не писали. Мы брали слово буквально, и
-    // `* { box-sizing: inherit }` оставлял всю страницу без `border-box`.
+    // `inherit` takes the parent's cascaded value; `initial` and `unset` act
+    // as if unset (`* { box-sizing: inherit }` must propagate `border-box`).
     const parentOf = () => {
       const p = el.parentNode;
       return p && p.nodeType === ELEMENT_NODE ? __cascadeFor(p) : null;
@@ -7894,8 +7678,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     for (const [n, v] of decls) {
       if (v == null) { out.delete(n); continue; }
       if (v.indexOf('var(') < 0) { take(n, v); continue; }
-      // Не нашедшая значения подстановка делает объявление недействительным:
-      // свойство ведёт себя так, будто его не писали.
+      // A failed substitution makes the declaration invalid: as if not written.
       const sub = __ptSubstVars(v, vars);
       if (sub != null) take(n, sub);
     }
@@ -7903,8 +7686,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return out;
   }
 
-  /// Собственные свойства элемента: свои поверх унаследованных. Держатся
-  /// цепочкой прототипов, а не копией — у корня их сотни, а узлов тысячи.
+  /// Element custom properties: own over inherited. Kept as a prototype chain,
+  /// not a copy (hundreds at the root, thousands of nodes).
   function __customsFor(el, mine) {
     const hit = __passCustom.get(el);
     if (hit) return hit;
@@ -7919,8 +7702,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     const out = Object.create(base);
     for (const [n, v] of mine) out[n] = v;
-    // Свои значения сами могут ссылаться на переменные — и на свои, и на
-    // унаследованные. Круг делает значение недействительным.
+    // Own values may reference variables, own or inherited. A cycle makes the
+    // value invalid.
     for (const n of mine.keys()) {
       const v = out[n];
       if (typeof v !== 'string' || v.indexOf('var(') < 0) continue;
@@ -7931,14 +7714,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return out;
   }
 
-  /// Подставить `var(--имя[, запас])`. Возвращает null, если подстановка
-  /// не удалась и запаса нет.
+  /// Substitute `var(--name[, fallback])`. Returns null if substitution fails
+  /// and there is no fallback.
   function __ptSubstVars(v, vars, busy) {
     let out = '', i = 0, bad = false;
     while (i < v.length) {
       const at = v.indexOf('var(', i);
       if (at < 0) { out += v.slice(i); break; }
-      // `var(` внутри имени (`--my-var(`) не бывает, но `somevar(` бывает.
+      // `var(` never follows a name char (`--my-var(`), but `somevar(` exists.
       if (at > 0 && /[\w-]/.test(v[at - 1])) { out += v.slice(i, at + 4); i = at + 4; continue; }
       out += v.slice(i, at);
       let depth = 1, j = at + 4, comma = -1;
@@ -7971,22 +7754,19 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return bad ? null : out.trim();
   }
 
-  // Раскладка. Была строчная модель: каждый лист занимал двадцать пикселей, а
-  // ширину брал во всё окно, — и любой элемент отвечал одним и тем же размером
-  // независимо от своего CSS. Теперь считается обычный блочный поток: отступы,
-  // рамки, поля, проценты и `em` от кегля, ширина строки — из метрик гарнитуры.
-  // Точность браузера здесь не самоцель, но числа читает сборщик отпечатков, и
-  // элемент шириной во всё окно там, где в стиле написано двести пикселей, —
-  // это не приблизительность, а противоречие.
+  // Layout: normal block flow with padding, borders, margins, percentages,
+  // `em` from the font size, line widths from font metrics. Pixel-exactness is
+  // not the goal, but fingerprinters read these numbers, and a full-window
+  // width where the style says 200px is a contradiction.
   const __BLOCKISH = /^(block|flow-root|list-item|table|flex|grid|table-cell|table-row|table-caption)$/;
   const __INLINEISH = /^(inline|inline-block|inline-flex|inline-grid|inline-table)$/;
 
-  /// Дорожки сетки: `[{px}|{fr}|{auto}]`. Понимает длины, доли, `auto`,
-  /// `minmax()`, `repeat()` (и с `auto-fill`/`auto-fit`), имена линий
-  /// пропускает. Пусто — одна дорожка `auto`.
-  // Расстановка детей сетки: явные места (`grid-area: 1/1`, `grid-column: 2`)
-  // и авторасстановка по строкам в свободные ячейки; колонок столько,
-  // сколько нужно (неявные — auto). Общая для раскладки и для max-content.
+  /// Grid tracks: `[{px}|{fr}|{auto}]`. Handles lengths, fractions, `auto`,
+  /// `minmax()`, `repeat()` (incl. `auto-fill`/`auto-fit`); skips line names.
+  /// Empty means one `auto` track.
+  // Grid item placement: explicit (`grid-area: 1/1`, `grid-column: 2`) and
+  // row-wise auto-placement into free cells; as many columns as needed
+  // (implicit ones auto). Shared by layout and max-content.
   function __gridPlacement(flow, nTracks) {
     const lineOf = (c, prop) => { const v = String(__cascadeFor(c).get(prop) || 'auto').trim(); const m = /^(\d+)$/.exec(v); return m ? +m[1] : null; };
     const want = flow.map((c) => ({ col: lineOf(c, 'grid-column-start'), row: lineOf(c, 'grid-row-start') }));
@@ -8038,27 +7818,27 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const list = split(m[2].trim()).map(one);
       let count = parseInt(m[1], 10);
       if (!Number.isFinite(count)) {
-        // auto-fill / auto-fit: сколько поместится по наименьшему размеру.
+        // auto-fill / auto-fit: as many as fit at the minimum size.
         const size = list.reduce((a, d) => a + (d.px || 0), 0) + gap * list.length;
         count = size > 0 ? Math.max(1, Math.floor((avail + gap) / size)) : 1;
       }
       for (let r = 0; r < Math.min(count, 1000); r++) for (const d of list) out.push(Object.assign({}, d));
     }
-    // `minmax(200px, auto)` растёт как `auto`.
+    // `minmax(200px, auto)` grows like `auto`.
     for (const d of out) if (d.grow) { delete d.grow; }
     return out.length ? out : (rows ? [] : [{ auto: true }]);
   }
 
-  /// Кегль корня: от него считается `rem`. Мы брали шестнадцать, а
-  /// страницы часто пишут `html { font-size: 62.5% }` и дальше всё в `rem`.
+  /// Root font size, the base for `rem` (pages often set
+  /// `html { font-size: 62.5% }`).
   function __rootFontSize() {
     const doc = globalThis.document;
     const root = doc && doc.documentElement;
     return root ? __usedFontSize(root) : 16;
   }
 
-  /// Одно число с единицей — в пиксели. `base` — от чего проценты; без него
-  /// проценты не считаются.
+  /// One number with a unit to pixels. `base` is the percentage base; without
+  /// it percentages are not resolved.
   function __unitPx(x, u, fs, base) {
     switch (u) {
       case 'px': case '': return x;
@@ -8074,8 +7854,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       case 'ch': return x * fs / 2;
       case '%': return base == null ? null : x / 100 * base;
     }
-    // Доли окна, и новые (`dvh`, `svh`, `lvh`) тоже: без панелей и
-    // клавиатуры все три равны обычной.
+    // Viewport units, new ones too (`dvh`, `svh`, `lvh`): without toolbars
+    // and keyboard all three equal the plain one.
     const m = /^[dsl]?(vh|vw|vmin|vmax|vi|vb)$/.exec(u);
     if (m) {
       const k = m[1];
@@ -8086,9 +7866,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return null;
   }
 
-  /// Выражение `calc()`, `min()`, `max()`, `clamp()` — в пиксели, или null.
-  /// Раньше любое из них значило «не задано», и блок с
-  /// `width: min(100%, 40rem)` растягивался на всё окно.
+  /// A `calc()`, `min()`, `max()` or `clamp()` expression to pixels, or null.
   function __ptCalcPx(v, fs, base) {
     const toks = [];
     const re = /\s*(?:([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)([a-z%]*)|([a-z-]+)\(|([()*/,+-]))/iy;
@@ -8099,8 +7877,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (!m) { if (/^\s*$/.test(v.slice(pos))) break; return null; }
       pos = re.lastIndex;
       if (m[1] != null) {
-        // `a -1px` — это вычитание, а не число со знаком, если перед ним
-        // стоит операнд.
+        // `a -1px` is subtraction, not a signed number, after an operand.
         const prev = toks[toks.length - 1];
         if (/^[+-]/.test(m[1]) && prev && (prev.t === 'n' || prev.t === ')')) {
           toks.push({ t: m[1][0] });
@@ -8111,8 +7888,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     let i = 0, fail = false;
     const peek = () => toks[i] || { t: 'end' };
-    // Значение — пара: пиксели и признак «голое число», чтобы `2 * 10px`
-    // и `10px / 2` считались, а `10px * 10px` — нет.
+    // A value is a pair: pixels and a "bare number" flag, so `2 * 10px` and
+    // `10px / 2` work but `10px * 10px` does not.
     const expr = () => {
       let a = term();
       while (!fail && (peek().t === '+' || peek().t === '-')) {
@@ -8186,7 +7963,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const u = m[2].toLowerCase();
       const px = __unitPx(parseFloat(m[1]), u, fs, base);
       if (px == null) return null;
-      // Доли окна и проценты браузер держит с точностью в 1/64 пикселя.
+      // Viewport units and percentages are kept at 1/64 px precision.
       return u === '%' || /v/.test(u) ? Math.round(px * 64) / 64 : px;
     }
     if (__CALC_FN.test(v)) {
@@ -8196,9 +7973,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return null;
   }
 
-  // Высота строки при `line-height: normal` и подъём до базовой линии — из
-  // самой гарнитуры, а не из доли кегля: у Liberation Sans строка это 1,15
-  // кегля, у другой гарнитуры своё.
+  // `line-height: normal` and baseline ascent come from the face, not a fixed
+  // ratio: Liberation Sans is 1.15 of the size, other faces differ.
   function __fontBox(fs, family) {
     if (typeof __pt_canvasMeasureText === 'function') {
       try {
@@ -8210,16 +7986,13 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   }
   const __normalLine = (fs, family) => __fontBox(fs, family).line;
 
-  // Мерить строку дорого: раскладка HarfBuzz'ом с подбором шрифта по знакам.
-  // А раскладка страницы меряет одно и то же снова и снова — каждая правка
-  // дерева пересчитывает все коробки, и пять сотен узлов дают пять сотен
-  // замеров тех же слов. Ответ зависит только от строки и шрифта, поэтому
-  // держим его при себе; при переполнении — начинаем сначала, чтобы карта
-  // не росла на странице, которая печатает уникальный текст.
+  // Measuring a string is expensive (HarfBuzz shaping with per-glyph font
+  // fallback), and layout re-measures the same words on every mutation. The
+  // result depends only on string and font; cache it, and restart when full so
+  // the map does not grow on pages printing unique text.
   const __widths = new Map();
-  // Пробелы в SVG схлопываются: перевод строки выброшен, табуляция — пробел,
-  // подряд идущие сжаты в один, по краям срезаны. `<text>  ii  </text>` меряется
-  // как «ii», а не как строка с отступами.
+  // SVG whitespace collapses: newlines dropped, tabs become spaces, runs
+  // squeezed, ends trimmed. `<text>  ii  </text>` measures as "ii".
   const __svgText = (el) => String((el && el.textContent) || '')
     .replace(/[\r\n]/g, '').replace(/\t/g, ' ').replace(/ +/g, ' ').trim();
 
@@ -8240,17 +8013,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   }
 
   function __textWidth(text, fs, family, bold, italic) {
-    // Ширина текста в раскладке — вверх до 1/64 px, как LayoutUnit у Chrome:
-    // пол ниже на долю давал перенос слова в колонке, сжатой по тексту.
+    // Text width rounds up to 1/64 px, like Chrome's LayoutUnit: flooring
+    // wrapped a word in a column shrunk to its text.
     const w = __textMetrics(text, fs, family, bold, italic)[0] || 0;
     return Math.ceil(w * 64 - 1e-6) / 64;
   }
 
-  // Перенос по словам. Абзац в браузере занимает столько строк, сколько
-  // требует его ширина, а у нас любой текст умещался в одну — и абзац шириной
-  // сто двадцать пикселей отвечал высотой восемнадцать вместо семидесяти двух.
-  // Разрыв жадный, по пробелам, хвостовой пробел в ширину строки не входит —
-  // как в браузере.
+  // Word wrapping: greedy, at spaces; the trailing space does not count
+  // toward the line width, as in Chrome.
   function __wrapLines(text, maxWidth, fs, family, bold) {
     const words = String(text).split(' ').filter((w) => w.length);
     const out = [];
@@ -8271,7 +8041,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       }
     }
     if (line) out.push({ text: line, width: __textWidth(line, fs, family, bold, false) });
-    // Ширины строк браузер, как и всё остальное, держит в шестьдесят четвёртых.
+    // Line widths are kept in 1/64 px too.
     for (const l of out) l.width = Math.round(l.width * 64) / 64;
     return out;
   }
@@ -8282,10 +8052,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return t.replace(/\s+/g, ' ').trim();
   };
 
-  // Размеры, которые элементам даёт сам движок браузера, а не страница. Сняты
-  // с Chrome 151: флажок 13×13, поле ввода 177×15 в рамке 2 и отступе 2/1,
-  // кнопка сжимается по надписи с отступом 6/1. У полей формы свой кегль —
-  // 13,3333 пикселя, — и без него надписи на кнопках меряются не тем.
+  // Sizes the UA gives form controls, from Chrome 151: checkbox 13x13, input
+  // 177x15 with border 2 and padding 2/1, button shrinks to its label with
+  // padding 6/1. Form controls use 13.3333px text.
   const UA_FORM_FONT = 13.3333;
   function __uaBox(el, tag) {
     if (tag === 'input') {
@@ -8295,7 +8064,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (t === 'range') return { w: 129, h: 16, p: [0, 0], b: 0, m: [2, 2] };
       if (t === 'file') return { w: 253, h: 21, p: [0, 0], b: 0, m: [0, 0] };
       if (t === 'submit' || t === 'button' || t === 'reset') {
-        // Ненадписанная кнопка отправки подписана движком, а не страницей.
+        // An unlabelled submit button gets its label from the UA.
         const dflt = t === 'submit' ? 'Submit' : t === 'reset' ? 'Reset' : '';
         return { label: true, dflt, h: 15, p: [1, 6], b: 2, m: [0, 0] };
       }
@@ -8303,7 +8072,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       return { w: 177, h: 15, p: [1, 2], b: 2, m: [0, 0] };
     }
     if (tag === 'button') return { label: true, h: 15, p: [1, 6], b: 2, m: [0, 0] };
-    // У списка размер задан по внешней рамке, а не по содержимому.
+    // A select is sized by its outer border, not content.
     if (tag === 'select') return { w: 28, h: 17, p: [0, 0], b: 1, m: [0, 0] };
     if (tag === 'textarea') return { w: 195, h: 36, p: [2, 2], b: 1, m: [0, 0] };
     if (tag === 'iframe') return { w: 300, h: 150, p: [0, 0], b: 2, m: [0, 0] };
@@ -8311,19 +8080,15 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return null;
   }
 
-  // Поля, которые блочным элементам даёт таблица стилей самого браузера. Без
-  // них абзацы и заголовки лежат вплотную, и вся страница ниже съезжает вверх.
-  // Первое число — поле сверху и снизу в долях кегля, второе — по бокам в
-  // пикселях. В долях, а не в пикселях: у заголовка поле считается от его
-  // собственного кегля, и `h1` внутри блока с другим шрифтом отступает иначе.
+  // UA stylesheet margins for block elements. First number: top/bottom in em
+  // (relative to the element's own font size, so `h1` differs by font);
+  // second: sides in px.
   const UA_MARGIN = {
     p: [1, 0], blockquote: [1, 40], figure: [1, 40], ul: [1, 0], ol: [1, 0],
     dir: [1, 0], menu: [1, 0], dl: [1, 0], dd: [0, 40], pre: [1, 0], form: [0, 0],
     h1: [0.67, 0], h2: [0.83, 0], h3: [1, 0], h4: [1.33, 0], h5: [1.67, 0], h6: [2.33, 0],
   };
-  // Поля, заданные прямо в пикселях: у тела страницы это восемь пикселей со
-  // всех сторон, и без них вся раскладка стоит на восемь пикселей выше
-  // браузерной.
+  // Margins set in pixels (body has 8px on all sides).
   const UA_MARGIN_PX = { body: [8, 8], hr: [8, 0], fieldset: [0, 2] };
 
   function __uaMargin(tag, fs) {
@@ -8333,10 +8098,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return em ? [em[0] * (fs || 16), em[1]] : null;
   }
 
-  // Направление письма по таблице браузера. Начальное значение —
-  // `normal`, а `isolate` браузер раздаёт блочным элементам списком, и в этот
-  // список не входят ни тело страницы, ни поля ввода. Мы отвечали `isolate`
-  // всему, что не строчное, и перечисленный стиль расходился.
+  // unicode-bidi from the UA sheet: initial is `normal`; `isolate` is given
+  // to a list of block elements that excludes body and inputs.
   const UA_BIDI = {
     html: 'normal', body: 'normal', input: 'normal', button: 'normal', select: 'normal',
     textarea: 'normal', fieldset: 'normal', option: 'normal', optgroup: 'normal',
@@ -8344,30 +8107,26 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     output: 'isolate',
   };
 
-  // Кегль и насыщенность от таблицы браузера. Заголовок крупнее родителя в
-  // свою долю, `small` мельче в 1,2 раза, и всё это множится по цепочке —
-  // `small` внутри `small` мельче вдвойне, как в браузере.
+  // UA font size and weight. Headings scale from the parent, `small` is 1.2x
+  // smaller, and it compounds (`small` in `small`), as in Chrome.
   const UA_FONT_SIZE = {
     h1: 2, h2: 1.5, h3: 1.17, h4: 1, h5: 0.83, h6: 0.67,
     small: 1 / 1.2, sub: 1 / 1.2, sup: 1 / 1.2, big: 1.2,
   };
   const UA_BOLD = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'b', 'strong', 'th']);
 
-  // Что браузер набирает моноширинным: свой кегль (13 пикселей против
-  // шестнадцати) и своё семейство. Поле области ввода — 13⅓, как у прочих
-  // полей.
+  // Monospace in the UA sheet: its own size (13px vs 16px) and family.
+  // Textarea uses 13.33px like other form controls.
   const UA_MONO = new Set(['pre', 'code', 'kbd', 'samp', 'tt', 'textarea', 'xmp', 'plaintext', 'listing']);
 
-  // Строчный ли это уровень: такие дети ложатся в одну строку, а не столбиком.
-  /// Два поля, схлопнутые в одно: наибольшее положительное плюс наименьшее
-  /// отрицательное.
+  // Whether a child is inline-level: such children share a line.
+  /// Two margins collapsed into one: largest positive plus most negative.
   const __collapseM = (a, b) => Math.max(0, a, b) + Math.min(0, a, b);
 
-  /// Ширина по содержимому (max-content), рамка включительно: сколько
-  /// займёт элемент, если ему ничего не навязывать. Нужна ребёнку гибкого
-  /// ряда: его основа — эта ширина, а не вся строка. Мы давали всю строку,
-  /// и пустой `div`, который api.js Turnstile вставляет в центрованный ряд,
-  /// у нас стоял у правого края — а его место уходит виджету в письме.
+  /// Max-content width, border included: what the element takes unconstrained.
+  /// A flex item's basis is this width, not the whole line (Turnstile's api.js
+  /// inserts an empty `div` into a centred row, and its position feeds the
+  /// widget's report).
   function __maxContentW(el, depth) {
     depth = depth || 0;
     if (depth > 40 || !el || el.nodeType !== ELEMENT_NODE || __isUnboxed(el)) return 0;
@@ -8416,7 +8175,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       kids.forEach((c, i) => { const k = place[i].k; cols[k] = Math.max(cols[k], outer(c)); });
       inner += cols.reduce((a, x) => a + x, 0) + gap('column-gap') * (n - 1);
     } else {
-      // Строчные — в одну строку, блочные — каждый своей.
+      // Inline children share a line; each block gets its own.
       let line = inner, widest = 0;
       for (const c of kids) {
         if (__isInlineLevel(c)) line += outer(c);
@@ -8433,9 +8192,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return /^inline(-block|-flex|-grid|-table)?$/.test(d);
   }
 
-  // Атомарный ли он — прямоугольник, который стоит в строке целиком:
-  // `inline-block`, картинка, поле ввода. Обычный `<span>` таким не считается:
-  // он разливается по строке и высоту берёт от своего шрифта.
+  // Atomic inline: a box placed whole on the line (`inline-block`, image,
+  // input). A plain `<span>` is not: it flows and takes its font's height.
   const __ATOMIC_TAGS = new Set(['img', 'input', 'button', 'select', 'textarea', 'svg',
     'canvas', 'video', 'audio', 'object', 'embed', 'iframe', 'meter', 'progress']);
   function __isAtomicInline(el) {
@@ -8444,9 +8202,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return d !== 'inline' || __ATOMIC_TAGS.has(tag);
   }
 
-  // Прогон строчных детей: слева направо, с переносом по ширине и
-  // выравниванием по базовой линии. Атомарный ребёнок стоит на базовой линии
-  // нижним краем — так браузер ставит `inline-block`.
+  // Inline run: left to right, wrapped by width, aligned on the baseline. An
+  // atomic child sits on the baseline with its bottom edge, like `inline-block`.
   function __layoutInlineRun(run, originX, originY, availW, strut, strutLine) {
     const q = (v) => Math.floor(v * 64) / 64;
     const sAsc = strut ? strut.asc : strutLine * 0.8;
@@ -8456,8 +8213,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     let lineW = 0;
     const flush = () => {
       if (!line.length) return;
-      // Пустые строчные коробки строки не делают: у браузера `<span></span>`
-      // не даёт ни высоты, ни строки.
+      // Empty inline boxes make no line: `<span></span>` has no height.
       const solid = line.some((it) => it.atomic || it.text);
       let asc = solid ? sAsc : 0, desc = solid ? sDesc : 0;
       for (const it of line) {
@@ -8499,7 +8255,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return { y, widest };
   }
 
-  // Переставить уже разложенную коробку вместе со всем, что внутри.
+  // Move an already laid-out box with everything inside it.
   function __ptShiftBox(el, x, y) {
     const b = el.__ptBox;
     if (!b) return;
@@ -8521,15 +8277,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   }
 
   function __layoutOne(el, originX, originY, availW, strut, forced) {
-    // В порядке документа, не после детей: попадание в точку ищется с конца
-    // списка, и глубокий элемент должен стоять там позже своего родителя.
+    // Document order, not after children: hit testing scans from the end and a
+    // deeper element must come after its parent.
     __boxes.push(el);
     const cs = __cascadeFor(el);
     const fs = __usedFontSize(el);
     const tag = (el.localName || '').toLowerCase();
-    // Шрифт наследуется: у `<span>` внутри тела своего объявления нет, и без
-    // наследования он мерился запасной гарнитурой — а с ней не сходится ни
-    // ширина слова, ни высота строки.
+    // Font is inherited; without it a `<span>` was measured in the fallback
+    // face and word widths and line heights were off.
     let familyRaw = cs.get('font-family');
     if (familyRaw == null) familyRaw = cs.get('font');
     if (familyRaw == null && typeof __inheritedValue === 'function') {
@@ -8537,8 +8292,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     const family = String(familyRaw || '').trim() || 'sans-serif';
     let weight = cs.get('font-weight') || cs.get('font');
-    // Таблица браузера сильнее наследования: `<b>` внутри обычного текста
-    // жирный, даже если у родителя насыщенность задана.
+    // The UA sheet beats inheritance: `<b>` is bold whatever the parent weight.
     if (weight == null && UA_BOLD.has(tag)) weight = '700';
     if (weight == null && typeof __inheritedValue === 'function') {
       weight = __inheritedValue(el, 'font-weight');
@@ -8558,8 +8312,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       return one;
     };
     const rawM = side('margin');
-    // Ноль от автора — это заданное значение, а не молчание: страница с
-    // `body { margin: 0 }` не должна получать браузерные восемь пикселей.
+    // An author 0 is a set value: `body { margin: 0 }` must not get the UA 8px.
     const setM = rawM.map((v) => v != null);
     let [mt, mr, mb, ml] = rawM.map((v) => v || 0);
     let [pt_, pr, pb, pl] = side('padding').map((v) => v || 0);
@@ -8575,8 +8328,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const ovAll = String(cs.get('overflow') || '').toLowerCase();
     const ovX = String(cs.get('overflow-x') || ovAll || 'visible').toLowerCase();
     const ovY = String(cs.get('overflow-y') || ovAll || 'visible').toLowerCase();
-    // Ребёнок гибкого контейнера — блок, каким бы ни был его собственный
-    // `display`: браузер его «блокирует», и высота у него строки, а не чернил.
+    // A flex item is blockified whatever its `display`; its height is the line,
+    // not the ink.
     const forcedW = !!(forced && forced.w != null);
     const inlineish = __INLINEISH.test(display) && !(forced && forced.block);
     const position = String(cs.get('position') || 'static').toLowerCase();
@@ -8594,17 +8347,15 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (!setM[0] && !setM[2] && ua.m) { mt = ua.m[0]; mb = ua.m[0]; }
       if (!setM[3] && !setM[1] && ua.m) { ml = ua.m[1]; mr = ua.m[1]; }
     }
-    // `box-sizing: border-box` — размер назван вместе с полями и рамкой. Мы
-    // его не знали, и почти любая современная страница (`* { box-sizing:
-    // border-box }`) выходила у нас шире и выше, чем у браузера.
+    // `box-sizing: border-box`: the size includes padding and border.
     const bbox = /^border-box$/i.test(String(cs.get('box-sizing') || '').trim());
     const inW = (v) => (v == null ? null : bbox ? Math.max(0, v - pl - pr - bl - br) : v);
     const inH = (v) => (v == null ? null : bbox ? Math.max(0, v - pt_ - pb - bt - bb) : v);
-    // Проценты высоты — от заданной высоты родителя; у корня это окно. Мы
-    // считали их от ширины, и `height: 100%` давало высоту в ширину окна.
+    // Percent heights are relative to the parent's set height; the root's is
+    // the viewport.
     const up = el.parentNode;
-    // Абсолютный ребёнок меряет проценты от содержащего блока, который
-    // передал родитель (его padding-box), а не от страницы.
+    // An absolute child resolves percentages against the containing block the
+    // parent passed (its padding box), not the page.
     const __cb = (position === 'absolute' || position === 'fixed') && forced && forced.cb ? forced.cb : null;
     const baseH = __cb && __cb.h != null ? __cb.h : (up && up.nodeType === ELEMENT_NODE
       ? (up.__ptDefH != null ? up.__ptDefH : null) : LAYOUT.H);
@@ -8623,22 +8374,19 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
                       fs, family, bold, false)
         : ua.w;
     }
-    // Замер без доступной ширины (`availW` null — сжатие по содержимому
-    // для колонки сетки или гибкого ребёнка): блок меряется по детям, а не
-    // по NaN, который давал ноль.
+    // Measuring with no available width (`availW` null: shrink-to-fit for a
+    // grid column or flex item) sizes the block by its children, not NaN.
     const shrinkToFit = cw == null && !inlineish && availW == null;
     if (cw == null && !inlineish && availW != null) cw = Math.max(0, availW - ml - mr - bl - br - pl - pr);
-    // Пределы ширины: без них колонка с `max-width` растягивалась во всё
-    // окно, а вместе с ней уезжала и вся геометрия под ней.
+    // Width limits; without them a `max-width` column took the whole window.
     if (cw != null) {
       const maxW = inW(len('max-width', availW));
       const minW = inW(len('min-width', availW));
       if (maxW != null && cw > maxW) cw = maxW;
       if (minW != null && cw < minW) cw = minW;
     }
-    // `margin: 0 auto` — блок посередине. Мы клали его влево, и всякая
-    // страница с колонкой по центру отдавала не ту геометрию: челлендж
-    // спрашивает прямоугольники у полутора десятков узлов.
+    // `margin: 0 auto` centres the block; the challenge reads rects of ~15
+    // nodes.
     const autoSide = (name) => {
       const v = cs.get(name);
       if (v != null) return /^auto$/i.test(String(v).trim());
@@ -8655,15 +8403,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       else if (left) ml = free - mr;
       else mr = free - ml;
     }
-    // Гибкий родитель назначает ребёнку длину сам — и до того, как тот
-    // разложит своё содержимое, иначе строки обернутся не по той ширине.
+    // A flex parent assigns the child's size before the child lays out its
+    // content, so lines wrap at the right width.
     if (forced && forced.w != null) cw = Math.max(0, forced.w - pl - pr - bl - br);
 
     let boxX = originX + ml, boxY = originY + mt;
     if (position === 'absolute' || position === 'fixed') {
-      // Отсчёт — от содержащего блока (padding-box позиционированного
-      // предка), а не от начала страницы: `inset:0` в блоке с отступом
-      // давал (0,0) вместо его угла.
+      // Offsets are from the containing block (padding box of the positioned
+      // ancestor), not the page: `inset:0` inside a padded block is its corner.
       const ox = __cb ? __cb.x : originX, oy = __cb ? __cb.y : originY;
       const cbw = __cb && __cb.w != null ? __cb.w : availW, cbh = __cb && __cb.h != null ? __cb.h : null;
       const left = len('left', cbw), top = len('top', cbh), right = len('right', cbw), bottom = len('bottom', cbh);
@@ -8678,41 +8425,37 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     for (const c of (el.__ptKids || [])) kids.push(c);
     const boxedKids = kids.filter((c) => c.nodeType === ELEMENT_NODE && !__isUnboxed(c));
 
-    // Строчный элемент сжимается по содержимому: по детям, а если их нет — по
-    // собственному тексту, измеренному настоящей гарнитурой.
+    // An inline element shrinks to its children, or else to its own text
+    // measured in the real face.
     if (cw == null) {
       cw = boxedKids.length ? 0 : __textWidth(__OWN_TEXT(el), fs, family, bold, false);
     }
     if (forcedW) cw = Math.max(0, forced.w - pl - pr - bl - br);
 
     const fbox = __fontBox(fs, family);
-    // Высота строки — из стиля, а не из метрик гарнитуры: `font: 16px/1.4`
-    // делает строку в 22,4 пикселя, и ребёнок гибкого контейнера ровно
-    // такой высоты. Мы брали высоту чернил и отвечали восемнадцатью.
+    // Line height comes from the style, not font metrics: `font: 16px/1.4`
+    // makes a 22.4px line, and a flex item is exactly that tall.
     let lineH = fbox.line;
     {
       let lh = cs.get('line-height');
       if (lh == null && typeof __inheritedValue === 'function') lh = __inheritedValue(el, 'line-height');
       const t = lh == null ? '' : String(lh).trim();
       if (t && t !== 'normal') {
-        // Множитель и проценты — от кегля; у нас `125%` считался от ширины.
+        // Multiplier and percentage are relative to the font size.
         lineH = /^[\d.]+$/.test(t) ? parseFloat(t) * fs : /^[\d.]+%$/.test(t) ? parseFloat(t) / 100 * fs : (__lengthPx(t, fs, availW) || fbox.line);
       }
     }
     const contentX = boxX + bl + pl;
     let contentY = boxY + bt + pt_;
-    // Поля детей, убежавшие наружу через пустой край родителя.
+    // Child margins escaping through the parent's empty edge.
     let escapedTop = 0, escapedBottom = 0, hasEscapedTop = false;
     let y = contentY, widest = 0, deepest = 0;
-    // Гибкий контейнер: дети ложатся в ряд (или в столбец), свободное место
-    // делится по `flex-grow`, нехватка — по `flex-shrink`, а поперёк они по
-    // умолчанию растягиваются. Раньше мы клали их обычным блочным потоком, и
-    // виджет — а он почти всегда гибкий — получал не ту геометрию.
+    // Flex container: children in a row (or column), free space split by
+    // `flex-grow`, shortfall by `flex-shrink`, stretched on the cross axis by
+    // default. Widgets are almost always flex.
     const flexish = display === 'flex' || display === 'inline-flex';
-    // Сетка: дети по ячейкам, строки высотой в самого высокого, промежутки
-    // `gap`, растяжение по ячейке. Раньше сетка раскладывалась обычным
-    // блочным потоком — без промежутков и без растяжения, и форма входа
-    // chess.com (сетка с `gap: 16px`) выходила на полсотни пикселей ниже.
+    // Grid: children in cells, rows as tall as the tallest, `gap` gutters,
+    // stretch within the cell.
     const gridish = display === 'grid' || display === 'inline-grid';
     if (gridish && boxedKids.length) {
       const gapLen = (n) => {
@@ -8725,36 +8468,35 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         const p = String(__cascadeFor(c).get('position') || 'static').toLowerCase();
         return p !== 'absolute' && p !== 'fixed';
       });
-      // Без шаблона колонок все колонки — `auto` (по содержимому), в том
-      // числе неявные, заведённые `grid-column: 2`.
+      // Without a column template every column is `auto`, including implicit
+      // ones created by `grid-column: 2`.
       const tmplCols = String(cs.get('grid-template-columns') == null ? 'none' : cs.get('grid-template-columns')).trim().toLowerCase();
       const cols = tmplCols === 'none' || tmplCols === 'auto' || tmplCols === '' ? [{ auto: true }] : __gridTracks(cs.get('grid-template-columns'), cw, colGap, fs);
-      // Явные места (`grid-area: 1/1`, `grid-column: 2`) и авторасстановка
-      // по строкам в свободные ячейки; неявные колонки — `auto`.
+      // Explicit placement (`grid-area: 1/1`, `grid-column: 2`) and row-wise
+      // auto-placement into free cells; implicit columns are `auto`.
       const { place, n, want } = __gridPlacement(flow, cols.length);
       while (cols.length < n) cols.push({ auto: true });
       const marg = (c, a, b) => {
         const ccs = __cascadeFor(c), cfs = __usedFontSize(c);
         return (__lengthPx(ccs.get(a), cfs, cw) || 0) + (__lengthPx(ccs.get(b), cfs, cw) || 0);
       };
-      // Ширины колонок: заданные — как есть, доли — от остатка, `auto` —
-      // по содержимому, а остаток без долей делится между `auto` поровну.
+      // Column widths: fixed as is, fractions from the remainder, `auto` by
+      // content; a remainder without fractions is split evenly among `auto`.
       const widths = cols.map((t) => (t.px != null ? t.px : 0));
       const frTotal = cols.reduce((a, t) => a + (t.fr || 0), 0);
       const autos = [];
       cols.forEach((t, k) => { if (t.auto) autos.push(k); });
-      // Сетка без заданной ширины внутри гибкого или сеточного родителя (или
-      // строчная) ужимается по содержимому: auto-колонки — по самому
-      // широкому ребёнку, свободного места нет. У нас такая сетка брала
-      // ширину родителя и делила её между колонками — текст переносился.
+      // A grid with no set width inside a flex or grid parent (or an inline
+      // grid) shrinks to content: auto columns take the widest child, no free
+      // space.
       const parentDisp = String((el.parentNode && el.parentNode.nodeType === ELEMENT_NODE ? __cascadeFor(el.parentNode).get('display') : '') || '').toLowerCase();
       const shrinkGrid = !forcedW && explicitW == null && (inlineish || /flex|grid/.test(parentDisp));
       if (autos.length) {
         flow.forEach((c, i) => {
           const k = place[i].k;
           if (!cols[k].auto) return;
-          // Вклад ребёнка в auto-колонку — его max-content (замер без ширины),
-          // иначе блочный ребёнок занимал всю ширину контейнера.
+          // A child's contribution to an auto column is its max-content
+          // (measured with no width); otherwise a block child takes it all.
           const b = __layoutOne(c, contentX, contentY, null, fbox) || { w: 0 };
           widths[k] = Math.max(widths[k], b.w + marg(c, 'margin-left', 'margin-right'));
         });
@@ -8778,7 +8520,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         return v === 'auto' ? dflt : v;
       };
       const stretchy = (v) => v === 'normal' || v === 'stretch' || v === 'legacy';
-      // Первый проход — высоты строк.
+      // First pass: row heights.
       const nRows = Math.max(1, ...place.map((p) => p.r + 1));
       const rowH = new Array(nRows).fill(0);
       flow.forEach((c, i) => {
@@ -8800,7 +8542,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const boxH = explicitH != null ? explicitH : null;
       const slackH = boxH != null ? Math.max(0, boxH - totalH) : 0;
       const leadY = ac === 'center' ? slackH / 2 : (ac === 'end' || ac === 'flex-end') ? slackH : 0;
-      // Второй проход — окончательные места.
+      // Second pass: final positions.
       const rowY = [];
       { let yy = contentY + leadY; for (let r = 0; r < nRows; r++) { rowY.push(yy); yy += rowH[r] + rowGap; } }
       flow.forEach((c, i) => {
@@ -8853,11 +8595,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         const p = String(__cascadeFor(c).get('position') || 'static').toLowerCase();
         return p !== 'absolute' && p !== 'fixed';
       });
-      // Первый проход — узнать естественные размеры.
+      // First pass: natural sizes.
       const items = flow.map((c) => {
         const ccs = __cascadeFor(c);
-        // Контейнер, сжатый по содержимому (замер без ширины), меряет детей
-        // так же — по их содержимому, а не в нулевую ширину.
+        // A shrink-to-fit container measures its children by content too, not
+        // at zero width.
         const cb = __layoutOne(c, contentX, contentY, shrinkToFit ? null : cw, fbox) || { w: 0, h: 0 };
         const cfs = __usedFontSize(c);
         const mw = (__lengthPx(ccs.get('margin-left'), cfs, cw) || 0)
@@ -8868,7 +8610,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         const basis = String(ccs.get('flex-basis') || 'auto').toLowerCase();
         const basisPx = basis === 'auto' || basis === 'content'
           ? null : __lengthPx(basis, cfs, cw);
-        // Основа в ряду — ширина по содержимому, если ширина не задана.
+        // Basis in a row is the content width when no width is set.
         const autoW = ccs.get('width') == null || /^auto$/i.test(String(ccs.get('width')).trim());
         const natural = row ? (autoW ? (shrinkToFit ? cb.w : Math.min(cb.w, __maxContentW(c))) : cb.w) : cb.h;
         return {
@@ -8882,9 +8624,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const gaps = gapMain * Math.max(0, items.length - 1);
       const used = items.reduce((a, it) => a + it.base + it.mMain, 0) + gaps;
       if (row && shrinkToFit) cw = used;
-      // Столбец без заданной высоты высок как его содержимое, но не ниже
-      // `min-height` и не выше `max-height`. Мы брали ноль, и нехватка
-      // сжимала всех детей в ничто.
+      // A column with no set height is as tall as its content, clamped by
+      // `min-height`/`max-height`.
       let inner = cw;
       if (!row) {
         if (explicitH != null) inner = explicitH;
@@ -8919,8 +8660,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       } else if (justify === 'space-evenly' && items.length) {
         lead = slack / (items.length + 1); between += slack / (items.length + 1);
       }
-      // Поперечный размер строки: заданная высота контейнера или самый
-      // высокий ребёнок.
+      // Cross size of the line: the container's set height or the tallest
+      // child.
       const crossOuter = items.reduce((a, it) => Math.max(a, (row ? it.box.h : it.box.w) + it.mCross), 0);
       const lineCross = row
         ? (explicitH != null ? explicitH : crossOuter)
@@ -8956,24 +8697,21 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         }
         along += it.main + it.mMain + between;
       }
-      // Промежуток ставится между детьми, а не после последнего.
+      // The gap goes between children, not after the last.
       y = contentY + (row ? lineCross : Math.max(0, along - (order.length ? between : 0)));
-      // Остальное — как у блока: абсолютные дети кладутся сами по себе.
+      // Otherwise as a block: absolute children are placed on their own.
       for (const c of boxedKids) {
         const p = String(__cascadeFor(c).get('position') || 'static').toLowerCase();
         if (p === 'absolute' || p === 'fixed') __layoutOne(c, contentX, contentY, cw, fbox, { cb: { x: boxX + bl, y: boxY + bt, w: cw + pl + pr, h: (y - contentY) + pt_ + pb } });
       }
     } else {
-      // Блоки ложатся друг под друга, строчные — в строку, и строка
-      // переносится по ширине содержимого. Раньше всякий ребёнок начинал
-      // новую строку, и два `<span>` подряд стояли лесенкой, а не рядом,
-      // как у браузера.
+      // Blocks stack, inline content flows into lines wrapped at the content
+      // width.
       let i = 0;
-      // Поля соседних блоков схлопываются: между двумя абзацами у браузера
-      // шестнадцать пикселей, а не тридцать два. Поле первого и последнего
-      // ребёнка уходит наружу, если у родителя нет ни рамки, ни отступа с
-      // этой стороны, — и становится полем самого родителя.
-      let carry = 0;          // нижнее поле предыдущего блока, ждёт схлопывания
+      // Adjacent margins collapse (16px between two paragraphs, not 32). The
+      // first and last child's margin escapes to the parent when the parent
+      // has no border or padding on that side.
+      let carry = 0;          // previous block's bottom margin, pending collapse
       let firstFlow = true;
       const positionOf = (c) => String(__cascadeFor(c).get('position') || 'static').toLowerCase();
       while (i < boxedKids.length) {
@@ -8993,12 +8731,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
           i++;
           if (!cb) continue;
           const cmt = cb.mt || 0;
-          // Наружу — только у первого в потоке и только через пустой край.
-          // У соседей поля схлопываются в большее из двух: коробка встала на
-          // своё поле, и добрать надо лишь разницу.
-          // Отрицательные поля тоже схлопываются: итог — наибольшее
-          // положительное плюс наименьшее отрицательное. Мы их отбрасывали,
-          // и `margin-top: -15px` у chess.com не поднимал блок ни на пиксель.
+          // Only the first in flow escapes, and only through an empty edge.
+          // Sibling margins collapse to the larger: the box already sits on its
+          // own margin, so add only the difference. Negative margins collapse
+          // too: largest positive plus most negative.
           const escapes = firstFlow && !bt && !pt_;
           const shift = escapes ? -cmt : __collapseM(carry, cmt) - cmt;
           if (escapes) { escapedTop = cmt; hasEscapedTop = true; }
@@ -9015,7 +8751,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
                && positionOf(boxedKids[i]) !== 'absolute' && positionOf(boxedKids[i]) !== 'fixed') {
           run.push(boxedKids[i++]);
         }
-        // Строка соседствует с блоком через полное поле: схлопывать нечему.
+        // A line next to a block uses the full margin: nothing to collapse.
         const done = __layoutInlineRun(run, contentX, y + carry, cw, fbox, lineH);
         y = done.y;
         carry = 0;
@@ -9023,14 +8759,13 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         widest = Math.max(widest, done.widest);
         deepest = Math.max(deepest, y - contentY);
       }
-      // Нижнее поле последнего ребёнка остаётся внутри только тогда, когда
-      // край родителя не пуст.
+      // The last child's bottom margin stays inside only if the parent's edge
+      // is not empty.
       if (carry && (bb || pb)) y += carry;
       else if (carry) escapedBottom = carry;
     }
-    // Убежавшее поле становится полем самого родителя: блок с абзацем внутри
-    // стоит у браузера на шестнадцать пикселей ниже, чем встал бы без этого,
-    // а дети внутри — там же, где были.
+    // An escaped margin becomes the parent's own margin: the block moves down,
+    // the children stay where they were.
     const collapsedTop = hasEscapedTop ? __collapseM(mt, escapedTop) : mt;
     if (collapsedTop !== mt) {
       const delta = collapsedTop - mt;
@@ -9055,13 +8790,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     else if (attrH != null) ch = attrH;
     else if (boxedKids.length) ch = Math.max(0, y - contentY);
     else if (lines && lines.length) ch = lines.length * lineH;
-    // Пустая строчная коробка высоты не имеет: `inline-block` без содержимого
-    // у браузера нулевой, а не в строку высотой.
+    // An empty inline box has no height: an empty `inline-block` is 0 tall.
     else ch = (inlineish && display === 'inline') ? Math.round(lineH) : 0;
 
-    // Строчный элемент высок настолько, насколько высоки его чернила, а не
-    // строка целиком. Заменяемого это не касается: у `<iframe width height>`
-    // размер назван в атрибуте, и он главнее.
+    // An inline element is as tall as its ink, not the whole line. Not for
+    // replaced elements: `<iframe width height>` takes the attribute size.
     if (inlineish && display === 'inline' && !frame
         && explicitH == null && attrH == null && !boxedKids.length && !(lines && lines.length)) {
       ch = fbox.asc + fbox.desc;
@@ -9074,12 +8807,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (minH != null && ch < minH) ch = minH;
     }
 
-    // Браузер держит длины в шестьдесят четвёртых пикселя, и это видно:
-    // ширина строки 72.26171875 у нас против 72.265625 у Chrome — та же
-    // величина, округлённая до его шага.
-    // Браузер держит длины в шестьдесят четвёртых пикселя и **отбрасывает**
-    // остаток, а не округляет: высота строки 22,4 становится 22,390625, а не
-    // 22,40625. Разница видна в каждом дробном размере.
+    // Chrome keeps lengths in 1/64 px and truncates rather than rounds:
+    // line height 22.4 becomes 22.390625, not 22.40625.
     const q = (v) => Math.floor(v * 64) / 64;
     const box = {
       x: q(boxX), y: q(boxY),
@@ -9090,44 +8819,41 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       mt: q(mt), mr: q(mr), ml: q(ml),
       line: lineH, inline: inlineish, lineTop: q(boxY), lines,
       asc: fbox.asc, desc: fbox.desc,
-      // Область прокрутки — по содержимому, а не по самой коробке; полоса
-      // прокрутки, если она есть, отъедает пятнадцать пикселей у видимой части.
+      // Scroll area is the content extent; a scrollbar, if any, takes 15px off
+      // the visible part.
       sw: q(Math.max(cw, widest)), sh: q(Math.max(ch, deepest)),
       bar: [0, 0],
     };
-    // Полоса прокрутки занимает место: у блока с `overflow: auto`, чьё
-    // содержимое не влезает, видимая часть на пятнадцать пикселей уже и ниже.
-    // Мы отвечали полным размером, то есть страницей без полос вообще.
+    // A scrollbar takes space: an `overflow: auto` block whose content does not
+    // fit is 15px narrower and shorter inside.
     {
       const needX = (ovX === 'scroll') || (ovX === 'auto' && widest > cw + 0.5);
       const needY = (ovY === 'scroll') || (ovY === 'auto' && deepest > ch + 0.5);
       box.bar = [needY ? 15 : 0, needX ? 15 : 0];
     }
     if (box.inline && strut) {
-      // Выравнивание по базовой линии, а не по центру: браузер ставит строчный
-      // элемент так, чтобы его базовая линия легла на базовую линию строки.
-      // `<span>` в тринадцать пикселей внутри шестнадцатипиксельного текста
-      // опускается ровно на разницу подъёмов — на два пикселя.
+      // Baseline alignment, not centring: a 13px `<span>` in 16px text drops by
+      // the ascent difference (2px).
       const shift = Math.max(0, strut.asc - fbox.asc);
       box.y = q(box.y + shift);
       box.cy = q(box.cy + shift);
     }
     el.__ptBox = box;
     el.__ptBoxV = __layoutBuilt;
-    // Кадр поменял размер — у его окна поменялся и вид.
+    // A resized frame changes its window's viewport.
     if (tag === 'iframe' && el.__ptRealm) __ptTellFrame(el, box);
     return box;
   }
 
-  // Сообщить окну кадра его размер. Кадра без коробки — `display: none` —
-  // браузер не раскладывает совсем, и об этом окну тоже надо сказать.
+  // Tell a frame's window its size. A `display: none` frame is not laid out
+  // at all, and its window must be told that too.
   function __ptTellFrame(el, box) {
     const w = el.__ptRealm;
     if (!w) return;
     try {
       if (!box) {
         if (typeof w.__pt_setRendered === 'function') w.__pt_setRendered(false);
-        // Окно кадра без коробки — нулевое: innerWidth/innerHeight у Chrome 0.
+        // A boxless frame's window is zero-sized: innerWidth/innerHeight 0 in Chrome.
         if ((el.__ptSeenW !== 0 || el.__ptSeenH !== 0) && typeof w.__pt_setViewport === 'function') {
           el.__ptSeenW = 0; el.__ptSeenH = 0;
           w.__pt_setViewport(0, 0);
@@ -9141,8 +8867,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     } catch (e) {}
   }
 
-  // Кадры, у которых есть своё окно: после каждой раскладки им говорят,
-  // что с ними стало, — спрятанному тоже.
+  // Frames with their own window; after every layout each is told its size,
+  // hidden ones included.
   const __realmFrames = new Set();
 
   function __relayout() {
@@ -9154,10 +8880,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const doc = globalThis.document;
     const de = doc && doc.documentElement;
     if (!de) return;
-    // Отметка раскладки держится на самом документе: коробки его узлов
-    // читает и соседний реалм — окно страницы меряет тело своего кадра, — а
-    // свой счётчик у каждого реалма собственный, и чужие коробки по нему
-    // выходили то пустыми, то устаревшими.
+    // The layout stamp lives on the document: another realm reads its boxes
+    // (a page measures its frame's body), and per-realm counters gave empty or
+    // stale boxes.
     try {
       Object.defineProperty(doc, '__ptLayoutV', { value: __layoutBuilt, configurable: true, enumerable: false, writable: true });
       if (typeof doc.__ptRelayout !== 'function') {
@@ -9166,10 +8891,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     } catch (e) {}
     if (!__rendered) return;
     __layoutOne(de, 0, 0, LAYOUT.W);
-    // В режиме совместимости корень и тело тянутся на всё окно: у пустого
-    // кадра 300×150 браузер отвечает высотой 150 у `html` и 134 у тела, а не
-    // высотой строки. Кадр без доктайпа — обычное дело: `about:blank` и
-    // `srcdoc` идут именно так.
+    // In quirks mode the root and body stretch to the viewport: an empty
+    // 300x150 frame gives `html` 150 and body 134, not a line height. Frames
+    // without a doctype (`about:blank`, `srcdoc`) are common.
     try {
       if (doc.compatMode === 'BackCompat') {
         const stretch = (el, avail) => {
@@ -9186,11 +8910,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         stretch(doc.body, inner);
       }
     } catch (e) {}
-    // Порядок обхода — порядок наложения: попадание в точку ищется с конца, то
-    // есть от самого глубокого и позднего, как в браузере.
+    // Traversal order is paint order: hit testing scans from the end, deepest
+    // and latest first.
     __rows = __boxes;
-    // Спрятанные кадры в обход не попадают, а сказать им надо: пока им не
-    // скажут, внутри останется старая раскладка.
+    // Hidden frames are not traversed but must still be told, or they keep a
+    // stale layout.
     for (const f of __realmFrames) {
       if (!f.isConnected) { __realmFrames.delete(f); continue; }
       if (f.__ptBoxV !== __layoutBuilt) __ptTellFrame(f, null);
@@ -9215,11 +8939,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return out;
   }
 
-  // getComputedStyle: у браузера это 456 свойств с разрешёнными значениями, у
-  // нас была заглушка с двумя. Загрузчик Cloudflare меряет свой виджет именно
-  // так — `getComputedStyle(iframe)` — и пустой ответ читается как «элемента не
-  // видно». Таблицы сняты с Chrome 148: порядок имён, значения по умолчанию для
-  // блочного элемента и дельты для строчного и заменяемого.
+  // getComputedStyle: Chrome exposes 456 resolved properties. Cloudflare's
+  // loader measures its widget with `getComputedStyle(iframe)` and treats an
+  // empty answer as "not visible". Tables from Chrome 148: name order, block
+  // element defaults, deltas for inline and replaced elements.
 const CS_ORDER = ["accent-color","align-content","align-items","align-self","alignment-baseline","anchor-name","anchor-scope","animation-composition","animation-delay","animation-direction","animation-duration","animation-fill-mode","animation-iteration-count","animation-name","animation-play-state","animation-range-end","animation-range-start","animation-timeline","animation-timing-function","animation-trigger","app-region","appearance","aspect-ratio","backdrop-filter","backface-visibility","background-attachment","background-blend-mode","background-clip","background-color","background-image","background-origin","background-position","background-repeat","background-size","baseline-shift","baseline-source","block-size","border-block-end-color","border-block-end-style","border-block-end-width","border-block-start-color","border-block-start-style","border-block-start-width","border-bottom-color","border-bottom-left-radius","border-bottom-right-radius","border-bottom-style","border-bottom-width","border-collapse","border-end-end-radius","border-end-start-radius","border-image-outset","border-image-repeat","border-image-slice","border-image-source","border-image-width","border-inline-end-color","border-inline-end-style","border-inline-end-width","border-inline-start-color","border-inline-start-style","border-inline-start-width","border-left-color","border-left-style","border-left-width","border-right-color","border-right-style","border-right-width","border-shape","border-start-end-radius","border-start-start-radius","border-top-color","border-top-left-radius","border-top-right-radius","border-top-style","border-top-width","bottom","box-decoration-break","box-shadow","box-sizing","break-after","break-before","break-inside","buffered-rendering","caption-side","caret-animation","caret-color","caret-shape","clear","clip","clip-path","clip-rule","color","color-interpolation","color-interpolation-filters","color-rendering","color-scheme","column-count","column-fill","column-gap","column-height","column-rule-break","column-rule-color","column-rule-inset-cap-end","column-rule-inset-cap-start","column-rule-inset-junction-end","column-rule-inset-junction-start","column-rule-style","column-rule-visibility-items","column-rule-width","column-span","column-width","column-wrap","contain","contain-intrinsic-block-size","contain-intrinsic-height","contain-intrinsic-inline-size","contain-intrinsic-size","contain-intrinsic-width","container-name","container-type","content","content-visibility","corner-bottom-left-shape","corner-bottom-right-shape","corner-end-end-shape","corner-end-start-shape","corner-start-end-shape","corner-start-start-shape","corner-top-left-shape","corner-top-right-shape","counter-increment","counter-reset","counter-set","cursor","cx","cy","d","direction","display","dominant-baseline","dynamic-range-limit","empty-cells","field-sizing","fill","fill-opacity","fill-rule","filter","flex-basis","flex-direction","flex-grow","flex-line-count","flex-shrink","flex-wrap","float","flood-color","flood-opacity","font-family","font-feature-settings","font-kerning","font-language-override","font-optical-sizing","font-palette","font-size","font-size-adjust","font-stretch","font-style","font-synthesis-small-caps","font-synthesis-style","font-synthesis-weight","font-variant","font-variant-alternates","font-variant-caps","font-variant-east-asian","font-variant-emoji","font-variant-ligatures","font-variant-numeric","font-variant-position","font-variation-settings","font-weight","forced-color-adjust","grid-auto-columns","grid-auto-flow","grid-auto-rows","grid-column-end","grid-column-start","grid-row-end","grid-row-start","grid-template-areas","grid-template-columns","grid-template-rows","height","hyphenate-character","hyphenate-limit-chars","hyphens","image-orientation","image-rendering","initial-letter","inline-size","inset-block-end","inset-block-start","inset-inline-end","inset-inline-start","interactivity","interest-delay-end","interest-delay-start","interpolate-size","isolation","justify-content","justify-items","justify-self","left","letter-spacing","lighting-color","line-break","line-height","list-style-image","list-style-position","list-style-type","margin-block-end","margin-block-start","margin-bottom","margin-inline-end","margin-inline-start","margin-left","margin-right","margin-top","marker-end","marker-mid","marker-start","mask-clip","mask-composite","mask-image","mask-mode","mask-origin","mask-position","mask-repeat","mask-size","mask-type","math-depth","math-shift","math-style","max-block-size","max-height","max-inline-size","max-width","min-block-size","min-height","min-inline-size","min-width","mix-blend-mode","object-fit","object-position","object-view-box","offset-anchor","offset-distance","offset-path","offset-position","offset-rotate","opacity","order","orphans","outline-color","outline-offset","outline-style","outline-width","overflow-anchor","overflow-block","overflow-clip-margin","overflow-inline","overflow-wrap","overflow-x","overflow-y","overlay","overscroll-behavior-block","overscroll-behavior-inline","overscroll-behavior-x","overscroll-behavior-y","padding-block-end","padding-block-start","padding-bottom","padding-inline-end","padding-inline-start","padding-left","padding-right","padding-top","paint-order","perspective","perspective-origin","pointer-events","position","position-anchor","position-area","position-try-fallbacks","position-try-order","position-visibility","print-color-adjust","quotes","r","reading-flow","reading-order","resize","right","rotate","row-gap","row-rule-break","row-rule-color","row-rule-inset-cap-end","row-rule-inset-cap-start","row-rule-inset-junction-end","row-rule-inset-junction-start","row-rule-style","row-rule-visibility-items","row-rule-width","ruby-align","ruby-overhang","ruby-position","rule-overlap","rx","ry","scale","scroll-behavior","scroll-initial-target","scroll-margin-block-end","scroll-margin-block-start","scroll-margin-bottom","scroll-margin-inline-end","scroll-margin-inline-start","scroll-margin-left","scroll-margin-right","scroll-margin-top","scroll-marker-group","scroll-padding-block-end","scroll-padding-block-start","scroll-padding-bottom","scroll-padding-inline-end","scroll-padding-inline-start","scroll-padding-left","scroll-padding-right","scroll-padding-top","scroll-snap-align","scroll-snap-stop","scroll-snap-type","scroll-target-group","scroll-timeline-axis","scroll-timeline-name","scrollbar-color","scrollbar-gutter","scrollbar-width","shape-image-threshold","shape-margin","shape-outside","shape-rendering","speak","stop-color","stop-opacity","stroke","stroke-dasharray","stroke-dashoffset","stroke-linecap","stroke-linejoin","stroke-miterlimit","stroke-opacity","stroke-width","tab-size","table-layout","text-align","text-align-last","text-anchor","text-autospace","text-box-edge","text-box-trim","text-combine-upright","text-decoration","text-decoration-color","text-decoration-line","text-decoration-skip-ink","text-decoration-style","text-decoration-thickness","text-emphasis-color","text-emphasis-position","text-emphasis-style","text-fit","text-indent","text-justify","text-orientation","text-overflow","text-rendering","text-shadow","text-size-adjust","text-spacing-trim","text-transform","text-underline-offset","text-underline-position","text-wrap-mode","text-wrap-style","timeline-scope","timeline-trigger-activation-range-end","timeline-trigger-activation-range-start","timeline-trigger-active-range-end","timeline-trigger-active-range-start","timeline-trigger-name","timeline-trigger-source","top","touch-action","transform","transform-box","transform-origin","transform-style","transition-behavior","transition-delay","transition-duration","transition-property","transition-timing-function","translate","trigger-scope","unicode-bidi","user-select","vector-effect","vertical-align","view-timeline-axis","view-timeline-inset","view-timeline-name","view-transition-class","view-transition-group","view-transition-name","view-transition-scope","visibility","white-space-collapse","widows","width","will-change","word-break","word-spacing","writing-mode","x","y","z-index","zoom","-webkit-border-horizontal-spacing","-webkit-border-image","-webkit-border-vertical-spacing","-webkit-box-align","-webkit-box-decoration-break","-webkit-box-direction","-webkit-box-flex","-webkit-box-ordinal-group","-webkit-box-orient","-webkit-box-pack","-webkit-box-reflect","-webkit-font-smoothing","-webkit-line-break","-webkit-line-clamp","-webkit-locale","-webkit-mask-box-image","-webkit-mask-box-image-outset","-webkit-mask-box-image-repeat","-webkit-mask-box-image-slice","-webkit-mask-box-image-source","-webkit-mask-box-image-width","-webkit-mask-position-x","-webkit-mask-position-y","-webkit-rtl-ordering","-webkit-ruby-position","-webkit-tap-highlight-color","-webkit-text-combine","-webkit-text-decorations-in-effect","-webkit-text-fill-color","-webkit-text-orientation","-webkit-text-security","-webkit-text-stroke-color","-webkit-text-stroke-width","-webkit-user-drag","-webkit-user-modify","-webkit-writing-mode"];
 const CS_BASE = {"accent-color":"auto","align-content":"normal","align-items":"normal","align-self":"auto","alignment-baseline":"auto","anchor-name":"none","anchor-scope":"none","animation-composition":"replace","animation-delay":"0s","animation-direction":"normal","animation-duration":"0s","animation-fill-mode":"none","animation-iteration-count":"1","animation-name":"none","animation-play-state":"running","animation-range-end":"normal","animation-range-start":"normal","animation-timeline":"auto","animation-timing-function":"ease","animation-trigger":"none","app-region":"none","appearance":"none","aspect-ratio":"auto","backdrop-filter":"none","backface-visibility":"visible","background-attachment":"scroll","background-blend-mode":"normal","background-clip":"border-box","background-color":"rgba(0, 0, 0, 0)","background-image":"none","background-origin":"padding-box","background-position":"0% 0%","background-repeat":"repeat","background-size":"auto","baseline-shift":"0px","baseline-source":"auto","block-size":"auto","border-block-end-color":"rgb(0, 0, 0)","border-block-end-style":"none","border-block-end-width":"0px","border-block-start-color":"rgb(0, 0, 0)","border-block-start-style":"none","border-block-start-width":"0px","border-bottom-color":"rgb(0, 0, 0)","border-bottom-left-radius":"0px","border-bottom-right-radius":"0px","border-bottom-style":"none","border-bottom-width":"0px","border-collapse":"separate","border-end-end-radius":"0px","border-end-start-radius":"0px","border-image-outset":"0","border-image-repeat":"stretch","border-image-slice":"100%","border-image-source":"none","border-image-width":"1","border-inline-end-color":"rgb(0, 0, 0)","border-inline-end-style":"none","border-inline-end-width":"0px","border-inline-start-color":"rgb(0, 0, 0)","border-inline-start-style":"none","border-inline-start-width":"0px","border-left-color":"rgb(0, 0, 0)","border-left-style":"none","border-left-width":"0px","border-right-color":"rgb(0, 0, 0)","border-right-style":"none","border-right-width":"0px","border-shape":"none","border-start-end-radius":"0px","border-start-start-radius":"0px","border-top-color":"rgb(0, 0, 0)","border-top-left-radius":"0px","border-top-right-radius":"0px","border-top-style":"none","border-top-width":"0px","bottom":"auto","box-decoration-break":"slice","box-shadow":"none","box-sizing":"content-box","break-after":"auto","break-before":"auto","break-inside":"auto","buffered-rendering":"auto","caption-side":"top","caret-animation":"auto","caret-color":"rgb(0, 0, 0)","caret-shape":"auto","clear":"none","clip":"auto","clip-path":"none","clip-rule":"nonzero","color":"rgb(0, 0, 0)","color-interpolation":"srgb","color-interpolation-filters":"linearrgb","color-rendering":"auto","color-scheme":"normal","column-count":"auto","column-fill":"balance","column-gap":"normal","column-height":"auto","column-rule-break":"normal","column-rule-color":"rgb(0, 0, 0)","column-rule-inset-cap-end":"0px","column-rule-inset-cap-start":"0px","column-rule-inset-junction-end":"0px","column-rule-inset-junction-start":"0px","column-rule-style":"none","column-rule-visibility-items":"normal","column-rule-width":"3px","column-span":"none","column-width":"auto","column-wrap":"auto","contain":"none","contain-intrinsic-block-size":"none","contain-intrinsic-height":"none","contain-intrinsic-inline-size":"none","contain-intrinsic-size":"none","contain-intrinsic-width":"none","container-name":"none","container-type":"normal","content":"normal","content-visibility":"visible","corner-bottom-left-shape":"round","corner-bottom-right-shape":"round","corner-end-end-shape":"round","corner-end-start-shape":"round","corner-start-end-shape":"round","corner-start-start-shape":"round","corner-top-left-shape":"round","corner-top-right-shape":"round","counter-increment":"none","counter-reset":"none","counter-set":"none","cursor":"auto","cx":"0px","cy":"0px","d":"none","direction":"ltr","display":"block","dominant-baseline":"auto","dynamic-range-limit":"no-limit","empty-cells":"show","field-sizing":"fixed","fill":"rgb(0, 0, 0)","fill-opacity":"1","fill-rule":"nonzero","filter":"none","flex-basis":"auto","flex-direction":"row","flex-grow":"0","flex-line-count":"1","flex-shrink":"1","flex-wrap":"nowrap","float":"none","flood-color":"rgb(0, 0, 0)","flood-opacity":"1","font-family":"\"Times New Roman\"","font-feature-settings":"normal","font-kerning":"auto","font-language-override":"normal","font-optical-sizing":"auto","font-palette":"normal","font-size":"16px","font-size-adjust":"none","font-stretch":"100%","font-style":"normal","font-synthesis-small-caps":"auto","font-synthesis-style":"auto","font-synthesis-weight":"auto","font-variant":"normal","font-variant-alternates":"normal","font-variant-caps":"normal","font-variant-east-asian":"normal","font-variant-emoji":"normal","font-variant-ligatures":"normal","font-variant-numeric":"normal","font-variant-position":"normal","font-variation-settings":"normal","font-weight":"400","forced-color-adjust":"auto","grid-auto-columns":"auto","grid-auto-flow":"row","grid-auto-rows":"auto","grid-column-end":"auto","grid-column-start":"auto","grid-row-end":"auto","grid-row-start":"auto","grid-template-areas":"none","grid-template-columns":"none","grid-template-rows":"none","height":"auto","hyphenate-character":"auto","hyphenate-limit-chars":"auto","hyphens":"manual","image-orientation":"from-image","image-rendering":"auto","initial-letter":"normal","inline-size":"auto","inset-block-end":"auto","inset-block-start":"auto","inset-inline-end":"auto","inset-inline-start":"auto","interactivity":"auto","interest-delay-end":"normal","interest-delay-start":"normal","interpolate-size":"numeric-only","isolation":"auto","justify-content":"normal","justify-items":"normal","justify-self":"auto","left":"auto","letter-spacing":"normal","lighting-color":"rgb(255, 255, 255)","line-break":"auto","line-height":"normal","list-style-image":"none","list-style-position":"outside","list-style-type":"disc","margin-block-end":"0px","margin-block-start":"0px","margin-bottom":"0px","margin-inline-end":"0px","margin-inline-start":"0px","margin-left":"0px","margin-right":"0px","margin-top":"0px","marker-end":"none","marker-mid":"none","marker-start":"none","mask-clip":"border-box","mask-composite":"add","mask-image":"none","mask-mode":"match-source","mask-origin":"border-box","mask-position":"0% 0%","mask-repeat":"repeat","mask-size":"auto","mask-type":"luminance","math-depth":"0","math-shift":"normal","math-style":"normal","max-block-size":"none","max-height":"none","max-inline-size":"none","max-width":"none","min-block-size":"0px","min-height":"0px","min-inline-size":"0px","min-width":"0px","mix-blend-mode":"normal","object-fit":"fill","object-position":"50% 50%","object-view-box":"none","offset-anchor":"auto","offset-distance":"0px","offset-path":"none","offset-position":"normal","offset-rotate":"auto 0deg","opacity":"1","order":"0","orphans":"2","outline-color":"rgb(0, 0, 0)","outline-offset":"0px","outline-style":"none","outline-width":"3px","overflow-anchor":"auto","overflow-block":"visible","overflow-clip-margin":"0px","overflow-inline":"visible","overflow-wrap":"normal","overflow-x":"visible","overflow-y":"visible","overlay":"none","overscroll-behavior-block":"auto","overscroll-behavior-inline":"auto","overscroll-behavior-x":"auto","overscroll-behavior-y":"auto","padding-block-end":"0px","padding-block-start":"0px","padding-bottom":"0px","padding-inline-end":"0px","padding-inline-start":"0px","padding-left":"0px","padding-right":"0px","padding-top":"0px","paint-order":"normal","perspective":"none","perspective-origin":"50% 50%","pointer-events":"auto","position":"static","position-anchor":"normal","position-area":"none","position-try-fallbacks":"none","position-try-order":"normal","position-visibility":"anchors-visible","print-color-adjust":"economy","quotes":"auto","r":"0px","reading-flow":"normal","reading-order":"0","resize":"none","right":"auto","rotate":"none","row-gap":"normal","row-rule-break":"normal","row-rule-color":"rgb(0, 0, 0)","row-rule-inset-cap-end":"0px","row-rule-inset-cap-start":"0px","row-rule-inset-junction-end":"0px","row-rule-inset-junction-start":"0px","row-rule-style":"none","row-rule-visibility-items":"normal","row-rule-width":"3px","ruby-align":"space-around","ruby-overhang":"auto","ruby-position":"over","rule-overlap":"row-over-column","rx":"auto","ry":"auto","scale":"none","scroll-behavior":"auto","scroll-initial-target":"none","scroll-margin-block-end":"0px","scroll-margin-block-start":"0px","scroll-margin-bottom":"0px","scroll-margin-inline-end":"0px","scroll-margin-inline-start":"0px","scroll-margin-left":"0px","scroll-margin-right":"0px","scroll-margin-top":"0px","scroll-marker-group":"none","scroll-padding-block-end":"auto","scroll-padding-block-start":"auto","scroll-padding-bottom":"auto","scroll-padding-inline-end":"auto","scroll-padding-inline-start":"auto","scroll-padding-left":"auto","scroll-padding-right":"auto","scroll-padding-top":"auto","scroll-snap-align":"none","scroll-snap-stop":"normal","scroll-snap-type":"none","scroll-target-group":"none","scroll-timeline-axis":"block","scroll-timeline-name":"none","scrollbar-color":"auto","scrollbar-gutter":"auto","scrollbar-width":"auto","shape-image-threshold":"0","shape-margin":"0px","shape-outside":"none","shape-rendering":"auto","speak":"normal","stop-color":"rgb(0, 0, 0)","stop-opacity":"1","stroke":"none","stroke-dasharray":"none","stroke-dashoffset":"0px","stroke-linecap":"butt","stroke-linejoin":"miter","stroke-miterlimit":"4","stroke-opacity":"1","stroke-width":"1px","tab-size":"8","table-layout":"auto","text-align":"start","text-align-last":"auto","text-anchor":"start","text-autospace":"no-autospace","text-box-edge":"auto","text-box-trim":"none","text-combine-upright":"none","text-decoration":"none","text-decoration-color":"rgb(0, 0, 0)","text-decoration-line":"none","text-decoration-skip-ink":"auto","text-decoration-style":"solid","text-decoration-thickness":"auto","text-emphasis-color":"rgb(0, 0, 0)","text-emphasis-position":"over","text-emphasis-style":"none","text-fit":"none","text-indent":"0px","text-justify":"auto","text-orientation":"mixed","text-overflow":"clip","text-rendering":"auto","text-shadow":"none","text-size-adjust":"auto","text-spacing-trim":"normal","text-transform":"none","text-underline-offset":"auto","text-underline-position":"auto","text-wrap-mode":"wrap","text-wrap-style":"auto","timeline-scope":"none","timeline-trigger-activation-range-end":"normal","timeline-trigger-activation-range-start":"normal","timeline-trigger-active-range-end":"auto","timeline-trigger-active-range-start":"auto","timeline-trigger-name":"none","timeline-trigger-source":"auto","top":"auto","touch-action":"auto","transform":"none","transform-box":"view-box","transform-origin":"50% 50%","transform-style":"flat","transition-behavior":"normal","transition-delay":"0s","transition-duration":"0s","transition-property":"all","transition-timing-function":"ease","translate":"none","trigger-scope":"none","unicode-bidi":"isolate","user-select":"auto","vector-effect":"none","vertical-align":"baseline","view-timeline-axis":"block","view-timeline-inset":"auto","view-timeline-name":"none","view-transition-class":"none","view-transition-group":"normal","view-transition-name":"none","view-transition-scope":"none","visibility":"visible","white-space-collapse":"collapse","widows":"2","width":"auto","will-change":"auto","word-break":"normal","word-spacing":"0px","writing-mode":"horizontal-tb","x":"0px","y":"0px","z-index":"auto","zoom":"1","-webkit-border-horizontal-spacing":"0px","-webkit-border-image":"none","-webkit-border-vertical-spacing":"0px","-webkit-box-align":"stretch","-webkit-box-decoration-break":"slice","-webkit-box-direction":"normal","-webkit-box-flex":"0","-webkit-box-ordinal-group":"1","-webkit-box-orient":"horizontal","-webkit-box-pack":"start","-webkit-box-reflect":"none","-webkit-font-smoothing":"auto","-webkit-line-break":"auto","-webkit-line-clamp":"none","-webkit-locale":"auto","-webkit-mask-box-image":"none","-webkit-mask-box-image-outset":"0","-webkit-mask-box-image-repeat":"stretch","-webkit-mask-box-image-slice":"0 fill","-webkit-mask-box-image-source":"none","-webkit-mask-box-image-width":"auto","-webkit-mask-position-x":"0%","-webkit-mask-position-y":"0%","-webkit-rtl-ordering":"logical","-webkit-ruby-position":"before","-webkit-tap-highlight-color":"rgba(0, 0, 0, 0.18)","-webkit-text-combine":"none","-webkit-text-decorations-in-effect":"none","-webkit-text-fill-color":"rgb(0, 0, 0)","-webkit-text-orientation":"vertical-right","-webkit-text-security":"none","-webkit-text-stroke-color":"rgb(0, 0, 0)","-webkit-text-stroke-width":"0px","-webkit-user-drag":"auto","-webkit-user-modify":"read-only","-webkit-writing-mode":"horizontal-tb"};
 const CS_INLINE = {"block-size":"auto","display":"inline","height":"auto","inline-size":"auto","perspective-origin":"0px 0px","transform-origin":"0px 0px","unicode-bidi":"normal","width":"auto"};
@@ -9246,10 +8969,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   const CS_REPLACED_TAGS = new Set(['iframe', 'img', 'canvas', 'video', 'audio', 'object', 'embed']);
   const CS_CAMEL = (n) => n.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 
-  // Наследуемые свойства. У нас их не наследовал никто: `<div>` внутри `<body>`
-  // с заданным шрифтом отвечал шрифтом по умолчанию, то есть противоречил
-  // собственной странице. Список — из спецификации; проверен на Chrome по
-  // цвету, шрифту, высоте строки и выключке.
+  // Inherited properties, per spec; verified in Chrome on colour, font, line
+  // height and alignment.
   const CSS_INHERITED = new Set([
     'azimuth', 'border-collapse', 'border-spacing', 'caption-side', 'caret-color',
     'color', 'color-scheme', 'cursor', 'direction', 'empty-cells', 'font',
@@ -9284,7 +9005,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     '-webkit-border-vertical-spacing', '-webkit-ruby-position',
     '-webkit-tap-highlight-color', '-webkit-text-combine',
   ]);
-  /// Значение наследуемого свойства: ближайший предок, который его назвал.
+  /// Value of an inherited property: the nearest ancestor that sets it.
   const __inheritedValue = (el, prop) => {
     let own = el && el.nodeType === ELEMENT_NODE ? __passInherit.get(el) : null;
     if (own) {
@@ -9303,11 +9024,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     return out;
   };
 
-  // Сокращённые свойства. В вычисленном стиле браузер их не показывает вовсе
-  // — только длинные, — а значение раскладывает по ним сам. Мы же клали в
-  // ответ и само сокращение (лишнее имя в перечислении), и оставляли длинные
-  // при начальных значениях: `background: blue` не давало `background-color`,
-  // `border: 2px solid red` — ни цвета, ни стиля.
+  // Shorthands: computed style never lists them, only the longhands they
+  // expand to (`background: blue` sets `background-color`).
   const CS_SIDES = ['top', 'right', 'bottom', 'left'];
   const __ptIsColour = (t) => !!(globalThis.__pt_cssColour && globalThis.__pt_cssColour(t))
     || /^(currentcolor|transparent)$/i.test(t)
@@ -9315,8 +9033,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   const CS_BORDER_STYLES = new Set(['none', 'hidden', 'dotted', 'dashed', 'solid', 'double',
     'groove', 'ridge', 'inset', 'outset']);
   const CS_WIDTH_WORDS = { thin: '1px', medium: '3px', thick: '5px' };
-  // Разбиение по пробелам верхнего уровня: `rgba(1, 2, 3, .4) solid 1px` —
-  // три куска, а не семь.
+  // Split on top-level spaces: `rgba(1, 2, 3, .4) solid 1px` is three parts.
   const __ptCssParts = (v) => {
     const out = [];
     let depth = 0, cur = '';
@@ -9340,8 +9057,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     void pick;
     return CS_SIDES.map((side, i) => [name.replace('*', side), order[i]]);
   };
-  // Возвращает пары «длинное свойство — значение» или null, если это не
-  // сокращение.
+  // Returns [longhand, value] pairs, or null if not a shorthand.
   const __ptExpand = (prop, value) => {
     const v = String(value).trim();
     const parts = __ptCssParts(v);
@@ -9459,8 +9175,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       return out;
     }
     if (prop === 'transition') {
-      // Первый слой: браузер печатает списки по слоям, а на странице почти
-      // всегда один.
+      // First layer only: lists print per layer, and pages almost always have one.
       const layer = v.split(',')[0].trim();
       const p = __ptCssParts(layer);
       const times = p.filter((x) => /^[\d.]+m?s$/i.test(x));
@@ -9484,14 +9199,14 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     }
     return null;
   };
-  // Цвет, унаследованный от `color`: у этих свойств начальное значение —
-  // `currentColor`, и браузер печатает в них цвет самого элемента.
+  // Colours whose initial value is `currentColor`; Chrome prints the
+  // element's colour there.
   const CS_CURRENT_COLOUR = ['caret-color', 'column-rule-color', 'row-rule-color', 'outline-color',
     'text-decoration-color', 'text-emphasis-color', '-webkit-text-fill-color',
     '-webkit-text-stroke-color', 'border-top-color', 'border-right-color',
     'border-bottom-color', 'border-left-color', 'border-block-start-color',
     'border-block-end-color', 'border-inline-start-color', 'border-inline-end-color'];
-  // Логические имена браузер печатает теми же значениями, что и физические.
+  // Logical names print the same values as physical ones.
   const CS_LOGICAL = [
     ['border-block-start-color', 'border-top-color'], ['border-block-end-color', 'border-bottom-color'],
     ['border-inline-start-color', 'border-left-color'], ['border-inline-end-color', 'border-right-color'],
@@ -9515,8 +9230,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     ['max-inline-size', 'max-width'], ['max-block-size', 'max-height'],
   ];
 
-  // Какие свойства движок знает: `CSS.supports` у браузера отвечает `false`
-  // на выдуманное имя, а у нас отвечал `true` на что угодно с двоеточием.
+  // Known properties: Chrome's `CSS.supports` answers `false` for an
+  // unknown name.
   try {
     const known = new Set(CS_ORDER);
     for (const name of CSS_PROPS) {
@@ -9530,20 +9245,18 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     });
   } catch (e) {}
 
-  // Вычисленный стиль дорог: тысяча двести свойств, каскад, наследование и
-  // раскладка. Страница спрашивает его десятками раз подряд, и между
-  // вопросами ничего не меняется — держим готовый ответ до первой правки
-  // дерева.
+  // Computed style is expensive and pages ask for it repeatedly; cache it
+  // until the next tree mutation.
   const __computedCache = new WeakMap();
 
-  // В плоском дереве ли узел: дитя хозяина теневого корня попадает туда только
-  // через слот с тем же именем; остальные хозяин прячет, и стиля у них нет.
+  // Whether a node is in the flat tree: a shadow host's child gets there only
+  // through a slot of the same name; the rest are hidden and have no style.
   function __inFlatTree(el) {
     let n = el;
     for (let guard = 0; n && guard < 10000; guard++) {
       const p = n.parentNode;
-      // Корень — документ (какой именно, проверяет вызывающий по ownerDocument:
-      // у реалма корень дерева и глобальный `document` — разные объекты).
+      // The root is a document (the caller checks which one via ownerDocument:
+      // in a realm the tree root and the global `document` differ).
       if (!p) return n.nodeType === 9;
       if (p.nodeType === ELEMENT_NODE && p.__ptShadow) {
         const sr = p.__ptShadow;
@@ -9568,15 +9281,12 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       if (hit && hit.at === __layoutBuilt) return hit.style;
     }
     const map = new Map();
-    // У элемента вне отрисованного дерева вычисленного стиля нет: браузер
-    // отдаёт пустую строку на каждое свойство и `length` ноль. Мы отвечали
-    // значениями по умолчанию — то есть утверждали, что оторванный `<div>`
-    // блочный и чёрный, чего браузер про него не говорит. Проверяется одной
-    // строкой: создать элемент и спросить его `display`.
+    // An element outside the rendered tree has no computed style: Chrome
+    // returns '' for every property and `length` 0.
     const connected = !!(el && el.nodeType === ELEMENT_NODE && el.isConnected);
-    // Документ без окна (DOMParser, createHTMLDocument): стиль не считается
-    // вовсе — пусто и длина ноль. Узел в окне, но вне плоского дерева (дитя
-    // хозяина теневого корня без слота): имена есть, значения пусты.
+    // A windowless document (DOMParser, createHTMLDocument): empty, length 0.
+    // A node in the window but outside the flat tree (unslotted shadow host
+    // child): names present, values empty.
     const inView = connected && (!el.ownerDocument || el.ownerDocument === document || !!el.ownerDocument.defaultView);
     if (!connected || !inView) {
       for (const k of CS_ORDER) map.set(k, '');
@@ -9597,14 +9307,13 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     if (CS_REPLACED_TAGS.has(tag)) for (const [k, v] of Object.entries(CS_REPLACED)) map.set(k, v);
     if (CS_DISPLAY[tag]) map.set('display', CS_DISPLAY[tag]);
     if (UA_BIDI[tag]) map.set('unicode-bidi', UA_BIDI[tag]);
-    // Заявленное автором поверх умолчаний, потом — использованные размеры.
-    // Автор — это и таблицы стилей, а не только атрибут `style`: элемент с
-    // `width: 200px` в таблице отвечал шириной окна, противореча CSS страницы.
+    // Author declarations (stylesheets and `style`) over defaults, then used
+    // sizes.
     try {
       __relayout();
       const cascade = el ? __cascadeFor(el) : new Map();
       const fs = el ? __usedFontSize(el) : 16;
-      // Сначала унаследованное от предков, потом своё поверх.
+      // Inherited values first, then own on top.
       for (const prop of CSS_INHERITED) {
         if (cascade.has(prop)) continue;
         const v = __inheritedValue(el, prop);
@@ -9614,12 +9323,10 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         if (map.has(prop)) map.set(prop, v);
       }
       if (UA_BOLD.has(tag)) map.set('font-weight', '700');
-      // Моноширинное семейство браузер задаёт своей таблицей, а она сильнее
-      // наследования: `<pre>` внутри тела с заданным шрифтом всё равно
-      // набирается моноширинным.
+      // The UA stylesheet sets monospace and beats inheritance: `<pre>` in a
+      // body with a set font is still monospace.
       if (UA_MONO.has(tag)) map.set('font-family', 'monospace');
-      // Только длинные имена: сокращений в вычисленном стиле браузер не
-      // показывает, но раскладывает их значения по длинным сам.
+      // Longhands only: computed style never lists shorthands.
       const put = (k, raw) => {
         if (!map.has(k)) return;
         map.set(k, __resolveLength(String(raw).trim(), k, fs, el));
@@ -9635,9 +9342,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         put(n, v);
         written.add(n);
       }
-      // Поля от таблицы стилей самого браузера: автор их перебивает, но там,
-      // где автор молчит, браузер печатает своё — у тела страницы восемь
-      // пикселей, у абзаца кегль, у заголовка доля кегля.
+      // UA stylesheet margins where the author set none (body 8px, p, h*).
       {
         const q = (v) => (Math.round(v * 1e4) / 1e4) + 'px';
         const uam = __uaMargin(tag, fs);
@@ -9647,9 +9352,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
             if (!written.has(k) && map.has(k)) map.set(k, q(v));
           }
         }
-        // `auto` браузер в вычисленном стиле не печатает: он отвечает тем
-        // полем, которое получилось на раскладке — у блока по центру это
-        // половина свободного места.
+        // Chrome prints the used margin, not `auto` (half the free space when
+        // centred).
         const ab = __boxOf(el);
         if (ab) {
           for (const [k, v] of [['margin-top', ab.mt], ['margin-bottom', ab.mb],
@@ -9658,7 +9362,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
           }
         }
       }
-      // Преобразование браузер печатает матрицей: `matrix(1.001, 0, 0, 1.001, 0, 0)`.
+      // Transforms are printed as a matrix: `matrix(1.001, 0, 0, 1.001, 0, 0)`.
       {
         const tr = map.get('transform');
         if (tr && tr !== 'none') {
@@ -9666,14 +9370,14 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
           if (M) map.set('transform', 'matrix(' + M.map(__cssNum1).join(', ') + ')');
         }
       }
-      // Цвет по записи браузера: всякая запись sRGB приводится к `rgb(…)`.
+      // Any sRGB colour is normalised to `rgb(…)`.
       for (const k of map.keys()) {
         if (k !== 'color' && !k.endsWith('-color')) continue;
         const norm = globalThis.__pt_cssColour && globalThis.__pt_cssColour(map.get(k));
         if (norm) map.set(k, norm);
       }
-      // `currentColor` — начальное значение у целого ряда свойств: браузер
-      // печатает в них цвет самого элемента.
+      // `currentColor` is the initial value of several properties; Chrome
+      // prints the element's own colour there.
       const own = map.get('color');
       if (own) {
         for (const k of CS_CURRENT_COLOUR) {
@@ -9682,14 +9386,13 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
           if (!written.has(k) || /^currentcolor$/i.test(String(cur))) map.set(k, own);
         }
       }
-      // Логические имена повторяют физические.
+      // Logical names mirror physical ones.
       for (const [logical, physical] of CS_LOGICAL) {
         if (map.has(logical) && map.has(physical) && !written.has(logical)) {
           map.set(logical, map.get(physical));
         }
       }
-      // Ребёнок гибкого контейнера: браузер делает его блочным и меняет
-      // начальный минимум на `auto`.
+      // A flex item is blockified and its initial min size becomes `auto`.
       try {
         const parent = el.parentNode;
         const pd = parent && parent.nodeType === ELEMENT_NODE
@@ -9704,12 +9407,10 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
           }
         }
       } catch (e) {}
-      // Тень браузер печатает по-своему: сперва цвет, потом четыре длины с
-      // единицами, и `inset` в конце.
+      // Shadow format: colour first, then four lengths, `inset` last.
       {
         const sh = String(map.get('box-shadow') || '');
-        // Вычисленный стиль печатает все четыре длины, даже если автор написал
-        // две: браузер дописывает размытие и разброс нулями.
+        // All four lengths are printed; Chrome fills blur and spread with 0.
         if (sh && sh !== 'none') {
           const parts = __ptCssParts(sh);
           let colour = null, inset = false;
@@ -9726,18 +9427,18 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
             .join(' ') + (inset ? ' inset' : ''));
         }
       }
-      // Множитель межстрочного браузер печатает уже в пикселях.
+      // A line-height multiplier is printed in pixels.
       const lh = String(map.get('line-height') || '');
       if (/^[\d.]+$/.test(lh)) {
         const px = parseFloat(lh) * parseFloat(map.get('font-size')) || 0;
         map.set('line-height', (Math.round(px * 1e4) / 1e4) + 'px');
       }
-      // Ссылка: у браузера свой стиль по умолчанию, и он виден в вычисленном.
+      // Links have a UA default style, visible in computed style.
       if (el.localName === 'a' && __ptHasA(el, 'href')) {
         if (!written.has('cursor')) map.set('cursor', 'pointer');
         if (!written.has('text-decoration-line')) map.set('text-decoration-line', 'underline');
       }
-      // Сокращения, которые браузер всё же печатает, собираются из длинных.
+      // Shorthands Chrome does print are built from longhands.
       {
         const line = map.get('text-decoration-line');
         if (map.has('text-decoration')) {
@@ -9763,15 +9464,13 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         if (__isUnboxed(el)) map.set('display', 'none');
         const b = __boxOf(el);
         if (b) {
-          // Браузер называет здесь поле содержимого: у элемента с рамкой и
-          // отступами `width` — это его `width` из CSS, а не внешний размер.
-          // Браузер печатает вычисленную длину с четырьмя знаками после
-          // запятой: `72.2656px`, не `72.265625px`.
+          // `width` is the content box (CSS `width`), not the outer size,
+          // printed with four decimals: `72.2656px`, not `72.265625px`.
           const q = (v) => {
             const r = Math.round(v * 1e4) / 1e4;
             return (Number.isInteger(r) ? r : parseFloat(r.toFixed(4))) + 'px';
           };
-          // При `border-box` — вместе с полями и рамкой, как и названо в CSS.
+          // With `border-box`, padding and border included.
           const outer = map.get('box-sizing') === 'border-box';
           const w = outer ? b.w : b.cw, h = outer ? b.h : b.ch;
           map.set('width', q(w)); map.set('height', q(h));
@@ -9781,11 +9480,10 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         }
       }
     } catch (e) {}
-    // Перечисляются только длинные свойства: сокращения читаются, но в
-    // `length` и в нумерованные имена не попадают, как и в браузере.
-    // Ребёнок гибкого контейнера и сетки, а ещё вынутый из потока
-    // (`absolute`, `fixed`, `float`) и корень — блочные, как бы их ни
-    // объявили: браузер печатает `grid` там, где написано `inline-grid`.
+    // Only longhands are enumerated; shorthands are readable but not in
+    // `length` or indexed names. Flex/grid items, out-of-flow boxes
+    // (`absolute`, `fixed`, `float`) and the root are blockified: Chrome
+    // prints `grid` where `inline-grid` was written.
     if (el && el.nodeType === ELEMENT_NODE) {
       const BLOCKIFY = { inline: 'block', 'inline-block': 'block', 'inline-flex': 'flex', 'inline-grid': 'grid', 'inline-table': 'table', 'inline-flow-root': 'flow-root', 'list-item': null };
       const d = map.get('display');
@@ -9805,8 +9503,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         if (why) map.set('display', to);
       }
     }
-    // Числа в вычисленном стиле печатаются шестью значащими цифрами, как и
-    // в объявлении: `138.828125px` → `138.828px`.
+    // Numbers print with six significant digits: `138.828125px` -> `138.828px`.
     for (const k of map.keys()) {
       const v = map.get(k);
       if (typeof v === 'string' && v && /\d/.test(v) && !(k.charCodeAt(0) === 45 && k.charCodeAt(1) === 45)) {
@@ -9815,8 +9512,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     }
     const names = [...map.keys()];
     __addShorthands(map);
-    // Собственные свойства читаются `getPropertyValue('--имя')`, но в
-    // перечислении не стоят.
+    // Custom properties are readable via `getPropertyValue('--name')` but not
+    // enumerated.
     if (el && el.nodeType === ELEMENT_NODE) {
       const vars = __passCustom.get(el);
       if (vars) for (const k in vars) if (typeof vars[k] === 'string') map.set(k, vars[k]);
@@ -9828,23 +9525,20 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     return made;
   };
 
-  /// Объявление вычисленного стиля. `names` пуст, когда элемент не отрисован:
-  /// тогда у объекта нет числовых свойств и `length` равен нулю, но имена в
-  /// camelCase на месте — их семьсот сорок пять и у отрисованного, и у нет.
-  // Сокращённые свойства вычисленного стиля. Браузер отвечает на них
-  // собранным значением, у нас они были пустыми строками — а страница, которая
-  // перечисляет весь стиль и складывает пары «имя: значение», недосчитывалась
-  // двух с половиной сотен значений.
-  //
-  // Собирается из длинных свойств по правилам записи CSS. Псевдонимы
-  // `-webkit-*` зеркалят обычное свойство. Остальное — начальные значения,
-  // снятые с Chrome: у этих сокращений нет длинных свойств, которые мы ведём.
+  /// Computed style declaration. `names` is empty when the element is not
+  /// rendered: no indexed properties and `length` 0, but the 745 camelCase
+  /// names are present either way.
+  // Computed shorthands: Chrome returns the assembled value; pages that
+  // enumerate the whole style read them. Built from longhands by CSS
+  // serialization rules; `-webkit-*` aliases mirror the plain property; the
+  // rest are initial values taken from Chrome (shorthands with no longhands we
+  // track).
   const SH_ALIAS = {"webkit-align-content": "align-content", "webkit-align-items": "align-items", "webkit-align-self": "align-self", "webkit-animation": "animation", "webkit-animation-delay": "animation-delay", "webkit-animation-direction": "animation-direction", "webkit-animation-duration": "animation-duration", "webkit-animation-fill-mode": "animation-fill-mode", "webkit-animation-iteration-count": "animation-iteration-count", "webkit-animation-name": "animation-name", "webkit-animation-play-state": "animation-play-state", "webkit-animation-timing-function": "animation-timing-function", "webkit-app-region": "app-region", "webkit-appearance": "appearance", "webkit-backface-visibility": "backface-visibility", "webkit-background-clip": "background-clip", "webkit-background-origin": "background-origin", "webkit-background-size": "background-size", "webkit-border-bottom-left-radius": "border-bottom-left-radius", "webkit-border-bottom-right-radius": "border-bottom-right-radius", "webkit-border-image": "border-image", "webkit-border-radius": "border-radius", "webkit-border-top-left-radius": "border-top-left-radius", "webkit-border-top-right-radius": "border-top-right-radius", "webkit-box-decoration-break": "box-decoration-break", "webkit-box-shadow": "box-shadow", "webkit-box-sizing": "box-sizing", "webkit-clip-path": "clip-path", "webkit-column-count": "column-count", "webkit-column-gap": "column-gap", "webkit-column-rule": "column-rule", "webkit-column-rule-color": "column-rule-color", "webkit-column-rule-style": "column-rule-style", "webkit-column-rule-width": "column-rule-width", "webkit-column-span": "column-span", "webkit-column-width": "column-width", "webkit-columns": "columns", "webkit-filter": "filter", "webkit-flex": "flex", "webkit-flex-basis": "flex-basis", "webkit-flex-direction": "flex-direction", "webkit-flex-flow": "flex-flow", "webkit-flex-grow": "flex-grow", "webkit-flex-shrink": "flex-shrink", "webkit-flex-wrap": "flex-wrap", "webkit-font-feature-settings": "font-feature-settings", "webkit-hyphenate-character": "hyphenate-character", "webkit-justify-content": "justify-content", "webkit-line-break": "line-break", "webkit-mask": "mask", "webkit-mask-clip": "mask-clip", "webkit-mask-composite": "mask-composite", "webkit-mask-image": "mask-image", "webkit-mask-origin": "mask-origin", "webkit-mask-position": "mask-position", "webkit-mask-repeat": "mask-repeat", "webkit-mask-size": "mask-size", "webkit-opacity": "opacity", "webkit-order": "order", "webkit-perspective": "perspective", "webkit-perspective-origin": "perspective-origin", "webkit-print-color-adjust": "print-color-adjust", "webkit-shape-image-threshold": "shape-image-threshold", "webkit-shape-margin": "shape-margin", "webkit-shape-outside": "shape-outside", "webkit-text-emphasis": "text-emphasis", "webkit-text-emphasis-color": "text-emphasis-color", "webkit-text-emphasis-position": "text-emphasis-position", "webkit-text-emphasis-style": "text-emphasis-style", "webkit-text-size-adjust": "text-size-adjust", "webkit-transform": "transform", "webkit-transform-origin": "transform-origin", "webkit-transform-style": "transform-style", "webkit-transition": "transition", "webkit-transition-delay": "transition-delay", "webkit-transition-duration": "transition-duration", "webkit-transition-property": "transition-property", "webkit-transition-timing-function": "transition-timing-function", "webkit-user-select": "user-select", "webkit-writing-mode": "writing-mode"};
   const SH_CONST = {"animation-range": "normal", "border-image": "none", "border-spacing": "0px", "column-rule-inset": "0px", "column-rule-inset-cap": "0px", "column-rule-inset-end": "0px", "column-rule-inset-junction": "0px", "column-rule-inset-start": "0px", "columns": "auto", "container": "none", "corner-block-end-shape": "round", "corner-block-start-shape": "round", "corner-bottom-shape": "round", "corner-inline-end-shape": "round", "corner-inline-start-shape": "round", "corner-left-shape": "round", "corner-right-shape": "round", "corner-shape": "round", "corner-top-shape": "round", "interest-delay": "normal", "marker": "none", "mask": "none", "offset": "none 0px auto 0deg", "page": "auto", "position-try": "none", "row-rule": "3px rgb(0, 0, 0)", "row-rule-inset": "0px", "row-rule-inset-cap": "0px", "row-rule-inset-end": "0px", "row-rule-inset-junction": "0px", "row-rule-inset-start": "0px", "rule": "3px rgb(0, 0, 0)", "rule-break": "normal", "rule-color": "rgb(0, 0, 0)", "rule-inset": "0px", "rule-inset-cap": "0px", "rule-inset-end": "0px", "rule-inset-junction": "0px", "rule-inset-start": "0px", "rule-style": "none", "rule-visibility-items": "normal", "rule-width": "3px", "scroll-timeline": "none", "text-box": "normal", "timeline-trigger": "none", "timeline-trigger-activation-range": "normal", "timeline-trigger-active-range": "auto", "view-timeline": "none", "webkit-border-after": "0px none rgb(0, 0, 0)", "webkit-border-after-color": "rgb(0, 0, 0)", "webkit-border-after-style": "none", "webkit-border-after-width": "0px", "webkit-border-before": "0px none rgb(0, 0, 0)", "webkit-border-before-color": "rgb(0, 0, 0)", "webkit-border-before-style": "none", "webkit-border-before-width": "0px", "webkit-border-end": "0px none rgb(0, 0, 0)", "webkit-border-end-color": "rgb(0, 0, 0)", "webkit-border-end-style": "none", "webkit-border-end-width": "0px", "webkit-border-horizontal-spacing": "0px", "webkit-border-start": "0px none rgb(0, 0, 0)", "webkit-border-start-color": "rgb(0, 0, 0)", "webkit-border-start-style": "none", "webkit-border-start-width": "0px", "webkit-border-vertical-spacing": "0px", "webkit-box-align": "stretch", "webkit-box-direction": "normal", "webkit-box-flex": "0", "webkit-box-ordinal-group": "1", "webkit-box-orient": "horizontal", "webkit-box-pack": "start", "webkit-box-reflect": "none", "webkit-column-break-after": "auto", "webkit-column-break-before": "auto", "webkit-column-break-inside": "auto", "webkit-font-smoothing": "auto", "webkit-line-clamp": "none", "webkit-locale": "\"en\"", "webkit-logical-height": "0px", "webkit-logical-width": "925px", "webkit-margin-after": "0px", "webkit-margin-before": "0px", "webkit-margin-end": "0px", "webkit-margin-start": "0px", "webkit-mask-box-image": "none", "webkit-mask-box-image-outset": "0", "webkit-mask-box-image-repeat": "stretch", "webkit-mask-box-image-slice": "0 fill", "webkit-mask-box-image-source": "none", "webkit-mask-box-image-width": "auto", "webkit-mask-position-x": "0%", "webkit-mask-position-y": "0%", "webkit-max-logical-height": "none", "webkit-max-logical-width": "none", "webkit-min-logical-height": "0px", "webkit-min-logical-width": "0px", "webkit-padding-after": "0px", "webkit-padding-before": "0px", "webkit-padding-end": "0px", "webkit-padding-start": "0px", "webkit-rtl-ordering": "logical", "webkit-ruby-position": "before", "webkit-tap-highlight-color": "rgba(0, 0, 0, 0.18)", "webkit-text-combine": "none", "webkit-text-decorations-in-effect": "none", "webkit-text-fill-color": "rgb(0, 0, 0)", "webkit-text-orientation": "vertical-right", "webkit-text-security": "none", "webkit-text-stroke": "0px rgb(0, 0, 0)", "webkit-text-stroke-color": "rgb(0, 0, 0)", "webkit-text-stroke-width": "0px", "webkit-user-drag": "auto", "webkit-user-modify": "read-only"};
   const __addShorthands = (map) => {
     const g = (k) => map.get(k) || '';
     const set = (k, v) => { if (v !== '' && v != null) map.set(k, v); };
-    // Четыре стороны сворачиваются, пока значения совпадают.
+    // Four sides collapse while values match.
     const four = (t, r, b, l) => {
       if (!t) return '';
       if (t === r && r === b && b === l) return t;
@@ -9876,7 +9570,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       const tail = sh.slice(base.length);
       set(sh, two(g(base + '-start' + tail), g(base + '-end' + tail)));
     }
-    // Рамка: ширина, стиль, цвет — и только когда все стороны согласны.
+    // Border: width, style, colour, only when all sides agree.
     const edge = (p) => {
       const w = g(p + '-width'), s = g(p + '-style'), c = g(p + '-color');
       return w && s && c ? w + ' ' + s + ' ' + c : '';
@@ -9889,12 +9583,12 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     set('border', (bt && bt === edge('border-right') && bt === edge('border-bottom') && bt === edge('border-left')) ? bt : '');
     set('column-rule', g('column-rule-width') + ' ' + g('column-rule-color'));
     set('row-rule', g('row-rule-width') + ' ' + g('row-rule-color'));
-    // Общая линейка колонок и рядов: браузер печатает её, когда обе совпадают.
+    // Shared column/row rule, printed only when both match.
     set('rule-width', two(g('row-rule-width'), g('column-rule-width')));
     set('rule-style', two(g('row-rule-style'), g('column-rule-style')));
     set('rule-color', two(g('row-rule-color'), g('column-rule-color')));
     set('rule', g('rule-width') + ' ' + g('rule-color'));
-    // Старые вебкитовские имена логических сторон — те же значения.
+    // Old webkit logical-side names carry the same values.
     for (const [old_, now] of [['webkit-border-before', 'border-block-start'],
       ['webkit-border-after', 'border-block-end'],
       ['webkit-border-start', 'border-inline-start'],
@@ -9911,11 +9605,11 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       map.set(old_, g(now));
       for (const tail of ['-width', '-style', '-color']) if (g(now + tail)) map.set(old_ + tail, g(now + tail));
     }
-    // Обводка текста: ширина и цвет вместе, как её печатает браузер.
+    // Text stroke: width and colour together.
     map.set('webkit-text-stroke-color', g('-webkit-text-stroke-color'));
     map.set('webkit-text-stroke-width', g('-webkit-text-stroke-width'));
     map.set('webkit-text-stroke', g('-webkit-text-stroke-width') + ' ' + g('-webkit-text-stroke-color'));
-    // Обвод браузер пишет цветом, стилем и шириной — именно в этом порядке.
+    // Outline order: colour, style, width.
     set('outline', g('outline-color') + ' ' + g('outline-style') + ' ' + g('outline-width'));
     set('background', g('background-color') + ' ' + g('background-image') + ' ' + g('background-repeat') +
       ' ' + g('background-attachment') + ' ' + g('background-position') + ' / ' + g('background-size') +
@@ -9925,8 +9619,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     set('background-position-y', bp[1] || bp[0] || '');
     set('flex', g('flex-grow') + ' ' + g('flex-shrink') + ' ' + g('flex-basis'));
     set('flex-flow', g('flex-direction') + ' ' + g('flex-wrap'));
-    // Шрифт браузер печатает целиком: начертание, капитель, насыщенность,
-    // кегль с межстрочным через косую черту и семейство.
+    // Font: style, variant, weight, size/line-height, family.
     {
       const bits = [];
       if (g('font-style') && g('font-style') !== 'normal') bits.push(g('font-style'));
@@ -9948,7 +9641,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     set('place-content', two(g('align-content'), g('justify-content')));
     set('place-items', two(g('align-items'), g('justify-items')));
     set('place-self', two(g('align-self'), g('justify-self')));
-    // Части сетки браузер разделяет косой чертой, а пустой конец опускает.
+    // Grid parts are slash-separated; an empty end is omitted.
     for (const axis of ['row', 'column']) {
       const a = g('grid-' + axis + '-start'), b = g('grid-' + axis + '-end');
       set('grid-' + axis, !b || b === 'auto' || b === a ? a : a + ' / ' + b);
@@ -9967,7 +9660,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     set('columns', two(g('column-width'), g('column-count')) === 'auto auto' ? 'auto'
       : two(g('column-width'), g('column-count')));
     set('animation', g('animation-name') === 'none' && g('animation-duration') === '0s' ? 'none' : '');
-    // Переход: браузер опускает то, что стоит на своём начальном значении.
+    // Transition: parts at their initial value are omitted.
     {
       const dur = g('transition-duration'), ease = g('transition-timing-function');
       const delay = g('transition-delay'), prop = g('transition-property');
@@ -9976,7 +9669,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
            ease && ease !== 'ease' ? ease : '', delay && delay !== '0s' ? delay : '']
           .filter(Boolean).join(' '));
     }
-    // Пробелы: браузер сводит их к одному слову, когда сочетание известное.
+    // White-space: known combinations collapse to one keyword.
     const wsc = g('white-space-collapse'), twm = g('text-wrap-mode');
     set('white-space', wsc === 'collapse' && twm === 'wrap' ? 'normal'
       : (wsc === 'preserve' && twm === 'nowrap' ? 'pre'
@@ -9989,48 +9682,45 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     set('page-break-after', g('break-after'));
     set('page-break-before', g('break-before'));
     set('page-break-inside', g('break-inside'));
-    // Постоянные раньше псевдонимов: иначе зеркало ссылается на пустоту.
+    // Constants before aliases, or an alias mirrors nothing.
     for (const k of Object.keys(SH_CONST)) if (!map.has(k)) map.set(k, SH_CONST[k]);
     for (const k of Object.keys(SH_ALIAS)) set(k, g(SH_ALIAS[k]));
   };
 
   function __makeComputed(map, names) {
-    // Объект называет себя как в браузере: `[object CSSStyleDeclaration]`.
+    // `[object CSSStyleDeclaration]`, as in Chrome.
     const proto = (globalThis.CSSStyleDeclaration && CSSStyleDeclaration.prototype) || Object.prototype;
-    // Заглушка интерфейса могла приехать без своего имени — тогда ставим его.
+    // The interface stub may lack its name; set it.
     try {
       if (proto !== Object.prototype && !Object.getOwnPropertyDescriptor(proto, Symbol.toStringTag)) {
         Object.defineProperty(proto, Symbol.toStringTag, { value: 'CSSStyleDeclaration', configurable: true });
       }
     } catch (e) {}
-    // Форма как у браузера: собственные свойства объявления — это индексы и
-    // имена в camelCase, и больше ничего; методы и `length` — на прототипе.
-    // Дефисные имена читаются, но собственными свойствами не числятся, поэтому
-    // за них отвечает Proxy.
+    // Chrome's shape: own properties are indices and camelCase names only;
+    // methods and `length` live on the prototype. Dashed names are readable
+    // but not own, so a Proxy answers them.
     const decl = Object.create(__inlineStyleProto());
     __cssReaders.set(decl, { computed: true, names, map });
     const own = (name, d) => { try { Object.defineProperty(decl, name, d); } catch (e) {} };
     for (let i = 0; i < names.length; i++) own(String(i), { value: names[i], enumerable: true, configurable: true });
     for (const name of CSS_PROPS) {
-      // `webkitBorderAfter` — это `-webkit-border-after`: у вендорных имён
-      // дефис ведущий. А `webkitAlignItems` своего свойства не имеет вовсе —
-      // это просто другое имя для `align-items`, и браузер отвечает по нему
-      // тем же значением.
+      // `webkitBorderAfter` is `-webkit-border-after` (leading dash for vendor
+      // names), while `webkitAlignItems` is just another name for
+      // `align-items` and returns the same value.
       const plain = name.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase()).toLowerCase();
       const keys = /^(webkit|moz|ms|o)-/.test(plain)
         ? ['-' + plain, plain, plain.replace(/^(webkit|moz|ms|o)-/, '')]
         : [plain];
-      // Значением, а не акцессором: у браузера в описании свойства лежит
-      // `value`, и `get` там нет вовсе. Вычисленный стиль всё равно снят на
-      // один миг — меняться его значениям уже не от чего.
+      // A data property, not an accessor: Chrome's descriptor has `value` and
+      // no `get`. The computed snapshot does not change anyway.
       let v = '';
       for (const k of keys) { const got = map.get(k); if (got) { v = got; break; } }
       own(name, { value: v, writable: true, enumerable: true, configurable: true });
     }
     const dashOf = (p) => String(p).replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
     return __ptProxy(decl, {
-      // Только список имён: описания у свойств уже такие, как надо, а лишняя
-      // ловушка стоила бы полторы миллисекунды на каждый перебор стиля.
+      // Only ownKeys: descriptors are already right, and another trap would
+      // cost ~1.5 ms per style enumeration.
       ownKeys: (t) => __withEpub(Reflect.ownKeys(t)),
       get: (t, p) => {
         if (typeof p === 'string' && EPUB_SET.has(p)) return undefined;
@@ -10041,7 +9731,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     });
   }
 
-  /// Кегль, действующий на элементе: он наследуется, а `em` считается от него.
+  /// Font size in effect on an element (inherited; `em` resolves against it).
   function __usedFontSize(el) {
     if (el && el.nodeType === ELEMENT_NODE) {
       const hit = __passFont.get(el);
@@ -10062,16 +9752,15 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     let size = 16;
     const chain = [];
     for (let e = el; e && e.nodeType === ELEMENT_NODE; e = e.parentNode) chain.push(e);
-    // Поля формы не наследуют кегль страницы: движок браузера даёт им свой.
+    // Form controls do not inherit the page font size; the UA gives their own.
     const own = (el && el.localName) || '';
     if (own === 'input' || own === 'button' || own === 'select' || own === 'textarea') {
       size = UA_FORM_FONT;
       const raw = __cascadeFor(el).get('font-size');
       if (raw == null) return size;
     }
-    // Моноширинное набирается своим кеглем: у браузера это тринадцать
-    // пикселей, а не шестнадцать, и `pre` без своего правила отступает на
-    // тринадцать, а не на шестнадцать.
+    // Monospace text uses 13px, not 16px, so `pre` without its own rule gets
+    // 13px margins.
     if (own !== 'textarea' && UA_MONO.has(own)) {
       size = 13;
       const raw = __cascadeFor(el).get('font-size');
@@ -10085,26 +9774,26 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         continue;
       }
       let v = String(raw).trim().toLowerCase();
-      // `rem` у самого корня значит начальный кегль, а не свой же.
+      // `rem` on the root means the initial font size, not its own.
       const e = chain[i];
       if (e.ownerDocument && e === e.ownerDocument.documentElement) v = v.replace(/(\d)rem\b/g, '$1em');
       if (FONT_KEYWORDS[v]) { size = FONT_KEYWORDS[v]; continue; }
       if (v === 'smaller') { size /= 1.2; continue; }
       if (v === 'larger') { size *= 1.2; continue; }
-      // `em` и проценты — от кегля родителя, `calc()` и `clamp()` тоже.
+      // `em`, percentages, `calc()` and `clamp()` resolve against the parent's size.
       const px = __lengthPx(v, size, size);
       if (px != null && px >= 0) size = px;
     }
     return Math.round(size * 1e4) / 1e4;
   }
 
-  /// Длина в пикселях, как её отдаёт браузер: `em` от кегля, проценты — от
-  /// ширины родителя, всё прочее как есть.
+  /// Length in pixels as Chrome reports it: `em` from the font size,
+  /// percentages from the parent width, the rest as is.
   const __LENGTH_PROPS = /^(width|height|min-|max-|margin|padding|border-.*-width|top|right|bottom|left|inset|gap|font-size|line-height|text-indent|letter-spacing|word-spacing|outline-width|border-spacing|column-gap|row-gap)/;
   function __resolveLength(raw, prop, fontSize, el) {
     let v = String(raw);
     if (!__LENGTH_PROPS.test(prop)) return v;
-    // Выражения браузер печатает готовым числом, если всё в них известно.
+    // Chrome prints an expression as a number when everything is known.
     if (__CALC_FN.test(v)) v = __ptCalcOut(v, fontSize, el);
     if (!/[\d.](?:em|rem|pt|%|[dsl]?v(?:h|w|min|max))/.test(v)) return v;
     return v.replace(/(-?[\d.]+)(em|rem|pt|[dsl]?vmin|[dsl]?vmax|[dsl]?vh|[dsl]?vw|%)(?![\w-])/g, (m, n, unit) => {
@@ -10113,23 +9802,22 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       if (unit === 'em') return (x * fontSize) + 'px';
       if (unit === 'rem') return (x * __rootFontSize()) + 'px';
       if (unit.length > 2 && /^[dsl]v/.test(unit)) unit = unit.slice(1);
-      // Доли окна браузер тоже печатает пикселями: `margin: 15vh auto` в
-      // вычисленном стиле выходит числом, а не записью автора.
+      // Viewport units are printed in pixels too (`margin: 15vh auto`).
       if (unit === 'vh' || unit === 'vw' || unit === 'vmin' || unit === 'vmax') {
         const base = unit === 'vh' ? LAYOUT.H : unit === 'vw' ? LAYOUT.W
           : unit === 'vmin' ? Math.min(LAYOUT.W, LAYOUT.H) : Math.max(LAYOUT.W, LAYOUT.H);
         return (Math.round(x / 100 * base * 64) / 64) + 'px';
       }
-      // Межстрочное в процентах — от кегля, не от ширины.
+      // Percent line-height is relative to the font size, not the width.
       if (prop === 'line-height') return (Math.round(x / 100 * fontSize * 64) / 64) + 'px';
-      // Проценты по вертикали считаются тоже от ширины — так в спецификации.
+      // Vertical percentages are relative to the width too, per spec.
       const base = __containingWidth(el);
       return base != null ? (Math.round(x / 100 * base * 64) / 64) + 'px' : m;
     });
   }
 
-  /// Каждое `calc()`/`min()`/`max()`/`clamp()` верхнего уровня — в пиксели,
-  /// если хватает данных; иначе остаётся как написано.
+  /// Resolve each top-level `calc()`/`min()`/`max()`/`clamp()` to pixels when
+  /// possible; otherwise leave it as written.
   function __ptCalcOut(v, fontSize, el) {
     let out = '', i = 0;
     const re = /(?:-webkit-)?(?:calc|min|max|clamp)\(/gi;
@@ -10152,7 +9840,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     return out;
   }
 
-  /// Ширина содержимого блока, в котором лежит элемент.
+  /// Content width of the element's containing block.
   function __containingWidth(el) {
     const parent = el && el.parentNode;
     if (!parent || parent.nodeType !== ELEMENT_NODE) return LAYOUT.W;
@@ -10164,8 +9852,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     if (!el || el.nodeType !== ELEMENT_NODE) return null;
     const doc = el.ownerDocument;
     if (doc && doc !== globalThis.document) {
-      // Узел чужого документа: раскладывает его тот реалм, которому он
-      // принадлежит, и отметку надо спрашивать у документа, а не у себя.
+      // A node of another document is laid out by its own realm; ask its
+      // document for the layout stamp.
       try {
         const win = doc.defaultView;
         if (win && typeof win.__pt_relayout === 'function') win.__pt_relayout();
@@ -10176,8 +9864,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     return el.__ptBoxV === __layoutBuilt ? el.__ptBox : null; // detached/hidden → no box
   }
 
-  /// Список прямоугольников: у браузера это `DOMRectList`, а не массив, и имя
-  /// объекта читают.
+  /// Rect list: Chrome returns a `DOMRectList`, not an array, and pages read
+  /// the name.
   function __ptRectList(items) {
     const list = items.slice();
     list.item = function item(i) { return this[i] || null; };
@@ -10185,12 +9873,10 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     return list;
   }
 
-  // Прямоугольник и метрики текста — не литералы, а объекты с именем. Страница
-  // спрашивает `Object.prototype.toString.call(el.getBoundingClientRect())` и
-  // должна услышать `[object DOMRect]`, а не `[object Object]`; у нас это были
-  // безымянные объекты, и `measureText` тоже. Состав прототипов снят с Chrome
-  // 151 перечислением: у `DOMRectReadOnly` десять имён, у `DOMRect` пять своих
-  // поверх них, у `TextMetrics` одиннадцать.
+  // Rects and text metrics are named objects, not literals:
+  // `Object.prototype.toString.call(el.getBoundingClientRect())` must be
+  // `[object DOMRect]`. Prototype members taken from Chrome 151: 10 on
+  // `DOMRectReadOnly`, 5 more on `DOMRect`, 11 on `TextMetrics`.
   const __rectVals = new WeakMap();
   class DOMRectReadOnly {
     constructor(x, y, w, h) {
@@ -10225,8 +9911,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   }
   globalThis.__pt_makeRect = (x, y, w, h) => new DOMRect(x, y, w, h);
 
-  // Точка: у Chrome DOMPointReadOnly (x, y, z, w, matrixTransform, toJSON,
-  // fromPoint) и DOMPoint поверх неё с сеттерами. Была заглушкой без значений.
+  // Point: Chrome's DOMPointReadOnly (x, y, z, w, matrixTransform, toJSON,
+  // fromPoint) and DOMPoint on top with setters.
   const __ptVals = new WeakMap();
   const __ptNum = (v) => { const n = +v; return Number.isNaN(n) ? NaN : n; };
   class DOMPointReadOnly {
@@ -10269,9 +9955,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     globalThis[n] = globalThis.__pt_native ? __pt_native(C) : C;
   }
 
-  // `TextMetrics`: значения на прототипе, у самого объекта своих свойств нет —
-  // как и у всего, что отдаёт браузер. Базовые линии считаются от метрик
-  // гарнитуры: висячая — четыре пятых подъёма, иероглифическая — минус спуск.
+  // `TextMetrics`: values on the prototype, no own properties. Baselines come
+  // from font metrics: hanging = 0.8 * ascent, ideographic = -descent.
   const __tmVals = new WeakMap();
   const TM_KEYS = ['width', 'actualBoundingBoxLeft', 'actualBoundingBoxRight',
                    'actualBoundingBoxAscent', 'actualBoundingBoxDescent',
@@ -10294,16 +9979,15 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       actualBoundingBoxAscent: v.ascent || 0, actualBoundingBoxDescent: v.descent || 0,
       fontBoundingBoxAscent: v.fontAscent || 0, fontBoundingBoxDescent: v.fontDescent || 0,
       alphabeticBaseline: 0,
-      // Chrome держит висячую базовую линию во float32 (10.399999618530273).
+      // Chrome keeps the hanging baseline in float32 (10.399999618530273).
       hangingBaseline: Math.fround((v.fontAscent || 0) * 0.8),
       ideographicBaseline: -(v.fontDescent || 0),
     });
     return m;
   };
 
-  // Градиент, узор и выделение — тоже объекты с именем, а не литералы. У
-  // градиента вдобавок наружу светила наша метка `__ptGrad`: собственное
-  // свойство, которого у браузерного объекта нет ни одного.
+  // Gradient, pattern and selection are named objects too, with no own
+  // marker property a browser object would not have.
   const __gradVals = new WeakMap();
   class CanvasGradient {
     addColorStop(pos, color) {
@@ -10349,8 +10033,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     globalThis.getSelection = globalThis.__pt_native
       ? __pt_native(function getSelection() { return sel; })
       : function getSelection() { return sel; };
-    // На прототипе, а не на самом документе: у документа собственное свойство
-    // ровно одно — `location`, и лишнее там видно первой же проверкой.
+    // On the prototype: a document has exactly one own property, `location`.
     const D = globalThis.document && Object.getPrototypeOf(globalThis.document);
     if (D) {
       try {
@@ -10369,7 +10052,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   function __elementFromPoint(x, y) {
     __relayout();
     if (x == null || y == null || x < 0 || y < 0) return null;
-    // Самый глубокий и самый поздний из тех, чья коробка накрывает точку.
+    // The deepest, latest element whose box covers the point.
     for (let i = __boxes.length - 1; i >= 0; i--) {
       const el = __boxes[i], b = el.__ptBox;
       if (!b || b.w <= 0 || b.h <= 0) continue;
@@ -10397,9 +10080,9 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   const __INNERTEXT_SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'HEAD', 'TITLE']);
   function __innerText(el) {
     if (!el || el.nodeType !== ELEMENT_NODE) return '';
-    // Неотрисованный элемент отвечает своим `textContent` — со стилями,
-    // скриптами и всем, что внутри. Мы отвечали пустотой, а это разные вещи:
-    // у Chrome `d.style.display='none'; d.innerText` даёт «.z{color:red}текст».
+    // A non-rendered element returns its `textContent`, styles and scripts
+    // included: in Chrome `d.style.display='none'; d.innerText` gives
+    // ".z{color:red}text".
     if (__isHiddenEl(el)) return el.textContent || '';
     // `innerText` renders only visible content — the text inside <script>/<style>
     // etc. is not rendered, so it must not leak into it (`textContent` includes it).
@@ -10425,18 +10108,14 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   // A mouse action at (x,y): resolve the topmost element there and fire the
   // matching pointer + mouse events, synthesizing `click` on release over the
   // same element that received the press (as a real browser does).
-  // Точка попала во фрейм? Тогда клик принадлежит не нам: движок спустится в
-  // его контекст и повторит попадание уже в координатах фрейма. Виджет
-  // Turnstile живёт ровно так — iframe в закрытой тени хоста, — и без этого
-  // спуска нажать его нечем.
-  // Первый видимый управляющий элемент документа — чекбокс, переключатель или
-  // кнопка, — вместе с точкой, куда по нему бьют. Ищет и в теневых деревьях:
-  // виджеты держат свой UI именно там, и обычный querySelector их не находит.
-  // Знания о конкретной капче здесь нет и быть не должно — есть «нажимаемое».
-  // `widgetOnly` — искать только внутри теневых деревьев: собственная форма
-  // страницы виджету не принадлежит, и нажимать её кнопку «отправить» нельзя ни
-  // при каких обстоятельствах. Во фрейме виджета ограничение снимается: там всё
-  // содержимое и есть виджет.
+  // A point inside a frame belongs to the frame: the engine descends into its
+  // context and re-hits in frame coordinates (the Turnstile widget is an
+  // iframe in a closed shadow root).
+  // First visible control of the document (checkbox, radio or button) with the
+  // point to click, searching shadow trees too, where widgets keep their UI.
+  // No captcha-specific knowledge here. `widgetOnly` searches only inside
+  // shadow trees: the page's own form must never be submitted. In the
+  // widget's frame the restriction is lifted.
   globalThis.__pt_findControl = (widgetOnly) => {
     __relayout();
     const seen = [];
@@ -10450,11 +10129,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
             || n.tagName === 'BUTTON'
             || role === 'checkbox' || role === 'button' || role === 'switch';
           if (control && (shadowed || !widgetOnly)) {
-            // Настоящий флажок виджета спрятан: нулевого размера, с прозрачной
-            // подложкой поверх. Человек нажимает не его, а то, что видит, —
-            // ближайшую обёртку с настоящей коробкой. Пока раскладка была
-            // выдуманной, невидимый вход отвечал размером во всё окно и промаха
-            // не было; с настоящей раскладкой промах появился.
+            // The real widget checkbox is hidden (zero size, transparent
+            // overlay); a human clicks the nearest wrapper with a real box.
             let r = n.getBoundingClientRect();
             if (!(r.width > 0 && r.height > 0)) {
               for (let a = n.parentNode; a && a.nodeType === ELEMENT_NODE; a = a.parentNode) {
@@ -10480,8 +10156,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     return __ptJSON.stringify(seen.slice(0, 8));
   };
 
-  // Отладка решателя: все поля ввода и подписи документа (с тенями) с их
-  // прямоугольниками и видимостью — чтобы понять, почему нечего нажать.
+  // Solver debugging: every input and label (shadow trees included) with
+  // its rect and visibility.
   globalThis.__pt_ctlDebug = () => {
     const out = [];
     const walk = (n, depth) => {
@@ -10503,11 +10179,11 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     return __ptJSON.stringify({ ctl: out.slice(0, 20), body: globalThis.document && document.body ? (document.body.innerText || '').slice(0, 120) : '' });
   };
 
-  // Прямоугольник элемента кадра по его номеру — где бы он ни стоял, в том
-  // числе в теневом дереве (кадр виджета живёт в закрытой тени).
-  // Токен стендового виджета (`cf-turnstile-response`) — обходом дерева
-  // изнутри, а не `querySelector` страницы: челлендж записывает, какие
-  // селекторы на странице спрашивали, и наш вопрос попадал в его отчёт.
+  // Rect of a frame element by its id, wherever it is, shadow trees included
+  // (the widget frame lives in a closed shadow root).
+  // Token of the widget (`cf-turnstile-response`) found by walking the tree
+  // internally, not via the page's `querySelector`: the challenge records
+  // which selectors were queried and reports them.
   globalThis.__pt_widgetToken = () => {
     let out = '';
     try {
@@ -10518,9 +10194,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     } catch (e) {}
     return out;
   };
-  // Что стоит на странице перед сайтом — для водителя, обходом дерева
-  // изнутри: ни один вызов страницы (селекторы, коллекции) не остаётся в
-  // её следах, которые челлендж записывает в отчёт.
+  // What the page shows in front of the site, for the driver; walks the tree
+  // internally so no page API call shows up in the challenge's report.
   globalThis.__pt_gateInfo = () => {
     const out = { title: '', url: '', inter: false, widget: false, token: false, datadome: false, orchestrator: false };
     try {
@@ -10564,9 +10239,9 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     for (let el = __elementFromPoint(x, y); el && el.nodeType === ELEMENT_NODE; el = el.parentNode) {
       if (el.__ptLocal === 'iframe' && el.__ptFrameId) {
         const r = el.getBoundingClientRect();
-        // Один к одному, как в настоящем окне: фрейм не сжимает содержимое под
-        // свою рамку, он показывает его верх, а остальное уходит под обрез.
-        // Точка внутри рамки — та же точка в координатах фрейма.
+        // One to one, as in a real window: a frame does not scale its content,
+        // it clips it. A point in the frame box is the same point in frame
+        // coordinates.
         return __ptJSON.stringify({ frame: el.__ptFrameId, x: x - r.x, y: y - r.y });
       }
     }
@@ -10574,8 +10249,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   };
 
 
-  /// Поле, которое активирует подпись под указателем: либо названное в `for`,
-  /// либо первое поле внутри самой подписи. Ничего не нашлось — null.
+  /// The control a label activates: the one named by `for`, or the first
+  /// control inside the label; null if none.
   function __labelFor(el) {
     for (let e = el; e && e.nodeType === ELEMENT_NODE; e = e.parentNode) {
       if (e.tagName !== 'LABEL') continue;
@@ -10592,13 +10267,13 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     return null;
   }
 
-  // Ввод мыши движком — так, как его видит страница в Chrome (сверено по
-  // записи настоящего нажатия в кадре виджета): у указательных событий
-  // дробные координаты, у мышиных — целые; экранные — с положением окна и
-  // кадра; сдвиг от прошлой точки; у движения button −1 (у мышиного 0) и
-  // which 0; у нажатия which 1; click — PointerEvent; у мышиных событий
-  // sourceCapabilities, у указательных — null. `ox`/`oy` — экранная точка
-  // начала кадра (передаёт ядро; без них — начало своего окна).
+  // Engine mouse input as a page sees it in Chrome (checked against a real
+  // click recorded in the widget frame): pointer events have fractional
+  // coordinates, mouse events integer ones; screen coordinates include the
+  // window and frame position; movement deltas; on move button -1 (mouse
+  // event 0) and which 0; on press which 1; click is a PointerEvent; mouse
+  // events have sourceCapabilities, pointer events null. `ox`/`oy` are the
+  // frame origin on screen (passed by the core; default: own window origin).
   let __lastSX = null, __lastSY = null, __idc = null, __winFocused = false;
   const __devCaps = () => {
     if (__idc) return __idc;
@@ -10627,7 +10302,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     const b = button === 'right' ? 2 : button === 'middle' ? 1 : (button | 0);
     const down = type === 'mousePressed', up = type === 'mouseReleased', move = type === 'mouseMoved';
     const clicks = clickCount || 1;
-    // Поля, которых нет в словаре конструктора, ставятся после создания.
+    // Fields not in the constructor dictionary are set after creation.
     const finish = (ev, mouse, extra) => {
       const cx = mouse ? Math.trunc(x) : x, cy = mouse ? Math.trunc(y) : y;
       const E = ev.__ptE;
@@ -10668,7 +10343,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       hoverTo(el);
       send(el, P('pointerdown', { button: b, buttons: 1, pressure: 0.5 }, { which: b + 1, detail: 0 }));
       send(el, M('mousedown', { button: b, buttons: 1, detail: clicks }, { which: b + 1 }));
-      // Окно, получившее нажатие впервые, само получает focus — до элемента.
+      // A window that receives its first press gets focus before the element.
       if (!__winFocused) {
         __winFocused = true;
         try { const wf = new FocusEvent('focus', { bubbles: false, cancelable: false, composed: false }); globalThis.dispatchEvent(__ptTrust(wf)); } catch (e) {}
@@ -10684,15 +10359,14 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       send(el, M('mouseup', { button: b, buttons: 0, detail: clicks }, { which: b + 1 }));
       if (__mouseDownEl === el) {
         const isBox = (n) => n && n.tagName === 'INPUT' && /^(checkbox|radio)$/i.test(__ptGetA(n, 'type') || '');
-        // Флажок переключается до click (его обработчик читает новое
-        // состояние), а input/change идут после click — как у браузера; click
-        // с preventDefault откатывает переключение.
+        // A checkbox toggles before click (its handler reads the new state),
+        // input/change fire after click; preventDefault on click reverts it.
         const clickOn = (target) => {
           const box = isBox(target) ? target : null;
           const was = box ? box.checked : null;
           if (box) box.checked = String(__ptGetA(box, 'type')).toLowerCase() === 'radio' ? true : !box.checked;
-          // click у Chrome — PointerEvent, но с целыми координатами мыши и
-          // isPrimary false.
+          // Chrome's click is a PointerEvent with integer mouse coordinates
+          // and isPrimary false.
           const ev = new PointerEvent('click', ptrInit({ button: b, buttons: 0, pressure: 0, detail: clicks, isPrimary: false }));
           finish(ev, true, { which: b + 1, detail: clicks, isPrimary: false });
           const ok = send(target, ev);
@@ -10706,9 +10380,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
           }
         };
         clickOn(el);
-        // Нажатие на подпись — это нажатие на её поле. Виджет прячет свой
-        // флажок нулевым размером и кладёт поверх видимую обёртку внутри
-        // `<label>`; человек попадает в обёртку, а переключается флажок.
+        // A click on a label is a click on its control: the widget hides its
+        // checkbox at zero size under a visible wrapper inside `<label>`.
         const lbl = __labelFor(el);
         if (lbl && lbl !== el) {
           clickOn(lbl);

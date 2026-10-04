@@ -34,10 +34,9 @@ pub enum NetError {
     Timeout,
     #[error("connection error: {0}")]
     Connect(String),
-    /// Хоста не достать вовсе: нет маршрута до его адреса (у нас так с
-    /// IPv6-only именами). Браузер в этом случае не отвечает отказом сразу —
-    /// запрос висит, пока не выйдет его собственный таймаут соединения, — и
-    /// страница, которая ждёт этот ответ, ждёт молча, а не получает ошибку.
+    /// No route to the host (e.g. IPv6-only names here). Chrome does not fail
+    /// such a request at once: it hangs until its own connect timeout, so the
+    /// waiting page gets silence, not an error.
     #[error("host unreachable: {0}")]
     Unreachable(String),
     #[error("all connection slots for host `{0}` are in use")]
@@ -117,18 +116,18 @@ impl EmulationOs {
 }
 
 /// The Chrome major version emulated by default — current stable. Keep in step
-/// with `nokk_stealth::CHROME_MAJOR`. Само рукопожатие идёт по самому новому
-/// набору, какой знает `wreq-util` — см. [`profile_for_major`].
+/// with `nokk_stealth::CHROME_MAJOR`. The handshake itself uses the newest
+/// profile `wreq-util` knows; see [`profile_for_major`].
 pub const DEFAULT_CHROME_MAJOR: u32 = 151;
 
-/// Переписать номер версии Chrome в заголовках набора: `user-agent` и список
-/// марок `sec-ch-ua` должны говорить то же, что `navigator.userAgent` и
-/// `navigator.userAgentData.brands` на стороне JS.
+/// Rewrites the Chrome version in the profile headers: `user-agent` and the
+/// `sec-ch-ua` brands must agree with `navigator.userAgent` and
+/// `navigator.userAgentData.brands` in JS.
 fn retag_chrome_version(headers: &mut wreq::header::HeaderMap, major: u32) {
     use wreq::header::{HeaderValue, HeaderName};
     if let Some(ua) = headers.get(wreq::header::USER_AGENT).cloned() {
         if let Ok(text) = ua.to_str() {
-            // `Chrome/<n>.0.0.0` → `Chrome/<major>.0.0.0`, остальное не трогаем.
+            // `Chrome/<n>.0.0.0` → `Chrome/<major>.0.0.0`, the rest untouched.
             let mut out = String::with_capacity(text.len());
             let mut rest = text;
             while let Some(at) = rest.find("Chrome/") {
@@ -144,8 +143,8 @@ fn retag_chrome_version(headers: &mut wreq::header::HeaderMap, major: u32) {
             }
         }
     }
-    // Список марок — тот же, что отдаёт `userAgentData.brands`: GREASE-марка
-    // впереди, затем Chrome и Chromium одной версии.
+    // Same list as `userAgentData.brands`: GREASE brand first, then Chrome and
+    // Chromium at the same version.
     let brands = format!(
         "\"Not=A?Brand\";v=\"99\", \"Google Chrome\";v=\"{major}\", \"Chromium\";v=\"{major}\""
     );
@@ -195,9 +194,9 @@ pub fn profile_for_major(major: u32) -> wreq_util::Profile {
         147 => P::Chrome147,
         148 => P::Chrome148,
         149 => P::Chrome149,
-        // Отпечаток снят с Chrome 151, а самый новый набор рукопожатия у
-        // `wreq-util` — 149. ClientHello между ними не менялся, поэтому версии
-        // выше сводятся к нему, а не падают в умолчание с предупреждением.
+        // The fingerprint is from Chrome 151 but `wreq-util` tops out at 149;
+        // the ClientHello is unchanged between them, so map newer versions to
+        // 149 instead of falling back to the default with a warning.
         150..=152 => P::Chrome149,
         other => {
             tracing::warn!(
@@ -210,9 +209,9 @@ pub fn profile_for_major(major: u32) -> wreq_util::Profile {
     }
 }
 
-/// Подписи, которые Chrome 151 объявляет в `signature_algorithms`, в его
-/// порядке: три постквантовых впереди, дальше обычные восемь. Имена — как их
-/// понимает BoringSSL; `mldsa*` знает только наш вендоренный.
+/// Chrome 151's `signature_algorithms`, in its order: three post-quantum ones
+/// first, then the usual eight. BoringSSL names; `mldsa*` exist only in our
+/// vendored copy.
 const CHROME_SIGALGS: &str = concat!(
     "mldsa44:mldsa65:mldsa87:",
     "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:",
@@ -271,10 +270,9 @@ pub struct Request {
     /// reloads *itself*, and a reload that claims a human gesture is one no
     /// browser sends. Meaningless for anything but a navigation.
     pub user_activated: bool,
-    /// Запрос идёт из кадра, чей источник не совпадает с источником страницы.
-    /// Браузер добавляет в таком кадре `sec-fetch-storage-access`, и челлендж
-    /// Cloudflare живёт ровно в таком кадре: все три его запроса этот
-    /// заголовок несут, а первый POST — тот самый, по которому решают.
+    /// The request comes from a frame whose origin differs from the top page.
+    /// Chrome adds `sec-fetch-storage-access` there; the Cloudflare challenge
+    /// runs in such a frame and its deciding first POST carries the header.
     pub third_party: bool,
 }
 
@@ -329,22 +327,19 @@ pub struct Response {
     pub status: u16,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
-    /// Сколько байт тела пришло по проводу — до распаковки. Браузер показывает
-    /// это число страницам (`encodedBodySize`, а `transferSize` — оно же плюс
-    /// заголовки), и сторона, отдавшая файл, знает его точно. Мы отдавали
-    /// распакованную длину: у сжатого скрипта расхождение втрое.
+    /// Body bytes on the wire, before decompression. Pages see it as
+    /// `encodedBodySize` (`transferSize` adds headers), and the server knows it.
     pub encoded_len: usize,
-    /// Сколько заняло само обращение, в миллисекундах. У браузера у каждого
-    /// ресурса своя длительность; у нас всем подряд ставилось двенадцать.
+    /// Request duration in milliseconds, reported per resource.
     pub elapsed_ms: f64,
-    /// `content-encoding` ответа (`br`, `gzip`…), пустая — без сжатия. Заголовок
-    /// после распаковки снимается, а значение браузер показывает в записи
+    /// Response `content-encoding` (`br`, `gzip`...), empty if uncompressed. The
+    /// header is stripped after decoding; Chrome still reports the value in
     /// Resource Timing (`contentEncoding`).
     pub content_encoding: String,
-    /// Через сколько миллисекунд от начала пришёл ответ последнего
-    /// перенаправления; `None` — перенаправлений не было. Браузер показывает
-    /// это в Resource Timing (`redirectStart`/`redirectEnd`), и api.js
-    /// Turnstile, который всегда приходит через 302, отдаёт эту запись виджету.
+    /// Milliseconds from start to the last redirect response; `None` if there
+    /// was no redirect. Used for Resource Timing `redirectStart`/`redirectEnd`;
+    /// Turnstile's api.js always arrives via a 302 and hands that entry to
+    /// the widget.
     pub redirect_ms: Option<f64>,
     /// Final URL after any redirects were followed — the origin the body
     /// actually came from. Callers use it as the document base URL.
@@ -352,9 +347,8 @@ pub struct Response {
 }
 
 
-/// Распаковать тело по `content-encoding`. Неизвестная или пустая кодировка —
-/// тело как есть; сломанный поток — тоже как есть: ронять загрузку страницы
-/// из-за этого браузер не стал бы.
+/// Decodes the body per `content-encoding`. Unknown/empty encoding or a broken
+/// stream returns the body as is; a browser would not fail the load over it.
 fn decode_body(encoding: &str, raw: Vec<u8>) -> Vec<u8> {
     use std::io::Read;
     if raw.is_empty() {
@@ -505,27 +499,21 @@ impl FingerprintClient {
                 true,
             ));
         }
-        // Версия в заголовках — та, которую показывает JS. Набор рукопожатия у
-        // `wreq-util` доходит до Chrome 149, и его заголовки говорят «149», а
-        // наш `navigator` — «151»: несоответствие между заголовком и тем, что
-        // собрала страница, видно с первого запроса. Переписываем только
-        // номер версии и список марок, всё остальное — от набора.
+        // Header version must match what JS reports: the `wreq-util` profile
+        // says 149 while our `navigator` says 151. Rewrite only the version and
+        // brand list; everything else comes from the profile.
         retag_chrome_version(&mut emulation.headers, config.chrome_major);
-        // Постквантовые подписи. Chrome 151 объявляет их первыми тремя в
-        // `signature_algorithms` (ML-DSA-44/65/87, кодовые точки 0904/0905/0906),
-        // а набор `wreq-util` — нет, и третий кусок JA4 из-за этого не совпадал
-        // ни с одним настоящим браузером. Знает эти имена наш BoringSSL: см.
-        // `vendor/btls-sys/PATCHES.md`. Выбрать такую подпись сервер не может —
-        // рукопожатие с ней просто не состоится, — но её объявление у Chrome
-        // есть, а значит должно быть и у нас.
+        // Post-quantum sigalgs: Chrome 151 advertises ML-DSA-44/65/87
+        // (0904/0905/0906) first, `wreq-util` does not, so the third JA4 part
+        // matched no real browser. Only our BoringSSL knows these names (see
+        // `vendor/btls-sys/PATCHES.md`); a server cannot actually select them.
         if let Some(tls) = emulation.tls_options.as_mut() {
             tls.sigalgs_list = Some(CHROME_SIGALGS.into());
         }
         let mut builder = wreq::Client::builder().emulation(emulation);
-        // Распаковываем сами: клиент, делающий это за нас, стирает
-        // `content-encoding` и `content-length`, а с ними — размер, ушедший по
-        // проводу. Заголовок `accept-encoding` ставит профиль эмуляции, так что
-        // на вид запроса это не влияет.
+        // Decompress ourselves: the client would strip `content-encoding` and
+        // `content-length` and lose the on-wire size. `accept-encoding` still
+        // comes from the emulation profile, so the request looks the same.
         builder = builder.gzip(false).brotli(false).zstd(false).deflate(false);
         // Named session or not, the jar is ours: a named one is shared (and
         // serializable) across contexts of the same identity, an anonymous one is
@@ -560,7 +548,7 @@ impl FingerprintClient {
 }
 
 
-/// Источник адреса — схема, узел и порт, как их пишет браузер в `Origin`.
+/// The URL's origin (scheme, host, port) as Chrome writes it in `Origin`.
 fn origin_of(url: &str) -> Option<String> {
     let rest = url.strip_prefix("https://").map(|r| ("https", r))
         .or_else(|| url.strip_prefix("http://").map(|r| ("http", r)))?;
@@ -634,19 +622,17 @@ impl HttpClient for FingerprintClient {
             .header("sec-fetch-site", site)
             .header("sec-fetch-mode", mode)
             .header("sec-fetch-dest", dest);
-        // По HTTP/1.1 у Chrome первыми идут `Host` и `Connection: keep-alive`, а
-        // у нас `host` уходил последним и соединения не было вовсе. Протокол
-        // решает ALPN, но простой `http://` — это почти всегда версия первая.
-        // (`priority` там лишний, но его кладёт сама эмуляция уже после сборки
-        // запроса, и снять его отсюда нечем.)
+        // Over HTTP/1.1 Chrome sends `Host` and `Connection: keep-alive` first.
+        // ALPN decides the protocol, but plain `http://` is almost always 1.1.
+        // (`priority` is extra there, but the emulation adds it after the
+        // request is built and it cannot be removed from here.)
         let plain_http = req.url.starts_with("http://");
         rb = rb.header("priority", req.kind.priority());
         if plain_http {
             rb = rb.header("connection", "keep-alive");
         }
-        // Источник: браузер шлёт его у всякого запроса не-GET и у всякого
-        // междоменного. Без него запрос от страницы не отличить от запроса
-        // из программы — и у Cloudflare это первое, на что он смотрит.
+        // Chrome sends `Origin` on every non-GET and every cross-origin
+        // request; Cloudflare checks it first.
         let wants_origin = req.method != "GET" && req.method != "HEAD" || !same_origin;
         let page_origin = req
             .headers
@@ -665,10 +651,9 @@ impl HttpClient for FingerprintClient {
             order.insert("host");
             order.insert("connection");
         }
-        // Подсказки о браузере идут в разном порядке у перехода и у запроса
-        // из страницы: у перехода — `sec-ch-ua`, `-mobile`, `-platform`, у
-        // запроса — `-platform`, `user-agent`, `sec-ch-ua`, `content-type`,
-        // `-mobile`. Снято с Chrome 151.
+        // Client hints order differs between navigations (`sec-ch-ua`,
+        // `-mobile`, `-platform`) and subresources (`-platform`, `user-agent`,
+        // `sec-ch-ua`, `content-type`, `-mobile`). Captured from Chrome 151.
         let subresource = req.kind != RequestKind::Document;
         if subresource {
             order.insert("content-length");
@@ -701,8 +686,8 @@ impl HttpClient for FingerprintClient {
         if sent_origin {
             order.insert("origin");
         }
-        // Доступ к своим кукам в чужом кадре: браузер говорит о нём отдельным
-        // заголовком, и только в стороннем кадре — на своей же странице его нет.
+        // Storage access to own cookies inside a third-party frame: Chrome
+        // sends a separate header there, never on a first-party page.
         let storage_access = req.third_party && same_origin && req.kind != RequestKind::Document;
         if storage_access {
             rb = rb.header("sec-fetch-storage-access", "active");
@@ -747,8 +732,8 @@ impl HttpClient for FingerprintClient {
         if let Some(body) = req.body {
             rb = rb.body(body);
         }
-        // Что уходит на самом деле — видно только здесь: эмуляция владеет частью
-        // заголовков, страница другой, и спор между ними стоит одного 401.
+        // The only place the real outgoing headers are visible: emulation owns
+        // some, the page others, and a conflict between them costs a 401.
         if tracing::enabled!(tracing::Level::TRACE) {
             let sent: Vec<String> = req
                 .headers
@@ -758,8 +743,8 @@ impl HttpClient for FingerprintClient {
             tracing::trace!(url = %req.url, method = %req.method, page_headers = %sent.join(" | "), "request");
         }
         let started = std::time::Instant::now();
-        // Своя политика перенаправлений на запрос — только чтобы засечь, когда
-        // пришёл ответ последнего из них. Правило то же: не больше десяти.
+        // Per-request redirect policy only to time the last redirect response.
+        // Same limit: at most ten.
         let hop_at: Arc<std::sync::Mutex<Option<std::time::Instant>>> = Arc::default();
         {
             let hop_at = hop_at.clone();
@@ -775,8 +760,8 @@ impl HttpClient for FingerprintClient {
             if e.is_timeout() {
                 NetError::Timeout
             } else {
-                // Причину видно только в глубине цепочки источников: наверху у
-                // всех отказов один и тот же текст.
+                // The cause is only visible deep in the source chain; the
+                // top-level text is the same for every failure.
                 let mut chain = Vec::new();
                 let mut src: Option<&(dyn std::error::Error + 'static)> = Some(&e);
                 while let Some(err) = src {
@@ -785,9 +770,9 @@ impl HttpClient for FingerprintClient {
                 }
                 let cause = chain.join(" <- ");
                 tracing::debug!(url = %req.url, chain = %cause, "request failed");
-                // «Нет маршрута» — не то же, что «отказано» или «имя не
-                // разрешилось»: первые два браузер сообщает сразу, а до
-                // недостижимого адреса он продолжает стучаться.
+                // "No route" differs from "refused" or "name not resolved":
+                // Chrome reports those at once but keeps trying an
+                // unreachable address.
                 if cause.contains("Network is unreachable") || cause.contains("No route to host") {
                     NetError::Unreachable(e.to_string())
                 } else {
@@ -804,9 +789,9 @@ impl HttpClient for FingerprintClient {
                 headers.insert(k.to_string(), s.to_string());
             }
         }
-        // Ответ без тела (204/304) готов по заголовкам: браузер разрешает
-        // `fetch` сразу, а маячок челленджа держит поток открытым и ждёт,
-        // пока страница сама его не оборвёт, — мы ждали тело до таймаута.
+        // A bodyless response (204/304) is complete at the headers: Chrome
+        // resolves `fetch` at once, while the challenge beacon keeps the stream
+        // open until the page aborts it, so waiting for a body would time out.
         let raw = if status == 204 || status == 304 {
             Vec::new()
         } else {
@@ -817,9 +802,8 @@ impl HttpClient for FingerprintClient {
         };
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         let encoded_len = raw.len();
-        // Распаковка наша, а не клиентская: только так остаётся известен
-        // размер, ушедший по проводу. Заголовки о сжатии после этого убираем —
-        // браузер странице их тоже не показывает.
+        // Our own decompression keeps the on-wire size known. The compression
+        // headers are then dropped; Chrome hides them from the page too.
         let encoding = headers
             .get("content-encoding")
             .map(|s| s.trim().to_ascii_lowercase())

@@ -1,19 +1,15 @@
-//! Сжиматель звука — тот же счёт, что у браузера, до последнего разряда.
+//! Dynamics compressor, bit-exact with the browser.
 //!
-//! Канонический отпечаток по звуку — это осциллятор, пропущенный через
-//! `DynamicsCompressorNode`, и страница читает все разряды каждого отсчёта.
-//! Само по себе повторение алгоритма не помогает: у браузера он идёт в
-//! одинарной точности, а `powf` и `log10f` берутся из системной библиотеки.
-//! В движке JavaScript те же действия делает своя математика (порт fdlibm), и
-//! её последний разряд иногда другой — этого хватает, чтобы разошёлся и
-//! коэффициент колена, и вся огибающая за ним.
+//! The canonical audio fingerprint is an oscillator run through
+//! `DynamicsCompressorNode`, and the page reads every bit of every sample.
+//! Chrome runs it in single precision with `powf`/`log10f` from the system libm;
+//! V8's own math (fdlibm port) sometimes differs in the last bit, which is
+//! enough to shift the knee coefficient and the whole envelope after it.
+//! Rust's `f32::powf`/`f32::log10` call the same libm functions.
 //!
-//! Поэтому счёт живёт здесь: в Rust `f32::powf` и `f32::log10` — это те же
-//! `powf` и `log10f` из libm, которые зовёт браузер на этой машине.
-//!
-//! Перенос `DynamicsCompressor::Process` из Chrome 151.
+//! Port of `DynamicsCompressor::Process` from Chrome 151.
 
-/// Зоны отпускания и постоянные кривой — как у браузера, `float`.
+/// Release zones and curve constants, as `float` like the browser.
 const RELEASE_ZONE_1: f32 = 0.09;
 const RELEASE_ZONE_2: f32 = 0.16;
 const RELEASE_ZONE_3: f32 = 0.42;
@@ -74,7 +70,7 @@ fn ensure_finite(x: f32, alt: f32) -> f32 {
     }
 }
 
-/// Кривая колена: линейна до порога, дальше подходит к `порог + 1/k`.
+/// Knee curve: linear up to the threshold, then approaches `threshold + 1/k`.
 fn knee_curve(x: f32, k: f32, linear_threshold: f32) -> f32 {
     if x < linear_threshold {
         return x;
@@ -82,7 +78,7 @@ fn knee_curve(x: f32, k: f32, linear_threshold: f32) -> f32 {
     linear_threshold + (1.0f32 - ((-k * (x - linear_threshold)) as f64).exp() as f32) / k
 }
 
-/// Полная кривая: колено, дальше постоянное отношение.
+/// Full curve: knee, then a constant ratio.
 fn saturate(x: f32, k: f32, p: &Curve) -> f32 {
     if x < p.knee_threshold {
         return knee_curve(x, k, p.linear_threshold);
@@ -92,7 +88,7 @@ fn saturate(x: f32, k: f32, p: &Curve) -> f32 {
     db_to_linear(db_y)
 }
 
-/// Постоянные кривой, посчитанные один раз на прогон.
+/// Curve constants, computed once per run.
 struct Curve {
     linear_threshold: f32,
     knee_threshold: f32,
@@ -101,8 +97,7 @@ struct Curve {
     slope: f32,
 }
 
-/// Двоичный поиск коэффициента колена по наклону — пятнадцать делений, как в
-/// браузере.
+/// Binary search of the knee coefficient by slope, 15 steps as in the browser.
 fn k_at_slope(desired_slope: f32, db_threshold: f32, db_knee: f32, linear_threshold: f32) -> f32 {
     let db_x = db_threshold + db_knee;
     let x = db_to_linear(db_x);
@@ -133,14 +128,14 @@ fn k_at_slope(desired_slope: f32, db_threshold: f32, db_knee: f32, linear_thresh
     k
 }
 
-/// Итог прогона: отсчёты и показание затухания, которое страница читает у узла.
+/// Run output: samples and the `reduction` reading the page sees on the node.
 pub struct Compressed {
     pub samples: Vec<f32>,
     pub reduction: f32,
 }
 
-/// Пропустить сигнал через сжиматель с браузерными умолчаниями графа:
-/// предзадержка 6 мс, добавочное усиление 0 дБ, смешивание целиком.
+/// Run a signal through the compressor with the browser's graph defaults:
+/// 6 ms pre-delay, 0 dB post-gain, fully wet.
 pub fn process(
     input: &[f32],
     sample_rate: f32,
@@ -163,9 +158,8 @@ pub fn process(
         slope,
     };
 
-    // Компенсирующее усиление: без него сжиматель с порогом −50 дБ тише на два
-    // порядка. Степень — `float`-постоянная, и это важно: у ровной шести
-    // десятых другой последний разряд.
+    // Makeup gain. The exponent must be the `float` constant: 0.6 as a double
+    // differs in the last bit.
     let linear_post_gain = (1.0f32 / saturate(1.0, k, &curve)).powf(0.6f32);
     let attack_frames = attack_time.max(0.001f32) * sample_rate;
     let release_frames = sample_rate * release_time;
@@ -176,8 +170,8 @@ pub fn process(
     let d = release_frames * d_base();
     let e = release_frames * e_base();
 
-    // Постоянная сглаживания показания — считается в двойной точности и
-    // округляется к одинарной, как в `DiscreteTimeConstantForSampleRate`.
+    // Metering smoothing constant: computed in double, rounded to float, as in
+    // `DiscreteTimeConstantForSampleRate`.
     let metering_release_k =
         (1.0 - (-1.0 / (sample_rate as f64 * METERING_RELEASE_TIME_CONSTANT as f64)).exp()) as f32;
 
@@ -292,27 +286,27 @@ pub fn process(
 mod tests {
     use super::*;
 
-    /// Канонический отпечаток: треугольник 10 кГц через сжиматель с порогом
-    /// −50 дБ. Числа сняты с Chrome 151 на этой машине — сверяются побитно.
+    /// Canonical fingerprint: 10 kHz triangle through a compressor at -50 dB.
+    /// Values recorded from Chrome 151 on this machine, compared bit for bit.
     #[test]
     fn the_first_samples_match_the_browser() {
-        // Вход — первые отсчёты осциллятора; они у нас уже совпадают с
-        // браузерными, и проверяется именно сжиматель.
+        // Input is the oscillator's first samples (already browser-exact), so
+        // this tests the compressor alone.
         let table = crate::wavetable::basic_table("triangle", 44100.0, 27);
-        assert_eq!(table.len(), 4096, "таблица построена");
-        // Прогон на тишине: показание затухания не должно уходить в бесконечность.
+        assert_eq!(table.len(), 4096, "table built");
+        // Silence must not drive the reduction reading to infinity.
         let silence = vec![0.0f32; 1024];
         let got = process(&silence, 44100.0, -50.0, 40.0, 12.0, 0.0, 0.25);
         assert_eq!(got.samples.len(), 1024);
-        assert!(got.reduction.is_finite(), "показание конечно: {}", got.reduction);
+        assert!(got.reduction.is_finite(), "reduction is finite: {}", got.reduction);
         assert!(
             got.samples.iter().all(|v| v.abs() < 1e-6),
-            "на тишине выход тихий"
+            "silence in, silence out"
         );
     }
 
-    /// Коэффициент колена ищется по наклону: у найденного `k` наклон кривой
-    /// в точке колена должен сойтись с обратным отношением сжатия.
+    /// The `k` found by slope search must give a knee slope equal to the
+    /// inverse compression ratio.
     #[test]
     fn the_knee_lands_on_the_asked_slope() {
         let linear_threshold = db_to_linear(-50.0);
@@ -324,7 +318,7 @@ mod tests {
         let slope = (db_y2 - db_y) / (linear_to_db(x2) - linear_to_db(x));
         assert!(
             (slope - 1.0 / 12.0).abs() < 0.01,
-            "наклон в колене {slope} при k={k}"
+            "knee slope {slope} at k={k}"
         );
     }
 }

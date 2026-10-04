@@ -1,7 +1,7 @@
-//! Путь как у `SkPathBuilder`/`SkPathRaw` (Skia ревизии Chrome 151) и
-//! построение пути холста как у Blink (`canvas_path.cc`, `path_builder.cc`):
-//! дуги — кониками через `arcTo`, полный круг — овалом, угол — во float,
-//! выпуклость — как её вычисляет Skia перед выбором обходчика.
+//! Path as in `SkPathBuilder`/`SkPathRaw` (Skia at Chrome 151) and the canvas
+//! path as Blink builds it (`canvas_path.cc`, `path_builder.cc`): arcs as
+//! conics via `arcTo`, a full circle as an oval, angles in float, convexity
+//! computed as Skia does before picking the scan converter.
 
 use super::geometry::{
     cos_snap_to_zero, degrees_to_radians, nearly_equal, sin_snap_to_zero, Conic, Matrix, Point,
@@ -89,15 +89,15 @@ impl Path {
         out.convexity = transform_convexity(m, &self.pts, self.convexity);
         out
     }
-    /// Выпуклость, как её узнаёт `SkPathRaw` при `SkResolveConvexity::kYes`.
+    /// Convexity as `SkPathRaw` finds it with `SkResolveConvexity::kYes`.
     pub fn resolve_convexity(&mut self) {
         if self.convexity == Convexity::Unknown {
             self.convexity = compute_convexity(&self.pts, &self.verbs);
         }
     }
-    /// Простая проверка «путь — прямоугольник» для четырёх прямых. Skia
-    /// (`SkPathRaw::isRect`) умеет больше, но холст рисует прямоугольники
-    /// только через `rect()`, а это ровно такая фигура.
+    /// Simple "path is a rect" check for four lines. Skia
+    /// (`SkPathRaw::isRect`) handles more, but canvas only draws rects
+    /// via `rect()`, which yields exactly this shape.
     pub fn as_rect(&self) -> Option<Rect> {
         let v = &self.verbs;
         let ok = match v.len() {
@@ -118,7 +118,7 @@ impl Path {
                 return None;
             }
         }
-        // Противоположные стороны должны идти по разным осям.
+        // Opposite sides must run along different axes.
         let horiz0 = p[0].y == p[1].y && p[0].x != p[1].x;
         let vert1 = p[1].x == p[2].x && p[1].y != p[2].y;
         let horiz2 = p[2].y == p[3].y && p[2].x != p[3].x;
@@ -185,8 +185,8 @@ impl PathBuilder {
     pub fn last_pt(&self) -> Option<Point> {
         self.pts.last().copied()
     }
-    /// После прямого дописывания вербов/точек (addPath): пересчитать маску
-    /// сегментов и признак «нужен Move».
+    /// After appending verbs/points directly (addPath): recompute the segment
+    /// mask and the "needs Move" flag.
     pub fn note_appended(&mut self) {
         let mut mask = 0u8;
         for v in &self.verbs {
@@ -201,7 +201,7 @@ impl PathBuilder {
         self.segment_mask = mask;
         self.convexity = Convexity::Unknown;
         self.needs_move_verb = self.verbs.last() == Some(&Verb::Close);
-        // Точка последнего Move — для ensure_move после Close.
+        // Last Move point, for ensure_move after Close.
         let mut pi = 0usize;
         for v in &self.verbs {
             match v {
@@ -285,7 +285,7 @@ impl PathBuilder {
         }
     }
 
-    /// `SkPathBuilder::addRect(rect, dir, index)`; у Blink — CW, index 0.
+    /// `SkPathBuilder::addRect(rect, dir, index)`; Blink uses CW, index 0.
     pub fn add_rect(&mut self, r: &Rect, cw: bool, index: usize) {
         let was_empty = self.segment_mask == 0;
         let pts = [
@@ -305,7 +305,7 @@ impl PathBuilder {
         }
     }
 
-    /// `SkPathBuilder::addOval(oval, dir, index)` — четыре коники w=√2/2.
+    /// `SkPathBuilder::addOval(oval, dir, index)`: four conics, w=√2/2.
     pub fn add_oval(&mut self, oval: &Rect, cw: bool, index: usize) {
         let was_empty = self.segment_mask == 0;
         let cx = oval.center_x();
@@ -409,7 +409,7 @@ impl PathBuilder {
         }
     }
 
-    /// `SkPathBuilder::transform`: точки через матрицу, выпуклость забыта.
+    /// `SkPathBuilder::transform`: points through the matrix, convexity reset.
     pub fn transform(&mut self, m: &Matrix) {
         m.map_points(&mut self.pts);
         self.last_move_point = m.map_point(self.last_move_point);
@@ -450,7 +450,7 @@ impl PointIter {
     }
 }
 
-// ── Выпуклость (SkPathPriv::ComputeConvexity) ─────────────────────────────
+// ── Convexity (SkPathPriv::ComputeConvexity) ──────────────────────────────
 
 fn is_axis_aligned(pts: &[Point]) -> bool {
     for i in 1..pts.len() {
@@ -655,7 +655,7 @@ pub fn compute_convexity(points: &[Point], verbs: &[Verb]) -> Convexity {
     let mut contour_count = 0;
     let mut needs_close = false;
     let mut state = Convexicator::new();
-    let mut pi = 0usize; // индекс первой точки текущего верба (для Move — самой точки)
+    let mut pi = 0usize; // index of the current verb's first point (the point itself for Move)
     for &verb in verbs {
         let n = pts_in_verb(verb);
         if contour_count == 0 {
@@ -700,19 +700,19 @@ pub fn compute_convexity(points: &[Point], verbs: &[Verb]) -> Convexity {
     }
 }
 
-// ── Blink: путь холста ────────────────────────────────────────────────────
+// ── Blink: canvas path ────────────────────────────────────────────────────
 
 const TWO_PI_F: f32 = std::f32::consts::PI * 2.0;
 const PI_F: f32 = std::f32::consts::PI;
 const PI_OVER_TWO_F: f32 = std::f32::consts::FRAC_PI_2;
 
-/// Что в итоге рисуется: как у Blink `CanvasPath` с его ускорителями.
+/// What actually gets drawn, as in Blink's `CanvasPath` with its fast paths.
 #[derive(Clone, Debug)]
 pub enum Drawable {
     Empty,
-    /// Отрезок: заливка — пустая операция.
+    /// A line segment: filling it is a no-op.
     Line(Point, Point),
-    /// Одиночная дуга: `PaintCanvas::drawArc`.
+    /// A single arc: `PaintCanvas::drawArc`.
     Arc { oval: Rect, start_deg: f32, sweep_deg: f32, closed: bool },
     Path(Path),
 }
@@ -731,7 +731,7 @@ enum ArcState {
     Closed,
 }
 
-/// Состояние `CanvasPath`: три строителя, как в Blink.
+/// `CanvasPath` state: three builders, as in Blink.
 pub struct CanvasPath {
     line_state: LineState,
     line_start: Point,
@@ -1015,7 +1015,7 @@ impl CanvasPath {
         self.builder.add_rect(&Rect::from_ltrb(x, y, x + w, y + h), true, 0);
     }
 
-    /// Итог для заливки/обводки.
+    /// Result for fill/stroke.
     pub fn drawable(&self) -> Drawable {
         if self.is_empty() {
             return Drawable::Empty;
@@ -1047,14 +1047,14 @@ impl CanvasPath {
 }
 
 fn rotation_matrix(radians: f32) -> Matrix {
-    // AffineTransform::RotateRadians: cos/sin в double, потом матрица double;
-    // MapPoint считает в double и сужает. Здесь — та же точность.
+    // AffineTransform::RotateRadians: cos/sin in double, then a double matrix;
+    // MapPoint computes in double and narrows. Same precision here.
     let c = (radians as f64).cos();
     let s = (radians as f64).sin();
     Matrix { sx: c as f32, kx: (-s) as f32, tx: 0.0, ky: s as f32, sy: c as f32, ty: 0.0 }
 }
 
-/// `PathBuilder::AddEllipse(p, rx, ry, start, end)` у Blink.
+/// Blink's `PathBuilder::AddEllipse(p, rx, ry, start, end)`.
 pub fn add_ellipse(b: &mut PathBuilder, p: Point, rx: f32, ry: f32, start: f32, end: f32) {
     let oval = Rect::from_ltrb(p.x - rx, p.y - ry, p.x + rx, p.y + ry);
     let start_deg = rad2deg(start);
@@ -1068,15 +1068,15 @@ pub fn add_ellipse(b: &mut PathBuilder, p: Point, rx: f32, ry: f32, start: f32, 
     }
 }
 
-/// `WebCoreFloatNearlyEqual(a, b)` = `SkScalarNearlyEqual` после
-/// `ClampNonFiniteToZero` (допуск 1/4096).
+/// `WebCoreFloatNearlyEqual(a, b)` = `SkScalarNearlyEqual` after
+/// `ClampNonFiniteToZero` (tolerance 1/4096).
 fn nearly_equal_web(a: f32, b: f32) -> bool {
     let c = |v: f32| if v.is_finite() { v } else { 0.0 };
     nearly_equal(c(a), c(b))
 }
 
-/// `PathBuilder::AddEllipse` с поворотом: путь переводится в систему
-/// эллипса, дуга добавляется, путь переводится обратно.
+/// `PathBuilder::AddEllipse` with rotation: the path is moved into the
+/// ellipse's frame, the arc added, then the path moved back.
 pub fn add_ellipse_rotated(
     b: &mut PathBuilder,
     p: Point,
@@ -1090,11 +1090,11 @@ pub fn add_ellipse_rotated(
         add_ellipse(b, p, rx, ry, start, end);
         return;
     }
-    // AffineTransform::Translation(p).RotateRadians(rotation) — в double.
+    // AffineTransform::Translation(p).RotateRadians(rotation), in double.
     let c = (rotation as f64).cos();
     let s = (rotation as f64).sin();
     let fwd = Matrix { sx: c as f32, kx: (-s) as f32, tx: p.x, ky: s as f32, sy: c as f32, ty: p.y };
-    // Обратная: поворот на −rotation и снос −p (в double, как Inverse()).
+    // Inverse: rotate by −rotation and translate by −p (double, like Inverse()).
     let inv = {
         let det = c * c + s * s;
         let (a, bb, cc, d) = (c / det, s / det, -s / det, c / det);
@@ -1107,8 +1107,8 @@ pub fn add_ellipse_rotated(
     b.transform(&fwd);
 }
 
-/// `SkPathPriv::CreateDrawArcPath(arc, isFillNoPathEffect)` для дуг без
-/// центра (холст рисует именно такие).
+/// `SkPathPriv::CreateDrawArcPath(arc, isFillNoPathEffect)` for arcs without
+/// a centre (the kind canvas draws).
 pub fn create_draw_arc_path(oval: &Rect, start_angle: f32, sweep_angle: f32, is_fill: bool) -> Path {
     let mut start = start_angle;
     let mut sweep = sweep_angle;
@@ -1144,7 +1144,7 @@ pub fn create_draw_arc_path(oval: &Rect, start_angle: f32, sweep_angle: f32, is_
     b.detach()
 }
 
-/// `SkPath::Oval(oval)` — как рисует `drawOval`.
+/// `SkPath::Oval(oval)`, as `drawOval` draws it.
 pub fn oval_path(oval: &Rect) -> Path {
     let mut b = PathBuilder::new();
     b.add_oval(oval, true, 1);

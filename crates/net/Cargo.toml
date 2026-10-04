@@ -27,11 +27,10 @@ wreq-util = { workspace = true }
 cookie_store = "0.21"
 url = "2"
 
-# Распаковка тела своими руками. Без неё клиент распаковывает сам и стирает
-# `content-length` с `content-encoding`, а вместе с ними — размер, который
-# ушёл по проводу. Браузер его знает и показывает страницам
-# (`transferSize`, `encodedBodySize`), и сторона, отдавшая файл, знает тоже:
-# несовпадение там видно сразу. Версии — те же, что уже в дереве через wreq.
+# We decompress bodies ourselves: the client's own decompression drops
+# `content-length`/`content-encoding` and with them the on-wire size, which
+# pages see via `transferSize`/`encodedBodySize` and the server can compare.
+# Same versions wreq already pulls in.
 brotli = "8"
 flate2 = "1"
 zstd = "0.13"

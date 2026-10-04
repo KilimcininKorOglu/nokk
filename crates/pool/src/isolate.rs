@@ -31,33 +31,32 @@ struct ModuleRegistry {
     edges: HashMap<(String, String), String>,
 }
 
-/// Дожидающиеся `import()`. У V8 нет своего загрузчика: он зовёт крючок и ждёт
-/// обещание, которое встроитель обязан сам исполнить. Без этого крючка каждый
-/// динамический импорт отклоняется — а на нём держится любая сборка «по кускам»,
-/// то есть почти всякий современный сайт.
+/// Pending `import()` calls. V8 has no module loader of its own: it calls a
+/// hook and waits on a promise the embedder must settle. Without the hook every
+/// dynamic import rejects, which breaks any code-split site.
 #[derive(Default)]
 #[allow(clippy::type_complexity)]
 struct DynamicImports {
     next_id: u32,
-    /// id → обещание, которое нужно исполнить, когда модуль готов.
+    /// id -> promise to settle once the module is ready.
     pending: HashMap<u32, v8::Global<v8::PromiseResolver>>,
-    /// Что спросили и откуда: (id, индекс контекста, адрес просящего, спецификатор).
+    /// What was asked and by whom: (id, context index, referrer URL, specifier).
     queue: Vec<(u32, usize, String, String)>,
 }
 
-/// Есть ли у движка данные ICU. С ними родной `Intl` отвечает как браузерный —
-/// валюты, склонения, часовые пояса, разбор на слова; без них его приходится
-/// подменять заглушкой, а заглушка отвечает не то.
+/// Whether the engine has ICU data. With it native `Intl` answers like Chrome
+/// (currencies, plurals, time zones, segmentation); without it a stub stands in
+/// and answers differently.
 static ICU_READY: AtomicBool = AtomicBool::new(false);
 
-/// Загружены ли данные ICU (см. [`ICU_READY`]).
+/// Whether ICU data is loaded (see [`ICU_READY`]).
 pub fn icu_ready() -> bool {
     ICU_READY.load(Ordering::Relaxed)
 }
 
-/// Где искать `icudtl.dat`: сперва там, куда указали, потом рядом с самим
-/// двоичным файлом. Формат данных привязан к версии ICU, с которой собран V8,
-/// поэтому чужой файл может и не подойти — тогда пробуем следующий.
+/// Where to look for `icudtl.dat`: the configured path first, then next to the
+/// binary. The data format is tied to the ICU version V8 was built with, so a
+/// foreign file may not fit; then the next candidate is tried.
 fn icu_candidates() -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     if let Ok(p) = std::env::var("NOKK_ICU_DATA") {
@@ -77,9 +76,9 @@ static V8_INIT: Once = Once::new();
 /// startup-only cost per worker, so a global lock here is free in practice.
 static CREATE_LOCK: Mutex<()> = Mutex::new(());
 
-/// Снимок V8 с уже исполненным загрузчиком: контекст из него восстанавливается
-/// за миллисекунды вместо ~300 мс загрузчика. Один на процесс — для загрузчика
-/// по умолчанию; остальные (повёрнутые профили, геолокация) идут прежним путём.
+/// V8 snapshot with the bootstrap already run: a context restores in
+/// milliseconds instead of the ~300 ms bootstrap. One per process, for the
+/// default bootstrap; others (rotated profiles, geolocation) take the regular path.
 pub struct Snapshot {
     bootstrap: String,
     data: &'static [u8],
@@ -118,14 +117,14 @@ const NORMALIZE_FOR_SNAPSHOT: &str = r#"(() => {
   }
 })();"#;
 
-/// После восстановления из снимка: часы — с этого мига, а не с постройки.
-/// И то, что V8 доставил при восстановлении, — в тот вид, какой придал бы
-/// загрузчик (`__pt_afterRestore`, заводится только при сборке снимка).
+/// After restoring from the snapshot: the clock starts now, not at build time.
+/// Also reshapes what V8 delivered on restore the way the bootstrap would have
+/// (`__pt_afterRestore`, installed only when building the snapshot).
 pub(crate) const AFTER_SNAPSHOT: &str = "globalThis.__pt_resetClock && __pt_resetClock();\n\
     if (globalThis.__pt_afterRestore) { try { __pt_afterRestore(); } catch (e) {} delete globalThis.__pt_afterRestore; delete globalThis.__pt_wasmStreaming; delete globalThis.__pt_lateShape; }";
 
-/// Собрать снимок для `bootstrap`. Вызывать до создания пула (изоляты
-/// получают снимок при рождении). `NOKK_NO_SNAPSHOT=1` — не собирать.
+/// Build the snapshot for `bootstrap`. Call before creating the pool (isolates
+/// get the snapshot at birth). `NOKK_NO_SNAPSHOT=1` disables it.
 pub fn build_snapshot(bootstrap: &str) -> Result<usize, String> {
     if std::env::var_os("NOKK_NO_SNAPSHOT").is_some() {
         return Err("disabled".into());
@@ -135,11 +134,11 @@ pub fn build_snapshot(bootstrap: &str) -> Result<usize, String> {
     }
     init_platform();
     let t0 = std::time::Instant::now();
-    // Сначала полная установка нативов в пустом изоляте — чтобы список внешних
-    // ссылок был полон до создания снимка. Заодно — имена глобалей обычного
-    // контекста: часть их V8 при сборке снимка не заводит (экспериментальное
-    // по флагам, WebAssembly, SharedArrayBuffer) и доставляет при
-    // восстановлении — поверх того, что успел сделать загрузчик.
+    // Install all natives in an empty isolate first so the external-reference
+    // list is complete before the snapshot. Also record the regular context's
+    // global names: V8 omits some when building a snapshot (flag-gated features,
+    // WebAssembly, SharedArrayBuffer) and adds them on restore, on top of the
+    // bootstrap's work.
     const GLOBAL_NAMES: &str = "JSON.stringify(Object.getOwnPropertyNames(globalThis))";
     let plain_names: Vec<String> = {
         let _guard = CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -156,8 +155,8 @@ pub fn build_snapshot(bootstrap: &str) -> Result<usize, String> {
         serde_json::from_str(&names).unwrap_or_default()
     };
     let refs = crate::natives::external_refs();
-    // Отладка: NOKK_SNAP_CUT=<слой> — снимок загрузчика до конца слоя (нужен
-    // NOKK_TRACE_BOOT, чтобы в тексте были метки слоёв).
+    // Debug: NOKK_SNAP_CUT=<layer> snapshots the bootstrap up to the end of that
+    // layer (needs NOKK_TRACE_BOOT so the source carries layer markers).
     let cut: String;
     let bootstrap = match std::env::var("NOKK_SNAP_CUT") {
         Ok(layer) => {
@@ -173,9 +172,8 @@ pub fn build_snapshot(bootstrap: &str) -> Result<usize, String> {
         }
         Err(_) => bootstrap,
     };
-    // Снимок зависит только от загрузчика, флагов V8 и самого бинарника — и
-    // собирается 700+ мс. Процесс, запускаемый на каждый сайт, платил их каждый
-    // раз; теперь готовый снимок лежит на диске и читается за миллисекунды.
+    // The snapshot depends only on the bootstrap, V8 flags and the binary, and
+    // takes 700+ ms to build, so it is cached on disk for per-site processes.
     let cache = snapshot_cache_path(bootstrap);
     if let Some(path) = &cache {
         if let Ok(bytes) = std::fs::read(path) {
@@ -191,8 +189,8 @@ pub fn build_snapshot(bootstrap: &str) -> Result<usize, String> {
     let blob = {
         let _guard = CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut iso = v8::Isolate::snapshot_creator(Some(refs), None);
-        // Ошибка загрузчика не должна ронять процесс: изолят-создатель снимка
-        // обязан закончить create_blob, иначе rusty_v8 паникует при сбросе.
+        // A bootstrap error must not crash the process: the snapshot creator must
+        // finish create_blob, or rusty_v8 panics on drop.
         let built: Result<(), String> = (|| {
             v8::scope!(scope, &mut iso);
             let default = v8::Context::new(scope, v8::ContextOptions::default());
@@ -209,11 +207,10 @@ pub fn build_snapshot(bootstrap: &str) -> Result<usize, String> {
                 run_script(cs, bootstrap)?;
                 cs.perform_microtask_checkpoint();
                 run_script(cs, "delete globalThis.__pt_lateNames;")?;
-                // Перед снимком — объекты интерфейсов в словарный режим:
-                // десериализатор V8 спотыкался о разделяемые массивы описаний
-                // («Check failed: LinearSearch…») после наших перестановок
-                // членов. Добавить два свойства и удалить первое — перевод в
-                // словарь без следа.
+                // Switch interface objects to dictionary mode before the snapshot: V8's
+                // deserializer tripped on shared descriptor arrays ("Check failed:
+                // LinearSearch...") after our member reordering. Adding two properties and
+                // deleting the first converts without a trace.
                 let _ = run_script(cs, NORMALIZE_FOR_SNAPSHOT);
             }
             scope.add_context(context);
@@ -229,8 +226,8 @@ pub fn build_snapshot(bootstrap: &str) -> Result<usize, String> {
     let _ = SNAPSHOT.set(Snapshot { bootstrap: bootstrap.to_string(), data });
     tracing::info!(bytes = size, ms = t0.elapsed().as_millis() as u64, "v8 snapshot built");
     if let Some(path) = cache {
-        // Атомарно: соседний процесс, стартующий в тот же миг, прочтёт или
-        // целый файл, или никакого.
+        // Atomic: a process starting at the same moment reads either the whole file
+        // or none.
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
         if path.parent().map(std::fs::create_dir_all).is_some()
             && std::fs::write(&tmp, data).is_ok()
@@ -242,9 +239,9 @@ pub fn build_snapshot(bootstrap: &str) -> Result<usize, String> {
     Ok(size)
 }
 
-/// Ключ снимка меняется с каждой сборкой движка, и без уборки каталог рос на
-/// 10 МБ за обновление. Оставляем `keep` самых свежих, включая только что
-/// записанный.
+/// The snapshot key changes with every engine build; without cleanup the
+/// directory grew by 10 MB per update. Keep the `keep` newest, including the one
+/// just written.
 fn prune_snapshot_cache(current: &std::path::Path, keep: usize) {
     let Some(dir) = current.parent() else { return };
     let Ok(rd) = std::fs::read_dir(dir) else { return };
@@ -266,10 +263,10 @@ fn prune_snapshot_cache(current: &std::path::Path, keep: usize) {
     }
 }
 
-/// Где лежит снимок для этого загрузчика: `$NOKK_CACHE_DIR`, иначе
-/// `$XDG_CACHE_HOME/nokk`, иначе `~/.cache/nokk`. Имя — хэш загрузчика, флагов
-/// V8 и бинарника (размер и время изменения: пересобранный движок снимок
-/// старого не прочтёт). `NOKK_NO_SNAPSHOT_CACHE=1` — без диска.
+/// Snapshot path for this bootstrap: `$NOKK_CACHE_DIR`, else
+/// `$XDG_CACHE_HOME/nokk`, else `~/.cache/nokk`. The name hashes the bootstrap,
+/// V8 flags and the binary (size and mtime, so a rebuilt engine never reads a
+/// stale snapshot). `NOKK_NO_SNAPSHOT_CACHE=1` disables the disk cache.
 fn snapshot_cache_path(bootstrap: &str) -> Option<std::path::PathBuf> {
     use sha2::{Digest, Sha256};
     if std::env::var_os("NOKK_NO_SNAPSHOT_CACHE").is_some() {
@@ -290,7 +287,7 @@ fn snapshot_cache_path(bootstrap: &str) -> Option<std::path::PathBuf> {
     Some(dir.join(format!("snapshot-{hex}.bin")))
 }
 
-/// Контекст из снимка (если загрузчик тот же) — уже с нативами и загрузчиком.
+/// Context from the snapshot (if the bootstrap matches), with natives and bootstrap already applied.
 fn context_from_snapshot<'s>(scope: &mut v8::PinScope<'s, '_, ()>, bootstrap: &str) -> Option<v8::Local<'s, v8::Context>> {
     if !snapshot_for(bootstrap) {
         return None;
@@ -305,25 +302,18 @@ fn context_from_snapshot<'s>(scope: &mut v8::PinScope<'s, '_, ()>, bootstrap: &s
 /// in [`Isolate::new`] is then a no-op.
 pub(crate) fn init_platform() {
     V8_INIT.call_once(|| {
-        // Долгое время здесь стоял `--no-maglev`: средний ярус оптимизатора в V8
-        // 13.7 неверно компилировал цикл, который встречается на первой же
-        // настоящей странице — обход графа глобалей сборщиком отпечатков. После
-        // тысячи с лишним витков функция поднималась на ярус, и сравнение строк
-        // внутри неё начинало отвечать неверно: одно свойство молча пропадало из
-        // того, что насчитала страница.
-        //
-        // На V8 14.9 этого нет — проверено тестом
-        // `a_warmed_enumeration_still_sees_every_property` и обходом графа на
-        // живой странице, — поэтому движок работает без ограничений, как в
-        // браузере. `NOKK_V8_FLAGS` по-прежнему заменяет набор целиком.
+        // `--no-maglev` used to be set here: V8 13.7's mid-tier compiler miscompiled
+        // the global-graph enumeration loop of fingerprint collectors, silently
+        // dropping a property after ~1000 iterations. V8 14.9 is fine (see
+        // `a_warmed_enumeration_still_sees_every_property`), so no flags by default.
+        // `NOKK_V8_FLAGS` replaces the whole set.
         let flags = std::env::var("NOKK_V8_FLAGS").unwrap_or_default();
         if !flags.is_empty() {
             v8::V8::set_flags_from_string(&flags);
         }
-        // Данные ICU: без них у прибитой сборки V8 нет ни `Intl`, ни локальных
-        // форматов дат и чисел — их приходится подменять заглушкой, а заглушка
-        // отвечает не то, что браузер. Путь к файлу даётся снаружи, потому что
-        // формат данных привязан к версии ICU, с которой собран V8.
+        // ICU data: without it the pinned V8 build has no `Intl` and no locale
+        // date/number formats, and the stub answers differently from Chrome. The path
+        // is supplied externally because the format is tied to V8's ICU version.
         for path in icu_candidates() {
             let Ok(bytes) = std::fs::read(&path) else { continue };
             let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
@@ -340,29 +330,26 @@ pub(crate) fn init_platform() {
         // Pin one ref for the whole process so the platform is never freed while
         // isolates still reference it (a use-after-free otherwise).
         std::mem::forget(platform.clone());
-        // И держим ссылку для прокачки: у платформы своя очередь задач, и без
-        // неё асинхронная работа V8 не завершается никогда. Заметнее всего это
-        // на `WebAssembly.compile` — обещание просто не разрешается, а
-        // сборщик отпечатка, который его ждёт, стоит до собственного таймаута.
+        // Keep a handle for pumping: the platform has its own task queue, and
+        // without pumping V8's async work never completes (most visibly,
+        // `WebAssembly.compile` promises never resolve and collectors time out).
         PLATFORM.set(platform.clone()).ok();
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();
     });
 }
 
-/// Платформа V8, разделяемая процессом: нужна, чтобы прокачивать её очередь
-/// задач между витками нашего цикла событий.
+/// Process-wide V8 platform, kept to pump its task queue between event-loop turns.
 static PLATFORM: std::sync::OnceLock<v8::SharedRef<v8::Platform>> = std::sync::OnceLock::new();
 
-/// Прокачать очередь задач платформы для этого изолята: одна порция задач и
-/// контрольная точка микрозадач. Возвращает `true`, если что-то выполнилось.
+/// Pump the platform task queue for this isolate: one batch of tasks and a
+/// microtask checkpoint. Returns `true` if anything ran.
 fn pump_platform(isolate: &mut v8::Isolate) -> bool {
     let Some(platform) = PLATFORM.get() else {
         return false;
     };
     let mut ran = false;
-    // Ограничиваем порцию: очередь может пополнять сама себя, и бесконечный
-    // цикл здесь заморозил бы весь воркер.
+    // Bound the batch: the queue can refill itself and would freeze the worker.
     for _ in 0..64 {
         if !v8::Platform::pump_message_loop(platform, isolate, false) {
             break;
@@ -444,8 +431,8 @@ impl Isolate {
             .unwrap_or(Self::EVAL_TIMEOUT)
     }
 
-    /// Сколько на машине физической памяти. Chrome отводит кучу от неё, а не от
-    /// свободной, и от неё же берёт `navigator.deviceMemory`.
+    /// Physical memory size. Chrome derives the heap limit from it (not from free
+    /// memory), and `navigator.deviceMemory` too.
     pub fn physical_memory_bytes() -> u64 {
         #[cfg(target_os = "linux")]
         if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
@@ -458,7 +445,7 @@ impl Isolate {
                 }
             }
         }
-        // Ничего не узнали — говорим то же, что самая обычная машина.
+        // Unknown: report a typical machine.
         8 * 1024 * 1024 * 1024
     }
 
@@ -476,12 +463,10 @@ impl Isolate {
             // initial = 0 lets V8 pick its default starting heap; max is the cap.
             params = params.heap_limits(0, mb * 1024 * 1024);
         } else {
-            // Без явного потолка V8 считает предел по свободной памяти, и на
-            // занятой машине он выходит втрое ниже браузерного. Chrome считает
-            // его от физической — той же функцией V8, — и `performance.memory`
-            // это показывает: на машине с 16 ГБ браузер объявляет 4 395 630 592,
-            // а мы объявляли 1 568 669 696. Число видно со страницы, поэтому
-            // считаем так же.
+            // Without an explicit limit V8 derives it from free memory, which on a busy
+            // machine is three times below Chrome's. Chrome uses physical memory (same V8
+            // function), and pages see it via `performance.memory`: on 16 GB Chrome
+            // reports 4 395 630 592 where we reported 1 568 669 696.
             params = params.heap_limits_from_system_memory(Self::physical_memory_bytes(), 0);
         }
         let mut isolate = {
@@ -495,15 +480,13 @@ impl Isolate {
         isolate.set_slot(DynamicImports::default());
         isolate.set_host_initialize_import_meta_object_callback(import_meta);
         isolate.set_host_import_module_dynamically_callback(import_dynamically);
-        // Как читается `error.stack`. С этим крючком V8 больше не зовёт
-        // `Error.prepareStackTrace` сам — зовём мы, из `__pt_formatStack`, уже
-        // без кадров собственного движка.
+        // `error.stack` formatting. With this hook V8 no longer calls
+        // `Error.prepareStackTrace` itself; `__pt_formatStack` does, without engine frames.
         isolate.set_prepare_stack_trace_callback(prepare_stack_trace);
-        // Content Security Policy: в контексте, где `__pt_setCodegen(false)`
-        // запретил порождение кода из строк, `eval`/`Function` получают вместо
-        // своего исходника бросок EvalError с текстом Chrome. Сам запрет —
-        // на контексте, поэтому подменять источник надо, а не запрещать: иначе
-        // V8 бросит своё «Code generation from strings disallowed».
+        // CSP: where `__pt_setCodegen(false)` disallowed codegen from strings,
+        // `eval`/`Function` get their source replaced with a throw of Chrome's
+        // EvalError. The ban is per context, so substitute the source rather than
+        // refuse; otherwise V8 throws its own "Code generation from strings disallowed".
         isolate.set_modify_code_generation_from_strings_callback(modify_codegen);
 
         // Install the graceful-OOM callback once, if a cap is in effect.
@@ -555,16 +538,11 @@ impl Isolate {
         self.contexts.iter().filter(|c| c.is_some()).count()
     }
 
-    /// Create a fresh context, run `bootstrap` in it (the stealth environment:
-    /// `navigator`/`window`/`screen`…), and return its index. If the bootstrap
-    /// script throws, the context is discarded and the error is returned.
-    /// Наполнить запас реалмов до `n` — см. [`crate::natives::SpareRealms`].
-    /// Зовётся, пока страница ещё ничего не мерит: при создании контекста.
-    /// Добрать запас до `n`, построив не больше `step` реалмов за раз, — для
-    /// подпитки в простое, чтобы не держать поток долго.
+    /// Top up the spare realms to `n`, building at most `step` at a time, so an
+    /// idle-time refill does not hold the thread long.
     pub fn top_up_realms(&mut self, n: usize, step: usize) {
-        // Подпитываем только там, где реалмы уже просили: странице без пустых
-        // кадров запас ни к чему.
+        // Only refill where realms were already requested: a page without blank
+        // frames does not need them.
         let Some(have) = self
             .isolate
             .get_slot::<crate::natives::SpareRealms>()
@@ -584,6 +562,8 @@ impl Isolate {
         }
     }
 
+    /// Fill the spare realms up to `n` (see [`crate::natives::SpareRealms`]).
+    /// Called at context creation, before the page measures anything.
     pub fn prewarm_realms(&mut self, bootstrap: &str, n: usize) {
         if self.isolate.get_slot::<crate::natives::RealmBootstrap>().is_none() {
             self.isolate
@@ -628,9 +608,9 @@ impl Isolate {
         }
     }
 
-    /// Запас готовых контекстов (загрузчик исполнен, номер не выдан) — для
-    /// воркеров: страница создаёт воркер и тут же шлёт ему задание, а
-    /// загрузчик стоит триста миллисекунд. Строится в простое потока.
+    /// Spare ready contexts (bootstrap run, no index assigned) for workers: a
+    /// page creates a worker and posts to it right away, while the bootstrap takes
+    /// ~300 ms. Built while the thread is idle.
     pub fn prewarm_contexts(&mut self, bootstrap: &str, n: usize) {
         loop {
             let have = self
@@ -670,8 +650,8 @@ impl Isolate {
         }
     }
 
-    /// Как [`Self::create_context`], но из запаса, если он есть: часы контекста
-    /// начинаются в миг выдачи.
+    /// Like [`Self::create_context`], but from the spare pool when available;
+    /// the context clock starts at hand-out.
     pub fn create_context_or_spare(&mut self, bootstrap: &str) -> Result<usize, String> {
         let spare = self
             .isolate
@@ -703,6 +683,9 @@ impl Isolate {
         Ok(index)
     }
 
+    /// Create a fresh context, run `bootstrap` in it (the stealth environment:
+    /// `navigator`/`window`/`screen`...), and return its index. If the bootstrap
+    /// script throws, the context is discarded and the error is returned.
     pub fn create_context(&mut self, bootstrap: &str) -> Result<usize, String> {
         let t_build = std::time::Instant::now();
         let r = self.create_context_inner(bootstrap);
@@ -735,7 +718,7 @@ impl Isolate {
                 // Native bindings must exist before the bootstrap runs — the JS
                 // WebCrypto layer is built on top of them.
                 crate::natives::install(scope);
-                // NOKK_AUDIT_NATIVES=1: какие нативы зовёт сам загрузчик.
+                // NOKK_AUDIT_NATIVES=1: which natives the bootstrap itself calls.
                 let audit = std::env::var_os("NOKK_AUDIT_NATIVES").is_some();
                 if audit {
                     let _ = run_script(scope, "(() => { const c = {}; Object.defineProperty(globalThis, '__pt_auditCounts', { value: c, configurable: true }); for (const k of Object.getOwnPropertyNames(globalThis)) { if (!k.startsWith('__pt_')) continue; const f = globalThis[k]; if (typeof f !== 'function') continue; globalThis[k] = function () { c[k] = (c[k] || 0) + 1; return f.apply(this, arguments); }; } })();");
@@ -747,12 +730,9 @@ impl Isolate {
                     }
                 }
             }
-            // Крючок динамического импорта видит только область; чтобы он знал,
-            // в каком контексте спросили, контекст носит свой номер под
-            // `__pt`-именем — такие имена перечисление не показывает.
-            // Заводится невидимым: обычное присваивание кладёт на окно
-            // перечислимое свойство, и `for…in` у страницы показывал наше
-            // служебное имя наравне со своими.
+            // The dynamic-import hook sees only the scope, so the context stores its
+            // index under a `__pt` name, which enumeration hides. Defined non-enumerable:
+            // a plain assignment showed up in the page's `for...in` over window.
             let _ = run_script(
                 scope,
                 &format!(
@@ -763,8 +743,8 @@ impl Isolate {
             global
         };
         self.contexts.push(Some(global));
-        // Отладка памяти: NOKK_HEAP_SNAPSHOT_AT=<n> — снимок кучи изолята в
-        // файл `nokk-heap-<n>.heapsnapshot`, когда у него становится n контекстов.
+        // Memory debugging: NOKK_HEAP_SNAPSHOT_AT=<n> writes the isolate heap to
+        // `nokk-heap-<n>.heapsnapshot` when it reaches n contexts.
         if let Ok(at) = std::env::var("NOKK_HEAP_SNAPSHOT_AT") {
             if at.parse::<usize>().ok() == Some(self.contexts.len()) {
                 let mut out = Vec::new();
@@ -792,9 +772,9 @@ impl Isolate {
         self.eval_named(index, source, None)
     }
 
-    /// То же, но скрипт назван своим адресом — как называет свои браузер.
-    /// Имя уходит в `ScriptOrigin`, а не в `//# sourceURL`: первое видно и
-    /// родителю вложенного `eval`, второе — нет.
+    /// Same, but the script is named by its URL, as Chrome does. The name goes
+    /// into `ScriptOrigin` rather than `//# sourceURL`: the former is visible to a
+    /// nested `eval`'s parent frame, the latter is not.
     pub fn eval_named(
         &mut self,
         index: usize,
@@ -882,9 +862,9 @@ impl Isolate {
     }
 
     /// What `import()` calls are waiting to be loaded, taken off the queue.
-    /// То же, но только для перечисленных контекстов: остальные остаются в
-    /// очереди. На одном потоке живут контексты разных страниц, и кадр,
-    /// вынесенный на чужой поток, не должен забирать их `import()`.
+    /// Same, but only for the listed contexts; the rest stay queued. One thread
+    /// hosts contexts of different pages, and a frame moved to another thread must
+    /// not take their `import()`s.
     pub fn drain_dynamic_imports_for(&mut self, indices: &[usize]) -> Vec<(u32, usize, String, String)> {
         let Some(d) = self.isolate.get_slot_mut::<DynamicImports>() else {
             return Vec::new();
@@ -1013,12 +993,12 @@ impl Isolate {
         // gets a chance to fire in that case. Arm the same terminate-watchdog as
         // `eval` so one runaway callback can't wedge the worker permanently.
         let watchdog = TerminateWatchdog::arm(&mut self.isolate);
-        // Сначала — очередь платформы: там доделывается то, что V8 начал сам
-        // (асинхронная компиляция WebAssembly и прочая фоновая работа). Её
-        // обещания разрешаются только здесь, а таймеры страницы ждут их.
+        // Platform queue first: it finishes work V8 started itself (async
+        // WebAssembly compilation etc.). Its promises resolve only here, and page
+        // timers wait on them.
         let pumped = pump_platform(&mut self.isolate);
         let mut result = self.pump_timers(&global, max_callbacks, deadline);
-        // И ещё раз после таймеров: колбэк мог начать новую фоновую работу.
+        // Again after timers: a callback may have started new background work.
         if pump_platform(&mut self.isolate) || pumped {
             if let Ok(n) = result.as_mut() {
                 *n += 1;
@@ -1032,15 +1012,15 @@ impl Isolate {
         result
     }
 
-    /// То же, но контекст держит своё время сам: когда ничего не наступило, а
-    /// ближайший таймер ближе `near`, поток ждёт его здесь и продолжает круг,
-    /// вместо того чтобы возвращать ход наверх и ехать обратно.
+    /// Same, but the context keeps its own time: when nothing is due and the next
+    /// timer is closer than `near`, the thread waits for it here and continues
+    /// instead of returning to the caller.
     ///
-    /// Так работает воркер в браузере: у него свой поток, и цепочка коротких
-    /// таймеров — а сборщик отпечатка Cloudflare разложен именно в неё — идёт
-    /// подряд, а не по шагу за виток чужого цикла. Ждать здесь можно только
-    /// потому, что контекст воркера живёт на изоляте, который больше никому не
-    /// нужен; для страницы это было бы остановкой всего.
+    /// This matches a browser worker, which has its own thread: a chain of short
+    /// timers (where Cloudflare's fingerprint collector runs) proceeds back to back,
+    /// not one step per turn of a shared loop. Waiting is safe only because a
+    /// worker context's isolate serves nobody else; for a page it would stall
+    /// everything.
     pub fn run_worker_loop(
         &mut self,
         index: usize,
@@ -1064,8 +1044,7 @@ impl Isolate {
         }
     }
 
-    /// Через сколько сработает ближайший таймер контекста; `None` — не ждёт
-    /// ничего вовсе.
+    /// Time until the context's next timer; `None` if nothing is pending.
     fn next_timer_delay(&mut self, index: usize) -> Option<std::time::Duration> {
         let ms = self
             .eval(
@@ -1115,8 +1094,7 @@ impl Isolate {
     /// reclaim the memory on the next GC. Leaves a `None` tombstone so the
     /// indices of other contexts are preserved (the slot is emptied, not
     /// removed) — otherwise every later context's pinned index would shift.
-    /// Отладка памяти (`RUST_LOG=nokk::heap=debug`): куча изолята и число живых
-    /// контекстов в нём.
+    /// Memory debugging (`RUST_LOG=nokk::heap=debug`): isolate heap and its live context count.
     fn log_heap(&mut self, what: &'static str) {
         if tracing::enabled!(target: "nokk::heap", tracing::Level::DEBUG) {
             let st = self.isolate.get_heap_statistics();
@@ -1131,9 +1109,8 @@ impl Isolate {
         self.log_heap("dispose");
         if let Some(slot) = self.contexts.get_mut(index) {
             if slot.take().is_some() && gc_hint_due() {
-                // Контекст — это мегабайты кучи, и освободит их только сборка;
-                // подсказка ускоряет её ценой процессора — включается
-                // `NOKK_GC_HINT_MS` (см. `gc_hint_due`).
+                // A context is megabytes of heap that only GC frees; the hint speeds that
+                // up at CPU cost. Enabled by `NOKK_GC_HINT_MS` (see `gc_hint_due`).
                 self.isolate
                     .memory_pressure_notification(v8::MemoryPressureLevel::Moderate);
             }
@@ -1234,19 +1211,6 @@ fn compile_module<'s>(
     v8::script_compiler::compile_module(scope, &mut src)
 }
 
-/// V8 asks the embedder to load an `import()`, and waits on the promise we
-/// hand back. Everything here is bookkeeping: make the promise, remember the
-/// resolver by id, and queue what was asked for the driver to fetch.
-/// Стек ошибки, каким его увидит страница. V8 зовёт это, когда у ошибки в
-/// первый раз читают `stack`, и отдаёт разобранные кадры; дальше решает JS —
-/// `__pt_formatStack` из общего пролога: он выбрасывает кадры самого движка
-/// (безымянный скрипт с позицией — диспетчер событий, XHR, таймеры) и зовёт
-/// `Error.prepareStackTrace` страницы, если та его ставила. Без этого всякий
-/// `new Error()` внутри обработчика показывал нашу кухню, которой в браузере
-/// на этом месте нет вовсе.
-/// Что компилировать вместо строки `eval`/`Function` в контексте с CSP без
-/// 'unsafe-eval': выражение, бросающее EvalError с текстом из
-/// `globalThis.__pt_cspEval`. Без такого текста — исходник как есть.
 fn trusted_script_text<'s>(scope: &mut v8::PinScope<'s, '_>, source: v8::Local<'s, v8::Value>) -> Option<v8::Local<'s, v8::String>> {
     if source.is_string() || !source.is_object() {
         return None;
@@ -1258,6 +1222,9 @@ fn trusted_script_text<'s>(scope: &mut v8::PinScope<'s, '_>, source: v8::Local<'
     if v.is_string() { v.to_string(scope) } else { None }
 }
 
+/// What to compile instead of an `eval`/`Function` string in a CSP context
+/// without 'unsafe-eval': an expression throwing EvalError with the text from
+/// `globalThis.__pt_cspEval`. Without that text, the source as is.
 fn modify_codegen<'s, 'i>(
     scope: &mut v8::PinScope<'s, 'i>,
     source: v8::Local<'s, v8::Value>,
@@ -1265,9 +1232,9 @@ fn modify_codegen<'s, 'i>(
 ) -> v8::ModifyCodeGenerationFromStringsResult<'s> {
     let context = scope.get_current_context();
     let global = context.global(scope);
-    // Trusted Types раньше CSP: при `require-trusted-types-for 'script'`
-    // строка идёт через политику по умолчанию (`__pt_ttEval`), и без неё
-    // eval отвечает EvalError словами Chrome. TrustedScript — доверен и так.
+    // Trusted Types before CSP: with `require-trusted-types-for 'script'` the
+    // string goes through the default policy (`__pt_ttEval`); without one, eval
+    // throws Chrome's EvalError. A TrustedScript is already trusted.
     let mut tt_source: Option<v8::Local<'s, v8::String>> = None;
     let tt_on = v8::String::new(scope, "__pt_ttOn")
         .and_then(|k| global.get(scope, k.into()))
@@ -1282,9 +1249,8 @@ fn modify_codegen<'s, 'i>(
             match r.filter(|v| v.is_string()).and_then(|v| v.to_string(scope)) {
                 Some(code) => tt_source = Some(code),
                 None => {
-                    // `new Function(...)`: V8 разбирает подмену как текст функции,
-                    // поэтому бросок кладётся в её тело (сработает при вызове);
-                    // прямой eval бросает сразу.
+                    // `new Function(...)`: V8 parses the substitute as a function body, so the
+                    // throw goes inside it (fires on call); direct eval throws immediately.
                     let src = source.to_rust_string_lossy(scope);
                     let throw = "throw new EvalError(\"Evaluating a string as JavaScript violates this document's Trusted Type assignment requirements.\");";
                     let js = if src.starts_with("(function anonymous(") || src.starts_with("(async function anonymous(") || src.starts_with("(function* anonymous(") || src.starts_with("(async function* anonymous(") {
@@ -1305,8 +1271,8 @@ fn modify_codegen<'s, 'i>(
         .map(|v| v.to_rust_string_lossy(scope))
         .filter(|m| !m.is_empty());
     let Some(msg) = msg else {
-        // TrustedScript исполняется своим текстом (скрытое поле, см.
-        // natives::TRUSTED_SCRIPT_KEY); прочие объекты eval возвращает как есть.
+        // A TrustedScript runs its own text (hidden field, see
+        // natives::TRUSTED_SCRIPT_KEY); eval returns other objects unchanged.
         let _ = is_code_like;
         let modified = tt_source.or_else(|| trusted_script_text(scope, source));
         return v8::ModifyCodeGenerationFromStringsResult { codegen_allowed: true, modified_source: modified };
@@ -1325,14 +1291,19 @@ fn modify_codegen<'s, 'i>(
         }
     }
     quoted.push('"');
-    // Под Trusted Types текст EvalError — всегда их: Blink ставит сообщение
-    // для порождения кода один раз на документ, и TT переписывает его.
+    // Under Trusted Types the EvalError text is always TT's: Blink sets the
+    // codegen message once per document and TT overrides it.
     let quoted = if tt_on { "\"Evaluating a string as JavaScript violates this document's Trusted Type assignment requirements.\"".to_string() } else { quoted };
     let js = format!("(function () {{ try {{ if (typeof __pt_cspEvalViolation === 'function') __pt_cspEvalViolation(); }} catch (e) {{}} throw new EvalError({quoted}); }})()");
     let modified = v8::String::new(scope, &js);
     v8::ModifyCodeGenerationFromStringsResult { codegen_allowed: true, modified_source: modified }
 }
 
+/// The error stack as the page sees it. V8 calls this on the first read of
+/// `stack` with parsed frames; `__pt_formatStack` from the shared prologue drops
+/// the engine's own frames (unnamed scripts: event dispatch, XHR, timers) and
+/// calls the page's `Error.prepareStackTrace` if set. Otherwise `new Error()` in
+/// a handler exposed engine internals.
 fn prepare_stack_trace<'s, 'a>(
     scope: &mut v8::PinScope<'s, 'a>,
     error: v8::Local<'s, v8::Value>,
@@ -1348,10 +1319,10 @@ fn prepare_stack_trace<'s, 'a>(
         if let Some(v) = f.call(scope, undef, &[error, sites.into()]) {
             return v;
         }
-        // Формат бросил — пусть бросок и дойдёт до читателя, как дошёл бы у V8.
+        // The formatter threw: let the throw reach the reader, as V8 would.
         return v8::undefined(scope).into();
     }
-    // Пролога нет (голый контекст): собрать по умолчанию, кадр за кадром.
+    // No prologue (bare context): default format, frame by frame.
     let mut out = String::from("Error");
     for i in 0..sites.length() {
         if let Some(site) = sites.get_index(scope, i) {
@@ -1367,6 +1338,9 @@ fn prepare_stack_trace<'s, 'a>(
     }
 }
 
+/// V8 asks the embedder to load an `import()`, and waits on the promise we
+/// hand back. Everything here is bookkeeping: make the promise, remember the
+/// resolver by id, and queue what was asked for the driver to fetch.
 fn import_dynamically<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     _host_defined_options: v8::Local<'s, v8::Data>,
@@ -1447,11 +1421,11 @@ fn run_script(scope: &mut v8::PinScope, source: &str) -> Result<String, String> 
     run_script_named(scope, source, None)
 }
 
-/// То же, но скрипт назван своим адресом. Имя видно не только в кадрах
-/// стека самого скрипта (для этого хватало бы `//# sourceURL`), но и там, где
-/// движок называет *родителя*: у `new Function` и `eval` браузер пишет
-/// `eval at <anonymous> (https://…:2:12)`, а безымянный скрипт даёт
-/// `unknown source`. Стек читают — и эту разницу видно.
+/// Same, but the script is named by its URL. The name shows not only in the
+/// script's own frames (`//# sourceURL` would do for that) but also where V8
+/// names the *parent*: for `new Function` and `eval` Chrome writes
+/// `eval at <anonymous> (https://...:2:12)`, while an unnamed script gives
+/// `unknown source`. Pages read stacks, so the difference shows.
 fn run_script_named(
     scope: &mut v8::PinScope,
     source: &str,
@@ -1505,8 +1479,8 @@ fn exception_message(
                 .to_string(tc)
                 .map(|s| s.to_rust_string_lossy(tc))
                 .unwrap_or_else(|| "uncatchable JS exception".to_string());
-            // Со стеком, когда он есть: ошибка загрузчика без него — иголка в
-            // стоге на сотню тысяч строк.
+            // Include the stack when present: a bootstrap error without one is a needle
+            // in a 100k-line haystack.
             let stack = ex
                 .to_object(tc)
                 .and_then(|o| {

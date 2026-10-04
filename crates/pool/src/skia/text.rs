@@ -1,17 +1,17 @@
-//! Текст холста, как его кладёт Chrome 151 на Linux.
+//! Canvas text as Chrome 151 on Linux lays it out.
 //!
-//! Раскладка — Blink поверх HarfBuzz: кегль огрубляется до сотых
-//! (`FontDescription::EffectiveFontSize`), ширины глифов приходят от Skia
-//! (линейные, с усечением кегля до 26.6, как у FreeType), кернинг GPOS
-//! масштабирует сам HarfBuzz (`em_mult`), позиции копятся в 16.16.
+//! Layout is Blink over HarfBuzz: text size rounded to hundredths
+//! (`FontDescription::EffectiveFontSize`), glyph advances from Skia
+//! (linear, size truncated to 26.6 as FreeType does), GPOS kerning scaled
+//! by HarfBuzz itself (`em_mult`), positions accumulated in 16.16.
 //!
-//! Глифы — Skia поверх Fontations (`SkTypeface_Fontations`): контур из
-//! skrifa с автохинтером в режиме light, субпиксельный сдвиг по x на
-//! четверть пикселя, границы `roundOut`, растр аналитическим AA в маску A8
-//! (`GenerateImageFromPath`), затем гамма-таблица `SkMaskGamma`
-//! (контраст 0.2, гамма 1.2, по яркости краски). У слоя тени таблицы нет,
-//! зато каждый глиф размывается отдельно (маска-фильтр в контексте
-//! скейлера) и кладётся своим `blitMask`.
+//! Glyphs are Skia over Fontations (`SkTypeface_Fontations`): skrifa outline
+//! with the light autohinter, quarter-pixel subpixel x offset, `roundOut`
+//! bounds, analytic-AA raster into an A8 mask
+//! (`GenerateImageFromPath`), then the `SkMaskGamma` table
+//! (contrast 0.2, gamma 1.2, by paint luminance). The shadow layer has no
+//! table, but each glyph is blurred separately (mask filter in the scaler
+//! context) and drawn with its own `blitMask`.
 
 use super::aaa;
 use super::blit::Blitter;
@@ -24,12 +24,12 @@ use skrifa::{FontRef, GlyphId, MetadataProvider};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-/// `FontDescription::EffectiveFontSize`: кегль с точностью до сотых.
+/// `FontDescription::EffectiveFontSize`: text size to hundredths.
 pub fn effective_size(css_px: f32) -> f32 {
     (css_px * 100.0).floor() / 100.0
 }
 
-/// `SkiaScalarToHarfBuzzPosition`: float → 16.16 с усечением.
+/// `SkiaScalarToHarfBuzzPosition`: float -> 16.16, truncated.
 pub fn to_hb_position(v: f32) -> i32 {
     let x = v * 65536.0;
     if x >= i32::MAX as f32 {
@@ -41,12 +41,12 @@ pub fn to_hb_position(v: f32) -> i32 {
     }
 }
 
-/// `hb_font_t::em_mult`: значение в единицах шрифта → 16.16.
+/// `hb_font_t::em_mult`: font units -> 16.16.
 pub fn em_mult(v: i32, mult: i64) -> i32 {
     ((v as i64 * mult + 32768) >> 16) as i32
 }
 
-/// Разложенный глиф: номер, шрифт из цепочки и начало по x в CSS-пикселях.
+/// Laid-out glyph: id, font from the fallback chain, x origin in CSS px.
 #[derive(Clone, Copy, Debug)]
 pub struct ShapedGlyph {
     pub gid: u16,
@@ -59,7 +59,7 @@ thread_local! {
     static GAMMA: RefCell<Option<&'static [[u8; 256]; 8]>> = const { RefCell::new(None) };
 }
 
-/// Стили глифов автохинтера (`GlyphStyles::new`) — дорого, считаем раз на шрифт.
+/// Autohinter glyph styles (`GlyphStyles::new`): expensive, computed once per font.
 fn glyph_styles(bytes: &'static [u8], outlines: &skrifa::OutlineGlyphCollection) -> &'static GlyphStyles {
     STYLES.with(|m| {
         let key = bytes.as_ptr() as usize;
@@ -74,7 +74,7 @@ fn glyph_styles(bytes: &'static [u8], outlines: &skrifa::OutlineGlyphCollection)
 
 // ── SkMaskGamma ───────────────────────────────────────────────────────────
 
-/// `sk_t_scale255<3>`: три бита яркости → 0..255.
+/// `sk_t_scale255<3>`: three luminance bits -> 0..255.
 fn scale255_3(i: u32) -> f32 {
     let base = i << 5;
     (base | (base >> 3) | (base >> 6)) as f32
@@ -85,7 +85,7 @@ fn round2int(x: f32) -> i32 {
     (x + 0.5).floor() as i32
 }
 
-/// `SkTMaskGamma_build_correcting_lut` для гаммы Skia (pow), одна таблица.
+/// `SkTMaskGamma_build_correcting_lut` for Skia's (pow) gamma, one table.
 fn build_lut(lum: f32, contrast: f32, gamma: f32) -> [u8; 256] {
     let to_luma = |l: f32| l.powf(gamma);
     let from_luma = |l: f32| l.powf(1.0 / gamma);
@@ -114,8 +114,8 @@ fn build_lut(lum: f32, contrast: f32, gamma: f32) -> [u8; 256] {
     table
 }
 
-/// Таблицы для контраста SK_GAMMA_CONTRAST=0.2 и гаммы SK_GAMMA_EXPONENT=1.2
-/// после квантования в `SkScalerContextRec` (51/255 и 76/64).
+/// Tables for contrast SK_GAMMA_CONTRAST=0.2 and gamma SK_GAMMA_EXPONENT=1.2
+/// after quantization in `SkScalerContextRec` (51/255 and 76/64).
 fn gamma_tables() -> &'static [[u8; 256]; 8] {
     GAMMA.with(|g| {
         if let Some(t) = *g.borrow() {
@@ -133,15 +133,15 @@ fn gamma_tables() -> &'static [[u8; 256]; 8] {
     })
 }
 
-/// `SkComputeLuminance` + `PreprocessRec`: серый цвет яркости краски.
+/// `SkComputeLuminance` + `PreprocessRec`: gray of the paint's luminance.
 pub fn luminance_byte(rgb: [u8; 3]) -> u8 {
     ((rgb[0] as u32 * 54 + rgb[1] as u32 * 183 + rgb[2] as u32 * 19) >> 8) as u8
 }
 
-// ── Растр глифов (SkTypeface_Fontations + SkScalerContext) ────────────────
+// ── Glyph raster (SkTypeface_Fontations + SkScalerContext) ──────────────────
 
-/// Перо Skia (`VerbsPointsPen`): y вниз, повторы точек схлопываются,
-/// `close` только после сегмента.
+/// Skia pen (`VerbsPointsPen`): y down, repeated points collapsed,
+/// `close` only after a segment.
 struct SkPen {
     b: PathBuilder,
     started: bool,
@@ -207,7 +207,7 @@ impl OutlinePen for SkPen {
     }
 }
 
-/// Маска одного глифа в координатах устройства относительно его начала.
+/// One glyph's mask in device coordinates relative to its origin.
 pub struct GlyphMask {
     pub left: i32,
     pub top: i32,
@@ -216,7 +216,7 @@ pub struct GlyphMask {
     pub image: Vec<u8>,
 }
 
-/// Контекст скейлера для одного шрифта, кегля и матрицы.
+/// Scaler context for one font, text size and matrix.
 pub struct Scaler<'a> {
     outlines: skrifa::OutlineGlyphCollection<'a>,
     instance: Option<HintingInstance>,
@@ -224,14 +224,14 @@ pub struct Scaler<'a> {
     scale: f32,
 }
 
-/// `SkScalerContextRec::computeMatrices(kVertical)` для матрицы без
-/// перспективы: A = кегль · post2x2; s = |A.scaleY|; sA — остаток.
+/// `SkScalerContextRec::computeMatrices(kVertical)` for a non-perspective
+/// matrix: A = size * post2x2; s = |A.scaleY|; sA is the remainder.
 fn compute_matrices(text_size: f32, post: &Matrix) -> (f32, Matrix) {
     let a = Matrix { sx: text_size * post.sx, kx: text_size * post.kx, ky: text_size * post.ky, sy: text_size * post.sy, tx: 0.0, ty: 0.0 };
     let skewed_or_flipped = a.kx != 0.0 || a.ky != 0.0 || a.sx < 0.0 || a.sy < 0.0;
     if skewed_or_flipped {
-        // Поворот/наклон: скейлер Skia снимает вращение через Гивенса; здесь
-        // берём общий случай sA = A · S⁻¹ с s = |scaleY|.
+        // Rotation/skew: Skia's scaler removes rotation via Givens; here we
+        // take the general case sA = A * S^-1 with s = |scaleY|.
         let s = a.sy.abs().max(1e-6);
         let mut sa = a;
         sa.pre_scale(1.0 / s, 1.0 / s);
@@ -251,11 +251,11 @@ fn compute_matrices(text_size: f32, post: &Matrix) -> (f32, Matrix) {
 }
 
 impl<'a> Scaler<'a> {
-    /// `text_size` — кегль после огрубления, `post` — 2×2 матрицы холста.
+    /// `text_size` is the rounded size, `post` the canvas matrix 2x2.
     pub fn new(bytes: &'static [u8], font: &FontRef<'a>, text_size: f32, post: &Matrix) -> Option<Scaler<'a>> {
         let (scale, remaining) = compute_matrices(text_size, post);
         let outlines = font.outline_glyphs();
-        // kSlight → автохинтер light (`AutoHintingControl::ForceForGlyf`).
+        // kSlight -> light autohinter (`AutoHintingControl::ForceForGlyf`).
         let styles = glyph_styles(bytes, &outlines);
         let instance = HintingInstance::new(
             &outlines,
@@ -274,7 +274,7 @@ impl<'a> Scaler<'a> {
         self.scale
     }
 
-    /// Контур глифа в пикселях устройства (`generatePathImpl`).
+    /// Glyph outline in device pixels (`generatePathImpl`).
     pub fn path(&self, gid: u16) -> Option<Path> {
         let glyph = self.outlines.get(GlyphId::from(gid))?;
         let mut pen = SkPen::new();
@@ -292,7 +292,7 @@ impl<'a> Scaler<'a> {
         }
     }
 
-    /// Контур глифа со субпиксельным сдвигом (`internalGetPath`: makeOffset).
+    /// Glyph outline with subpixel offset (`internalGetPath`: makeOffset).
     pub fn offset_path(&self, gid: u16, sub_x: u32, sub_y: u32) -> Option<Path> {
         let mut path = self.path(gid)?;
         if sub_x != 0 || sub_y != 0 {
@@ -301,16 +301,16 @@ impl<'a> Scaler<'a> {
         Some(path)
     }
 
-    /// Маска заливки (`GenerateMetricsFromPath` + `GenerateImageFromPath`):
-    /// `sub_x`/`sub_y` — субпиксельные доли (0..3 четверти).
+    /// Fill mask (`GenerateMetricsFromPath` + `GenerateImageFromPath`):
+    /// `sub_x`/`sub_y` are subpixel quarters (0..3).
     pub fn fill_mask(&self, gid: u16, sub_x: u32, sub_y: u32) -> Option<GlyphMask> {
         let path = self.offset_path(gid, sub_x, sub_y)?;
         mask_from_path(&path)
     }
 }
 
-/// Маска штриха (`internalGetPath` с fFrameWidth ≥ 0): контур в пространство
-/// кегля обратной матрицей 2×2, SkStroke, обратно матрицей, растр как заливка.
+/// Stroke mask (`internalGetPath` with fFrameWidth >= 0): outline into text-size
+/// space by the inverse 2x2, SkStroke, back by the matrix, rasterized as a fill.
 pub fn stroke_mask(path: &Path, post: &Matrix, params: &super::stroke::StrokeParams) -> Option<GlyphMask> {
     let inverse = post.invert()?;
     let local = if post.is_identity() { path.clone() } else { path.transform(&inverse) };
@@ -319,7 +319,7 @@ pub fn stroke_mask(path: &Path, post: &Matrix, params: &super::stroke::StrokePar
     mask_from_path(&dev)
 }
 
-/// Маска из контура: границы `roundOut`, растр AAA в A8 через `SkA8_Blitter`.
+/// Mask from an outline: `roundOut` bounds, AAA raster into A8 via `SkA8_Blitter`.
 pub fn mask_from_path(path: &Path) -> Option<GlyphMask> {
     if path.pts.is_empty() {
         return None;
@@ -343,7 +343,7 @@ pub fn mask_from_path(path: &Path) -> Option<GlyphMask> {
     Some(GlyphMask { left, top, width, height, image })
 }
 
-/// `applyLUTToA8Mask` по яркости краски (индекс — старшие три бита).
+/// `applyLUTToA8Mask` by paint luminance (index = top three bits).
 pub fn apply_gamma(mask: &mut GlyphMask, lum: u8) {
     let table = &gamma_tables()[(lum >> 5) as usize];
     for v in mask.image.iter_mut() {
@@ -351,8 +351,8 @@ pub fn apply_gamma(mask: &mut GlyphMask, lum: u8) {
     }
 }
 
-/// Размытая маска глифа (маска-фильтр в контексте скейлера): границы и
-/// изображение уже с полями размытия.
+/// Blurred glyph mask (mask filter in the scaler context): bounds and
+/// image already include the blur margins.
 pub fn blur_mask(mask: &GlyphMask, sigma: f64) -> Option<GlyphMask> {
     let src = Mask {
         bounds: IRect::from_ltrb(mask.left, mask.top, mask.left + mask.width, mask.top + mask.height),
@@ -371,9 +371,9 @@ pub fn blur_mask(mask: &GlyphMask, sigma: f64) -> Option<GlyphMask> {
     Some(GlyphMask { left: dst.bounds.left, top: dst.bounds.top, width: w, height: h, image })
 }
 
-/// Позиция глифа на устройстве (`prepare_for_direct_mask_drawing`): матрица
-/// позиций с прибавкой половины шага, затем `floor`; субпиксель — по
-/// правилам `SkPackedGlyphID::PackIDSkPoint` и выравниванию осей.
+/// Glyph device position (`prepare_for_direct_mask_drawing`): position matrix
+/// plus half a sample step, then `floor`; subpixel per
+/// `SkPackedGlyphID::PackIDSkPoint` and axis alignment.
 pub struct DevicePos {
     pub x: i32,
     pub y: i32,
@@ -381,9 +381,9 @@ pub struct DevicePos {
     pub sub_y: u32,
 }
 
-/// `pos_matrix` = CTM.preTranslate(origin) — без прибавки округления.
+/// `pos_matrix` = CTM.preTranslate(origin), without the rounding bias.
 pub fn device_position(pos_matrix: &Matrix, glyph_x: f32, axis_x_only: bool, axis_y_only: bool) -> Option<DevicePos> {
-    // halfAxisSampleFreq: субпиксель по x → 1/8, по y → 1/2 (kX).
+    // halfAxisSampleFreq: subpixel x -> 1/8, y -> 1/2 (kX).
     let (hx, hy) = if axis_x_only {
         (0.125f32, 0.5f32)
     } else if axis_y_only {
@@ -406,7 +406,7 @@ pub fn device_position(pos_matrix: &Matrix, glyph_x: f32, axis_x_only: bool, axi
     Some(DevicePos { x: fx as i32, y: fy as i32, sub_x, sub_y })
 }
 
-/// Выравнивание осей (`computeAxisAlignmentForHText`) для матрицы холста.
+/// Axis alignment (`computeAxisAlignmentForHText`) for the canvas matrix.
 pub fn axis_alignment(post: &Matrix) -> (bool, bool) {
     if post.ky == 0.0 {
         (true, false)
@@ -417,7 +417,7 @@ pub fn axis_alignment(post: &Matrix) -> (bool, bool) {
     }
 }
 
-/// `paintMasks`: положить маску глифа блиттером в окне холста.
+/// `paintMasks`: draw a glyph mask with the blitter inside the canvas clip.
 pub fn blit_glyph(blitter: &mut dyn Blitter, mask: &GlyphMask, x: i32, y: i32, clip: &IRect) {
     let bounds = IRect::from_ltrb(mask.left + x, mask.top + y, mask.left + x + mask.width, mask.top + y + mask.height);
     if let Some(cr) = bounds.intersect(clip) {
@@ -425,7 +425,7 @@ pub fn blit_glyph(blitter: &mut dyn Blitter, mask: &GlyphMask, x: i32, y: i32, c
     }
 }
 
-/// `SkMatrix::preTranslate` для матрицы без перспективы.
+/// `SkMatrix::preTranslate` for a non-perspective matrix.
 pub fn pre_translate(m: &Matrix, dx: f32, dy: f32) -> Matrix {
     let mut out = *m;
     if m.is_translate_only() {
@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn em_mult_matches_harfbuzz() {
-        // 27.77px: x_scale = 1819934, upem 2048 → кернинг R/y −82 = −72868.
+        // 27.77px: x_scale = 1819934, upem 2048 -> R/y kerning -82 = -72868.
         let x_scale = to_hb_position(27.77) as i64;
         let x_mult = (x_scale << 16) / 2048;
         assert_eq!(em_mult(-82, x_mult), -72868);

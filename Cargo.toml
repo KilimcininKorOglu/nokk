@@ -84,11 +84,10 @@ clap = { version = "4", features = ["derive", "env"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 
-# Свой BoringSSL: в нём объявлены постквантовые подписи Chrome (ML-DSA,
-# 0904/0905/0906). Без них третий кусок JA4 не совпадает ни с одним настоящим
-# браузером, а Cloudflare читает JA4 на каждом запросе. Заплатка узкая — три
-# имени и пропуск в проверке предпочтений; выбрать такую подпись сервер
-# по-прежнему не может. См. vendor/btls-sys/PATCHES.md.
+# Patched BoringSSL that advertises Chrome's post-quantum ML-DSA sigalgs
+# (0904/0905/0906); without them the third JA4 part matches no real browser,
+# and Cloudflare reads JA4 on every request. Advertised only: the server still
+# cannot pick them. See vendor/btls-sys/PATCHES.md.
 [patch.crates-io]
 btls-sys = { path = "vendor/btls-sys" }
 
