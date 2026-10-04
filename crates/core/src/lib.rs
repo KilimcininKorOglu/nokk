@@ -2177,16 +2177,16 @@ impl BrowserContext {
                 self.engine.pool.dispatch_detached(self.worker, |iso| iso.top_up_realms(4, 1));
                 if last_spare_topup.elapsed() >= std::time::Duration::from_millis(500) {
                     last_spare_topup = std::time::Instant::now();
-                    for w in 0..self.engine.pool.worker_count() {
+                    for w in self.engine.pool.live_worker_ids() {
                         // Не на потоках страницы и кадров: сборка занимает их на
                         // сотни миллисекунд, и таймеры страницы ждут.
-                        if w == self.worker.0 || w == self.frame_worker.0 {
+                        if w == self.worker || w == self.frame_worker {
                             continue;
                         }
                         let boot = self.bootstrap.clone();
                         self.engine
                             .pool
-                            .dispatch_detached(nokk_pool::WorkerId(w), move |iso| iso.prewarm_contexts(&boot, 1));
+                            .dispatch_detached(w, move |iso| iso.prewarm_contexts(&boot, 1));
                     }
                 }
             }
@@ -3432,14 +3432,14 @@ impl BrowserContext {
                         // И по готовому контексту воркера на каждом потоке пула:
                         // программа челленджа заводит воркеры один за другим и
                         // ждёт ответа в пределах сотен миллисекунд.
-                        for w in 0..self.engine.pool.worker_count() {
-                            if w == self.worker.0 || w == self.frame_worker.0 {
+                        for w in self.engine.pool.live_worker_ids() {
+                            if w == self.worker || w == self.frame_worker {
                                 continue;
                             }
                             let boot = boot.clone();
                             self.engine
                                 .pool
-                                .dispatch_detached(nokk_pool::WorkerId(w), move |iso| iso.prewarm_contexts(&boot, 1));
+                                .dispatch_detached(w, move |iso| iso.prewarm_contexts(&boot, 1));
                         }
                     }
                     let nav_started = std::time::Instant::now();

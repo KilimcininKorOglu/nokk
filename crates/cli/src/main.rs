@@ -34,9 +34,12 @@ struct Cli {
     #[arg(long, env = "NOKK_HOST", default_value = "127.0.0.1")]
     host: std::net::IpAddr,
 
-    /// Number of isolate worker threads. Defaults to available parallelism for the
-    /// CDP server, and to 1 for a one-shot `--load`/`--eval`: one page needs no
-    /// pool, and every extra isolate costs ~150 MB at the peak of a challenge.
+    /// Maximum number of isolate worker threads. The pool starts with one and
+    /// grows only when every live worker already carries a context; a worker
+    /// whose last context closed drains again. Defaults to available parallelism
+    /// for the CDP server, and to 1 for a one-shot `--load`/`--eval`: one page
+    /// needs no pool, and every extra isolate costs ~150 MB at the peak of a
+    /// challenge.
     #[arg(long, env = "NOKK_WORKERS")]
     workers: Option<usize>,
 
