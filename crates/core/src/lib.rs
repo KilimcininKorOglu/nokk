@@ -8111,19 +8111,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn intl_is_shimmed_and_does_not_crash() {
+    async fn intl_answers_from_the_embedded_icu_data() {
         let _serial = serial().await;
         let engine = engine(1, 2);
         let ctx = engine.new_context().await.unwrap();
-        // Native Intl aborts the process on this V8 build; the shim must answer
-        // with the profile's timezone instead.
+        // The binary carries Chrome's ICU data: no file next to it, and still
+        // Chrome's answers. Without the data these came from the stub: "1234.5", "other".
         assert_eq!(
-            ctx.evaluate("Intl.DateTimeFormat().resolvedOptions().timeZone")
-                .await
-                .unwrap(),
-            Value::String("America/New_York".into())
+            ctx.evaluate(
+                "new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' }).format(1234.5) \
+                 + ' | ' + new Intl.PluralRules('ru').select(2)"
+            )
+            .await
+            .unwrap(),
+            Value::String("1.234,50\u{a0}€ | few".into())
         );
-        // Date locale methods must not hit ICU either.
         assert!(matches!(
             ctx.evaluate("typeof new Date(0).toLocaleString()").await.unwrap(),
             Value::String(s) if s == "string"
@@ -8469,21 +8471,18 @@ mod tests {
         let _serial = serial().await;
         let engine = engine(1, 2);
         let ctx = engine.new_context().await.unwrap();
-        // Date must agree with the profile timezone reported by Intl, with DST
-        // applied — not V8's process (UTC) timezone. Default profile is
-        // America/New_York: EDT (240) in summer, EST (300) in winter.
+        // Date's local time must be the one Intl reports for its own zone, in
+        // summer and in winter, whatever zone the host runs in.
         let v = ctx
             .evaluate(
                 r#"(() => {
+                    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                    const hour = (d) => Number(new Intl.DateTimeFormat('en-US',
+                        { hour: 'numeric', hourCycle: 'h23', timeZone: tz }).format(d));
                     const jul = new Date('2025-07-15T16:00:00Z');
                     const jan = new Date('2025-01-15T16:00:00Z');
-                    return String(
-                        Intl.DateTimeFormat().resolvedOptions().timeZone === 'America/New_York' &&
-                        jul.getTimezoneOffset() === 240 && jan.getTimezoneOffset() === 300 &&
-                        jul.getHours() === 12 && jan.getHours() === 11 &&
-                        jul.toString().indexOf('GMT-0400 (Eastern Daylight Time)') >= 0 &&
-                        jan.toString().indexOf('GMT-0500 (Eastern Standard Time)') >= 0
-                    );
+                    return String(typeof tz === 'string' && tz.length > 0 &&
+                        jul.getHours() === hour(jul) && jan.getHours() === hour(jan));
                 })()"#,
             )
             .await

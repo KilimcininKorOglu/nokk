@@ -18,6 +18,14 @@ docker run --rm ghcr.io/koloss777/nokk:latest --eval 'navigator.webdriver'   # -
 docker run --rm ghcr.io/koloss777/nokk:latest --load https://example.com --eval 'document.title'
 ```
 
+The page sees the container's timezone. The image has none of its own, so it reports
+`America/New_York`; pass the zone that matches your exit IP, or let `--geoip-timezone` set
+it per context:
+
+```bash
+docker run --rm -e TZ=Europe/Berlin -p 9222:9222 ghcr.io/koloss777/nokk:latest
+```
+
 Three variants are published per release:
 
 | Tag | Base | Notes |

@@ -1,4 +1,4 @@
-# ICU data: why `Intl` is not browser-like without it
+# ICU data: why `Intl` needs it
 
 The prebuilt V8 the engine runs on contains all of ICU but **no data**: without
 `icudtl.dat` any `Intl` call aborts the process. So the stealth layer replaced
@@ -19,25 +19,29 @@ The stub answers differently from a browser, and visibly so:
 Of the twenty-two checks a fingerprinting script typically runs, twenty
 differed from Chrome, and fourteen of them are fixed by this one file.
 
-## Providing the data
+## Where the data comes from
 
-Put `icudtl.dat` next to the binary, or point to it:
+The binary carries it. `crates/pool/icu/icudtl.dat` is Chrome 151's own file
+(ICU 78, byte for byte the one Chromium ships), embedded at build time, so `Intl`
+gives Chrome's answers with nothing to install. ICU data is under the
+[Unicode license](../crates/pool/icu/LICENSE).
+
+An external file still wins, which lets the data follow a V8 upgrade without a
+rebuild:
 
 ```
 NOKK_ICU_DATA=/path/to/icudtl.dat nokk --load https://example.com
 ```
 
-The engine logs `ICU data loaded` and steps aside: native `Intl` answers from
-then on. Without the file the stub stays: it works, but is wrong on locales.
+or `icudtl.dat` next to the binary. The file must match the ICU version V8 links
+(`set_common_data_78`): data of another version loads, and then every call throws
+`TypeError: Internal error. Icu error.` When V8 moves to a new ICU, replace the
+embedded file with the one from the matching Chrome release.
 
-## Which file
+## Timezone
 
-**ICU 74.** The binding calls `udata_setCommonData_74`; data of another version
-is accepted, but every call then throws `TypeError: Internal error. Icu
-error.` Verified here: files from Electron builds of that era
-(~10,467,680 bytes) work, files from Chromium 128+ do not.
-
-Get it from an [icu4c](https://github.com/unicode-org/icu/releases) release
-(package `icu4c-74_2-data-bin-*`); ICU data is under the Unicode license and
-freely redistributable. The file is about ten megabytes; it can be rebuilt for
-specific locales with `pkgdata` from the same release.
+With native `Intl` the page sees the process's zone: `TZ`, else the host's
+`/etc/localtime`, else `America/New_York` (a host with no zone at all, such as a
+distroless image, would otherwise report `Etc/Unknown`). A context whose zone
+comes from `--geoip-timezone` keeps the JS layer for `Intl` and `Date`, because
+native `Intl` knows only one zone per process.

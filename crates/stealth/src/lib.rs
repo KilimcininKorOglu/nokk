@@ -61,6 +61,11 @@ pub struct StealthProfile {
     /// match the TLS emulation ([`nokk_net`]'s `chrome_major`). Change it via
     /// [`Self::with_chrome_major`] so the UA string and this field stay coherent.
     pub chrome_major: u32,
+    /// The timezone was set for this context (from its proxy's exit IP), so it
+    /// must win over the process's: native `Intl` only knows the OS zone, and the
+    /// shim, which carries `timezone`, stays on.
+    #[serde(default)]
+    pub pin_timezone: bool,
 }
 
 impl Default for StealthProfile {
@@ -214,6 +219,7 @@ impl FingerprintProfile {
             timezone_dst: timezone_dst.clone(),
             timezone_name_std: timezone_name_std.clone(),
             timezone_name_dst: timezone_name_dst.clone(),
+            pin_timezone: false,
         };
         match self {
             Self::ChromeLinux => common(
@@ -462,6 +468,7 @@ pub fn apply_geo(profile: &StealthProfile, timezone: &str, country_code: &str) -
         p.timezone_dst = tz.dst_rule.to_string();
         p.timezone_name_std = tz.name_std.to_string();
         p.timezone_name_dst = tz.name_dst.to_string();
+        p.pin_timezone = true;
     }
     p.languages = country_languages(country_code);
     p
@@ -627,9 +634,9 @@ pub fn bootstrap_script(profile: &StealthProfile) -> String {
     // The Intl shim shadows the prebuilt V8's native Intl/Date-locale APIs, which
     // ICU-abort the whole process (this build lacks working ICU data). It also
     // pins timezone/locale to the profile — both fingerprint vectors.
-    // Only installed when V8 has no ICU data: with it native `Intl` answers
-    // like the browser and the stub does not.
-    let intl = if native_intl() {
+    // Installed when V8 has no ICU data, or when the context's timezone comes from
+    // its proxy: native `Intl` answers like the browser but only in the OS zone.
+    let intl = if native_intl() && !profile.pin_timezone {
         String::new()
     } else {
         INTL_SHIM_TEMPLATE

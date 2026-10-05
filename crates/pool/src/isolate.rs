@@ -54,9 +54,17 @@ pub fn icu_ready() -> bool {
     ICU_READY.load(Ordering::Relaxed)
 }
 
-/// Where to look for `icudtl.dat`: the configured path first, then next to the
-/// binary. The data format is tied to the ICU version V8 was built with, so a
-/// foreign file may not fit; then the next candidate is tried.
+/// Chrome 151's own `icudtl.dat` (ICU 78, the version this V8 links), so `Intl`
+/// answers as Chrome does. Embedded: the release archives and packages carry only
+/// the binary, and without data every published build ran the `Intl` stub.
+/// ICU reads its data in place and expects it aligned; `include_bytes!` is byte-aligned.
+#[repr(C, align(16))]
+struct Aligned<T: ?Sized>(T);
+static EMBEDDED_ICU: &Aligned<[u8]> = &Aligned(*include_bytes!("../icu/icudtl.dat"));
+
+/// Where to look for `icudtl.dat` before the embedded copy: the configured path,
+/// then next to the binary. The data format is tied to the ICU version V8 was
+/// built with, so a foreign file may not fit; then the next candidate is tried.
 fn icu_candidates() -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     if let Ok(p) = std::env::var("NOKK_ICU_DATA") {
@@ -311,9 +319,22 @@ pub(crate) fn init_platform() {
         if !flags.is_empty() {
             v8::V8::set_flags_from_string(&flags);
         }
+        // No zone from the host (no `TZ`, no /etc/localtime, as in a distroless
+        // image): ICU would report `Etc/Unknown`, which no browser does. Keep the
+        // zone the default profile always had. Main thread, before any worker.
+        // An empty `TZ` gives `Etc/Unknown` too; it means "the host's", so drop it.
+        #[cfg(unix)]
+        {
+            if std::env::var_os("TZ").is_some_and(|v| v.is_empty()) {
+                std::env::remove_var("TZ");
+            }
+            if std::env::var_os("TZ").is_none() && !std::path::Path::new("/etc/localtime").exists() {
+                std::env::set_var("TZ", "America/New_York");
+            }
+        }
         // ICU data: without it the pinned V8 build has no `Intl` and no locale
-        // date/number formats, and the stub answers differently from Chrome. The path
-        // is supplied externally because the format is tied to V8's ICU version.
+        // date/number formats, and the stub answers differently from Chrome. An
+        // external file wins, so the data can follow a V8 upgrade without a rebuild.
         for path in icu_candidates() {
             let Ok(bytes) = std::fs::read(&path) else { continue };
             let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
@@ -324,6 +345,15 @@ pub(crate) fn init_platform() {
                     break;
                 }
                 Err(code) => tracing::warn!(path = %path.display(), code, "ICU data refused"),
+            }
+        }
+        if !ICU_READY.load(Ordering::Relaxed) {
+            match v8::icu::set_common_data_78(&EMBEDDED_ICU.0) {
+                Ok(()) => {
+                    ICU_READY.store(true, Ordering::Relaxed);
+                    tracing::debug!("ICU data loaded from the binary");
+                }
+                Err(code) => tracing::warn!(code, "embedded ICU data refused"),
             }
         }
         let platform = v8::new_default_platform(0, false).make_shared();
