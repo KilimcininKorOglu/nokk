@@ -2,73 +2,93 @@
 
 # nokk
 
-**An undetectable headless browser engine, written in Rust.**
+**A stealth headless browser engine in Rust. Passes Cloudflare without Chromium.**
 
-Real V8 JavaScript and a full DOM, with a Chrome TLS/HTTP fingerprint and JS-level
-stealth — driven over the Chrome DevTools Protocol, so your existing Puppeteer code
-just connects. No Chromium process, no rendering, no `navigator.webdriver`.
+Real V8 and a DOM, a Chrome TLS/HTTP fingerprint (JA3/JA4) and JS-level stealth,
+driven over the Chrome DevTools Protocol: Puppeteer and Playwright connect as usual.
 
-Also usable from **Node** (`npm install @koloss777/nokk`) and **Python** (`pip install nokk`) —
-each ships the prebuilt binary, no browser download — and as an **MCP server**, to give an
-AI agent a stealth browser.
+[![CI](https://github.com/koloss777/nokk/actions/workflows/ci.yml/badge.svg)](https://github.com/koloss777/nokk/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/koloss777/nokk?include_prereleases)](https://github.com/koloss777/nokk/releases/latest)
+[![PyPI](https://img.shields.io/pypi/v/nokk.svg)](https://pypi.org/project/nokk/)
+[![npm](https://img.shields.io/npm/v/@koloss777/nokk.svg)](https://www.npmjs.com/package/@koloss777/nokk)
+[![Docker](https://img.shields.io/badge/ghcr.io-koloss777%2Fnokk-blue)](https://github.com/koloss777/nokk/pkgs/container/nokk)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Status: alpha](https://img.shields.io/badge/status-alpha-yellow.svg)](#project-status)
+
+<img src="docs/demo.svg" alt="curl gets 403 from a Cloudflare test page; nokk loads it, clears the challenge and prints the page behind it in about 5 seconds" width="760">
 
 <sub><i>The nøkk is a shapeshifting water-spirit of Norse myth that takes on a
 familiar shape to pass unnoticed. This one takes the shape of Chrome.</i></sub>
-
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
-[![PyPI](https://img.shields.io/pypi/v/nokk.svg)](https://pypi.org/project/nokk/)
-[![npm](https://img.shields.io/npm/v/@koloss777/nokk.svg)](https://www.npmjs.com/package/@koloss777/nokk)
-[![Status: alpha](https://img.shields.io/badge/status-alpha-yellow.svg)](#project-status)
 
 </div>
 
 ---
 
-## Why nokk
+## Install
 
-Puppeteer and Playwright drive a real Chromium — which anti-bot systems (Cloudflare,
-DataDome, PerimeterX, Akamai) are very good at spotting: the automation leaks through
-`navigator.webdriver`, CDP artifacts, a headless TLS handshake, and dozens of other
-tells. The usual answer is a stack of stealth plugins bolted onto a 300 MB browser.
+```bash
+pip install nokk                    # Python: the prebuilt binary is in the wheel
+npm install @koloss777/nokk         # Node: run it with `npx nokk`
+docker run --rm -p 9222:9222 ghcr.io/koloss777/nokk:latest
+```
 
-**nokk takes the opposite approach: build the browser to be indistinguishable from
-the ground up, and skip the rendering engine entirely.**
-
-- 🛡️ **One coherent profile, TLS to JS.** The network layer emits a byte-exact
-  current-Chrome ClientHello (JA3/JA4) and HTTP/2 SETTINGS, and the JavaScript environment
-  (`navigator`, `screen`, canvas/WebGL/audio, `window.chrome`) is spoofed from the *same*
-  profile — so the wire fingerprint and the JS one agree (UA, platform, versions all line
-  up). Closing the remaining JS-level tells is active work; see the [roadmap](ROADMAP.md).
-- ⚡ **No Chromium.** No browser process tree, no compositor — V8 and a DOM in one
-  binary. Measured on an 8-core Linux box (October 2026): **~0.2 s** cold start (the V8
-  snapshot is cached in `~/.cache/nokk` after the first run), **~115 MB** idle with the
-  default 8 isolate threads (**~65 MB** with `--workers 1`), and **~9 MB per page
-  context** — the Chrome-shaped window every page gets is not small. Clearing a Cloudflare
-  interstitial takes **~7 s of CPU** and peaks at **~0.57 GB** in a one-shot `--load`
-  (Chrome on the same challenge: ~9.5 s and ~0.73 GB). Short of memory rather than
-  cores? `NOKK_GC_HINT_MS=0` nudges V8's collector on every disposed context: ~0.43 GB,
-  but ~9 s of CPU.
-- 🧩 **Drop-in for Puppeteer.** nokk speaks CDP over WebSocket. Point
-  `puppeteer.connect()` at it and drive pages, navigate, and `evaluate()` as usual.
-- 🔬 **Real JS, real DOM.** Google's V8 runs page scripts against an HTML-parsed DOM,
-  with timers, microtasks, `fetch`, and `XMLHttpRequest` — enough to clear JS challenges
-  and run client-rendered pages.
-- 🕸️ **Built-in request interception.** Every request a page makes — the document,
-  every `<script>`, every `fetch`/XHR — flows through Rust and is logged, so scraping
-  a site's internal JSON API needs no proxy plumbing.
-- 🚀 **Built around concurrency.** The core is a pool of V8 isolates (one per thread,
-  each multiplexing several contexts) with semaphore backpressure on live contexts, so
-  memory stays bounded (`--max-contexts`). Cutting the per-context cost further and
-  hardening *sustained* thousand-context churn are on the [roadmap](ROADMAP.md).
-
-> **Keywords:** undetectable headless browser · anti-bot bypass · Cloudflare bypass ·
-> JA3/JA4 TLS fingerprint · browser fingerprint spoofing · stealth web scraping ·
-> Puppeteer-compatible · headless Chrome alternative · Rust.
+No browser to download. Linux x86_64 prebuilt; other platforms
+[build from source](docs/BUILD.md).
 
 ## Quick start
 
-### Run with Docker (no build required)
+```bash
+# Load a page behind Cloudflare, clear the challenge, print what is behind it
+nokk --load https://www.scrapingcourse.com/cloudflare-challenge --solve-challenge 30 \
+     --eval "document.querySelector('h2').textContent.trim()"
+
+# Or run the CDP server and drive it from any client
+nokk --port 9222 --auto-solve   # ws://127.0.0.1:9222/devtools/browser/nokk
+```
+
+```python
+import nokk
+from playwright.sync_api import sync_playwright
+
+with nokk.launch(auto_solve=True) as server, sync_playwright() as pw:
+    page = pw.chromium.connect_over_cdp(server.ws_endpoint).new_page()
+    page.goto("https://www.scrapingcourse.com/cloudflare-challenge")
+    print(page.title())
+```
+
+Puppeteer, the MCP server, sessions and the Cloudflare options are below.
+
+## Why nokk
+
+Puppeteer and Playwright drive a real Chromium, and anti-bot systems spot it through
+`navigator.webdriver`, CDP artifacts and a headless TLS handshake. nokk is built to
+look like Chrome from the TLS handshake to the JavaScript environment, and has no
+rendering engine at all.
+
+| | nokk 0.1.34 | Chrome 151 (Puppeteer / Playwright) |
+|---|---|---|
+| Start until CDP answers | ~0.05 s | ~0.2 s |
+| Idle memory (PSS) | ~60 MB, 1 process | ~330 MB, 12–14 processes |
+| Cloudflare solve, median wall time | 12.2 s | 12.7 s |
+| CPU per solve | 6.2 s | 9.5 s |
+| Peak memory per solve | ~545 MB | ~725 MB |
+| Solved | 24/24 | 24/24 |
+| TLS fingerprint (JA3/JA4) | matches Chrome 151 | Chrome |
+| Screenshots, PDF, layout | no | yes |
+| CDP coverage | the common path | full |
+
+<sub>An 8-core Linux box, October 2026. Cloudflare row: 8 production sites × 3 runs
+through one proxy, nokk with <code>--until-clearance</code>, Chrome driven by a
+checkbox-clicking harness; a solve counts only if the site then opens with the cookie.</sub>
+
+**Not for you if** you need screenshots, PDFs, layout or paint, or the whole
+Playwright/CDP surface: nokk has no rendering engine by design, and its CDP coverage
+is the path Puppeteer and Playwright use for navigation and scripting.
+
+## More ways to run
+
+### Docker images
 
 The published image bundles the binary, glibc, and TLS roots — nothing to compile.
 `:latest` is a tiny [distroless](https://github.com/GoogleContainerTools/distroless)
@@ -394,7 +414,7 @@ surface a page sees is real JS objects, not native bindings a detector can trivi
 
 **Alpha.** The engine is real and end-to-end: V8 executes page JS against a parsed DOM,
 the fingerprinted transport clears Cloudflare's TLS/HTTP checks, the engine solves
-Turnstile on live sites — invisible, managed and interactive — and Puppeteer can connect
+Turnstile on live sites — invisible, managed and interactive — and Puppeteer and Playwright connect
 over CDP to open a page, navigate, and evaluate.
 
 What is **not** done yet, and where the sharp edges are:
@@ -407,9 +427,9 @@ What is **not** done yet, and where the sharp edges are:
   against Chrome section by section is how the remaining tells get found; it is **not**
   yet a match for a dedicated fingerprinting suite like CreepJS. See the
   [roadmap](ROADMAP.md).
-- **CDP coverage is the Puppeteer happy path**, not the whole protocol. `page.$` /
-  `$eval` / `$$eval` and `page.evaluate()` work; Playwright and less-common CDP domains
-  are not supported yet.
+- **CDP coverage is the common path**, not the whole protocol. Puppeteer and Playwright
+  connect over CDP: navigation, `evaluate`, `$` / `$eval` / `$$eval`, `title()`, `url()`,
+  new pages and CDP sessions are tested; less-common domains are not implemented yet.
 - **Per-context cookie isolation and per-session persistence** work (each browser context
   gets its own jar; named sessions persist across runs); **per-host / per-proxy / global
   connection limits** are not yet enforced (Phase 7).
