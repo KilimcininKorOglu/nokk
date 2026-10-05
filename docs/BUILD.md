@@ -58,24 +58,21 @@ BINDGEN_EXTRA_CLANG_ARGS = "-isystem /usr/lib/gcc/x86_64-linux-gnu/12/include -i
 
 ## The V8 archive
 
-The engine pins `rusty_v8` to a git tag rather than a crates.io release, because
-the version matching the Chrome we emulate is published on GitHub only. For a
-crates.io release the crate downloads its prebuilt V8 archive itself; for a git
-dependency it does not, so point it at a local copy of the two release files:
+`v8` comes from crates.io (`=152.2.0`, V8 15.2), and its build script downloads the
+prebuilt V8 for the target from the matching rusty_v8 GitHub release (~185 MB
+unpacked, per target). Offline, or to keep one copy across clean builds, download
+the two files once and name them in `.cargo/config.toml`:
 
 ```
-https://github.com/denoland/rusty_v8/releases/tag/v149.4.0
-  librusty_v8_release_x86_64-unknown-linux-gnu.a.gz  → lib.a      (185 MB unpacked)
-  src_binding_release_x86_64-unknown-linux-gnu.rs    → binding.rs
+https://github.com/denoland/rusty_v8/releases/tag/v152.2.0
+  librusty_v8_release_<target>.a.gz  → lib.a
+  src_binding_release_<target>.rs    → binding.rs
 ```
-
-Put them somewhere stable — not `/tmp` — and name them in the same
-`.cargo/config.toml`:
 
 ```toml
 [env]
-RUSTY_V8_ARCHIVE = "/home/you/.cache/nokk/rusty_v8-149.4.0/lib.a"
-RUSTY_V8_SRC_BINDING_PATH = "/home/you/.cache/nokk/rusty_v8-149.4.0/binding.rs"
+RUSTY_V8_ARCHIVE = "/home/you/.cache/nokk/rusty_v8-152.2.0/lib.a"
+RUSTY_V8_SRC_BINDING_PATH = "/home/you/.cache/nokk/rusty_v8-152.2.0/binding.rs"
 ```
 
 Building V8 from source instead (`V8_FROM_SOURCE=1`) works but wants ~30 GB and

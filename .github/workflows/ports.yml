@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: [.github/workflows/ports.yml]
+    paths: [.github/workflows/ports.yml, Cargo.toml, Cargo.lock, "crates/*/Cargo.toml"]
 
 jobs:
   linux-arm64:
