@@ -1148,6 +1148,9 @@ pub enum ChallengeKind {
     TurnstileWidget,
     /// DataDome's gate — not something this engine solves.
     DataDome,
+    /// A reCAPTCHA checkbox, no token yet (Google's /sorry/ page). An image puzzle
+    /// behind it is not something this engine solves.
+    RecaptchaWidget,
 }
 
 impl ChallengeKind {
@@ -1157,6 +1160,7 @@ impl ChallengeKind {
             ChallengeKind::CloudflareInterstitial => "cloudflare-interstitial",
             ChallengeKind::TurnstileWidget => "turnstile-widget",
             ChallengeKind::DataDome => "datadome",
+            ChallengeKind::RecaptchaWidget => "recaptcha-widget",
         }
     }
 }
@@ -2611,6 +2615,8 @@ impl BrowserContext {
             ChallengeKind::DataDome
         } else if g("widget") && !g("token") {
             ChallengeKind::TurnstileWidget
+        } else if g("recaptcha") && !g("token") {
+            ChallengeKind::RecaptchaWidget
         } else {
             ChallengeKind::None
         };
@@ -2656,6 +2662,13 @@ impl BrowserContext {
                 .unwrap_or(false);
             if token && !cleared {
                 tracing::info!(target: "nokk", elapsed_ms = t.elapsed().as_millis(), presses = pressed, "challenge complete: widget token issued");
+                // The page's callback usually submits the form now (Google's /sorry/
+                // does): give it the moment, so the result is where it leads.
+                let until = std::time::Instant::now() + std::time::Duration::from_millis(1_500);
+                while std::time::Instant::now() < until && !self.is_loading() {
+                    let _ = self.run_event_loop().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
                 break ChallengeStatus::TokenIssued;
             }
             if self.stop_at_clearance.load(std::sync::atomic::Ordering::Acquire)
@@ -3516,7 +3529,7 @@ impl BrowserContext {
                     // frame id (so its `postMessage` can be routed back) and that it
                     // is not the top-level window.
                     let _ = self
-                        .eval_in(index, &format!("__pt_markAsFrame({id});"))
+                        .eval_in(index, &format!("__pt_markAsFrame({id}, {});", js_str(op["name"].as_str().unwrap_or(""))))
                         .await;
                     // Third-party status and referrer: in a third-party frame Chrome answers "denied"
                     // to permissions, and `document.referrer` under strict-origin-when-cross-origin is
@@ -3585,6 +3598,8 @@ impl BrowserContext {
                             },
                         );
                     }
+                    // Before its document runs: it may look its siblings up at once.
+                    self.tell_frames_their_siblings().await;
                     if let Err(e) = self.load_html_into(index, &url, &html).await {
                         tracing::debug!(url = %url, error = %e, "iframe document failed to load");
                     }
@@ -3607,6 +3622,7 @@ impl BrowserContext {
                             .pool
                             .dispatch(w, move |iso| iso.dispose_context(raw))
                             .await;
+                        self.tell_frames_their_siblings().await;
                     }
                 }
                 // `parent.postMessage` from inside a frame, or
@@ -3629,7 +3645,16 @@ impl BrowserContext {
                     let to_parent = op["toParent"].as_bool().unwrap_or(false);
                     let target = self.frames.lock().ok().and_then(|f| f.get(&id).cloned());
                     let Some(frame) = target else { continue };
-                    let (index, origin) = if to_parent {
+                    // From one frame to a sibling (`parent.frames[name].postMessage`).
+                    let sibling = op["toFrame"].as_u64().and_then(|to| {
+                        self.frames.lock().ok().and_then(|f| f.get(&(to as u32)).map(|t| t.index))
+                    });
+                    if op["toFrame"].is_u64() && sibling.is_none() {
+                        continue;
+                    }
+                    let (index, origin) = if let Some(to) = sibling {
+                        (to, frame.origin.clone())
+                    } else if to_parent {
                         (self.idx(), frame.origin.clone())
                     } else {
                         (frame.index, origin_of(base))
@@ -3639,7 +3664,7 @@ impl BrowserContext {
                         .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
                         .unwrap_or_default();
                     if !ports.is_empty() {
-                        let sender = if to_parent { frame.index } else { self.idx() };
+                        let sender = if to_parent || sibling.is_some() { frame.index } else { self.idx() };
                         if let Ok(mut ends) = self.port_ends.lock() {
                             for p in &ports {
                                 // A port passed on again keeps its stayed end where it was.
@@ -3655,7 +3680,7 @@ impl BrowserContext {
                                 "__pt_deliverMessage({}, {}, {}, {});",
                                 data,
                                 js_str(&origin),
-                                if to_parent {
+                                if to_parent || sibling.is_some() {
                                     id.to_string()
                                 } else {
                                     "0".into()
@@ -4215,6 +4240,28 @@ impl BrowserContext {
             }
         }
         Ok(work)
+    }
+
+    /// Give every frame the page's current frame list, so `parent.frames[name]` and
+    /// `parent.frames[i]` inside one reach the others (reCAPTCHA's checkbox frame
+    /// talks to its challenge frame this way).
+    async fn tell_frames_their_siblings(&self) {
+        let list = self
+            .evaluate("typeof __pt_frameList === 'function' ? __pt_frameList() : '[]'")
+            .await
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "[]".into());
+        let targets: Vec<usize> = self
+            .frames
+            .lock()
+            .map(|f| f.values().map(|s| s.index).collect())
+            .unwrap_or_default();
+        for index in targets {
+            let _ = self
+                .eval_in(index, &format!("typeof __pt_setSiblings === 'function' && __pt_setSiblings({list});"))
+                .await;
+        }
     }
 
     /// The document URL a frame resolves its own relative URLs against.

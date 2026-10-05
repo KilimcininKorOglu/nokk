@@ -51,7 +51,7 @@ const { browserContextId } = await cdp.send('Target.createBrowserContext', { aut
 
 // on demand, from a page session
 const state = await session.send('Nokk.challengeState');
-// → { kind: 'cloudflare-interstitial' | 'turnstile-widget' | 'datadome' | 'none',
+// → { kind: 'cloudflare-interstitial' | 'turnstile-widget' | 'recaptcha-widget' | 'datadome' | 'none',
 //     title, url, cleared, token, solvable }
 const out = await session.send('Nokk.solveChallenge', { timeoutMs: 30000 });
 // → { status: 'cleared' | 'token-issued' | 'cleared-but-stuck' | 'timeout', solved,

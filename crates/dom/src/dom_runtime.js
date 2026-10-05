@@ -1641,7 +1641,7 @@
       const st = { el: this, ready: false, sameOrigin: false, win: null, doc: null, pending: [] };
       st.win = __frameWindow(id, st);
       __frames.set(id, st);
-      __frameOps.push({ op: 'open', id, src, w: box[0] || 300, h: box[1] || 150 });
+      __frameOps.push({ op: 'open', id, src, name: __ptGetA(this, 'name') || '', w: box[0] || 300, h: box[1] || 150 });
     }
 
     // Shadow DOM. A widget that draws itself into a shadow root — Cloudflare's
@@ -7001,6 +7001,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     get window() { return st.win; },
   });
 
+  // The page's frames in document order, for the engine to tell each frame its siblings.
+  globalThis.__pt_frameList = () => __ptJSON.stringify([...__frames.entries()]
+    .map(([id, st]) => ({ id, name: (st.el && __ptGetA(st.el, 'name')) || '' })));
+
   globalThis.__pt_frameReady = (id, origin) => {
     const st = __frames.get(id);
     if (!st) return;
@@ -7024,7 +7028,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     // The value arrives as a parsed literal; revive the same types from it.
     let data = raw;
     try { data = globalThis.__pt_cloneRevive ? __pt_cloneRevive(raw) : raw; } catch (e) {}
-    const source = fromFrameId ? (__frames.get(fromFrameId) || {}).win || null : (globalThis.parent === globalThis ? null : globalThis.parent);
+    const source = fromFrameId
+      ? ((__frames.get(fromFrameId) || {}).win || (globalThis.__pt_siblingWindow ? __pt_siblingWindow(fromFrameId) : null) || null)
+      : (globalThis.parent === globalThis ? null : globalThis.parent);
     const ev = {
       type: 'message', data, origin: String(origin || ''), lastEventId: '',
       source, ports: Object.freeze(__receivePorts(portIds)), isTrusted: true, target: globalThis, currentTarget: globalThis,
@@ -7036,19 +7042,56 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // goes back up. The engine calls this right after creating the child context
   // and before its document exists — a context cannot know it is a frame while
   // its own bootstrap is still running.
-  globalThis.__pt_markAsFrame = (id) => {
+  globalThis.__pt_markAsFrame = (id, name) => {
     globalThis.__pt_frameId = id;
+    // `window.name` is the element's `name`: reCAPTCHA's checkbox frame derives
+    // its challenge frame's name from its own and looks it up in `parent.frames`.
+    if (name) { try { globalThis.name = String(name); } catch (e) {} }
+    // The other frames of the same page: the engine keeps the list current.
+    let siblings = [];
+    const sibWins = new Map();
+    const sibling = (sid) => {
+      if (sid === id) return globalThis;
+      if (!sibWins.has(sid)) {
+        const w = {
+          postMessage: (data, targetOrigin, transfer) => {
+            __pushFrameOp({ op: 'post', toFrame: sid, data: __pt_cloneEncode(data),
+              ports: __transferPorts(__transferOf(targetOrigin, transfer)) });
+          },
+          get closed() { return !siblings.some((f) => f.id === sid); },
+          get frames() { return w; },
+          get length() { return 0; },
+          get parent() { return up; },
+          get top() { return up; },
+          get self() { return w; },
+          get window() { return w; },
+        };
+        sibWins.set(sid, w);
+      }
+      return sibWins.get(sid);
+    };
+    globalThis.__pt_setSiblings = (list) => { siblings = Array.isArray(list) ? list : []; };
+    globalThis.__pt_siblingWindow = (sid) => siblings.some((f) => f.id === sid) ? sibling(sid) : null;
+    const frameAt = (k) => {
+      if (typeof k !== 'string') return undefined;
+      const f = /^\d+$/.test(k) ? siblings[Number(k)] : siblings.find((x) => x.name && x.name === k);
+      return f ? sibling(f.id) : undefined;
+    };
     const up = {
       postMessage: (data, targetOrigin, transfer) => {
         __pushFrameOp({ op: 'post', data: __pt_cloneEncode(data), toParent: true,
           ports: __transferPorts(__transferOf(targetOrigin, transfer)) });
       },
       get closed() { return false; },
-      get frames() { return up; },
-      get length() { return 0; },
+      get length() { return siblings.length; },
       get self() { return up; },
       get window() { return up; },
     };
+    const framesOf = new Proxy(up, {
+      get(t, k) { if (k in t) return t[k]; return frameAt(k); },
+      has(t, k) { return (k in t) || frameAt(k) !== undefined; },
+    });
+    Object.defineProperty(up, 'frames', { get: () => framesOf, configurable: true });
     try {
       Object.defineProperty(globalThis, 'parent', { value: up, configurable: true });
       Object.defineProperty(globalThis, 'top', { value: up, configurable: true });
@@ -10264,7 +10307,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     try {
       __walkTree(globalThis.document, (n) => {
         if (out || !n || n.nodeType !== ELEMENT_NODE) return;
-        if ((n.__ptLocal === 'input' || n.__ptLocal === 'textarea') && __ptGetA(n, 'name') === 'cf-turnstile-response') { const v = n.value; if (v) out = String(v); }
+        if ((n.__ptLocal === 'input' || n.__ptLocal === 'textarea') && /^(cf-turnstile-response|g-recaptcha-response)$/.test(__ptGetA(n, 'name') || '')) { const v = n.value; if (v) out = String(v); }
       });
     } catch (e) {}
     return out;
@@ -10272,7 +10315,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   // What the page shows in front of the site, for the driver; walks the tree
   // internally so no page API call shows up in the challenge's report.
   globalThis.__pt_gateInfo = () => {
-    const out = { title: '', url: '', inter: false, widget: false, token: false, datadome: false, orchestrator: false };
+    const out = { title: '', url: '', inter: false, widget: false, recaptcha: false, token: false, datadome: false, orchestrator: false };
     try {
       out.title = String((globalThis.document && document.title) || '');
       out.url = String((globalThis.location && location.href) || '');
@@ -10281,12 +10324,15 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         if (!n || n.nodeType !== ELEMENT_NODE) return;
         const t = n.__ptLocal;
         if (t === 'iframe' && /challenges\.cloudflare\.com/.test(__ptGetA(n, 'src') || '')) out.widget = true;
+        // A reCAPTCHA checkbox (Google's /sorry/ page among others); the invisible
+        // kind asks nothing of a user.
+        if (t === 'iframe' && /\/recaptcha\/(api2|enterprise)\/anchor/.test(__ptGetA(n, 'src') || '') && !/size=invisible/.test(__ptGetA(n, 'src') || '')) out.recaptcha = true;
         if (t === 'script') {
           const src = __ptGetA(n, 'src') || '';
           if (/\/cdn-cgi\/challenge-platform\//.test(src)) out.orchestrator = true;
           if (/captcha-delivery\.com|datadome/.test(src)) out.datadome = true;
         }
-        if ((t === 'input' || t === 'textarea') && __ptGetA(n, 'name') === 'cf-turnstile-response' && n.value) out.token = true;
+        if ((t === 'input' || t === 'textarea') && /^(cf-turnstile-response|g-recaptcha-response)$/.test(__ptGetA(n, 'name') || '') && n.value) out.token = true;
       });
       if (!out.inter && out.orchestrator && typeof globalThis._cf_chl_opt === 'object') out.inter = true;
     } catch (e) {}
