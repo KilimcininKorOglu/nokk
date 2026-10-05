@@ -272,7 +272,8 @@ fn prune_snapshot_cache(current: &std::path::Path, keep: usize) {
 }
 
 /// Snapshot path for this bootstrap: `$NOKK_CACHE_DIR`, else
-/// `$XDG_CACHE_HOME/nokk`, else `~/.cache/nokk`. The name hashes the bootstrap,
+/// `$XDG_CACHE_HOME/nokk`, else `~/.cache/nokk` (`%LOCALAPPDATA%\nokk` on Windows).
+/// The name hashes the bootstrap,
 /// V8 flags and the binary (size and mtime, so a rebuilt engine never reads a
 /// stale snapshot). `NOKK_NO_SNAPSHOT_CACHE=1` disables the disk cache.
 fn snapshot_cache_path(bootstrap: &str) -> Option<std::path::PathBuf> {
@@ -283,7 +284,8 @@ fn snapshot_cache_path(bootstrap: &str) -> Option<std::path::PathBuf> {
     let dir = std::env::var_os("NOKK_CACHE_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("XDG_CACHE_HOME").map(|d| std::path::PathBuf::from(d).join("nokk")))
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache").join("nokk")))?;
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache").join("nokk")))
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("nokk")))?;
     let exe = std::env::current_exe().ok()?;
     let meta = std::fs::metadata(&exe).ok()?;
     let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();

@@ -1,6 +1,6 @@
 name: ports
 
-# Linux ARM64 and macOS Apple Silicon: build, test, smoke-run, keep the binary as an
+# Linux ARM64, macOS Apple Silicon and Windows x64: build, test, smoke-run, keep the binary as an
 # artifact for testing on real hardware. Manual (or on a change to this file) until
 # both are steadily green;
 # releases do not use it yet.
@@ -32,6 +32,7 @@ jobs:
       - name: Smoke
         run: |
           ./out/nokk --version
+          ./out/nokk --eval "document.title = 'ok'; document.title + (1 + 1)"
           ./out/nokk --eval "[navigator.webdriver, navigator.platform, new Intl.NumberFormat('de-DE',{style:'currency',currency:'EUR'}).format(1234.5), new Intl.PluralRules('ru').select(2)].join(' | ')"
 
       # Datacenter addresses get a harder time from Cloudflare: informative only.
@@ -63,10 +64,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # One coherent SDK: a CommandLineTools include path mixed with the Xcode SDK
+      # breaks BoringSSL's C++ build.
+      - name: Configure libclang and the SDK
+        run: |
+          SDK="$(xcrun --show-sdk-path)"
+          echo "SDKROOT=$SDK" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=-isystem $SDK/usr/include/c++/v1" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib" >> "$GITHUB_ENV"
+
       - name: Build
         run: |
-          export LIBCLANG_PATH="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
-          [ -f "$LIBCLANG_PATH/libclang.dylib" ] || export LIBCLANG_PATH=/Library/Developer/CommandLineTools/usr/lib
           cargo build --release --bin nokk
           tar -czf nokk-macos-aarch64.tar.gz -C target/release nokk
 
@@ -76,14 +84,12 @@ jobs:
           path: nokk-macos-aarch64.tar.gz
 
       - name: Test
-        run: |
-          export LIBCLANG_PATH="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
-          [ -f "$LIBCLANG_PATH/libclang.dylib" ] || export LIBCLANG_PATH=/Library/Developer/CommandLineTools/usr/lib
-          cargo test --release --workspace
+        run: cargo test --release --workspace
 
       - name: Smoke
         run: |
           ./target/release/nokk --version
+          ./target/release/nokk --eval "document.title = 'ok'; document.title + (1 + 1)"
           ./target/release/nokk --eval "[navigator.webdriver, navigator.platform, new Intl.NumberFormat('de-DE',{style:'currency',currency:'EUR'}).format(1234.5), new Intl.PluralRules('ru').select(2)].join(' | ')"
 
       - name: Public Cloudflare pages
@@ -92,3 +98,41 @@ jobs:
           brew install coreutils >/dev/null   # cf-check.sh uses GNU timeout
           export PATH="$(brew --prefix coreutils)/libexec/gnubin:$PATH"
           NOKK=./target/release/nokk tools/cf-check.sh
+
+  windows-x64:
+    name: windows x64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: |
+          cargo build --release --bin nokk
+          7z a nokk-windows-x64.zip ./target/release/nokk.exe >/dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nokk-windows-x64
+          path: nokk-windows-x64.zip
+
+      - name: Test
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: cargo test --release --workspace
+
+      - name: Smoke
+        run: |
+          ./target/release/nokk.exe --version
+          ./target/release/nokk.exe --eval "document.title = 'ok'; document.title + (1 + 1)"
+          ./target/release/nokk.exe --eval "[navigator.webdriver, navigator.platform, new Intl.NumberFormat('de-DE',{style:'currency',currency:'EUR'}).format(1234.5), new Intl.PluralRules('ru').select(2)].join(' | ')"
+
+      - name: Public Cloudflare pages
+        continue-on-error: true
+        run: NOKK=./target/release/nokk.exe tools/cf-check.sh
