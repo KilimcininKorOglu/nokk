@@ -67,13 +67,14 @@ Puppeteer and Playwright drive a real Chromium, and anti-bot systems spot it thr
 look like Chrome from the TLS handshake to the JavaScript environment, and has no
 rendering engine at all.
 
-| | nokk 0.1.34 | Chrome 151 (Puppeteer / Playwright) |
+| | nokk 0.1.35 | Chrome 151 (Puppeteer / Playwright) |
 |---|---|---|
 | Start until CDP answers | ~0.05 s | ~0.2 s |
 | Idle memory (PSS) | ~60 MB, 1 process | ~330 MB, 12–14 processes |
-| Cloudflare solve, median wall time | 12.2 s | 12.7 s |
-| CPU per solve | 6.2 s | 9.5 s |
-| Peak memory per solve | ~545 MB | ~725 MB |
+| Cloudflare solve, median wall time | 12.4 s | 12.4 s |
+| Slowest solve | 15.6 s | 27.8 s |
+| CPU per solve | 6.4 s | 9.5 s |
+| Peak memory per solve | ~570 MB | ~720 MB |
 | Solved | 24/24 | 24/24 |
 | TLS fingerprint (JA3/JA4) | matches Chrome 151 | Chrome |
 | Screenshots, PDF, layout | no | yes |
