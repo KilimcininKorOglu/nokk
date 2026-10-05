@@ -1249,6 +1249,30 @@ impl Conn {
                     .collect();
                 vec![ok(id, &session, json!({ "frames": frames }))]
             }
+            // Press an element the way a hand does (pointer trail, held press), in the
+            // frame whose URL contains `frameUrl` or in the page: { pressed }.
+            // Type into one key by key: { typed }.
+            "Nokk.press" | "Nokk.type" => {
+                let typing = method == "Nokk.type";
+                let frame_url = params.get("frameUrl").and_then(|v| v.as_str()).map(str::to_string);
+                let selector = params.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                self.targets[idx].ran_js.store(true, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let r = if typing {
+                        ctx.type_selector(frame_url.as_deref(), &selector, &text).await
+                    } else {
+                        ctx.press_selector(frame_url.as_deref(), &selector).await
+                    };
+                    let m = match r {
+                        Ok(done) => ok(id, &session, if typing { json!({ "typed": done }) } else { json!({ "pressed": done }) }),
+                        Err(e) => err(id, &session, -32000, &e.to_string()),
+                    };
+                    let _ = tx.send(Message::Text(m.to_string()));
+                });
+                vec![]
+            }
             "Nokk.challengeState" => {
                 let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {

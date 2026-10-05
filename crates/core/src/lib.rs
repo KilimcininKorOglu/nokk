@@ -2757,6 +2757,164 @@ impl BrowserContext {
         ChallengeOutcome { status, presses: pressed, elapsed_ms: t.elapsed().as_millis() as u64 }
     }
 
+    /// Press at (`x`, `y`) in `frame` (or the page) the way a hand does: an arc in from
+    /// a distance, a pause, a held press slightly off centre, a small drift after.
+    async fn human_press(&self, frame: Option<u32>, x: f64, y: f64) {
+        // Inside the frame that owns it, so no coordinate has to survive a
+        // trip through a parent that lays its frames out differently.
+        //
+        // Three events in one tick is not a human press: the pointer appears dead centre
+        // and presses and releases in zero time, and the challenge measures that. So:
+        // approach along an arc, pause, hold, and land slightly off centre.
+        let trace = std::env::var_os("NOKK_TRACE_CONTROLS").is_some();
+        let press_t0 = std::time::Instant::now();
+        let send = async |js: String| {
+            let t = std::time::Instant::now();
+            let _ = match frame {
+                None => self.evaluate(&js).await,
+                Some(id) => self.evaluate_in_frame(id, &js).await,
+            };
+            if trace {
+                tracing::info!(target: "nokk::press", took_ms = t.elapsed().as_millis() as u64, at_ms = press_t0.elapsed().as_millis() as u64, what = %js.chars().take(40).collect::<String>(), "step");
+            }
+        };
+        // Screen position of the document origin holding the checkbox: window plus browser
+        // chrome plus the frame's position. Without it screenX/Y equalled clientX/Y, which
+        // a real mouse never gives.
+        let origin_js = match frame {
+            None => "__pt_screenOrigin()".to_string(),
+            Some(id) => format!(
+                "(() => {{ const o = JSON.parse(__pt_screenOrigin()); let r = null; try {{ r = JSON.parse(__pt_frameRectById({id}) || 'null'); }} catch (e) {{}} return JSON.stringify([o[0] + (r ? r.x : 0), o[1] + (r ? r.y : 0)]); }})()"
+            ),
+        };
+        let (ox, oy) = self
+            .evaluate(&origin_js)
+            .await
+            .ok()
+            .and_then(|v| v.as_str().and_then(|t| serde_json::from_str::<Vec<f64>>(t).ok()))
+            .filter(|v| v.len() == 2)
+            .map(|v| (v[0], v[1]))
+            .unwrap_or((0.0, 0.0));
+        // Spread derived from the coordinates: stable per target, different across
+        // targets, no randomness.
+        let spread = ((x + y * 7.0) as i64).unsigned_abs() % 5;
+        let mut seed = ((x * 131.0 + y * 977.0) as i64).unsigned_abs() | 1;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 10_000) as f64 / 10_000.0
+        };
+        let (tx, ty) = (x + 1.0 + spread as f64 * 0.37 + rnd() * 0.6, y - 1.0 + (spread % 3) as f64 * 0.41 + rnd() * 0.6);
+        // Approach like a recorded hand in Chrome: about twenty points over half a second,
+        // uneven steps (8-60 ms, occasionally longer), arcing in from afar and slowing near
+        // the target.
+        let steps = 18 + (spread as usize * 2) % 7;
+        let (sx0, sy0) = (tx + 55.0 + rnd() * 20.0, ty + 18.0 + rnd() * 12.0);
+        for i in 1..=steps {
+            let t = i as f64 / steps as f64;
+            let e = 1.0 - (1.0 - t).powi(3);
+            let bow = (t * std::f64::consts::PI).sin();
+            let px = sx0 + (tx - sx0) * e + bow * (4.0 + rnd() * 2.0);
+            let py = sy0 + (ty - sy0) * e - bow * (6.0 + rnd() * 3.0);
+            send(format!(
+                "__pt_mouse(\"mouseMoved\", {px:.4}, {py:.4}, \"left\", 0, {ox:.4}, {oy:.4})"
+            ))
+            .await;
+            let gap = if rnd() < 0.12 { 60.0 + rnd() * 120.0 } else { 8.0 + rnd() * 40.0 };
+            self.settle(std::time::Duration::from_millis(gap as u64)).await;
+        }
+        self.settle(std::time::Duration::from_millis(90 + (rnd() * 140.0) as u64))
+            .await;
+        send(format!("__pt_mouse(\"mousePressed\", {tx:.4}, {ty:.4}, \"left\", 1, {ox:.4}, {oy:.4})")).await;
+        self.settle(std::time::Duration::from_millis(85 + (rnd() * 50.0) as u64))
+            .await;
+        send(format!("__pt_mouse(\"mouseReleased\", {tx:.4}, {ty:.4}, \"left\", 1, {ox:.4}, {oy:.4})")).await;
+        // The hand does not freeze after the press: a few points off to the side.
+        for k in 1..=3 {
+            self.settle(std::time::Duration::from_millis(30 + (rnd() * 60.0) as u64)).await;
+            let (px, py) = (tx + k as f64 * (2.0 + rnd() * 3.0), ty + k as f64 * (4.0 + rnd() * 5.0));
+            send(format!("__pt_mouse(\"mouseMoved\", {px:.4}, {py:.4}, \"left\", 0, {ox:.4}, {oy:.4})")).await;
+        }
+    }
+
+    /// Press the first element matching `selector` in the frame whose URL contains
+    /// `frame_url` (the page itself when `None`), with [`Self::human_press`]. A
+    /// widget's own buttons (reCAPTCHA's audio, verify, reload) are read for the
+    /// pointer trail that led to them; a script `click()` has none. False when
+    /// there is no such frame or element.
+    pub async fn press_selector(&self, frame_url: Option<&str>, selector: &str) -> Result<bool, EngineError> {
+        let frame = match frame_url {
+            Some(part) => match self.frame_list().into_iter().find(|f| f.url.contains(part)) {
+                Some(f) => Some(f.id),
+                None => return Ok(false),
+            },
+            None => None,
+        };
+        let js = format!(
+            "(() => {{ const e = document.querySelector({}); if (!e) return ''; const r = e.getBoundingClientRect(); return JSON.stringify([r.x + r.width / 2, r.y + r.height / 2]); }})()",
+            js_str(selector)
+        );
+        let at = match frame {
+            Some(id) => self.evaluate_in_frame(id, &js).await?,
+            None => self.evaluate(&js).await?,
+        };
+        let Some((x, y)) = at
+            .as_str()
+            .and_then(|t| serde_json::from_str::<Vec<f64>>(t).ok())
+            .filter(|v| v.len() == 2)
+            .map(|v| (v[0], v[1]))
+        else {
+            return Ok(false);
+        };
+        let target = format!("typeof __pt_setPressTarget === 'function' && __pt_setPressTarget({})", js_str(selector));
+        let clear = "typeof __pt_setPressTarget === 'function' && __pt_setPressTarget(null)";
+        match frame {
+            Some(id) => { let _ = self.evaluate_in_frame(id, &target).await; }
+            None => { let _ = self.evaluate(&target).await; }
+        }
+        self.human_press(frame, x, y).await;
+        match frame {
+            Some(id) => { let _ = self.evaluate_in_frame(id, clear).await; }
+            None => { let _ = self.evaluate(clear).await; }
+        }
+        Ok(true)
+    }
+
+    /// Type `text` into the element matching `selector` in a frame (or the page):
+    /// focus it, then a key down/up per character at a typing pace, so the page
+    /// sees keystrokes rather than a value appearing.
+    pub async fn type_selector(&self, frame_url: Option<&str>, selector: &str, text: &str) -> Result<bool, EngineError> {
+        let frame = match frame_url {
+            Some(part) => match self.frame_list().into_iter().find(|f| f.url.contains(part)) {
+                Some(f) => Some(f.id),
+                None => return Ok(false),
+            },
+            None => None,
+        };
+        let run = |js: String| async move {
+            match frame {
+                Some(id) => self.evaluate_in_frame(id, &js).await,
+                None => self.evaluate(&js).await,
+            }
+        };
+        let focused = run(format!("(e => e ? (e.focus(), 'ok') : '')(document.querySelector({}))", js_str(selector))).await?;
+        if focused.as_str() != Some("ok") {
+            return Ok(false);
+        }
+        let mut seed = (text.len() as u64).wrapping_mul(2654435761) | 1;
+        for ch in text.chars() {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            let key = ch.to_string();
+            let init = serde_json::json!({ "key": key, "text": key, "code": "" }).to_string();
+            run(format!("__pt_key('keyDown', {init})")).await?;
+            self.settle(std::time::Duration::from_millis(40 + seed % 60)).await;
+            run(format!("__pt_key('keyUp', {init})")).await?;
+            self.settle(std::time::Duration::from_millis(60 + (seed >> 8) % 140)).await;
+        }
+        Ok(true)
+    }
+
     pub async fn press_widget_control(&self) -> Result<Option<String>, EngineError> {
         // Frames first: a challenge widget is one, and its control is the one
         // worth pressing.
@@ -2793,82 +2951,7 @@ impl BrowserContext {
                 c["x"].as_f64().unwrap_or(0.0),
                 c["y"].as_f64().unwrap_or(0.0),
             );
-            // Inside the frame that owns it, so no coordinate has to survive a
-            // trip through a parent that lays its frames out differently.
-            //
-            // Three events in one tick is not a human press: the pointer appears dead centre
-            // and presses and releases in zero time, and the challenge measures that. So:
-            // approach along an arc, pause, hold, and land slightly off centre.
-            let trace = std::env::var_os("NOKK_TRACE_CONTROLS").is_some();
-            let press_t0 = std::time::Instant::now();
-            let send = async |js: String| {
-                let t = std::time::Instant::now();
-                let _ = match frame {
-                    None => self.evaluate(&js).await,
-                    Some(id) => self.evaluate_in_frame(id, &js).await,
-                };
-                if trace {
-                    tracing::info!(target: "nokk::press", took_ms = t.elapsed().as_millis() as u64, at_ms = press_t0.elapsed().as_millis() as u64, what = %js.chars().take(40).collect::<String>(), "step");
-                }
-            };
-            // Screen position of the document origin holding the checkbox: window plus browser
-            // chrome plus the frame's position. Without it screenX/Y equalled clientX/Y, which
-            // a real mouse never gives.
-            let origin_js = match frame {
-                None => "__pt_screenOrigin()".to_string(),
-                Some(id) => format!(
-                    "(() => {{ const o = JSON.parse(__pt_screenOrigin()); let r = null; try {{ r = JSON.parse(__pt_frameRectById({id}) || 'null'); }} catch (e) {{}} return JSON.stringify([o[0] + (r ? r.x : 0), o[1] + (r ? r.y : 0)]); }})()"
-                ),
-            };
-            let (ox, oy) = self
-                .evaluate(&origin_js)
-                .await
-                .ok()
-                .and_then(|v| v.as_str().and_then(|t| serde_json::from_str::<Vec<f64>>(t).ok()))
-                .filter(|v| v.len() == 2)
-                .map(|v| (v[0], v[1]))
-                .unwrap_or((0.0, 0.0));
-            // Spread derived from the coordinates: stable per target, different across
-            // targets, no randomness.
-            let spread = ((x + y * 7.0) as i64).unsigned_abs() % 5;
-            let mut seed = ((x * 131.0 + y * 977.0) as i64).unsigned_abs() | 1;
-            let mut rnd = move || {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                (seed % 10_000) as f64 / 10_000.0
-            };
-            let (tx, ty) = (x + 1.0 + spread as f64 * 0.37 + rnd() * 0.6, y - 1.0 + (spread % 3) as f64 * 0.41 + rnd() * 0.6);
-            // Approach like a recorded hand in Chrome: about twenty points over half a second,
-            // uneven steps (8-60 ms, occasionally longer), arcing in from afar and slowing near
-            // the target.
-            let steps = 18 + (spread as usize * 2) % 7;
-            let (sx0, sy0) = (tx + 55.0 + rnd() * 20.0, ty + 18.0 + rnd() * 12.0);
-            for i in 1..=steps {
-                let t = i as f64 / steps as f64;
-                let e = 1.0 - (1.0 - t).powi(3);
-                let bow = (t * std::f64::consts::PI).sin();
-                let px = sx0 + (tx - sx0) * e + bow * (4.0 + rnd() * 2.0);
-                let py = sy0 + (ty - sy0) * e - bow * (6.0 + rnd() * 3.0);
-                send(format!(
-                    "__pt_mouse(\"mouseMoved\", {px:.4}, {py:.4}, \"left\", 0, {ox:.4}, {oy:.4})"
-                ))
-                .await;
-                let gap = if rnd() < 0.12 { 60.0 + rnd() * 120.0 } else { 8.0 + rnd() * 40.0 };
-                self.settle(std::time::Duration::from_millis(gap as u64)).await;
-            }
-            self.settle(std::time::Duration::from_millis(90 + (rnd() * 140.0) as u64))
-                .await;
-            send(format!("__pt_mouse(\"mousePressed\", {tx:.4}, {ty:.4}, \"left\", 1, {ox:.4}, {oy:.4})")).await;
-            self.settle(std::time::Duration::from_millis(85 + (rnd() * 50.0) as u64))
-                .await;
-            send(format!("__pt_mouse(\"mouseReleased\", {tx:.4}, {ty:.4}, \"left\", 1, {ox:.4}, {oy:.4})")).await;
-            // The hand does not freeze after the press: a few points off to the side.
-            for k in 1..=3 {
-                self.settle(std::time::Duration::from_millis(30 + (rnd() * 60.0) as u64)).await;
-                let (px, py) = (tx + k as f64 * (2.0 + rnd() * 3.0), ty + k as f64 * (4.0 + rnd() * 5.0));
-                send(format!("__pt_mouse(\"mouseMoved\", {px:.4}, {py:.4}, \"left\", 0, {ox:.4}, {oy:.4})")).await;
-            }
+            self.human_press(frame, x, y).await;
             let what = format!(
                 "{}[{}]@{}{}",
                 c["tag"].as_str().unwrap_or("?"),
@@ -4605,8 +4688,15 @@ impl BrowserContext {
                 // `response.url` is the final URL after redirects (fetch spec).
                 let url_s: &str = url;
                 let final_url: &str = if resp.url.is_empty() { url_s } else { &resp.url };
+                // Bytes that are not UTF-8 also go as themselves, for `arrayBuffer()`.
+                let bytes64 = if std::str::from_utf8(&resp.body).is_err() {
+                    use base64::Engine as _;
+                    format!("\"{}\"", base64::engine::general_purpose::STANDARD.encode(&resp.body))
+                } else {
+                    "null".to_string()
+                };
                 format!(
-                    "{}__pt_fetchResolve({}, {}, {}, {}, {}, {})",
+                    "{}__pt_fetchResolve({}, {}, {}, {}, {}, {}, {})",
                     meta,
                     id,
                     resp.status,
@@ -4614,6 +4704,7 @@ impl BrowserContext {
                     headers_js,
                     serde_json::to_string(&*body).unwrap(),
                     serde_json::to_string(final_url).unwrap(),
+                    bytes64,
                 )
             }
             Err(e) => {

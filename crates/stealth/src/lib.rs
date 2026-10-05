@@ -7404,13 +7404,16 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   globalThis.__pt_drainFetchQueue = () => { const q = queue.splice(0); return __ptJSON.stringify(q); };
   globalThis.__pt_pendingFetches = () => pending.size;
 
-  globalThis.__pt_fetchResolve = (id, status, statusText, headers, body, finalUrl) => {
+  // `bytes64`: the body's own bytes when they are not UTF-8 text (an mp3, an image, a
+  // protobuf). `body` is then lossy text, as `text()` would decode it.
+  globalThis.__pt_fetchResolve = (id, status, statusText, headers, body, finalUrl, bytes64) => {
     const p = pending.get(id); if (!p) return; pending.delete(id);
     if (globalThis.__pt_encTrace) { try { (globalThis.__pt_parentConsole || console).error('[fetch] ' + Math.round(performance.now()) + 'ms #' + id + ' resp ' + status + ' len=' + (body == null ? 0 : (body.byteLength || body.length || 0)) + ' ' + String(p.url).slice(-60) + ' hdrs=' + JSON.stringify(headers).slice(0, 300) + ((body && (body.byteLength || body.length || 0) < 500) ? ' body=' + JSON.stringify(typeof body === 'string' ? body : new TextDecoder().decode(body)).slice(0, 400) : '')); } catch (e) {} }
     const lower = {}; for (const k in headers) lower[k.toLowerCase()] = headers[k];
     const resp = {
       ok: status >= 200 && status < 300, status, statusText: statusText || '',
       url: finalUrl || p.url, redirected: false, type: 'basic', bodyUsed: false, _body: body,
+      _bytes: bytes64 ? Uint8Array.from(globalThis.atob(bytes64), (c) => c.charCodeAt(0)) : null,
       // A real Headers: pages iterate `[...r.headers]` and `for...of`.
       headers: (typeof globalThis.Headers === 'function' ? (() => { try { return new Headers(lower); } catch (e) { return null; } })() : null) || {
         get: (k) => (k.toLowerCase() in lower ? lower[k.toLowerCase()] : null),
@@ -7421,7 +7424,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       },
       text() { this.bodyUsed = true; return Promise.resolve(this._body); },
       json() { this.bodyUsed = true; return Promise.resolve(__ptJSON.parse(this._body)); },
-      arrayBuffer() { this.bodyUsed = true; return Promise.resolve(new TextEncoder().encode(this._body).buffer); },
+      arrayBuffer() { this.bodyUsed = true; return Promise.resolve(this._bytes ? this._bytes.slice().buffer : new TextEncoder().encode(this._body).buffer); },
       clone() { return Object.assign({}, this); },
     };
     p.resolve(resp);
@@ -7660,12 +7663,16 @@ const FETCH_TEMPLATE: &str = r#"(() => {
           b.status = r.status; b.statusText = r.statusText; b.responseURL = r.url || b.url;
           r.headers.forEach((v, k) => { b.respHeaders[k] = v; });
           setState(self, 2); setState(self, 3);
-          b.responseText = await r.text();
+          if (b.responseType === 'arraybuffer') { b.response = await r.arrayBuffer(); b.responseText = ''; }
+          else b.responseText = await r.text();
           if (encTrace) { try { (globalThis.__pt_parentConsole || console).error('[xhr] ' + Math.round(performance.now()) + 'ms resp ' + r.status + ' ' + String(b.url).slice(-40) + ' body=' + bodyLen + ' resp=' + b.responseText.length); } catch (e) {} }
-          try { b.response = b.responseType === 'json' ? __ptJSON.parse(b.responseText || 'null') : b.responseText; }
-          catch (e) { b.response = null; }
+          if (b.responseType !== 'arraybuffer') {
+            try { b.response = b.responseType === 'json' ? __ptJSON.parse(b.responseText || 'null') : b.responseText; }
+            catch (e) { b.response = null; }
+          }
+          const got = b.responseType === 'arraybuffer' ? b.response.byteLength : b.responseText.length;
           setState(self, 4);
-          fire(self, 'progress', { lengthComputable: true, loaded: b.responseText.length, total: b.responseText.length });
+          fire(self, 'progress', { lengthComputable: true, loaded: got, total: got });
           fire(self, 'load'); fire(self, 'loadend');
         })
         .catch(() => {

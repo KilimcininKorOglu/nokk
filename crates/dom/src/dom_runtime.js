@@ -10408,9 +10408,16 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     const oy = (w.screenY || 0) + Math.max(0, (w.outerHeight || 0) - (w.innerHeight || 0));
     return __ptJSON.stringify([ox, oy]);
   };
+  // A press aimed at a known element goes to it: our layout can put another element
+  // under its centre (reCAPTCHA's footer buttons land below the frame's window).
+  let __pressTarget = null;
+  globalThis.__pt_setPressTarget = (sel) => {
+    __pressTarget = sel ? (globalThis.document && globalThis.document.querySelector(sel)) || null : null;
+    return !!__pressTarget;
+  };
   globalThis.__pt_mouse = (type, x, y, button, clickCount, ox, oy) => {
     x = __q(+x || 0); y = __q(+y || 0);
-    const el = __elementFromPoint(x, y) || (globalThis.document && globalThis.document.body);
+    const el = __pressTarget || __elementFromPoint(x, y) || (globalThis.document && globalThis.document.body);
     if (!el) return false;
     if (ox === undefined || oy === undefined) {
       try { const o = __ptJSON.parse(globalThis.__pt_screenOrigin()); ox = o[0]; oy = o[1]; } catch (e) { ox = 0; oy = 0; }
