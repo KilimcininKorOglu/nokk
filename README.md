@@ -95,11 +95,11 @@ result. Run them yourself with `tools/cf-check.sh`.
 
 | Page | Challenge | Solved | Median | Slowest |
 |---|---|---|---|---|
-| `chess.com/login` | invisible Turnstile widget on a live site | 3/3 | 6 s | 6 s |
-| `scrapingcourse.com/cloudflare-challenge` | managed interstitial | 3/3 | 5 s | 8 s |
+| `chess.com/login` | invisible Turnstile widget on a live site | 3/3 | 7 s | 9 s |
+| `scrapingcourse.com/cloudflare-challenge` | managed interstitial | 3/3 | 5 s | 7 s |
 | `peet.ws/turnstile-test/managed.html` | managed widget | 3/3 | 7 s | 8 s |
-| `peet.ws/turnstile-test/non-interactive.html` | non-interactive widget | 3/3 | 5 s | 32 s |
-| `nopecha.com/demo/cloudflare` | interactive interstitial with a checkbox | 3/3 | 9 s | 11 s |
+| `peet.ws/turnstile-test/non-interactive.html` | non-interactive widget | 3/3 | 3 s | 4 s |
+| `nopecha.com/demo/cloudflare` | interactive interstitial with a checkbox | 3/3 | 10 s | 11 s |
 
 On production sites behind Cloudflare the result is in the [comparison above](#why-nokk):
 8 sites, 24 of 24 solved. Those sites are not named here.

@@ -882,6 +882,9 @@ struct InFlight {
     deliver: Deliver,
     info: FetchInfo,
     handle: tokio::task::JoinHandle<Result<nokk_net::Response, NetError>>,
+    /// The page document a page request belongs to; its reply is dropped once the page
+    /// has moved on. `None` for frame and worker requests.
+    doc: Option<u64>,
 }
 
 enum Prepared {
@@ -1713,7 +1716,8 @@ impl BrowserContext {
             // dozens, modules included, and a module leaves this loop early.
             if index == self.idx() {
                 self.frames_take_a_turn().await;
-                self.wait_for_blocking_sheets(index).await;
+                let is_async = page.script_modes.get(idx) == Some(&nokk_dom::ScriptMode::Async);
+                self.wait_for_blocking_sheets(index, if is_async { SHEETS_WAIT_ASYNC } else { SHEETS_WAIT }).await;
             }
             // `<script nomodule>` is addressed to a browser without modules. We
             // have them, so we are not the audience — and a site that ships both
@@ -1891,7 +1895,6 @@ impl BrowserContext {
         let base = self.base_url.lock().map(|b| b.clone()).unwrap_or_default();
 
         let mut total_timers = 0u32;
-        let mut fetches_done = 0usize;
         let mut waited = std::time::Duration::ZERO;
         // Due on the first round: a frame inserted by the document's own scripts
         // has been waiting since before this call started.
@@ -2026,15 +2029,49 @@ impl BrowserContext {
             // second before its first script. The queue is already drained, so anything not
             // done here never settles: stake.com had 128 stylesheets behind 389 module
             // preloads and waited forever when only the first 200 were taken. All, in batches.
+            // A request still out after PAGE_FETCH_GRACE stops holding the round and is
+            // answered by a later one, as in a browser. Waiting for every request let one
+            // dead host (a stylesheet that never connects) stall the page's JS for the
+            // whole request timeout.
             let mut settles = Vec::with_capacity(reqs.len());
             for batch in reqs.chunks(MAX_FETCHES) {
-                fetches_done += batch.len();
-                settles.extend(
-                    self.with_frames_live(futures_util::future::join_all(
-                        batch.iter().map(|r| self.perform_fetch(index, &base, r)),
-                    ))
-                    .await,
-                );
+                let started: Vec<_> = batch
+                    .iter()
+                    .map(|r| match self.prepare_fetch(index, &base, r) {
+                        Prepared::Settled(js) => Err(js),
+                        Prepared::Send(req, info) => {
+                            let client = self.client.clone();
+                            Ok((info, tokio::spawn(async move { client.send(req).await })))
+                        }
+                    })
+                    .collect();
+                let all_done = async {
+                    while started.iter().any(|s| matches!(s, Ok((_, h)) if !h.is_finished())) {
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    }
+                };
+                let _ = self
+                    .with_frames_live(tokio::time::timeout(PAGE_FETCH_GRACE, all_done))
+                    .await;
+                for s in started {
+                    match s {
+                        Err(js) => settles.push(js),
+                        Ok((info, handle)) if handle.is_finished() => {
+                            let res = match handle.await {
+                                Ok(r) => r,
+                                Err(e) => Err(NetError::Connect(format!("fetch task failed: {e}"))),
+                            };
+                            settles.push(self.settle_fetch(&info, res));
+                        }
+                        Ok((info, handle)) => {
+                            tracing::debug!(target: "nokk::load", url = %info.url, "slow request left in flight");
+                            let doc = Some(self.doc_seq.load(std::sync::atomic::Ordering::Acquire));
+                            if let Ok(mut v) = self.inflight.lock() {
+                                v.push(InFlight { deliver: Deliver::Frame(index), info, handle, doc });
+                            }
+                        }
+                    }
+                }
             }
             for settle in settles {
                 let (w, raw) = self.route(index);
@@ -2090,12 +2127,15 @@ impl BrowserContext {
                 }
             }
 
-            if busy || frames_ran > 0 || !frame_ops.is_empty() {
+            // A slow page request that has just answered is work for this round.
+            let late = self.settle_inflight().await?;
+            if busy || late > 0 || frames_ran > 0 || !frame_ops.is_empty() {
                 continue;
             }
             // Frame and worker replies are still in flight: wait a bit and give frames a
-            // turn instead of declaring idle.
-            if self.inflight_pending() && std::time::Instant::now() < deadline {
+            // turn instead of declaring idle. A slow page request is not waited for here;
+            // it can take the whole request timeout.
+            if self.inflight_awaited() && std::time::Instant::now() < deadline {
                 tokio::time::sleep(FRAME_PUMP_EVERY).await;
                 if self.has_frames() {
                     last_frame_pump = std::time::Instant::now();
@@ -3829,7 +3869,7 @@ impl BrowserContext {
     /// Wait for markup stylesheets before running the next script, as a browser does.
     /// The wait is not idle: the page lives, its timers run, and the stylesheet
     /// requests are served by the same loop.
-    async fn wait_for_blocking_sheets(&self, index: usize) {
+    async fn wait_for_blocking_sheets(&self, index: usize, cap: std::time::Duration) {
         // One deadline per document, not per script: a sheet that missed 15 s will not
         // arrive for the next script, and a SvelteKit page carries dozens (stake.com sat
         // like this for half an hour at 100% CPU).
@@ -3837,7 +3877,7 @@ impl BrowserContext {
         if self.sheets_gave_up.load(std::sync::atomic::Ordering::Acquire) == doc + 1 {
             return;
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + cap;
         loop {
             let pending = self
                 .eval_in(index, "globalThis.__ptBlockingSheets | 0")
@@ -3849,6 +3889,10 @@ impl BrowserContext {
                 return;
             }
             if std::time::Instant::now() >= deadline {
+                // A short wait running out says nothing about the sheets yet.
+                if cap < SHEETS_WAIT {
+                    return;
+                }
                 let urls = self
                     .eval_in(index, "JSON.stringify([...(globalThis.__ptBlockingSheetUrls || [])])")
                     .await
@@ -4230,16 +4274,6 @@ impl BrowserContext {
     }
 
     /// Run one queued `fetch` request and build the JS call that settles it.
-    async fn perform_fetch(&self, context: usize, base: &str, r: &Value) -> String {
-        match self.prepare_fetch(context, base, r) {
-            Prepared::Settled(js) => js,
-            Prepared::Send(req, info) => {
-                let res = self.client.send(req).await;
-                self.settle_fetch(&info, res)
-            }
-        }
-    }
-
     /// Start a frame or worker request without waiting: `settle_inflight` picks the reply
     /// up on a later pump. An instantly settled one (blocked URL) is returned now.
     fn start_fetch(&self, deliver: Deliver, context: usize, base: &str, r: &Value) -> Option<String> {
@@ -4254,15 +4288,16 @@ impl BrowserContext {
                 let client = self.client.clone();
                 let handle = tokio::spawn(async move { client.send(req).await });
                 if let Ok(mut v) = self.inflight.lock() {
-                    v.push(InFlight { deliver, info, handle });
+                    v.push(InFlight { deliver, info, handle, doc: None });
                 }
                 None
             }
         }
     }
 
-    fn inflight_pending(&self) -> bool {
-        self.inflight.lock().map(|v| !v.is_empty()).unwrap_or(false)
+    /// Frame and worker requests in flight, the ones an idle loop waits for.
+    fn inflight_awaited(&self) -> bool {
+        self.inflight.lock().map(|v| v.iter().any(|f| f.doc.is_none())).unwrap_or(false)
     }
 
     /// Deliver replies that have arrived: record the request and settle the promise
@@ -4284,7 +4319,11 @@ impl BrowserContext {
             Err(_) => Vec::new(),
         };
         let mut n = 0;
+        let doc_now = self.doc_seq.load(std::sync::atomic::Ordering::Acquire);
         for f in done {
+            if f.doc.is_some_and(|d| d != doc_now) {
+                continue;
+            }
             let res = match f.handle.await {
                 Ok(r) => r,
                 Err(e) => Err(NetError::Connect(format!("fetch task failed: {e}"))),
@@ -4798,6 +4837,13 @@ const LOAD_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_millis(1
 // the challenge times "set a 55 ms timer, reply". 20 ms delivery lag turned 55 into
 // 79, and the widget retried the probe until it expired.
 const FRAME_PUMP_EVERY: std::time::Duration = std::time::Duration::from_millis(4);
+/// How long a round waits for the page's requests before leaving the slow ones in flight.
+const PAGE_FETCH_GRACE: std::time::Duration = std::time::Duration::from_millis(1000);
+/// How long a parser-blocking or deferred script waits for markup stylesheets.
+const SHEETS_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// An async script does not wait for stylesheets in a browser. It waits briefly here so
+/// that a sheet already on its way still lands first, which is the common case there.
+const SHEETS_WAIT_ASYNC: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// A preloaded script: when it was requested and the task awaiting it.
 type Preloaded = (
@@ -9461,6 +9507,55 @@ mod tests {
                 "{how} must land on the new document, not just change the address"
             );
         }
+    }
+
+    /// A host that accepts and never answers must not hold the page: in Chrome a hung
+    /// stylesheet or fetch blocks nothing an async script or a timer does. Here every
+    /// round waited for all its requests, and peet.ws (a dead stylesheet host) sat for
+    /// the whole 30 s request timeout before Turnstile's async loader ran.
+    #[tokio::test]
+    async fn a_hung_request_does_not_hold_the_page() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut hung = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (ctype, body) = if req.contains("GET /dead") {
+                    hung.push(stream);
+                    continue;
+                } else if req.contains("GET /a.js") {
+                    ("text/javascript", "document.title += 'async;'; fetch('/dead-xhr'); setTimeout(() => { document.title += 'timer;'; }, 50);")
+                } else {
+                    ("text/html", "<html><head><title></title><link rel=stylesheet href=/dead.css><script async src=/a.js></script></head><body>x</body></html>")
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        let t = std::time::Instant::now();
+        let _ = ctx.navigate(&format!("http://127.0.0.1:{}/", addr.port())).await;
+        while t.elapsed() < std::time::Duration::from_secs(8)
+            && ctx.evaluate("document.title").await.unwrap_or_default() != Value::String("async;timer;".into())
+        {
+            let _ = ctx.run_event_loop().await;
+        }
+        assert_eq!(ctx.evaluate("document.title").await.unwrap(), Value::String("async;timer;".into()));
+        assert!(t.elapsed() < std::time::Duration::from_secs(8), "took {:?}", t.elapsed());
     }
 
     /// Two documents: one that sends itself to the other, and the other.
