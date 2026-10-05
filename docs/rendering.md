@@ -26,8 +26,8 @@ probes: draw specific content, hash the pixels).
 **Non-goals.** No page layout/compositing/paint. No visible window. This is
 **off-screen rasterization of the two contexts fingerprinters read**, nothing
 more. It is **necessary but not sufficient** for interactive Turnstile (which also
-needs Web Workers, cross-origin iframe execution, and full environment coherence
-— see [examples/cf-harvester](../examples/cf-harvester) for the real-browser path).
+needs Web Workers, cross-origin iframe execution, and full environment coherence;
+the engine now has all of these and solves it, see [cloudflare.md](cloudflare.md)).
 
 ## Why light is the default again
 
@@ -212,7 +212,7 @@ Effort: **medium-high** (glow) to **high** (SwiftShader).
 
 ## Related
 
-- Why a from-scratch engine can't beat Turnstile in-engine, and the harvest+replay
-  hybrid that does: [examples/cf-harvester/docs/RESEARCH.md](../examples/cf-harvester/docs/RESEARCH.md).
+- How the engine clears Turnstile, and how to import a clearance from a real
+  browser: [cloudflare.md](cloudflare.md).
 - Native-binding mechanism (first used by `crypto.subtle`):
   [crates/pool/src/natives.rs](../crates/pool/src/natives.rs).

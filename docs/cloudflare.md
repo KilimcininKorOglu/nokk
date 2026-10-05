@@ -81,5 +81,4 @@ nokk --load https://gated.example/ \
 
 A clearance expires, and `--fail-on-challenge` says when it did (don't trust the
 cookie's own `expires` — Cloudflare decides validity on its side, against the IP and the
-TLS fingerprint too). See [examples/cf-harvester](../examples/cf-harvester/) for a scriptable
-harvester and the [research write-up](../examples/cf-harvester/docs/RESEARCH.md).
+TLS fingerprint too).
