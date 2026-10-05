@@ -57,7 +57,8 @@ with nokk.launch(auto_solve=True) as server, sync_playwright() as pw:
     print(page.title())
 ```
 
-Puppeteer, the MCP server, sessions and the Cloudflare options are below.
+For AI agents, `pip install "nokk[mcp]"` turns it into an [MCP server](#for-ai-agents-mcp).
+Puppeteer, Node, sessions and the Cloudflare options are [below](#usage).
 
 ## Why nokk
 
@@ -86,294 +87,69 @@ checkbox-clicking harness; a solve counts only if the site then opens with the c
 Playwright/CDP surface: nokk has no rendering engine by design, and its CDP coverage
 is the path Puppeteer and Playwright use for navigation and scripting.
 
-## More ways to run
+## Measured on public pages
 
-### Docker images
+Three runs per page from the CLI with `--solve-challenge 30` and no proxy, on an 8-core
+Linux box (October 2026). The time is the whole command, from process start to the printed
+result. Run them yourself with `tools/cf-check.sh`.
 
-The published image bundles the binary, glibc, and TLS roots — nothing to compile.
-`:latest` is a tiny [distroless](https://github.com/GoogleContainerTools/distroless)
-image (~62 MB, ~22 MB compressed):
+| Page | Challenge | Solved | Median | Slowest |
+|---|---|---|---|---|
+| `chess.com/login` | invisible Turnstile widget on a live site | 3/3 | 6 s | 6 s |
+| `scrapingcourse.com/cloudflare-challenge` | managed interstitial | 3/3 | 5 s | 8 s |
+| `peet.ws/turnstile-test/managed.html` | managed widget | 3/3 | 7 s | 8 s |
+| `peet.ws/turnstile-test/non-interactive.html` | non-interactive widget | 3/3 | 5 s | 32 s |
+| `nopecha.com/demo/cloudflare` | interactive interstitial with a checkbox | 3/3 | 9 s | 11 s |
 
-```bash
-docker run --rm -p 9222:9222 ghcr.io/koloss777/nokk:latest
-```
+On production sites behind Cloudflare the result is in the [comparison above](#why-nokk):
+8 sites, 24 of 24 solved. Those sites are not named here.
 
-That starts the CDP server; point Puppeteer at `ws://localhost:9222/devtools/browser/nokk`.
-One-shot modes work too — just override the args:
+## Usage
 
-```bash
-docker run --rm ghcr.io/koloss777/nokk:latest --eval 'navigator.webdriver'   # -> false
-docker run --rm ghcr.io/koloss777/nokk:latest --load https://example.com --eval 'document.title'
-```
-
-Three variants are published per release:
-
-| Tag | Base | Notes |
-|-----|------|-------|
-| `:latest`, `:<version>`, `:distroless` | distroless | Light build, smallest image; no shell. The default. |
-| `:debian`, `:<version>-debian` | debian-slim | Light build with a shell for `docker exec` debugging. |
-| `:render`, `:<version>-render` | debian-slim + Mesa | **Real** canvas/WebGL pixels instead of synthesis, ~100 MB more at peak — see [`docs/rendering.md`](docs/rendering.md). |
-
-Or build the image yourself from a checkout: `docker build -t nokk .` (add
-`--target debian` or `--target render` for the other variants).
-
-### Run the prebuilt binary
-
-Grab the Linux x86_64 tarball from the [latest release](../../releases/latest):
+### Command line
 
 ```bash
-tar -xzf nokk-*-linux-x86_64.tar.gz
-./nokk --eval 'navigator.webdriver'
+nokk --fetch https://tls.browserleaks.com/json                   # Chrome TLS + HTTP/2 fingerprint
+nokk --load https://example.com --eval 'document.title'          # run the page, query the DOM
+nokk --load https://quotes.toscrape.com --dump-requests          # every request the page makes
+nokk --load https://target --proxy socks5://host:1080            # through a proxy
+nokk --port 9222 --rotate-fingerprint --geoip-timezone           # CDP server, a machine per context
 ```
 
-That is the light build, which `npm install` and `pip install` fetch too. The release
-also carries `nokk-render-*-linux-x86_64.tar.gz`: the same engine with real canvas/WebGL
-rasterization compiled in, for sites that compare pixels (`cargo build --features
-render,webgl` from source). Canvas 2D works anywhere; WebGL needs Mesa on the host
-(`libegl1 libgl1-mesa-dri`) and falls back to synthesis without it.
+Ad, analytics and tracker requests are dropped by default; `--allow-trackers` loads them.
+Anti-bot vendors are never blocked, because they must run to hand out a token.
 
-### Build from source
-
-nokk's fingerprinted transport is backed by BoringSSL (via `wreq`), so the first build
-compiles it from source. You need a C/C++ toolchain, `cmake`, and `libclang`. On
-Debian/Ubuntu:
-
-```bash
-sudo apt install build-essential cmake clang libclang-dev
-git clone https://github.com/koloss777/nokk
-cd nokk
-cargo build --release
-```
-
-> No root? BoringSSL can be bootstrapped from user-space `pip` packages — see
-> [`docs/BUILD.md`](docs/BUILD.md) for the `cmake` + `libclang` + `.cargo/config.toml`
-> recipe used to build this repo without sudo.
-
-### Use it from the command line
-
-```bash
-# Fetch a URL with a full Chrome fingerprint (JA3/JA4 + HTTP/2)
-cargo run --release --bin nokk -- --fetch https://tls.browserleaks.com/json
-
-# Navigate a real page, run its scripts, and probe the resulting DOM
-cargo run --release --bin nokk -- --load https://example.com --eval 'document.title'
-
-# Prove the automation flag is gone
-cargo run --release --bin nokk -- --eval 'navigator.webdriver'   # -> false
-
-# Scrape a page's internal API: dump every request it makes, then one body
-cargo run --release --bin nokk -- --load https://quotes.toscrape.com --dump-requests
-cargo run --release --bin nokk -- --load https://some.site --dump-request '/api/'
-
-# Route through a proxy (essential for IP rotation against WAFs)
-cargo run --release --bin nokk -- --load https://target --proxy socks5://host:1080
-
-# Give every browser context its own coherent machine, with its timezone/locale
-# matched to the proxy's exit IP
-cargo run --release --bin nokk -- --port 9222 --rotate-fingerprint --geoip-timezone
-```
-
-Ad/analytics/tracker subresources are dropped by default (trimming the passive-fingerprinting
-surface and speeding loads); pass `--allow-trackers` to load them. Anti-bot vendors are never
-blocked — they must run to hand out a token.
-
-### Drive it from Puppeteer
-
-Run nokk as a CDP server, then connect any existing Puppeteer script to it:
-
-```bash
-cargo run --release --bin nokk -- --port 9222 --workers 4 --max-contexts 64
-```
+### Puppeteer
 
 ```js
 import puppeteer from 'puppeteer';
 
 const browser = await puppeteer.connect({
-  browserWSEndpoint: 'ws://127.0.0.1:9222/devtools/browser/nokk',
+  browserWSEndpoint: 'ws://127.0.0.1:9222/devtools/browser/nokk',   // nokk --port 9222
 });
 const page = await browser.newPage();
 await page.goto('https://example.com');
 console.log(await page.title());
-await browser.close();
 ```
 
-### Persistent sessions (warm up once, resume anytime)
+### Node and Python
 
-Start nokk with a session store, then bind a browser context to a **session name**. Its
-cookie jar — login state, `cf_clearance`, session cookies and all — persists to
-`<store>/<name>.json` and reloads automatically, even in a new process. Warm a session once
-and re-attach it later instead of re-solving a challenge every run:
-
-```bash
-cargo run --release --bin nokk -- --port 9222 --session-store ./sessions
-```
+Both packages carry the prebuilt binary and start the CDP server for you.
 
 ```js
-const browser = await puppeteer.connect({
-  browserWSEndpoint: 'ws://127.0.0.1:9222/devtools/browser/nokk',
-});
-// `sessionName` is a nokk extension to Target.createBrowserContext, sent via raw CDP.
-const cdp = await browser.target().createCDPSession();
-const { browserContextId } = await cdp.send('Target.createBrowserContext', {
-  sessionName: 'acme',
-  // proxyServer: 'http://user:pass@host:port',   // optional, per-session IP
-});
+const server = await require("@koloss777/nokk").launch({ autoSolve: true });
+// server.wsEndpoint -> puppeteer.connect / chromium.connectOverCDP
 ```
-
-Every page opened in that context shares the named jar; it flushes to disk when the context
-closes. Distinct session names are fully isolated. Without `--session-store`, sessions are
-in-memory only. From the Rust API this is `Engine::new_context_with_session(name, proxy)`.
-
-### Cloudflare challenges solve themselves
-
-nokk clears Cloudflare's Turnstile on its own — the invisible kind, the managed
-interstitial ("Just a moment…"), and the interactive one with the *Verify you are human*
-checkbox. There is nothing to configure and nothing to point at: the engine knows no
-particular challenge. It waits while the page works, and if a widget puts up a control
-it presses it the way a person would, with the pointer moving in from a distance and the
-events a real click produces. The control sits in a closed shadow root inside a
-cross-origin frame, where page script (and a CSS selector from a driver) cannot reach —
-which is exactly why the press lives in the engine. A cleared interstitial then submits
-its form and walks on to the real page by itself.
-
-```bash
-# one-shot: load, solve whatever comes up, print the page
-nokk --load https://gated.example/ --solve-challenge 25 --fail-on-challenge
-```
-
-`--fail-on-challenge` turns the outcome into an exit code (`0` the site, `3` still the
-gate), and `--solve-challenge N` is the time budget. Measured on live sites (2026-10):
-`chess.com/login` (invisible widget, ~6 s), `scrapingcourse.com/cloudflare-challenge`
-(interstitial, ~9 s), `nopecha.com/demo/cloudflare`
-(interactive interstitial, ~10 s), the Turnstile test pages on `peet.ws` (standalone
-widget: the token lands in `cf-turnstile-response`, and that counts as success).
-
-**Only after the cookie?** `--until-clearance` stops the moment Cloudflare hands out a
-fresh `cf_clearance` and does not load the site behind the gate — on a heavy site that
-page is most of a solve. Take the cookie from `--session-store` and use it from any
-client on the same exit IP and Chrome version:
-
-```bash
-nokk --load https://www.indeed.com/ --solve-challenge 60 --until-clearance \
-     --fail-on-challenge --session-store ./sessions --session s1
-# ./sessions/s1.json now holds cf_clearance; the process exits 0
-```
-
-Measured through one proxy (October 2026): indeed 31 s → 9 s, stake 42 s → 11 s,
-cardmarket 38 s → 9 s and 40 s → 9 s of CPU — the site's own bundles, not the challenge,
-were the cost.
-
-**Over CDP / Puppeteer** it is the same engine with three ways in:
-
-```bash
-nokk --port 9222 --auto-solve        # every page.goto() that lands on a gate solves it first
-```
-
-```js
-// per browser context, regardless of the server flag
-const { browserContextId } = await cdp.send('Target.createBrowserContext', { autoSolve: true });
-
-// on demand, from a page session
-const state = await session.send('Nokk.challengeState');
-// → { kind: 'cloudflare-interstitial' | 'turnstile-widget' | 'datadome' | 'none',
-//     title, url, cleared, token, solvable }
-const out = await session.send('Nokk.solveChallenge', { timeoutMs: 30000 });
-// → { status: 'cleared' | 'token-issued' | 'cleared-but-stuck' | 'timeout', solved,
-//     presses, elapsedMs, remaining, title, url }
-```
-
-Whenever a navigation lands on a gate, the page session also gets a `Nokk.challenge`
-event — `{ kind, solved, attempted, status, remaining, title, url }` — so a page that
-still shows a gate never looks like an ordinary load. A gate nokk does not solve
-(DataDome, image puzzles) is reported by kind; the way through those is a session
-warmed in a real browser (below), not a selector.
-
-**Replaying a `cf_clearance` from a real browser.** A clearance earned elsewhere can be
-imported too. The cookie is bound to the exit IP **and to the TLS fingerprint of the
-browser that earned it**, so the two have to match: nokk emulates Chrome 151 and its JA4
-is byte-identical to the real browser's, which is what makes the handoff work.
-
-```bash
-# 1. earn it in a real browser (visible window; nothing is injected into the page)
-node tools/harvest-clearance.js https://gated.example/ 40 cf_clearance.json
-
-# 2. hand it to nokk
-nokk --load https://gated.example/ \
-     --session-store ./sessions --session cf --import-cookies cf_clearance.json
-```
-
-A clearance expires, and `--fail-on-challenge` says when it did (don't trust the
-cookie's own `expires` — Cloudflare decides validity on its side, against the IP and the
-TLS fingerprint too). See [examples/cf-harvester](examples/cf-harvester/) for a scriptable
-harvester and the [research write-up](examples/cf-harvester/docs/RESEARCH.md).
-
-### Rotating fingerprints across contexts
-
-With `--rotate-fingerprint`, every browser context presents its **own coherent machine** —
-not just a different User-Agent, but a matched set of `{ TLS/JA3 emulation OS + UA +
-navigator.userAgentData + sec-ch-ua + platform + screen + hardwareConcurrency + WebGL }`
-where every layer agrees. The profile is chosen deterministically from the context's identity
-(the Puppeteer browser-context id), so a given context is the **same** machine across runs,
-and distinct contexts look like distinct devices. Naive UA rotation is a *net negative* — a UA
-that contradicts the TLS handshake or the client hints is itself a detection signal — so nokk
-rotates the whole identity or nothing.
-
-```js
-// Two contexts → two self-consistent, distinct machines (Chrome on Linux / Windows / macOS)
-const a = await browser.createBrowserContext();
-const b = await browser.createBrowserContext();
-```
-
-Add `--geoip-timezone` to derive each context's `Intl` timezone and `navigator.languages`
-from its **proxy's exit IP** (one lookup per proxy, made through that proxy and cached), so a
-context routed through a German proxy reports `Europe/Berlin` and `de-DE` — a browser whose
-timezone disagrees with its IP is a classic tell. Both flags are off by default, so a single
-context stays deterministic. From the Rust API these are `EngineConfig::rotate_fingerprint`
-and `EngineConfig::geoip_timezone`.
-
-### From Node (`npm install @koloss777/nokk`)
-
-nokk ships an [npm package](https://www.npmjs.com/package/@koloss777/nokk) that fetches the prebuilt
-binary on install — no Chromium download. `launch()` returns a `wsEndpoint` for Puppeteer or
-Playwright:
-
-```js
-const nokk = require("@koloss777/nokk");
-const puppeteer = require("puppeteer");
-
-const server = await nokk.launch({ rotateFingerprint: true });
-const browser = await puppeteer.connect({ browserWSEndpoint: server.wsEndpoint });
-const page = await browser.newPage();
-await page.goto("https://example.com");
-console.log(await page.title());
-await browser.close();
-await server.close();
-```
-
-`npx @koloss777/nokk --port 9222` runs the CDP server directly.
-
-### From Python (`pip install nokk`)
-
-nokk ships a [PyPI package](https://pypi.org/project/nokk/) that **embeds the prebuilt
-binary** — no toolchain, no browser download, no Docker. `launch()` (or async
-`launch_async()`) starts the CDP server and hands back an endpoint for Playwright/pyppeteer:
 
 ```python
-import nokk
-from playwright.sync_api import sync_playwright
-
-with nokk.launch(rotate_fingerprint=True) as server, sync_playwright() as pw:
-    browser = pw.chromium.connect_over_cdp(server.ws_endpoint)
-    page = browser.new_page()
-    page.goto("https://example.com")
-    print(page.title())
+with nokk.launch(auto_solve=True) as server:   # or: await nokk.launch_async()
+    ...  # server.ws_endpoint -> connect_over_cdp
 ```
 
-### As an MCP server (give an AI agent a stealth browser)
+### For AI agents (MCP)
 
 With the `nokk[mcp]` extra, nokk runs as a [Model Context Protocol](https://modelcontextprotocol.io)
-server, so an AI agent (Claude Desktop/Code, …) can browse and scrape through the
-fingerprinted engine instead of a headful browser anti-bots flag:
+server, so an agent such as Claude Desktop or Claude Code browses through the fingerprinted engine.
 
 ```jsonc
 // pip install "nokk[mcp]"   (use the python from that environment)
@@ -382,33 +158,47 @@ fingerprinted engine instead of a headful browser anti-bots flag:
 
 Tools: `open`, `read_text`, `read_html`, `click`, `fill`, `evaluate`, `links`, `reset`.
 
+### Cloudflare challenges
+
+nokk clears Turnstile by itself: the invisible widget, the managed interstitial and the
+interactive *Verify you are human* checkbox. Nothing is configured per site. Where a widget
+needs a press, the engine presses it like a person would.
+
+- `--solve-challenge N` sets the time budget, and `--fail-on-challenge` exits `3` if a gate is still up.
+- `--until-clearance` stops at a fresh `cf_clearance` and skips the heavy page behind the gate.
+- `--auto-solve` does the same for every `page.goto()` over CDP; `Nokk.solveChallenge` does it on demand.
+- A `cf_clearance` from a real browser can be imported, because nokk's JA4 matches Chrome 151.
+
+Details, the CDP methods and events: [docs/cloudflare.md](docs/cloudflare.md).
+
+### Persistent sessions
+
+`--session-store ./sessions` saves each named session's cookie jar, `cf_clearance` included,
+to disk and reloads it in a new process. Warm a session once and reuse it instead of
+solving the challenge on every run. See [docs/sessions.md](docs/sessions.md).
+
+### Rotating fingerprints
+
+`--rotate-fingerprint` gives every browser context its own coherent machine: TLS emulation,
+User-Agent, client hints, platform, screen and WebGL all agree. `--geoip-timezone` matches the
+timezone and languages to the proxy's exit IP. See [docs/fingerprints.md](docs/fingerprints.md).
+
+## Builds
+
+| Build | What it adds | Where |
+|---|---|---|
+| light (default) | everything above; canvas and WebGL pixels are synthesised | pip, npm, `ghcr.io/koloss777/nokk:latest`, `nokk-*.tar.gz` |
+| render | real canvas 2D and WebGL rasterisation, about 100 MB more at peak | `:render` image, `nokk-render-*.tar.gz`, `--features render,webgl` |
+
+Prebuilt for Linux x86_64. Docker variants, the tarballs and building from source are in
+[docs/install.md](docs/install.md).
+
 ## How it works
 
-nokk is a Cargo workspace of small, single-responsibility crates:
-
-| Crate            | Responsibility |
-|------------------|----------------|
-| `nokk`         | Public `Engine`/`BrowserContext` API; ties the layers together |
-| `nokk-pool`    | Isolate worker pool + backpressure (one V8 isolate per thread) |
-| `nokk-net`     | Chrome-fingerprinted HTTP client (BoringSSL), connection pool, proxy |
-| `nokk-dom`     | HTML parsing (`html5ever`) → DOM tree |
-| `nokk-stealth` | The spoofed JS environment + fingerprint hardening |
-| `nokk-cdp`     | Chrome DevTools Protocol WebSocket server (Puppeteer-compatible) |
-| `nokk-cli`     | The `nokk` binary |
-
-Three constraints shape every design decision:
-
-1. **V8 isolates are single-threaded.** Concurrency is a pool of OS threads, one isolate
-   each, every isolate multiplexing several contexts ("tabs"). Contexts are pinned to a
-   thread and never move; a crash in one must not take down the pool.
-2. **Network is non-blocking and off the isolate threads.** All IO runs on `tokio` over a
-   shared connection pool, so a slow request never occupies a JS worker.
-3. **Fingerprint coherence is sacred.** The JS-level fingerprint and the TLS/HTTP
-   fingerprint must always agree — changing one without the other is what gets you caught.
-
-The DOM, timers, `fetch`, and most stealth shims are implemented in JavaScript injected
-into each context, bridged to Rust through a handful of hidden globals — so the browser
-surface a page sees is real JS objects, not native bindings a detector can trivially probe.
+A Cargo workspace of small crates: a V8 isolate pool, a Chrome-fingerprinted HTTP client on
+BoringSSL, an `html5ever` DOM, the stealth layer and a CDP server. Concurrency is one isolate
+per thread with many contexts each, all IO runs on `tokio` off the isolate threads, and the
+JS fingerprint and the TLS fingerprint always agree. More in [docs/architecture.md](docs/architecture.md).
 
 ## Project status
 
@@ -460,4 +250,3 @@ additional terms or conditions.
 
 <div align="center">
 <sub>nokk is an independent research project and is not affiliated with Google, Chrome, or any anti-bot vendor. Use it only against systems you are authorized to test.</sub>
-</div>
