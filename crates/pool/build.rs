@@ -10,6 +10,8 @@ fn main() {
     println!("cargo:rerun-if-changed=vendor/pffft/pffft.h");
     cc::Build::new()
         .file("vendor/pffft/pffft.c")
+        // MSVC defines M_PI and M_SQRT2 only on request.
+        .define("_USE_MATH_DEFINES", None)
         .opt_level(2)
         .warnings(false)
         .compile("pffft");
