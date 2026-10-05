@@ -4,6 +4,10 @@ name: ports
 # artifact for testing on real hardware. Manual (or on a change to this file) until
 # both are steadily green;
 # releases do not use it yet.
+concurrency:
+  group: ports-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   workflow_dispatch:
   push:
@@ -32,7 +36,7 @@ jobs:
       - name: Smoke
         run: |
           ./out/nokk --version
-          ./out/nokk --eval "document.title = 'ok'; document.title + (1 + 1)"
+          ./out/nokk --eval "(document.title = 'ok', document.title + (1 + 1))"
           ./out/nokk --eval "[navigator.webdriver, navigator.platform, new Intl.NumberFormat('de-DE',{style:'currency',currency:'EUR'}).format(1234.5), new Intl.PluralRules('ru').select(2)].join(' | ')"
 
       # Datacenter addresses get a harder time from Cloudflare: informative only.
@@ -89,7 +93,7 @@ jobs:
       - name: Smoke
         run: |
           ./target/release/nokk --version
-          ./target/release/nokk --eval "document.title = 'ok'; document.title + (1 + 1)"
+          ./target/release/nokk --eval "(document.title = 'ok', document.title + (1 + 1))"
           ./target/release/nokk --eval "[navigator.webdriver, navigator.platform, new Intl.NumberFormat('de-DE',{style:'currency',currency:'EUR'}).format(1234.5), new Intl.PluralRules('ru').select(2)].join(' | ')"
 
       - name: Public Cloudflare pages
@@ -130,7 +134,7 @@ jobs:
       - name: Smoke
         run: |
           ./target/release/nokk.exe --version
-          ./target/release/nokk.exe --eval "document.title = 'ok'; document.title + (1 + 1)"
+          ./target/release/nokk.exe --eval "(document.title = 'ok', document.title + (1 + 1))"
           ./target/release/nokk.exe --eval "[navigator.webdriver, navigator.platform, new Intl.NumberFormat('de-DE',{style:'currency',currency:'EUR'}).format(1234.5), new Intl.PluralRules('ru').select(2)].join(' | ')"
 
       - name: Public Cloudflare pages
