@@ -760,6 +760,7 @@ impl Engine {
             worker_init_scripts: std::sync::Mutex::new(Vec::new()),
             init_scripts: std::sync::Mutex::new(Vec::new()),
             inflight: std::sync::Mutex::new(Vec::new()),
+            port_ends: std::sync::Mutex::new(HashMap::new()),
             next_timer_at: std::sync::Mutex::new(None),
             session,
             _permit: permit,
@@ -978,6 +979,9 @@ pub struct BrowserContext {
     init_scripts: std::sync::Mutex<Vec<String>>,
     /// Frame and worker requests still on the network: JS keeps running meanwhile, as in a browser.
     inflight: std::sync::Mutex<Vec<InFlight>>,
+    /// Where each end of a MessageChannel sent across a frame boundary lives:
+    /// `<id>:a` stayed with the sender, `<id>:b` went with the message.
+    port_ends: std::sync::Mutex<HashMap<String, usize>>,
     /// When this page's earliest pending timer comes due, as of the last turn of
     /// the event loop. `None` means nothing is pending. Timers wait out their real
     /// delays now, so a page only advances while something drives it — this is how
@@ -3630,21 +3634,48 @@ impl BrowserContext {
                     } else {
                         (frame.index, origin_of(base))
                     };
+                    let ports: Vec<String> = op["ports"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                        .unwrap_or_default();
+                    if !ports.is_empty() {
+                        let sender = if to_parent { frame.index } else { self.idx() };
+                        if let Ok(mut ends) = self.port_ends.lock() {
+                            for p in &ports {
+                                // A port passed on again keeps its stayed end where it was.
+                                ends.entry(format!("{p}:a")).or_insert(sender);
+                                ends.insert(format!("{p}:b"), index);
+                            }
+                        }
+                    }
                     let _ = self
                         .eval_in(
                             index,
                             &format!(
-                                "__pt_deliverMessage({}, {}, {});",
+                                "__pt_deliverMessage({}, {}, {}, {});",
                                 data,
                                 js_str(&origin),
                                 if to_parent {
                                     id.to_string()
                                 } else {
                                     "0".into()
-                                }
+                                },
+                                serde_json::to_string(&ports).unwrap_or_else(|_| "[]".into())
                             ),
                         )
                         .await;
+                }
+                // A message on a port whose other end is in another frame.
+                "portpost" => {
+                    let end = op["end"].as_str().unwrap_or("").to_string();
+                    let data = op["data"].as_str().unwrap_or("null").to_string();
+                    let target = self.port_ends.lock().ok().and_then(|e| e.get(&end).copied());
+                    if let Some(index) = target {
+                        tracing::debug!(%end, payload = %&data[..data.len().min(200)], "port message");
+                        let _ = self
+                            .eval_in(index, &format!("__pt_portIn({}, {});", js_str(&end), data))
+                            .await;
+                    }
                 }
                 _ => {}
             }
@@ -4441,7 +4472,14 @@ impl BrowserContext {
                 serde_json::to_string("blocked by tracker filter").unwrap()
             ));
         }
-        let body = r["body"].as_str().map(|s| s.as_bytes().to_vec());
+        let body = r["body"].as_str().map(|s| {
+            if r["bodyB64"].as_bool() == Some(true) {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.decode(s).unwrap_or_default()
+            } else {
+                s.as_bytes().to_vec()
+            }
+        });
         let sent = body.clone().unwrap_or_default();
         let req = Request {
             method,
@@ -9568,6 +9606,63 @@ mod tests {
                 "{how} must land on the new document, not just change the address"
             );
         }
+    }
+
+    /// A binary body leaves as its bytes. `String(new Uint8Array(…))` is "1,2,3", and that
+    /// is what went out: reCAPTCHA's protobuf `reload` came back "Invalid API parameter(s)"
+    /// and no token was ever issued.
+    #[tokio::test]
+    async fn a_binary_request_body_leaves_as_bytes() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let mut got = 0;
+                    loop {
+                        let n = stream.read(&mut buf[got..]).await.unwrap_or(0);
+                        if n == 0 { break; }
+                        got += n;
+                        let text = String::from_utf8_lossy(&buf[..got]).to_string();
+                        if let Some(at) = text.find("\r\n\r\n") {
+                            let len = text.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length: ").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                            if got >= at + 4 + len { break; }
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf[..got]).to_string();
+                    let reply = match text.find("\r\n\r\n") {
+                        Some(at) if text.starts_with("POST") => buf[at + 4..got].iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        _ => "<html><body>x</body></html>".to_string(),
+                    };
+                    let resp = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{reply}", reply.len());
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&format!("http://127.0.0.1:{}/", addr.port())).await.unwrap();
+        ctx.evaluate(r#"(() => {
+            const u8 = new Uint8Array([0, 255, 1, 128, 10]);
+            fetch('/p', { method: 'POST', body: u8 }).then(r => r.text()).then(t => { globalThis.__a = t; });
+            fetch('/p', { method: 'POST', body: u8.subarray(1, 3) }).then(r => r.text()).then(t => { globalThis.__b = t; });
+            fetch('/p', { method: 'POST', body: u8.buffer }).then(r => r.text()).then(t => { globalThis.__c = t; });
+        })()"#).await.unwrap();
+        for _ in 0..50 {
+            ctx.run_event_loop().await.unwrap();
+            if ctx.evaluate("typeof __c").await.unwrap() == Value::String("string".into()) { break; }
+        }
+        assert_eq!(ctx.evaluate("__a").await.unwrap(), Value::String("00ff01800a".into()));
+        assert_eq!(ctx.evaluate("__b").await.unwrap(), Value::String("ff01".into()), "a view sends its own window");
+        assert_eq!(ctx.evaluate("__c").await.unwrap(), Value::String("00ff01800a".into()));
     }
 
     /// `document.cookie` and the network share one jar, as in a browser. They were two:

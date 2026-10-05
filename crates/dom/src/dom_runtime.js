@@ -6863,6 +6863,58 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   };
 
   globalThis.__pt_drainFrameQueue = () => __frameOps.splice(0);
+
+  // MessagePorts sent across a frame boundary. The port that leaves goes dead here;
+  // its partner stays and from now on talks to the other frame through the engine.
+  // Each channel gets an id, its ends `<id>:a` (stayed) and `<id>:b` (went).
+  const __portEnds = new Map();
+  let __portSeq = 0;
+  const __transferPorts = (transfer) => {
+    const ids = [];
+    if (!transfer || typeof transfer[Symbol.iterator] !== 'function') return ids;
+    for (const p of transfer) {
+      const st = p && p.__pt;
+      if (!st || !('remote' in st)) continue;
+      const id = (globalThis.__pt_frameId || 0) + '-' + (++__portSeq) + '-' + Math.random().toString(36).slice(2, 8);
+      const peer = st.peer;
+      st.peer = null;
+      if (peer) {
+        peer.__pt.peer = null;
+        peer.__pt.remote = id + ':b';
+        __portEnds.set(id + ':a', peer);
+      } else if (st.remote) {
+        // A port that already crossed once and moves on: hand its route over.
+        ids.push(st.remote.replace(/:[ab]$/, ''));
+        continue;
+      }
+      ids.push(id);
+    }
+    return ids;
+  };
+  globalThis.__pt_portOut = (end, data) => {
+    __pushFrameOp({ op: 'portpost', end, data: __pt_cloneEncode(data) });
+  };
+  globalThis.__pt_portIn = (end, raw) => {
+    const port = __portEnds.get(end);
+    if (!port) return;
+    let data = raw;
+    try { data = globalThis.__pt_cloneRevive ? __pt_cloneRevive(raw) : raw; } catch (e) {}
+    const ev = { type: 'message', data, origin: '', lastEventId: '', source: null, ports: [], isTrusted: true, target: port, currentTarget: port };
+    setTimeout(() => {
+      const st = port.__pt;
+      if (!st.started) { st.queue.push(ev); return; }
+      port.__ptDeliver(ev);
+    }, 0);
+  };
+  const __receivePorts = (ids) => (ids || []).map((id) => {
+    const port = new MessageChannel().port1;
+    port.__pt.peer = null;
+    port.__pt.remote = id + ':a';
+    __portEnds.set(id + ':b', port);
+    return port;
+  });
+  // `postMessage(data, targetOrigin, transfer)` or `postMessage(data, { targetOrigin, transfer })`.
+  const __transferOf = (a, b) => (a && typeof a === 'object' && !Array.isArray(a)) ? a.transfer : b;
   // A frame element's box at request time: no layout exists at insertion, and
   // the engine asks after the document is parsed.
   globalThis.__pt_frameBoxOf = (el) => {
@@ -6933,8 +6985,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // carries what is allowed. Messages sent before the document exists are held
   // and flushed on ready, as a browser queues them against `about:blank`.
   const __frameWindow = (id, st) => ({
-    postMessage: (data, targetOrigin) => {
-      const op = { op: 'post', id, data: __pt_cloneEncode(data), toParent: false, targetOrigin: String(targetOrigin || '*') };
+    postMessage: (data, targetOrigin, transfer) => {
+      const origin = (targetOrigin && typeof targetOrigin === 'object') ? targetOrigin.targetOrigin : targetOrigin;
+      const op = { op: 'post', id, data: __pt_cloneEncode(data), toParent: false, targetOrigin: String(origin || '*'),
+        ports: __transferPorts(__transferOf(targetOrigin, transfer)) };
       __pushFrameOp(op, st.ready ? __frameOps : st.pending);
     },
     get closed() { return false; },
@@ -6966,14 +7020,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   };
 
   // A `message` event arriving from the other side of a frame boundary.
-  globalThis.__pt_deliverMessage = (raw, origin, fromFrameId) => {
+  globalThis.__pt_deliverMessage = (raw, origin, fromFrameId, portIds) => {
     // The value arrives as a parsed literal; revive the same types from it.
     let data = raw;
     try { data = globalThis.__pt_cloneRevive ? __pt_cloneRevive(raw) : raw; } catch (e) {}
     const source = fromFrameId ? (__frames.get(fromFrameId) || {}).win || null : (globalThis.parent === globalThis ? null : globalThis.parent);
     const ev = {
       type: 'message', data, origin: String(origin || ''), lastEventId: '',
-      source, ports: [], isTrusted: true, target: globalThis, currentTarget: globalThis,
+      source, ports: Object.freeze(__receivePorts(portIds)), isTrusted: true, target: globalThis, currentTarget: globalThis,
     };
     try { globalThis.dispatchEvent && globalThis.dispatchEvent(ev); } catch (e) {}
   };
@@ -6985,8 +7039,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   globalThis.__pt_markAsFrame = (id) => {
     globalThis.__pt_frameId = id;
     const up = {
-      postMessage: (data) => {
-        __pushFrameOp({ op: 'post', data: __pt_cloneEncode(data), toParent: true });
+      postMessage: (data, targetOrigin, transfer) => {
+        __pushFrameOp({ op: 'post', data: __pt_cloneEncode(data), toParent: true,
+          ports: __transferPorts(__transferOf(targetOrigin, transfer)) });
       },
       get closed() { return false; },
       get frames() { return up; },

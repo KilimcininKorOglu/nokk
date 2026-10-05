@@ -7328,13 +7328,31 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     const cacheMode = String(opts.cache || 'default');
     if (cacheMode === 'no-cache' && !('cache-control' in hdrs)) hdrs['cache-control'] = 'max-age=0';
     else if ((cacheMode === 'no-store' || cacheMode === 'reload') && !('cache-control' in hdrs)) { hdrs['cache-control'] = 'no-cache'; hdrs['pragma'] = 'no-cache'; }
+    // Bytes travel as base64: `String(new Uint8Array(…))` is "1,2,3", which sent every
+    // binary body (reCAPTCHA's protobuf, a beacon's ArrayBuffer) as digits and commas.
+    let body = null, bodyB64 = false;
+    const b = opts.body;
+    if (b != null) {
+      let bytes = null;
+      if (b instanceof ArrayBuffer) bytes = new Uint8Array(b);
+      else if (ArrayBuffer.isView(b)) bytes = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+      if (bytes) {
+        let bin = '';
+        for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        body = globalThis.btoa(bin); bodyB64 = true;
+      } else if (typeof b !== 'string' && globalThis.__pt_blobParts && globalThis.__pt_blobParts(b)) {
+        body = b.__ptText();
+      } else {
+        body = String(b);
+      }
+    }
     const req = {
       id, url: String(url),
       method: (opts.method || 'GET').toUpperCase(),
       headers: hdrs,
       // A blob worker's requests carry no referrer.
       noReferrer: !!globalThis.__ptNoReferrer,
-      body: opts.body != null ? String(opts.body) : null,
+      body, bodyB64,
       // A frame granted access to its cookies marks its requests: the browser
       // adds a separate header to them.
       storageAccess: !!globalThis.__ptStorageAccess,
@@ -7914,7 +7932,8 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     const __MessagePort = globalThis.MessagePort = class MessagePort {
       constructor() {
         Object.defineProperty(this, '__pt', {
-          value: { peer: null, started: false, queue: [], onmessage: null, listeners: [] },
+          // `remote`: the other end lives in another frame; the engine carries the message.
+          value: { peer: null, remote: null, started: false, queue: [], onmessage: null, listeners: [] },
           enumerable: false,
         });
       }
@@ -7938,6 +7957,10 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       }
       close() { this.__pt.peer = null; }
       postMessage(data) {
+        if (this.__pt.remote && typeof globalThis.__pt_portOut === 'function') {
+          globalThis.__pt_portOut(this.__pt.remote, data);
+          return;
+        }
         const peer = this.__pt.peer;
         if (!peer) return;
         const ev = { type: 'message', data, origin: '', lastEventId: '', source: null, ports: [], isTrusted: true, target: peer, currentTarget: peer };
