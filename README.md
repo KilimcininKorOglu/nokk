@@ -16,7 +16,7 @@ AI agent a stealth browser.
 familiar shape to pass unnoticed. This one takes the shape of Chrome.</i></sub>
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 [![PyPI](https://img.shields.io/pypi/v/nokk.svg)](https://pypi.org/project/nokk/)
 [![npm](https://img.shields.io/npm/v/@koloss777/nokk.svg)](https://www.npmjs.com/package/@koloss777/nokk)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-yellow.svg)](#project-status)

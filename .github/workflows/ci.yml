@@ -1,0 +1,58 @@
+name: ci
+
+# Tests and lints on every push to main and every pull request. The rasterizer
+# features have their own workflow (render-tests.yml).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test + clippy (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build deps (BoringSSL needs clang + cmake)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config cmake
+
+      - name: Test
+        run: |
+          export LIBCLANG_PATH="$(dirname "$(find /usr/lib -name 'libclang.so*' | head -1)")"
+          cargo test --release --workspace
+
+      - name: Clippy
+        run: |
+          export LIBCLANG_PATH="$(dirname "$(find /usr/lib -name 'libclang.so*' | head -1)")"
+          cargo clippy --release --workspace --all-targets
+
+  msrv:
+    name: builds on the declared minimum Rust (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config cmake
+
+      # rust-toolchain.toml pins `stable`, so name the toolchain explicitly.
+      - name: Check
+        run: |
+          export LIBCLANG_PATH="$(dirname "$(find /usr/lib -name 'libclang.so*' | head -1)")"
+          cargo +1.88 check --workspace
