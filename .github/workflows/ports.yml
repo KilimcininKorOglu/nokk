@@ -1,10 +1,14 @@
 name: ports
 
 # Linux ARM64 and macOS Apple Silicon: build, test, smoke-run, keep the binary as an
-# artifact for testing on real hardware. Manual only until both are steadily green;
+# artifact for testing on real hardware. Manual (or on a change to this file) until
+# both are steadily green;
 # releases do not use it yet.
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/ports.yml]
 
 jobs:
   linux-arm64:
