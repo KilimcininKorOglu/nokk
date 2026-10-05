@@ -12686,7 +12686,8 @@ variationSettings,weight",
         .await
         .unwrap();
 
-        let out = pump_until(&ctx, "__ptJSON.stringify(__log)", 40).await;
+        // Windows retries a refused connect for about two seconds before giving up.
+        let out = pump_until(&ctx, "__ptJSON.stringify(__log)", 400).await;
         let log: Value = serde_json::from_str(out.as_str().unwrap()).unwrap();
         assert_eq!(
             log["events"].as_array().unwrap().len(),
