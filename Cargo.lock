@@ -1398,6 +1398,7 @@ dependencies = [
  "nokk-cdp",
  "nokk-net",
  "nokk-stealth",
+ "percent-encoding",
  "serde_json",
  "tokio",
  "tracing",

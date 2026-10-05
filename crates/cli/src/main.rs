@@ -195,12 +195,21 @@ fn parse_proxy(s: &str) -> Option<nokk_net::ProxyConfig> {
         "socks5" | "socks5h" => nokk_net::ProxyScheme::Socks5,
         _ => return None,
     };
+    // `url` drops a port equal to the scheme's default, so `http://host:80` reads as
+    // portless. A port written out counts; a missing one is still an error.
+    let port = u.port().or_else(|| {
+        let default = u.port_or_known_default()?;
+        let authority = s.split_once("://")?.1.split(['/', '?', '#']).next()?;
+        authority.ends_with(&format!(":{default}")).then_some(default)
+    })?;
+    // Userinfo comes percent-encoded (`p%40ss`); the proxy wants the real bytes.
+    let decode = |v: &str| percent_encoding::percent_decode_str(v).decode_utf8_lossy().into_owned();
     Some(nokk_net::ProxyConfig {
         scheme,
         host: u.host_str()?.to_string(),
-        port: u.port()?,
-        username: (!u.username().is_empty()).then(|| u.username().to_string()),
-        password: u.password().map(|p| p.to_string()),
+        port,
+        username: (!u.username().is_empty()).then(|| decode(u.username())),
+        password: u.password().map(decode),
     })
 }
 
@@ -397,12 +406,8 @@ impl Cli {
             pool.max_heap_mb = Some(mb.max(16)); // a tiny cap would fail instantly
         }
         let mut client = ClientConfig::default();
-        if let Some(spec) = &self.proxy {
-            match parse_proxy(spec) {
-                Some(p) => client.proxy = Some(p),
-                None => eprintln!("warning: could not parse --proxy '{spec}', ignoring"),
-            }
-        }
+        // Validated in `real_main`: a proxy that does not parse never gets here.
+        client.proxy = self.proxy.as_deref().and_then(parse_proxy);
         EngineConfig {
             pool,
             client,
@@ -454,6 +459,12 @@ fn main() -> Result<()> {
 
 async fn real_main() -> Result<()> {
     let cli = Cli::parse();
+    // Going direct when the proxy was meant would expose the real address.
+    if let Some(spec) = &cli.proxy {
+        if parse_proxy(spec).is_none() {
+            anyhow::bail!("--proxy '{spec}' is not scheme://[user:pass@]host:port (http, https, socks5, socks5h)");
+        }
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(&cli.log))
@@ -2952,6 +2963,17 @@ mod tests {
     fn parse_proxy_requires_explicit_port() {
         // No default-port inference — the proxy port must be given.
         assert!(parse_proxy("http://host.example").is_none());
+        // Written out, the scheme's default port counts (`url` hides it).
+        assert_eq!(parse_proxy("http://u:p@p.webshare.io:80").expect(":80").port, 80);
+        assert_eq!(parse_proxy("https://h.example:443/").expect(":443").port, 443);
+        assert!(parse_proxy("http://h.example:8080").is_some());
+    }
+
+    #[test]
+    fn parse_proxy_decodes_credentials() {
+        let p = parse_proxy("http://us%40er:p%3Ass%40@10.0.0.1:3128").expect("should parse");
+        assert_eq!(p.username.as_deref(), Some("us@er"));
+        assert_eq!(p.password.as_deref(), Some("p:ss@"));
     }
 
     #[test]

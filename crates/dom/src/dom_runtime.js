@@ -2038,15 +2038,31 @@
     get domain() { return (globalThis.location && globalThis.location.hostname) || globalThis.__pt_inheritedHost || ''; }
     set domain(v) { /* only ever narrowed to a parent domain; nothing to do here */ }
 
-    get cookie() { return this.__ptCookie; }
+    // One jar with the network, as in a browser: the engine keeps `__ptCookie` to
+    // what the jar holds for this document (HttpOnly left out), and a write goes
+    // to the jar before the page's next request leaves.
+    get cookie() { return this === globalThis.document ? this.__ptCookie : ''; }
     set cookie(v) {
-      const pair = String(v).split(';')[0];
+      if (this !== globalThis.document) return;
+      const raw = String(v);
+      const parts = raw.split(';');
+      const pair = parts[0].trim();
       const eq = pair.indexOf('=');
-      if (eq < 0) return;
-      const name = pair.slice(0, eq).trim();
+      const name = (eq < 0 ? '' : pair.slice(0, eq)).trim();
+      let gone = false;
+      for (const p of parts.slice(1)) {
+        const [k, ...rest] = p.split('=');
+        const key = k.trim().toLowerCase(), val = rest.join('=').trim();
+        // Script cannot set an HttpOnly cookie, nor a Secure one on plain http.
+        if (key === 'httponly') return;
+        if (key === 'secure' && globalThis.location && globalThis.location.protocol !== 'https:') return;
+        if (key === 'max-age' && Number(val) <= 0) gone = true;
+        if (key === 'expires') { const t = Date.parse(val); if (!isNaN(t) && t <= Date.now()) gone = true; }
+      }
+      __cookieOps.push(raw);
       const jar = this.__ptCookie ? this.__ptCookie.split('; ') : [];
-      const kept = jar.filter(c => c.split('=')[0] !== name);
-      kept.push(pair.trim());
+      const kept = jar.filter(c => (c.indexOf('=') < 0 ? '' : c.slice(0, c.indexOf('='))) !== name);
+      if (!gone) kept.push(pair);
       this.__ptCookie = kept.join('; ');
     }
 
@@ -2399,9 +2415,13 @@
   // prototypes, `self`). Only the port lives here: an outbound op queue and
   // message delivery back.
   const __workerOps = [];
+  // `document.cookie` writes, for the engine to put in the jar (see Document).
+  const __cookieOps = [];
   const __workers = new Map();
   let __nextWorkerId = 1;
   globalThis.__pt_drainWorkerQueue = () => __workerOps.splice(0);
+  globalThis.__pt_drainCookieQueue = () => __cookieOps.splice(0);
+  globalThis.__pt_setCookieMirror = (v) => { if (globalThis.document) globalThis.document.__ptCookie = v; };
   globalThis.__pt_workerMessage = (id, json) => {
     const W = __workers.get(id);
     if (!W || W.closed) return;

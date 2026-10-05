@@ -461,6 +461,11 @@ impl FingerprintClient {
         self.jar.snapshot()
     }
 
+    /// Store a cookie as if `Set-Cookie: <set_cookie>` had come from `url`.
+    pub fn set_cookie(&self, set_cookie: &str, url: &str) {
+        self.jar.add_set_cookie(set_cookie, url);
+    }
+
     /// The default Chrome profile we impersonate; must agree with the stealth JS
     /// profile (its UA / sec-ch-ua / `CHROME_MAJOR`). Newer emulations track
     /// Chrome's current TLS + request-header set more closely, and a stale version
@@ -847,6 +852,14 @@ impl Client {
         match self {
             Client::Stub(_) => Vec::new(),
             Client::Fingerprint(c) => c.cookies(),
+        }
+    }
+
+    /// Store a cookie as if `Set-Cookie: <set_cookie>` had come from `url`
+    /// (`document.cookie = …`). The stub has no jar.
+    pub fn set_cookie(&self, set_cookie: &str, url: &str) {
+        if let Client::Fingerprint(c) = self {
+            c.set_cookie(set_cookie, url);
         }
     }
 }

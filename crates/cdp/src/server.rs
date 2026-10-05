@@ -313,7 +313,7 @@ fn parse_proxy_server(s: &str) -> Option<ProxyConfig> {
         Some((a, hp)) => (Some(a), hp),
         None => (None, rest),
     };
-    let (host, port) = hostport.rsplit_once(':')?;
+    let (host, port) = hostport.trim_end_matches('/').rsplit_once(':')?;
     let port: u16 = port.parse().ok()?;
     let (username, password) = match auth {
         Some(a) => match a.split_once(':') {
@@ -2275,6 +2275,7 @@ mod tests {
             .is_none());
         assert!(super::parse_proxy_server("ftp://h:1").is_none());
         assert!(super::parse_proxy_server("no-port").is_none());
+        assert_eq!(super::parse_proxy_server("http://p.webshare.io:80/").unwrap().port, 80);
     }
 
     #[tokio::test]

@@ -1640,6 +1640,7 @@ impl BrowserContext {
         // Install the parsed tree as `document`.
         self.eval_in(index, &install).await?;
         tracing::debug!(target: "nokk::load", ms = t_parse.elapsed().as_millis() as u64, "document installed");
+        self.sync_cookie_mirror(index, base_url).await;
         if let Some(csp) = self.document_csp(base_url) {
             let js = format!("try {{ if (typeof __pt_applyCsp === 'function') __pt_applyCsp({}, 'header'); }} catch (e) {{}}", js_str(&csp));
             let _ = self.eval_in(index, &js).await;
@@ -1955,6 +1956,7 @@ impl BrowserContext {
             let frame_ops: Vec<Value> = queues["frames"].as_array().cloned().unwrap_or_default();
             let script_ops: Vec<Value> = queues["scripts"].as_array().cloned().unwrap_or_default();
             let nav_ops: Vec<Value> = queues["nav"].as_array().cloned().unwrap_or_default();
+            let cookie_ops: Vec<Value> = queues["cookies"].as_array().cloned().unwrap_or_default();
             let worker_ops: Vec<Value> = queues["workers"].as_array().cloned().unwrap_or_default();
             self.log_console("page", &queues);
             // How long until the page's next timer, straight from the same queue
@@ -1969,6 +1971,10 @@ impl BrowserContext {
 
             // 3. Sockets: apply what the page asked for, then hand it whatever the
             //    sockets have produced since the last round.
+            // Cookie writes first: the requests and the navigation below carry them.
+            if self.apply_cookie_ops(&base, &cookie_ops) {
+                self.sync_cookie_mirror(index, &base).await;
+            }
             self.apply_ws_ops(&base, &ws_ops).await;
             let delivered = self.deliver_ws_events(index).await?;
 
@@ -2072,6 +2078,10 @@ impl BrowserContext {
                         }
                     }
                 }
+            }
+            // A response's Set-Cookie is in the jar before the page sees the response.
+            if !settles.is_empty() && index == self.idx() {
+                self.sync_cookie_mirror(index, &base).await;
             }
             for settle in settles {
                 let (w, raw) = self.route(index);
@@ -2217,6 +2227,50 @@ impl BrowserContext {
     ///
     /// This is the only way to export a warmed session (a `cf_clearance`, an
     /// Akamai `bm_s*`) to another process: `document.cookie` cannot see any of it.
+    /// What `document.cookie` reads at `url`: the jar's cookies for it, HttpOnly
+    /// left out (and Secure ones on plain http), longer paths first as Chrome lists them.
+    fn document_cookie_for(&self, url: &str) -> String {
+        let Ok(u) = url::Url::parse(url) else { return String::new() };
+        if !matches!(u.scheme(), "http" | "https") {
+            return String::new();
+        }
+        let https = u.scheme() == "https";
+        let mut v: Vec<CookieRecord> = self
+            .cookies(&[url.to_string()])
+            .into_iter()
+            .filter(|c| !c.http_only && (https || !c.secure))
+            .collect();
+        v.sort_by_key(|c| std::cmp::Reverse(c.path.as_deref().unwrap_or("/").len()));
+        v.iter().map(|c| format!("{}={}", c.name, c.value)).collect::<Vec<_>>().join("; ")
+    }
+
+    /// Bring the document's `document.cookie` to what the jar holds.
+    async fn sync_cookie_mirror(&self, index: usize, url: &str) {
+        let js = format!(
+            "typeof __pt_setCookieMirror === 'function' && __pt_setCookieMirror({})",
+            js_str(&self.document_cookie_for(url))
+        );
+        let _ = self.eval_in(index, &js).await;
+    }
+
+    /// Put the page's `document.cookie` writes in the jar, before its next request.
+    /// A script cannot replace an HttpOnly cookie. True if anything was stored.
+    fn apply_cookie_ops(&self, url: &str, ops: &[Value]) -> bool {
+        if !url.starts_with("http") {
+            return false;
+        }
+        let mut stored = false;
+        for raw in ops.iter().filter_map(Value::as_str) {
+            let name = raw.split(';').next().unwrap_or("").split('=').next().unwrap_or("").trim();
+            if self.cookies(&[url.to_string()]).iter().any(|c| c.http_only && c.name == name) {
+                continue;
+            }
+            self.client.set_cookie(raw, url);
+            stored = true;
+        }
+        stored
+    }
+
     pub fn cookies(&self, urls: &[String]) -> Vec<CookieRecord> {
         let all = self.client.cookies();
         if urls.is_empty() {
@@ -4026,6 +4080,11 @@ impl BrowserContext {
             }
             let base = self.frame_base(id);
             self.log_console(&format!("frame {id}"), &queues);
+            if let Some(ops) = queues["cookies"].as_array() {
+                if self.apply_cookie_ops(&base, ops) {
+                    self.sync_cookie_mirror(index, &base).await;
+                }
+            }
 
             // A frame learns its size more than once: styles arrive after insertion and the
             // element can change. A browser then resizes the frame window; do the same until it settles.
@@ -4334,6 +4393,9 @@ impl BrowserContext {
                     // A browser adds the resource entry before the page learns of the response
                     // (load/then), so flush first.
                     self.flush_resource_timings(index).await;
+                    if index == self.idx() {
+                        self.sync_cookie_mirror(index, &self.document_url()).await;
+                    }
                     let _ = self.eval_in(index, &settle).await;
                 }
                 Deliver::Worker(place, child) => {
@@ -4819,6 +4881,7 @@ const DRAIN_IO: &str = "__ptJSON.stringify({\
     scripts: typeof __pt_drainScriptQueue === 'function' ? __pt_drainScriptQueue() : [],\
     nav: typeof __pt_drainNavQueue === 'function' ? __pt_drainNavQueue() : [],\
     workers: typeof __pt_drainWorkerQueue === 'function' ? __pt_drainWorkerQueue() : [],\
+    cookies: typeof __pt_drainCookieQueue === 'function' ? __pt_drainCookieQueue() : [],\
     console: typeof __pt_drainConsole === 'function' ? __pt_drainConsole() : [],\
     timers: typeof __pt_nextTimerDelay === 'function' ? __pt_nextTimerDelay() : -1})";
 
@@ -9505,6 +9568,62 @@ mod tests {
                 "{how} must land on the new document, not just change the address"
             );
         }
+    }
+
+    /// `document.cookie` and the network share one jar, as in a browser. They were two:
+    /// the page never saw a header cookie, and a cookie set from script never left with
+    /// a request, which breaks every challenge that sets a cookie and reloads (Google's
+    /// SearchGuard among them).
+    #[tokio::test]
+    async fn document_cookie_and_the_network_share_one_jar() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if req.starts_with("GET /echo") {
+                        let cookie = req.lines().find_map(|l| l.strip_prefix("cookie: ").or_else(|| l.strip_prefix("Cookie: "))).unwrap_or("").to_string();
+                        format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{cookie}", cookie.len())
+                    } else {
+                        let body = "<html><body>x</body></html>";
+                        format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\nSet-Cookie: hdr=h1; Path=/\r\nSet-Cookie: ho=secret; Path=/; HttpOnly\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&format!("http://127.0.0.1:{}/", addr.port())).await.unwrap();
+        assert_eq!(ctx.evaluate("document.cookie").await.unwrap(), Value::String("hdr=h1".into()), "a header cookie is visible, an HttpOnly one is not");
+        ctx.evaluate(r#"(() => {
+            document.cookie = 'js=v; path=/';
+            document.cookie = 'hdr=; max-age=0; path=/';
+            document.cookie = 'ho=hack; path=/; HttpOnly';
+            fetch('/echo').then(r => r.text()).then(t => { globalThis.__sent = t; });
+        })()"#).await.unwrap();
+        for _ in 0..50 {
+            ctx.run_event_loop().await.unwrap();
+            if ctx.evaluate("typeof __sent").await.unwrap() == Value::String("string".into()) {
+                break;
+            }
+        }
+        let sent = ctx.evaluate("__sent").await.unwrap();
+        let sent = sent.as_str().unwrap_or_default();
+        assert!(sent.contains("js=v"), "a script cookie leaves with the next request: {sent}");
+        assert!(sent.contains("ho=secret"), "script cannot replace an HttpOnly cookie: {sent}");
+        assert!(!sent.contains("hdr="), "an expired write deletes: {sent}");
+        assert_eq!(ctx.evaluate("document.cookie").await.unwrap(), Value::String("js=v".into()));
     }
 
     /// A host that accepts and never answers must not hold the page: in Chrome a hung
