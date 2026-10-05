@@ -533,7 +533,9 @@ impl Conn {
                         json!({ "context": {
                             "id": frame_ctx_id(f.id), "origin": f.origin, "name": "",
                             "uniqueId": format!("{}.1", frame_ctx_id(f.id)),
-                            "auxData": { "isDefault": false, "type": "default", "frameId": fid },
+                            // The frame's main world: `isDefault` is what Playwright and
+                            // Puppeteer wait for before `frame.evaluate`, as Chrome sends it.
+                            "auxData": { "isDefault": true, "type": "default", "frameId": fid },
                         }}),
                     ),
                 ] {
@@ -1230,6 +1232,22 @@ impl Conn {
                     let _ = tx.send(Message::Text(m.to_string()));
                 });
                 vec![]
+            }
+            // The page's frames with the execution context each evaluates in: for
+            // `Runtime.evaluate { contextId }` into a frame (a widget's challenge frame)
+            // without tracking context events.
+            "Nokk.frames" => {
+                let target_id = self.targets[idx].target_id.clone();
+                let frames: Vec<Value> = self.targets[idx]
+                    .ctx
+                    .frame_list()
+                    .iter()
+                    .map(|f| json!({
+                        "frameId": child_frame_id(&target_id, f.id), "url": f.url,
+                        "origin": f.origin, "executionContextId": frame_ctx_id(f.id),
+                    }))
+                    .collect();
+                vec![ok(id, &session, json!({ "frames": frames }))]
             }
             "Nokk.challengeState" => {
                 let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
