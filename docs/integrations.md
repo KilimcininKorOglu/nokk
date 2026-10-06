@@ -10,6 +10,8 @@ and the pages it visits see Chrome 151 on Linux, Cloudflare's challenges include
 Its own Chromium is stopped by Cloudflare ("Blocked by anti-bot protection"); with
 nokk the same crawl gets the page behind the challenge. Needs nokk 0.1.37 or newer.
 
+<img src="crawl4ai-demo.svg" alt="crawl4ai with its own Chromium is blocked by Cloudflare; the same crawl through nokk gets the page" width="760">
+
 ```python
 import asyncio, nokk
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
