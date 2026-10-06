@@ -195,15 +195,16 @@ class NokkServer:
     also registered to shut down at interpreter exit as a safety net.
     """
 
-    def __init__(self, process: "subprocess.Popen[bytes]", host: str, port: int):
+    def __init__(self, process: "subprocess.Popen[bytes]", host: str, port: int, token: Optional[str] = None):
         self._process = process
         self.host = host
         self.port = port
+        self._query = f"?token={token}" if token else ""
 
     @property
     def ws_endpoint(self) -> str:
         """``browserWSEndpoint`` to pass to ``connect_over_cdp`` / ``connect``."""
-        return f"ws://{self.host}:{self.port}/devtools/browser/nokk"
+        return f"ws://{self.host}:{self.port}/devtools/browser/nokk{self._query}"
 
     @property
     def http_endpoint(self) -> str:
@@ -216,7 +217,7 @@ class NokkServer:
     def _wait_until_ready(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
         last_err: Optional[BaseException] = None
-        url = f"{self.http_endpoint}/json/version"
+        url = f"{self.http_endpoint}/json/version{self._query}"
         while time.monotonic() < deadline:
             code = self._process.poll()
             if code is not None:
@@ -313,8 +314,9 @@ def launch(
         auto_solve=auto_solve,
         args=args,
     )
-    process = subprocess.Popen(cmd, env=_merged_env(env))
-    server = NokkServer(process, host, resolved_port)
+    child_env = _merged_env(env)
+    process = subprocess.Popen(cmd, env=child_env)
+    server = NokkServer(process, host, resolved_port, child_env.get("NOKK_TOKEN") or None)
     try:
         server._wait_until_ready(timeout)
     except BaseException:
@@ -329,7 +331,7 @@ def launch(
 # --------------------------------------------------------------------------- #
 
 
-async def _ready_async(host: str, port: int, timeout: float) -> bool:
+async def _ready_async(host: str, port: int, timeout: float, query: str = "") -> bool:
     """Whether the CDP HTTP endpoint answers 200, without blocking the loop."""
     try:
         reader, writer = await asyncio.wait_for(
@@ -339,7 +341,7 @@ async def _ready_async(host: str, port: int, timeout: float) -> bool:
         return False
     try:
         writer.write(
-            f"GET /json/version HTTP/1.0\r\nHost: {host}:{port}\r\n"
+            f"GET /json/version{query} HTTP/1.0\r\nHost: {host}:{port}\r\n"
             f"Connection: close\r\n\r\n".encode()
         )
         await writer.drain()
@@ -359,14 +361,15 @@ class AsyncNokkServer:
     Returned by :func:`launch_async`. Use ``async with`` or :meth:`aclose`.
     """
 
-    def __init__(self, process: "asyncio.subprocess.Process", host: str, port: int):
+    def __init__(self, process: "asyncio.subprocess.Process", host: str, port: int, token: Optional[str] = None):
         self._process = process
         self.host = host
         self.port = port
+        self._query = f"?token={token}" if token else ""
 
     @property
     def ws_endpoint(self) -> str:
-        return f"ws://{self.host}:{self.port}/devtools/browser/nokk"
+        return f"ws://{self.host}:{self.port}/devtools/browser/nokk{self._query}"
 
     @property
     def http_endpoint(self) -> str:
@@ -384,7 +387,7 @@ class AsyncNokkServer:
                 raise RuntimeError(
                     f"nokk exited before becoming ready (code {self._process.returncode})"
                 )
-            if await _ready_async(self.host, self.port, 1.0):
+            if await _ready_async(self.host, self.port, 1.0, self._query):
                 return
             await asyncio.sleep(0.05)
         raise TimeoutError(f"nokk did not become ready within {timeout:.1f}s")
@@ -448,8 +451,9 @@ async def launch_async(
         auto_solve=auto_solve,
         args=args,
     )
-    process = await asyncio.create_subprocess_exec(*cmd, env=_merged_env(env))
-    server = AsyncNokkServer(process, host, resolved_port)
+    child_env = _merged_env(env)
+    process = await asyncio.create_subprocess_exec(*cmd, env=child_env)
+    server = AsyncNokkServer(process, host, resolved_port, child_env.get("NOKK_TOKEN") or None)
     try:
         await server._wait_until_ready(timeout)
     except BaseException:

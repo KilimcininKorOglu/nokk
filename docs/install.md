@@ -11,6 +11,19 @@ docker run --rm -p 9222:9222 ghcr.io/koloss777/nokk:latest
 ```
 
 That starts the CDP server; point Puppeteer at `ws://localhost:9222/devtools/browser/nokk`.
+
+The image listens on all interfaces, so anyone who can reach the port can drive the
+browser: open any address from your machine and read its sessions. Anywhere but your
+own laptop, give it a token, and connect with it:
+
+```bash
+docker run --rm -p 9222:9222 -e NOKK_TOKEN="$(openssl rand -hex 16)" ghcr.io/koloss777/nokk:latest
+# ws://localhost:9222/devtools/browser/nokk?token=<the token>   (or Authorization: Bearer <the token>)
+```
+
+Without a token nokk prints a warning when it listens beyond loopback. The `--token`
+flag does the same as `NOKK_TOKEN`, and the Python and npm wrappers pass a
+`NOKK_TOKEN` from their environment through to the endpoint they return.
 One-shot modes work too — just override the args:
 
 ```bash

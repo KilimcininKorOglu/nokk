@@ -80,6 +80,28 @@ pub struct ServerConfig {
     /// one, with this much time; `None` leaves navigation as it is (a context
     /// created with `autoSolve: true` still solves).
     pub auto_solve: Option<std::time::Duration>,
+    /// Required from every client when set: `?token=` on the URL or an
+    /// `Authorization: Bearer` header. Whoever reaches the port drives the browser,
+    /// so a server bound beyond loopback should have one.
+    pub token: Option<String>,
+}
+
+/// Whether the request carries the configured token. Constant time over the token.
+fn authorized(head: &str, path: &str, token: Option<&str>) -> bool {
+    let Some(want) = token else { return true };
+    let eq = |got: &str| {
+        got.len() == want.len()
+            && got.bytes().zip(want.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+    };
+    let from_query = path
+        .split_once('?')
+        .map(|(_, q)| q.split('&').filter_map(|kv| kv.strip_prefix("token=")).any(eq))
+        .unwrap_or(false);
+    let from_header = header(head, "authorization")
+        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+        .map(|t| eq(t.trim()))
+        .unwrap_or(false);
+    from_query || from_header
 }
 
 /// How long an automatic solve may take when the caller named no budget.
@@ -91,14 +113,16 @@ pub async fn serve(engine: Engine, config: ServerConfig) -> std::io::Result<()> 
     let listener = TcpListener::bind(config.addr).await?;
     let port = config.addr.port();
     let auto_solve = config.auto_solve;
+    let token: Option<std::sync::Arc<str>> = config.token.as_deref().map(std::sync::Arc::from);
     let registry = TargetRegistry::default();
     tracing::info!(%config.addr, "CDP server listening — ws://{}/devtools/browser/nokk", config.addr);
     loop {
         let (stream, peer) = listener.accept().await?;
         let engine = engine.clone();
         let registry = registry.clone();
+        let token = token.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, engine, port, registry, auto_solve).await {
+            if let Err(e) = handle_conn(stream, engine, port, registry, auto_solve, token.as_deref()).await {
                 tracing::debug!(%peer, error = %e, "cdp connection ended");
             }
         });
@@ -134,17 +158,27 @@ async fn handle_conn(
     port: u16,
     registry: TargetRegistry,
     auto_solve: Option<std::time::Duration>,
+    token: Option<&str>,
 ) -> std::io::Result<()> {
     let head = read_head(&mut stream).await?;
     let request_line = head.lines().next().unwrap_or("");
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+    if !authorized(&head, path, token) {
+        let body = r#"{"error":"a token is required: ?token=... or Authorization: Bearer ..."}"#;
+        let resp = format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(resp.as_bytes()).await?;
+        return Ok(());
+    }
 
     let is_ws = header(&head, "upgrade")
         .map(|u| u.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
 
     if !is_ws {
-        return serve_http(&mut stream, path, port, &registry).await;
+        return serve_http(&mut stream, path, port, &registry, token).await;
     }
 
     // WebSocket upgrade handshake.
@@ -171,8 +205,15 @@ async fn serve_http(
     path: &str,
     port: u16,
     registry: &TargetRegistry,
+    token: Option<&str>,
 ) -> std::io::Result<()> {
     let ws_url = format!("ws://127.0.0.1:{port}/devtools/browser/nokk");
+    // The addresses handed out carry the token, so a client that found the server
+    // through discovery can connect.
+    let ws_url = match token {
+        Some(t) => format!("{ws_url}?token={t}"),
+        None => ws_url,
+    };
     let body = match path {
         p if p.starts_with("/json/version") => json!({
             "Browser": "Chrome/148.0.0.0",
@@ -185,8 +226,14 @@ async fn serve_http(
         // The real page list. Every entry's debugger URL is the browser endpoint:
         // nokk uses CDP's flatten model, where one browser socket carries every
         // page and a client picks a page with `Target.attachToTarget`.
-        p if p.starts_with("/json/list") || p == "/json" || p == "/json/" => {
-            json!(registry.list())
+        p if p.starts_with("/json/list") || p == "/json" || p.starts_with("/json?") || p == "/json/" => {
+            let mut list = json!(registry.list());
+            if let Some(entries) = list.as_array_mut() {
+                for e in entries {
+                    e["webSocketDebuggerUrl"] = json!(ws_url);
+                }
+            }
+            list
         }
         // Creating a page without a connection to own it is not something this
         // server can do — pages live and die with the CDP connection that opened
@@ -2292,6 +2339,20 @@ mod tests {
     fn has_event(out: &[Value], method: &str) -> bool {
         out.iter()
             .any(|m| m.get("method").and_then(|v| v.as_str()) == Some(method))
+    }
+
+    #[test]
+    fn a_token_is_checked_on_the_url_or_the_header() {
+        let head = "GET /json/version HTTP/1.1\r\nHost: x\r\n";
+        assert!(super::authorized(head, "/json/version", None), "no token configured: open");
+        assert!(!super::authorized(head, "/json/version", Some("s3cret")));
+        assert!(super::authorized(head, "/json/version?token=s3cret", Some("s3cret")));
+        assert!(super::authorized(head, "/devtools/browser/nokk?a=1&token=s3cret", Some("s3cret")));
+        assert!(!super::authorized(head, "/json/version?token=s3cre", Some("s3cret")));
+        let bearer = "GET /devtools/browser/nokk HTTP/1.1\r\nAuthorization: Bearer s3cret\r\n";
+        assert!(super::authorized(bearer, "/devtools/browser/nokk", Some("s3cret")));
+        let wrong = "GET / HTTP/1.1\r\nAuthorization: Bearer nope\r\n";
+        assert!(!super::authorized(wrong, "/", Some("s3cret")));
     }
 
     #[test]

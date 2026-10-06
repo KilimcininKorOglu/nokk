@@ -44,9 +44,9 @@ function freePort(host) {
   });
 }
 
-function ready(host, port) {
+function ready(host, port, query) {
   return new Promise((resolve) => {
-    const req = http.get(`http://${host}:${port}/json/version`, (r) => {
+    const req = http.get(`http://${host}:${port}/json/version${query || ""}`, (r) => {
       r.resume();
       resolve(r.statusCode === 200);
     });
@@ -62,14 +62,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** A running nokk CDP server. Returned by {@link launch}. */
 class NokkServer {
-  constructor(proc, host, port) {
+  constructor(proc, host, port, token) {
     this._proc = proc;
     this.host = host;
     this.port = port;
+    this._query = token ? `?token=${token}` : "";
   }
   /** browserWSEndpoint for puppeteer.connect / chromium.connectOverCDP. */
   get wsEndpoint() {
-    return `ws://${this.host}:${this.port}/devtools/browser/nokk`;
+    return `ws://${this.host}:${this.port}/devtools/browser/nokk${this._query}`;
   }
   get httpEndpoint() {
     return `http://${this.host}:${this.port}`;
@@ -134,11 +135,10 @@ async function launch(opts = {}) {
   else if (typeof opts.autoSolve === "number") args.push("--auto-solve", String(opts.autoSolve));
   if (opts.args) args.push(...opts.args);
 
-  const proc = spawn(binaryPath(), args, {
-    stdio: opts.stdio || "inherit",
-    env: { ...process.env, ...(opts.env || {}) },
-  });
-  const server = new NokkServer(proc, host, port);
+  const env = { ...process.env, ...(opts.env || {}) };
+  const proc = spawn(binaryPath(), args, { stdio: opts.stdio || "inherit", env });
+  // A NOKK_TOKEN in the child's environment guards its CDP port: carry it along.
+  const server = new NokkServer(proc, host, port, env.NOKK_TOKEN || "");
 
   const timeout = opts.timeout != null ? opts.timeout : 30000;
   const deadline = Date.now() + timeout;
@@ -151,7 +151,7 @@ async function launch(opts = {}) {
     if (proc.exitCode !== null) {
       throw new Error(`nokk exited before becoming ready (code ${proc.exitCode})`);
     }
-    if (await ready(host, port)) {
+    if (await ready(host, port, server._query)) {
       process.once("exit", killOnExit); // safety net
       return server;
     }

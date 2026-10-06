@@ -34,6 +34,13 @@ struct Cli {
     #[arg(long, env = "NOKK_HOST", default_value = "127.0.0.1")]
     host: std::net::IpAddr,
 
+    /// Require this token from every CDP client: `ws://…/devtools/browser/nokk?token=…`
+    /// or `Authorization: Bearer …`. Whoever reaches the port can browse from this
+    /// machine and read its sessions, so set one when the server is reachable from
+    /// other hosts. Use URL-safe characters.
+    #[arg(long, env = "NOKK_TOKEN", value_name = "TOKEN")]
+    token: Option<String>,
+
     /// Maximum number of isolate worker threads. The pool starts with one and
     /// grows only when every live worker already carries a context; a worker
     /// whose last context closed drains again. Defaults to available parallelism
@@ -2913,12 +2920,21 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
     } else {
         cli.host
     };
+    let token = cli.token.clone().filter(|t| !t.is_empty());
+    let query = token.as_ref().map(|t| format!("?token={t}")).unwrap_or_default();
     println!(
-        "CDP server on ws://{advertise}:{}/devtools/browser/nokk",
+        "CDP server on ws://{advertise}:{}/devtools/browser/nokk{query}",
         cli.port
     );
-    println!("  Puppeteer: puppeteer.connect({{ browserWSEndpoint: 'ws://{advertise}:{}/devtools/browser/nokk' }})", cli.port);
-    nokk_cdp::serve(engine, nokk_cdp::ServerConfig { addr, auto_solve: cli.auto_solve.map(Duration::from_secs) }).await?;
+    println!("  Puppeteer: puppeteer.connect({{ browserWSEndpoint: 'ws://{advertise}:{}/devtools/browser/nokk{query}' }})", cli.port);
+    if token.is_none() && !cli.host.is_loopback() {
+        eprintln!(
+            "warning: the CDP server listens on {} without a token; anyone who reaches the port \
+             can browse from this machine and read its sessions. Set --token or NOKK_TOKEN.",
+            cli.host
+        );
+    }
+    nokk_cdp::serve(engine, nokk_cdp::ServerConfig { addr, auto_solve: cli.auto_solve.map(Duration::from_secs), token }).await?;
     Ok(())
 }
 

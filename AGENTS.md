@@ -66,7 +66,8 @@ cargo clippy --release --workspace --all-targets
   `read_text`, `read_html`, `click`, `fill`, `evaluate`, `links`, `reset`.
 - **CDP:** run `nokk --port 9222 --auto-solve` and connect to
   `ws://127.0.0.1:9222/devtools/browser/nokk`. Use the `ws://` address: an
-  `http://` one goes through `HTTP_PROXY` if that is set.
+  `http://` one goes through `HTTP_PROXY` if that is set. A server started with `--token`
+  (or `NOKK_TOKEN`) wants `?token=…` on that address.
 - **Frames:** `Nokk.frames` lists frames with their `executionContextId` for
   `Runtime.evaluate { contextId }`.
 - **Challenges:** `Nokk.challengeState` and `Nokk.solveChallenge` report and clear
