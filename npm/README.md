@@ -84,7 +84,7 @@ const state = await nokk.challengeState(page);
 // { kind: "cloudflare-interstitial" | "turnstile-widget" | "datadome" | "none", solvable, … }
 if (state.solvable) {
   const r = await nokk.solveChallenge(page, { timeout: 30000 });
-  // { status: "cleared" | "token-issued" | "cleared-but-stuck" | "timeout", solved, presses, remaining, … }
+  // { status: "cleared" | "token-issued" | "cleared-but-stuck" | "timeout" | "needs-human", solved, presses, remaining, … }
 }
 ```
 

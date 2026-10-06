@@ -59,7 +59,7 @@ export type ChallengeKind =
   | "turnstile-widget"
   | "datadome";
 
-export type ChallengeStatus = "cleared" | "token-issued" | "cleared-but-stuck" | "timeout";
+export type ChallengeStatus = "cleared" | "token-issued" | "cleared-but-stuck" | "timeout" | "needs-human" | "none";
 
 export interface ChallengeState {
   kind: ChallengeKind;

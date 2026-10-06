@@ -1190,6 +1190,9 @@ pub enum ChallengeStatus {
     Timeout,
     /// The page showed no gate at all: nothing to solve.
     NoChallenge,
+    /// The press was answered with a task for a person (reCAPTCHA's image or audio
+    /// puzzle, or its "try again later"): waiting out the budget changes nothing.
+    NeedsHuman,
 }
 
 impl ChallengeStatus {
@@ -1200,6 +1203,7 @@ impl ChallengeStatus {
             ChallengeStatus::ClearedButStuck => "cleared-but-stuck",
             ChallengeStatus::Timeout => "timeout",
             ChallengeStatus::NoChallenge => "none",
+            ChallengeStatus::NeedsHuman => "needs-human",
         }
     }
     pub fn is_success(&self) -> bool {
@@ -2650,6 +2654,8 @@ impl BrowserContext {
         // jar may be the stale cookie that sent us to the gate.
         let lock_at_start = self.clearance_value();
         let mut gate_checked = t - std::time::Duration::from_secs(1);
+        let mut last_press: Option<std::time::Instant> = None;
+        let mut puzzle_checked = t;
         let status = loop {
             let worked = self.run_event_loop().await.unwrap_or(0);
             let cleared = self.cookies(&[]).iter().any(|c| c.name == "cf_clearance");
@@ -2709,6 +2715,18 @@ impl BrowserContext {
                 tracing::warn!(target: "nokk", presses = pressed, "challenge did not clear in time");
                 break ChallengeStatus::Timeout;
             }
+            // A pressed reCAPTCHA that answers with a puzzle is not going to clear by
+            // itself. Give a checkbox-only pass its moment, then stop.
+            if pressed > 0
+                && last_press.is_some_and(|at| at.elapsed() >= std::time::Duration::from_secs(2))
+                && puzzle_checked.elapsed() >= std::time::Duration::from_millis(500)
+            {
+                puzzle_checked = std::time::Instant::now();
+                if self.recaptcha_wants_a_person().await {
+                    tracing::info!(target: "nokk", elapsed_ms = t.elapsed().as_millis(), presses = pressed, "the widget asks for a person");
+                    break ChallengeStatus::NeedsHuman;
+                }
+            }
             // Press only what is offered, once per control that appears: a
             // widget that ignores a press is not asking for another, and a
             // flurry of clicks is its own signature.
@@ -2716,6 +2734,7 @@ impl BrowserContext {
                 if let Ok(Some(what)) = self.press_widget_control().await {
                     if seen_controls.insert(what.clone()) {
                         pressed += 1;
+                        last_press = Some(std::time::Instant::now());
                         tracing::info!(target: "nokk", control = %what, "pressed the challenge widget");
                         // The second and a half after a press is work, not sleep:
                         // the widget counts in exactly that window, and an engine
@@ -2913,6 +2932,23 @@ impl BrowserContext {
             self.settle(std::time::Duration::from_millis(60 + (seed >> 8) % 140)).await;
         }
         Ok(true)
+    }
+
+    /// Whether a reCAPTCHA challenge frame shows a task for a person: the image
+    /// grid, the audio task, or the "try again later" refusal.
+    async fn recaptcha_wants_a_person(&self) -> bool {
+        const JS: &str = "!!document.querySelector('.rc-imageselect-challenge .rc-imageselect-tile, .rc-imageselect-target, .rc-audiochallenge-response-field, .rc-doscaptcha-header')";
+        for f in self.frame_list() {
+            if !f.url.contains("/recaptcha/") || !f.url.contains("/bframe") {
+                continue;
+            }
+            if let Ok(v) = self.evaluate_in_frame(f.id, JS).await {
+                if v.as_bool() == Some(true) || v.as_str() == Some("true") {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub async fn press_widget_control(&self) -> Result<Option<String>, EngineError> {

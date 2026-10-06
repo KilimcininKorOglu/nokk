@@ -114,7 +114,7 @@ state = nokk.challenge_state(page)
 # {"kind": "cloudflare-interstitial" | "turnstile-widget" | "datadome" | "none", "solvable": …}
 if state["solvable"]:
     r = nokk.solve_challenge(page, timeout=30)
-    # {"status": "cleared" | "token-issued" | "cleared-but-stuck" | "timeout", "solved": …, "presses": …}
+    # {"status": "cleared" | "token-issued" | "cleared-but-stuck" | "timeout" | "needs-human", "solved": …, "presses": …}
 ```
 
 Nobody passes selectors: the engine finds and presses the checkbox itself.

@@ -54,7 +54,7 @@ const state = await session.send('Nokk.challengeState');
 // → { kind: 'cloudflare-interstitial' | 'turnstile-widget' | 'recaptcha-widget' | 'datadome' | 'none',
 //     title, url, cleared, token, solvable }
 const out = await session.send('Nokk.solveChallenge', { timeoutMs: 30000 });
-// → { status: 'cleared' | 'token-issued' | 'cleared-but-stuck' | 'timeout', solved,
+// → { status: 'cleared' | 'token-issued' | 'cleared-but-stuck' | 'timeout' | 'needs-human', solved,
 //     presses, elapsedMs, remaining, title, url }
 ```
 
