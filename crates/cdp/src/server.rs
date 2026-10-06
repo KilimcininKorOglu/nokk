@@ -345,6 +345,53 @@ struct BrowserContextCfg {
     /// `autoSolve` (non-standard param): solve challenges on navigation for
     /// pages of this context, regardless of the server-wide setting.
     auto_solve: Option<bool>,
+    /// Cookies set on the context before it had a page (`Storage.setCookies`,
+    /// Playwright's `addCookies`), stored when its first page is created.
+    pending_cookies: Vec<(String, String)>,
+}
+
+/// A CDP cookie param (`Network.CookieParam`) as a `Set-Cookie` line and the URL
+/// it is set from. Without `url`, the URL is built from `domain` and `path`.
+fn cookie_param(c: &Value) -> Option<(String, String)> {
+    let name = c.get("name")?.as_str()?;
+    let value = c.get("value").and_then(|v| v.as_str()).unwrap_or("");
+    let domain = c.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+    let path = c.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+    let secure = c.get("secure").and_then(|v| v.as_bool()).unwrap_or(false);
+    let url = match c.get("url").and_then(|v| v.as_str()) {
+        Some(u) => u.to_string(),
+        None if !domain.is_empty() => format!(
+            "{}://{}{}",
+            if secure { "https" } else { "http" },
+            domain.trim_start_matches('.'),
+            path
+        ),
+        None => return None,
+    };
+    let mut line = format!("{name}={value}; Path={path}");
+    if domain.starts_with('.') {
+        line.push_str(&format!("; Domain={domain}"));
+    }
+    if secure {
+        line.push_str("; Secure");
+    }
+    if c.get("httpOnly").and_then(|v| v.as_bool()).unwrap_or(false) {
+        line.push_str("; HttpOnly");
+    }
+    if let Some(ss) = c.get("sameSite").and_then(|v| v.as_str()) {
+        line.push_str(&format!("; SameSite={ss}"));
+    }
+    if let Some(exp) = c.get("expires").and_then(|v| v.as_f64()).filter(|e| *e > 0.0) {
+        line.push_str(&format!("; Max-Age={}", (exp - now_secs()).max(0.0) as i64));
+    }
+    Some((line, url))
+}
+
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 /// Parse a CDP `proxyServer` string (`scheme://[user:pass@]host:port`, scheme
@@ -747,6 +794,29 @@ impl Conn {
             // the catch-all and hand back `{}`, crashing the client on
             // `undefined.map`. Cookies come from the pages of the browser context
             // named in the params, or from every page when none is named.
+            // Playwright's `addCookies`: at browser level, for a browser context that
+            // may not have a page yet. Its pages share one jar, so one page is enough;
+            // with none, the cookies wait for the first.
+            "Storage.setCookies" if browser_level => {
+                let want = params.get("browserContextId").and_then(|v| v.as_str()).map(String::from);
+                let cookies: Vec<(String, String)> = params
+                    .get("cookies")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(cookie_param).collect())
+                    .unwrap_or_default();
+                match self.targets.iter().find(|t| t.browser_context_id == want) {
+                    Some(t) => {
+                        for (line, url) in &cookies {
+                            t.ctx.set_cookie(line, url);
+                        }
+                    }
+                    None => {
+                        let key = want.clone().unwrap_or_default();
+                        self.browser_contexts.entry(key).or_default().pending_cookies.extend(cookies);
+                    }
+                }
+                vec![ok(id, &session, json!({}))]
+            }
             "Storage.getCookies" | "Network.getAllCookies" if browser_level => {
                 let want = params
                     .get("browserContextId")
@@ -851,6 +921,7 @@ impl Conn {
                         proxy,
                         session: session_name,
                         auto_solve,
+                        pending_cookies: Vec::new(),
                     },
                 );
                 vec![ok(id, &session, json!({ "browserContextId": bcid }))]
@@ -876,6 +947,12 @@ impl Conn {
                     .and_then(|bc| self.browser_contexts.get(bc).cloned())
                     .unwrap_or_default();
                 let proxy = cfg.proxy;
+                let pending_cookies = browser_context_id
+                    .as_deref()
+                    .or(Some(""))
+                    .and_then(|bc| self.browser_contexts.get_mut(bc))
+                    .map(|c| std::mem::take(&mut c.pending_cookies))
+                    .unwrap_or_default();
                 let target_id = next_id("T");
                 let session_id = next_id("S");
                 let engine = self.engine.clone();
@@ -898,6 +975,11 @@ impl Conn {
                         None => engine.new_context_with_identity(identity, proxy).await,
                     }
                     .map_err(|e| e.to_string());
+                    if let Ok(ctx) = &result {
+                        for (line, url) in &pending_cookies {
+                            ctx.set_cookie(line, url);
+                        }
+                    }
                     let _ = reg.send(PendingTarget {
                         id,
                         session,
@@ -1095,6 +1177,22 @@ impl Conn {
             // so this is the only route for handing a warmed session to another
             // process. `Storage.getCookies` is the browser-wide spelling of the
             // same thing; both answer from this page's client.
+            "Network.setCookies" | "Storage.setCookies" | "Network.setCookie" => {
+                let list: Vec<Value> = match params.get("cookies").and_then(|v| v.as_array()) {
+                    Some(a) => a.clone(),
+                    None => vec![params.clone()],
+                };
+                let mut stored = 0;
+                for (line, url) in list.iter().filter_map(cookie_param) {
+                    self.targets[idx].ctx.set_cookie(&line, &url);
+                    stored += 1;
+                }
+                if method == "Network.setCookie" {
+                    vec![ok(id, session, json!({ "success": stored > 0 }))]
+                } else {
+                    vec![ok(id, session, json!({}))]
+                }
+            }
             "Network.getCookies" | "Network.getAllCookies" | "Storage.getCookies" => {
                 let urls: Vec<String> = params
                     .get("urls")
@@ -2339,6 +2437,21 @@ mod tests {
     fn has_event(out: &[Value], method: &str) -> bool {
         out.iter()
             .any(|m| m.get("method").and_then(|v| v.as_str()) == Some(method))
+    }
+
+    #[test]
+    fn a_cdp_cookie_param_becomes_a_set_cookie_line() {
+        let (line, url) = super::cookie_param(&json!({
+            "name": "a", "value": "1", "url": "https://x.example/p"
+        })).unwrap();
+        assert_eq!((line.as_str(), url.as_str()), ("a=1; Path=/", "https://x.example/p"));
+        let (line, url) = super::cookie_param(&json!({
+            "name": "b", "value": "2", "domain": ".x.example", "path": "/q",
+            "secure": true, "httpOnly": true, "sameSite": "Lax"
+        })).unwrap();
+        assert_eq!(url, "https://x.example/q");
+        assert_eq!(line, "b=2; Path=/q; Domain=.x.example; Secure; HttpOnly; SameSite=Lax");
+        assert!(super::cookie_param(&json!({ "name": "c", "value": "3" })).is_none(), "no url and no domain");
     }
 
     #[test]

@@ -2283,6 +2283,12 @@ impl BrowserContext {
         stored
     }
 
+    /// Store a cookie as if `Set-Cookie: <set_cookie>` had come from `url` (CDP
+    /// `Network.setCookies`, Playwright's `addCookies`).
+    pub fn set_cookie(&self, set_cookie: &str, url: &str) {
+        self.client.set_cookie(set_cookie, url);
+    }
+
     pub fn cookies(&self, urls: &[String]) -> Vec<CookieRecord> {
         let all = self.client.cookies();
         if urls.is_empty() {
