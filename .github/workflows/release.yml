@@ -1,7 +1,8 @@
 name: release
 
 # Push a tag like v0.1.0-alpha to build and publish both artifacts:
-#   * a Linux x86_64 binary attached to the GitHub Release
+#   * binaries attached to the GitHub Release: Linux x86_64 (light and render),
+#     Linux ARM64, macOS on Apple Silicon, Windows x64
 #   * a container image pushed to ghcr.io/<owner>/nokk
 on:
   push:
@@ -82,12 +83,75 @@ jobs:
             ## Run it
             ```bash
             docker run --rm -p 9222:9222 ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            # :<version>-render for real canvas/WebGL pixels · or the binaries below
+            # :<version>-render for real canvas/WebGL pixels · or the binaries below:
+            # Linux x86_64 / ARM64, macOS (Apple Silicon), Windows x64
             ```
             Point Puppeteer at `ws://localhost:9222/devtools/browser/nokk`.
             Full docs: [README](https://github.com/${{ github.repository }}#readme).
 
             ---
+
+  # Linux ARM64, macOS Apple Silicon and Windows x64, the light build each, added to
+  # the release the x86 job created. Same steps as ports.yml, where they were brought up.
+  binary-ports:
+    name: Build ${{ matrix.name }}
+    needs: binary
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-aarch64, os: ubuntu-24.04-arm }
+          - { name: macos-aarch64, os: macos-14 }
+          - { name: windows-x86_64, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (Debian bullseye, as the x86 binary)
+        if: runner.os == 'Linux'
+        run: |
+          docker build -f .github/bullseye-build.Dockerfile --target bin-out --output type=local,dest=out .
+          tar -czf "nokk-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" -C out nokk
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: runner.os != 'Linux'
+
+      # One coherent SDK: a CommandLineTools include path mixed with the Xcode SDK
+      # breaks BoringSSL's C++ build.
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          SDK="$(xcrun --show-sdk-path)"
+          export SDKROOT="$SDK" CXXFLAGS="-isystem $SDK/usr/include/c++/v1"
+          export LIBCLANG_PATH="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+          export MACOSX_DEPLOYMENT_TARGET=11.0
+          cargo build --release --bin nokk
+          tar -czf "nokk-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" -C target/release nokk
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: |
+          cargo build --release --bin nokk
+          7z a "nokk-${GITHUB_REF_NAME}-${{ matrix.name }}.zip" ./target/release/nokk.exe >/dev/null
+
+      - name: Smoke (no network)
+        run: |
+          B=out/nokk; [ -f "$B" ] || B=target/release/nokk; [ -f "$B" ] || B=target/release/nokk.exe
+          "$B" --version
+          "$B" --eval "[navigator.webdriver, navigator.platform, new Intl.NumberFormat('de-DE',{style:'currency',currency:'EUR'}).format(1234.5)].join(' | ')"
+
+      - name: Add to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            nokk-${{ github.ref_name }}-${{ matrix.name }}.tar.gz
+            nokk-${{ github.ref_name }}-${{ matrix.name }}.zip
+          fail_on_unmatched_files: false
 
   image:
     name: Build and push images

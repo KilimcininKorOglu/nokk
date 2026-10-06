@@ -52,12 +52,23 @@ Or build the image yourself from a checkout: `docker build -t nokk .` (add
 
 ## Run the prebuilt binary
 
-Grab the Linux x86_64 tarball from the [latest release](https://github.com/koloss777/nokk/releases/latest):
+Grab the archive for your platform from the [latest release](https://github.com/koloss777/nokk/releases/latest):
+
+| Platform | Archive |
+|---|---|
+| Linux x86_64 | `nokk-<version>-linux-x86_64.tar.gz` |
+| Linux ARM64 (a Raspberry Pi 5 too) | `nokk-<version>-linux-aarch64.tar.gz` |
+| macOS on Apple Silicon | `nokk-<version>-macos-aarch64.tar.gz` |
+| Windows x64 | `nokk-<version>-windows-x86_64.zip` |
 
 ```bash
 tar -xzf nokk-*-linux-x86_64.tar.gz
 ./nokk --eval 'navigator.webdriver'
 ```
+
+On Windows, unzip and run `.\nokk.exe` from PowerShell. The Linux binaries need glibc
+2.31 or newer (Debian 11, Ubuntu 20.04, RHEL 9). The page always sees Chrome on Linux:
+the fingerprint is the same whichever machine runs nokk.
 
 That is the light build, which `npm install` and `pip install` fetch too. The release
 also carries `nokk-render-*-linux-x86_64.tar.gz`: the same engine with real canvas/WebGL

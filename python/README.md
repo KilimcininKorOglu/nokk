@@ -12,8 +12,8 @@ connect your existing Playwright or pyppeteer script over CDP.
 pip install nokk
 ```
 
-> **Alpha:** prebuilt wheels are currently **Linux x86_64** only. macOS/Windows
-> wheels are on the roadmap.
+> **Alpha.** Prebuilt wheels: Linux x86_64 and aarch64, macOS on Apple Silicon,
+> Windows x64.
 
 ## Quick start
 

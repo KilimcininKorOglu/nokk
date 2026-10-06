@@ -33,8 +33,8 @@ npm install @koloss777/nokk         # Node: run it with `npx nokk`
 docker run --rm -p 9222:9222 ghcr.io/koloss777/nokk:latest
 ```
 
-No browser to download. Linux x86_64 prebuilt; other platforms
-[build from source](docs/BUILD.md).
+No browser to download. Prebuilt for Linux (x86_64, ARM64), macOS on Apple Silicon and
+Windows x64; anything else [builds from source](docs/BUILD.md).
 
 ## Quick start
 
@@ -191,7 +191,8 @@ timezone and languages to the proxy's exit IP. See [docs/fingerprints.md](docs/f
 | light (default) | everything above; canvas and WebGL pixels are synthesised | pip, npm, `ghcr.io/koloss777/nokk:latest`, `nokk-*.tar.gz` |
 | render | real canvas 2D and WebGL rasterisation, about 100 MB more at peak | `:render` image, `nokk-render-*.tar.gz`, `--features render,webgl` |
 
-Prebuilt for Linux x86_64. Docker variants, the tarballs and building from source are in
+Prebuilt for Linux x86_64 and ARM64, macOS on Apple Silicon and Windows x64; the render build
+for Linux x86_64. Docker variants, the archives and building from source are in
 [docs/install.md](docs/install.md).
 
 ## How it works

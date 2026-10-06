@@ -117,7 +117,8 @@ def binary_path() -> str:
     raise FileNotFoundError(
         "the bundled `nokk` binary was not found. Reinstall the package "
         "(`pip install --force-reinstall nokk`), or set NOKK_BINARY to a "
-        "`nokk` executable. Note: prebuilt wheels are currently Linux x86_64 only."
+        "`nokk` executable. Prebuilt wheels: Linux x86_64/aarch64, macOS on Apple "
+        "Silicon, Windows x64."
     )
 
 

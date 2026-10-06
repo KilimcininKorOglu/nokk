@@ -60,11 +60,84 @@ jobs:
           name: wheels-linux
           path: python/dist/*.whl
 
+  # Linux ARM64, macOS Apple Silicon and Windows x64 wheels.
+  build-ports:
+    name: Build ${{ matrix.name }} wheel
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-aarch64, os: ubuntu-24.04-arm }
+          - { name: macos-aarch64, os: macos-14 }
+          - { name: windows-x86_64, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync wheel version from the tag
+        if: github.ref_type == 'tag'
+        run: |
+          RAW="${GITHUB_REF_NAME#v}"
+          PEP="${RAW/-alpha/a1}"; PEP="${PEP/-beta/b1}"; PEP="${PEP/-rc./rc}"
+          sed -i.bak "s/^version = \".*\"/version = \"$PEP\"/" python/pyproject.toml && rm python/pyproject.toml.bak
+
+      - name: Build wheel (Debian bullseye, as the x86 wheel)
+        if: runner.os == 'Linux'
+        run: |
+          docker build -f .github/bullseye-build.Dockerfile --target wheel-out \
+            --output type=local,dest=python/dist .
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: runner.os != 'Linux'
+      - uses: actions/setup-python@v5
+        if: runner.os != 'Linux'
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          SDK="$(xcrun --show-sdk-path)"
+          export SDKROOT="$SDK" CXXFLAGS="-isystem $SDK/usr/include/c++/v1"
+          export LIBCLANG_PATH="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+          export MACOSX_DEPLOYMENT_TARGET=11.0
+          pip install "maturin>=1.7,<2"
+          cd python && maturin build --release --out dist
+
+      - name: Build wheel (Windows)
+        if: runner.os == 'Windows'
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: |
+          pip install "maturin>=1.7,<2"
+          cd python && maturin build --release --out dist
+
+      - name: Sanity-check the wheel embeds the binary
+        run: |
+          PYBIN=$(command -v python3 || command -v python)
+          "$PYBIN" - <<'PY'
+          import glob, zipfile
+          whl = glob.glob("python/dist/*.whl")[0]
+          names = zipfile.ZipFile(whl).namelist()
+          assert any(n.endswith((".data/scripts/nokk", ".data/scripts/nokk.exe")) for n in names), \
+              f"binary not embedded in wheel: {names}"
+          print("ok:", whl)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.name }}
+          path: python/dist/*.whl
+
   publish:
     name: Publish to PyPI
-    needs: [build]
+    needs: [build, build-ports]
     runs-on: ubuntu-latest
-    if: github.ref_type == 'tag'
+    # The x86 wheel goes out even if a newer platform failed to build.
+    if: always() && github.ref_type == 'tag' && needs.build.result == 'success'
     environment: pypi
     permissions:
       # PyPI Trusted Publishing (OIDC) — configure the publisher on the PyPI

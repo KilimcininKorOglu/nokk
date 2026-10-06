@@ -29,7 +29,7 @@ function binaryPath() {
   if (fs.existsSync(BUNDLED)) return BUNDLED;
   throw new Error(
     "the bundled `nokk` binary was not found — reinstall (`npm install nokk`). " +
-      "Prebuilt binaries are currently Linux x64 only."
+      "Prebuilt binaries: Linux x64/arm64, macOS on Apple Silicon, Windows x64."
   );
 }
 

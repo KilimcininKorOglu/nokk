@@ -28,6 +28,6 @@
   "files": ["index.js", "index.d.ts", "install.js", "bin/", "README.md"],
   "scripts": { "postinstall": "node install.js" },
   "engines": { "node": ">=16" },
-  "os": ["linux"],
-  "cpu": ["x64"]
+  "os": ["linux", "darwin", "win32"],
+  "cpu": ["x64", "arm64"]
 }

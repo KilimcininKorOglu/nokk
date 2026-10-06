@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: [.github/workflows/ports.yml, Cargo.toml, Cargo.lock, "crates/*/Cargo.toml", "crates/*/build.rs"]
+    paths: [.github/workflows/ports.yml, Cargo.toml, Cargo.lock, "crates/*/Cargo.toml", "crates/*/build.rs", python/pyproject.toml, .github/bullseye-build.Dockerfile]
 
 jobs:
   linux-arm64:
@@ -146,3 +146,63 @@ jobs:
       - name: Public Cloudflare pages
         continue-on-error: true
         run: NOKK=./target/release/nokk.exe tools/cf-check.sh
+
+  wheels:
+    name: wheel ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-aarch64, os: ubuntu-24.04-arm }
+          - { name: macos-aarch64, os: macos-14 }
+          - { name: windows-x86_64, os: windows-latest }
+    continue-on-error: true   # bring-up
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheel (Debian bullseye, as the x86 wheel)
+        if: runner.os == 'Linux'
+        run: |
+          docker build -f .github/bullseye-build.Dockerfile --target wheel-out \
+            --output type=local,dest=python/dist .
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: runner.os != 'Linux'
+      - uses: actions/setup-python@v5
+        if: runner.os != 'Linux'
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          SDK="$(xcrun --show-sdk-path)"
+          export SDKROOT="$SDK" CXXFLAGS="-isystem $SDK/usr/include/c++/v1"
+          export LIBCLANG_PATH="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+          export MACOSX_DEPLOYMENT_TARGET=11.0
+          pip install "maturin>=1.7,<2"
+          cd python && maturin build --release --out dist
+
+      - name: Build wheel (Windows)
+        if: runner.os == 'Windows'
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: |
+          pip install "maturin>=1.7,<2"
+          cd python && maturin build --release --out dist
+
+      - name: Sanity-check the wheel embeds the binary
+        run: |
+          PYBIN=$(command -v python3 || command -v python)
+          "$PYBIN" - <<'PY'
+          import glob, zipfile
+          whl = glob.glob("python/dist/*.whl")[0]
+          names = zipfile.ZipFile(whl).namelist()
+          assert any(n.endswith((".data/scripts/nokk", ".data/scripts/nokk.exe")) for n in names), \
+              f"binary not embedded in wheel: {names}"
+          print("ok:", whl)
+          PY

@@ -39,7 +39,9 @@ COPY --from=bin-render /w/target/release/nokk /nokk
 
 # The Linux wheel: maturin builds the binary again from python/pyproject.toml
 # (it names crates/cli), embeds it and auditwheel-tags the wheel manylinux_2_31.
-FROM bin-render AS wheel
+# The light build, like the binary pip users get; chained after `bin` for its
+# target dir, not after the render build, which the wheel does not need.
+FROM bin AS wheel
 RUN cd python && maturin build --release --out dist
 FROM scratch AS wheel-out
 COPY --from=wheel /w/python/dist/ /
