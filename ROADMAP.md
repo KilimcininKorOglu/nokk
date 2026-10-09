@@ -19,6 +19,7 @@ Legend: ✅ done · 🟡 partial / in progress · ⬜ planned
 | 6 | JS-level stealth (canvas/WebGL/audio, `window.chrome`, hardening) | 🟡 |
 | 7 | Scaling & concurrency (100–1000 contexts under a memory ceiling) | ⬜ |
 | 8 | Testing, benchmarks, fingerprint regression suite | 🟡 |
+| — | Performance: less memory and faster than Chrome on the same machine | 🟡 |
 | 9 | Packaging & release (crates.io, Docker, prebuilt binaries) | ⬜ |
 
 ## Cloudflare challenges ✅
@@ -389,16 +390,66 @@ ceiling.
 - ⬜ **Navigation task queue + per-proxy concurrency caps** with fair scheduling.
 - ⬜ Settle fetches dropped past the per-navigation cap instead of leaving promises pending.
 
+## Performance: lighter and faster than Chrome
+
+The goal: on the same machine, every page nokk loads costs less memory **and is ready
+sooner** than in Chrome 151. Memory is already ahead; speed is not, on heavy pages.
+
+Baseline, October 2026, 8-core Linux, median of three runs. Peak PSS of the whole process
+tree (Chrome counts only its own processes) and wall time to a loaded page:
+
+| Page | nokk memory | Chrome memory | nokk time | Chrome time |
+|---|---|---|---|---|
+| example.com | 74 MB | 262 MB | 0.3 s | 1.2 s |
+| Hacker News | 82 MB | 351 MB | 1.2 s | 2.2 s |
+| Wikipedia article | 245 MB | 366 MB | 5.4 s | 1.6 s |
+| github.com | 200 MB | 446 MB | 5.5 s | 2.8 s |
+| bbc.com/news | 395 MB | 536 MB | 10.6 s | 7.4 s |
+
+### Memory
+
+- ✅ **A JS context costs 4.0 MB, was 8.3.** Every page, frame, worker and challenge
+  sandbox is one. The loader's functions read as native through one script mark instead
+  of a registry; stubs share one value store and get one function each instead of a
+  stub plus a guard; data tables reach templates as `JSON.parse` (literals kept a
+  boilerplate copy and allocation sites); load-time tables are released when their
+  layer ends. A Cloudflare interstitial solve peaks at ~400 MB (Chrome ~720 MB).
+- ✅ **Heavy pages keep styles between layout passes**, collect under memory pressure, and
+  spare frames follow demand (a large Elementor page: live heap 197 → 128 MB).
+- ⬜ **Lazy interfaces, as in Blink.** Build an interface's prototype and its members on
+  first access rather than all ~1000 at context creation; the floor now is ~110 bytes per
+  member function. Target: under 2 MB per context.
+- ⬜ **Per-page heap on heavy pages** (target: half of Chrome's): DOM nodes as fewer JS
+  objects, CSS rule objects out of dictionary mode, subresource bodies not kept after
+  use, script sources dropped once compiled.
+- ⬜ **Runaway allocation on facebook.com / instagram.com**: after load a page timer grows
+  the heap by ~100 MB every 60 ms of live data. Find and fix the loop.
+- ⬜ **Backpressure**: new contexts wait while the machine is low on memory instead of
+  pushing it into the OOM killer.
+
+### Speed
+
+- ⬜ **Layout without thrashing.** A script that writes a style and reads a height in a
+  loop gets a full relayout per read; azure.microsoft.com spends half a minute there.
+  Lay out only the dirty subtree and reuse boxes that did not change.
+- ⬜ **`:has()` invalidation.** Any `:has()` rule now drops every cascade at each style
+  pass (azure: 23,000 rules, 108 with `:has`). Invalidate only when a mutation touches
+  something a `:has` argument can match. Measured: 65 s → 44 s on azure from this alone.
+- ⬜ **Faster cascade.** Index rules by id, class and tag; share computed style between
+  siblings with the same classes and parent, as Blink does.
+- ⬜ **Wikipedia in 5.4 s vs 1.6 s**: profile and fix the main cost before anything else
+  on this list is called done.
+- ⬜ **`window.length` / `frames[i]`** walk the whole DOM on each read (jQuery reads
+  `window.length` often); keep a live list of frames.
+- ⬜ **A committed benchmark**: `tools/bench` with fixed pages, nokk against Chrome on
+  the same machine, memory and time, run for every release; the README table comes
+  from it.
+
 ## Testing & benchmarks (Phase 8)
 
-- 🟡 Memory and start time, remeasured October 2026 (8-core Linux): ~0.2 s cold start with
-  the cached V8 snapshot (0.95 s before), ~115 MB idle (~65 MB with `--workers 1`), ~9 MB per
-  page context (12.3 MB before; the earlier "0.5 MB/context, 20 MB idle" predates the
-  Chrome-shaped window), and a Cloudflare interstitial solve peaking at ~1.05 GB (~0.6 GB
-  with one worker). Open levers: the ~1500 interface objects the snapshot has to keep in
-  dictionary mode (a V8 deserializer check fails otherwise), ~5000 hand-masked functions
-  that still carry their own property store, and one isolate per thread in one-shot runs.
-  A committed, repeatable benchmark harness is still to come.
+- 🟡 Memory and start time: ~0.2 s cold start with the cached V8 snapshot, 4.0 MB per
+  JS context, a Cloudflare interstitial solve at ~400 MB peak. Per-page numbers against
+  Chrome are in [Performance](#performance-lighter-and-faster-than-chrome).
 - 🟡 Live challenge check: [`tools/cf-check.sh`](tools/cf-check.sh) runs the five public
   Cloudflare targets and prints a verdict, time and final title for each.
 - ⬜ A fixture-based WAF-challenge test suite (offline replay of real challenge pages).
