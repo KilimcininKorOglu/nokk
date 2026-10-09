@@ -1924,10 +1924,15 @@ pub fn proto_shape_script() -> String {
     PROTO_SHAPE_TEMPLATE
         .replace("__SHAPE_SKIP__", &skip)
         .replace("__SHAPE__", &json_table(PROTO_SHAPE))
+        .replace("__REFLECT__", &json_table(REFLECT_TABLE))
         .replace("__BRAND_TRACE__", if std::env::var_os("NOKK_TRACE_BRAND").is_some() { "true" } else { "false" })
 }
 
 const PROTO_SHAPE: &str = include_str!("proto_shape.json");
+/// Chrome 151 reflected attributes per interface (captured from Chrome): the
+/// attribute, its type (string, boolean, number, enumerated, URL) and the
+/// defaults for a missing, empty or invalid value.
+const REFLECT_TABLE: &str = include_str!("reflect_table.json");
 
 const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
   'use strict';
@@ -1946,6 +1951,7 @@ const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
     __s_indexOf = __sm(String.prototype.indexOf, 'indexOf'),
     __s_trim = __sm(String.prototype.trim, 'trim'),
     __s_replace = __sm(String.prototype.replace, 'replace'),
+    __s_toLowerCase = __sm(String.prototype.toLowerCase, 'toLowerCase'),
     __s_split = __sm(String.prototype.split, 'split');
   const SKIP = __SHAPE_SKIP__;
   // Released at the end: stubs outlive this layer and keep its scope.
@@ -2073,6 +2079,90 @@ const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
       if (!d || !sd || !d.configurable) continue;
       const isStub = stubs && ((d.value && stubs.has(d.value)) || (d.get && stubs.has(d.get)));
       if (isStub) def(P, k, Object.assign({}, sd, { enumerable: d.enumerable, configurable: d.configurable }));
+    }
+  }
+  // Reflected attributes: a stub member that Chrome reflects becomes the real
+  // thing, read from and written to the attribute (259 of 337 read undefined
+  // and wrote nothing: `button.formMethod`, `audio.autoplay`, `col.span`...).
+  {
+    const R = __REFLECT__;
+    const EP = globalThis.Element && globalThis.Element.prototype;
+    const GA = EP && EP.getAttribute, SA = EP && EP.setAttribute, HA = EP && EP.hasAttribute, RA = EP && EP.removeAttribute;
+    const isStub = (d) => !d || (stubs && ((d.get && stubs.has(d.get)) || (d.value && stubs.has(d.value))));
+    // Plain reflections the DOM runtime got wrong (no enum, wrong type).
+    const FORCE = new Set(['referrerPolicy', 'placeholder', 'HTMLImageElement.loading', 'HTMLIFrameElement.loading',
+      'HTMLButtonElement.type', 'HTMLIFrameElement.width', 'HTMLIFrameElement.height', 'HTMLTableElement.width',
+      'HTMLTemplateElement.shadowRootMode', 'HTMLTemplateElement.shadowRootCustomElementRegistry']);
+    const tagOf = (el) => { try { return __s_toLowerCase(String(el.localName || '')); } catch (e) { return ''; } };
+    const missingOf = (sp, el) => (sp.mt && Object.prototype.hasOwnProperty.call(sp.mt, tagOf(el)) ? sp.mt[tagOf(el)] : sp.m);
+    const docUrl = () => { try { return String(globalThis.document.URL); } catch (e) { return ''; } };
+    const baseUrl = () => { try { return String(globalThis.document.baseURI); } catch (e) { return docUrl(); } };
+    // HTML's rules for parsing integers and floating-point numbers.
+    const parseNum = (s, float) => {
+      const m = float ? /^[\t\n\f\r ]*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)/.exec(s) : /^[\t\n\f\r ]*([-+]?\d+)/.exec(s);
+      if (!m) return null;
+      const n = float ? parseFloat(m[1]) : parseInt(m[1], 10);
+      return Number.isFinite(n) ? n : null;
+    };
+    const getterFor = (sp, k) => {
+      const a = sp.a;
+      if (sp.y === 'b') return function () { return HA.call(this, a); };
+      if (sp.y === 's') return function () { const v = GA.call(this, a); return v === null ? missingOf(sp, this) : v; };
+      if (sp.y === 'u') return function () {
+        const v = GA.call(this, a);
+        if (v === null) return missingOf(sp, this) === '@doc' ? docUrl() : '';
+        try { return new globalThis.URL(v, baseUrl()).href; } catch (e) { return v; }
+      };
+      if (sp.y === 'e') return function () {
+        const v = GA.call(this, a);
+        if (v === null) return missingOf(sp, this);
+        if (v === '') return sp.e;
+        const low = __s_toLowerCase(v);
+        return Object.prototype.hasOwnProperty.call(sp.v, low) ? sp.v[low] : sp.i;
+      };
+      return function () {
+        const v = GA.call(this, a);
+        const dflt = missingOf(sp, this);
+        if (v === null) return dflt;
+        let n = parseNum(v, sp.f);
+        if (n === null) return sp.j;
+        if (n < 0 && !sp.neg) return sp.j;
+        if (n === 0 && !sp.zero) return sp.j;
+        if (sp.max !== undefined && n > sp.max) n = sp.max;
+        return n;
+      };
+    };
+    const setterFor = (sp, k, owner) => {
+      const a = sp.a;
+      if (sp.y === 'b') return function (v) { if (v) SA.call(this, a, ''); else RA.call(this, a); };
+      if (sp.y !== 'n') return function (v) { SA.call(this, a, String(v)); };
+      return function (v) {
+        let n = Number(v);
+        if (!sp.f) n = Number.isFinite(n) ? Math.trunc(n) : 0;
+        if (n < 0 && sp.sn !== 'a') {
+          if (__s_slice(sp.sn, 0, 2) === 't:') throw __pt_mkErr(globalThis.DOMException || Error, __s_replace(__s_slice(sp.sn, 2), '(-3)', '(' + n + ')'), 'IndexSizeError');
+          SA.call(this, a, __s_slice(sp.sn, 2));
+          return;
+        }
+        SA.call(this, a, String(n));
+      };
+    };
+    if (GA && SA) {
+      for (const owner of Object.keys(R)) {
+        const P = protoOf(owner);
+        if (!P) continue;
+        for (const k of Object.keys(R[owner])) {
+          const d = desc(P, k);
+          if (!isStub(d) && !FORCE.has(k) && !FORCE.has(owner + '.' + k)) continue;
+          const sp = R[owner][k];
+          const g = getterFor(sp, k), st = setterFor(sp, k, owner);
+          const acc = Object.getOwnPropertyDescriptor({
+            get [k]() { return g.call(this); },
+            set [k](v) { st.call(this, v); },
+          }, k);
+          def(P, k, { get: acc.get, set: acc.set, enumerable: d ? d.enumerable : true, configurable: true });
+        }
+      }
     }
   }
   T = null;
@@ -2459,7 +2549,9 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
       if (sd) def(F, k, sd);
     }
     const cd = desc(C.prototype, 'constructor');
-    if (cd && cd.configurable) def(C.prototype, 'constructor', Object.assign({}, cd, { value: F }));
+    // `Image`, `Audio` and `Option` share their interface's prototype, whose
+    // constructor stays `HTMLImageElement` and the rest.
+    if (cd && cd.configurable && cd.value === C) def(C.prototype, 'constructor', Object.assign({}, cd, { value: F }));
     N(F);
     def(globalThis, name, Object.assign({}, d, { value: F }));
   };

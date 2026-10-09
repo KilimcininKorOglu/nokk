@@ -4978,11 +4978,34 @@ impl BrowserContext {
         resource_type: &str,
         referrer: Option<&str>,
     ) -> Result<(String, String), EngineError> {
+        if resource_type != "document" && (url.starts_with("data:") || url.starts_with("blob:")) {
+            return self.local_source(context, url).await;
+        }
         let mut req = self.get_request(url, resource_type, referrer);
         req.context = Some(context);
         let started = std::time::Instant::now();
         let sent = self.client.send(req).await;
         self.finish_text(context, url, resource_type, started, sent)
+    }
+
+    /// A `data:` or `blob:` resource is decoded in the page, as Chrome does; the
+    /// HTTP client cannot fetch it (Facebook's markup has
+    /// `src="data:text/javascript;base64,..."`, duolingo imports one).
+    async fn local_source(&self, context: usize, url: &str) -> Result<(String, String), EngineError> {
+        let src = self
+            .eval_in(
+                context,
+                &format!(
+                    "(() => {{ const s = globalThis.__pt_localSource && __pt_localSource({}); \
+                       return typeof s === 'string' ? s : null; }})()",
+                    js_str(url)
+                ),
+            )
+            .await?;
+        match src.as_str() {
+            Some(code) => Ok((url.to_string(), code.to_string())),
+            None => Err(EngineError::Js(format!("no source for {url}"))),
+        }
     }
 
     /// A script requested by the preload scanner, or fetched now if it was not preloaded.
@@ -4991,25 +5014,6 @@ impl BrowserContext {
         pre: Option<Preloaded>,
         url: &str,
     ) -> Result<(String, String), EngineError> {
-        // A `data:` or `blob:` script in the markup is decoded in the page, as
-        // Chrome does; the HTTP client cannot fetch it (Facebook's markup has
-        // `src="data:text/javascript;base64,..."`).
-        if url.starts_with("data:") || url.starts_with("blob:") {
-            let src = self
-                .eval_in(
-                    self.idx(),
-                    &format!(
-                        "(() => {{ const s = globalThis.__pt_localSource && __pt_localSource({}); \
-                           return typeof s === 'string' ? s : null; }})()",
-                        js_str(url)
-                    ),
-                )
-                .await?;
-            return match src.as_str() {
-                Some(code) => Ok((url.to_string(), code.to_string())),
-                None => Err(EngineError::Js(format!("no source for {url}"))),
-            };
-        }
         match pre {
             Some((started, handle)) => match handle.await {
                 Ok(sent) => self.finish_text(self.idx(), url, "script", started, sent),
@@ -10460,11 +10464,11 @@ mod tests {
         let ctx = engine.new_context().await.unwrap();
         ctx.load_html(
             "https://example.com/",
-            "<html><head><title>t</title><script src=\"data:text/javascript;base64,ZG9jdW1lbnQudGl0bGUgKz0gJ0InOw==\"></script><script src=\"data:text/javascript,document.title%20%2B%3D%20'C'%3B\"></script></head><body></body></html>",
+            "<html><head><title>t</title><script src=\"data:text/javascript;base64,ZG9jdW1lbnQudGl0bGUgKz0gJ0InOw==\"></script><script src=\"data:text/javascript,document.title%20%2B%3D%20'C'%3B\"></script><script type=\"module\">import 'data:text/javascript,document.title%2B%3D%22D%22';</script></head><body></body></html>",
         )
         .await
         .unwrap();
-        assert_eq!(ctx.evaluate("document.title").await.unwrap(), Value::String("tBC".into()));
+        assert_eq!(ctx.evaluate("document.title").await.unwrap(), Value::String("tBCD".into()));
     }
 
     /// A base with an opaque path (`about:blank`, `data:`, `mailto:`) takes only

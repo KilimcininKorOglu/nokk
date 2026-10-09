@@ -4430,13 +4430,8 @@
       walk(e, (k) => { if (!bad && __isInvalid(k)) bad = true; });
       return bad;
     }
-    if (!(t === 'input' || t === 'select' || t === 'textarea') || __isDisabled(e)) return false;
-    if (t === 'input' && /^(hidden|submit|reset|button|image)$/.test(__inputType(e))) return false;
-    if (__ptHasA(e, 'required')) {
-      if (t === 'input' && /^(checkbox|radio)$/.test(__inputType(e))) return !e.checked;
-      if (__valueOf(e) === '') return true;
-    }
-    return false;
+    if (!(t === 'input' || t === 'select' || t === 'textarea' || t === 'button')) return false;
+    return __candidate(e) && !__validity(e).valid;
   };
 
   function __selPseudo(name, arg) {
@@ -5026,6 +5021,7 @@
     // a second time. Only what a page inserts later goes through `__ptRunScript`.
     if (spec.tag === 'script') {
       Object.defineProperty(el, '__ptRan', { value: true, configurable: true, enumerable: false });
+      el.__ptNoForceAsync = true;
     }
     for (const [name, value] of spec.attrs) __ptSetA(el, name, value);
     // The parser puts template children into its content and leaves the
@@ -5204,13 +5200,18 @@
     thead: 'HTMLTableSectionElement', template: 'HTMLTemplateElement',
     textarea: 'HTMLTextAreaElement', time: 'HTMLTimeElement', title: 'HTMLTitleElement',
     track: 'HTMLTrackElement', ul: 'HTMLUListElement', video: 'HTMLVideoElement',
+    dir: 'HTMLDirectoryElement', font: 'HTMLFontElement', frame: 'HTMLFrameElement',
+    frameset: 'HTMLFrameSetElement', marquee: 'HTMLMarqueeElement', param: 'HTMLParamElement',
+    listing: 'HTMLPreElement', xmp: 'HTMLPreElement', fencedframe: 'HTMLFencedFrameElement',
+    selectedcontent: 'HTMLSelectedContentElement',
   };
   // Tags known to HTML without their own interface: HTMLElement.
   const PLAIN_TAGS = new Set(['abbr', 'address', 'article', 'aside', 'b', 'bdi', 'bdo',
     'cite', 'code', 'dd', 'dfn', 'dt', 'em', 'figcaption', 'figure', 'footer', 'header',
     'hgroup', 'i', 'kbd', 'main', 'mark', 'nav', 'noscript', 'rp', 'rt', 'ruby', 's',
     'samp', 'search', 'section', 'small', 'strong', 'sub', 'summary', 'sup', 'u', 'var',
-    'wbr', 'center', 'font', 'big', 'strike', 'tt', 'nobr']);
+    'wbr', 'center', 'big', 'strike', 'tt', 'nobr', 'acronym', 'basefont', 'layer',
+    'noembed', 'noframes', 'nolayer', 'plaintext', 'rb', 'rtc']);
   for (const name of new Set(Object.values(TAG_IFACE))) __ifaceProto.set(name, __mkIface(name, __htmlProto));
   // Media elements inherit HTMLMediaElement.
   const __mediaProto = __mkIface('HTMLMediaElement', __htmlProto);
@@ -5218,10 +5219,6 @@
     try { Object.setPrototypeOf(globalThis[n].prototype, __mediaProto); } catch (e) {}
   }
   __ifaceProto.set('HTMLUnknownElement', __mkIface('HTMLUnknownElement', __htmlProto));
-  for (const n of ['HTMLFrameSetElement', 'HTMLFrameElement', 'HTMLMarqueeElement',
-                   'HTMLDirectoryElement', 'HTMLFontElement', 'HTMLParamElement']) {
-    if (!globalThis[n]) __mkIface(n, __htmlProto);
-  }
   // Form and table collections: `table.rows`, `tr.cells`, `select.options`,
   // `form.elements`… (the Cloudflare challenge parses its test markup this way).
   {
@@ -5252,18 +5249,18 @@
     const T = proto('HTMLTableElement');
     defGet(T, 'rows', function () { return __collection(tableRows(this)); });
     defGet(T, 'tBodies', function () { return __collection(kids(this).filter((k) => isTag(k, 'tbody'))); });
-    const defAcc = (P, k, get, set) => { try { Object.defineProperty(P, k, { get, set, enumerable: true, configurable: true }); } catch (e) {} };
+    const defPair = (P, k, get, set) => { if (!P) return; try { Object.defineProperty(P, k, { get, set, enumerable: true, configurable: true }); } catch (e) {} };
     const tableSet = (t, tag, v, where) => {
       if (v !== null && !(v && isTag(v, tag))) throw __pt_mkErr(TypeError, "Failed to set the '" + (tag === 'thead' ? 'tHead' : tag === 'tfoot' ? 'tFoot' : tag) + "' property on 'HTMLTableElement': The provided value is not of type '" + (tag === 'caption' ? 'HTMLTableCaptionElement' : 'HTMLTableSectionElement') + "'.");
       const old = kids(t).find((k) => isTag(k, tag)); if (old) t.removeChild(old);
       if (!v) return;
       const ref = where(t); ref ? t.insertBefore(v, ref) : t.appendChild(v);
     };
-    defAcc(T, 'tHead', function () { return kids(this).find((k) => isTag(k, 'thead')) || null; },
+    defPair(T, 'tHead', function () { return kids(this).find((k) => isTag(k, 'thead')) || null; },
       function (v) { tableSet(this, 'thead', v, (t) => kids(t).find((k) => !isTag(k, 'caption') && !isTag(k, 'colgroup')) || null); });
-    defAcc(T, 'tFoot', function () { return kids(this).find((k) => isTag(k, 'tfoot')) || null; },
+    defPair(T, 'tFoot', function () { return kids(this).find((k) => isTag(k, 'tfoot')) || null; },
       function (v) { tableSet(this, 'tfoot', v, () => null); });
-    defAcc(T, 'caption', function () { return kids(this).find((k) => isTag(k, 'caption')) || null; },
+    defPair(T, 'caption', function () { return kids(this).find((k) => isTag(k, 'caption')) || null; },
       function (v) { tableSet(this, 'caption', v, (t) => kids(t)[0] || null); });
     const S = proto('HTMLTableSectionElement');
     defGet(S, 'rows', function () { return __collection(kids(this).filter((k) => isTag(k, 'tr'))); });
@@ -5312,7 +5309,7 @@
     globalThis.__pt_selSetIndex = selSetIndex;
     // A select's `value` is the selected option's; option `selected`/`value`/`text`.
     const optValue = (o) => { const v = __ptGetA(o, 'value'); return v != null ? String(v) : __s_trim(__s_replace(String(o.textContent || ''), /\s+/g, ' ')); };
-    defAcc(SEL, 'value', function () {
+    defPair(SEL, 'value', function () {
       const opts = selOptions(this); const multiple = __ptHasA(this, 'multiple');
       let chosen = opts.filter(isSelected);
       if (!multiple) { if (chosen.length > 1) chosen = [chosen[chosen.length - 1]]; if (!chosen.length && opts.length && __ptGetA(this, 'size') == null) chosen = [opts[0]]; }
@@ -5322,13 +5319,13 @@
       for (const o of opts) { if (!hit && optValue(o) === v) { o.__ptSelected = true; hit = true; } else o.__ptSelected = false; }
     });
     const O_ = proto('HTMLOptionElement');
-    defAcc(O_, 'selected', function () { return isSelected(this); }, function (v) {
+    defPair(O_, 'selected', function () { return isSelected(this); }, function (v) {
       this.__ptSelected = !!v;
       __markDirty();
       if (v) { let p = this.parentNode; if (p && isTag(p, 'optgroup')) p = p.parentNode; if (p && isTag(p, 'select') && !__ptHasA(p, 'multiple')) for (const o of selOptions(p)) if (o !== this) o.__ptSelected = false; }
     });
-    defAcc(O_, 'value', function () { return optValue(this); }, function (v) { __ptSetA(this, 'value', String(v)); });
-    defAcc(O_, 'text', function () { return __s_trim(__s_replace(String(this.textContent || ''), /\s+/g, ' ')); }, function (v) { this.textContent = String(v); });
+    defPair(O_, 'value', function () { return optValue(this); }, function (v) { __ptSetA(this, 'value', String(v)); });
+    defPair(O_, 'text', function () { return __s_trim(__s_replace(String(this.textContent || ''), /\s+/g, ' ')); }, function (v) { this.textContent = String(v); });
     defGet(SEL, 'selectedOptions', function () {
       const opts = selOptions(this);
       const multiple = __ptHasA(this, 'multiple');
@@ -5336,14 +5333,14 @@
       if (!multiple) { if (chosen.length > 1) chosen = [chosen[chosen.length - 1]]; if (!chosen.length && opts.length && __ptGetA(this, 'size') == null) chosen = [opts[0]]; }
       return __collection(chosen);
     });
-    defAcc(SEL, 'selectedIndex', function () {
+    defPair(SEL, 'selectedIndex', function () {
       const opts = selOptions(this);
       const multiple = __ptHasA(this, 'multiple');
       const chosen = opts.filter(isSelected);
       if (chosen.length) return __s_indexOf(opts, multiple ? chosen[0] : chosen[chosen.length - 1]);
       return !multiple && opts.length && __ptGetA(this, 'size') == null ? 0 : -1;
     }, function (v) { selSetIndex(this, v); });
-    defAcc(SEL, 'length', function () { return selOptions(this).length; }, function (v) { selSetLength(this, v); });
+    defPair(SEL, 'length', function () { return selOptions(this).length; }, function (v) { selSetLength(this, v); });
     defGet(SEL, 'type', function () { return __ptHasA(this, 'multiple') ? 'select-multiple' : 'select-one'; });
     defFn(SEL, 'item', function item(i) { return selOptions(this)[i | 0] || null; });
     defFn(SEL, 'namedItem', function namedItem(n) { return selOptions(this).find((o) => o.id === n || __ptGetA(o, 'name') === n) || null; });
@@ -5410,6 +5407,33 @@
       __walkTree(this, (m) => { if (!found && m !== this && m.nodeType === ELEMENT_NODE && LABELABLE.has(local(m)) && !(local(m) === 'input' && __s_toLowerCase(String(__ptGetA(m, 'type') || '')) === 'hidden')) found = m; });
       return found;
     });
+    // Members that look reflected but are not, as in Chrome.
+    // A script made by a page is async until told otherwise ("force async");
+    // one from the parser is not.
+    defPair(proto('HTMLScriptElement'), 'async',
+      function () { return !this.__ptNoForceAsync || __ptHasA(this, 'async'); },
+      function (v) { this.__ptNoForceAsync = true; if (v) __ptSetA(this, 'async', ''); else __ptDelA(this, 'async'); });
+    // `disabled` is the sheet's flag; without a sheet it reads false and a
+    // write does nothing.
+    defPair(proto('HTMLStyleElement'), 'disabled',
+      function () { const sh = this.sheet; return sh ? !!sh.disabled : false; },
+      function (v) { const sh = this.sheet; if (sh) sh.disabled = !!v; });
+    // The default value of a textarea is its text.
+    defPair(proto('HTMLTextAreaElement'), 'defaultValue',
+      function () { return this.textContent; },
+      function (v) { this.textContent = String(v); });
+    defPair(proto('HTMLOutputElement'), 'defaultValue',
+      function () { return this.__ptDefault != null ? this.__ptDefault : this.textContent; },
+      function (v) { if (this.__ptDefault != null) this.__ptDefault = String(v); else this.textContent = String(v); });
+    // The rendered size: only an image button has one, and nothing renders.
+    for (const k of ['width', 'height']) {
+      defPair(proto('HTMLInputElement'), k,
+        function () { return __s_toLowerCase(String(__ptGetA(this, 'type') || '')) === 'image' ? (parseInt(__ptGetA(this, k), 10) >>> 0) || 0 : 0; },
+        function (v) { __ptSetA(this, k, String(Number(v) >>> 0)); });
+    }
+    defPair(__mediaProto, 'preservesPitch',
+      function () { return this.__ptKeepPitch !== false; },
+      function (v) { this.__ptKeepPitch = !!v; });
     const M = proto('HTMLMapElement');
     defGet(M, 'areas', function () { const out = []; __walkTree(this, (n) => { if (isTag(n, 'area')) out.push(n); }); return __collection(out); });
     const O = proto('HTMLOptionElement');
@@ -6861,6 +6885,422 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     };
   }
 
+  // ---- Constraint validation ---------------------------------------------
+  // `input.validity` was undefined, and form code that reads `.valid` threw
+  // (fingerprint.com's signup form took the page down with it). One reckoning
+  // of a control's state serves the API and the `:valid`/`:invalid` selectors.
+  // Messages are Chrome's.
+  const __customValidity = new WeakMap();
+  const __validityObj = new WeakMap();
+  const __candidate = (e) => {
+    const t = e.localName;
+    if (t === 'input') {
+      const ty = __inputType(e);
+      if (/^(hidden|reset|button)$/.test(ty)) return false;
+      if (__ptHasA(e, 'readonly') && !/^(checkbox|radio|file|range|color|submit|image)$/.test(ty)) return false;
+    } else if (t === 'textarea') {
+      if (__ptHasA(e, 'readonly')) return false;
+    } else if (t === 'button') {
+      const ty = __s_toLowerCase(String(__ptGetA(e, 'type') || 'submit'));
+      if (ty !== 'submit') return false;
+    } else if (t !== 'select') return false;
+    if (__isDisabled(e)) return false;
+    for (let p = __parentEl(e); p; p = __parentEl(p)) if (p.localName === 'datalist') return false;
+    return true;
+  };
+  const __EMAIL_LOCAL = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+$/;
+  const __EMAIL_DOMAIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
+  const __emailProblem = (v) => {
+    const at = __s_indexOf(v, '@');
+    if (at < 0) return "Please include an '@' in the email address. '" + v + "' is missing an '@'.";
+    const local = __s_slice(v, 0, at), domain = __s_slice(v, at + 1);
+    if (!local) return "Please enter a part followed by '@'. '" + v + "' is incomplete.";
+    if (!domain) return "Please enter a part following '@'. '" + v + "' is incomplete.";
+    if (!__EMAIL_LOCAL.test(local)) { const bad = local.match(/[^A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]/); return "A part followed by '@' should not contain the symbol '" + (bad ? bad[0] : '') + "'."; }
+    if (__s_indexOf(domain, '@') >= 0) return "A part following '@' should not contain the symbol '@'.";
+    if (!__EMAIL_DOMAIN.test(domain)) {
+      const bad = domain.match(/[^A-Za-z0-9.-]/);
+      if (bad) return "A part following '@' should not contain the symbol '" + bad[0] + "'.";
+      return "'.' is used at a wrong position in '" + domain + "'.";
+    }
+    return '';
+  };
+  const __numberOf = (e, v) => { const n = Number(v); return v !== '' && Number.isFinite(n) ? n : null; };
+  const __radioGroupChecked = (e) => {
+    const name = __ptGetA(e, 'name');
+    if (!name) return e.checked;
+    const root = e.form || (e.getRootNode ? e.getRootNode() : document);
+    let found = false;
+    try { walk(root, (k) => { if (!found && k.localName === 'input' && __inputType(k) === 'radio' && __ptGetA(k, 'name') === name && k.checked) found = true; }); } catch (x) {}
+    return found;
+  };
+  const __validity = (e) => {
+    const out = { valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false,
+      rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: false, valid: true, message: '' };
+    const custom = __customValidity.get(e) || '';
+    if (custom) { out.customError = true; }
+    if (!__candidate(e)) { out.valid = !out.customError; out.message = ''; return out; }
+    const t = e.localName;
+    const ty = t === 'input' ? __inputType(e) : t;
+    const v = t === 'button' ? '' : __valueOf(e);
+    if (__ptHasA(e, 'required') && t !== 'button') {
+      if (ty === 'checkbox') { if (!e.checked) { out.valueMissing = true; out.message = 'Please check this box if you want to proceed.'; } }
+      else if (ty === 'radio') { if (!__radioGroupChecked(e)) { out.valueMissing = true; out.message = 'Please select one of these options.'; } }
+      else if (ty === 'file') { if (!e.files || !e.files.length) { out.valueMissing = true; out.message = 'Please select a file.'; } }
+      else if (t === 'select') { if (v === '') { out.valueMissing = true; out.message = 'Please select an item in the list.'; } }
+      else if (v === '') { out.valueMissing = true; out.message = 'Please fill out this field.'; }
+    }
+    if (!out.valueMissing && v !== '' && t === 'input') {
+      if (ty === 'email') {
+        const parts = __ptHasA(e, 'multiple') ? __s_split(v, ',').map((x) => __s_trim(x)) : [v];
+        for (const one of parts) { const m = __emailProblem(one); if (m) { out.typeMismatch = true; out.message = m; break; } }
+      } else if (ty === 'url') {
+        try { new URL(v); } catch (x) { out.typeMismatch = true; out.message = 'Please enter a URL.'; }
+      }
+      const pat = __ptGetA(e, 'pattern');
+      if (!out.typeMismatch && pat !== null && /^(text|search|url|tel|email|password)$/.test(ty)) {
+        let re = null;
+        try { re = new RegExp('^(?:' + pat + ')$', 'v'); } catch (x) { try { re = new RegExp('^(?:' + pat + ')$', 'u'); } catch (y) { re = null; } }
+        if (re && !re.test(v)) { out.patternMismatch = true; out.message = 'Please match the requested format.'; }
+      }
+      if (ty === 'number' || ty === 'range') {
+        const n = __numberOf(e, v);
+        const min = __numberOf(e, __ptGetA(e, 'min') || ''), max = __numberOf(e, __ptGetA(e, 'max') || '');
+        if (n !== null) {
+          if (min !== null && n < min) { out.rangeUnderflow = true; out.message = 'Value must be greater than or equal to ' + min + '.'; }
+          else if (max !== null && n > max) { out.rangeOverflow = true; out.message = 'Value must be less than or equal to ' + max + '.'; }
+          else {
+            const stepA = __ptGetA(e, 'step');
+            const step = stepA === null ? 1 : __s_toLowerCase(stepA) === 'any' ? 0 : Number(stepA) > 0 ? Number(stepA) : 1;
+            const base = min !== null ? min : 0;
+            if (step) {
+              const k = (n - base) / step;
+              if (Math.abs(k - Math.round(k)) > 1e-9) {
+                out.stepMismatch = true;
+                const lo = base + Math.floor(k) * step, hi = lo + step;
+                const fmt = (x) => String(Math.round(x * 1e9) / 1e9);
+                out.message = max !== null && hi > max ? 'Please enter a valid value. The nearest valid value is ' + fmt(lo) + '.'
+                  : 'Please enter a valid value. The two nearest valid values are ' + fmt(lo) + ' and ' + fmt(hi) + '.';
+              }
+            }
+          }
+        }
+      }
+    }
+    if (out.customError) out.message = custom;
+    out.valid = !(out.valueMissing || out.typeMismatch || out.patternMismatch || out.tooLong || out.tooShort
+      || out.rangeUnderflow || out.rangeOverflow || out.stepMismatch || out.badInput || out.customError);
+    if (out.valid) out.message = '';
+    return out;
+  };
+  globalThis.ValidityState = class ValidityState {
+    constructor() { throw __pt_mkErr(TypeError, "Failed to construct 'ValidityState': Illegal constructor"); }
+  };
+  for (const k of ['valueMissing', 'typeMismatch', 'patternMismatch', 'tooLong', 'tooShort', 'rangeUnderflow', 'rangeOverflow', 'stepMismatch', 'badInput', 'customError', 'valid']) {
+    Object.defineProperty(globalThis.ValidityState.prototype, k, { get: Object.getOwnPropertyDescriptor({ get [k]() {
+      const el = __validityObj.get(this);
+      if (!el) throw __pt_mkErr(TypeError, 'Illegal invocation');
+      return __validity(el)[k];
+    } }, k).get, enumerable: true, configurable: true });
+  }
+  const __fireInvalid = (e) => { const ev = new Event('invalid', { cancelable: true }); __ptTrust(ev); e.dispatchEvent(ev); };
+  const __controlsOf = (form) => {
+    const out = [];
+    walk(form, (k) => { if (k !== form && /^(input|select|textarea|button|fieldset|output|object)$/.test(k.localName)) out.push(k); });
+    return out;
+  };
+  const __vMethods = {
+    get validity() {
+      let v = null;
+      v = this.__ptValidity;
+      if (!v) { v = Object.create(globalThis.ValidityState.prototype); __validityObj.set(v, this); try { Object.defineProperty(this, '__ptValidity', { value: v, enumerable: false }); } catch (x) {} }
+      return v;
+    },
+    get validationMessage() { return __validity(this).message; },
+    get willValidate() { return __candidate(this); },
+    checkValidity() { const r = __validity(this); if (__candidate(this) && !r.valid) { __fireInvalid(this); return false; } return true; },
+    reportValidity() { const r = __validity(this); if (__candidate(this) && !r.valid) { __fireInvalid(this); return false; } return true; },
+    setCustomValidity(m) { if (arguments.length < 1) throw __pt_mkErr(TypeError, "Failed to execute 'setCustomValidity' on '" + (this.constructor && this.constructor.name) + "': 1 argument required, but only 0 present."); __customValidity.set(this, String(m)); __markDirty(); },
+  };
+  for (const name of ['HTMLInputElement', 'HTMLTextAreaElement', 'HTMLSelectElement', 'HTMLButtonElement', 'HTMLFieldSetElement', 'HTMLOutputElement', 'HTMLObjectElement']) {
+    const C = globalThis[name];
+    if (typeof C !== 'function' || !C.prototype) continue;
+    for (const k of Object.getOwnPropertyNames(__vMethods)) {
+      const d = Object.getOwnPropertyDescriptor(__vMethods, k);
+      const nd = d.get ? { get: d.get, enumerable: true, configurable: true } : { value: d.value, writable: true, enumerable: true, configurable: true };
+      try { Object.defineProperty(C.prototype, k, nd); } catch (x) {}
+    }
+  }
+  if (typeof globalThis.HTMLFormElement === 'function') {
+    const F = globalThis.HTMLFormElement.prototype;
+    const all = (form, report) => { let ok = true; for (const c of __controlsOf(form)) { if (__candidate(c) && !__validity(c).valid) { ok = false; __fireInvalid(c); } } return ok; };
+    Object.defineProperty(F, 'checkValidity', { value: { checkValidity() { return all(this, false); } }.checkValidity, writable: true, enumerable: true, configurable: true });
+    Object.defineProperty(F, 'reportValidity', { value: { reportValidity() { return all(this, true); } }.reportValidity, writable: true, enumerable: true, configurable: true });
+  }
+
+  // ---- Web Animations ------------------------------------------------------
+  // `element.animate()` returned undefined, and animation code that sets
+  // `animation.startTime` threw inside requestAnimationFrame (fingerprint.com
+  // lost its page to it). Nothing is painted here: an animation keeps its time
+  // against `document.timeline` and finishes on a timer, as in a browser.
+  const __ANIM = new WeakMap();
+  const __animLive = new Set();
+  const __animNow = () => { try { return document.timeline.currentTime; } catch (e) { return performance.now(); } };
+  const __timingOf = (o) => {
+    const t = { delay: 0, direction: 'normal', duration: 'auto', easing: 'linear', endDelay: 0, fill: 'auto', iterationStart: 0, iterations: 1 };
+    if (typeof o === 'number') { t.duration = o; return t; }
+    if (o && typeof o === 'object') {
+      for (const k of ['delay', 'endDelay', 'iterationStart', 'iterations']) if (o[k] !== undefined) t[k] = Number(o[k]);
+      for (const k of ['direction', 'easing', 'fill']) if (o[k] !== undefined) t[k] = String(o[k]);
+      if (o.duration !== undefined) t.duration = typeof o.duration === 'number' ? o.duration : String(o.duration) === 'auto' ? 'auto' : Number(o.duration);
+    }
+    if (t.duration !== 'auto' && (Number.isNaN(t.duration) || t.duration < 0)) throw __pt_mkErr(TypeError, "Failed to execute 'animate' on 'Element': duration must be non-negative or auto.");
+    return t;
+  };
+  const __animFrames = (kf) => {
+    if (kf === null || kf === undefined) return [];
+    let list = kf;
+    if (!Array.isArray(kf)) {
+      // Property-indexed form: { opacity: [0, 1] }.
+      const keys = Object.keys(kf).filter((k) => k !== 'offset' && k !== 'easing' && k !== 'composite');
+      const n = Math.max(1, ...keys.map((k) => (Array.isArray(kf[k]) ? kf[k].length : 1)));
+      list = [];
+      for (let i = 0; i < n; i++) {
+        const f = {};
+        for (const k of keys) { const v = kf[k]; f[k] = Array.isArray(v) ? v[i] : v; }
+        list.push(f);
+      }
+    }
+    const n = list.length;
+    return list.map((f, i) => {
+      const o = { offset: f.offset === undefined ? null : Number(f.offset), easing: f.easing === undefined ? 'linear' : String(f.easing), composite: f.composite === undefined ? 'auto' : String(f.composite) };
+      for (const k of Object.keys(f)) if (k !== 'offset' && k !== 'easing' && k !== 'composite') o[k] = String(f[k]);
+      o.computedOffset = o.offset !== null ? o.offset : n === 1 ? 1 : i / (n - 1);
+      return o;
+    });
+  };
+  const __animFx = (o) => { const st = o !== null && typeof o === 'object' ? __ANIM.get(o) : undefined; if (!st || st.kind !== 'effect') throw __pt_mkErr(TypeError, 'Illegal invocation'); return st; };
+  const __animOf = (o) => { const st = o !== null && typeof o === 'object' ? __ANIM.get(o) : undefined; if (!st || st.kind !== 'anim') throw __pt_mkErr(TypeError, 'Illegal invocation'); return st; };
+  const __endTime = (eff) => {
+    if (!eff) return 0;
+    const t = __ANIM.get(eff).timing;
+    const d = t.duration === 'auto' ? 0 : t.duration;
+    return Math.max(0, t.delay + d * t.iterations + t.endDelay);
+  };
+  if (typeof globalThis.AnimationEffect !== 'function' || !globalThis.AnimationEffect.prototype.getTiming) {
+    globalThis.AnimationEffect = class AnimationEffect {
+      constructor() { throw __pt_mkErr(TypeError, "Failed to construct 'AnimationEffect': Illegal constructor"); }
+      getTiming() { return Object.assign({}, __animFx(this).timing); }
+      getComputedTiming() {
+        const st = __animFx(this), t = st.timing;
+        const d = t.duration === 'auto' ? 0 : t.duration;
+        const active = d * t.iterations;
+        const anim = st.animation ? __ANIM.get(st.animation) : null;
+        const local = anim ? __animCurrent(anim) : null;
+        let progress = null, iter = null;
+        if (local !== null && local >= t.delay && local < t.delay + active) { const x = d ? (local - t.delay) / d : 0; iter = Math.floor(x); progress = x - iter; }
+        return Object.assign({}, t, { duration: d, activeDuration: active, endTime: __endTime(this), localTime: local, progress, currentIteration: iter });
+      }
+      updateTiming() { const st = __animFx(this); const next = Object.assign({}, st.timing, arguments[0] || {}); st.timing = __timingOf(next); }
+    };
+  }
+  globalThis.KeyframeEffect = class KeyframeEffect extends globalThis.AnimationEffect {
+    constructor(target, keyframes, options) {
+      if (arguments.length < 2) throw __pt_mkErr(TypeError, "Failed to construct 'KeyframeEffect': 2 arguments required, but only " + arguments.length + ' present.');
+      const self = Object.create(new.target.prototype);
+      if (target instanceof globalThis.KeyframeEffect) {
+        const src = __ANIM.get(target);
+        __ANIM.set(self, { kind: 'effect', target: src.target, frames: src.frames.slice(), timing: Object.assign({}, src.timing), composite: src.composite, pseudo: src.pseudo, animation: null });
+        return self;
+      }
+      __ANIM.set(self, { kind: 'effect', target: target || null, frames: __animFrames(keyframes), timing: __timingOf(options), composite: (options && options.composite) || 'replace', pseudo: (options && options.pseudoElement) || null, animation: null });
+      return self;
+    }
+    get target() { return __animFx(this).target; }
+    set target(v) { __animFx(this).target = v || null; }
+    get pseudoElement() { return __animFx(this).pseudo; }
+    set pseudoElement(v) { __animFx(this).pseudo = v == null ? null : String(v); }
+    get composite() { return __animFx(this).composite; }
+    set composite(v) { __animFx(this).composite = String(v); }
+    getKeyframes() { return __animFx(this).frames.map((f) => Object.assign({}, f)); }
+    setKeyframes(kf) { __animFx(this).frames = __animFrames(kf); }
+  };
+  const __animCurrent = (st) => {
+    if (st.hold !== null) return st.hold;
+    if (st.start === null) return null;
+    return (__animNow() - st.start) * st.rate;
+  };
+  const __animState = (st) => {
+    const cur = __animCurrent(st);
+    if (cur === null && !st.pendingPlay) return 'idle';
+    if (st.paused) return 'paused';
+    const end = __endTime(st.effect);
+    if (cur !== null && ((st.rate > 0 && cur >= end) || (st.rate < 0 && cur <= 0))) return 'finished';
+    return 'running';
+  };
+  const __animFire = (anim, type) => {
+    const st = __ANIM.get(anim);
+    let ev;
+    try {
+      ev = typeof globalThis.AnimationPlaybackEvent === 'function'
+        ? new globalThis.AnimationPlaybackEvent(type, { currentTime: __animCurrent(st), timelineTime: __animNow() })
+        : new Event(type);
+    } catch (e) { ev = new Event(type); }
+    __ptTrust(ev);
+    try { globalThis.EventTarget.prototype.dispatchEvent.call(anim, ev); } catch (e) {}
+  };
+  const __newDeferred = (st, key) => {
+    const d = {};
+    d.promise = new Promise((res, rej) => { d.resolve = res; d.reject = rej; });
+    d.promise.then(undefined, () => {});
+    st[key] = d;
+    return d;
+  };
+  const __scheduleFinish = (anim) => {
+    const st = __ANIM.get(anim);
+    if (st.timer) { clearTimeout(st.timer); st.timer = null; }
+    if (st.paused || st.start === null || st.rate === 0) return;
+    const cur = __animCurrent(st), end = __endTime(st.effect);
+    const left = st.rate > 0 ? (end - cur) / st.rate : cur / -st.rate;
+    const done = () => {
+      st.timer = null;
+      if (__animState(st) !== 'finished' || st.finishedFired) return;
+      st.finishedFired = true;
+      __animLive.delete(anim);
+      st.finished.resolve(anim);
+      __animFire(anim, 'finish');
+    };
+    if (left <= 0) Promise.resolve().then(done);
+    else st.timer = setTimeout(done, left);
+  };
+  const __play = (anim) => {
+    const st = __ANIM.get(anim);
+    const end = __endTime(st.effect);
+    const cur = __animCurrent(st);
+    if (st.rate > 0 && (cur === null || cur < 0 || cur >= end)) st.hold = 0;
+    else if (st.rate < 0 && (cur === null || cur <= 0 || cur > end)) st.hold = end;
+    else if (st.hold === null) st.hold = cur;
+    if (st.finishedFired) { st.finishedFired = false; __newDeferred(st, 'finished'); }
+    st.paused = false;
+    st.pendingPlay = true;
+    st.start = null;
+    __animLive.add(anim);
+    if (st.ready.settled) __newDeferred(st, 'ready');
+    // A pending play starts on the next frame, with the timeline's time.
+    requestAnimationFrame(() => {
+      if (!st.pendingPlay) return;
+      st.pendingPlay = false;
+      st.start = __animNow() - (st.hold || 0) / st.rate;
+      st.hold = null;
+      st.ready.settled = true;
+      st.ready.resolve(anim);
+      __scheduleFinish(anim);
+    });
+  };
+  globalThis.Animation = class Animation {
+    constructor(effect, timeline) {
+      const self = Object.create(new.target.prototype);
+      const st = { kind: 'anim', effect: effect || null, timeline: timeline === undefined ? document.timeline : timeline, start: null, hold: null, rate: 1,
+        paused: false, pendingPlay: false, finishedFired: false, timer: null, id: '', onfinish: null, oncancel: null, onremove: null };
+      __newDeferred(st, 'ready'); st.ready.settled = true; st.ready.resolve(self);
+      __newDeferred(st, 'finished');
+      __ANIM.set(self, st);
+      if (effect && __ANIM.get(effect)) __ANIM.get(effect).animation = self;
+      return self;
+    }
+    get id() { return __animOf(this).id; }
+    set id(v) { __animOf(this).id = String(v); }
+    get effect() { return __animOf(this).effect; }
+    set effect(v) { const st = __animOf(this); st.effect = v || null; if (v && __ANIM.get(v)) __ANIM.get(v).animation = this; }
+    get timeline() { return __animOf(this).timeline; }
+    set timeline(v) { __animOf(this).timeline = v; }
+    get startTime() { return __animOf(this).start; }
+    set startTime(v) {
+      const st = __animOf(this);
+      if (v === null) { st.hold = __animCurrent(st); st.start = null; return; }
+      st.start = Number(v); st.hold = null; st.pendingPlay = false; st.paused = false;
+      if (!st.ready.settled) { st.ready.settled = true; st.ready.resolve(this); }
+      __animLive.add(this);
+      __scheduleFinish(this);
+    }
+    get currentTime() { return __animCurrent(__animOf(this)); }
+    set currentTime(v) {
+      const st = __animOf(this), t = Number(v);
+      if (st.start !== null && !st.paused) st.start = __animNow() - t / st.rate; else st.hold = t;
+      __scheduleFinish(this);
+    }
+    get playbackRate() { return __animOf(this).rate; }
+    set playbackRate(v) { const st = __animOf(this); const cur = __animCurrent(st); st.rate = Number(v); if (st.start !== null && cur !== null) st.start = __animNow() - cur / st.rate; __scheduleFinish(this); }
+    get playState() { return __animState(__animOf(this)); }
+    get replaceState() { __animOf(this); return 'active'; }
+    get pending() { const st = __animOf(this); return st.pendingPlay; }
+    get ready() { return __animOf(this).ready.promise; }
+    get finished() { return __animOf(this).finished.promise; }
+    get onfinish() { return __animOf(this).onfinish; }
+    set onfinish(v) { __animOf(this).onfinish = typeof v === 'function' ? v : null; }
+    get oncancel() { return __animOf(this).oncancel; }
+    set oncancel(v) { __animOf(this).oncancel = typeof v === 'function' ? v : null; }
+    get onremove() { return __animOf(this).onremove; }
+    set onremove(v) { __animOf(this).onremove = typeof v === 'function' ? v : null; }
+    play() { __animOf(this); __play(this); }
+    pause() {
+      const st = __animOf(this);
+      if (st.paused) return;
+      const cur = __animCurrent(st);
+      st.hold = cur === null ? 0 : cur; st.start = null; st.paused = true; st.pendingPlay = false;
+      if (st.timer) { clearTimeout(st.timer); st.timer = null; }
+      if (!st.ready.settled) { st.ready.settled = true; st.ready.resolve(this); }
+    }
+    finish() {
+      const st = __animOf(this);
+      const end = st.rate < 0 ? 0 : __endTime(st.effect);
+      st.pendingPlay = false; st.paused = false;
+      st.start = __animNow() - end / st.rate; st.hold = null;
+      if (!st.ready.settled) { st.ready.settled = true; st.ready.resolve(this); }
+      __scheduleFinish(this);
+    }
+    cancel() {
+      const st = __animOf(this);
+      if (__animState(st) === 'idle') return;
+      if (st.timer) { clearTimeout(st.timer); st.timer = null; }
+      st.start = null; st.hold = null; st.pendingPlay = false; st.paused = false;
+      const err = __pt_mkErr(globalThis.DOMException || Error, 'The user aborted a request.', 'AbortError');
+      if (!st.ready.settled) { st.ready.settled = true; st.ready.reject(err); __newDeferred(st, 'ready'); st.ready.settled = true; st.ready.resolve(this); }
+      if (!st.finishedFired) { st.finished.reject(err); __newDeferred(st, 'finished'); }
+      st.finishedFired = false;
+      __animLive.delete(this);
+      __animFire(this, 'cancel');
+    }
+    reverse() { const st = __animOf(this); st.rate = -st.rate; __play(this); }
+    updatePlaybackRate(r) { this.playbackRate = r; }
+    persist() { __animOf(this); }
+    commitStyles() { __animOf(this); }
+  };
+  // `element.animate()` and the lists of running animations.
+  const __animsOf = (root, sub) => {
+    const out = [];
+    for (const a of __animLive) {
+      const st = __ANIM.get(a), eff = st.effect && __ANIM.get(st.effect);
+      const t = eff && eff.target;
+      if (!t) continue;
+      if (t === root || (sub && root.contains && root.contains(t))) if (__animState(st) !== 'finished' || (eff.timing.fill === 'forwards' || eff.timing.fill === 'both')) out.push(a);
+    }
+    return out;
+  };
+  Object.defineProperty(Element.prototype, 'animate', { value: { animate(keyframes, options) {
+    if (arguments.length < 1) throw __pt_mkErr(TypeError, "Failed to execute 'animate' on 'Element': 1 argument required, but only 0 present.");
+    const effect = new globalThis.KeyframeEffect(this, keyframes, options);
+    const anim = new globalThis.Animation(effect, document.timeline);
+    if (options && typeof options === 'object' && options.id !== undefined) __ANIM.get(anim).id = String(options.id);
+    __play(anim);
+    return anim;
+  } }.animate, writable: true, enumerable: true, configurable: true });
+  for (const C of [Element, Document, ShadowRoot]) {
+    Object.defineProperty(C.prototype, 'getAnimations', { value: { getAnimations() {
+      return C === Element ? __animsOf(this, !!(arguments[0] && arguments[0].subtree)) : __animsOf(this.documentElement || this, true);
+    } }.getAnimations, writable: true, enumerable: true, configurable: true });
+  }
+
   // ---- CDP object registry (ElementHandle / JSHandle support) --------------
   // Non-value CDP results return an `objectId` handle instead of the value; the
   // server calls these to wrap/unwrap so Puppeteer's `$`/`$eval`/`.evaluate`
@@ -7617,36 +8057,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   // Each element names its interface (`[object HTMLCanvasElement]`). There are
   // no per-tag classes, so the name is derived from the tag.
-  const __IFACE = {
-    a: 'HTMLAnchorElement', area: 'HTMLAreaElement', audio: 'HTMLAudioElement',
-    base: 'HTMLBaseElement', body: 'HTMLBodyElement', br: 'HTMLBRElement',
-    button: 'HTMLButtonElement', canvas: 'HTMLCanvasElement', data: 'HTMLDataElement',
-    datalist: 'HTMLDataListElement', dialog: 'HTMLDialogElement', div: 'HTMLDivElement',
-    dl: 'HTMLDListElement', embed: 'HTMLEmbedElement', fieldset: 'HTMLFieldSetElement',
-    form: 'HTMLFormElement', head: 'HTMLHeadElement', hr: 'HTMLHRElement',
-    html: 'HTMLHtmlElement', iframe: 'HTMLIFrameElement', img: 'HTMLImageElement',
-    input: 'HTMLInputElement', label: 'HTMLLabelElement', legend: 'HTMLLegendElement',
-    li: 'HTMLLIElement', link: 'HTMLLinkElement', map: 'HTMLMapElement',
-    menu: 'HTMLMenuElement', meta: 'HTMLMetaElement', meter: 'HTMLMeterElement',
-    object: 'HTMLObjectElement', ol: 'HTMLOListElement', optgroup: 'HTMLOptGroupElement',
-    option: 'HTMLOptionElement', output: 'HTMLOutputElement', p: 'HTMLParagraphElement',
-    picture: 'HTMLPictureElement', pre: 'HTMLPreElement', progress: 'HTMLProgressElement',
-    q: 'HTMLQuoteElement', script: 'HTMLScriptElement', select: 'HTMLSelectElement',
-    slot: 'HTMLSlotElement', source: 'HTMLSourceElement', span: 'HTMLSpanElement',
-    style: 'HTMLStyleElement', table: 'HTMLTableElement', tbody: 'HTMLTableSectionElement',
-    td: 'HTMLTableCellElement', template: 'HTMLTemplateElement', textarea: 'HTMLTextAreaElement',
-    tfoot: 'HTMLTableSectionElement', th: 'HTMLTableCellElement', thead: 'HTMLTableSectionElement',
-    title: 'HTMLTitleElement', tr: 'HTMLTableRowElement', track: 'HTMLTrackElement',
-    ul: 'HTMLUListElement', video: 'HTMLVideoElement',
-  };
   const __tagFor = (el) => {
     const local = el.__ptLocal || '';
-    if (__IFACE[local]) return __IFACE[local];
+    if (TAG_IFACE[local]) return TAG_IFACE[local];
     // A dashed name is a custom element (HTMLElement); an unknown single-word
     // tag is HTMLUnknownElement.
-    if (__s_indexOf(local, '-') > 0) return 'HTMLElement';
-    return /^(abbr|address|article|aside|b|bdi|bdo|cite|code|dd|dfn|dt|em|figcaption|figure|footer|h1|h2|h3|h4|h5|h6|header|hgroup|i|ins|del|kbd|main|mark|nav|noscript|rp|rt|ruby|s|samp|section|small|strong|sub|summary|sup|time|u|var|wbr|details|blockquote|caption|colgroup|col)$/.test(local)
-      ? 'HTMLElement' : 'HTMLUnknownElement';
+    return __s_indexOf(local, '-') > 0 || PLAIN_TAGS.has(local) ? 'HTMLElement' : 'HTMLUnknownElement';
   };
   for (const [C, name] of [[Node, 'Node'], [Element, 'Element'], [Text, 'Text'], [Comment, 'Comment'],
     [Document, 'Document'], [DocumentFragment, 'DocumentFragment'], [ShadowRoot, 'ShadowRoot']]) {
