@@ -65,6 +65,7 @@ pub fn install(scope: &mut v8::PinScope) {
     bind(scope, "__pt_codeLike", code_like_js);
     bind(scope, "__pt_randomBytes", random_bytes);
     bind(scope, "__pt_digest", digest);
+    bind(scope, "__pt_isProxy", is_proxy);
     bind(scope, "__pt_hmac", hmac_sign);
     bind(scope, "__pt_pbkdf2", pbkdf2_derive);
     bind(scope, "__pt_hkdf", hkdf_derive);
@@ -2372,6 +2373,11 @@ pub const BOOT_SCRIPT_MARK: &str = "nokk:boot";
 
 /// `__pt_isBoot(fn)`: whether `fn` was compiled from the bootstrap, in any
 /// context of this isolate. Such functions are the engine's and read as native.
+/// `__pt_isProxy(v)`: whether `v` is a Proxy, without running any of its traps.
+fn is_proxy(_scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
+    rv.set_bool(args.get(0).is_proxy());
+}
+
 fn fn_is_boot(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,

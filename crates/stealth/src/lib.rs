@@ -6926,9 +6926,29 @@ const STACK_TEMPLATE: &str = r##"(() => {
   // looped through an endless prototype chain.
   // Captured up front: the trap must not call anything the page may wrap.
   const __pxGPO = Reflect.getPrototypeOf, __pxSPO = Reflect.setPrototypeOf, __pxProxy = Proxy;
+  const __pxOurs = new WeakSet(), __pxFrameType = new WeakMap();
+  // The type a builtin's frame is named after when the receiver inherits
+  // from one of our proxies: V8 stops its constructor lookup at a proxy
+  // ("Object"), where Chrome's real function gives "Function". Ordinary
+  // objects only: their prototype and own keys are read without running code.
+  const __pxIsProxy = globalThis.__pt_isProxy, __pxHasOwn = Object.prototype.hasOwnProperty;
+  Object.defineProperty(globalThis, '__pt_noteFrameType', {
+    value: (err, recv) => {
+      try {
+        if (typeof __pxIsProxy !== 'function' || recv === null || typeof recv !== 'object' || err === null || typeof err !== 'object') return;
+        for (let q = recv, i = 0; q !== null && i < 64; i++) {
+          if (__pxIsProxy(q)) { if (__pxOurs.has(q) && typeof q === 'function') __pxFrameType.set(err, 'Function'); return; }
+          if (__pxHasOwn.call(q, 'constructor')) return;
+          q = __pxGPO(q);
+        }
+      } catch (e) {}
+    },
+    writable: true, enumerable: false, configurable: true,
+  });
   Object.defineProperty(globalThis, '__pt_proxy', {
     value: (target, handler) => {
       const px = new __pxProxy(target, handler);
+      __pxOurs.add(px);
       handler.setPrototypeOf = (t, proto) => {
         for (let q = proto, i = 0; q !== null && q !== undefined && i < 100000; i++) {
           if (q === t || q === px) throw __pt_mkErr(TypeError, 'Cyclic __proto__ value');
@@ -6959,10 +6979,11 @@ const STACK_TEMPLATE: &str = r##"(() => {
         // frame rather than hidden, and builtins inside it stay visible.
         const CONS = new Set(['assert', 'clear', 'context', 'count', 'countReset', 'createTask', 'debug', 'dir', 'dirxml', 'error', 'group', 'groupCollapsed', 'groupEnd', 'info', 'log', 'profile', 'profileEnd', 'table', 'time', 'timeEnd', 'timeLog', 'timeStamp', 'trace', 'warn']);
         const consoleName = (f, i) => { try { const n = f.getFunctionName(); const t = f.getTypeName(); return mine[i] && CONS.has(n) && (t === 'console' || t === 'Object' || t == null) ? n : null; } catch (e) { return null; } };
-        const fake = (name) => {
-          const label = 'console.' + name + ' (<anonymous>)';
+        const fake = (name, full) => {
+          if (full === undefined) full = 'console.' + name;
+          const label = full + ' (<anonymous>)';
           const u = () => undefined, n = () => null, no = () => false;
-          return { toString: () => label, getFunctionName: () => 'console.' + name, getMethodName: () => name, getTypeName: n, getFileName: u, getScriptNameOrSourceURL: u, getLineNumber: n, getColumnNumber: n, getEnclosingLineNumber: n, getEnclosingColumnNumber: n, getPosition: () => 0, getPromiseIndex: n, getEvalOrigin: u, getThis: u, getFunction: u, getScriptHash: () => '', isNative: no, isEval: no, isConstructor: no, isToplevel: no, isAsync: no, isPromiseAll: no };
+          return { toString: () => label, getFunctionName: () => full, getMethodName: () => name, getTypeName: n, getFileName: u, getScriptNameOrSourceURL: u, getLineNumber: n, getColumnNumber: n, getEnclosingLineNumber: n, getEnclosingColumnNumber: n, getPosition: () => 0, getPromiseIndex: n, getEvalOrigin: u, getThis: u, getFunction: u, getScriptHash: () => '', isNative: no, isEval: no, isConstructor: no, isToplevel: no, isAsync: no, isPromiseAll: no };
         };
         // Outside in: a chain of builtins above our frame is hidden entirely,
         // except the one inside a console frame.
@@ -6976,6 +6997,20 @@ const STACK_TEMPLATE: &str = r##"(() => {
             hidden[i] = false; swap[i] = fake(cn); inside = true; continue;
           }
           hidden[i] = mine[i] || (builtin(sites[i]) && !inside && !!hidden[i + 1]);
+        }
+        // A builtin behind one of our proxies (`Function.prototype.toString`):
+        // the trap hands the call on with `Reflect.apply`, which leaves no
+        // frame. The page called the builtin, so its frame stays
+        // (`at Function.toString (<anonymous>)`, which pages check); the
+        // trap's does not.
+        const fname = (f) => { try { return f.getFunctionName(); } catch (e) { return null; } };
+        for (let i = 0; i + 1 < sites.length; i++) {
+          if (!hidden[i] || mine[i] || !builtin(sites[i])) continue;
+          if (!mine[i + 1] || fname(sites[i + 1]) !== 'apply') continue;
+          if (i + 2 < sites.length && hidden[i + 2]) continue;
+          hidden[i] = false;
+          const ty = __pxFrameType.get(err), fn = fname(sites[i]);
+          if (ty && fn) swap[i] = fake(fn, ty + '.' + fn);
         }
         keep = [];
         for (let i = 0; i < sites.length; i++) if (!hidden[i]) keep.push(swap[i] || sites[i]);
@@ -9910,12 +9945,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       return d && typeof d.value === 'string' ? d.value : '';
     } catch (e) { return ''; }
   };
+  const __ptNoteType = globalThis.__pt_noteFrameType;
   const __ptToStr = __pt_proxy(Function.prototype.toString, {
     apply(target, thisArg, args) {
       if (__ptIsNat(thisArg)) {
         return 'function ' + __ptFnName(thisArg) + '() { [native code] }';
       }
-      return __ptRApply(target, thisArg, args);
+      try { return __ptRApply(target, thisArg, args); }
+      catch (e) { if (__ptNoteType) __ptNoteType(e, thisArg); throw e; }
     },
   });
   try {
@@ -12317,7 +12354,6 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       },
       disconnect() { __pt_write(state.__ptOut, 'length', 0); },
       start() {}, stop() {},
-      addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
     }, extra || {});
     const iface = NODE_IFACE[kind];
     // Shared members on `AudioNode`, own ones on the kind's prototype: Chrome's
@@ -12659,14 +12695,80 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     return out;
   }
 
+  // A real AudioBuffer: rendered results, `createBuffer` and `new
+  // AudioBuffer({...})` were plain objects with own fields (`[object
+  // Object]`, `Object.keys` not empty) and `new AudioBuffer()` gave nothing to
+  // read (creepjs threw on it).
+  const AB = new WeakMap();
+  const abToken = Symbol();
+  const abOf = (o) => { const st = o !== null && typeof o === 'object' ? AB.get(o) : undefined; if (!st) throw __pt_mkErr(TypeError, 'Illegal invocation'); return st; };
+  const abFail = (m, msg) => "Failed to execute '" + m + "' on 'AudioBuffer': " + msg;
+  const abChannel = (st, c, m) => {
+    const n = Number(c) >>> 0;
+    if (n >= st.chans.length) throw __pt_mkErr(globalThis.DOMException || Error, abFail(m, 'The channelNumber provided (' + n + ') is outside the range [0, ' + (st.chans.length - 1) + '].'), 'IndexSizeError');
+    return st.chans[n];
+  };
+  const abFloat = (v, m) => {
+    if (!(v instanceof Float32Array)) throw __pt_mkErr(TypeError, abFail(m, "parameter 1 is not of type 'Float32Array'."));
+    return v;
+  };
+  class AudioBuffer {
+    constructor(options) {
+      const self = Object.create(new.target.prototype);
+      let chans;
+      if (options === abToken) {
+        chans = arguments[1];
+        AB.set(self, { chans, length: arguments[2], rate: arguments[3] });
+        return self;
+      }
+      const ctor = (msg) => "Failed to construct 'AudioBuffer': " + msg;
+      if (arguments.length < 1) throw __pt_mkErr(TypeError, ctor('1 argument required, but only 0 present.'));
+      const o = options === undefined || options === null ? {} : options;
+      if (typeof o !== 'object' && typeof o !== 'function') throw __pt_mkErr(TypeError, ctor("The provided value is not of type 'AudioBufferOptions'."));
+      const len = o.length, n = o.numberOfChannels, rate = o.sampleRate;
+      if (len === undefined) throw __pt_mkErr(TypeError, ctor("Failed to read the 'length' property from 'AudioBufferOptions': Required member is undefined."));
+      if (rate === undefined) throw __pt_mkErr(TypeError, ctor("Failed to read the 'sampleRate' property from 'AudioBufferOptions': Required member is undefined."));
+      const count = n === undefined ? 1 : Number(n) >>> 0, frames = Number(len) >>> 0, sr = Math.fround(Number(rate));
+      if (count < 1 || count > 32) throw __pt_mkErr(globalThis.DOMException || Error, ctor('The number of channels provided (' + count + ') is outside the range [1, 32].'), 'NotSupportedError');
+      if (frames < 1) throw __pt_mkErr(globalThis.DOMException || Error, ctor('The number of frames provided (' + frames + ') is less than or equal to the minimum bound (0).'), 'NotSupportedError');
+      if (!(sr >= 3000 && sr <= 768000)) throw __pt_mkErr(globalThis.DOMException || Error, ctor('The sample rate provided (' + sr + ') is outside the range [3000, 768000].'), 'NotSupportedError');
+      chans = [];
+      for (let i = 0; i < count; i++) chans.push(new Float32Array(frames));
+      AB.set(self, { chans, length: frames, rate: sr });
+      return self;
+    }
+    get length() { return abOf(this).length; }
+    get duration() { const st = abOf(this); return st.length / st.rate; }
+    get sampleRate() { return abOf(this).rate; }
+    get numberOfChannels() { return abOf(this).chans.length; }
+    copyFromChannel(destination, channelNumber) {
+      const st = abOf(this);
+      if (arguments.length < 2) throw __pt_mkErr(TypeError, abFail('copyFromChannel', '2 arguments required, but only ' + arguments.length + ' present.'));
+      const dst = abFloat(destination, 'copyFromChannel');
+      const src = abChannel(st, channelNumber, 'copyFromChannel');
+      const start = arguments.length > 2 && arguments[2] !== undefined ? Number(arguments[2]) >>> 0 : 0;
+      for (let i = 0; i < dst.length && start + i < src.length; i++) dst[i] = src[start + i];
+    }
+    copyToChannel(source, channelNumber) {
+      const st = abOf(this);
+      if (arguments.length < 2) throw __pt_mkErr(TypeError, abFail('copyToChannel', '2 arguments required, but only ' + arguments.length + ' present.'));
+      const from = abFloat(source, 'copyToChannel');
+      const dst = abChannel(st, channelNumber, 'copyToChannel');
+      const start = arguments.length > 2 && arguments[2] !== undefined ? Number(arguments[2]) >>> 0 : 0;
+      for (let i = 0; i < from.length && start + i < dst.length; i++) dst[start + i] = from[i];
+    }
+    getChannelData(channel) {
+      const st = abOf(this);
+      if (arguments.length < 1) throw __pt_mkErr(TypeError, abFail('getChannelData', '1 argument required, but only 0 present.'));
+      const n = Number(channel) >>> 0;
+      if (n >= st.chans.length) throw __pt_mkErr(globalThis.DOMException || Error, abFail('getChannelData', 'channel index (' + n + ') exceeds number of channels (' + st.chans.length + ')'), 'IndexSizeError');
+      return st.chans[n];
+    }
+  }
   const bufferOf = (data, chans, len, rate) => {
-    const b = {
-      numberOfChannels: chans, length: len, sampleRate: rate, duration: len / rate,
-      getChannelData(c) { return c ? new Float32Array(len) : data; },
-      copyFromChannel(dst, c, start) { const s = c ? 0 : (start | 0); for (let i = 0; i < dst.length && s + i < len; i++) dst[i] = data[s + i]; },
-      copyToChannel() {},
-    };
-    return b;
+    const list = [data];
+    for (let i = 1; i < chans; i++) list.push(new Float32Array(len));
+    return new AudioBuffer(abToken, list, len, rate);
   };
 
   class BaseAudioContext {
@@ -12733,7 +12835,6 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     resume() { __pt_write(this, 'state', 'running'); return Promise.resolve(); }
     suspend() { __pt_write(this, 'state', 'suspended'); return Promise.resolve(); }
     close() { __pt_write(this, 'state', 'closed'); return Promise.resolve(); }
-    addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
     // The graph is rendered by walking from the destination, not replaced by a
     // fixed synthesis: buffer sources must produce their own numbers and
     // `compressor.reduction` the browser's -20 dB.
@@ -13031,6 +13132,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // different object of that name:
   // `Object.getPrototypeOf(AudioContext.prototype) !== BaseAudioContext.prototype`.
   globalThis.BaseAudioContext = audioTag(mask(BaseAudioContext, 'BaseAudioContext'), 'BaseAudioContext');
+  globalThis.AudioBuffer = audioTag(mask(AudioBuffer, 'AudioBuffer'), 'AudioBuffer');
   globalThis.AudioContext = audioTag(mask(class AudioContext extends BaseAudioContext {
     constructor() {
       super();
@@ -13068,12 +13170,22 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     }
     startRendering() {
       const buffer = this.__ptRender(this.__ptChans, this.length);
-      // Fire the legacy `oncomplete` asynchronously (as the real API does; the
-      // classic FingerprintJS routine waits on it) *and* resolve the promise.
-      Promise.resolve().then(() => {
-        if (typeof this.oncomplete === 'function') { try { this.oncomplete({ renderedBuffer: buffer, type: 'complete' }); } catch (e) {} }
+      // As in Chrome: rendering ends on another thread, then a trusted
+      // OfflineAudioCompletionEvent reaches `oncomplete` and the listeners
+      // (creepjs waits on `addEventListener('complete')`), then the promise
+      // resolves.
+      return new Promise((resolve) => {
+        setTimeout(() => {
+          try {
+            const ev = new globalThis.OfflineAudioCompletionEvent('complete', { renderedBuffer: buffer });
+            __pt_write(ev, 'renderedBuffer', buffer);
+            if (typeof globalThis.__pt_trustEvent === 'function') globalThis.__pt_trustEvent(ev);
+            const ET = globalThis.EventTarget;
+            if (typeof ET === 'function' && typeof ET.prototype.dispatchEvent === 'function') ET.prototype.dispatchEvent.call(this, ev);
+          } catch (e) {}
+          resolve(buffer);
+        }, 0);
       });
-      return Promise.resolve(buffer);
     }
   }, 'OfflineAudioContext'), 'OfflineAudioContext');
 

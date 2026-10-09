@@ -10471,6 +10471,72 @@ mod tests {
         assert_eq!(ctx.evaluate("document.title").await.unwrap(), Value::String("tBCD".into()));
     }
 
+    /// Chrome's shapes for what fingerprinting scripts poke at (creepjs,
+    /// khanacademy.org): the builtin frame of `Function.prototype.toString` in
+    /// a thrown stack, a real AudioBuffer and completion event, and a
+    /// `startViewTransition` whose promises settle in order.
+    #[tokio::test]
+    async fn engine_shapes_match_chrome_where_fingerprinters_look() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<html><head><title>t</title><script>try { Object.create(Math.sin).toString(); } catch (e) { window.__s = String(e.stack).split('\\n')[1]; }</script></head><body></body></html>",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ctx.evaluate("window.__s").await.unwrap(),
+            Value::String("    at Function.toString (<anonymous>)".into())
+        );
+        ctx
+            .evaluate(
+                r#"new Promise((res) => {
+                  const out = [];
+                  const b = new AudioBuffer({ length: 4, sampleRate: 44100, numberOfChannels: 2 });
+                  b.copyToChannel(new Float32Array([1, 2]), 1, 2);
+                  out.push(Object.prototype.toString.call(b), Object.keys(b).length, b.getChannelData(1).join(), b.getChannelData(1) === b.getChannelData(1));
+                  const c = new OfflineAudioContext(1, 128, 44100);
+                  c.addEventListener('complete', (e) => out.push(e.constructor.name, e.renderedBuffer instanceof AudioBuffer));
+                  c.startRendering().then(() => out.push('promise'));
+                  const t = document.startViewTransition(() => out.push('update'));
+                  t.updateCallbackDone.then(() => out.push('done'));
+                  t.ready.then(() => out.push('ready'));
+                  t.finished.then(() => { window.__out = out.join(); });
+                  res();
+                })"#,
+            )
+            .await
+            .unwrap();
+        ctx.run_event_loop().await.unwrap();
+        assert_eq!(
+            ctx.evaluate("window.__out").await.unwrap(),
+            Value::String("[object AudioBuffer],0,0,0,1,2,true,OfflineAudioCompletionEvent,true,promise,update,done,ready".into())
+        );
+    }
+
+    /// An inline script whose digest is in `script-src` runs; another one does
+    /// not (Fastly's client challenge on khanacademy.org is allowed this way).
+    #[tokio::test]
+    async fn an_inline_script_allowed_by_its_csp_hash_runs() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<html><head><meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'self' 'sha256-mYLiJ7RpfjwBtPaS8+J4BeJmK/DN02f862bMPeVXe9g='\"><title>t</title><script>document.title += 'H';</script><script>document.title += 'X';</script></head><body></body></html>",
+        )
+        .await
+        .unwrap();
+        assert_eq!(ctx.evaluate("document.title").await.unwrap(), Value::String("tH".into()));
+        // A relative address on the page's own origin is 'self'.
+        assert_eq!(
+            ctx.evaluate("[__pt_cspBlocksScriptUrl(null, '/a.js'), __pt_cspBlocksScriptUrl(null, 'https://other.test/a.js')].join()").await.unwrap(),
+            Value::String("false,true".into())
+        );
+    }
+
     /// A base with an opaque path (`about:blank`, `data:`, `mailto:`) takes only
     /// a fragment; Chrome refuses anything else. We built `about://a/b.js`.
     #[tokio::test]

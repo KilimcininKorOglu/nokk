@@ -6507,6 +6507,51 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     return false;
   };
+  // `'sha256-…'` and friends: the digest of the script's UTF-8 text, base64
+  // (Chrome takes the URL-safe alphabet too).
+  const __cspDigest = globalThis.__pt_digest;
+  const __cspB64 = (u8) => {
+    const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    let out = '';
+    for (let i = 0; i < u8.length; i += 3) {
+      const n = (u8[i] << 16) | ((u8[i + 1] || 0) << 8) | (u8[i + 2] || 0);
+      out += A[(n >> 18) & 63] + A[(n >> 12) & 63] + (i + 1 < u8.length ? A[(n >> 6) & 63] : '=') + (i + 2 < u8.length ? A[n & 63] : '=');
+    }
+    return out;
+  };
+  const __cspUtf8 = (str) => {
+    const out = [];
+    for (let i = 0; i < str.length; i++) {
+      let c = str.charCodeAt(i);
+      if (c >= 0xd800 && c < 0xdc00 && i + 1 < str.length) {
+        const d = str.charCodeAt(i + 1);
+        if (d >= 0xdc00 && d < 0xe000) { c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00); i++; }
+        else c = 0xfffd;
+      } else if (c >= 0xd800 && c < 0xe000) c = 0xfffd;
+      if (c < 0x80) out.push(c);
+      else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+      else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+      else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    }
+    return new Uint8Array(out);
+  };
+  const __cspHashMatches = (list, code) => {
+    if (typeof __cspDigest !== 'function') return false;
+    let bytes = null;
+    const memo = {};
+    for (const t of list) {
+      const m = /^'(sha256|sha384|sha512)-([A-Za-z0-9+/_-]+={0,2})'$/i.exec(t);
+      if (!m) continue;
+      const alg = 'SHA-' + __s_slice(__s_toLowerCase(m[1]), 3);
+      if (!(alg in memo)) {
+        if (!bytes) bytes = __cspUtf8(String(code));
+        const d = __cspDigest(alg, bytes);
+        memo[alg] = d ? __s_replace(__cspB64(d), /=+$/, '') : null;
+      }
+      if (memo[alg] && memo[alg] === __s_replace(__s_replace(__s_replace(m[2], /-/g, '+'), /_/g, '/'), /=+$/, '')) return true;
+    }
+    return false;
+  };
   // Inline script: nonce/hash/'unsafe-inline' (the last is voided by nonce/hash).
   const __cspAllowsInline = (el) => {
     for (const p of __csp.policies) {
@@ -6516,6 +6561,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const hasNonceOrHash = list.some((t) => /^'(nonce-|sha(256|384|512)-)/i.test(t));
       const nonce = el && (__ptGetA(el, 'nonce') || el.__ptNonce || '');
       if (nonce && list.some((t) => t === "'nonce-" + nonce + "'")) continue;
+      if (el && hasNonceOrHash && __cspHashMatches(list, el.textContent || '')) continue;
       if (!hasNonceOrHash && __cspHas(list, "'unsafe-inline'")) continue;
       return { name: d[0], list };
     }
@@ -6540,6 +6586,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return true;
   };
   globalThis.__pt_cspBlocksScriptUrl = (el, url) => {
+    if (!__csp.policies.length) return false;
+    // Matched, and reported, as the absolute URL.
+    try { url = new URL(String(url), document.baseURI).href; } catch (e) {}
     for (const p of __csp.policies) {
       const d = __cspScriptDirective(p);
       if (!d) continue;
@@ -7300,6 +7349,101 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       return C === Element ? __animsOf(this, !!(arguments[0] && arguments[0].subtree)) : __animsOf(this.documentElement || this, true);
     } }.getAnimations, writable: true, enumerable: true, configurable: true });
   }
+
+  // ---- View Transitions ----------------------------------------------------
+  // `document.startViewTransition()` returned undefined, and code that reads
+  // `.ready` off the result broke the page (khanacademy.org rendered half).
+  // Nothing is captured or painted: the update runs on the next frame, then
+  // the promises settle in Chrome's order (updateCallbackDone, ready, finished).
+  const __VT = new WeakMap();
+  const __vtToken = Symbol();
+  let __vtActive = null;
+  const __vtOf = (o) => { const st = o !== null && typeof o === 'object' ? __VT.get(o) : undefined; if (!st) throw __pt_mkErr(TypeError, 'Illegal invocation'); return st; };
+  const __vtAbort = (msg, name) => __pt_mkErr(globalThis.DOMException || Error, msg, name);
+  const __VTTypes = globalThis.ViewTransitionTypeSet = class ViewTransitionTypeSet {
+    constructor(token, list) {
+      if (token !== __vtToken) throw __pt_mkErr(TypeError, 'Illegal constructor');
+      const self = Object.create(new.target.prototype);
+      const set = new Set();
+      for (const t of list || []) set.add(String(t));
+      __VT.set(self, { set });
+      return self;
+    }
+    get size() { return __vtOf(this).set.size; }
+    add(v) { __vtOf(this).set.add(String(v)); return this; }
+    clear() { __vtOf(this).set.clear(); }
+    delete(v) { return __vtOf(this).set.delete(String(v)); }
+    has(v) { return __vtOf(this).set.has(String(v)); }
+    entries() { return __vtOf(this).set.entries(); }
+    keys() { return __vtOf(this).set.values(); }
+    values() { return __vtOf(this).set.values(); }
+    forEach(cb) { const thisArg = arguments[1]; for (const v of __vtOf(this).set) cb.call(thisArg, v, v, this); }
+  };
+  Object.defineProperty(__VTTypes.prototype, Symbol.iterator, { value: __VTTypes.prototype.values, writable: true, configurable: true });
+  Object.defineProperty(__VTTypes.prototype, Symbol.toStringTag, { value: 'ViewTransitionTypeSet', configurable: true });
+  const __VTClass = globalThis.ViewTransition = class ViewTransition {
+    constructor(token, update, types) {
+      if (token !== __vtToken) throw __pt_mkErr(TypeError, 'Illegal constructor');
+      const self = Object.create(new.target.prototype);
+      const st = { update, types: new __VTTypes(__vtToken, types), skipped: false, readySettled: false, waits: [] };
+      __newDeferred(st, 'ucd');
+      __newDeferred(st, 'ready');
+      __newDeferred(st, 'finished');
+      __VT.set(self, st);
+      return self;
+    }
+    get finished() { return __vtOf(this).finished.promise; }
+    get ready() { return __vtOf(this).ready.promise; }
+    get updateCallbackDone() { return __vtOf(this).ucd.promise; }
+    get types() { return __vtOf(this).types; }
+    get transitionRoot() { __vtOf(this); return document.documentElement; }
+    skipTransition() { __vtSkip(__vtOf(this), __vtAbort('Transition was skipped', 'AbortError')); }
+    waitUntil(p) {
+      if (arguments.length < 1) throw __pt_mkErr(TypeError, "Failed to execute 'waitUntil' on 'ViewTransition': 1 argument required, but only 0 present.");
+      __vtOf(this).waits.push(Promise.resolve(p));
+    }
+  };
+  Object.defineProperty(__VTClass.prototype, Symbol.toStringTag, { value: 'ViewTransition', configurable: true });
+  const __vtSkip = (st, err) => {
+    if (st.readySettled) return;
+    st.readySettled = true; st.skipped = true;
+    st.ready.reject(err);
+  };
+  const __vtRun = (vt) => {
+    const st = __VT.get(vt);
+    let r;
+    try { r = typeof st.update === 'function' ? st.update.call(undefined) : undefined; }
+    catch (e) { r = Promise.reject(e); }
+    Promise.resolve(r).then(() => {
+      st.ucd.resolve(undefined);
+      if (!st.readySettled) { st.readySettled = true; st.ready.resolve(undefined); }
+      return Promise.all(st.waits);
+    }, (e) => {
+      st.ucd.reject(e);
+      __vtSkip(st, e);
+      throw e;
+    }).then(() => st.finished.resolve(undefined), (e) => st.finished.reject(e))
+      .then(() => { if (__vtActive === vt) __vtActive = null; });
+  };
+  Object.defineProperty(Document.prototype, 'startViewTransition', { value: { startViewTransition() {
+    const arg = arguments[0];
+    let update = null, types = [];
+    if (typeof arg === 'function') update = arg;
+    else if (arg !== undefined && arg !== null) {
+      if (typeof arg !== 'object') throw __pt_mkErr(TypeError, "Failed to execute 'startViewTransition' on 'Document': The provided value is not of type '(StartViewTransitionOptions or ViewTransitionUpdateCallback)'.");
+      if (arg.update !== undefined && arg.update !== null) update = arg.update;
+      if (arg.types !== undefined && arg.types !== null) types = Array.from(arg.types, String);
+    }
+    const vt = new __VTClass(__vtToken, update, types);
+    const st = __VT.get(vt);
+    if (__vtActive) __vtSkip(__VT.get(__vtActive), __vtAbort('Transition was skipped', 'AbortError'));
+    __vtActive = vt;
+    if (this.visibilityState === 'hidden') __vtSkip(st, __vtAbort('View transition was skipped because document visibility state is hidden.', 'InvalidStateError'));
+    // The update runs at the next rendering opportunity.
+    setTimeout(() => __vtRun(vt), 16);
+    return vt;
+  } }.startViewTransition, writable: true, enumerable: true, configurable: true });
+  Object.defineProperty(Document.prototype, 'activeViewTransition', { get: Object.getOwnPropertyDescriptor({ get activeViewTransition() { return __vtActive; } }, 'activeViewTransition').get, enumerable: true, configurable: true });
 
   // ---- CDP object registry (ElementHandle / JSHandle support) --------------
   // Non-value CDP results return an `objectId` handle instead of the value; the
