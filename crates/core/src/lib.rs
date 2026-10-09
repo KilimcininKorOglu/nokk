@@ -10245,6 +10245,65 @@ mod tests {
         assert!(t.elapsed() < std::time::Duration::from_secs(8), "took {:?}", t.elapsed());
     }
 
+    /// With a header CSP Chrome hides nonces: the attribute reads empty, the
+    /// value stays in the `nonce` property. The header was applied after the
+    /// tree was built, so the parsed nonces stayed visible.
+    #[tokio::test]
+    async fn a_header_csp_hides_nonces_of_the_parsed_document() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let body = "<html><head><script nonce=\"abc\" id=\"s1\">window.__r = [document.currentScript.nonce, document.currentScript.getAttribute('nonce')].join('/');</script></head><body></body></html>";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\nContent-Security-Policy: script-src 'nonce-abc'\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        let _ = ctx.navigate(&format!("http://127.0.0.1:{}/", addr.port())).await;
+        let v = ctx
+            .evaluate("window.__r + '|' + document.getElementById('s1').outerHTML.slice(0, 25)")
+            .await
+            .unwrap();
+        assert_eq!(v, Value::String("abc/|<script nonce=\"\" id=\"s1\">".into()));
+    }
+
+    /// Deeply nested flex containers lay out in linear time and memory. The
+    /// layout memo kept a node once per time it was laid out, so each level
+    /// doubled the list: facebook.com grew the heap by gigabytes a second.
+    #[tokio::test]
+    async fn nested_flex_layout_does_not_grow_exponentially() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>").await.unwrap();
+        let v = ctx
+            .evaluate(
+                r#"(() => { const root = document.createElement('div'); document.body.appendChild(root); let cur = root;
+                  for (let i = 0; i < 26; i++) { cur.style.display = 'flex'; cur.style.flexDirection = i % 2 ? 'row' : 'column';
+                    const a = document.createElement('div'); a.textContent = 'x' + i; cur.appendChild(a);
+                    const b = document.createElement('div'); cur.appendChild(b); cur = b; }
+                  const t = Date.now(); const h = root.offsetHeight;
+                  return (Date.now() - t < 3000 && performance.memory.usedJSHeapSize < 200 * 1048576 && h > 0) + ''; })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(v, Value::String("true".into()));
+    }
+
     /// A `data:` script in the markup runs from its own bytes; it was sent to the
     /// network and failed (Facebook's pages carry them).
     #[tokio::test]

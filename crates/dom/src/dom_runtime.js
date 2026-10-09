@@ -6649,6 +6649,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       __csp.policies.push({ raw: t, dirs: __cspParse(t), source: source || 'meta' });
       if ((source || 'meta') === 'header') __csp.headerDelivered = true;
     }
+    // The header arrives after the tree is installed: hide the nonces already
+    // in it (Facebook's loader compares the attribute with the property).
+    if (__csp.headerDelivered && globalThis.document && document.documentElement) {
+      __walkTree(document.documentElement, (n) => { try { if (n && n.nodeType === ELEMENT_NODE && typeof n.__ptHideNonce === 'function') n.__ptHideNonce(); } catch (e) {} });
+    }
     __cspWrapEval();
   };
   globalThis.__pt_cspActive = () => __csp.policies.length > 0;
@@ -8788,12 +8793,18 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     const start = __boxes.length, tellStart = __tellLog.length;
     const ret = __layoutOneRaw(el, originX, originY, availW, strut, forced);
-    const seq = __s_slice(__boxes, start), tells = __s_slice(__tellLog, tellStart);
-    const snap = [];
+    const tells = __s_slice(__tellLog, tellStart);
+    // Each node once: a child laid out twice (measure, then place) appeared
+    // twice, its parent's list doubled that, and so on up the tree; replaying
+    // copied it all back. Deep flex trees (facebook.com) grew the heap by
+    // gigabytes a second.
+    const seq = [], snap = [];
     const seen = new Set();
-    for (const n of seq) {
+    for (let i = start; i < __boxes.length; i++) {
+      const n = __boxes[i];
       if (seen.has(n)) continue;
       seen.add(n);
+      seq.push(n);
       if (n.__ptBox) snap.push([n, n.__ptBox, n.__ptDefH]);
     }
     if (!mine) __layoutMemo.set(el, (mine = new Map()));
