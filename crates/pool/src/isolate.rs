@@ -896,7 +896,10 @@ impl Isolate {
 
         // Disarm and clear any pending termination so the next eval on this
         // isolate starts clean.
-        watchdog.disarm();
+        if watchdog.disarm() && std::env::var_os("NOKK_TRACE_WATCHDOG").is_some() {
+            let head: String = source.chars().take(300).collect();
+            tracing::warn!(name = ?name, source = %head, "watchdog stopped an evaluation");
+        }
         self.isolate.cancel_terminate_execution();
         // A termination caused by the heap cap reads as a generic error; surface
         // it as a clear out-of-memory message instead.

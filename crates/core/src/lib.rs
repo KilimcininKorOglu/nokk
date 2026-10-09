@@ -1751,6 +1751,8 @@ impl BrowserContext {
                 };
                 let Some(abs) = resolve_url(base_url, src) else { continue };
                 if preload.contains_key(&abs)
+                    || abs.starts_with("data:")
+                    || abs.starts_with("blob:")
                     || (self.engine.block_trackers && nokk_net::is_blocked_url(&abs))
                 {
                     continue;
@@ -1899,7 +1901,17 @@ impl BrowserContext {
         if index == self.idx() {
             self.flush_resource_timings(index).await;
         }
-        self.eval_in(index, "__pt_finishLoad();").await?;
+        // Listeners' own errors are caught in the dispatch; what reaches here is
+        // a listener stopped for running too long (azure.microsoft.com relays
+        // out its sticky header for a minute). Chrome would still show the
+        // page, so the load goes on.
+        for attempt in 0..3 {
+            let call = if attempt == 0 { "__pt_finishLoad(false);" } else { "__pt_finishLoad(true);" };
+            match self.eval_in(index, call).await {
+                Ok(_) => break,
+                Err(e) => tracing::warn!(error = %e, "a load event listener was stopped; the page goes on"),
+            }
+        }
         Ok(())
     }
 
@@ -4953,6 +4965,25 @@ impl BrowserContext {
         pre: Option<Preloaded>,
         url: &str,
     ) -> Result<(String, String), EngineError> {
+        // A `data:` or `blob:` script in the markup is decoded in the page, as
+        // Chrome does; the HTTP client cannot fetch it (Facebook's markup has
+        // `src="data:text/javascript;base64,..."`).
+        if url.starts_with("data:") || url.starts_with("blob:") {
+            let src = self
+                .eval_in(
+                    self.idx(),
+                    &format!(
+                        "(() => {{ const s = globalThis.__pt_localSource && __pt_localSource({}); \
+                           return typeof s === 'string' ? s : null; }})()",
+                        js_str(url)
+                    ),
+                )
+                .await?;
+            return match src.as_str() {
+                Some(code) => Ok((url.to_string(), code.to_string())),
+                None => Err(EngineError::Js(format!("no source for {url}"))),
+            };
+        }
         match pre {
             Some((started, handle)) => match handle.await {
                 Ok(sent) => self.finish_text(self.idx(), url, "script", started, sent),
@@ -10212,6 +10243,22 @@ mod tests {
         }
         assert_eq!(ctx.evaluate("document.title").await.unwrap(), Value::String("async;timer;".into()));
         assert!(t.elapsed() < std::time::Duration::from_secs(8), "took {:?}", t.elapsed());
+    }
+
+    /// A `data:` script in the markup runs from its own bytes; it was sent to the
+    /// network and failed (Facebook's pages carry them).
+    #[tokio::test]
+    async fn a_data_script_in_the_markup_runs() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<html><head><title>t</title><script src=\"data:text/javascript;base64,ZG9jdW1lbnQudGl0bGUgKz0gJ0InOw==\"></script><script src=\"data:text/javascript,document.title%20%2B%3D%20'C'%3B\"></script></head><body></body></html>",
+        )
+        .await
+        .unwrap();
+        assert_eq!(ctx.evaluate("document.title").await.unwrap(), Value::String("tBC".into()));
     }
 
     /// A base with an opaque path (`about:blank`, `data:`, `mailto:`) takes only

@@ -6783,13 +6783,24 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     document.__ptReady = 'interactive';
     try { document.dispatchEvent(__ptTrust(new Event('readystatechange'))); } catch (e) {}
   };
-  globalThis.__pt_finishLoad = () => {
-    // readyState changes are visible: Chrome fires `readystatechange` at each
-    // step.
-    const setReadyState = (v) => {
-      document.__ptReady = v;
-      try { document.dispatchEvent(__ptTrust(new Event('readystatechange'))); } catch (e) {}
-    };
+  // In steps, resumable: a listener the engine stops for running too long
+  // ends only its own step, and the engine calls again for the rest (the
+  // page still gets `load`, as in Chrome).
+  globalThis.__pt_finishLoad = (resume) => {
+    const steps = [__finishDcl, __finishLoadEvent, __finishPageshow];
+    for (let i = resume ? document.__ptFinishAt | 0 : 0; i < steps.length; i++) {
+      document.__ptFinishAt = i + 1;
+      steps[i]();
+    }
+  };
+  // readyState changes are visible: Chrome fires `readystatechange` at each
+  // step.
+  const __setReadyState = (v) => {
+    document.__ptReady = v;
+    try { document.dispatchEvent(__ptTrust(new Event('readystatechange'))); } catch (e) {}
+  };
+  const __finishDcl = () => {
+    const setReadyState = __setReadyState;
     // Parsing may have finished earlier, before deferred scripts.
     if (document.__ptReady === 'loading') { __ptMark('interactive'); setReadyState('interactive'); }
     __ptMark('dclStart');
@@ -6808,14 +6819,18 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       }
     } catch (e) {}
     __ptMark('dclEnd');
+  };
+  const __finishLoadEvent = () => {
     __ptMark('complete');
-    setReadyState('complete');
+    __setReadyState('complete');
     __ptMark('loadStart');
     const load = __ptTrust(new Event('load'));
     globalThis.dispatchEvent && globalThis.dispatchEvent(load);
     // In Chrome `load` reaches the document and the body too.
     try { document.dispatchEvent(__ptTrust(new Event('load'))); } catch (e) {}
     __ptMark('loadEnd');
+  };
+  const __finishPageshow = () => {
     // `pageshow` follows `load`, with `persisted: false` on a normal load.
     try {
       const ps = __ptTrust(new Event('pageshow'));
