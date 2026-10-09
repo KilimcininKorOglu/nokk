@@ -99,9 +99,9 @@ async def solve_challenge(timeout_seconds: float = 30) -> Dict[str, Any]:
 @mcp.tool()
 async def challenge_state() -> Dict[str, Any]:
     """Which gate the current page shows: ``kind`` is ``"none"``,
-    ``"cloudflare-interstitial"``, ``"turnstile-widget"`` or ``"datadome"``
-    (recognised, not solvable); ``solvable`` says whether ``solve_challenge``
-    can take it on."""
+    ``"cloudflare-interstitial"``, ``"turnstile-widget"``, ``"aws-waf"``,
+    ``"recaptcha-widget"`` or ``"datadome"`` (recognised, not solvable);
+    ``solvable`` says whether ``solve_challenge`` can take it on."""
     page = await _get_page()
     return await page.challenge_state()
 

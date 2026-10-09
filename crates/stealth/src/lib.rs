@@ -7687,6 +7687,47 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     return out;
   };
 
+  // A FormData body as Chrome encodes it: a `----WebKitFormBoundary` boundary
+  // with 16 characters from Chrome's alphabet, CRLF line ends in names and
+  // values, `"` CR LF escaped in names and file names, a nameless blob as
+  // `blob` of `application/octet-stream`. It went out as "[object FormData]",
+  // and AWS WAF answered its challenge with 400.
+  const RANDOM = globalThis.__pt_randomBytes;
+  const BOUNDARY_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB';
+  const utf8 = (str, out) => {
+    for (let i = 0; i < str.length; i++) {
+      let c = __s_codePointAt(str, i);
+      if (c > 0xffff) i++;
+      else if (c >= 0xd800 && c <= 0xdfff) c = 0xfffd;
+      if (c < 0x80) out.push(c);
+      else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+      else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+      else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    }
+    return out;
+  };
+  const crlf = (s) => __s_replace(String(s), /\r\n|\r|\n/g, '\r\n');
+  const escapeName = (s) => __s_replace(__s_replace(__s_replace(crlf(s), /"/g, '%22'), /\r/g, '%0D'), /\n/g, '%0A');
+  const multipart = (fd) => {
+    const rnd = typeof RANDOM === 'function' ? RANDOM(16) : null;
+    let boundary = '----WebKitFormBoundary';
+    for (let i = 0; i < 16; i++) boundary += BOUNDARY_CHARS[(rnd ? rnd[i] : (i * 37 + 11)) & 63];
+    const out = [];
+    for (const [name, value, given] of fd.__ptD || []) {
+      utf8('--' + boundary + '\r\nContent-Disposition: form-data; name="' + escapeName(name) + '"', out);
+      if (value != null && typeof value === 'object' && globalThis.Blob && value instanceof globalThis.Blob) {
+        const fname = given !== undefined ? given : typeof value.name === 'string' ? value.name : 'blob';
+        utf8('; filename="' + escapeName(fname) + '"\r\nContent-Type: ' + (value.type || 'application/octet-stream') + '\r\n\r\n', out);
+        utf8(typeof value.__ptText === 'function' ? value.__ptText() : '', out);
+      } else {
+        utf8('\r\n\r\n' + crlf(value), out);
+      }
+      utf8('\r\n', out);
+    }
+    utf8('--' + boundary + '--\r\n', out);
+    return { type: 'multipart/form-data; boundary=' + boundary, bytes: new Uint8Array(out) };
+  };
+
   // `blob:` and `data:` never reach the network — they are answered from the
   // page's own memory. A blob URL handed to the network client fails with
   // "invalid authority", which is how Turnstile's challenge stalls: its VM builds
@@ -7742,7 +7783,11 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     const b = opts.body;
     if (b != null) {
       let bytes = null;
-      if (b instanceof ArrayBuffer) bytes = new Uint8Array(b);
+      if (globalThis.FormData && b instanceof globalThis.FormData) {
+        const mp = multipart(b);
+        bytes = mp.bytes;
+        if (!Object.keys(hdrs).some((k) => __s_toLowerCase(k) === 'content-type')) hdrs['content-type'] = mp.type;
+      } else if (b instanceof ArrayBuffer) bytes = new Uint8Array(b);
       else if (ArrayBuffer.isView(b)) bytes = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
       if (bytes) {
         let bin = '';
@@ -12423,8 +12468,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // beacons are captured, not silently dropped.
   navExtra('sendBeacon', mask(function sendBeacon(url, data) {
     try {
-      let body;
-      if (data != null) body = typeof data === 'string' ? data : (data.toString ? data.toString() : '');
+      // The data itself: fetch encodes a FormData, a blob or bytes as Chrome does.
+      const body = data == null ? undefined : data;
       globalThis.fetch(String(url), { method: 'POST', headers: { 'x-pt-kind': 'beacon' }, body }).catch(() => {});
     } catch (e) {}
     return true;
@@ -13164,7 +13209,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
   }
   if (!globalThis.FormData) {
-    globalThis.FormData = class FormData { constructor() { this.__ptD = []; } append(k, v) { this.__ptD.push([String(k), v]); } set(k, v) { this.delete(k); this.append(k, v); } get(k) { const e = this.__ptD.find((x) => x[0] === k); return e ? e[1] : null; } getAll(k) { return this.__ptD.filter((x) => x[0] === k).map((x) => x[1]); } has(k) { return this.__ptD.some((x) => x[0] === k); } delete(k) { this.__ptD = this.__ptD.filter((x) => x[0] !== k); } forEach(f) { for (const [k, v] of this.__ptD) f(v, k, this); } keys() { return this.__ptD.map((x) => x[0])[Symbol.iterator](); } values() { return this.__ptD.map((x) => x[1])[Symbol.iterator](); } entries() { return this.__ptD.map((x) => [x[0], x[1]])[Symbol.iterator](); } [Symbol.iterator]() { return this.entries(); } toString() { return this.__ptD.map(([k, v]) => k + '=' + v).join('&'); } };
+    globalThis.FormData = class FormData { constructor() { this.__ptD = []; } append(k, v, f) { this.__ptD.push(f === undefined ? [String(k), v] : [String(k), v, String(f)]); } set(k, v, f) { this.delete(k); this.append(k, v, f); } get(k) { const e = this.__ptD.find((x) => x[0] === k); return e ? e[1] : null; } getAll(k) { return this.__ptD.filter((x) => x[0] === k).map((x) => x[1]); } has(k) { return this.__ptD.some((x) => x[0] === k); } delete(k) { this.__ptD = this.__ptD.filter((x) => x[0] !== k); } forEach(f) { for (const [k, v] of this.__ptD) f(v, k, this); } keys() { return this.__ptD.map((x) => x[0])[Symbol.iterator](); } values() { return this.__ptD.map((x) => x[1])[Symbol.iterator](); } entries() { return this.__ptD.map((x) => [x[0], x[1]])[Symbol.iterator](); } [Symbol.iterator]() { return this.entries(); } toString() { return this.__ptD.map(([k, v]) => k + '=' + v).join('&'); } };
   }
 
   // Params owned by a URL (`url.searchParams`) rewrite its query when edited;

@@ -500,7 +500,9 @@ def solve_challenge(page: Any, timeout: Optional[float] = None) -> Dict[str, Any
 def challenge_state(page: Any) -> Dict[str, Any]:
     """What gate a (sync Playwright) page shows: ``{kind, title, url, cleared,
     token, solvable}``. ``kind`` is ``"none"``, ``"cloudflare-interstitial"``,
-    ``"turnstile-widget"`` or ``"datadome"`` (recognised, not solved)."""
+    ``"turnstile-widget"``, ``"aws-waf"`` (the page earns its token; solving
+    waits for it), ``"recaptcha-widget"`` or ``"datadome"`` (recognised, not
+    solved)."""
     session = page.context.new_cdp_session(page)
     try:
         return session.send("Nokk.challengeState")

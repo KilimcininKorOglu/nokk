@@ -10776,7 +10776,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   // What the page shows in front of the site, for the driver; walks the tree
   // internally so no page API call shows up in the challenge's report.
   globalThis.__pt_gateInfo = () => {
-    const out = { title: '', url: '', inter: false, widget: false, recaptcha: false, token: false, datadome: false, orchestrator: false };
+    const out = { title: '', url: '', inter: false, widget: false, recaptcha: false, token: false, datadome: false, orchestrator: false, awswaf: false };
     try {
       out.title = String((globalThis.document && document.title) || '');
       out.url = String((globalThis.location && location.href) || '');
@@ -10796,6 +10796,9 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         if ((t === 'input' || t === 'textarea') && /^(cf-turnstile-response|g-recaptcha-response)$/.test(__ptGetA(n, 'name') || '') && n.value) out.token = true;
       });
       if (!out.inter && out.orchestrator && typeof globalThis._cf_chl_opt === 'object') out.inter = true;
+      // AWS WAF's challenge page: its config object and the container it
+      // renders into. A real page that only loads the integration has neither.
+      if (globalThis.gokuProps && typeof globalThis.gokuProps === 'object' && document.getElementById('challenge-container')) out.awswaf = true;
     } catch (e) {}
     return __ptJSON.stringify(out);
   };

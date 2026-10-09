@@ -782,6 +782,7 @@ impl Engine {
             sheets_gave_up: std::sync::atomic::AtomicU64::new(0),
             stop_at_clearance: std::sync::atomic::AtomicBool::new(false),
             stopped_at_clearance: std::sync::atomic::AtomicBool::new(false),
+            work_left: std::sync::atomic::AtomicBool::new(false),
             lock_at_doc: std::sync::Mutex::new(None),
             requests: std::sync::Mutex::new(Vec::new()),
             started: std::time::Instant::now(),
@@ -970,6 +971,10 @@ pub struct BrowserContext {
     stop_at_clearance: std::sync::atomic::AtomicBool,
     /// Set when a navigation stopped at a fresh clearance.
     stopped_at_clearance: std::sync::atomic::AtomicBool,
+    /// The last event-loop call returned with work still queued (its time ran
+    /// out): a driver that pumps only on timers must come back now, or a
+    /// request the page queued waits for the next timer.
+    work_left: std::sync::atomic::AtomicBool,
     /// The `cf_clearance` in the jar when the current document was loaded
     /// (`None` inside: there was none). A navigation away from a document after
     /// a new lock arrived is the interstitial walking on to the site.
@@ -1200,6 +1205,9 @@ pub enum ChallengeKind {
     TurnstileWidget,
     /// DataDome's gate — not something this engine solves.
     DataDome,
+    /// AWS WAF's challenge page: the page's own script earns the token and
+    /// reloads; the solver waits for it.
+    AwsWaf,
     /// A reCAPTCHA checkbox, no token yet (Google's /sorry/ page). An image puzzle
     /// behind it is not something this engine solves.
     RecaptchaWidget,
@@ -1212,6 +1220,7 @@ impl ChallengeKind {
             ChallengeKind::CloudflareInterstitial => "cloudflare-interstitial",
             ChallengeKind::TurnstileWidget => "turnstile-widget",
             ChallengeKind::DataDome => "datadome",
+            ChallengeKind::AwsWaf => "aws-waf",
             ChallengeKind::RecaptchaWidget => "recaptcha-widget",
         }
     }
@@ -1974,6 +1983,8 @@ impl BrowserContext {
         // has been waiting since before this call started.
         let mut last_frame_pump = std::time::Instant::now() - FRAME_PUMP_EVERY;
         let mut last_spare_topup = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        // Cleared only when the loop runs dry; any other exit leaves work queued.
+        self.work_left.store(true, std::sync::atomic::Ordering::Release);
 
         for _ in 0..MAX_ROUNDS {
             if std::time::Instant::now() >= deadline {
@@ -2283,14 +2294,20 @@ impl BrowserContext {
             // promptly: continuous delivery is the caller's job (the CDP server
             // pumps periodically), not this call's.
             if !self.has_open_sockets().await {
+                self.work_left.store(false, std::sync::atomic::Ordering::Release);
                 break;
             }
             if !self.await_ws_event(SOCKET_IDLE_GRACE).await {
+                self.work_left.store(false, std::sync::atomic::Ordering::Release);
                 break;
             }
         }
-        
         Ok(total_timers)
+    }
+
+    /// Whether the last event-loop call stopped with work still queued.
+    pub fn has_work_left(&self) -> bool {
+        self.work_left.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Every cookie this context's client holds, HttpOnly included — the jar the
@@ -2699,6 +2716,8 @@ impl BrowserContext {
             ChallengeKind::CloudflareInterstitial
         } else if g("datadome") {
             ChallengeKind::DataDome
+        } else if g("awswaf") {
+            ChallengeKind::AwsWaf
         } else if g("widget") && !g("token") {
             ChallengeKind::TurnstileWidget
         } else if g("recaptcha") && !g("token") {
@@ -2732,6 +2751,9 @@ impl BrowserContext {
         // a widget can be inserted by script a moment after the load.
         const NO_GATE_GRACE: std::time::Duration = std::time::Duration::from_secs(4);
         let mut gate_last_seen = t;
+        // A gate that was there and went away was passed (AWS WAF reloads into
+        // the site), which is not the same answer as "no gate at all".
+        let mut gate_seen = false;
         // In stop-at-clearance mode only a fresh lock counts: one already in the
         // jar may be the stale cookie that sent us to the gate.
         let lock_at_start = self.clearance_value();
@@ -2788,6 +2810,10 @@ impl BrowserContext {
                 gate_checked = std::time::Instant::now();
                 if self.challenge_state().await.kind != ChallengeKind::None {
                     gate_last_seen = gate_checked;
+                    gate_seen = true;
+                } else if gate_seen && gate_last_seen.elapsed() >= std::time::Duration::from_secs(1) {
+                    tracing::info!(target: "nokk", elapsed_ms = t.elapsed().as_millis(), "the gate went away");
+                    break ChallengeStatus::Cleared;
                 } else if gate_last_seen.elapsed() >= NO_GATE_GRACE {
                     tracing::info!(target: "nokk", elapsed_ms = t.elapsed().as_millis(), "no challenge on the page");
                     break ChallengeStatus::NoChallenge;
@@ -10243,6 +10269,85 @@ mod tests {
         }
         assert_eq!(ctx.evaluate("document.title").await.unwrap(), Value::String("async;timer;".into()));
         assert!(t.elapsed() < std::time::Duration::from_secs(8), "took {:?}", t.elapsed());
+    }
+
+    /// A FormData body goes out as Chrome's multipart: WebKit boundary, CRLF line
+    /// ends, escaped names, a nameless blob as `blob`. It went out as
+    /// "[object FormData]" and AWS WAF refused its own challenge answer.
+    #[tokio::test]
+    async fn a_form_data_body_is_multipart_as_in_chrome() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let got: Arc<std::sync::Mutex<String>> = Arc::default();
+        let sink = got.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                // Read until the body announced by Content-Length is in.
+                loop {
+                    let n = stream.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 { break; }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end].lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                        if buf.len() >= end + 4 + len { break; }
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).to_string();
+                let body = if text.starts_with("POST") { *sink.lock().unwrap() = text; "ok" } else { "<html><body>x</body></html>" };
+                let resp = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        let _ = ctx.navigate(&format!("http://127.0.0.1:{}/", addr.port())).await;
+        let _ = ctx
+            .evaluate("(() => { const f = new FormData(); f.append('a', 'x\\ny'); f.append('q\"n', '1'); f.append('b', new Blob(['raw'])); f.append('f', new Blob(['hi'], { type: 'text/plain' }), 'h.txt'); fetch('/p', { method: 'POST', body: f }); return 1; })()")
+            .await;
+        let _ = ctx.run_event_loop().await;
+        let req = got.lock().unwrap().clone();
+        let ct = req.lines().find(|l| l.to_ascii_lowercase().starts_with("content-type:")).unwrap_or("").to_string();
+        let boundary = ct.split("boundary=").nth(1).unwrap_or("").trim().to_string();
+        assert!(boundary.starts_with("----WebKitFormBoundary") && boundary.len() == 38, "{ct}");
+        let body = req.split("\r\n\r\n").skip(1).collect::<Vec<_>>().join("\r\n\r\n").replace(&boundary, "B");
+        assert_eq!(
+            body,
+            "--B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nx\r\ny\r\n\
+             --B\r\nContent-Disposition: form-data; name=\"q%22n\"\r\n\r\n1\r\n\
+             --B\r\nContent-Disposition: form-data; name=\"b\"; filename=\"blob\"\r\nContent-Type: application/octet-stream\r\n\r\nraw\r\n\
+             --B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"h.txt\"\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
+             --B--\r\n"
+        );
+    }
+
+    /// AWS WAF's challenge page is a gate the solver waits through; a page that
+    /// only loads the integration script is not.
+    #[tokio::test]
+    async fn the_aws_waf_challenge_page_is_a_gate() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://www.example.com/",
+            "<html><head><script>window.gokuProps = { key: 'k', iv: 'i', context: 'c' };</script></head><body><div id=\"challenge-container\"></div></body></html>",
+        )
+        .await
+        .unwrap();
+        assert_eq!(ctx.challenge_state().await.kind.as_str(), "aws-waf");
+        ctx.load_html("https://www.example.com/", "<html><head><script>window.gokuProps = {};</script></head><body>shop</body></html>")
+            .await
+            .unwrap();
+        assert_eq!(ctx.challenge_state().await.kind.as_str(), "none");
     }
 
     /// With a header CSP Chrome hides nonces: the attribute reads empty, the

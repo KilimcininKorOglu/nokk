@@ -587,6 +587,7 @@ impl Conn {
             // nothing, and a page with a slow timer is woken when it is due rather
             // than twenty times a second.
             let wants_pump = t.ran_js.swap(false, Ordering::Relaxed)
+                || t.ctx.has_work_left()
                 || t.ctx.timer_due()
                 || t.ctx.has_frames()
                 || t.ctx.has_open_sockets().await;
@@ -1231,13 +1232,24 @@ impl Conn {
                     self.targets[idx].net_ids.clone(),
                 );
                 tokio::spawn(async move {
+                    // Loaders whose document request has gone out. A page that
+                    // navigates itself before its first load finishes (AWS WAF's
+                    // challenge reloads at once) sends a second document under the
+                    // same loader; with the loader's id it overwrote the first, and
+                    // its in-flight state reached `page.goto` as `net::ERR_FAILED`.
+                    let mut loaders_used: std::collections::HashSet<String> = std::collections::HashSet::new();
                     while let Some(rec) = rx.recv().await {
                         let loader_id = loader.lock().map(|l| l.clone()).unwrap_or_default();
-                        let held_id = if rec.announced {
+                        let mut held_id = if rec.announced {
                             ids.lock().ok().and_then(|mut m| m.remove(&rec.request_id))
                         } else {
                             None
                         };
+                        if rec.frame.is_none() && rec.resource_type == "document" && held_id.is_none()
+                            && !loaders_used.insert(loader_id.clone())
+                        {
+                            held_id = Some(rec.request_id.clone());
+                        }
                         // A frame's requests belong to that frame and its own document.
                         let (fid, lid) = match rec.frame {
                             Some(f) => (child_frame_id(&frame, f), format!("LF{f}")),
@@ -1537,7 +1549,7 @@ impl Conn {
                     let m = ok(id, &session, json!({
                         "kind": st.kind.as_str(), "title": st.title, "url": st.url,
                         "cleared": st.cleared, "token": st.token,
-                        "solvable": matches!(st.kind, nokk::ChallengeKind::CloudflareInterstitial | nokk::ChallengeKind::TurnstileWidget),
+                        "solvable": matches!(st.kind, nokk::ChallengeKind::CloudflareInterstitial | nokk::ChallengeKind::TurnstileWidget | nokk::ChallengeKind::AwsWaf),
                     }));
                     let _ = tx.send(Message::Text(m.to_string()));
                 });
