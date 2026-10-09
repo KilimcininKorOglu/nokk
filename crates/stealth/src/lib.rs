@@ -13299,6 +13299,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         if (!base) return false;
         const b = URL_STATE.get(base) || base;
         scheme = b.scheme;
+        // A base with an opaque path (`about:blank`, `data:`, `mailto:`) takes
+        // only a fragment; anything else is not a URL (WHATWG "no scheme").
+        if (b.opaque) {
+          if (!__s_startsWith(s, '#')) return false;
+          st.scheme = b.scheme; st.username = ''; st.password = ''; st.host = ''; __pt_write(st, 'port', '');
+          st.opaque = true; st.path = b.path; st.query = b.query; st.fragment = encFrag(s);
+          return true;
+        }
         if (!__s_startsWith(s, '//')) {
           // Relative URL: scheme, credentials and host are taken from the base
           // as is. Rebuilding them into a string lost the port, so navigating

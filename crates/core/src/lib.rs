@@ -181,6 +181,7 @@ impl EngineInner {
         // pooled client for a key never disagrees with a later lookup's OS.
         if let Some(os) = emulation_os {
             cfg.emulation_os = os;
+            cfg.hints = hint_values_for(&preset_for_os(os).stealth());
         }
         let client = Client::Fingerprint(FingerprintClient::new(&cfg)?);
         let mut pool = self.client_pool.lock().unwrap_or_else(|e| e.into_inner());
@@ -363,6 +364,7 @@ impl EngineInner {
         cfg.proxy = proxy;
         if let Some(os) = emulation_os {
             cfg.emulation_os = os;
+            cfg.hints = hint_values_for(&preset_for_os(os).stealth());
         }
         let client = Client::Fingerprint(FingerprintClient::with_session(&cfg, Some(jar))?);
         let mut pool = self.client_pool.lock().unwrap_or_else(|e| e.into_inner());
@@ -419,6 +421,27 @@ fn sanitize_session_name(name: &str) -> Option<String> {
 /// client among contexts that route through the same proxy).
 /// The TLS emulation OS that matches a JS stealth profile, derived from its
 /// Client-Hints platform, so the ClientHello and the User-Agent agree.
+/// What client hints report for a JS profile: the values the page reads from
+/// `userAgentData`, `deviceMemory` and the window size.
+fn hint_values_for(profile: &StealthProfile) -> nokk_net::HintValues {
+    nokk_net::HintValues {
+        full_version: nokk_stealth::CHROME_FULL.to_string(),
+        device_memory: profile.device_memory_gb,
+        viewport_width: profile.screen_width,
+        viewport_height: profile.avail_height.saturating_sub(111),
+        ..Default::default()
+    }
+}
+
+/// The preset a rotated identity uses for an OS (one preset per OS).
+fn preset_for_os(os: nokk_net::EmulationOs) -> nokk_stealth::FingerprintProfile {
+    match os {
+        nokk_net::EmulationOs::Windows => nokk_stealth::FingerprintProfile::ChromeWindows,
+        nokk_net::EmulationOs::Mac => nokk_stealth::FingerprintProfile::ChromeMac,
+        _ => nokk_stealth::FingerprintProfile::ChromeLinux,
+    }
+}
+
 fn emulation_os_for(profile: &StealthProfile) -> nokk_net::EmulationOs {
     match profile.ua_platform.as_str() {
         "Windows" => nokk_net::EmulationOs::Windows,
@@ -578,6 +601,7 @@ impl Engine {
         // Keep the TLS/HTTP emulation OS coherent with the JS profile's OS, so the
         // ClientHello (JA3/JA4) never contradicts the User-Agent.
         config.client.emulation_os = emulation_os_for(&config.stealth);
+        config.client.hints = hint_values_for(&config.stealth);
         if let Some(dir) = &config.session_store {
             std::fs::create_dir_all(dir).map_err(|e| {
                 EngineError::Session(format!("create store `{}`: {e}", dir.display()))
@@ -10188,6 +10212,88 @@ mod tests {
         }
         assert_eq!(ctx.evaluate("document.title").await.unwrap(), Value::String("async;timer;".into()));
         assert!(t.elapsed() < std::time::Duration::from_secs(8), "took {:?}", t.elapsed());
+    }
+
+    /// A base with an opaque path (`about:blank`, `data:`, `mailto:`) takes only
+    /// a fragment; Chrome refuses anything else. We built `about://a/b.js`.
+    #[tokio::test]
+    async fn a_url_against_an_opaque_base_is_only_a_fragment() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        let v = ctx
+            .evaluate(
+                r#"(() => { const t = (b, r) => { try { return String(new URL(r, b)); } catch (e) { return e.message; } };
+                  return [t('about:blank', 'a/b.js'), t('about:blank', '#f'), t('data:text/html,x', 'a'),
+                          t('about:blank', '//x.y/p'), t('mailto:x@y?s=1', '#z'), t('https://a.b/c/d', '../e')].join('|'); })()"#,
+            )
+            .await
+            .unwrap();
+        let bad = "Failed to construct 'URL': Invalid URL";
+        assert_eq!(v, Value::String(format!("{bad}|about:blank#f|{bad}|{bad}|mailto:x@y?s=1#z|https://a.b/e")));
+    }
+
+    /// Client hints a site asks for with `Accept-CH` go to its later requests,
+    /// in Chrome's order; `Critical-CH` restarts the navigation with them.
+    #[tokio::test]
+    async fn client_hints_follow_accept_ch_like_chrome() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                log.lock().unwrap().push(req.clone());
+                let (ctype, extra, body) = if req.starts_with("GET /s.js") {
+                    ("text/javascript", "", "1")
+                } else if req.starts_with("GET /p1") {
+                    ("text/html", "Accept-CH: Sec-CH-UA-Arch, Sec-CH-UA-Bitness\r\n", "<html><body><script src=/s.js></script></body></html>")
+                } else if req.starts_with("GET /crit") {
+                    ("text/html", "Accept-CH: Sec-CH-UA-Model\r\nCritical-CH: Sec-CH-UA-Model\r\n", "<html><body>c</body></html>")
+                } else {
+                    ("text/html", "", "<html><body>x</body></html>")
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: {ctype}\r\n{extra}Content-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let _ = ctx.navigate(&format!("{base}/p1")).await;
+        let _ = ctx.run_event_loop().await;
+        let _ = ctx.navigate(&format!("{base}/p2")).await;
+        let _ = ctx.navigate(&format!("{base}/crit")).await;
+        let seen = seen.lock().unwrap().clone();
+        let hints = |path: &str, nth: usize| -> Vec<String> {
+            let req = seen.iter().filter(|r| r.starts_with(&format!("GET {path} "))).nth(nth).cloned().unwrap_or_default();
+            req.lines()
+                .filter_map(|l| l.split_once(':').map(|(k, _)| k.to_ascii_lowercase()))
+                .filter(|k| k.starts_with("sec-ch-") || k == "user-agent")
+                .collect()
+        };
+        // Not asked for yet: the three every request carries.
+        assert_eq!(hints("/p1", 0), ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "user-agent"]);
+        // The document's own script already has them, in the header map's order.
+        assert_eq!(hints("/s.js", 0), ["sec-ch-ua-arch", "sec-ch-ua-platform", "user-agent", "sec-ch-ua", "sec-ch-ua-bitness", "sec-ch-ua-mobile"]);
+        // The next navigation lists them in the browser's order.
+        assert_eq!(hints("/p2", 0), ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-arch", "sec-ch-ua-platform", "sec-ch-ua-bitness", "user-agent"]);
+        // A critical hint that was not sent restarts the request, hints after `accept`.
+        assert_eq!(hints("/crit", 0), ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-arch", "sec-ch-ua-platform", "sec-ch-ua-bitness", "user-agent"]);
+        assert_eq!(hints("/crit", 1), ["user-agent", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "sec-ch-ua-model"]);
     }
 
     /// The engine's own work (cascade, layout, colors, stack formatting) must not run

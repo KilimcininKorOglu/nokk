@@ -17,9 +17,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 mod blocklist;
+mod client_hints;
 mod geoip;
 mod session;
 mod websocket;
+pub use client_hints::HintValues;
 pub use blocklist::{host_of, is_blocked, is_blocked_url};
 pub use geoip::{parse_geo, GeoInfo, GEO_LOOKUP_URL};
 pub use session::{CookieRecord, SessionJar};
@@ -232,6 +234,9 @@ pub struct ClientConfig {
     pub limits: PoolLimits,
     pub proxy: Option<ProxyConfig>,
     pub request_timeout: Duration,
+    /// What client hints report when a site asks for them (`Accept-CH`); keep
+    /// in step with the JS profile.
+    pub hints: HintValues,
 }
 
 impl Default for ClientConfig {
@@ -243,6 +248,7 @@ impl Default for ClientConfig {
             limits: PoolLimits::default(),
             proxy: None,
             request_timeout: Duration::from_secs(30),
+            hints: HintValues::default(),
         }
     }
 }
@@ -439,6 +445,9 @@ pub struct FingerprintClient {
     /// cookie that matters for a warmed session (`cf_clearance`, Akamai's
     /// `bm_s*`) is HttpOnly, so `document.cookie` is no substitute.
     jar: Arc<SessionJar>,
+    /// Hints each origin asked for with `Accept-CH`, and their values.
+    hint_store: Arc<client_hints::HintStore>,
+    hint_values: Arc<HintValues>,
 }
 
 /// Header names the emulation profile owns; caller-supplied values for these are
@@ -551,7 +560,12 @@ impl FingerprintClient {
         let inner = builder
             .build()
             .map_err(|e| NetError::Connect(e.to_string()))?;
-        Ok(Self { inner, jar })
+        Ok(Self {
+            inner,
+            jar,
+            hint_store: Arc::default(),
+            hint_values: Arc::new(config.hints.clone()),
+        })
     }
 }
 
@@ -583,6 +597,19 @@ fn same_site(referer: &str, url: &str) -> bool {
 
 impl HttpClient for FingerprintClient {
     async fn send(&self, req: Request) -> Result<Response, NetError> {
+        // A navigation whose response marks a hint critical that was not sent
+        // is restarted once with it, as Chrome does (`Critical-CH`).
+        let retry = (req.kind == RequestKind::Document).then(|| req.clone());
+        let (resp, restart) = self.send_once(req, false).await?;
+        match (restart, retry) {
+            (true, Some(again)) => Ok(self.send_once(again, true).await?.0),
+            _ => Ok(resp),
+        }
+    }
+}
+
+impl FingerprintClient {
+    async fn send_once(&self, req: Request, critical_retry: bool) -> Result<(Response, bool), NetError> {
         // Turnstile posts to `/eb/` when its own script throws: a script the
         // engine runs differently from Chrome. It still may pass, but this is
         // the first sign of a break (2026-10-07), so say it in plain logs.
@@ -627,6 +654,22 @@ impl HttpClient for FingerprintClient {
         // header — so ours is only the default when the caller named none. For a
         // navigation, a script or an image the page has no say, and the browser's
         // value is the only correct one.
+        // Hints this origin asked for: on its navigations and on its own
+        // same-origin subresources, never across origins or from a third-party
+        // frame (Chrome's default delegation policy is `self`).
+        let request_origin = origin_of(&req.url);
+        let hint_scope = client_hints::secure(&req.url)
+            && !req.third_party
+            && (req.kind == RequestKind::Document || same_origin);
+        let extra_hints: Vec<&'static str> = match (&request_origin, hint_scope) {
+            (Some(o), true) => self.hint_store.get(o),
+            _ => Vec::new(),
+        };
+        for name in &extra_hints {
+            if let Some(v) = self.hint_values.value(name) {
+                rb = rb.header(*name, v);
+            }
+        }
         let page_accept = req.headers.keys().any(|k| k.eq_ignore_ascii_case("accept"));
         let own_accept = !(page_accept && req.kind == RequestKind::Xhr);
         if own_accept {
@@ -665,20 +708,31 @@ impl HttpClient for FingerprintClient {
             order.insert("host");
             order.insert("connection");
         }
-        // Client hints order differs between navigations (`sec-ch-ua`,
-        // `-mobile`, `-platform`) and subresources (`-platform`, `user-agent`,
-        // `sec-ch-ua`, `content-type`, `-mobile`). Captured from Chrome 151.
+        // A navigation lists client hints in the browser's fixed order. A
+        // subresource's page headers, hints and `user-agent` come out of
+        // Blink's header hash map, in its slot order (see `client_hints`).
         let subresource = req.kind != RequestKind::Document;
+        let sends_hint = |n: &str| client_hints::BASE.contains(&n) || extra_hints.contains(&n);
         if subresource {
             order.insert("content-length");
-            order.insert("sec-ch-ua-platform");
-            order.insert("user-agent");
-            order.insert("sec-ch-ua");
-            order.insert("content-type");
-            order.insert("sec-ch-ua-mobile");
-        } else {
-            for name in ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"] {
+            let mut names: Vec<String> = req
+                .headers
+                .keys()
+                .map(|k| k.to_ascii_lowercase())
+                .filter(|k| {
+                    !FP_OWNED_HEADERS.contains(&k.as_str())
+                        && !k.starts_with("sec-")
+                        && !matches!(k.as_str(), "content-length" | "referer" | "origin" | "cookie" | "priority" | "upgrade-insecure-requests")
+                })
+                .collect();
+            names.extend(client_hints::BLINK_INSERT_ORDER.iter().filter(|n| sends_hint(n)).map(|n| n.to_string()));
+            names.push("user-agent".into());
+            for name in client_hints::blink_map_order(&names) {
                 order.insert(name);
+            }
+        } else if !critical_retry {
+            for name in client_hints::NAVIGATION_ORDER.iter().filter(|n| sends_hint(n)) {
+                order.insert(*name);
             }
         }
         let claims_user = req.kind == RequestKind::Document && req.user_activated;
@@ -697,6 +751,12 @@ impl HttpClient for FingerprintClient {
             order.insert("user-agent");
         }
         order.insert("accept");
+        // A restart for `Critical-CH` adds the hints after `accept`.
+        if critical_retry && !subresource {
+            for name in client_hints::BASE.iter().chain(client_hints::NAVIGATION_ORDER.iter().filter(|n| extra_hints.contains(n))) {
+                order.insert(*name);
+            }
+        }
         if sent_origin {
             order.insert("origin");
         }
@@ -803,6 +863,22 @@ impl HttpClient for FingerprintClient {
                 headers.insert(k.to_string(), s.to_string());
             }
         }
+        // A secure top-level document sets its origin's hints; its own
+        // subresources already carry them.
+        let mut restart = false;
+        if req.kind == RequestKind::Document && !req.third_party && client_hints::secure(&url) {
+            if let (Some(origin), Some(value)) = (origin_of(&url), headers.get("accept-ch")) {
+                let asked = client_hints::parse(value);
+                if !critical_retry && Some(&origin) == request_origin.as_ref() {
+                    if let Some(critical) = headers.get("critical-ch") {
+                        restart = client_hints::parse(critical)
+                            .iter()
+                            .any(|h| asked.contains(h) && !extra_hints.contains(h));
+                    }
+                }
+                self.hint_store.set(&origin, asked);
+            }
+        }
         // A bodyless response (204/304) is complete at the headers: Chrome
         // resolves `fetch` at once, while the challenge beacon keeps the stream
         // open until the page aborts it, so waiting for a body would time out.
@@ -831,16 +907,19 @@ impl HttpClient for FingerprintClient {
             .map(|t| t.duration_since(started).as_secs_f64() * 1000.0);
         headers.remove("content-encoding");
         headers.remove("content-length");
-        Ok(Response {
-            status,
-            url,
-            headers,
-            body,
-            encoded_len,
-            elapsed_ms,
-            content_encoding,
-            redirect_ms,
-        })
+        Ok((
+            Response {
+                status,
+                url,
+                headers,
+                body,
+                encoded_len,
+                elapsed_ms,
+                content_encoding,
+                redirect_ms,
+            },
+            restart,
+        ))
     }
 }
 
