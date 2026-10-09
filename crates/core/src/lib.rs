@@ -10271,6 +10271,48 @@ mod tests {
         assert!(t.elapsed() < std::time::Duration::from_secs(8), "took {:?}", t.elapsed());
     }
 
+    /// Streams, Response and AbortSignal behave as in Chrome 151 (values captured
+    /// there). The old streams said "done" when the queue was empty though the
+    /// source would write more, so a response streamed in parts ended early
+    /// (shopify.com lost its whole document); Response had no `body`.
+    #[tokio::test]
+    async fn streams_and_responses_behave_as_in_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>").await.unwrap();
+        let _ = ctx
+            .evaluate(
+                r#"(async () => { const r = []; const t = async (n, f) => { try { r.push(n + '=' + JSON.stringify(await f())); } catch (e) { r.push(n + '!' + e.message); } };
+                  await t('late', async () => { let c; const s = new ReadableStream({ start(x) { c = x; } }); const rd = s.getReader(); setTimeout(() => { c.enqueue('a'); setTimeout(() => { c.enqueue('b'); c.close(); }, 10); }, 10); const out = []; for (;;) { const { done, value } = await rd.read(); if (done) break; out.push(value); } return out; });
+                  await t('decode', async () => { const s = new ReadableStream({ start(c) { const b = new TextEncoder().encode('héllo'); c.enqueue(b.subarray(0, 2)); c.enqueue(b.subarray(2)); c.close(); } }); const rd = s.pipeThrough(new TextDecoderStream()).getReader(); let o = ''; for (;;) { const x = await rd.read(); if (x.done) break; o += x.value; } return o; });
+                  await t('body', async () => { const res = new Response('xyz'); const a = await res.body.getReader().read(); return [a.value.constructor.name, a.value.length, res.bodyUsed]; });
+                  await t('twice', async () => { const res = new Response('hi'); await res.text(); return await res.text(); });
+                  await t('tee', async () => { const [a, b] = new ReadableStream({ start(c) { c.enqueue('a'); c.close(); } }).tee(); return [(await a.getReader().read()).value, (await b.getReader().read()).value]; });
+                  await t('abort', () => { const a = new AbortController(); a.abort(); return [Object.prototype.toString.call(a.signal.reason), a.signal.reason.name, Object.getOwnPropertyNames(a.signal).length]; });
+                  window.__streams = r.join('|'); })()"#,
+            )
+            .await;
+        let t0 = std::time::Instant::now();
+        let mut out = Value::Null;
+        while t0.elapsed() < std::time::Duration::from_secs(5) {
+            let _ = ctx.run_event_loop().await;
+            out = ctx.evaluate("window.__streams || ''").await.unwrap_or(Value::Null);
+            if out.as_str().is_some_and(|s| !s.is_empty()) { break; }
+        }
+        assert_eq!(
+            out,
+            Value::String([
+                r#"late=["a","b"]"#,
+                r#"decode="héllo""#,
+                r#"body=["Uint8Array",3,true]"#,
+                "twice!Failed to execute 'text' on 'Response': body stream already read",
+                r#"tee=["a","a"]"#,
+                r#"abort=["[object DOMException]","AbortError",0]"#,
+            ].join("|"))
+        );
+    }
+
     /// A FormData body goes out as Chrome's multipart: WebKit boundary, CRLF line
     /// ends, escaped names, a nameless blob as `blob`. It went out as
     /// "[object FormData]" and AWS WAF refused its own challenge answer.
