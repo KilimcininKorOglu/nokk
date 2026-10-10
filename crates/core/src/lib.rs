@@ -125,6 +125,9 @@ struct EngineInner {
     block_trackers: bool,
     /// Directory where named session jars are persisted (`None` = in-memory only).
     session_store: Option<PathBuf>,
+    /// Icon addresses that failed for a profile (storage partition): Chrome
+    /// does not ask for them again in the session.
+    icons_failed: Mutex<std::collections::HashSet<(u64, String)>>,
     /// Shared, named session cookie jars — one per session name, loaded from the
     /// store on first use and the source of truth persisted back to disk.
     sessions: Mutex<HashMap<String, Arc<SessionJar>>>,
@@ -290,6 +293,8 @@ impl EngineInner {
         let req = Request {
             context: None,
             doc_hints: Vec::new(),
+            urgency: None,
+            omit_credentials: false,
             method: "GET".into(),
             url: nokk_net::GEO_LOOKUP_URL.to_string(),
             headers,
@@ -662,6 +667,7 @@ impl Engine {
         );
         Ok(Self {
             inner: Arc::new(EngineInner {
+                icons_failed: Mutex::new(std::collections::HashSet::new()),
                 pool,
                 client,
                 client_config: config.client,
@@ -919,6 +925,8 @@ impl Engine {
         let req = Request {
             context: None,
             doc_hints: Vec::new(),
+            urgency: None,
+            omit_credentials: false,
             method: "GET".into(),
             url: url.to_string(),
             headers,
@@ -1817,9 +1825,20 @@ impl BrowserContext {
             self.pull_doc_hints(index).await;
         }
         if index == self.idx() && std::env::var_os("NOKK_NO_PRELOAD").is_none() {
-            for script in &page.scripts {
-                let (nokk_dom::Script::External(src) | nokk_dom::Script::ExternalModule(src)) = script else {
-                    continue;
+            for (si, script) in page.scripts.iter().enumerate() {
+                let (src, module) = match script {
+                    nokk_dom::Script::External(src) => (src, false),
+                    nokk_dom::Script::ExternalModule(src) => (src, true),
+                    _ => continue,
+                };
+                // Chrome's priority by how the script runs: parser-blocking
+                // High, `async`/`defer` Low; a module is a CORS load.
+                let ty = if module {
+                    "module"
+                } else if mode_of(si) == nokk_dom::ScriptMode::Blocking {
+                    "script"
+                } else {
+                    "script-low"
                 };
                 let Some(abs) = resolve_url(base_url, src) else { continue };
                 if preload.contains_key(&abs)
@@ -1829,7 +1848,7 @@ impl BrowserContext {
                 {
                     continue;
                 }
-                let mut req = self.get_request(&abs, "script", None);
+                let mut req = self.get_request(&abs, ty, None);
                 req.doc_hints = self.doc_hints_of(index);
                 let client = self.client.clone();
                 let started = std::time::Instant::now();
@@ -1985,7 +2004,58 @@ impl BrowserContext {
                 Err(e) => tracing::warn!(error = %e, "a load event listener was stopped; the page goes on"),
             }
         }
+        if index == self.idx() {
+            self.request_icon(index, base_url).await;
+        }
         Ok(())
+    }
+
+    /// The tab icons, as Chrome asks for them once the top-level page has
+    /// loaded: every `<link rel="icon">` the document names (`shortcut icon`
+    /// included), else `/favicon.ico` of its origin, with an image request's
+    /// headers and the page as referrer. An address that failed is not asked
+    /// for again in the profile's session.
+    async fn request_icon(&self, index: usize, page: &str) {
+        if !(page.starts_with("http://") || page.starts_with("https://")) {
+            return;
+        }
+        let listed = self
+            .eval_in(
+                index,
+                "__ptJSON.stringify((() => { const out = []; for (const l of document.querySelectorAll('link[rel]')) { \
+                   const rel = String(l.getAttribute('rel') || '').toLowerCase().split(/\\s+/); \
+                   if (rel.includes('icon') && l.getAttribute('href')) { const u = String(l.href); if (/^https?:/.test(u) && !out.includes(u)) out.push(u); } } return out; })())",
+            )
+            .await
+            .ok()
+            .and_then(|v| v.as_str().and_then(|s| serde_json::from_str::<Vec<String>>(s).ok()))
+            .unwrap_or_default();
+        let urls = if listed.is_empty() {
+            let o = origin_of(page);
+            if o.is_empty() || o == "null" {
+                return;
+            }
+            vec![format!("{o}/favicon.ico")]
+        } else {
+            listed
+        };
+        for url in urls {
+            if self
+                .engine
+                .icons_failed
+                .lock()
+                .map(|f| f.contains(&(self.storage, url.clone())))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            // Through the page's own subresource road: it is logged, it shows in
+            // resource timing as `other` (as Chrome's icons do), and its failure
+            // is remembered when the answer is settled.
+            let _ = self
+                .eval_in(index, &format!("globalThis.__pt_subresource && __pt_subresource({}, 'icon').catch(() => {{}})", js_str(&url)))
+                .await;
+        }
     }
 
     /// Drive this context's event loop until it goes idle: alternately pump
@@ -2702,12 +2772,12 @@ impl BrowserContext {
                     "xhr" => "xmlhttprequest",
                     "fetch" => "fetch",
                     "document" if top_document => "navigation",
-                    "document" => "iframe",
+                    "document" | "iframe" => "iframe",
                     "stylesheet" => "link",
-                    "css" => "css",
-                    "img" | "image" => "img",
+                    "css" | "css-image" => "css",
+                    "img" | "image" | "image-low" => "img",
                     "font" => "css",
-                    "websocket" | "beacon" => "other",
+                    "icon" | "websocket" | "beacon" => "other",
                     _ => "link",
                 };
                 serde_json::json!({
@@ -3233,7 +3303,7 @@ impl BrowserContext {
                         }
                     } else {
                         match resolve_url(base, raw) {
-                            Some(url) => match self.fetch_text(&url, "script").await {
+                            Some(url) => match self.fetch_text(&url, "worker").await {
                                 Ok((_, code)) => code,
                                 Err(e) => {
                                     tracing::debug!(url = %url, error = %e, "worker script failed to load");
@@ -3818,7 +3888,8 @@ impl BrowserContext {
                         )
                         .await
                     } else {
-                        self.fetch_text(&url, "document").await
+                        // A frame's document: `iframe`, with the page as referrer.
+                        self.fetch_text_from(&url, "iframe", Some(base)).await
                     };
                     let Ok((_, html)) = fetched else {
                         let _ = self.evaluate(&format!("__pt_frameFailed({id})")).await;
@@ -4114,7 +4185,7 @@ impl BrowserContext {
             }
             let got = self
                 .with_frames_live(futures_util::future::join_all(
-                    to_fetch.iter().map(|t| self.fetch_text_in(index, t, "script", None)),
+                    to_fetch.iter().map(|t| self.fetch_text_in(index, t, "module", None)),
                 ))
                 .await;
             for (target, res) in to_fetch.into_iter().zip(got) {
@@ -4178,7 +4249,7 @@ impl BrowserContext {
                 None => Err(format!(
                     "Failed to resolve module specifier '{specifier}'"
                 )),
-                Some(target) => match self.with_frames_live(self.fetch_text_in(index, &target, "script", None)).await {
+                Some(target) => match self.with_frames_live(self.fetch_text_in(index, &target, "module", None)).await {
                     Err(e) => Err(format!("Failed to fetch dynamically imported module: {e}")),
                     Ok((final_url, code)) => match self.run_module(index, &final_url, code).await {
                         Err(e) => Err(e.to_string()),
@@ -4259,7 +4330,8 @@ impl BrowserContext {
                 let _ = self.eval_in(index, &done(true)).await;
                 continue;
             }
-            match self.fetch_text_in(index, &url, "script", None).await {
+            let ty = if op["module"].as_bool().unwrap_or(false) { "module" } else { "script-low" };
+            match self.fetch_text_in(index, &url, ty, None).await {
                 Ok((_, code)) => {
                     // A script reads its own <script> timing on its first line: the entry must exist
                     // before it starts, not at the end of the round.
@@ -4839,8 +4911,10 @@ impl BrowserContext {
         }
         // `x-pt-kind` is an internal tag (beacon/image) set by the JS shims — use
         // it as the resource type and strip it so it never hits the wire.
-        let kind = headers
-            .remove("x-pt-kind")
+        let kind = r["kind"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| headers.remove("x-pt-kind"))
             .unwrap_or_else(|| "fetch".to_string());
         // Page-initiated requests carry the document that made them, which is
         // also what decides `Sec-Fetch-Site`.
@@ -4874,7 +4948,9 @@ impl BrowserContext {
             url: url.clone(),
             headers,
             body,
-            kind: nokk_net::RequestKind::Xhr,
+            kind: Self::wire_kind(&kind).0,
+            urgency: Self::wire_kind(&kind).1,
+            omit_credentials: Self::wire_kind(&kind).2,
             // The frame was granted access to its cookies: from now on a browser marks its
             // requests with `sec-fetch-storage-access`.
             third_party: r["storageAccess"].as_bool().unwrap_or(false),
@@ -4887,6 +4963,12 @@ impl BrowserContext {
     fn settle_fetch(&self, info: &FetchInfo, res: Result<nokk_net::Response, NetError>) -> String {
         let FetchInfo { context, id, url, method, kind, sent } = info;
         let (context, id) = (*context, *id);
+        // A tab icon that failed is not asked for again in the profile's session.
+        if kind == "icon" && !matches!(&res, Ok(r) if r.status < 400) {
+            if let Ok(mut f) = self.engine.icons_failed.lock() {
+                f.insert((self.storage, url.clone()));
+            }
+        }
         match res {
             Ok(resp) => {
                 self.record_full(
@@ -5074,12 +5156,12 @@ impl BrowserContext {
         resource_type: &str,
         referrer: Option<&str>,
     ) -> Result<(String, String), EngineError> {
-        if resource_type != "document" && (url.starts_with("data:") || url.starts_with("blob:")) {
+        if resource_type != "document" && resource_type != "iframe" && (url.starts_with("data:") || url.starts_with("blob:")) {
             return self.local_source(context, url).await;
         }
         let mut req = self.get_request(url, resource_type, referrer);
         req.context = Some(context);
-        if resource_type != "document" {
+        if resource_type != "document" && resource_type != "iframe" {
             req.doc_hints = self.doc_hints_of(context);
         }
         let started = std::time::Instant::now();
@@ -5123,6 +5205,38 @@ impl BrowserContext {
     }
 
     /// A `GET` as a document sends it: fingerprint headers, referrer, destination.
+    /// What a resource type (the engine's or the page side's tag) is on the
+    /// wire: the destination, Chrome's urgency when it depends on context,
+    /// and whether it goes without cookies.
+    fn wire_kind(resource_type: &str) -> (nokk_net::RequestKind, Option<u8>, bool) {
+        use nokk_net::RequestKind as K;
+        match resource_type {
+            "document" => (K::Document, None, false),
+            "iframe" => (K::Iframe, None, false),
+            "script" => (K::Script, Some(1), false),
+            // Inserted, `async` or `defer`: Chrome starts these Low.
+            "script-low" => (K::Script, Some(3), false),
+            "module" | "link-module" => (K::ModuleScript, Some(1), false),
+            "worker" => (K::Worker, None, false),
+            "xhr" | "fetch" => (K::Xhr, None, false),
+            "beacon" => (K::Beacon, None, false),
+            // An `<img>` in the document starts Medium, one made by script or
+            // preloaded starts Low; the tab icon is High.
+            "img" | "image" => (K::Subresource, Some(2), false),
+            "image-low" | "link-image" | "css-image" => (K::Subresource, Some(3), false),
+            "icon" => (K::Subresource, Some(1), false),
+            "stylesheet" | "link-style" | "css" => (K::Style, Some(0), false),
+            "link-script" => (K::Script, Some(1), false),
+            "link-font" => (K::Font, Some(1), false),
+            "font" => (K::Font, Some(0), false),
+            "link-fetch" => (K::PreloadFetch, None, false),
+            "prefetch" => (K::Prefetch, None, false),
+            // A manifest is fetched with credentials `omit`.
+            "manifest" => (K::Manifest, None, true),
+            _ => (K::Xhr, None, false),
+        }
+    }
+
     /// The top-level document's `<meta http-equiv="Accept-CH">` hints for a
     /// request of `context` (none for frames: Chrome reads the meta only in
     /// the main frame).
@@ -5191,12 +5305,9 @@ impl BrowserContext {
             url: url.to_string(),
             headers,
             body: None,
-            kind: match resource_type {
-                "document" => nokk_net::RequestKind::Document,
-                "script" => nokk_net::RequestKind::Script,
-                "xhr" | "fetch" => nokk_net::RequestKind::Xhr,
-                _ => nokk_net::RequestKind::Subresource,
-            },
+            kind: Self::wire_kind(resource_type).0,
+            urgency: Self::wire_kind(resource_type).1,
+            omit_credentials: Self::wire_kind(resource_type).2,
             // A navigation nobody's page asked for is one a person asked for.
             third_party: false,
             user_activated: resource_type == "document" && referrer.is_none(),
@@ -5244,7 +5355,7 @@ impl BrowserContext {
                 let mut body = String::from_utf8_lossy(&resp.body).into_owned();
                 // A text or JSON document is shown the way Chrome builds it; the
                 // document then reports its real type.
-                if resource_type == "document" {
+                if resource_type == "document" || resource_type == "iframe" {
                     let mime = resp
                         .headers
                         .iter()
@@ -5339,7 +5450,7 @@ impl BrowserContext {
         let started_ms = now - duration_ms;
         let announced = self.client.hold.take_id(url);
         let frame = self.frame_of_context(context).or_else(|| {
-            (resource_type == "document")
+            (resource_type == "document" || resource_type == "iframe")
                 .then(|| self.frame_docs.lock().ok().and_then(|mut d| d.remove(url)))
                 .flatten()
         });
@@ -10900,6 +11011,74 @@ mod tests {
         // A critical hint that was not sent restarts the request, hints after `accept`.
         assert_eq!(hints("/crit", 0), ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-arch", "sec-ch-ua-platform", "sec-ch-ua-bitness", "user-agent"]);
         assert_eq!(hints("/crit", 1), ["user-agent", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "sec-ch-ua-model"]);
+    }
+
+    /// Each kind of load goes out with Chrome's destination, mode and purpose
+    /// (measured on one page that loads every kind), the manifest without
+    /// cookies, no `priority` over HTTP/1.1, and the tab icon after load.
+    #[tokio::test]
+    async fn every_load_carries_chromes_destination() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                log.lock().unwrap().push(req.clone());
+                let (ctype, body) = if req.starts_with("GET / ") {
+                    ("text/html", "<html><head><link rel=stylesheet href=/s.css><link rel=manifest href=/m.json><link rel=prefetch href=/pf.js><script type=module src=/mod.js></script></head><body><img src=/i.png><iframe src=/f.html></iframe><script>navigator.sendBeacon('/b', 'x')</script></body></html>")
+                } else if req.starts_with("GET /f.html") {
+                    ("text/html", "<html><body>f</body></html>")
+                } else {
+                    ("text/plain", "1")
+                };
+                let cookie = if req.starts_with("GET / ") { "Set-Cookie: sid=1; Path=/\r\n" } else { "" };
+                let resp = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: {ctype}\r\n{cookie}Content-Length: {}\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 2, max_live_contexts: 4, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        let _ = ctx.navigate(&format!("http://127.0.0.1:{}/", addr.port())).await;
+        for _ in 0..10 {
+            let _ = ctx.run_event_loop().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let seen = seen.lock().unwrap().clone();
+        let header = |path: &str, name: &str| -> Option<String> {
+            let req = seen.iter().find(|r| r.starts_with(&format!("GET {path} ")) || r.starts_with(&format!("POST {path} ")))?;
+            req.lines().find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+            })
+        };
+        let dm = |p: &str| (header(p, "sec-fetch-dest"), header(p, "sec-fetch-mode"));
+        let s = |x: &str| Some(x.to_string());
+        assert_eq!(dm("/s.css"), (s("style"), s("no-cors")));
+        assert_eq!(header("/s.css", "accept"), s("text/css,*/*;q=0.1"));
+        assert_eq!(dm("/i.png"), (s("image"), s("no-cors")));
+        assert_eq!(dm("/mod.js"), (s("script"), s("cors")));
+        assert!(header("/mod.js", "origin").is_some(), "a module script carries Origin");
+        assert_eq!(dm("/m.json"), (s("manifest"), s("cors")));
+        assert_eq!(header("/m.json", "cookie"), None, "a manifest goes without cookies");
+        assert_eq!(dm("/pf.js"), (s("empty"), s("no-cors")));
+        assert_eq!(header("/pf.js", "sec-purpose"), s("prefetch"));
+        assert_eq!(dm("/f.html"), (s("iframe"), s("navigate")));
+        assert_eq!(header("/f.html", "sec-fetch-user"), None);
+        assert_eq!(dm("/b"), (s("empty"), s("no-cors")));
+        assert_eq!(header("/b", "content-type"), s("text/plain;charset=UTF-8"));
+        assert_eq!(dm("/favicon.ico"), (s("image"), s("no-cors")));
+        assert!(seen.iter().all(|r| !r.to_ascii_lowercase().contains("\r\npriority:")), "no priority over HTTP/1.1");
     }
 
     /// What a site asked for with `Accept-CH` stays with a named session across

@@ -7926,7 +7926,11 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     __s_split = __sm(String.prototype.split, 'split');
   let fid = 1;
   const pending = new Map(); // id -> {resolve, reject, url}
-  const queue = [];          // [{id, url, method, headers, body}]
+  const queue = [];          // [{id, url, method, headers, body, kind}]
+  // The engine's own helpers, taken now: a page that replaces `btoa` or
+  // `queueMicrotask` must not see the engine's requests go through them.
+  const __qm = globalThis.queueMicrotask;
+  let __btoa = null; // set below, once the engine's `btoa` exists
 
   const headerObj = (h) => {
     const out = {};
@@ -8006,7 +8010,11 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   // the bytes live here, not on any server.
   globalThis.__pt_localSource = (u) => { const r = localResponse(u); return r ? r.body : null; };
 
-  globalThis.fetch = (url, opts) => {
+  // The request machinery. `fetch` is one caller; XHR, `sendBeacon` and the
+  // page's subresources are others and must not go through the page-visible
+  // `fetch` (a page that wraps it saw XHRs and beacons there, with our tag).
+  // `kind` tells the engine the destination: fetch, xhr, beacon, image...
+  const engineFetch = (url, opts, kind) => {
     opts = opts || {};
     // A Request as the input: its address, method, headers and body, with
     // `init` on top. It was turned into the string "[object Request]".
@@ -8024,7 +8032,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       const id = fid++;
       return new Promise((resolve, reject) => {
         pending.set(id, { resolve, reject, url: String(url) });
-        globalThis.queueMicrotask(() => globalThis.__pt_fetchResolve(
+        __qm(() => globalThis.__pt_fetchResolve(
           id, 200, 'OK', { 'content-type': local.type }, local.body, String(url)));
       });
     }
@@ -8041,6 +8049,12 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     // binary body (reCAPTCHA's protobuf, a beacon's ArrayBuffer) as digits and commas.
     let body = null, bodyB64 = false;
     const b = opts.body;
+    // The body's own type, as the Fetch spec extracts it, unless the page set one.
+    if (b != null && !Object.keys(hdrs).some((k) => __s_toLowerCase(k) === 'content-type')) {
+      if (typeof b === 'string') hdrs['content-type'] = 'text/plain;charset=UTF-8';
+      else if (globalThis.URLSearchParams && b instanceof globalThis.URLSearchParams) hdrs['content-type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
+      else if (globalThis.Blob && b instanceof globalThis.Blob && b.type) hdrs['content-type'] = String(b.type);
+    }
     if (b != null) {
       let bytes = null;
       if (globalThis.FormData && b instanceof globalThis.FormData) {
@@ -8052,7 +8066,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       if (bytes) {
         let bin = '';
         for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-        body = globalThis.btoa(bin); bodyB64 = true;
+        body = (__btoa || globalThis.btoa)(bin); bodyB64 = true;
       } else if (typeof b !== 'string' && globalThis.__pt_blobParts && globalThis.__pt_blobParts(b)) {
         body = b.__ptText();
       } else {
@@ -8069,12 +8083,15 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       // A frame granted access to its cookies marks its requests: the browser
       // adds a separate header to them.
       storageAccess: !!globalThis.__ptStorageAccess,
+      kind: kind || 'fetch',
     };
     return new Promise((resolve, reject) => {
       pending.set(id, { resolve, reject, url: req.url });
       queue.push(req);
     });
   };
+  Object.defineProperty(globalThis, '__pt_engineFetch', { value: engineFetch, configurable: true, enumerable: false });
+  globalThis.fetch = (url, opts) => engineFetch(url, opts, 'fetch');
 
   // Page subresources (images, styles, preloads) take the same road as
   // `fetch` but bypass the page's `fetch`: the browser makes these requests
@@ -8090,7 +8107,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     const seen = subresources.get(url);
     if (seen) return seen;
     const id = fid++;
-    queue.push({ id, url, method: 'GET', headers: { 'x-pt-kind': kind || 'img' }, body: null });
+    queue.push({ id, url, method: 'GET', headers: {}, body: null, kind: kind || 'image' });
     const p = new Promise((resolve, reject) => { pending.set(id, { resolve, reject, url }); });
     subresources.set(url, p);
     // A failure is not worth remembering: a browser retries a broken image.
@@ -8351,7 +8368,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       // `xmlhttprequest`, not `fetch`, visible from outside.
       // The browser sets the content type itself when the page did not: a
       // string goes as `text/plain;charset=UTF-8`, a form with its own type.
-      const headers = Object.assign({}, b.headers, { 'x-pt-kind': 'xhr' });
+      const headers = Object.assign({}, b.headers);
       if (body != null && !Object.keys(headers).some((k) => __s_toLowerCase(k) === 'content-type')) {
         if (typeof body === 'string') headers['Content-Type'] = 'text/plain;charset=UTF-8';
         else if (globalThis.URLSearchParams && body instanceof URLSearchParams) {
@@ -8367,7 +8384,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       const encTrace = !!globalThis.__pt_encTrace;
       const bodyLen = body == null ? 0 : (typeof body === 'string' ? body.length : (body.byteLength || body.size || 0));
       if (encTrace) { try { (globalThis.__pt_parentConsole || console).error('[xhr] ' + Math.round(performance.now()) + 'ms ' + b.method + ' ' + __s_slice(String(b.url), 0, 110) + ' body=' + bodyLen); } catch (e) {} }
-      fetch(b.url, { method: b.method, headers, body })
+      globalThis.__pt_engineFetch(b.url, { method: b.method, headers, body }, 'xhr')
         .then(async (r) => {
           if (b.aborted) return;
           b.status = r.status; b.statusText = r.statusText; b.responseURL = r.url || b.url;
@@ -8509,6 +8526,8 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       return out;
     };
   }
+  __btoa = globalThis.btoa;
+
   // Structured clone per HTML (StructuredSerializeInternal), verified against
   // Chrome 151 on 30 kinds of values:
   // Boolean/Number/String/BigInt wrappers, errors (name from the seven native
@@ -13433,7 +13452,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     try {
       // The data itself: fetch encodes a FormData, a blob or bytes as Chrome does.
       const body = data == null ? undefined : data;
-      globalThis.fetch(String(url), { method: 'POST', headers: { 'x-pt-kind': 'beacon' }, body }).catch(() => {});
+      globalThis.__pt_engineFetch(String(url), { method: 'POST', body }, 'beacon').catch(() => {});
     } catch (e) {}
     return true;
   }, 'sendBeacon'));

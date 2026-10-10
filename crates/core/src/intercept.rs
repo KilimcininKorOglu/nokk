@@ -81,10 +81,15 @@ impl std::ops::Deref for PageClient {
 
 fn resource_type(kind: RequestKind) -> &'static str {
     match kind {
-        RequestKind::Document => "Document",
-        RequestKind::Script => "Script",
+        RequestKind::Document | RequestKind::Iframe => "Document",
+        RequestKind::Script | RequestKind::ModuleScript => "Script",
         RequestKind::Xhr => "Fetch",
-        RequestKind::Subresource => "Other",
+        RequestKind::Subresource => "Image",
+        RequestKind::Style => "Stylesheet",
+        RequestKind::Font => "Font",
+        RequestKind::Manifest => "Manifest",
+        RequestKind::Beacon => "Ping",
+        RequestKind::PreloadFetch | RequestKind::Prefetch | RequestKind::Worker => "Other",
     }
 }
 

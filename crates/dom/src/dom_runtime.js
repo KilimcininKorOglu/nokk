@@ -1172,7 +1172,8 @@
         return;
       }
       if (typeof globalThis.__pt_subresource !== 'function') return;
-      __pt_subresource(url, 'img').then(
+      // In the document an image starts Medium; one made by script, Low.
+      __pt_subresource(url, this.isConnected ? 'image' : 'image-low').then(
         () => { this.__ptImgDone = true; this.__ptFireLoad(true); },
         () => { this.__ptImgDone = true; this.__ptFireLoad(false); },
       );
@@ -1227,9 +1228,11 @@
 
     __ptLoadLink() {
       const rel = __s_toLowerCase(String(__ptGetA(this, 'rel') || ''));
-      // Kinds that load; others (`alternate`, `canonical`, `dns-prefetch`)
-      // make no request.
-      if (!/^(stylesheet|preload|prefetch|modulepreload|icon|shortcut icon|apple-touch-icon|manifest|prerender)$/.test(rel)) return;
+      // Kinds the document loads. Icons are the browser's (it asks for them
+      // after load, see the engine), `apple-touch-icon` is not fetched by
+      // desktop Chrome, and the rest (`alternate`, `canonical`,
+      // `dns-prefetch`) make no request.
+      if (!/^(stylesheet|preload|prefetch|modulepreload|manifest)$/.test(rel)) return;
       const raw = __ptGetA(this, 'href');
       if (!raw) return;
       let url = raw;
@@ -1254,9 +1257,14 @@
         return;
       }
       if (__s_slice(url, 0, 5) === 'blob:' || typeof globalThis.__pt_subresource !== 'function') return;
-      // Resource timing names everything loaded via `<link>` as `link`:
-      // preload, icon, stylesheet.
-      const kind = rel === 'stylesheet' ? 'stylesheet' : 'link';
+      // The destination on the wire; resource timing names all of them `link`.
+      const as = __s_toLowerCase(String(__ptGetA(this, 'as') || ''));
+      const kind = rel === 'stylesheet' ? 'stylesheet'
+        : rel === 'modulepreload' ? 'link-module'
+        : rel === 'prefetch' ? 'prefetch'
+        : rel === 'manifest' ? 'manifest'
+        : as === 'script' ? 'link-script' : as === 'style' ? 'link-style' : as === 'font' ? 'link-font'
+        : as === 'image' ? 'link-image' : as === 'fetch' ? 'link-fetch' : 'link';
       // A markup stylesheet blocks the scripts after it until parsed; otherwise
       // they measure an unstyled page (Turnstile's api.js reported the
       // wrapper at the right edge instead of centred).
@@ -1290,6 +1298,31 @@
           if (wanted && res && typeof res.text === 'function') {
             res.text().then(take, () => take(null));
           } else take(null);
+          // A manifest names an icon for installability: Chrome fetches the
+          // largest of at least 144px it can use, as an icon request.
+          if (rel === 'manifest' && res && typeof res.text === 'function' && this.ownerDocument === document) {
+            res.text().then((text) => {
+              let m = null; try { m = __ptJSON.parse(text); } catch (e) { return; }
+              const icons = m && Array.isArray(m.icons) ? m.icons : [];
+              let best = null, bestSize = 0;
+              for (const ic of icons) {
+                if (!ic || typeof ic.src !== 'string') continue;
+                const purpose = __s_toLowerCase(String(ic.purpose || 'any'));
+                if (!/(^|\s)any(\s|$)/.test(purpose)) continue;
+                const type = __s_toLowerCase(String(ic.type || ''));
+                if (type && !/^image\/(png|webp|svg\+xml|jpeg|gif|x-icon|vnd\.microsoft\.icon)$/.test(type)) continue;
+                let size = 0;
+                for (const sz of __s_split(String(ic.sizes || ''), /\s+/)) {
+                  const mm = /^(\d+)x(\d+)$/i.exec(sz); if (mm) size = Math.max(size, Math.min(+mm[1], +mm[2]));
+                  if (__s_toLowerCase(sz) === 'any') size = Math.max(size, 1e6);
+                }
+                if (size >= 144 && size > bestSize) { best = ic; bestSize = size; }
+              }
+              if (!best) return;
+              let u = null; try { u = new URL(best.src, url).href; } catch (e) { return; }
+              if (/^https?:/.test(u)) __pt_subresource(u, 'icon').catch(() => {});
+            }, () => {});
+          }
         },
         () => { release(); if (this.__ptFireLoad) this.__ptFireLoad(false); },
       );

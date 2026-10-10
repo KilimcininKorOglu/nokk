@@ -287,29 +287,60 @@ pub struct Request {
     /// `<meta http-equiv="Accept-CH">` (header values as written). They apply
     /// to its own same-origin subresources only and are not remembered.
     pub doc_hints: Vec<String>,
+    /// Chrome's urgency (0 highest .. 4) when it depends on more than the
+    /// kind: an `<img>` in the document is Medium, `new Image()` Low; a
+    /// parser script High, an inserted one Low.
+    pub urgency: Option<u8>,
+    /// Sent without cookies and ignoring `Set-Cookie` (credentials `omit`:
+    /// a manifest).
+    pub omit_credentials: bool,
 }
 
 /// The destination a request is for, in the sense `Sec-Fetch-Dest` means it.
+/// Each kind's headers were measured from Chrome 151 on one page that loads
+/// every kind; the incremental flag of `priority` follows Blink's
+/// `ShouldLoadIncremental`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RequestKind {
     /// A top-level navigation.
     #[default]
     Document,
+    /// A frame's document (`<iframe src>`): a navigation, but not the top one.
+    Iframe,
     /// A classic `<script src>`.
     Script,
+    /// A module script, a static or dynamic `import`, `modulepreload`.
+    ModuleScript,
     /// `fetch()` / `XMLHttpRequest` from page JS.
     Xhr,
-    /// An image, a stylesheet, anything else a page pulls in.
+    /// `<link rel=preload as=fetch crossorigin>`.
+    PreloadFetch,
+    /// An image (`<img>`, `new Image()`, a CSS background, a tab icon).
     Subresource,
+    /// A stylesheet (`<link rel=stylesheet>`, `@import`, `preload as=style`).
+    Style,
+    /// A web font (`@font-face`, `preload as=font`).
+    Font,
+    /// `<link rel=manifest>`.
+    Manifest,
+    /// `<link rel=prefetch>`.
+    Prefetch,
+    /// `navigator.sendBeacon`.
+    Beacon,
+    /// A dedicated or shared worker's script.
+    Worker,
 }
+
+const DOC_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7";
 
 impl RequestKind {
     /// The `Accept` a browser sends for this destination.
     fn accept(self) -> &'static str {
         match self {
-            RequestKind::Document => "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            RequestKind::Script | RequestKind::Xhr => "*/*",
+            RequestKind::Document | RequestKind::Iframe | RequestKind::Prefetch => DOC_ACCEPT,
             RequestKind::Subresource => "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            RequestKind::Style => "text/css,*/*;q=0.1",
+            _ => "*/*",
         }
     }
 
@@ -317,20 +348,46 @@ impl RequestKind {
     fn sec_fetch(self) -> (&'static str, &'static str) {
         match self {
             RequestKind::Document => ("document", "navigate"),
+            RequestKind::Iframe => ("iframe", "navigate"),
             RequestKind::Script => ("script", "no-cors"),
-            RequestKind::Xhr => ("empty", "cors"),
+            RequestKind::ModuleScript => ("script", "cors"),
+            RequestKind::Xhr | RequestKind::PreloadFetch => ("empty", "cors"),
             RequestKind::Subresource => ("image", "no-cors"),
+            RequestKind::Style => ("style", "no-cors"),
+            RequestKind::Font => ("font", "cors"),
+            RequestKind::Manifest => ("manifest", "cors"),
+            RequestKind::Prefetch | RequestKind::Beacon => ("empty", "no-cors"),
+            RequestKind::Worker => ("worker", "same-origin"),
         }
     }
 
-    /// Chrome's request priority for this destination.
-    fn priority(self) -> &'static str {
+    /// Chrome's urgency for this destination when the engine names none.
+    fn urgency(self) -> u8 {
         match self {
-            RequestKind::Document => "u=0, i",
-            RequestKind::Xhr => "u=1, i",
-            RequestKind::Script => "u=1",
-            RequestKind::Subresource => "u=2, i",
+            RequestKind::Document | RequestKind::Iframe | RequestKind::Style => 0,
+            RequestKind::Script | RequestKind::ModuleScript | RequestKind::Xhr | RequestKind::PreloadFetch
+            | RequestKind::Font | RequestKind::Worker => 1,
+            RequestKind::Subresource | RequestKind::Manifest => 2,
+            RequestKind::Prefetch | RequestKind::Beacon => 4,
         }
+    }
+
+    /// Blink's `ShouldLoadIncremental` (a navigation is incremental too).
+    fn incremental(self) -> bool {
+        !matches!(
+            self,
+            RequestKind::Script | RequestKind::ModuleScript | RequestKind::Style | RequestKind::Font | RequestKind::Manifest
+        )
+    }
+
+    /// A navigation (top or frame): navigation headers and order.
+    fn navigates(self) -> bool {
+        matches!(self, RequestKind::Document | RequestKind::Iframe)
+    }
+
+    /// Element-initiated CORS loads carry `Origin` even same-origin.
+    fn always_origin(self) -> bool {
+        matches!(self, RequestKind::ModuleScript | RequestKind::Font | RequestKind::PreloadFetch)
     }
 }
 
@@ -524,6 +581,10 @@ impl FingerprintClient {
         // says 149 while our `navigator` says 151. Rewrite only the version and
         // brand list; everything else comes from the profile.
         retag_chrome_version(&mut emulation.headers, config.chrome_major);
+        // `priority` is an HTTP/2 and HTTP/3 header in Chrome: over HTTP/1.1
+        // it sends none. The profile put it on every request; ours goes on
+        // per request (see `send_once`).
+        emulation.headers.remove("priority");
         // Post-quantum sigalgs: Chrome 151 advertises ML-DSA-44/65/87
         // (0904/0905/0906) first, `wreq-util` does not, so the third JA4 part
         // matched no real browser. Only our BoringSSL knows these names (see
@@ -694,30 +755,40 @@ impl FingerprintClient {
             .header("sec-fetch-site", site)
             .header("sec-fetch-mode", mode)
             .header("sec-fetch-dest", dest);
-        // Over HTTP/1.1 Chrome sends `Host` and `Connection: keep-alive` first.
-        // ALPN decides the protocol, but plain `http://` is almost always 1.1.
-        // (`priority` is extra there, but the emulation adds it after the
-        // request is built and it cannot be removed from here.)
+        // Over HTTP/1.1 Chrome sends `Host` and `Connection: keep-alive` first,
+        // and no `priority`. ALPN decides the protocol, but plain `http://` is
+        // almost always 1.1 and `https://` almost always 2 or 3.
         let plain_http = req.url.starts_with("http://");
-        rb = rb.header("priority", req.kind.priority());
+        if !plain_http {
+            let u = req.urgency.unwrap_or_else(|| req.kind.urgency()).min(4);
+            let value = if req.kind.incremental() { format!("u={u}, i") } else { format!("u={u}") };
+            rb = rb.header("priority", value);
+        }
+        if req.kind == RequestKind::Prefetch {
+            rb = rb.header("sec-purpose", "prefetch");
+        }
+        if req.omit_credentials {
+            rb = rb.cookie_provider(Arc::new(wreq::cookie::Jar::default()));
+        }
         if plain_http {
             rb = rb.header("connection", "keep-alive");
         }
         // Chrome sends `Origin` on every non-GET and every cross-origin
         // request; Cloudflare checks it first.
-        let wants_origin = req.method != "GET" && req.method != "HEAD" || !same_origin;
+        let wants_origin = req.method != "GET" && req.method != "HEAD" || !same_origin || req.kind.always_origin();
         let page_origin = req
             .headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("referer"))
             .and_then(|(_, r)| origin_of(r));
         let mut sent_origin = false;
-        if wants_origin && req.kind != RequestKind::Document {
+        if wants_origin && !req.kind.navigates() {
             if let Some(o) = page_origin.as_deref() {
                 rb = rb.header("origin", o);
                 sent_origin = true;
             }
         }
+        let origin_in_map = sent_origin && req.kind.always_origin() && (req.method == "GET" || req.method == "HEAD");
         let mut order = wreq::header::OrigHeaderMap::new();
         if plain_http {
             order.insert("host");
@@ -726,7 +797,7 @@ impl FingerprintClient {
         // A navigation lists client hints in the browser's fixed order. A
         // subresource's page headers, hints and `user-agent` come out of
         // Blink's header hash map, in its slot order (see `client_hints`).
-        let subresource = req.kind != RequestKind::Document;
+        let subresource = !req.kind.navigates();
         let sends_hint = |n: &str| client_hints::BASE.contains(&n) || extra_hints.contains(&n);
         if subresource {
             order.insert("content-length");
@@ -740,6 +811,15 @@ impl FingerprintClient {
                         && !matches!(k.as_str(), "content-length" | "referer" | "origin" | "cookie" | "priority" | "upgrade-insecure-requests")
                 })
                 .collect();
+            // An element's CORS load (module script, font) sets `Origin` in
+            // Blink's map, as `rel=prefetch` sets `Sec-Purpose`; a beacon's or
+            // a POST's `Origin` comes later, from the network service.
+            if origin_in_map {
+                names.push("origin".into());
+            }
+            if req.kind == RequestKind::Prefetch {
+                names.push("sec-purpose".into());
+            }
             names.extend(client_hints::BLINK_INSERT_ORDER.iter().filter(|n| sends_hint(n)).map(|n| n.to_string()));
             names.push("user-agent".into());
             for name in client_hints::blink_map_order(&names) {
@@ -751,7 +831,7 @@ impl FingerprintClient {
             }
         }
         let claims_user = req.kind == RequestKind::Document && req.user_activated;
-        if req.kind == RequestKind::Document {
+        if req.kind.navigates() {
             // Only a navigation carries `upgrade-insecure-requests`, and its
             // absence is the difference between a browser and something replaying
             // cookies. `sec-fetch-user` is narrower still: it means a person did
@@ -772,12 +852,12 @@ impl FingerprintClient {
                 order.insert(*name);
             }
         }
-        if sent_origin {
+        if sent_origin && !origin_in_map {
             order.insert("origin");
         }
         // Storage access to own cookies inside a third-party frame: Chrome
         // sends a separate header there, never on a first-party page.
-        let storage_access = req.third_party && same_origin && req.kind != RequestKind::Document;
+        let storage_access = req.third_party && same_origin && !req.kind.navigates();
         if storage_access {
             rb = rb.header("sec-fetch-storage-access", "active");
         }
@@ -1012,6 +1092,8 @@ mod tests {
             third_party: false,
             user_activated: true,
             doc_hints: Vec::new(),
+            urgency: None,
+            omit_credentials: false,
         }
     }
 
