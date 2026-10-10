@@ -169,6 +169,22 @@ impl HintStore {
             .unwrap_or_default()
     }
 
+    /// Every origin's hints, for saving with a session.
+    pub(crate) fn snapshot(&self) -> HashMap<String, Vec<String>> {
+        self.prefs
+            .lock()
+            .map(|p| p.iter().map(|(o, h)| (o.clone(), h.iter().map(|s| s.to_string()).collect())).collect())
+            .unwrap_or_default()
+    }
+
+    /// Restore saved hints (names the engine does not know are dropped).
+    pub(crate) fn restore(&self, saved: &HashMap<String, Vec<String>>) {
+        for (origin, names) in saved {
+            let hints = parse(&names.join(","));
+            self.set(origin, hints);
+        }
+    }
+
     /// Store what `Accept-CH` asked for; an empty value forgets the origin.
     pub(crate) fn set(&self, origin: &str, hints: Vec<&'static str>) {
         if let Ok(mut p) = self.prefs.lock() {

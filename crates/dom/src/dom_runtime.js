@@ -86,8 +86,31 @@
     __connectWalk(node);
     if (__framesSeq !== before && globalThis.__pt_syncFrameSlots) { try { __pt_syncFrameSlots(); } catch (e) {} }
   };
+  // `<meta http-equiv="Accept-CH">` values as they connect, for the engine
+  // to put on the document's subresources (the engine keeps only the top
+  // document's).
+  const __metaHints = [];
+  const __metaSeen = new WeakSet();
+  const __noteMeta = (n) => {
+    if (__metaSeen.has(n) || __s_toLowerCase(String(__ptGetA(n, 'http-equiv') || '')) !== 'accept-ch') return;
+    __metaSeen.add(n);
+    const v = __ptGetA(n, 'content');
+    if (v) __metaHints.push(String(v));
+  };
+  // The parser builds the document without the connect path: the first
+  // look takes the metas already there.
+  let __metaScanned = null;
+  Object.defineProperty(globalThis, '__pt_drainHints', { value: () => {
+    const doc = globalThis.document;
+    if (doc && __metaScanned !== doc && doc.documentElement) {
+      __metaScanned = doc;
+      __walkTree(doc.documentElement, (n) => { if (n.__ptLocal === 'meta') __noteMeta(n); });
+    }
+    return __metaHints.splice(0);
+  }, configurable: true, enumerable: false });
   const __connectWalk = (node) => __walkTree(node, (n) => {
     if (__isFrameEl(n)) __framesSeq++;
+    if (n.__ptLocal === 'meta') __noteMeta(n);
     if (n.__ptLocal === 'iframe') n.__ptConnectFrame();
     else if (n.__ptLocal === 'script') n.__ptRunScript();
     // Stylesheets and preloads start loading on insertion, not on `href`
@@ -2583,6 +2606,13 @@
     if (!W || W.closed) return;
     let data = null;
     try { data = __pt_cloneDecode(json); } catch (e) {}
+    if (W.shared) {
+      // A shared worker answers through its port.
+      const ev = __ptTrust(new MessageEvent('message', { data, origin: '', source: null, ports: [] }));
+      const st = W.port.__pt;
+      if (!st.started) st.queue.push(ev); else W.port.__ptDeliver(ev);
+      return;
+    }
     const ev = __ptTrust(new MessageEvent('message', { data, origin: '', source: null }));
     try { __ptEvSet(ev, 'target', W.worker); __ptEvSet(ev, 'currentTarget', W.worker); } catch (e) {}
     // Inside the handler `window.event` is the event; outside, nothing.
@@ -2665,14 +2695,28 @@
   // `Object.prototype.toString.call(new Worker(...))` is "[object Worker]".
   try { Object.defineProperty(Worker.prototype, Symbol.toStringTag, { value: 'Worker', configurable: true }); } catch (e) {}
 
-  class SharedWorker {
+  // A shared worker runs as a worker context of its own (one per page here;
+  // the browser shares it between pages of the origin). Its `port` is a real
+  // MessagePort whose messages travel on the worker's channel; the worker
+  // side gets the other end in its `connect` event.
+  class SharedWorker extends EventTarget {
     constructor(scriptURL, options) {
-      const port = {
-        onmessage: null, onmessageerror: null,
-        postMessage() {}, start() {}, close() {},
-        addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
-      };
-      Object.defineProperty(this, '__ptW', { value: { onerror: null, port } });
+      super();
+      if (arguments.length < 1) throw __pt_mkErr(TypeError, "Failed to construct 'SharedWorker': 1 argument required, but only 0 present.");
+      const id = __nextWorkerId++;
+      const port = new globalThis.MessageChannel().port1;
+      port.__pt.peer = null;
+      port.__pt.remote = 'sw:' + id;
+      const W = { id, shared: true, onerror: null, closed: false, listeners: {}, worker: this, port };
+      Object.defineProperty(this, '__ptW', { value: W, enumerable: false });
+      __workers.set(id, W);
+      const src = String(scriptURL);
+      let body = null;
+      if (__s_slice(src, 0, 5) === 'blob:' || __s_slice(src, 0, 5) === 'data:') {
+        try { body = globalThis.__pt_localSource ? __pt_localSource(src) : null; } catch (e) {}
+      }
+      const name = typeof options === 'string' ? options : (options && options.name !== undefined ? String(options.name) : '');
+      __workerOps.push({ op: 'open', id, src, body, name, shared: true });
     }
     get port() { return this.__ptW.port; }
     get onerror() { return this.__ptW.onerror; }
@@ -7748,6 +7792,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return ids;
   };
   globalThis.__pt_portOut = (end, data) => {
+    // A shared worker's port talks over the worker channel.
+    if (__s_slice(end, 0, 3) === 'sw:') {
+      __workerOps.push({ op: 'post', id: +__s_slice(end, 3), data: __pt_cloneEncode(data) });
+      return;
+    }
     __pushFrameOp({ op: 'portpost', end, data: __pt_cloneEncode(data) });
   };
   globalThis.__pt_portIn = (end, raw) => {

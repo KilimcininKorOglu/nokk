@@ -3670,6 +3670,56 @@ pub fn late_originals_script() -> String {
         .to_string()
 }
 
+/// Turns a worker scope built by [`worker_scope_script`] into a shared
+/// worker's (Chrome 151): `SharedWorkerGlobalScope`, no global
+/// `postMessage`/`onmessage`, an `onconnect`, and a port per connection that
+/// talks over the worker channel. `__pt_sharedConnect()` delivers the
+/// `connect` event once the script has run.
+pub fn shared_worker_scope_script() -> &'static str {
+    SHARED_WORKER_SCOPE
+}
+const SHARED_WORKER_SCOPE: &str = r#"(() => {
+  const G = globalThis;
+  const P = Object.getPrototypeOf(G);
+  const S = ({ SharedWorkerGlobalScope: function () { throw __pt_mkErr(TypeError, 'Illegal constructor'); } }).SharedWorkerGlobalScope;
+  const nat = (f) => (G.__pt_native ? G.__pt_native(f) : f);
+  try { Object.defineProperty(S, 'prototype', { value: P, writable: false, enumerable: false, configurable: false }); } catch (e) {}
+  try { Object.defineProperty(P, 'constructor', { value: nat(S), writable: true, enumerable: false, configurable: true }); } catch (e) {}
+  try { Object.defineProperty(P, Symbol.toStringTag, { value: 'SharedWorkerGlobalScope', configurable: true }); } catch (e) {}
+  try { Object.defineProperty(S, 'TEMPORARY', { value: 0, writable: false, enumerable: true, configurable: false }); } catch (e) {}
+  try { Object.defineProperty(S, 'PERSISTENT', { value: 1, writable: false, enumerable: true, configurable: false }); } catch (e) {}
+  try { if (G.WorkerGlobalScope) Object.setPrototypeOf(S, G.WorkerGlobalScope); } catch (e) {}
+  try { Object.defineProperty(G, 'SharedWorkerGlobalScope', { value: nat(S), writable: true, enumerable: false, configurable: true }); } catch (e) {}
+  try { delete G.DedicatedWorkerGlobalScope; } catch (e) {}
+  const out = G.postMessage;
+  for (const k of ['postMessage', 'onmessage', 'onmessageerror', 'onrtctransform']) { try { delete G[k]; } catch (e) {} }
+  let onconnect = null;
+  const d = Object.getOwnPropertyDescriptor({ get onconnect() { return onconnect; }, set onconnect(v) { onconnect = typeof v === 'function' || (v !== null && typeof v === 'object') ? v : null; } }, 'onconnect');
+  try { Object.defineProperty(G, 'onconnect', { get: nat(d.get), set: nat(d.set), enumerable: true, configurable: true }); } catch (e) {}
+  // The connection's port: what the worker posts on it goes out on the
+  // worker channel; what comes in is delivered to it.
+  let port = null;
+  const portOut = G.__pt_portOut;
+  G.__pt_portOut = (end, data) => { if (end === 'sw-back') { out(data); return; } if (portOut) portOut(end, data); };
+  G.__pt_workerDeliver = (json) => {
+    if (!port) return;
+    let data = null;
+    try { data = __pt_cloneDecode(json); } catch (e) {}
+    let ev;
+    try { ev = new MessageEvent('message', { data, origin: '', lastEventId: '', source: null, ports: [] }); if (G.__pt_trustEvent) __pt_trustEvent(ev); } catch (e) { return; }
+    const st = port.__pt;
+    if (!st.started) st.queue.push(ev); else port.__ptDeliver(ev);
+  };
+  Object.defineProperty(G, '__pt_sharedConnect', { value: () => {
+    port = new MessageChannel().port1;
+    port.__pt.peer = null;
+    port.__pt.remote = 'sw-back';
+    let ev;
+    try { ev = new MessageEvent('connect', { data: null, origin: '', lastEventId: '', source: port, ports: [port] }); if (G.__pt_trustEvent) __pt_trustEvent(ev); } catch (e) { return; }
+    try { G.dispatchEvent(ev); } catch (e) { if (G.__pt_reportError) __pt_reportError(e, 'connect'); }
+  }, configurable: true, enumerable: false });
+})();"#;
+
 pub fn worker_scope_script(name: &str, url: &str) -> String {
     format!(
         r##"{helper}

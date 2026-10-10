@@ -289,6 +289,7 @@ impl EngineInner {
         headers.insert("User-Agent".to_string(), self.stealth.user_agent.clone());
         let req = Request {
             context: None,
+            doc_hints: Vec::new(),
             method: "GET".into(),
             url: nokk_net::GEO_LOOKUP_URL.to_string(),
             headers,
@@ -312,6 +313,12 @@ impl EngineInner {
         let store = self.session_store.as_ref()?;
         let safe = sanitize_session_name(name)?;
         Some(store.join(format!("{safe}.json")))
+    }
+
+    /// Where a named session's client hint preferences are saved: beside its jar.
+    fn session_hints_path(&self, name: &str) -> Option<std::path::PathBuf> {
+        let jar = self.session_path(name)?;
+        Some(jar.with_extension("hints.json"))
     }
 
     /// Get-or-load the shared jar for a named session. On first use it is loaded
@@ -367,6 +374,14 @@ impl EngineInner {
             cfg.hints = hint_values_for(&preset_for_os(os).stealth());
         }
         let client = Client::Fingerprint(FingerprintClient::with_session(&cfg, Some(jar))?);
+        // The hints sites asked for live with the session, next to its jar.
+        if let Some(saved) = self
+            .session_hints_path(name)
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice::<HashMap<String, Vec<String>>>(&b).ok())
+        {
+            client.restore_hint_preferences(&saved);
+        }
         let mut pool = self.client_pool.lock().unwrap_or_else(|e| e.into_inner());
         Ok(pool.entry(key).or_insert(client).clone())
     }
@@ -391,6 +406,20 @@ impl EngineInner {
         }
         if let Err(e) = jar.save_file(&path) {
             tracing::warn!(session = name, error = %e, "failed to persist session jar");
+        }
+        let client = self
+            .client_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&format!("session:{name}"))
+            .cloned();
+        if let (Some(client), Some(hp)) = (client, self.session_hints_path(name)) {
+            let prefs = client.hint_preferences();
+            if let Ok(bytes) = serde_json::to_vec(&prefs) {
+                if let Err(e) = std::fs::write(&hp, bytes) {
+                    tracing::warn!(session = name, error = %e, "failed to persist session client hints");
+                }
+            }
         }
     }
 }
@@ -807,6 +836,7 @@ impl Engine {
             workers: std::sync::Mutex::new(HashMap::new()),
             bootstrap,
             storage,
+            doc_hints: std::sync::Mutex::new(Vec::new()),
             frame_init_scripts: std::sync::Mutex::new(Vec::new()),
             worker_init_scripts: std::sync::Mutex::new(Vec::new()),
             init_scripts: std::sync::Mutex::new(Vec::new()),
@@ -888,6 +918,7 @@ impl Engine {
         );
         let req = Request {
             context: None,
+            doc_hints: Vec::new(),
             method: "GET".into(),
             url: url.to_string(),
             headers,
@@ -965,6 +996,10 @@ pub struct BrowserContext {
     /// The profile's IndexedDB partition, bound to every context this tab
     /// builds (page, frames, workers).
     storage: u64,
+    /// Client hints the current top-level document asked for in
+    /// `<meta http-equiv="Accept-CH">`; they go on its same-origin
+    /// subresources and end with it.
+    doc_hints: std::sync::Mutex<Vec<String>>,
     /// What outlives a document but not the tab, carried from one document's
     /// context to the next: per origin its `localStorage`, `sessionStorage` and
     /// IndexedDB (`{local, session, idb}`), and under `""` the tab's history
@@ -1528,6 +1563,9 @@ impl BrowserContext {
         if let Ok(mut b) = self.base_url.lock() {
             *b = base_url.to_string();
         }
+        if let Ok(mut h) = self.doc_hints.lock() {
+            h.clear();
+        }
         self.carry_in(base_url).await;
         self.load_html_into(self.idx(), base_url, html).await?;
         self.doc_seq.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -1775,6 +1813,9 @@ impl BrowserContext {
         // its turn came chained chess.com's hundred files: a second from api.js start to
         // widget render vs 200-300 ms in Chrome, and that number goes into the first POST.
         let mut preload: HashMap<String, Preloaded> = HashMap::new();
+        if index == self.idx() {
+            self.pull_doc_hints(index).await;
+        }
         if index == self.idx() && std::env::var_os("NOKK_NO_PRELOAD").is_none() {
             for script in &page.scripts {
                 let (nokk_dom::Script::External(src) | nokk_dom::Script::ExternalModule(src)) = script else {
@@ -1788,7 +1829,8 @@ impl BrowserContext {
                 {
                     continue;
                 }
-                let req = self.get_request(&abs, "script", None);
+                let mut req = self.get_request(&abs, "script", None);
+                req.doc_hints = self.doc_hints_of(index);
                 let client = self.client.clone();
                 let started = std::time::Instant::now();
                 let handle = tokio::spawn(async move { client.send(req).await });
@@ -2070,6 +2112,9 @@ impl BrowserContext {
             let nav_ops: Vec<Value> = queues["nav"].as_array().cloned().unwrap_or_default();
             let cookie_ops: Vec<Value> = queues["cookies"].as_array().cloned().unwrap_or_default();
             let worker_ops: Vec<Value> = queues["workers"].as_array().cloned().unwrap_or_default();
+            if index == self.idx() {
+                self.add_doc_hints(&queues["hints"]);
+            }
             self.log_console("page", &queues);
             // How long until the page's next timer, straight from the same queue
             // the driver just pumped: -1 for "nothing pending".
@@ -3268,6 +3313,10 @@ impl BrowserContext {
                     let _ = self
                         .eval_at(place, child, &nokk_stealth::worker_scope_script(name, &url))
                         .await;
+                    let shared = op["shared"].as_bool().unwrap_or(false);
+                    if shared {
+                        let _ = self.eval_at(place, child, nokk_stealth::shared_worker_scope_script()).await;
+                    }
                     // The worker scope inherits its creator's storage access
                     // (`sec-fetch-storage-access: active`), and a blob worker sends no referrer, as in Chrome.
                     let storage_access = self
@@ -3324,6 +3373,10 @@ impl BrowserContext {
                                 &format!("__pt_workerFailed({id}, {})", js_str(&e.to_string())),
                             )
                             .await;
+                    } else if shared {
+                        // The page's connection, once the script is in.
+                        let _ = self.eval_at(place, child, "globalThis.__pt_sharedConnect && __pt_sharedConnect()").await;
+                        self.serve_worker_soon(index, id, place, child).await;
                     }
                 }
                 "post" => {
@@ -4816,6 +4869,7 @@ impl BrowserContext {
         let sent = body.clone().unwrap_or_default();
         let req = Request {
             context: Some(context),
+            doc_hints: self.doc_hints_of(context),
             method,
             url: url.clone(),
             headers,
@@ -5025,6 +5079,9 @@ impl BrowserContext {
         }
         let mut req = self.get_request(url, resource_type, referrer);
         req.context = Some(context);
+        if resource_type != "document" {
+            req.doc_hints = self.doc_hints_of(context);
+        }
         let started = std::time::Instant::now();
         let sent = self.client.send(req).await;
         self.finish_text(context, url, resource_type, started, sent)
@@ -5066,6 +5123,43 @@ impl BrowserContext {
     }
 
     /// A `GET` as a document sends it: fingerprint headers, referrer, destination.
+    /// The top-level document's `<meta http-equiv="Accept-CH">` hints for a
+    /// request of `context` (none for frames: Chrome reads the meta only in
+    /// the main frame).
+    fn doc_hints_of(&self, context: usize) -> Vec<String> {
+        if context != self.idx() {
+            return Vec::new();
+        }
+        self.doc_hints.lock().map(|h| h.clone()).unwrap_or_default()
+    }
+
+    /// Take the `Accept-CH` meta values the document has connected since the
+    /// last look.
+    async fn pull_doc_hints(&self, index: usize) {
+        let Ok(v) = self
+            .eval_in(index, "__ptJSON.stringify(typeof __pt_drainHints === 'function' ? __pt_drainHints() : [])")
+            .await
+        else {
+            return;
+        };
+        let parsed = v.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or(v);
+        self.add_doc_hints(&parsed);
+    }
+
+    fn add_doc_hints(&self, v: &Value) {
+        let Some(list) = v.as_array() else { return };
+        if list.is_empty() {
+            return;
+        }
+        if let Ok(mut h) = self.doc_hints.lock() {
+            for item in list {
+                if let Some(s) = item.as_str() {
+                    h.push(s.to_string());
+                }
+            }
+        }
+    }
+
     fn get_request(&self, url: &str, resource_type: &str, referrer: Option<&str>) -> Request {
         let mut headers = std::collections::BTreeMap::new();
         headers.insert(
@@ -5092,6 +5186,7 @@ impl BrowserContext {
         }
         Request {
             context: None,
+            doc_hints: Vec::new(),
             method: "GET".into(),
             url: url.to_string(),
             headers,
@@ -5366,6 +5461,7 @@ const DRAIN_IO: &str = "__ptJSON.stringify({\
     workers: typeof __pt_drainWorkerQueue === 'function' ? __pt_drainWorkerQueue() : [],\
     cookies: typeof __pt_drainCookieQueue === 'function' ? __pt_drainCookieQueue() : [],\
     console: typeof __pt_drainConsole === 'function' ? __pt_drainConsole() : [],\
+    hints: typeof __pt_drainHints === 'function' ? __pt_drainHints() : [],\
     timers: typeof __pt_nextTimerDelay === 'function' ? __pt_nextTimerDelay() : -1})";
 
 /// How long [`BrowserContext::run_event_loop`] may spend *waiting* for timers
@@ -5963,6 +6059,38 @@ mod tests {
     /// What survives the trip to a worker and back. A browser uses structured
     /// clone: binary stays binary, a `Map` stays a `Map`, a date a date. Going
     /// through JSON turned them into something else.
+    /// A shared worker runs its script in a SharedWorkerGlobalScope, hears
+    /// `connect` with one port, and talks to the page over `worker.port`.
+    #[tokio::test]
+    async fn a_shared_worker_talks_through_its_port() {
+        let _serial = serial().await;
+        let engine = engine(4, 6);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/app/", "<html><body></body></html>").await.unwrap();
+        ctx.evaluate(
+            r#"(() => {
+            const src = "onconnect = (e) => { const p = e.ports[0]; p.onmessage = (m) => p.postMessage([m.data, self.constructor.name, self.name, typeof postMessage, e.source === p, e.isTrusted].join()); };";
+            const w = new SharedWorker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })), 'nm');
+            globalThis.__got = null;
+            w.port.onmessage = (e) => { globalThis.__got = [e.data, e instanceof MessageEvent, w.port instanceof MessagePort].join(' | '); };
+            w.port.postMessage('hi');
+            return 1;
+        })()"#,
+        )
+        .await
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            ctx.run_event_loop().await.unwrap();
+            if probe(&ctx, "__ptJSON.stringify(globalThis.__got ? 1 : 0)").await.as_u64().unwrap_or(0) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let got = probe(&ctx, "__ptJSON.stringify(globalThis.__got)").await;
+        assert_eq!(got, Value::String("hi,SharedWorkerGlobalScope,nm,undefined,true,true | true | true".into()));
+    }
+
     #[tokio::test]
     async fn a_message_to_a_worker_keeps_its_shape() {
         let _serial = serial().await;
@@ -10772,6 +10900,72 @@ mod tests {
         // A critical hint that was not sent restarts the request, hints after `accept`.
         assert_eq!(hints("/crit", 0), ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-arch", "sec-ch-ua-platform", "sec-ch-ua-bitness", "user-agent"]);
         assert_eq!(hints("/crit", 1), ["user-agent", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "sec-ch-ua-model"]);
+    }
+
+    /// What a site asked for with `Accept-CH` stays with a named session across
+    /// processes, as a browser profile keeps it; a document's
+    /// `<meta http-equiv="Accept-CH">` adds to its own subresources only.
+    #[tokio::test]
+    async fn client_hints_live_in_the_session_and_meta_adds_to_the_document() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                log.lock().unwrap().push(req.clone());
+                let (ctype, extra, body) = if req.starts_with("GET /ask") {
+                    ("text/html", "Accept-CH: Sec-CH-UA-Arch\r\n", "<html><body>a</body></html>")
+                } else if req.starts_with("GET /meta") {
+                    ("text/html", "", "<html><head><meta http-equiv=\"Accept-CH\" content=\"Sec-CH-UA-Model\"></head><body><script src=/m.js></script></body></html>")
+                } else if req.starts_with("GET /m.js") || req.starts_with("GET /n.js") {
+                    ("text/javascript", "", "1")
+                } else {
+                    ("text/html", "", "<html><body><script src=/n.js></script></body></html>")
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: {ctype}\r\n{extra}Content-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+        let store = std::env::temp_dir().join(format!("nokk-hints-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let make = || Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            session_store: Some(store.clone()),
+            ..Default::default()
+        })
+        .expect("engine");
+        {
+            let engine = make();
+            let ctx = engine.new_context_with_session("shop".into(), None).await.unwrap();
+            let _ = ctx.navigate(&format!("{base}/ask")).await;
+            let _ = ctx.navigate(&format!("{base}/meta")).await;
+            drop(ctx);
+            engine.save_session("shop");
+        }
+        let engine = make();
+        let ctx = engine.new_context_with_session("shop".into(), None).await.unwrap();
+        let _ = ctx.navigate(&format!("{base}/again")).await;
+        let seen = seen.lock().unwrap().clone();
+        let has = |path: &str, hint: &str| -> bool {
+            seen.iter().filter(|r| r.starts_with(&format!("GET {path} "))).any(|r| r.to_ascii_lowercase().contains(&format!("\r\n{hint}:")))
+        };
+        // The meta's hint reaches the document's script, not the next document.
+        assert!(has("/m.js", "sec-ch-ua-model"));
+        assert!(!has("/again", "sec-ch-ua-model") && !has("/n.js", "sec-ch-ua-model"));
+        // Accept-CH survived the process through the session.
+        assert!(has("/again", "sec-ch-ua-arch") && has("/n.js", "sec-ch-ua-arch"));
+        let _ = std::fs::remove_dir_all(&store);
     }
 
     /// The engine's own work (cascade, layout, colors, stack formatting) must not run

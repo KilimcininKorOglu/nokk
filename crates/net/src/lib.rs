@@ -283,6 +283,10 @@ pub struct Request {
     /// The engine's own tag for who asked (a frame's context); the network
     /// layer does not read it.
     pub context: Option<usize>,
+    /// Client hints the requesting document asked for with
+    /// `<meta http-equiv="Accept-CH">` (header values as written). They apply
+    /// to its own same-origin subresources only and are not remembered.
+    pub doc_hints: Vec<String>,
 }
 
 /// The destination a request is for, in the sense `Sec-Fetch-Dest` means it.
@@ -661,10 +665,21 @@ impl FingerprintClient {
         let hint_scope = client_hints::secure(&req.url)
             && !req.third_party
             && (req.kind == RequestKind::Document || same_origin);
-        let extra_hints: Vec<&'static str> = match (&request_origin, hint_scope) {
+        let mut extra_hints: Vec<&'static str> = match (&request_origin, hint_scope) {
             (Some(o), true) => self.hint_store.get(o),
             _ => Vec::new(),
         };
+        // A document's `<meta http-equiv="Accept-CH">` adds to its own
+        // subresources (Chrome's preload scanner honours it too).
+        if hint_scope && req.kind != RequestKind::Document {
+            for value in &req.doc_hints {
+                for h in client_hints::parse(value) {
+                    if !extra_hints.contains(&h) {
+                        extra_hints.push(h);
+                    }
+                }
+            }
+        }
         for name in &extra_hints {
             if let Some(v) = self.hint_values.value(name) {
                 rb = rb.header(*name, v);
@@ -950,6 +965,22 @@ impl Client {
             c.set_cookie(set_cookie, url);
         }
     }
+
+    /// The client hints each origin asked for with `Accept-CH` (origin ->
+    /// header names): a session keeps them, as a browser profile does.
+    pub fn hint_preferences(&self) -> std::collections::HashMap<String, Vec<String>> {
+        match self {
+            Client::Stub(_) => Default::default(),
+            Client::Fingerprint(c) => c.hint_store.snapshot(),
+        }
+    }
+
+    /// Restore saved `Accept-CH` preferences.
+    pub fn restore_hint_preferences(&self, saved: &std::collections::HashMap<String, Vec<String>>) {
+        if let Client::Fingerprint(c) = self {
+            c.hint_store.restore(saved);
+        }
+    }
 }
 
 impl HttpClient for Client {
@@ -980,6 +1011,7 @@ mod tests {
             kind: RequestKind::default(),
             third_party: false,
             user_activated: true,
+            doc_hints: Vec::new(),
         }
     }
 
