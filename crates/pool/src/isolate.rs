@@ -873,6 +873,16 @@ impl Isolate {
     /// Evaluate `source` in context `index` and return the result stringified.
     /// A thrown exception (or a force-termination after [`Self::EVAL_TIMEOUT`]) is
     /// returned as `Err` with its message; the isolate stays reusable afterward.
+    /// Tie a context to its profile's storage (IndexedDB). Done by the
+    /// engine right after building it, before any page script: the binding
+    /// lives in the context, not in a global a page could rewrite, and goes
+    /// away with it.
+    pub fn bind_storage(&mut self, index: usize, partition: u64) {
+        let Ok(global) = self.context(index) else { return };
+        v8::scope_with_context!(scope, &mut self.isolate, &global);
+        crate::idb::bind_context(scope, partition);
+    }
+
     pub fn eval(&mut self, index: usize, source: &str) -> Result<String, String> {
         self.eval_named(index, source, None)
     }

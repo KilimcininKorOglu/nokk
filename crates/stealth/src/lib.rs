@@ -1412,7 +1412,52 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   // Engine tasks (`__pt_addTask`) use separate negative ids, so the page's first
   // `setTimeout` returns 1 as in the browser.
   let iseq = -1;
-  const add = (fn, delay, interval, args, internal) => {
+  // Timers in a binary min-heap on (due, order queued): the next one is
+  // O(log n) to find, not a scan of every pending timer twice per run.
+  // Equal due times run in the order they were queued, engine tasks
+  // included. Entries are [due, order, timer]; a cleared or rescheduled
+  // timer leaves a stale entry
+  // that is dropped when it reaches the top, and the heap is rebuilt when
+  // stale entries outnumber live ones (a debounce clearing a far timer in a
+  // loop would grow it without bound).
+  const heap = [];
+  const before = (a, b) => a[0] < b[0] || (a[0] === b[0] && a[1] < b[1]);
+  const hpush = (e) => {
+    heap.push(e);
+    let i = heap.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (!before(heap[i], heap[p])) break;
+      const x = heap[i]; heap[i] = heap[p]; heap[p] = x; i = p;
+    }
+  };
+  const sift = (i) => {
+    const n = heap.length;
+    for (;;) {
+      const l = 2 * i + 1, r = l + 1;
+      let m = i;
+      if (l < n && before(heap[l], heap[m])) m = l;
+      if (r < n && before(heap[r], heap[m])) m = r;
+      if (m === i) return;
+      const x = heap[i]; heap[i] = heap[m]; heap[m] = x; i = m;
+    }
+  };
+  const hpop = () => {
+    const last = heap.pop();
+    if (heap.length) { heap[0] = last; sift(0); }
+  };
+  const live = (e) => { const t = e[2]; return !t.cancelled && t.due === e[0] && q.get(t.id) === t; };
+  let order = 0;
+  const schedule = (t) => {
+    hpush([t.due, ++order, t]);
+    if (heap.length > 64 && heap.length > 2 * q.size) {
+      const keep = heap.filter(live);
+      heap.length = 0;
+      for (const e of keep) heap.push(e);
+      for (let i = (heap.length >> 1) - 1; i >= 0; i--) sift(i);
+    }
+  };
+  const add = (fn, delay, interval, args, internal, front) => {
     // A string handler is compiled as global code when the timer fires.
     // Trusted Types passes TrustedScript through here too.
     if (typeof fn === 'string' || (fn !== null && typeof fn === 'object' &&
@@ -1427,10 +1472,14 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
     if (typeof fn !== 'function') return 0;
     let d = Number(delay);
     if (!(d > 0)) d = 0; // negative, NaN and undefined all mean "as soon as possible"
-    if (depth > 5 && d < 4) d = 4;
+    // Engine tasks (an IndexedDB event, a posted task) are fresh tasks in
+    // the browser: no nesting clamp, and timers they set start at level 1.
+    if (!internal && depth > 5 && d < 4) d = 4;
     const id = internal ? iseq-- : seq++;
-    q.set(id, { fn: () => fn.apply(globalThis, args), orig: fn, delay: d, interval,
-                due: clock() + d, cancelled: false, id, depth: depth + 1 });
+    const t = { fn: () => fn.apply(globalThis, args), orig: fn, delay: d, interval,
+                due: front ? clock() - 1 : clock() + d, cancelled: false, id, depth: internal ? 0 : depth + 1 };
+    q.set(id, t);
+    schedule(t);
     return id;
   };
   globalThis.setTimeout = (fn, delay, ...args) => add(fn, delay, false, args);
@@ -1443,10 +1492,11 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   globalThis.clearInterval = (id) => { const t = q.get(id); if (t) t.cancelled = true; q.delete(id); };
   // Non-timer task (`scheduler.postTask` with high priority): runs before
   // already queued zero-delay timers, as in the browser.
+  // Whether anything else is due now: an engine task that would only queue
+  // behind nothing can run its work at once (O(1): the top of the heap).
+  Object.defineProperty(globalThis, '__pt_anyDue', { value: () => { const t = earliest(); return !!t && t.due <= clock(); }, configurable: true, enumerable: false });
   Object.defineProperty(globalThis, '__pt_addTask', { value: (fn, delay, front) => {
-    const id = add(fn, delay, false, [], true);
-    if (front) { const t = q.get(id); if (t) t.due = clock() - 1; }
-    return id;
+    return add(fn, delay, false, [], true, front);
   }, configurable: true, enumerable: false });
   globalThis.queueMicrotask = (fn) => { Promise.resolve().then(fn); };
   // Animation frames have their own counter: the page's first
@@ -1507,12 +1557,8 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   // frame callback receives the same high-res timestamp a real browser passes.
 
   const earliest = () => {
-    let best = null;
-    for (const t of q.values()) {
-      if (t.cancelled) continue;
-      if (!best || t.due < best.due || (t.due === best.due && t.id < best.id)) best = t;
-    }
-    return best;
+    while (heap.length && !live(heap[0])) hpop();
+    return heap.length ? heap[0][2] : null;
   };
 
   // Run the single earliest *due* timer. Returns 1 if one ran, 0 if the queue is
@@ -1562,7 +1608,8 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
     }
     // An interval that fell behind (a long callback, a busy worker) schedules
     // its next tick from now, so it never fires a burst to catch up.
-    if (best.interval) best.due = Math.max(clock(), best.due) + best.delay;
+    hpop();
+    if (best.interval) { best.due = Math.max(clock(), best.due) + best.delay; schedule(best); }
     else q.delete(best.id);
     const outer = depth;
     depth = best.depth;
@@ -1610,6 +1657,13 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
 /// what kind of thing is it", which is the question being asked. Behaviour behind
 /// the ones that matter is implemented elsewhere, and each one that graduates from
 /// this list to a real implementation simply stops being consulted.
+/// IndexedDB (crates/stealth/src/indexeddb.js over the Rust store in
+/// `nokk_pool::idb`). Runs after the DOM runtime: its events are DOM events.
+pub fn indexeddb_script() -> &'static str {
+    INDEXEDDB_SCRIPT
+}
+const INDEXEDDB_SCRIPT: &str = include_str!("indexeddb.js");
+
 /// The platform surface fill-in — see [`WEB_SURFACE_TEMPLATE`]. Runs last in the
 /// bootstrap, after the DOM runtime and the fingerprint layer, so it only ever
 /// adds what nothing else defined.
@@ -3158,12 +3212,14 @@ const SHAPE_FIXES: &str = r#"(() => {
         if (!ok) return;
       }
       const data = typeof structuredClone === 'function' ? structuredClone(message) : message;
-      setTimeout(() => {
+      const deliver = () => {
         let ev;
         try { ev = new MessageEvent('message', { data, origin: mine, lastEventId: '', source: globalThis, ports: [] }); } catch (e) { return; }
         try { if (globalThis.__pt_trustEvent) __pt_trustEvent(ev); } catch (e) {}
         try { globalThis.dispatchEvent(ev); } catch (e) {}
-      }, 0);
+      };
+      // An engine task, as a port message: no clamp, no page timer id.
+      if (typeof globalThis.__pt_addTask === 'function') globalThis.__pt_addTask(deliver, 0); else setTimeout(deliver, 0);
     };
     const d = Object.getOwnPropertyDescriptor(globalThis, 'postMessage');
     if (!d || d.configurable) Object.defineProperty(globalThis, 'postMessage', { value: natp(pm, 'postMessage'), writable: true, enumerable: true, configurable: true });
@@ -3628,9 +3684,10 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
   // Interface object shape: a strict function has exactly `length, name,
   // prototype` (no `arguments`/`caller`) and, unlike a class, throws
   // "Illegal constructor" when called without `new` too.
+  // Named at birth: `self.constructor.name` reads the interface name.
   const __ptIllegal = (function () {{
     'use strict';
-    return function () {{ return function () {{ throw __pt_mkErr(TypeError, 'Illegal constructor'); }}; }};
+    return function (n) {{ return ({{ [n]: function () {{ throw __pt_mkErr(TypeError, 'Illegal constructor'); }} }})[n]; }};
   }})();
   const __ptName = (f, n) => {{
     try {{ Object.defineProperty(f, 'name', {{ value: n, configurable: true }}); }} catch (e) {{}}
@@ -3741,6 +3798,9 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
   // Interface constants as in Chrome: read-only, non-configurable.
   try {{ Object.defineProperty(dwgsProto, 'TEMPORARY', {{ value: 0, writable: false, enumerable: true, configurable: false }}); }} catch (e) {{}}
   try {{ Object.defineProperty(dwgsProto, 'PERSISTENT', {{ value: 1, writable: false, enumerable: true, configurable: false }}); }} catch (e) {{}}
+  // ...and on the interface object, after `prototype`, as Chrome lists them.
+  try {{ Object.defineProperty(DedicatedWorkerGlobalScope, 'TEMPORARY', {{ value: 0, writable: false, enumerable: true, configurable: false }}); }} catch (e) {{}}
+  try {{ Object.defineProperty(DedicatedWorkerGlobalScope, 'PERSISTENT', {{ value: 1, writable: false, enumerable: true, configurable: false }}); }} catch (e) {{}}
   try {{ Object.defineProperty(dwgsProto, Symbol.toStringTag, {{ value: 'DedicatedWorkerGlobalScope', configurable: true }}); }} catch (e) {{}}
   globalThis.WorkerGlobalScope = WorkerGlobalScope;
   globalThis.DedicatedWorkerGlobalScope = DedicatedWorkerGlobalScope;
@@ -8617,19 +8677,26 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         }
         const peer = this.__pt.peer;
         if (!peer) return;
-        const ev = { type: 'message', data, origin: '', lastEventId: '', source: null, ports: [], isTrusted: true, target: peer, currentTarget: peer };
         // A port message is a task, not a microtask: in the browser it comes
-        // after already queued zero-delay timers.
-        setTimeout(() => {
+        // after already queued zero-delay timers. An engine task: no nesting
+        // clamp (React's scheduler posts a message per unit of work) and no
+        // page timer id spent.
+        const deliver = () => {
+          let ev;
+          try { ev = new globalThis.MessageEvent('message', { data, origin: '', lastEventId: '', source: null, ports: [] }); if (globalThis.__pt_trustEvent) __pt_trustEvent(ev); }
+          catch (e) { ev = { type: 'message', data, origin: '', lastEventId: '', source: null, ports: [], isTrusted: true, target: peer, currentTarget: peer }; }
           const st = peer.__pt;
           if (!st.started) { st.queue.push(ev); return; }
           peer.__ptDeliver(ev);
-        }, 0);
+        };
+        if (typeof globalThis.__pt_addTask === 'function') globalThis.__pt_addTask(deliver, 0); else setTimeout(deliver, 0);
       }
       __ptDeliver(ev) {
         const st = this.__pt;
-        try { if (typeof st.onmessage === 'function') st.onmessage.call(this, ev); } catch (e) {}
-        for (const fn of __s_slice(st.listeners)) { try { fn.call(this, ev); } catch (e) {} }
+        // A handler's exception reaches window.onerror, as in the browser.
+        const report = (e) => { if (typeof globalThis.__pt_reportError === 'function') globalThis.__pt_reportError(e, 'message'); };
+        try { if (typeof st.onmessage === 'function') st.onmessage.call(this, ev); } catch (e) { report(e); }
+        for (const fn of __s_slice(st.listeners)) { try { fn.call(this, ev); } catch (e) { report(e); } }
       }
     };
     globalThis.MessageChannel = class MessageChannel {
@@ -9599,104 +9666,6 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         const m = /^\s*(--[-a-zA-Z0-9_]+|[-a-zA-Z]+)\s*:\s*([^;]+?)\s*$/.exec(String(a));
         return !!m && known(m[1]);
       },
-    };
-  }
-
-  // Minimal but genuinely working IndexedDB: pages use it to store and to probe
-  // for storage at all, and `undefined` is the loudest possible answer.
-  if (!globalThis.indexedDB) {
-    const __idbData = new Map();   // dbName -> { version, stores: Map<name, Map> }
-    // Databases belong to the origin, not the document: on navigation the
-    // engine takes them from the old document and gives them to the next one
-    // of the same origin. Values go through JSON.
-    (globalThis.__pt_carryParts || (globalThis.__pt_carryParts = {})).idb = {
-      out: () => [...__idbData].map(([name, e]) => [name, e.version,
-        [...e.stores].map(([sn, m]) => [sn, [...m].filter(([, v]) => {
-          try { __ptJSON.stringify(v); return true; } catch (x) { return false; }
-        })])]),
-      in: (dbs) => {
-        if (!Array.isArray(dbs)) return;
-        for (const [name, version, stores] of dbs) {
-          __idbData.set(String(name), { version: version | 0,
-            stores: new Map((stores || []).map(([sn, rows]) => [String(sn), new Map(rows || [])])) });
-        }
-      },
-    };
-    const req = (run) => {
-      const r = { readyState: 'pending', result: undefined, error: null,
-        onsuccess: null, onerror: null, onupgradeneeded: null, onblocked: null,
-        addEventListener(t, fn) { this['on' + t] = fn; }, removeEventListener() {}, dispatchEvent() { return true; } };
-      queueMicrotask(() => {
-        try {
-          run(r);
-          __pt_write(r, 'readyState', 'done');
-          const ev = { type: 'success', target: r, currentTarget: r };
-          if (typeof r.onsuccess === 'function') r.onsuccess(ev);
-        } catch (e) {
-          r.error = e; __pt_write(r, 'readyState', 'done');
-          const ev = { type: 'error', target: r, currentTarget: r };
-          if (typeof r.onerror === 'function') r.onerror(ev);
-        }
-      });
-      return r;
-    };
-    const makeStore = (map, name) => ({
-      name,
-      put(v, k) { return req((r) => { map.set(String(k === undefined ? (v && v.id) : k), v); r.result = k; }); },
-      add(v, k) { return this.put(v, k); },
-      get(k) { return req((r) => { r.result = map.get(String(k)); }); },
-      delete(k) { return req((r) => { map.delete(String(k)); }); },
-      clear() { return req(() => map.clear()); },
-      count() { return req((r) => { r.result = map.size; }); },
-      getAll() { return req((r) => { r.result = [...map.values()]; }); },
-      getAllKeys() { return req((r) => { r.result = [...map.keys()]; }); },
-      createIndex() { return { name: 'idx' }; },
-      deleteIndex() {},
-      index() { return { get: (k) => req((r) => { r.result = map.get(String(k)); }) }; },
-    });
-    globalThis.indexedDB = {
-      open(name, version) {
-        const key = String(name);
-        const fresh = !__idbData.has(key);
-        if (fresh) __idbData.set(key, { version: 0, stores: new Map() });
-        const entry = __idbData.get(key);
-        const wanted = version === undefined ? Math.max(1, entry.version) : (version | 0);
-        const db = {
-          name: key,
-          get version() { return entry.version; },
-          objectStoreNames: { contains: (n) => entry.stores.has(String(n)), get length() { return entry.stores.size; }, item: (i) => [...entry.stores.keys()][i] || null },
-          createObjectStore(n) { const m = new Map(); entry.stores.set(String(n), m); return makeStore(m, String(n)); },
-          deleteObjectStore(n) { entry.stores.delete(String(n)); },
-          transaction(names) {
-            const tx = { objectStore: (n) => makeStore(entry.stores.get(String(n)) || new Map(), String(n)),
-              abort() {}, commit() {}, oncomplete: null, onerror: null, onabort: null,
-              addEventListener(t, fn) { this['on' + t] = fn; }, removeEventListener() {} };
-            queueMicrotask(() => { if (typeof tx.oncomplete === 'function') tx.oncomplete({ type: 'complete', target: tx }); });
-            return tx;
-          },
-          close() {}, onerror: null, onclose: null, onversionchange: null,
-          addEventListener() {}, removeEventListener() {},
-        };
-        const r = { readyState: 'pending', result: undefined, error: null,
-          onsuccess: null, onerror: null, onupgradeneeded: null, onblocked: null,
-          addEventListener(t, fn) { this['on' + t] = fn; }, removeEventListener() {}, dispatchEvent() { return true; } };
-        queueMicrotask(() => {
-          r.result = db;
-          __pt_write(r, 'readyState', 'done');
-          if (wanted > entry.version) {
-            const old = entry.version;
-            entry.version = wanted;
-            if (typeof r.onupgradeneeded === 'function') {
-              r.onupgradeneeded({ type: 'upgradeneeded', target: r, oldVersion: old, newVersion: wanted, currentTarget: r });
-            }
-          }
-          if (typeof r.onsuccess === 'function') r.onsuccess({ type: 'success', target: r, currentTarget: r });
-        });
-        return r;
-      },
-      deleteDatabase(name) { return req(() => { __idbData.delete(String(name)); }); },
-      databases() { return Promise.resolve([...__idbData.keys()].map((n) => ({ name: n, version: __idbData.get(n).version }))); },
-      cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; },
     };
   }
 

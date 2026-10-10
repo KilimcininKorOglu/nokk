@@ -66,6 +66,7 @@ pub fn install(scope: &mut v8::PinScope) {
     bind(scope, "__pt_randomBytes", random_bytes);
     bind(scope, "__pt_digest", digest);
     bind(scope, "__pt_isProxy", is_proxy);
+    crate::idb::install(scope);
     bind(scope, "__pt_hmac", hmac_sign);
     bind(scope, "__pt_pbkdf2", pbkdf2_derive);
     bind(scope, "__pt_hkdf", hkdf_derive);
@@ -1495,7 +1496,7 @@ pub fn external_refs() -> std::borrow::Cow<'static, [v8::ExternalReference]> {
     std::borrow::Cow::Borrowed(v.0)
 }
 
-fn bind(scope: &mut v8::PinScope, name: &str, cb: impl v8::MapFnTo<v8::FunctionCallback>) {
+pub(crate) fn bind(scope: &mut v8::PinScope, name: &str, cb: impl v8::MapFnTo<v8::FunctionCallback>) {
     let global = scope.get_current_context().global(scope);
     let Some(key) = v8::String::new(scope, name) else {
         return;

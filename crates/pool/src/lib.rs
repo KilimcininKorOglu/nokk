@@ -34,6 +34,7 @@ mod compressor;
 mod wavetable;
 mod isolate;
 mod natives;
+pub mod idb;
 // Some GL ops (viewport, …) are the API surface the `__pt_gl*` natives wire next;
 // allow them ahead of that so the backend can land and be tested on its own.
 #[cfg(feature = "webgl")]

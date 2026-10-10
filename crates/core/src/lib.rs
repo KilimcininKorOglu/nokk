@@ -479,6 +479,7 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
         ("write_helper", nokk_stealth::write_helper_script()),
         ("bootstrap", nokk_stealth::bootstrap_script(profile)),
         ("dom_runtime", nokk_dom::runtime_js().to_string()),
+        ("indexeddb", nokk_stealth::indexeddb_script().to_string()),
         ("fingerprint", nokk_stealth::fingerprint_script(profile)),
         ("web_surface", nokk_stealth::web_surface_script()),
         // Late interfaces, then naturalization (every member must look native), then the
@@ -699,7 +700,8 @@ impl Engine {
                 .client_for(&identity, proxy, EngineInner::emulation_os_of(profile))?;
         let geo = self.inner.geo_for(&geo_key, &client).await;
         let bootstrap = self.inner.context_bootstrap(profile, geo.as_ref());
-        self.build_context(client, None, bootstrap).await
+        let storage = nokk_pool::idb::partition_for(&format!("id:{identity}"));
+        self.build_context(client, None, bootstrap, storage).await
     }
 
     /// Open a context bound to a named, persistent session. Its cookie jar is
@@ -725,7 +727,8 @@ impl Engine {
         )?;
         let geo = self.inner.geo_for(&geo_key, &client).await;
         let bootstrap = self.inner.context_bootstrap(profile, geo.as_ref());
-        self.build_context(client, Some(name), bootstrap).await
+        let storage = nokk_pool::idb::partition_for(&format!("s:{name}"));
+        self.build_context(client, Some(name), bootstrap, storage).await
     }
 
     /// Drop the pooled client (cookie jar + connection pool) bound to an
@@ -742,6 +745,7 @@ impl Engine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(identity);
+        nokk_pool::idb::drop_partition(&format!("id:{identity}"));
     }
 
     /// Shared tail of context creation: acquire a slot, place on the least-loaded
@@ -751,6 +755,7 @@ impl Engine {
         client: Client,
         session: Option<String>,
         bootstrap: String,
+        storage: u64,
     ) -> Result<BrowserContext, EngineError> {
         let permit = self.inner.pool.acquire_context().await?;
         let worker = self.inner.pool.pick_worker();
@@ -759,7 +764,13 @@ impl Engine {
         let index = self
             .inner
             .pool
-            .dispatch(worker, move |iso| iso.create_context(&boot))
+            .dispatch(worker, move |iso| {
+                let r = iso.create_context(&boot);
+                if let Ok(i) = r {
+                    iso.bind_storage(i, storage);
+                }
+                r
+            })
             .await?
             .map_err(EngineError::Js)?;
         tracing::debug!(?worker, index, "context created");
@@ -795,6 +806,7 @@ impl Engine {
             doc_types: std::sync::Mutex::new(HashMap::new()),
             workers: std::sync::Mutex::new(HashMap::new()),
             bootstrap,
+            storage,
             frame_init_scripts: std::sync::Mutex::new(Vec::new()),
             worker_init_scripts: std::sync::Mutex::new(Vec::new()),
             init_scripts: std::sync::Mutex::new(Vec::new()),
@@ -950,6 +962,9 @@ pub struct BrowserContext {
     /// navigation itself — a form the page submitted, a challenge that moved on,
     /// a link a script followed — learns of the new document by this changing.
     doc_seq: std::sync::atomic::AtomicU64,
+    /// The profile's IndexedDB partition, bound to every context this tab
+    /// builds (page, frames, workers).
+    storage: u64,
     /// What outlives a document but not the tab, carried from one document's
     /// context to the next: per origin its `localStorage`, `sessionStorage` and
     /// IndexedDB (`{local, session, idb}`), and under `""` the tab's history
@@ -1563,10 +1578,17 @@ impl BrowserContext {
                 .await;
         }
         let boot = self.bootstrap.clone();
+        let storage = self.storage;
         let fresh = self
             .engine
             .pool
-            .dispatch(self.worker, move |iso| iso.create_context(&boot))
+            .dispatch(self.worker, move |iso| {
+                let r = iso.create_context(&boot);
+                if let Ok(i) = r {
+                    iso.bind_storage(i, storage);
+                }
+                r
+            })
             .await?
             .map_err(EngineError::Js)?;
         self.index.store(fresh, std::sync::atomic::Ordering::Release);
@@ -1988,6 +2010,12 @@ impl BrowserContext {
 
         for _ in 0..MAX_ROUNDS {
             if std::time::Instant::now() >= deadline {
+                break;
+            }
+            // The callback budget is spent: return now and let the caller come
+            // back (work_left stays set). Going on ran up to MAX_ROUNDS empty
+            // rounds, ~200 ms, every 10 000 callbacks of a busy page.
+            if total_timers >= TIMER_CAP {
                 break;
             }
             // Stopped at a fresh clearance: the gate's page has nothing more to
@@ -3212,7 +3240,14 @@ impl BrowserContext {
                         .pool
                         .dispatch(place, {
                             let boot = boot.clone();
-                            move |iso| iso.create_context_or_spare(&boot)
+                            let storage = self.storage;
+                            move |iso| {
+                                let r = iso.create_context_or_spare(&boot);
+                                if let Ok(i) = r {
+                                    iso.bind_storage(i, storage);
+                                }
+                                r
+                            }
                         })
                         .await
                     else {
@@ -3747,10 +3782,17 @@ impl BrowserContext {
                     } else {
                         self.worker
                     };
+                    let storage = self.storage;
                     let Ok(Ok(raw_index)) = self
                         .engine
                         .pool
-                        .dispatch(place, move |iso| iso.create_context(&boot))
+                        .dispatch(place, move |iso| {
+                            let r = iso.create_context(&boot);
+                            if let Ok(i) = r {
+                                iso.bind_storage(i, storage);
+                            }
+                            r
+                        })
                         .await
                     else {
                         continue;
@@ -10469,6 +10511,53 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ctx.evaluate("document.title").await.unwrap(), Value::String("tBCD".into()));
+    }
+
+    async fn run_and_read(ctx: &BrowserContext, js: &str) -> Value {
+        ctx.evaluate(js).await.unwrap();
+        ctx.run_event_loop().await.unwrap();
+        ctx.evaluate("window.__r").await.unwrap()
+    }
+
+    /// IndexedDB belongs to the profile: it outlives a document, another tab
+    /// of the same profile sees it, another identity does not, and a value
+    /// keeps its types (structured clone, not JSON).
+    #[tokio::test]
+    async fn indexeddb_lives_in_the_profile() {
+        let _serial = serial().await;
+        let engine = engine(2, 6);
+        let write = r#"(() => { window.__r = 'pending';
+            const req = indexedDB.open('shop', 1);
+            req.onupgradeneeded = () => req.result.createObjectStore('cart', { keyPath: 'id' }).createIndex('by', 'when');
+            req.onsuccess = () => {
+              const tx = req.result.transaction('cart', 'readwrite');
+              tx.objectStore('cart').put({ id: 7, when: new Date(5), tags: new Set(['a']) });
+              tx.oncomplete = () => { window.__r = 'written'; req.result.close(); };
+            };
+          })()"#;
+        let read = r#"(() => { window.__r = 'pending';
+            const req = indexedDB.open('shop');
+            req.onsuccess = () => {
+              const db = req.result;
+              if (!db.objectStoreNames.contains('cart')) { window.__r = 'empty v' + db.version; return; }
+              const g = db.transaction('cart').objectStore('cart').index('by').get(new Date(5));
+              g.onsuccess = () => { const v = g.result; window.__r = v ? [v.id, v.when instanceof Date, v.tags instanceof Set].join() : 'none'; };
+            };
+          })()"#;
+        let a = engine.new_context().await.unwrap();
+        a.load_html("https://example.com/", "<html><body></body></html>").await.unwrap();
+        assert_eq!(run_and_read(&a, write).await, Value::String("written".into()));
+        a.load_html("https://example.com/next", "<html><body></body></html>").await.unwrap();
+        assert_eq!(run_and_read(&a, read).await, Value::String("7,true,true".into()));
+        let b = engine.new_context().await.unwrap();
+        b.load_html("https://example.com/", "<html><body></body></html>").await.unwrap();
+        assert_eq!(run_and_read(&b, read).await, Value::String("7,true,true".into()));
+        let other = engine.new_context_with_identity("someone-else".into(), None).await.unwrap();
+        other.load_html("https://example.com/", "<html><body></body></html>").await.unwrap();
+        assert_eq!(run_and_read(&other, read).await, Value::String("empty v1".into()));
+        let elsewhere = engine.new_context().await.unwrap();
+        elsewhere.load_html("https://example.org/", "<html><body></body></html>").await.unwrap();
+        assert_eq!(run_and_read(&elsewhere, read).await, Value::String("empty v1".into()));
     }
 
     /// Chrome's shapes for what fingerprinting scripts poke at (creepjs,

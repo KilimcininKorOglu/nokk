@@ -553,7 +553,9 @@
           if (w && event.type !== 'load') { path.push(w); targets.push(tgt); }
           break;
         }
-        n = n.parentNode;
+        // Not a node: an IndexedDB request bubbles to its transaction, then
+        // to the database.
+        n = n.nodeType === undefined ? (__ptEventParents.get(n) || null) : n.parentNode;
       }
       __ptEvSet(event, '__ptPathNow', path);
       const fireAt = (i, phase) => {
@@ -623,7 +625,12 @@
   }
   // A handler exception is not lost: it goes to `window.onerror`, fires
   // `error` on the window and is printed to the console.
+  // How many handler exceptions were reported: IndexedDB aborts a
+  // transaction whose event handler threw.
+  let __reported = 0;
+  Object.defineProperty(globalThis, '__pt_reportedErrors', { value: () => __reported, configurable: true, enumerable: false });
   globalThis.__pt_reportError = (e, where) => {
+    __reported++;
     const msg = 'Uncaught ' + String((e && e.name ? e.name + ': ' + e.message : e));
     try {
       const on = globalThis.onerror;
@@ -737,6 +744,10 @@
   // own property). The window marker is `importScripts` (worker only), not
   // `document`, which the engine builds in workers too and hides.
   const __ptEventSlot = () => typeof importScripts === 'undefined';
+  // Event parents of targets that are not nodes (IndexedDB: request ->
+  // transaction -> database). Weak: the parent link dies with the child.
+  const __ptEventParents = new WeakMap();
+  Object.defineProperty(globalThis, '__pt_eventParents', { value: __ptEventParents, configurable: true, enumerable: false });
   const __ptTakeEvent = (ev) => {
     const hadEvent = Object.prototype.hasOwnProperty.call(globalThis, 'event');
     const prevEvent = hadEvent ? globalThis.event : undefined;
