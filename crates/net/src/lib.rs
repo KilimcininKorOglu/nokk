@@ -651,6 +651,22 @@ fn origin_of(url: &str) -> Option<String> {
     Some(format!("{scheme}://{host}"))
 }
 
+/// The `Referer` Chrome sends under its default policy,
+/// `strict-origin-when-cross-origin`: the full address (no fragment) to the
+/// same origin, only the origin elsewhere, nothing from https to http.
+fn referrer_for(referer: &str, url: &str) -> Option<String> {
+    let full = referer.split('#').next().unwrap_or(referer);
+    let from = origin_of(full)?;
+    if full.starts_with("https://") && url.starts_with("http://") {
+        return None;
+    }
+    if origin_of(url).is_some_and(|o| o.eq_ignore_ascii_case(&from)) {
+        Some(full.to_string())
+    } else {
+        Some(format!("{from}/"))
+    }
+}
+
 /// Whether `referer` and `url` are the same origin — the difference between
 /// `sec-fetch-site: same-origin` and `cross-site`.
 fn same_site(referer: &str, url: &str) -> bool {
@@ -897,6 +913,12 @@ impl FingerprintClient {
             {
                 continue;
             }
+            if lk == "referer" {
+                if let Some(r) = referrer_for(v, &req.url) {
+                    rb = rb.header(k, r);
+                }
+                continue;
+            }
             rb = rb.header(k, v);
         }
         if let Some(body) = req.body {
@@ -1080,6 +1102,15 @@ mod tests {
     #[test]
     fn default_limits_match_chrome_per_host() {
         assert_eq!(PoolLimits::default().per_host, 6);
+    }
+
+    #[test]
+    fn referrer_is_trimmed_as_chrome_does_by_default() {
+        let page = "https://a.example/path/page?q=1#frag";
+        assert_eq!(referrer_for(page, "https://a.example/x.png").as_deref(), Some("https://a.example/path/page?q=1"));
+        assert_eq!(referrer_for(page, "https://cdn.example/x.png").as_deref(), Some("https://a.example/"));
+        assert_eq!(referrer_for(page, "http://a.example/x.png"), None);
+        assert_eq!(referrer_for("http://127.0.0.1:8799/c?x", "http://localhost:8799/i.png").as_deref(), Some("http://127.0.0.1:8799/"));
     }
 
     fn req(method: &str, url: &str) -> Request {
