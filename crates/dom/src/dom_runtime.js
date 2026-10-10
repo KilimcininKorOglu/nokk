@@ -4064,7 +4064,7 @@
     });
     def('setProperty', function setProperty(p, v, prio) {
       const s = st(this); if (!s) return;
-      if (s.computed) throw __pt_mkErr(TypeError, 'Cannot modify computed style');
+      if (s.computed) throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'setProperty' on 'CSSStyleDeclaration': These styles are computed, and therefore the '" + __cssKey(p) + "' property is read-only.", 'NoModificationAllowedError');
       // Priority is either empty or `important`; anything else makes Chrome
       // silently reject the whole call, as does `!important` inside the value.
       const pr = prio == null ? '' : __s_toLowerCase(__s_trim(String(prio)));
@@ -4080,7 +4080,7 @@
     });
     def('removeProperty', function removeProperty(p) {
       const s = st(this); if (!s) return '';
-      if (s.computed) throw __pt_mkErr(TypeError, 'Cannot modify computed style');
+      if (s.computed) throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'removeProperty' on 'CSSStyleDeclaration': These styles are computed, and therefore the '" + __cssKey(p) + "' property is read-only.", 'NoModificationAllowedError');
       const m = s.read(), k = __cssKey(p), had = m.get(k) || '';
       __cssDrop(m, k); s.write(m); return had;
     });
@@ -4105,6 +4105,7 @@
       },
       function cssText(v) {
         const s = st(this); if (!s) return;
+        if (s.computed) throw __pt_mkErr(globalThis.DOMException || Error, "Failed to set the 'cssText' property on 'CSSStyleDeclaration': These styles are computed, and therefore read-only.", 'NoModificationAllowedError');
         if (s.el && s.el.setAttribute) __ptSetA(s.el, 'style', String(v));
         __markDirty();
       });
@@ -8508,7 +8509,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // as invisible: `visibility: hidden` takes space and has a real rect.
   function __isUnboxed(el) {
     if (__UNRENDERED.has(el.tagName)) return true;
-    if (__noneBySheet.has(el)) return true;
+    if (__cascadeHides(el, false)) return true;
     if (el.hasAttribute && __ptHasA(el, 'hidden')) return true;
     // A hidden input takes no space, nor a line.
     if (el.tagName === 'INPUT' && /^hidden$/i.test(__ptGetA(el, 'type') || '')) return true;
@@ -8530,7 +8531,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   function __isHiddenEl(el) {
     if (__isUnboxed(el)) return true;
-    if (__hiddenBySheet.has(el)) return true;
+    if (__cascadeHides(el, true)) return true;
     const s = el.style;
     if (s) {
       const v = __s_toLowerCase(String(s.visibility || ''));
@@ -8658,7 +8659,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       __styleCache = new WeakMap();
       __styleTouched = [];
       __styleAllStale = false;
-      return;
+      return null;
     }
     const drop = (n) => {
       __lstats.dropped++;
@@ -8666,16 +8667,30 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       for (const k of (n.__ptKids || [])) if (k.nodeType === ELEMENT_NODE) drop(k);
       if (n.__ptShadow) for (const k of (n.__ptShadow.__ptKids || [])) if (k.nodeType === ELEMENT_NODE) drop(k);
     };
-    for (const r of __styleTouched) drop(r);
+    const roots = __styleTouched;
+    for (const r of roots) drop(r);
     __styleTouched = [];
+    return roots;
   }
   // Font size and inherited values walk the ancestors and are asked many
   // times per pass; cache them for the cascade's lifetime.
   let __passFont = new WeakMap();
   let __passInherit = new WeakMap();
   let __passCustom = new WeakMap();
-  let __hiddenBySheet = new WeakSet();
-  let __noneBySheet = new WeakSet();
+  // Hidden by the cascade: `display: none`, or with `invisible` also
+  // `visibility: hidden`/`collapse`. Read off the element's cascade, which is
+  // kept until a mutation reaches it, so it costs nothing a style pass would
+  // not pay anyway.
+  function __cascadeHides(el, invisible) {
+    const c = __cascadeFor(el);
+    const d = c.get('display');
+    if (d != null && __s_toLowerCase(__s_trim(String(d))) === 'none') return true;
+    if (!invisible) return false;
+    const v = c.get('visibility');
+    if (v == null) return false;
+    const t = __s_toLowerCase(__s_trim(String(v)));
+    return t === 'hidden' || t === 'collapse';
+  }
 
   // Rules of one tree: its stylesheets flattened into a list. Separate because
   // there can be more than one document (see `__rulesFor`).
@@ -9086,7 +9101,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const t0 = __perfNow();
     if (!force && t0 < __cssScanNext) return;
     __cssScanAt = at;
-    __collectHidden();
+    __styleBegin();
     // Web fonts still waiting for text that uses them. Measured in Chrome 151:
     // a face is requested when a rendered element's family list reaches it
     // (text or not); it holds `load` when it is the first family and the
@@ -9164,69 +9179,23 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     __cssScanNext = __perfNow() + Math.max(100, 4 * (__perfNow() - t0));
   };
-  // Once per tree state and viewport (media rules follow the viewport).
-  let __hiddenAt = -1, __hiddenW = -1, __hiddenH = -1;
-  function __collectHidden() {
-    if (__hiddenAt === __layoutSeq && __hiddenW === LAYOUT.W && __hiddenH === LAYOUT.H) return;
-    __hiddenAt = __layoutSeq; __hiddenW = LAYOUT.W; __hiddenH = LAYOUT.H;
+  // Start of a style pass: the rule list, per-pass caches, and the cascades a
+  // mutation reached dropped. Once per tree state and viewport (media rules
+  // follow the viewport).
+  let __styleAt = -1, __styleW = -1, __styleH = -1;
+  function __styleBegin() {
+    if (__styleAt === __layoutSeq && __styleW === LAYOUT.W && __styleH === LAYOUT.H) return;
+    __styleAt = __layoutSeq; __styleW = LAYOUT.W; __styleH = LAYOUT.H;
     __rules = [];
     __passBloom = new WeakMap();
     __passFont = new WeakMap();
     __passInherit = new WeakMap();
     __passCustom = new WeakMap();
-    __hiddenBySheet = new WeakSet();
-    __noneBySheet = new WeakSet();
     __foreignRules = new WeakMap();
     const doc = globalThis.document;
     if (!doc || !doc.documentElement) return;
     __rules = __gatherRulesCached(doc.documentElement);
     __styleRevalidate();
-    // Hiding is collected in the same pass; it is just another declaration.
-    // One walk per tree, testing only the hiding rules an element's keys and
-    // ancestors allow: the same sets as querying each rule over the tree.
-    const byRoot = new Map();
-    for (const r of __rules) {
-      const d = __ruleMap(r);
-      if (!d) continue;
-      const disp = __s_toLowerCase(String(d.get('display') || ''));
-      const vis = __s_toLowerCase(String(d.get('visibility') || ''));
-      if (disp !== 'none' && vis !== 'hidden' && vis !== 'collapse') continue;
-      let list = byRoot.get(r.root);
-      if (!list) byRoot.set(r.root, (list = []));
-      list.push({ r, none: disp === 'none' });
-    }
-    for (const [root, list] of byRoot) {
-      const keyed = new Map(), any = [];
-      for (const h of list) {
-        const k = __ruleKey(h.r.sel);
-        if (k == null) { any.push(h); continue; }
-        let l = keyed.get(k);
-        if (!l) keyed.set(k, (l = []));
-        l.push(h);
-      }
-      const ctx = { scope: root };
-      const test = (e, h) => {
-        const r = h.r;
-        try {
-          if (r.__ptSel === undefined) r.__ptSel = __selCompiled(r.sel) || null;
-          if (!r.__ptSel || !__bloomMayMatch(r.__ptSel, __ancBloom(e)) || !__selAny(r.__ptSel, e, ctx)) return;
-        } catch (err) { return; }
-        __hiddenBySheet.add(e);
-        if (h.none) __noneBySheet.add(e);
-      };
-      const byKey = (e, k) => { const l = keyed.get(k); if (l) for (const h of l) test(e, h); };
-      walk(root, (e) => {
-        for (const h of any) test(e, h);
-        if (!keyed.size) return;
-        byKey(e, 't' + __s_toLowerCase(String(e.localName || '')));
-        const id = __ptGetA(e, 'id');
-        if (id) byKey(e, 'i' + id);
-        const set = __ptClassSet(e);
-        if (set) for (const c of set) if (c) byKey(e, 'c' + c);
-        if (e.__ptAttrs) for (const name of e.__ptAttrs.keys()) byKey(e, 'a' + __s_toLowerCase(String(name)));
-        if (e === e.ownerDocument.documentElement) byKey(e, 'r');
-      });
-    }
   }
 
   // What a mutation can change through `:has()`: the elements the `:has()`
@@ -9243,15 +9212,29 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     // through their following siblings; `tilde` when any is `~`.
     const H = { any: false, tags: new Set(), classes: new Set(), ids: new Set(),
       sib: { tags: new Set(), classes: new Set(), ids: new Set() }, hasSib: false, tilde: false };
-    // A compound's key: its id, else a class, else its tag; parentheses
-    // (`:has(…)`, `:not(…)`) are not looked into.
-    const keyOf = (compound) => {
+    // A compound's keys: its id, else a class, else its tag. Parentheses
+    // (`:has(…)`, `:not(…)`) are not looked into, except a leading
+    // `:is()`/`:where()`: the element matches one of its alternatives, so the
+    // key of each alternative's last compound (all of them, or none).
+    const keyOf = (compound, depth) => {
       let flat = '', d = 0;
       for (const ch of compound) { if (ch === '(' || ch === '[') d++; else if (ch === ')' || ch === ']') d--; else if (d === 0) flat += ch; }
-      const id = /#([\w-]+)/.exec(flat); if (id) return ['ids', id[1]];
-      const cl = /\.([\w-]+)/.exec(flat); if (cl) return ['classes', cl[1]];
-      const tg = /^([a-zA-Z][\w-]*)/.exec(flat); if (tg) return ['tags', __s_toLowerCase(tg[1])];
-      return null;
+      const id = /#([\w-]+)/.exec(flat); if (id) return [['ids', id[1]]];
+      const cl = /\.([\w-]+)/.exec(flat); if (cl) return [['classes', cl[1]]];
+      const tg = /^([a-zA-Z][\w-]*)/.exec(flat); if (tg) return [['tags', __s_toLowerCase(tg[1])]];
+      const is = /^:(?:is|where)\(/i.exec(compound);
+      if (!is || (depth | 0) > 3) return null;
+      let j = is[0].length, dd = 1;
+      for (; j < compound.length && dd; j++) { if (compound[j] === '(') dd++; else if (compound[j] === ')') dd--; }
+      const arg = __s_slice(compound, is[0].length, j - 1);
+      const keys = [];
+      for (const alt of __s_split(arg, /,(?![^()]*\))/)) {
+        const cs = compounds(__s_trim(alt));
+        const k = cs.length ? keyOf(cs[cs.length - 1][1], (depth | 0) + 1) : null;
+        if (!k) return null;
+        for (const x of k) keys.push(x);
+      }
+      return keys.length ? keys : null;
     };
     // Top-level compounds of one selector, each with the combinator before it.
     const compounds = (sel) => {
@@ -9288,22 +9271,25 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
           const inner = __s_slice(comp, __s_indexOf(lower, ':has(') + 5);
           const sibling = /^\s*[+~]/.test(inner);
           let key = keyOf(comp);
-          if (!key && !sibling) {
+          let above = false;
+          if (!key) {
             // No key on the anchor: it lies under the nearest keyed compound
             // to its left (through descendant/child combinators), whose
-            // subtree a change then drops.
+            // subtree a change then drops. That ancestor also holds the
+            // siblings a `:has(+ …)`/`:has(~ …)` looks at.
             for (let j = i; j > 0 && !key; j--) {
               if (cs[j][0] === '+' || cs[j][0] === '~') break;
               key = keyOf(cs[j - 1][1]);
             }
+            above = !!key;
           }
           // `:has(> x)` with nothing to key on: the anchor is the parent of
           // a changed child, one level up.
-          if (!key && /^\s*>\s*[^\s>+~()]+\s*\)\s*$/.test(inner)) { H.parentAny = true; continue; }
+          if (!key && !sibling && /^\s*>\s*[^\s>+~()]+\s*\)\s*$/.test(inner)) { H.parentAny = true; continue; }
           if (!key) { H.any = true; break; }
-          const into = sibling ? H.sib : H;
-          if (sibling) { H.hasSib = true; if (/^\s*~/.test(inner)) H.tilde = true; }
-          into[key[0]].add(key[1]);
+          const into = sibling && !above ? H.sib : H;
+          if (sibling && !above) { H.hasSib = true; if (/^\s*~/.test(inner)) H.tilde = true; }
+          for (const [set, v] of key) into[set].add(v);
         }
       }
     }
@@ -10724,7 +10710,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (__layoutBuilt === __layoutSeq) return;
     __layoutBuilt = __layoutSeq;
     __lstats.relayouts++;
-    __collectHidden();
+    __styleBegin();
     __rows = [];
     __boxes = [];
     const doc = globalThis.document;
@@ -11097,9 +11083,6 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     });
   } catch (e) {}
 
-  // Computed style is expensive and pages ask for it repeatedly; cache it
-  // until the next tree mutation.
-  const __computedCache = new WeakMap();
 
   // Whether a node is in the flat tree: a shadow host's child gets there only
   // through a slot of the same name; the rest are hidden and have no style.
@@ -11126,12 +11109,11 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   }
   globalThis.__pt_inFlatTree = __inFlatTree;
 
-  globalThis.getComputedStyle = (el, pseudo) => {
-    if (el && !pseudo && el.nodeType === ELEMENT_NODE) {
-      __relayout();
-      const hit = __computedCache.get(el);
-      if (hit && hit.at === __layoutBuilt) return hit.style;
-    }
+  // One element's computed values. Without `withLayout` nothing is laid out:
+  // sizes keep their declared values and `flags` says which answers need the
+  // boxes (auto margins, percentages).
+  function __computedBuild(el, withLayout) {
+    const flags = { auto: false, pct: null };
     const map = new Map();
     // An element outside the rendered tree has no computed style: Chrome
     // returns '' for every property and `length` 0.
@@ -11142,13 +11124,13 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     const inView = connected && (!el.ownerDocument || el.ownerDocument === document || !!el.ownerDocument.defaultView);
     if (!connected || !inView) {
       for (const k of CS_ORDER) map.set(k, '');
-      return __makeComputed(map, []);
+      return { map, names: [], flags };
     }
     if (!__inFlatTree(el)) {
       for (const k of CS_ORDER) map.set(k, '');
       const names = [...map.keys()];
       __addShorthands(map);
-      return __makeComputed(map, names);
+      return { map, names, flags };
     }
     for (const k of CS_ORDER) map.set(k, CS_BASE[k]);
     const tag = (el && el.localName) || 'div';
@@ -11162,7 +11144,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     // Author declarations (stylesheets and `style`) over defaults, then used
     // sizes.
     try {
-      __relayout();
+      if (withLayout) __relayout(); else __styleBegin();
       const cascade = el ? __cascadeFor(el) : new Map();
       const fs = el ? __usedFontSize(el) : 16;
       // Inherited values first, then own on top.
@@ -11181,6 +11163,10 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       // Longhands only: computed style never lists shorthands.
       const put = (k, raw) => {
         if (!map.has(k)) return;
+        // A percentage of the containing block is known only after layout.
+        if (k !== 'font-size' && k !== 'line-height' && __s_indexOf(String(raw), '%') >= 0 && __LENGTH_PROPS.test(k)) {
+          (flags.pct || (flags.pct = new Set())).add(k);
+        }
         map.set(k, __resolveLength(__s_trim(String(raw)), k, fs, el));
       };
       const written = new Set();
@@ -11206,7 +11192,10 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         }
         // Chrome prints the used margin, not `auto` (half the free space when
         // centred).
-        const ab = __boxOf(el);
+        for (const k of ['margin-top', 'margin-bottom', 'margin-left', 'margin-right']) {
+          if (/^auto$/i.test(String(map.get(k) || ''))) flags.auto = true;
+        }
+        const ab = withLayout && flags.auto ? __boxOf(el) : null;
         if (ab) {
           for (const [k, v] of [['margin-top', ab.mt], ['margin-bottom', ab.mb],
                                 ['margin-left', ab.ml], ['margin-right', ab.mr]]) {
@@ -11314,7 +11303,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     try {
       if (el && el.nodeType === ELEMENT_NODE) {
         if (__isUnboxed(el)) map.set('display', 'none');
-        const b = __boxOf(el);
+        const b = withLayout ? __boxOf(el) : null;
         if (b) {
           // `width` is the content box (CSS `width`), not the outer size,
           // printed with four decimals: `72.2656px`, not `72.265625px`.
@@ -11370,16 +11359,179 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       const vars = __passCustom.get(el);
       if (vars) for (const k in vars) if (typeof vars[k] === 'string') map.set(k, vars[k]);
     }
-    const made = __makeComputed(map, names);
-    if (el && !pseudo && el.nodeType === ELEMENT_NODE) {
-      try { __computedCache.set(el, { at: __layoutBuilt, style: made }); } catch (e) {}
+    if (flags.pct) flags.pct = __geoClosure(flags.pct);
+    return { map, names, flags };
+  }
+  // Every name whose answer follows from these longhands: logical mirrors,
+  // shorthands, `-webkit-` aliases.
+  function __geoClosure(keys) {
+    const out = new Set(keys);
+    for (const [logical, physical] of CS_LOGICAL) if (out.has(physical)) out.add(logical);
+    for (const sh in CSS_LONGHANDS) if (CSS_LONGHANDS[sh].some((k) => out.has(k))) out.add(sh);
+    for (const alias in SH_ALIAS) if (out.has(SH_ALIAS[alias])) out.add(alias);
+    for (const k of [...out]) {
+      if (/^(padding|margin)-/.test(k) || /-(inline|block)-size$/.test(k)) {
+        for (const w of ['webkit-padding-before', 'webkit-padding-after', 'webkit-padding-start', 'webkit-padding-end',
+          'webkit-margin-before', 'webkit-margin-after', 'webkit-margin-start', 'webkit-margin-end',
+          'webkit-logical-width', 'webkit-logical-height', 'webkit-min-logical-width', 'webkit-min-logical-height',
+          'webkit-max-logical-width', 'webkit-max-logical-height']) out.add(w);
+        break;
+      }
     }
-    return made;
+    return out;
+  }
+
+  // Computed style is live, as in Chrome: a new declaration per call whose
+  // values follow the element (`el.style.color = 'red'` shows in a style read
+  // before it). Values are worked out on first read, from the style pass
+  // alone; only sizes, auto margins and percentages lay the page out. Per
+  // element the result is kept while its cascade is the same object (a
+  // mutation drops the cascades it can reach, see `__styleTouch`) and, for
+  // the layout part, while the layout is.
+  const __GEO_ALWAYS = new Set(['width', 'height', 'inline-size', 'block-size', 'perspective-origin',
+    'transform-origin', 'webkit-perspective-origin', 'webkit-transform-origin', 'webkit-logical-width',
+    'webkit-logical-height']);
+  const __GEO_MARGIN = new Set(['margin-top', 'margin-right', 'margin-bottom', 'margin-left', 'margin-block-start',
+    'margin-block-end', 'margin-inline-start', 'margin-inline-end', 'margin', 'margin-block', 'margin-inline',
+    'webkit-margin-before', 'webkit-margin-after', 'webkit-margin-start', 'webkit-margin-end']);
+  const __computedState = new WeakMap();
+  function __computedNow(el) {
+    let st = __computedState.get(el);
+    if (!st) { st = { cs: null, style: null, geoAt: -1, geo: null }; __computedState.set(el, st); }
+    const rendered = el.isConnected && __inFlatTree(el)
+      && (!el.ownerDocument || el.ownerDocument === document || !!el.ownerDocument.defaultView);
+    // Not rendered: empty answers, rebuilt only after the tree changed.
+    if (!rendered) {
+      if (st.cs !== null || st.seq !== __layoutSeq || !st.style) { st.cs = null; st.seq = __layoutSeq; st.style = __computedBuild(el, false); }
+      return { st, style: st.style };
+    }
+    __styleBegin();
+    const cs = __cascadeFor(el);
+    if (st.cs !== cs || !st.style) { st.cs = cs; st.style = __computedBuild(el, false); st.geoAt = -1; st.geo = null; }
+    return { st, style: st.style };
+  }
+  function __computedValue(el, key) {
+    const { st, style } = __computedNow(el);
+    if (!st.cs) return style.map.get(key);
+    const f = style.flags;
+    if (__GEO_ALWAYS.has(key) || (f.auto && __GEO_MARGIN.has(key)) || (f.pct && f.pct.has(key))) {
+      __relayout();
+      if (st.geoAt !== __layoutBuilt || !st.geo) { st.geo = __computedBuild(el, true); st.geoAt = __layoutBuilt; }
+      return st.geo.map.get(key);
+    }
+    return style.map.get(key);
+  }
+  function __computedNames(el) {
+    if (!el || el.nodeType !== ELEMENT_NODE || !el.isConnected) return [];
+    if (el.ownerDocument && el.ownerDocument !== document && !el.ownerDocument.defaultView) return [];
+    return CS_ORDER;
+  }
+  // A map's face over the live values, for the prototype's methods.
+  const __computedView = (el) => ({
+    get: (k) => __computedValue(el, k),
+    has: (k) => { const v = __computedValue(el, k); return v !== undefined; },
+  });
+  const __camelKeys = new Map();
+  const __computedKeysOf = (name) => {
+    let keys = __camelKeys.get(name);
+    if (keys) return keys;
+    // `webkitBorderAfter` is `-webkit-border-after` (leading dash for vendor
+    // names), while `webkitAlignItems` is just another name for `align-items`.
+    const plain = __s_toLowerCase(__s_replace(name, /[A-Z]/g, (c) => '-' + __s_toLowerCase(c)));
+    keys = /^(webkit|moz|ms|o)-/.test(plain)
+      ? ['-' + plain, plain, __s_replace(plain, /^(webkit|moz|ms|o)-/, '')]
+      : [plain];
+    __camelKeys.set(name, keys);
+    return keys;
+  };
+  const __computedOf = (el, name) => {
+    for (const k of __computedKeysOf(name)) { const v = __computedValue(el, k); if (v) return v; }
+    return '';
+  };
+  // A dashed name as a property (`cs['background-color']`): Chrome answers it
+  // as an own property too, though it is not listed.
+  let __DASH_NAMES = null;
+  const __dashNames = () => {
+    if (__DASH_NAMES) return __DASH_NAMES;
+    __DASH_NAMES = new Map();
+    for (const name of CSS_PROPS) {
+      const keys = __computedKeysOf(name);
+      for (const k of keys) if (!__DASH_NAMES.has(k)) __DASH_NAMES.set(k, name);
+    }
+    return __DASH_NAMES;
+  };
+  let __COMPUTED_KEYS = null, __INDEX_KEYS = [];
+  const __computedOwnKeys = (n) => {
+    if (!__COMPUTED_KEYS) __COMPUTED_KEYS = __withEpub(CSS_PROPS.slice());
+    if (__INDEX_KEYS.length !== n) { __INDEX_KEYS = []; for (let i = 0; i < n; i++) __INDEX_KEYS.push(String(i)); }
+    return __INDEX_KEYS.concat(__COMPUTED_KEYS);
+  };
+  const __readOnly = (what) => __pt_mkErr(globalThis.DOMException || Error, what, 'NoModificationAllowedError');
+  const __isIndex = (p) => typeof p === 'string' && p.length > 0 && p.length < 8 && /^(0|[1-9]\d*)$/.test(p);
+
+  globalThis.getComputedStyle = (el, pseudo) => {
+    const proto = __inlineStyleProto();
+    const target = Object.create(proto);
+    const reader = {
+      computed: true, el,
+      get names() { return __computedNames(el); },
+      get map() { return __computedView(el); },
+      read: () => __computedView(el),
+      write: () => { throw __readOnly("Failed to set the 'cssFloat' property on 'CSSStyleDeclaration': These styles are computed, and therefore read-only."); },
+    };
+    __cssReaders.set(target, reader);
+    const props = __cssPropSet();
+    const valueOf = (p) => {
+      if (props.has(p)) return __computedOf(el, p);
+      const camel = __dashNames().get(p);
+      return camel !== undefined ? (__computedValue(el, p) || __computedOf(el, camel)) : undefined;
+    };
+    const px = __ptProxy(target, {
+      ownKeys: () => __computedOwnKeys(__computedNames(el).length),
+      getOwnPropertyDescriptor: (t, p) => {
+        if (typeof p === 'string') {
+          if (EPUB_SET.has(p)) return undefined;
+          if (__isIndex(p)) {
+            const names = __computedNames(el);
+            return +p < names.length ? { value: names[+p], writable: false, enumerable: true, configurable: true } : undefined;
+          }
+          const v = valueOf(p);
+          if (v !== undefined) return { value: v, writable: true, enumerable: true, configurable: true };
+        }
+        return Reflect.getOwnPropertyDescriptor(t, p);
+      },
+      has: (t, p) => {
+        if (typeof p === 'string') {
+          if (EPUB_SET.has(p)) return false;
+          if (__isIndex(p)) return +p < __computedNames(el).length;
+          if (props.has(p) || __dashNames().has(p)) return true;
+        }
+        return Reflect.has(t, p);
+      },
+      get: (t, p, recv) => {
+        if (typeof p === 'string') {
+          if (EPUB_SET.has(p)) return undefined;
+          if (__isIndex(p)) return __computedNames(el)[+p];
+          const v = valueOf(p);
+          if (v !== undefined) return v;
+        }
+        return Reflect.get(t, p, recv);
+      },
+      set: (t, p, v, recv) => {
+        if (typeof p === 'string') {
+          if (p === 'cssText') throw __readOnly("Failed to set the 'cssText' property on 'CSSStyleDeclaration': These styles are computed, and therefore read-only.");
+          if (props.has(p) || __dashNames().has(p)) {
+            throw __readOnly("Failed to set a named property '" + p + "' on 'CSSStyleDeclaration': These styles are computed, and therefore the '" + p + "' property is read-only.");
+          }
+          if (__isIndex(p)) return true;
+        }
+        return Reflect.set(t, p, v, recv);
+      },
+    });
+    __cssReaders.set(px, reader);
+    return px;
   };
 
-  /// Computed style declaration. `names` is empty when the element is not
-  /// rendered: no indexed properties and `length` 0, but the 745 camelCase
-  /// names are present either way.
   // Computed shorthands: Chrome returns the assembled value; pages that
   // enumerate the whole style read them. Built from longhands by CSS
   // serialization rules; `-webkit-*` aliases mirror the plain property; the
@@ -11538,50 +11690,6 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     for (const k of Object.keys(SH_CONST)) if (!map.has(k)) map.set(k, SH_CONST[k]);
     for (const k of Object.keys(SH_ALIAS)) set(k, g(SH_ALIAS[k]));
   };
-
-  function __makeComputed(map, names) {
-    // `[object CSSStyleDeclaration]`, as in Chrome.
-    const proto = (globalThis.CSSStyleDeclaration && CSSStyleDeclaration.prototype) || Object.prototype;
-    // The interface stub may lack its name; set it.
-    try {
-      if (proto !== Object.prototype && !Object.getOwnPropertyDescriptor(proto, Symbol.toStringTag)) {
-        Object.defineProperty(proto, Symbol.toStringTag, { value: 'CSSStyleDeclaration', configurable: true });
-      }
-    } catch (e) {}
-    // Chrome's shape: own properties are indices and camelCase names only;
-    // methods and `length` live on the prototype. Dashed names are readable
-    // but not own, so a Proxy answers them.
-    const decl = Object.create(__inlineStyleProto());
-    __cssReaders.set(decl, { computed: true, names, map });
-    const own = (name, d) => { try { Object.defineProperty(decl, name, d); } catch (e) {} };
-    for (let i = 0; i < names.length; i++) own(String(i), { value: names[i], enumerable: true, configurable: true });
-    for (const name of CSS_PROPS) {
-      // `webkitBorderAfter` is `-webkit-border-after` (leading dash for vendor
-      // names), while `webkitAlignItems` is just another name for
-      // `align-items` and returns the same value.
-      const plain = __s_toLowerCase(__s_replace(name, /[A-Z]/g, (c) => '-' + __s_toLowerCase(c)));
-      const keys = /^(webkit|moz|ms|o)-/.test(plain)
-        ? ['-' + plain, plain, __s_replace(plain, /^(webkit|moz|ms|o)-/, '')]
-        : [plain];
-      // A data property, not an accessor: Chrome's descriptor has `value` and
-      // no `get`. The computed snapshot does not change anyway.
-      let v = '';
-      for (const k of keys) { const got = map.get(k); if (got) { v = got; break; } }
-      own(name, { value: v, writable: true, enumerable: true, configurable: true });
-    }
-    const dashOf = (p) => __s_replace(String(p), /[A-Z]/g, (c) => '-' + __s_toLowerCase(c));
-    return __ptProxy(decl, {
-      // Only ownKeys: descriptors are already right, and another trap would
-      // cost ~1.5 ms per style enumeration.
-      ownKeys: (t) => __withEpub(Reflect.ownKeys(t)),
-      get: (t, p) => {
-        if (typeof p === 'string' && EPUB_SET.has(p)) return undefined;
-        if (typeof p === 'string' && !(p in t)) return map.get(__s_toLowerCase(p)) || '';
-        const v = t[p];
-        return typeof v === 'function' ? v.bind(t) : v;
-      },
-    });
-  }
 
   /// Font size in effect on an element (inherited; `em` resolves against it).
   function __usedFontSize(el) {
