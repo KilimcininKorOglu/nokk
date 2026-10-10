@@ -10513,6 +10513,72 @@ mod tests {
         assert_eq!(ctx.evaluate("document.title").await.unwrap(), Value::String("tBCD".into()));
     }
 
+    /// `window.length` and `window[i]` follow frames entering and leaving the
+    /// tree (they are recomputed then, not on every DOM change).
+    #[tokio::test]
+    async fn window_frames_follow_the_tree() {
+        let _serial = serial().await;
+        let engine = engine(1, 4);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body><p>x</p></body></html>").await.unwrap();
+        let v = ctx
+            .evaluate(
+                r#"(() => { const r = [window.length];
+                  const a = document.createElement('iframe'); document.body.appendChild(a);
+                  const box = document.createElement('div'); box.innerHTML = '<span>t</span><iframe></iframe>'; document.body.appendChild(box);
+                  r.push(window.length, window[0] === a.contentWindow, window[1] === box.lastChild.contentWindow);
+                  document.querySelector('p').textContent = 'changed';
+                  r.push(window.length);
+                  box.remove(); r.push(window.length, window[1] === undefined);
+                  document.body.innerHTML = ''; r.push(window.length, window[0] === undefined);
+                  return r.join(); })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(v, Value::String("0,2,true,true,2,1,true,0,true".into()));
+    }
+
+    /// Styles that depend on `:has()` follow DOM changes: a descendant
+    /// appearing or leaving, a class deep inside, a sibling (`:has(+ …)`)
+    /// and an anchor with nothing to key on.
+    #[tokio::test]
+    async fn has_selectors_restyle_after_dom_changes() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><head><style>
+            .card { color: rgb(1, 1, 1) } .card:has(img) { color: rgb(2, 2, 2) }
+            .card:has(.hot) .title { color: rgb(3, 3, 3) }
+            li:has(+ .next) { color: rgb(5, 5, 5) }
+            .zone :has(> b) { color: rgb(6, 6, 6) }
+            </style></head><body>
+            <div class="card" id="c"><p class="title">t</p><div><span id="deep">x</span></div></div>
+            <ul><li id="l1">1</li><li id="l2">2</li></ul>
+            <div class="zone"><section><p id="host">h</p></section></div>
+            </body></html>"#,
+        )
+        .await
+        .unwrap();
+        let v = ctx
+            .evaluate(
+                r#"(() => { const c = (s) => getComputedStyle(document.querySelector(s)).color; const r = [c('#c')];
+                  document.getElementById('c').appendChild(document.createElement('img')); r.push(c('#c'));
+                  document.querySelector('#c img').remove(); r.push(c('#c'));
+                  document.getElementById('deep').className = 'hot'; r.push(c('#c .title'));
+                  document.getElementById('l2').className = 'next'; r.push(c('#l1'));
+                  document.getElementById('host').appendChild(document.createElement('b')); r.push(c('#host'));
+                  return r.join(' '); })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            v,
+            Value::String("rgb(1, 1, 1) rgb(2, 2, 2) rgb(1, 1, 1) rgb(3, 3, 3) rgb(5, 5, 5) rgb(6, 6, 6)".into())
+        );
+    }
+
     async fn run_and_read(ctx: &BrowserContext, js: &str) -> Value {
         ctx.evaluate(js).await.unwrap();
         ctx.run_event_loop().await.unwrap();

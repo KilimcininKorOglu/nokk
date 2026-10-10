@@ -72,7 +72,22 @@
   // builds `<script src=…>` and appends it (which is how every tag loader, widget
   // bootstrap and anti-bot orchestrator works, Cloudflare's interstitial included)
   // got a DOM node and nothing else: no fetch, no execution, no `onload`.
-  const __connectSubtree = (node) => __walkTree(node, (n) => {
+  // Frames in the tree change only when a frame element connects or leaves:
+  // `window.length` and `window[i]` are recomputed then, not on every DOM
+  // mutation (a text change walked the whole tree twice).
+  let __framesSeq = 0;
+  const __framesChanged = () => {
+    __framesSeq++;
+    if (globalThis.__pt_syncFrameSlots) { try { __pt_syncFrameSlots(); } catch (e) {} }
+  };
+  const __isFrameEl = (n) => n.__ptLocal === 'iframe' || n.__ptLocal === 'frame';
+  const __connectSubtree = (node) => {
+    const before = __framesSeq;
+    __connectWalk(node);
+    if (__framesSeq !== before && globalThis.__pt_syncFrameSlots) { try { __pt_syncFrameSlots(); } catch (e) {} }
+  };
+  const __connectWalk = (node) => __walkTree(node, (n) => {
+    if (__isFrameEl(n)) __framesSeq++;
     if (n.__ptLocal === 'iframe') n.__ptConnectFrame();
     else if (n.__ptLocal === 'script') n.__ptRunScript();
     // Stylesheets and preloads start loading on insertion, not on `href`
@@ -420,7 +435,7 @@
       if (i < 0) this.__ptKids.push(child); else this.__ptKids.splice(i, 0, child);
       child.__ptParent = this;
       __markDirty();
-      __styleTouch(this);
+      __styleTouch(this, true);
       __mutation(__childListRecord(this, [child], [], child.previousSibling, child.nextSibling));
       // A frame only becomes a browsing context once it is in the document — and
       // the frame is rarely the node being inserted. A widget builds its tree
@@ -441,19 +456,22 @@
           'NotFoundError');
       }
       const prev = this.__ptKids[i - 1] || null, next = this.__ptKids[i + 1] || null;
-      this.__ptKids.splice(i, 1); child.__ptParent = null; __markDirty(); __styleTouch(this);
+      this.__ptKids.splice(i, 1); child.__ptParent = null; __markDirty(); __styleTouch(this, true);
       __mutation(__childListRecord(this, [], [child], prev, next));
       // A removed frame is a closed browsing context. Without this its V8 context
       // outlives the element forever — a widget that replaces its iframe on a
       // retry (Turnstile does, repeatedly) would pile them up until the cap. The
       // whole subtree goes, for the same reason it connects as a whole.
+      let frameLeft = false;
       __walkTree(child, (f) => {
+        if (__isFrameEl(f)) frameLeft = true;
         if (f.__ptFrameId) __ptDisconnectFrame(f);
         // A sandboxed frame: the page keeps its window, but the context is
         // closed (zero sizes, `closed`, no `frameElement`).
         if (f.__ptRealm) { try { if (typeof f.__ptRealm.__pt_detach === 'function') f.__ptRealm.__pt_detach(); } catch (e) {} try { __realmFrames.delete(f); } catch (e) {} }
         if (f.__ptUpgraded) __customCallback(f, 'disconnectedCallback');
       });
+      if (frameLeft) __framesChanged();
       return child;
     }
     replaceChild(nw, old) {
@@ -800,7 +818,8 @@
     constructor(data) { super(TEXT_NODE); this.__ptData = String(data); }
     get data() { return this.__ptData; }
     // New text means new layout, and `:empty` sees it in the parent's style.
-    set data(v) { this.__ptData = String(v); if (this.__ptParent) { __markDirty(); __styleTouch(this.__ptParent); } }
+    // Text matches no selector: a change is layout work, not style work.
+    set data(v) { this.__ptData = String(v); if (this.__ptParent) __markDirty(); }
     get nodeName() { return '#text'; }
     get nodeValue() { return this.data; }
     set nodeValue(v) { this.data = String(v); }
@@ -4827,13 +4846,16 @@
     node.__ptKids = [];
     for (const c of old) c.__ptParent = null;
     __markDirty();
-    __styleTouch(node);
+    __styleTouch(node, true);
     __mutation(__childListRecord(node, [], old, null, null));
+    let frameLeft = false;
     for (const c of old) __walkTree(c, (f) => {
+      if (__isFrameEl(f)) frameLeft = true;
       if (f.__ptFrameId) __ptDisconnectFrame(f);
       if (f.__ptRealm) { try { if (typeof f.__ptRealm.__pt_detach === 'function') f.__ptRealm.__pt_detach(); } catch (e) {} try { __realmFrames.delete(f); } catch (e) {} }
       if (f.__ptUpgraded) __customCallback(f, 'disconnectedCallback');
     });
+    if (frameLeft) __framesChanged();
   }
 
   // Element classes as a set, parsed once per attribute value. The layout
@@ -6297,9 +6319,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // `window.length` and `window.frames[i]` count live frames, recomputed from
   // the tree so they stay in sync with insertions.
   {
+    let cache = null, cacheSeq = -1, cacheDoc = null;
     const frameEls = () => {
-      const out = [];
       const doc = globalThis.document;
+      if (cache && cacheSeq === __framesSeq && cacheDoc === doc) return cache;
+      const out = [];
+      cache = out; cacheSeq = __framesSeq; cacheDoc = doc;
       if (!doc || !doc.documentElement) return out;
       // Light tree only: Chrome does not count frames inside shadow roots.
       const walk = (n) => {
@@ -7572,9 +7597,6 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   function __markDirty() {
     __layoutSeq++;
-    // Indexed window properties track frames: one per frame in the tree, so
-    // mutations change them.
-    if (globalThis.__pt_syncFrameSlots) { try { __pt_syncFrameSlots(); } catch (e) {} }
   }
 
   // --- MutationObserver ---------------------------------------------------
@@ -8290,9 +8312,20 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (el.hasAttribute && __ptHasA(el, 'hidden')) return true;
     // A hidden input takes no space, nor a line.
     if (el.tagName === 'INPUT' && /^hidden$/i.test(__ptGetA(el, 'type') || '')) return true;
-    const s = el.style;
-    if (s && __s_toLowerCase(String(s.display || '')) === 'none') return true;
+    // The inline declarations straight from the engine's map: the page-facing
+    // `style.display` goes through brand checks, and asking for `style`
+    // built a declaration object for every element laid out.
+    const m = __inlineDecls(el);
+    if (m) { const d = m.get('display'); if (d != null && __s_toLowerCase(__s_trim(String(d))) === 'none') return true; }
     return false;
+  }
+  // An element's inline style as the engine's raw map, or null when it has
+  // none (no `style` attribute and the page never touched `.style`).
+  function __inlineDecls(el) {
+    const s = el.__ptStyle || (__ptHasA(el, 'style') ? el.style : null);
+    if (!s) return null;
+    const raw = __declRaw.get(s);
+    return raw ? raw() : null;
   }
 
   function __isHiddenEl(el) {
@@ -8357,9 +8390,17 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   let __styleTouched = [];
   let __styleAllStale = true;
   let __styleRulesSeen = null;
-  function __styleTouch(node) {
+  // What a change at a node can restyle: the node and everything below it
+  // (inheritance, descendant selectors). Its parent's subtree only when
+  // siblings can depend on it: for an attribute change, any `+`/`~` rule;
+  // for a change of its children, a rule with `:empty`/`:has()`/`:blank`
+  // before a sibling combinator. Ancestors through `:has()` are handled at
+  // revalidation. Until the rules are known, the parent.
+  let __sibAny = true, __sibOnChildren = true;
+  function __styleTouch(node, children) {
     if (__styleAllStale || !node) return;
-    const root = node.parentNode || node;
+    const up = children ? __sibOnChildren : __sibAny;
+    const root = up ? (node.parentNode || node) : node;
     if (__styleTouched.length >= 2000) { __styleAllStale = true; __styleTouched = []; return; }
     __styleTouched.push(root);
   }
@@ -8370,22 +8411,57 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   function __styleRevalidate() {
     __stylePass = new WeakMap();
     __styleVolatile = new WeakSet();
-    if (__styleRulesSeen !== __rules || __rules.__ptHasHas) __styleAllStale = true;
+    const why = (k) => { __lstats['stale_' + k] = (__lstats['stale_' + k] | 0) + 1; };
+    if (__styleRulesSeen !== __rules) { __styleAllStale = true; why('rules'); }
+    const H = __rules && __rules.__ptHas;
+    if (H && __styleTouched.length && !__styleAllStale) {
+      if (H.any) { __styleAllStale = true; why('hasAny'); }
+      else {
+        const anchors = new Set();
+        const sibOf = (a) => {
+          // Previous element siblings: the nearest for `+`, up to 64 for `~`.
+          let n = 0;
+          for (let p = a.previousElementSibling; p; p = p.previousElementSibling) {
+            if (!anchors.has(p) && __hasAnchorMatch(p, H.sib)) anchors.add(p);
+            if (!H.tilde || ++n >= 64) return n < 64 || !p.previousElementSibling;
+          }
+          return true;
+        };
+        let bounded = true;
+        if (H.parentAny) {
+          for (const r of __styleTouched.slice()) {
+            const p = r && r.parentNode;
+            if (p && p.nodeType === ELEMENT_NODE) anchors.add(p);
+          }
+        }
+        for (const r of __styleTouched) {
+          for (let a = r; a && a.nodeType === ELEMENT_NODE; a = a.parentNode) {
+            if (!anchors.has(a) && __hasAnchorMatch(a, H)) anchors.add(a);
+            if (H.hasSib && !sibOf(a)) bounded = false;
+          }
+        }
+        if (!bounded) { __styleAllStale = true; why('hasSibFar'); }
+        else for (const a of anchors) __styleTouched.push(a);
+      }
+    }
     const doc = globalThis.document;
     let hash = '';
     try { hash = String(globalThis.location && globalThis.location.hash || ''); } catch (e) {}
     const world = hash + '|' + __customs.size;
-    if (world !== __styleWorld || (doc && doc.__ptActive !== __styleActive)) __styleAllStale = true;
+    if (world !== __styleWorld) { __styleAllStale = true; why('world'); }
+    else if (doc && doc.__ptActive !== __styleActive) { __styleAllStale = true; why('focus'); }
     __styleWorld = world;
     __styleActive = doc ? doc.__ptActive : null;
     __styleRulesSeen = __rules;
     if (__styleAllStale) {
+      __lstats.allStale++;
       __styleCache = new WeakMap();
       __styleTouched = [];
       __styleAllStale = false;
       return;
     }
     const drop = (n) => {
+      __lstats.dropped++;
       __styleCache.delete(n);
       for (const k of (n.__ptKids || [])) if (k.nodeType === ELEMENT_NODE) drop(k);
       if (n.__ptShadow) for (const k of (n.__ptShadow.__ptKids || [])) if (k.nodeType === ELEMENT_NODE) drop(k);
@@ -8466,6 +8542,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (m) return 'c' + m[1];
     m = /^([a-zA-Z][\w-]*)/.exec(flat);
     if (m) return 't' + __s_toLowerCase(m[1]);
+    // `:root` (custom property blocks are mostly this) matches one element.
+    if (/^:root(?![\w-])/i.test(flat)) return 'r';
+    // Only an attribute test (`[data-theme=dark]`): keyed by the attribute's
+    // name, so it is tried on elements that have that attribute, not on all.
+    m = /^\[\s*([a-zA-Z_][\w-]*)\s*(?:[~|^$*]?=|\])/.exec(comp);
+    // Whatever follows (`:not(…)`, more attributes), an element without the
+    // first attribute cannot match.
+    if (m) return 'a' + __s_toLowerCase(m[1]);
     return null;
   }
   const __ruleIndexes = new WeakMap();
@@ -8476,6 +8560,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     for (const r of rules) {
       const k = __ruleKey(r.sel);
       if (k == null) { ix.any.push(r); continue; }
+      if (k[0] === 'a') ix.attrs = true;
       let list = ix.keyed.get(k);
       if (!list) ix.keyed.set(k, (list = []));
       list.push(r);
@@ -8504,6 +8589,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const inScope = (r) => !r.root || r.root === root || (root === docEl && r.root === docEl) || (root && root.nodeType !== 11 && r.root && r.root.nodeType !== 11);
     const out = ix.any.filter(inScope);
     const add = (k) => { const l = ix.keyed.get(k); if (l) for (const r of l) if (inScope(r)) out.push(r); };
+    if (el === docEl) add('r');
     add('t' + __s_toLowerCase(String(el.localName || '')));
     const id = __ptGetA(el, 'id');
     if (id) add('i' + id);
@@ -8512,6 +8598,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const seen = new Set();
       for (const c of __s_split(cls, /[\t\n\f\r ]+/)) if (c && !seen.has(c)) { seen.add(c); add('c' + c); }
     }
+    if (ix.attrs && el.__ptAttrs) for (const name of el.__ptAttrs.keys()) add('a' + __s_toLowerCase(String(name)));
     return out;
   }
 
@@ -8589,8 +8676,97 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         if (id) byKey(e, 'i' + id);
         const set = __ptClassSet(e);
         if (set) for (const c of set) if (c) byKey(e, 'c' + c);
+        if (e.__ptAttrs) for (const name of e.__ptAttrs.keys()) byKey(e, 'a' + __s_toLowerCase(String(name)));
+        if (e === e.ownerDocument.documentElement) byKey(e, 'r');
       });
     }
+  }
+
+  // What a mutation can change through `:has()`: the elements the `:has()`
+  // is attached to ("anchors") are ancestors of the mutated node. From each
+  // rule the compound right before `:has(` gives the anchor's tag, classes
+  // and id; a mutation then drops the cascades of the matching ancestors
+  // (and their subtrees), as Blink's :has invalidation does. An anchor with
+  // nothing to key on, a sibling `:has(+ …)`/`:has(~ …)`, or `:has` nested in
+  // another pseudo-class falls back to dropping everything, still only when
+  // something changed. Null when no rule uses `:has()`.
+  function __hasAnchors(rules) {
+    let found = false;
+    // `sib`: anchors of `:has(+ …)`/`:has(~ …)`, which a change reaches
+    // through their following siblings; `tilde` when any is `~`.
+    const H = { any: false, tags: new Set(), classes: new Set(), ids: new Set(),
+      sib: { tags: new Set(), classes: new Set(), ids: new Set() }, hasSib: false, tilde: false };
+    // A compound's key: its id, else a class, else its tag; parentheses
+    // (`:has(…)`, `:not(…)`) are not looked into.
+    const keyOf = (compound) => {
+      let flat = '', d = 0;
+      for (const ch of compound) { if (ch === '(' || ch === '[') d++; else if (ch === ')' || ch === ']') d--; else if (d === 0) flat += ch; }
+      const id = /#([\w-]+)/.exec(flat); if (id) return ['ids', id[1]];
+      const cl = /\.([\w-]+)/.exec(flat); if (cl) return ['classes', cl[1]];
+      const tg = /^([a-zA-Z][\w-]*)/.exec(flat); if (tg) return ['tags', __s_toLowerCase(tg[1])];
+      return null;
+    };
+    // Top-level compounds of one selector, each with the combinator before it.
+    const compounds = (sel) => {
+      const out = [];
+      let cur = '', comb = '', d = 0, q = null;
+      for (let i = 0; i < sel.length; i++) {
+        const ch = sel[i];
+        if (q) { cur += ch; if (ch === q) q = null; continue; }
+        if (ch === '"' || ch === "'") { q = ch; cur += ch; continue; }
+        if (ch === '(' || ch === '[') d++;
+        else if (ch === ')' || ch === ']') d--;
+        if (d === 0 && (ch === ' ' || ch === '>' || ch === '+' || ch === '~' || ch === '\t' || ch === '\n')) {
+          if (cur) { out.push([comb, cur]); cur = ''; comb = ' '; }
+          if (ch !== ' ' && ch !== '\t' && ch !== '\n') comb = ch;
+          continue;
+        }
+        cur += ch;
+      }
+      if (cur) out.push([comb, cur]);
+      return out;
+    };
+    for (const r of rules) {
+      const text = String(r.sel || '');
+      if (__s_indexOf(__s_toLowerCase(text), ':has(') < 0) continue;
+      found = true;
+      if (H.any) continue;
+      for (const part of __s_split(text, /,(?![^()]*\))/)) {
+        const cs = compounds(__s_trim(part));
+        for (let i = 0; i < cs.length && !H.any; i++) {
+          const comp = cs[i][1];
+          const lower = __s_toLowerCase(comp);
+          if (__s_indexOf(lower, ':has(') < 0) continue;
+          // Relative sibling combinator inside the `:has()`.
+          const inner = __s_slice(comp, __s_indexOf(lower, ':has(') + 5);
+          const sibling = /^\s*[+~]/.test(inner);
+          let key = keyOf(comp);
+          if (!key && !sibling) {
+            // No key on the anchor: it lies under the nearest keyed compound
+            // to its left (through descendant/child combinators), whose
+            // subtree a change then drops.
+            for (let j = i; j > 0 && !key; j--) {
+              if (cs[j][0] === '+' || cs[j][0] === '~') break;
+              key = keyOf(cs[j - 1][1]);
+            }
+          }
+          // `:has(> x)` with nothing to key on: the anchor is the parent of
+          // a changed child, one level up.
+          if (!key && /^\s*>\s*[^\s>+~()]+\s*\)\s*$/.test(inner)) { H.parentAny = true; continue; }
+          if (!key) { H.any = true; break; }
+          const into = sibling ? H.sib : H;
+          if (sibling) { H.hasSib = true; if (/^\s*~/.test(inner)) H.tilde = true; }
+          into[key[0]].add(key[1]);
+        }
+      }
+    }
+    return found ? H : null;
+  }
+  function __hasAnchorMatch(e, H) {
+    if (H.tags.size && H.tags.has(__s_toLowerCase(String(e.localName || '')))) return true;
+    if (H.ids.size) { const id = __ptGetA(e, 'id'); if (id && H.ids.has(id)) return true; }
+    if (H.classes.size) { const set = __ptClassSet(e); if (set) for (const c of set) if (H.classes.has(c)) return true; }
+    return false;
   }
 
   // The rule list is rebuilt only when a stylesheet changed: every CSSOM
@@ -8611,7 +8787,17 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (old && old.length === key.length && old.every((v, i) => v === key[i])) return __gatherHit;
     __gatherKey = key;
     __gatherHit = __gatherRules(docEl, []);
-    __gatherHit.__ptHasHas = __gatherHit.some((r) => /:has\(/i.test(r.sel));
+    __gatherHit.__ptHas = __hasAnchors(__gatherHit);
+    // Sibling combinators outside brackets and parentheses (`~=` and `2n+1`
+    // are not combinators).
+    let sib = false, sibChildren = false;
+    for (const r of __gatherHit) {
+      const bare = __s_replace(__s_replace(String(r.sel || ''), /\[[^\]]*\]/g, ''), /\([^()]*\)/g, '');
+      if (!/[+~]/.test(bare)) continue;
+      sib = true;
+      if (/:(empty|has|blank)\b/i.test(String(r.sel || ''))) { sibChildren = true; break; }
+    }
+    __sibAny = sib; __sibOnChildren = sibChildren;
     return __gatherHit;
   }
 
@@ -8644,6 +8830,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const up = el.parentNode;
     if (!volatile && up && up.nodeType === ELEMENT_NODE) { __cascadeFor(up); volatile = __styleVolatile.has(up); }
     const out = new Map();
+    __lstats.cascades++;
     // SVG presentation attributes are declarations of the lowest weight:
     // `<text font-size="150">` measures at 150px, not 16.
     if (el.__ptNS === 'http://www.w3.org/2000/svg' && el.hasAttribute) {
@@ -8699,7 +8886,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const m = __ruleMap(r);
       if (m) for (const [n, v] of m) note(n, String(v));
     }
-    const own = el.style;
+    const own = el.__ptStyle || (__ptHasA(el, 'style') ? el.style : null);
     if (own) noteAll(own);
     const vars = __customsFor(el, mine);
     // `inherit` takes the parent's cascaded value; `initial` and `unset` act
@@ -9384,6 +9571,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   }
 
   function __layoutOneRaw(el, originX, originY, availW, strut, forced) {
+    __lstats.layoutEls++;
     // Document order, not after children: hit testing scans from the end and a
     // deeper element must come after its parent.
     __boxes.push(el);
@@ -9978,9 +10166,17 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // hidden ones included.
   const __realmFrames = new Set();
 
+  // Cost counters for profiling the style and layout engine (always on: a few
+  // integer increments). `__pt_layoutStats()` reads them.
+  const __lstats = { relayouts: 0, cascades: 0, allStale: 0, dropped: 0, layoutEls: 0 };
+  Object.defineProperty(globalThis, '__pt_layoutStats', { value: () => Object.assign({}, __lstats), configurable: true, enumerable: false });
+  // Drop every cached cascade: checks compare incremental styles with a
+  // full recomputation.
+  Object.defineProperty(globalThis, '__pt_styleFlush', { value: () => { __styleAllStale = true; __layoutSeq++; }, configurable: true, enumerable: false });
   function __relayout() {
     if (__layoutBuilt === __layoutSeq) return;
     __layoutBuilt = __layoutSeq;
+    __lstats.relayouts++;
     __collectHidden();
     __rows = [];
     __boxes = [];

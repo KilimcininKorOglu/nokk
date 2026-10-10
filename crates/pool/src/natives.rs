@@ -78,6 +78,7 @@ pub fn install(scope: &mut v8::PinScope) {
     bind(scope, "__pt_waveTableCustom", wave_table_custom);
     bind(scope, "__pt_compress", compress);
     bind(scope, "__pt_atob", atob_native);
+    bind(scope, "__pt_base64Bytes", base64_bytes);
     bind(scope, "__pt_heapStats", heap_stats);
     bind(scope, "__pt_setCodegen", set_codegen);
     bind(scope, "__pt_fnLocation", fn_location);
@@ -1635,6 +1636,23 @@ fn compress(
 /// byte-per-char string, or `null` if the input is not base64 (the wrapper then
 /// throws the browser error). Native because the challenge decodes about a
 /// megabyte this way, and the JS loop took 80 ms over three calls.
+/// `__pt_base64Bytes(b64)`: a response body the engine sent as base64,
+/// straight into a Uint8Array (decoding it through a string and a per-byte
+/// callback was 13% of a heavy page's load).
+fn base64_bytes(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
+    use base64::Engine as _;
+    let Ok(s) = v8::Local::<v8::String>::try_from(args.get(0)) else {
+        rv.set_null();
+        return;
+    };
+    let mut raw = vec![0u8; s.length()];
+    s.write_one_byte_v2(scope, 0, &mut raw, v8::WriteFlags::empty());
+    match base64::engine::general_purpose::STANDARD.decode(&raw) {
+        Ok(bytes) => set_bytes(scope, &mut rv, &bytes),
+        Err(_) => rv.set_null(),
+    }
+}
+
 fn atob_native(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,

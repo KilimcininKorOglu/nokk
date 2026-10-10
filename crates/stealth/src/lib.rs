@@ -8069,6 +8069,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
 
   // `bytes64`: the body's own bytes when they are not UTF-8 text (an mp3, an image, a
   // protobuf). `body` is then lossy text, as `text()` would decode it.
+  const __b64bytes = typeof globalThis.__pt_base64Bytes === 'function' ? globalThis.__pt_base64Bytes : null;
   globalThis.__pt_fetchResolve = (id, status, statusText, headers, body, finalUrl, bytes64) => {
     const p = pending.get(id); if (!p) return; pending.delete(id);
     if (globalThis.__pt_encTrace) { try { (globalThis.__pt_parentConsole || console).error('[fetch] ' + Math.round(performance.now()) + 'ms #' + id + ' resp ' + status + ' len=' + (body == null ? 0 : (body.byteLength || body.length || 0)) + ' ' + __s_slice(String(p.url), -60) + ' hdrs=' + __s_slice(JSON.stringify(headers), 0, 300) + ((body && (body.byteLength || body.length || 0) < 500) ? ' body=' + __s_slice(JSON.stringify(typeof body === 'string' ? body : new TextDecoder().decode(body)), 0, 400) : '')); } catch (e) {} }
@@ -8083,7 +8084,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       status, statusText: statusText || '', url: finalU, type,
       redirected: !!finalUrl && __s_replace(finalUrl, /#.*$/, '') !== __s_replace(String(p.url), /#.*$/, ''),
       headers: new globalThis.Headers(lower),
-      bytes: bytes64 ? Uint8Array.from(globalThis.atob(bytes64), (c) => __s_charCodeAt(c, 0)) : null,
+      bytes: bytes64 ? (__b64bytes ? __b64bytes(bytes64) : Uint8Array.from(globalThis.atob(bytes64), (c) => __s_charCodeAt(c, 0))) : null,
       text: bytes64 ? undefined : (body == null ? '' : String(body)),
     });
     p.resolve(resp);
