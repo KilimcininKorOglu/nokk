@@ -1534,6 +1534,8 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
             try { if (globalThis.__pt_reportError) __pt_reportError(e, 'requestAnimationFrame'); } catch (x) {}
           }
         }
+        // The frame's style pass: what the callbacks styled starts loading.
+        try { if (globalThis.__pt_cssLoads) __pt_cssLoads(); } catch (e) {}
       }, Math.max(0, at - now), false, []);
       // A long animation frame is attributed to FrameRequestCallback.
       try { const t = q.get(tid); if (t) { t.invoker = 'FrameRequestCallback'; t.orig = fn; } } catch (e) {}
@@ -2711,24 +2713,76 @@ pub fn late_interfaces_script() -> String {
       function (v) { const o = state.get(this); if (o) o[k] = String(v); });
   }
   defg(P, 'status', function () { return at(this).status; });
-  const start = (face) => {
+  // `src` as Chrome reads it: sources in order, `local()` by the font files'
+  // own names (fontconfig substitutes do not count: `Arial` is not found on a
+  // machine without it), `url()` fetched as a font request; a `format()` the
+  // browser cannot use is skipped. The first that yields a font wins.
+  const SRC = /(local|url)\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*?))\s*\)(?:\s*format\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*?))\s*\))?/gi;
+  const USABLE = /^(woff2|woff|truetype|opentype|collection)(-variations)?$/;
+  const sourcesOf = (text) => {
+    const out = [];
+    SRC.lastIndex = 0;
+    let m;
+    while ((m = SRC.exec(text))) {
+      const arg = __s_trim(String(m[2] !== undefined ? m[2] : m[3] !== undefined ? m[3] : m[4] || ''));
+      const fmt = m[5] !== undefined ? m[5] : m[6] !== undefined ? m[6] : m[7];
+      if (fmt !== undefined && !USABLE.test(__s_toLowerCase(__s_trim(String(fmt))))) continue;
+      out.push([__s_toLowerCase(m[1]), arg]);
+    }
+    SRC.lastIndex = 0;
+    return out;
+  };
+  // Font files start with one of these tags; anything else does not decode.
+  const FONT_MAGIC = /^(wOF2|wOFF|OTTO|true|ttcf|typ1|\x00\x01\x00\x00)/;
+  const fetchFont = (o, url) => {
+    let abs = url;
+    try { abs = new URL(url, o.base || document.baseURI).href; } catch (e) { return Promise.resolve(false); }
+    if (!/^https?:/i.test(abs) || typeof globalThis.__pt_subresourceText !== 'function') return Promise.resolve(false);
+    return __pt_subresourceText(abs, 'font', o.referrer || null)
+      .then((text) => typeof text === 'string' && FONT_MAGIC.test(text), () => false);
+  };
+  const start = (face, quiet) => {
     const o = state.get(face);
     if (!o) return Promise.reject(__pt_mkErr(TypeError, 'Illegal invocation'));
     if (o.promise) return o.promise;
-    // `local(Name)` is the only source resolved without the network; anything
-    // else fails with a network error, like the browser with an unreachable
-    // URL. fontconfig substitutes do not count: the browser matches the font
-    // files' own names, and `Arial` is not found on a machine without it.
-    const m = /local\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)/i.exec(o.source || '');
-    const name = m ? __s_trim(String(m[1] || m[2] || m[3] || '')) : null;
-    const have = !!(name && typeof globalThis.__pt_localFont === 'function' && __pt_localFont(name));
+    const list = sourcesOf(o.source || '');
     o.status = 'loading';
-    o.promise = have
-      ? Promise.resolve().then(() => { o.status = 'loaded'; return face; })
-      : Promise.resolve().then(() => { o.status = 'error'; throw netError(); });
+    // Only a face in `document.fonts` makes the set load.
+    o.counted = !!(globalThis.__pt_fontsCounts && __pt_fontsCounts(face));
+    if (o.counted) __pt_fontsChanged(1);
+    // A load the page asked for holds the document's `load`; a CSS face is
+    // held by the text waiting for it, which the style pass decides.
+    const rel = !quiet && typeof globalThis.__pt_holdLoad === 'function' ? __pt_holdLoad('FontFace ' + o.family) : null;
+    const next = (i) => {
+      if (i >= list.length) return Promise.resolve(false);
+      const [kind, arg] = list[i];
+      if (kind === 'local') {
+        const have = !!(arg && typeof globalThis.__pt_localFont === 'function' && __pt_localFont(arg));
+        return have ? Promise.resolve(true) : next(i + 1);
+      }
+      return fetchFont(o, arg).then((ok) => (ok ? true : next(i + 1)));
+    };
+    o.promise = next(0).then((ok) => {
+      o.status = ok ? 'loaded' : 'error';
+      if (o.counted) __pt_fontsChanged(-1);
+      if (rel) rel();
+      if (!ok) throw netError();
+      return face;
+    });
     o.promise.catch(() => {});
     return o.promise;
   };
+  // A face from an `@font-face` rule: the same object a page meets in
+  // `document.fonts`, its URLs resolved against the declaring sheet.
+  Object.defineProperty(globalThis, '__pt_cssFontFace', { value: (family, source, desc, base, referrer) => {
+    const face = Object.create(FontFace.prototype);
+    const own = { family: String(family), source: String(source), status: 'unloaded', promise: null, css: true, base, referrer };
+    for (const [k, v] of DESCRIPTORS) own[k] = desc && desc[k] != null ? String(desc[k]) : v;
+    state.set(face, own);
+    return face;
+  }, configurable: true, enumerable: false });
+  Object.defineProperty(globalThis, '__pt_faceLoad', { value: (face) => start(face, true), configurable: true, enumerable: false });
+  Object.defineProperty(globalThis, '__pt_faceInfo', { value: (face) => state.get(face) || null, configurable: true, enumerable: false });
   meth(P, 'load', function load() { return start(this); });
   defg(P, 'loaded', function () { return start(this); });
   try { Object.defineProperty(P, Symbol.toStringTag, { value: 'FontFace', configurable: true }); } catch (e) {}
@@ -5454,11 +5508,35 @@ __OPFS__
       const P = FFS.prototype;
       // A real set: the page adds `FontFace`s, reads `size`, iterates and
       // awaits `load`.
+      // Faces from `@font-face` rules come first, as in Chrome, then the
+      // ones the page added.
       const faces = new Set();
-      let pending = 0;
-      defg(P, 'size', function () { return faces.size; });
+      const cssFaces = () => (typeof globalThis.__pt_cssFaces === 'function' ? __pt_cssFaces() : []);
+      const all = () => { const c = cssFaces(); return faces.size ? c.concat([...faces]) : c; };
+      // `loading` while any face loads, and until a task after the last one
+      // is done; `ready` is a new promise for each loading period.
+      let pending = 0, settle = null;
+      let ready = Promise.resolve(document.fonts);
+      Object.defineProperty(globalThis, '__pt_fontsChanged', { value: (d) => {
+        if (d > 0) {
+          if (pending++ === 0 && !settle) {
+            ready = new Promise((r) => { settle = r; });
+            ready.catch(() => {});
+          }
+          return;
+        }
+        const end = () => {
+          if (--pending > 0 || !settle) return;
+          const r = settle; settle = null; r(document.fonts);
+        };
+        if (typeof globalThis.__pt_addTask === 'function') __pt_addTask(end, 0); else setTimeout(end, 0);
+      }, configurable: true, enumerable: false });
+      Object.defineProperty(globalThis, '__pt_fontsCounts', { value: (face) => {
+        const o = globalThis.__pt_faceInfo ? __pt_faceInfo(face) : null;
+        return !!(o && o.css) || faces.has(face);
+      }, configurable: true, enumerable: false });
+      defg(P, 'size', function () { return cssFaces().length + faces.size; });
       defg(P, 'status', function () { return pending > 0 ? 'loading' : 'loaded'; });
-      const ready = Promise.resolve(document.fonts);
       defg(P, 'ready', function () { return ready; });
       for (const on of ['onloading', 'onloadingdone', 'onloadingerror']) {
         try { Object.defineProperty(P, on, { value: null, writable: true, enumerable: true, configurable: true }); } catch (e) {}
@@ -5483,30 +5561,27 @@ __OPFS__
         if (!parses(font)) {
           return Promise.reject(__pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'load' on 'FontFaceSet': Could not resolve '" + font + "' as a font.", 'SyntaxError'));
         }
-        const want = familyOf(font);
-        const mine = [...faces].filter((f) => {
-          try { return String(f.family) === want; } catch (e) { return false; }
+        const want = __s_toLowerCase(familyOf(font));
+        const info = globalThis.__pt_faceInfo;
+        const mine = all().filter((f) => {
+          const o = info ? info(f) : null;
+          return !!o && __s_toLowerCase(o.family) === want;
         });
-        pending++;
-        const done = () => { pending = Math.max(0, pending - 1); };
-        return Promise.all(mine.map((f) => {
-          try { return f.load().then(() => f, () => null); } catch (e) { return Promise.resolve(null); }
-        })).then((list) => {
-          setTimeout(done, 0);
-          return list.filter(Boolean);
-        }, (e) => { setTimeout(done, 0); throw e; });
+        return Promise.all(mine.map((f) => (globalThis.__pt_faceLoad ? __pt_faceLoad(f) : Promise.resolve(f))
+          .then(() => f, () => null))).then((list) => list.filter(Boolean));
       });
       meth(P, 'add', function (face) { if (face) faces.add(face); return this; });
       meth(P, 'delete', function (face) { return faces.delete(face); });
       meth(P, 'clear', function () { faces.clear(); });
-      meth(P, 'has', function (face) { return faces.has(face); });
-      meth(P, 'forEach', function (f, t) { faces.forEach(f, t); });
-      meth(P, 'keys', function () { return faces.keys(); });
-      meth(P, 'values', function () { return faces.values(); });
-      meth(P, 'entries', function () { return faces.entries(); });
+      meth(P, 'has', function (face) { return faces.has(face) || cssFaces().includes(face); });
+      meth(P, 'forEach', function (f, t) { for (const face of all()) f.call(t, face, face, this); });
+      // Set iterators, as Chrome's setlike gives.
+      meth(P, 'keys', function () { return new Set(all()).values(); });
+      meth(P, 'values', function () { return new Set(all()).values(); });
+      meth(P, 'entries', function () { return new Set(all()).entries(); });
       try {
         Object.defineProperty(P, Symbol.iterator, {
-          value: fn('[Symbol.iterator]', function () { return faces.values(); }),
+          value: fn('[Symbol.iterator]', function () { return new Set(all()).values(); }),
           writable: true, configurable: true,
         });
       } catch (e) {}
@@ -8102,18 +8177,33 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   // is one request. Without this the challenge's beacon went out twice, which is
   // one time more than it is ever meant to be sent.
   const subresources = new Map();
-  globalThis.__pt_subresource = (url, kind) => {
+  // `referrer`: a stylesheet asking for its imports, images and fonts.
+  globalThis.__pt_subresource = (url, kind, referrer) => {
     url = String(url);
     const seen = subresources.get(url);
     if (seen) return seen;
     const id = fid++;
-    queue.push({ id, url, method: 'GET', headers: {}, body: null, kind: kind || 'image' });
+    queue.push({ id, url, method: 'GET', headers: {}, body: null, kind: kind || 'image', referrer: referrer || null });
     const p = new Promise((resolve, reject) => { pending.set(id, { resolve, reject, url }); });
     subresources.set(url, p);
     // A failure is not worth remembering: a browser retries a broken image.
     p.catch(() => { subresources.delete(url); });
     return p;
   };
+  // The body of a subresource as text (null when it failed), read once and
+  // shared: an import and a font face may name the same address.
+  const subresourceTexts = new Map();
+  Object.defineProperty(globalThis, '__pt_subresourceText', { value: (url, kind, referrer) => {
+    url = String(url);
+    let p = subresourceTexts.get(url);
+    if (p) return p;
+    p = globalThis.__pt_subresource(url, kind, referrer).then(
+      (res) => (res && res.ok !== false && typeof res.text === 'function' ? res.text() : null),
+      () => null);
+    subresourceTexts.set(url, p);
+    p.then((t) => { if (t === null) subresourceTexts.delete(url); });
+    return p;
+  }, configurable: true, enumerable: false });
 
   // What an image turned out to be, by address. Rust reads the two numbers out
   // of the image header — the body reaches us as lossy text, where they are

@@ -97,6 +97,7 @@ pub fn install(scope: &mut v8::PinScope) {
         bind(scope, "__pt_canvasFillText", canvas_fill_text);
         bind(scope, "__pt_canvasMeasureText", canvas_measure_text);
         bind(scope, "__pt_localFont", local_font);
+        bind(scope, "__pt_fontFamily", font_family);
         bind(scope, "__pt_canvasFillPath", canvas_fill_path);
         bind(scope, "__pt_canvasFillOps", canvas_fill_ops);
         bind(scope, "__pt_canvasFillOpsGradient", canvas_fill_ops_gradient);
@@ -356,6 +357,19 @@ fn local_font(
 ) {
     let name = arg_string(scope, args.get(0));
     rv.set_bool(crate::canvas::has_local_font(&name));
+}
+
+/// `__pt_fontFamily(name)`: whether a CSS `font-family` name finds a face
+/// here (fontconfig's metric-compatible names included), so a web font
+/// listed after it is not needed.
+#[cfg(feature = "render")]
+fn font_family(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let name = arg_string(scope, args.get(0));
+    rv.set_bool(crate::canvas::has_family(&name));
 }
 
 /// `__pt_canvasMeasureText(text, size)` → advance width in CSS px (a number).

@@ -295,6 +295,7 @@ impl EngineInner {
             doc_hints: Vec::new(),
             urgency: None,
             omit_credentials: false,
+            initiator: None,
             method: "GET".into(),
             url: nokk_net::GEO_LOOKUP_URL.to_string(),
             headers,
@@ -927,6 +928,7 @@ impl Engine {
             doc_hints: Vec::new(),
             urgency: None,
             omit_credentials: false,
+            initiator: None,
             method: "GET".into(),
             url: url.to_string(),
             headers,
@@ -1990,20 +1992,34 @@ impl BrowserContext {
         // Before the load events: a page reading timings in `load` must see the full list.
         // Top page only: the request log is per context, and handing it to a frame would
         // mislead the frame and leave nothing for the page.
-        if index == self.idx() {
-            self.flush_resource_timings(index).await;
-        }
         // Listeners' own errors are caught in the dispatch; what reaches here is
         // a listener stopped for running too long (azure.microsoft.com relays
         // out its sticky header for a minute). Chrome would still show the
         // page, so the load goes on.
-        for attempt in 0..3 {
-            let call = if attempt == 0 { "__pt_finishLoad(false);" } else { "__pt_finishLoad(true);" };
-            match self.eval_in(index, call).await {
-                Ok(_) => break,
-                Err(e) => tracing::warn!(error = %e, "a load event listener was stopped; the page goes on"),
+        let finish = |upto: u8| async move {
+            for attempt in 0..3 {
+                let call = format!("__pt_finishLoad({}, {upto});", attempt > 0 || upto > 1);
+                match self.eval_in(index, &call).await {
+                    Ok(_) => break,
+                    Err(e) => tracing::warn!(error = %e, "a load event listener was stopped; the page goes on"),
+                }
             }
+        };
+        // Top page only: a frame's loads are served by the page's loop, which a
+        // frame must not re-enter.
+        let top = index == self.idx();
+        if top {
+            let _ = self.eval_in(index, "typeof __pt_cssSheets === 'function' && __pt_cssSheets()").await;
+            self.wait_for_holds(index, DCL_HOLDS, HOLD_WAIT).await;
+            self.flush_resource_timings(index).await;
         }
+        finish(1).await;
+        if top {
+            let _ = self.eval_in(index, "typeof __pt_cssLoads === 'function' && __pt_cssLoads(true)").await;
+            self.wait_for_holds(index, LOAD_HOLDS, HOLD_WAIT).await;
+            self.flush_resource_timings(index).await;
+        }
+        finish(3).await;
         if index == self.idx() {
             self.request_icon(index, base_url).await;
         }
@@ -2071,23 +2087,25 @@ impl BrowserContext {
     /// and holding a CDP command hostage to it would be worse than returning and
     /// letting the server's periodic pump carry the page forward.
     pub async fn run_event_loop(&self) -> Result<u32, EngineError> {
-        self.run_event_loop_waiting(IDLE_WAIT_BUDGET, false).await
+        self.run_event_loop_waiting(IDLE_WAIT_BUDGET, None).await
     }
 
     /// [`Self::run_event_loop`] with a longer patience for timers, used while a
     /// document is loading: work deferred by a few hundred milliseconds is still
     /// part of the load, and a caller that just navigated is waiting anyway.
     async fn run_event_loop_for_load(&self) -> Result<u32, EngineError> {
-        self.run_event_loop_waiting(LOAD_WAIT_BUDGET, false).await
+        self.run_event_loop_waiting(LOAD_WAIT_BUDGET, None).await
     }
 
     /// The loop both of the above run. `idle_wait` is the *total* time it may
     /// spend waiting for timers that are not due yet — time spent doing nothing,
-    /// as opposed to the deadline, which bounds the whole call.
+    /// as opposed to the deadline, which bounds the whole call. `until` is a JS
+    /// count the caller is waiting to reach zero: the loop returns as soon as
+    /// it does, instead of running everything the page has queued.
     async fn run_event_loop_waiting(
         &self,
         idle_wait: std::time::Duration,
-        until_sheets: bool,
+        until: Option<&str>,
     ) -> Result<u32, EngineError> {
         const TIMER_CAP: u32 = 10_000;
         const MAX_FETCHES: usize = 200;
@@ -2266,66 +2284,77 @@ impl BrowserContext {
             // answered by a later one, as in a browser. Waiting for every request let one
             // dead host (a stylesheet that never connects) stall the page's JS for the
             // whole request timeout.
-            let mut settles = Vec::with_capacity(reqs.len());
+            // Each answer reaches the page as it arrives, as in a browser: a fast
+            // response is not held behind the slowest of its round (Wikipedia's `load`
+            // waited six seconds behind images nobody waited for).
             for batch in reqs.chunks(MAX_FETCHES) {
-                let started: Vec<_> = batch
-                    .iter()
-                    .map(|r| match self.prepare_fetch(index, &base, r) {
-                        Prepared::Settled(js) => Err(js),
+                let mut settles = Vec::new();
+                let mut out: Vec<(FetchInfo, tokio::task::JoinHandle<Result<nokk_net::Response, NetError>>)> = Vec::new();
+                for r in batch {
+                    match self.prepare_fetch(index, &base, r) {
+                        Prepared::Settled(js) => settles.push(js),
                         Prepared::Send(req, info) => {
                             let client = self.client.clone();
-                            Ok((info, tokio::spawn(async move { client.send(*req).await })))
+                            out.push((info, tokio::spawn(async move { client.send(*req).await })));
                         }
-                    })
-                    .collect();
-                let all_done = async {
-                    while started.iter().any(|s| matches!(s, Ok((_, h)) if !h.is_finished())) {
-                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                     }
-                };
-                let _ = self
-                    .with_frames_live(tokio::time::timeout(PAGE_FETCH_GRACE, all_done))
-                    .await;
-                for s in started {
-                    match s {
-                        Err(js) => settles.push(js),
-                        Ok((info, handle)) if handle.is_finished() => {
+                }
+                let grace = std::time::Instant::now() + PAGE_FETCH_GRACE;
+                loop {
+                    let mut i = 0;
+                    while i < out.len() {
+                        if out[i].1.is_finished() {
+                            let (info, handle) = out.swap_remove(i);
                             let res = match handle.await {
                                 Ok(r) => r,
                                 Err(e) => Err(NetError::Connect(format!("fetch task failed: {e}"))),
                             };
                             settles.push(self.settle_fetch(&info, res));
+                        } else {
+                            i += 1;
                         }
-                        Ok((info, handle)) => {
-                            tracing::debug!(target: "nokk::load", url = %info.url, "slow request left in flight");
-                            let doc = Some(self.doc_seq.load(std::sync::atomic::Ordering::Acquire));
-                            if let Ok(mut v) = self.inflight.lock() {
-                                v.push(InFlight { deliver: Deliver::Frame(index), info, handle, doc });
+                    }
+                    if !settles.is_empty() {
+                        // A response's Set-Cookie is in the jar before the page sees the response.
+                        if index == self.idx() {
+                            self.sync_cookie_mirror(index, &base).await;
+                        }
+                        for settle in settles.drain(..) {
+                            let (w, raw) = self.route(index);
+                            self.engine
+                                .pool
+                                .dispatch(w, move |iso| iso.eval(raw, &settle))
+                                .await?
+                                .map_err(EngineError::Js)?;
+                            // Give frames turns between loads. While chess.com pulls a hundred files in
+                            // sequence, the widget's frame would stall (8 s on its own clock vs 1.5 s in a
+                            // browser, where the cross-origin frame has its own thread).
+                            if self.has_frames()
+                                && last_frame_pump.elapsed() >= FRAME_PUMP_EVERY
+                                && std::time::Instant::now() < deadline
+                            {
+                                last_frame_pump = std::time::Instant::now();
+                                self.pump_frames().await?;
+                            }
+                        }
+                        // What the caller waits for may have just arrived.
+                        if let Some(expr) = until {
+                            if self.js_count(index, expr).await == 0 {
+                                break;
                             }
                         }
                     }
+                    if out.is_empty() || std::time::Instant::now() >= grace {
+                        break;
+                    }
+                    self.with_frames_live(tokio::time::sleep(std::time::Duration::from_millis(2))).await;
                 }
-            }
-            // A response's Set-Cookie is in the jar before the page sees the response.
-            if !settles.is_empty() && index == self.idx() {
-                self.sync_cookie_mirror(index, &base).await;
-            }
-            for settle in settles {
-                let (w, raw) = self.route(index);
-                self.engine
-                    .pool
-                    .dispatch(w, move |iso| iso.eval(raw, &settle))
-                    .await?
-                    .map_err(EngineError::Js)?;
-                // Give frames turns between loads. While chess.com pulls a hundred files in
-                // sequence, the widget's frame would stall (8 s on its own clock vs 1.5 s in a
-                // browser, where the cross-origin frame has its own thread).
-                if self.has_frames()
-                    && last_frame_pump.elapsed() >= FRAME_PUMP_EVERY
-                    && std::time::Instant::now() < deadline
-                {
-                    last_frame_pump = std::time::Instant::now();
-                    self.pump_frames().await?;
+                for (info, handle) in out {
+                    tracing::debug!(target: "nokk::load", url = %info.url, "slow request left in flight");
+                    let doc = Some(self.doc_seq.load(std::sync::atomic::Ordering::Acquire));
+                    if let Ok(mut v) = self.inflight.lock() {
+                        v.push(InFlight { deliver: Deliver::Frame(index), info, handle, doc });
+                    }
                 }
             }
 
@@ -2350,16 +2379,11 @@ impl BrowserContext {
                     pump_ms = t.elapsed().as_millis() as u64, frames_ran, "frame round");
             }
 
-            // Only markup stylesheets were awaited and they arrived: run the next script
-            // rather than everything the page has queued.
-            if until_sheets {
-                let left = self
-                    .eval_in(index, "globalThis.__ptBlockingSheets | 0")
-                    .await
-                    .ok()
-                    .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-                    .unwrap_or(0);
-                if left == 0 {
+            // What the caller waits for has arrived (markup stylesheets before the next
+            // script, the loads `load` waits for): return rather than run everything
+            // the page has queued.
+            if let Some(expr) = until {
+                if self.js_count(index, expr).await == 0 {
                     break;
                 }
             }
@@ -4387,6 +4411,58 @@ impl BrowserContext {
         self.next_timer_in() == Some(std::time::Duration::ZERO)
     }
 
+    /// A count the page states as a JS expression (0 when it does not answer).
+    async fn js_count(&self, index: usize, expr: &str) -> i64 {
+        self.eval_in(index, expr)
+            .await
+            .ok()
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)).or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(0)
+    }
+
+    /// Hold a lifecycle event while the page has loads it waits for, as Chrome
+    /// does: `DOMContentLoaded` for stylesheets in the body, `load` for images,
+    /// frames, stylesheets, inserted scripts, CSS images and fonts. The page
+    /// lives meanwhile (its timers run, its requests are served). Chrome waits
+    /// without end; past `cap` the event goes out anyway, as a page that never
+    /// finishes loading is still a page.
+    async fn wait_for_holds(&self, index: usize, expr: &str, cap: std::time::Duration) {
+        let deadline = std::time::Instant::now() + cap;
+        let t0 = std::time::Instant::now();
+        loop {
+            let left = self.js_count(index, expr).await;
+            if tracing::enabled!(target: "nokk::holds", tracing::Level::DEBUG) {
+                let kinds = self
+                    .eval_in(index, "typeof __pt_loadHoldList === 'function' ? JSON.stringify(__pt_loadHoldList().reduce((m, w) => { const k = w.split(' ')[0]; m[k] = (m[k] || 0) + 1; return m; }, {})) : ''")
+                    .await
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                tracing::debug!(target: "nokk::holds", left, ms = t0.elapsed().as_millis() as u64, %kinds, "holds");
+            }
+            if left == 0 {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let list = self
+                    .eval_in(index, "typeof __pt_loadHoldList === 'function' ? JSON.stringify(__pt_loadHoldList().slice(0, 20)) : ''")
+                    .await
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                tracing::debug!(left, what = expr, %list, "loads still pending; the lifecycle event goes out without them");
+                return;
+            }
+            let worked = match Box::pin(self.run_event_loop_waiting(std::time::Duration::ZERO, Some(expr))).await {
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            if worked == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+    }
+
     /// Wait for markup stylesheets before running the next script, as a browser does.
     /// The wait is not idle: the page lives, its timers run, and the stylesheet
     /// requests are served by the same loop.
@@ -4400,12 +4476,7 @@ impl BrowserContext {
         }
         let deadline = std::time::Instant::now() + cap;
         loop {
-            let pending = self
-                .eval_in(index, "globalThis.__ptBlockingSheets | 0")
-                .await
-                .ok()
-                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-                .unwrap_or(0);
+            let pending = self.js_count(index, SHEETS_LEFT).await;
             if pending == 0 {
                 return;
             }
@@ -4425,7 +4496,7 @@ impl BrowserContext {
                 return;
             }
             // The loop may load a document itself, which then waits for sheets again.
-            let worked = match Box::pin(self.run_event_loop_waiting(std::time::Duration::ZERO, true)).await {
+            let worked = match Box::pin(self.run_event_loop_waiting(std::time::Duration::ZERO, Some(SHEETS_LEFT))).await {
                 Ok(n) => n,
                 Err(_) => return,
             };
@@ -4919,8 +4990,17 @@ impl BrowserContext {
         // Page-initiated requests carry the document that made them, which is
         // also what decides `Sec-Fetch-Site`.
         let no_referrer = r["noReferrer"].as_bool().unwrap_or(false);
-        if !no_referrer && !base.is_empty() && base != "about:blank" && !headers.keys().any(|k| k.eq_ignore_ascii_case("referer")) {
-            headers.insert("Referer".to_string(), base.to_string());
+        // A stylesheet's own loads (imports, images, fonts) name the sheet as
+        // referrer; the document stays the one asking.
+        let sheet = r["referrer"].as_str().filter(|s| s.starts_with("http"));
+        let mut initiator = None;
+        if !no_referrer && !headers.keys().any(|k| k.eq_ignore_ascii_case("referer")) {
+            if let Some(sheet) = sheet {
+                headers.insert("Referer".to_string(), sheet.to_string());
+                initiator = Some(base.to_string());
+            } else if !base.is_empty() && base != "about:blank" {
+                headers.insert("Referer".to_string(), base.to_string());
+            }
         }
         // Blocked tracker: never hit the wire; reject like a real ad-blocker
         // (ERR_BLOCKED_BY_CLIENT), and log it so the interception audit is complete.
@@ -4955,6 +5035,7 @@ impl BrowserContext {
             // requests with `sec-fetch-storage-access`.
             third_party: r["storageAccess"].as_bool().unwrap_or(false),
             user_activated: false,
+            initiator,
         };
         let method = req_method(&req);
         Prepared::Send(Box::new(req), FetchInfo { context, id, url, method, kind, sent })
@@ -5308,6 +5389,7 @@ impl BrowserContext {
             kind: Self::wire_kind(resource_type).0,
             urgency: Self::wire_kind(resource_type).1,
             omit_credentials: Self::wire_kind(resource_type).2,
+            initiator: None,
             // A navigation nobody's page asked for is one a person asked for.
             third_party: false,
             user_activated: resource_type == "document" && referrer.is_none(),
@@ -5564,6 +5646,7 @@ pub(crate) fn next_request_id() -> String {
 /// so a bare context (no stealth bootstrap, as in some tests) answers with empty
 /// queues instead of throwing.
 const DRAIN_IO: &str = "__ptJSON.stringify({\
+    css: (typeof __pt_cssLoads === 'function' && __pt_cssLoads(), 0),\
     fetch: typeof __pt_drainFetchQueue === 'function' ? __ptJSON.parse(__pt_drainFetchQueue()) : [],\
     ws: typeof __pt_drainWsQueue === 'function' ? __pt_drainWsQueue() : [],\
     frames: typeof __pt_drainFrameQueue === 'function' ? __pt_drainFrameQueue() : [],\
@@ -5594,6 +5677,15 @@ const FRAME_PUMP_EVERY: std::time::Duration = std::time::Duration::from_millis(4
 const PAGE_FETCH_GRACE: std::time::Duration = std::time::Duration::from_millis(1000);
 /// How long a parser-blocking or deferred script waits for markup stylesheets.
 const SHEETS_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Markup stylesheets still on their way.
+const SHEETS_LEFT: &str = "globalThis.__ptBlockingSheets | 0";
+/// Loads `DOMContentLoaded` waits for (stylesheets in the body).
+const DCL_HOLDS: &str = "typeof __pt_dclHolds === 'function' ? __pt_dclHolds() : 0";
+/// Loads `load` waits for. The style pass that starts CSS images and fonts runs
+/// once before the wait and then with every turn of the loop (`DRAIN_IO`).
+const LOAD_HOLDS: &str = "typeof __pt_loadHolds === 'function' ? __pt_loadHolds() : 0";
+/// The longest a lifecycle event is held for loads that do not come.
+const HOLD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// An async script does not wait for stylesheets in a browser. It waits briefly here so
 /// that a sheet already on its way still lands first, which is the common case there.
 const SHEETS_WAIT_ASYNC: std::time::Duration = std::time::Duration::from_millis(1000);
@@ -10554,6 +10646,94 @@ mod tests {
         }
         assert_eq!(ctx.evaluate("document.title").await.unwrap(), Value::String("async;timer;".into()));
         assert!(t.elapsed() < std::time::Duration::from_secs(8), "took {:?}", t.elapsed());
+    }
+
+    /// What a stylesheet loads, and what `load` waits for, as measured in
+    /// Chrome 151: an `@import` (its rules in the cascade), a background image
+    /// resolved against the importing sheet and fetched with it as referrer,
+    /// the web font text is waiting for; `load` after a slow image, not after
+    /// a `fetch`. A face nobody uses is in `document.fonts` but not fetched.
+    #[tokio::test]
+    async fn stylesheet_loads_and_load_waits_as_in_chrome() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = log.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let referer = req
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("referer:"))
+                        .map(|l| l[8..].trim().to_string())
+                        .unwrap_or_default();
+                    seen.lock().unwrap().push(format!("{path} {referer}"));
+                    let (ctype, body): (&str, Vec<u8>) = match path.as_str() {
+                        "/css/i.css" => ("text/css", b".x { background: url(img/bg.png) } .c { color: rgb(1, 2, 3) }".to_vec()),
+                        "/css/img/bg.png" | "/slow.png" => {
+                            if path == "/slow.png" {
+                                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                            }
+                            ("image/png", vec![0x89, b'P', b'N', b'G'])
+                        }
+                        "/f.ttf" | "/u.ttf" => ("font/ttf", b"\x00\x01\x00\x00rest".to_vec()),
+                        "/api" => {
+                            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                            ("application/json", b"{}".to_vec())
+                        }
+                        _ => ("text/html", br#"<html><head><style>@import url(/css/i.css);
+                            @font-face { font-family: F; src: url(/f.ttf) } @font-face { font-family: U; src: url(/u.ttf) }
+                            .f { font-family: F, serif }</style></head>
+                            <body><div class="x c">x</div><span class="f">text</span><img src="/slow.png">
+                            <script>fetch('/api')</script></body></html>"#.to_vec()),
+                    };
+                    let head = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n", body.len());
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        let page = format!("http://127.0.0.1:{}/", addr.port());
+        ctx.navigate(&page).await.unwrap();
+        let out = ctx
+            .evaluate(
+                r#"JSON.stringify((() => { const n = performance.getEntriesByType('navigation')[0];
+                  const x = document.querySelector('.x');
+                  return { load: n.loadEventStart, color: getComputedStyle(x).color,
+                    bg: getComputedStyle(x).backgroundImage, fonts: document.fonts.size,
+                    imported: document.styleSheets[0].cssRules[0].styleSheet.cssRules.length }; })())"#,
+            )
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_str(out.as_str().unwrap()).unwrap();
+        let root = format!("http://127.0.0.1:{}", addr.port());
+        assert_eq!(out["color"], "rgb(1, 2, 3)", "imported rules apply: {out}");
+        assert_eq!(out["bg"], format!("url(\"{root}/css/img/bg.png\")"), "{out}");
+        assert_eq!(out["fonts"], 2, "{out}");
+        assert_eq!(out["imported"], 2, "{out}");
+        let load = out["load"].as_f64().unwrap();
+        assert!(load >= 400.0, "load waits for the image: {out}");
+        assert!(load < 1400.0, "load does not wait for fetch: {out}");
+        let log = log.lock().unwrap().clone();
+        let has = |what: &str| log.iter().any(|l| l == what);
+        assert!(has(&format!("/css/i.css {page}")), "{log:?}");
+        assert!(has(&format!("/css/img/bg.png {root}/css/i.css")), "{log:?}");
+        assert!(has(&format!("/f.ttf {page}")), "{log:?}");
+        assert!(!log.iter().any(|l| l.starts_with("/u.ttf")), "an unused face is not fetched: {log:?}");
     }
 
     /// Streams, Response and AbortSignal behave as in Chrome 151 (values captured

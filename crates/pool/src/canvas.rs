@@ -79,6 +79,22 @@ pub fn has_local_font(name: &str) -> bool {
     local_index().contains(&key)
 }
 
+/// Whether a `font-family` name resolves to an installed face, as Chrome
+/// decides whether to go on down the list. Measured in Chrome 151 here:
+/// Arial, Helvetica, Times, Courier, Arimo and the generics `sans-serif`,
+/// `serif`, `monospace`, `system-ui` are present; `cursive`, `fantasy`,
+/// `emoji`, `ui-*`, Verdana, Roboto are not.
+pub fn has_family(name: &str) -> bool {
+    let key = name.trim().trim_matches(['"', '\'']).to_lowercase();
+    if key.is_empty() {
+        return false;
+    }
+    if let Some((_, files)) = FAMILIES.iter().find(|(f, _)| *f == key) {
+        return files.iter().any(|f| font_path(f).is_some());
+    }
+    font_index().contains_key(&key)
+}
+
 /// Names `local()` matches: full face name (name ID 4) and PostScript name
 /// (ID 6), not the family. In Chrome `local("Cantarell")` fails while
 /// `local("Cantarell Regular")` and `local("Cantarell-Regular")` succeed.

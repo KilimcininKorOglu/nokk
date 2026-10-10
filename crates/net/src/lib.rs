@@ -294,6 +294,10 @@ pub struct Request {
     /// Sent without cookies and ignoring `Set-Cookie` (credentials `omit`:
     /// a manifest).
     pub omit_credentials: bool,
+    /// The document that asked, when the `Referer` names something else (a
+    /// stylesheet's imports, images and fonts). It decides `Sec-Fetch-Site`
+    /// and `Origin`.
+    pub initiator: Option<String>,
 }
 
 /// The destination a request is for, in the sense `Sec-Fetch-Dest` means it.
@@ -698,12 +702,13 @@ impl FingerprintClient {
         // Chrome's order: `orig_headers` decides that, and without it our added
         // headers would trail after `priority`, in an order no browser produces.
         let (dest, mode) = req.kind.sec_fetch();
-        let same_origin = req
-            .headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("referer"))
-            .map(|(_, r)| same_site(r, &req.url))
-            .unwrap_or(false);
+        let asker = req.initiator.as_deref().or_else(|| {
+            req.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("referer"))
+                .map(|(_, r)| r.as_str())
+        });
+        let same_origin = asker.map(|r| same_site(r, &req.url)).unwrap_or(false);
         let has_referer = req
             .headers
             .keys()
@@ -776,11 +781,7 @@ impl FingerprintClient {
         // Chrome sends `Origin` on every non-GET and every cross-origin
         // request; Cloudflare checks it first.
         let wants_origin = req.method != "GET" && req.method != "HEAD" || !same_origin || req.kind.always_origin();
-        let page_origin = req
-            .headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("referer"))
-            .and_then(|(_, r)| origin_of(r));
+        let page_origin = asker.and_then(origin_of);
         let mut sent_origin = false;
         if wants_origin && !req.kind.navigates() {
             if let Some(o) = page_origin.as_deref() {
@@ -1094,6 +1095,7 @@ mod tests {
             doc_hints: Vec::new(),
             urgency: None,
             omit_credentials: false,
+            initiator: None,
         }
     }
 

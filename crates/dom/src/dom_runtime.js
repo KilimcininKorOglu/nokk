@@ -49,6 +49,37 @@
   // An engine task (load on readiness, CSP violation, script error) is not a
   // page timer: it must not consume a setTimeout id.
   const __ptLater = (f, d) => (typeof globalThis.__pt_addTask === 'function' ? __pt_addTask(f, d || 0) : setTimeout(f, d || 0));
+  // Loads the document's `load` event waits for, as Chrome measured: images
+  // (hidden and unattached ones too, not lazy ones), frames, stylesheets and
+  // their imports, inserted scripts, CSS images of rendered elements, fonts
+  // text is waiting for. Preloads, prefetches, fetch and XHR do not count.
+  // A hold taken after `load` started is no hold.
+  // Each hold is named by what took it, for `__pt_loadHoldList` when a load
+  // never finishes.
+  const __loadHold = { n: 0, live: new Set() };
+  const __holdLoad = (what) => {
+    const doc = globalThis.document;
+    if (!doc || (doc.__ptFinishAt | 0) >= 2) return () => {};
+    __loadHold.n++;
+    const tag = { what };
+    __loadHold.live.add(tag);
+    let done = false;
+    return () => { if (!done) { done = true; __loadHold.n--; __loadHold.live.delete(tag); } };
+  };
+  globalThis.__pt_loadHolds = () => __loadHold.n;
+  Object.defineProperty(globalThis, '__pt_loadHoldList', { value: () => [...__loadHold.live].map((t) => String(t.what)), configurable: true, enumerable: false });
+  Object.defineProperty(globalThis, '__pt_holdLoad', { value: __holdLoad, configurable: true, enumerable: false });
+  // A stylesheet in the body, with its imports, holds the parser and so
+  // `DOMContentLoaded` (one in the head does not, unless a script follows).
+  const __dclHold = { n: 0 };
+  const __holdDcl = (el) => {
+    const doc = globalThis.document;
+    if (!doc || (doc.__ptFinishAt | 0) >= 1 || !el || el.ownerDocument !== doc || !doc.body || !doc.body.contains(el)) return () => {};
+    __dclHold.n++;
+    let done = false;
+    return () => { if (!done) { done = true; __dclHold.n--; } };
+  };
+  globalThis.__pt_dclHolds = () => __dclHold.n;
   const VOID = new Set(['area','base','br','col','embed','hr','img','input',
     'link','meta','param','source','track','wbr']);
 
@@ -1145,6 +1176,7 @@
       if (this.__ptImgAt === url) return;                 // same URL: do not load twice
       Object.defineProperty(this, '__ptImgAt', { value: url, configurable: true, enumerable: false });
       Object.defineProperty(this, '__ptImgDone', { value: false, writable: true, configurable: true, enumerable: false });
+      if (__s_toLowerCase(String(__ptGetA(this, 'loading') || '')) !== 'lazy') this.__ptHoldLoad();
       if (__s_slice(url, 0, 5) === 'data:' || __s_slice(url, 0, 5) === 'blob:') {
         this.__ptImgDone = true;
         // Not an image (`data:,x`, a text blob): Chrome fires `error`.
@@ -1186,6 +1218,17 @@
       // the event, so `isTrusted` is true; an untrusted frame or image load is
       // a tell.
       try { this.dispatchEvent && this.dispatchEvent(__ptTrust(new Event(type))); } catch (e) {}
+      this.__ptReleaseLoad();
+    }
+    // The element's load delays the document's until its own event has fired.
+    __ptHoldLoad() {
+      if (this.__ptLoadRel) return;
+      const what = this.localName + ' ' + (__ptGetA(this, 'src') || __ptGetA(this, 'href') || '');
+      Object.defineProperty(this, '__ptLoadRel', { value: __holdLoad(what), writable: true, configurable: true, enumerable: false });
+    }
+    __ptReleaseLoad() {
+      const rel = this.__ptLoadRel;
+      if (rel) { this.__ptLoadRel = null; rel(); }
     }
     // `script.text` is the same text as textContent, and assigning it runs the
     // script: `s.text = <source>; head.appendChild(s)` is how the challenge
@@ -1268,32 +1311,42 @@
       // A markup stylesheet blocks the scripts after it until parsed; otherwise
       // they measure an unstyled page (Turnstile's api.js reported the
       // wrapper at the right edge instead of centred).
+      // A sheet for another medium (`media="print"`, the async-CSS trick) blocks nothing.
+      const media = __ptGetA(this, 'media');
       const blocking = rel === 'stylesheet' && !document.__ptCurScript
-        && this.ownerDocument === document && document.__ptReady === 'loading';
+        && this.ownerDocument === document && document.__ptReady === 'loading'
+        && (!media || __mediaApplies(media));
       if (blocking) {
         globalThis.__ptBlockingSheets = (globalThis.__ptBlockingSheets | 0) + 1;
         (globalThis.__ptBlockingSheetUrls || (globalThis.__ptBlockingSheetUrls = new Set())).add(url);
       }
       let released = false;
+      const dclRel = blocking ? __holdDcl(this) : null;
       const release = () => {
         if (!blocking || released) return;
         released = true;
+        dclRel();
         globalThis.__ptBlockingSheets = Math.max(0, (globalThis.__ptBlockingSheets | 0) - 1);
         try { globalThis.__ptBlockingSheetUrls.delete(url); } catch (e) {}
       };
+      if (rel === 'stylesheet') this.__ptHoldLoad();
       __pt_subresource(url, kind).then(
         (res) => {
           // An external stylesheet is rules, not just a request: they go into
           // `document.styleSheets[i].cssRules` and the cascade.
           const wanted = rel === 'stylesheet';
           const take = (text) => {
+            let imports = null;
             if (wanted && typeof text === 'string') {
               Object.defineProperty(this, '__ptSheetText',
                 { value: text, writable: true, enumerable: false, configurable: true });
               __markDirty();
+              // The sheet is parsed now and its imports start; its `load`
+              // waits for them, as Chrome's does.
+              try { imports = __sheetFor(this).__ptImports; } catch (e) {}
             }
-            release();
-            if (this.__ptFireLoad) this.__ptFireLoad(true);
+            const finish = () => { release(); if (this.__ptFireLoad) this.__ptFireLoad(true); };
+            if (imports) imports.then(finish, finish); else finish();
           };
           if (wanted && res && typeof res.text === 'function') {
             res.text().then(take, () => take(null));
@@ -1721,6 +1774,7 @@
       const isModule = type === 'module';
       if (src) {
         const id = __nextScriptId++;
+        this.__ptHoldLoad();
         __scriptEls.set(id, this);
         __scriptOps.push({ op: 'load', id, src: String(src), module: isModule });
         return;
@@ -1780,6 +1834,7 @@
       // (mid-parse it would freeze half-built); use the declared size.
       const box = __ptJSON.parse(globalThis.__pt_frameBoxOf ? __pt_frameBoxOf(this) : '[300,150]');
       const st = { el: this, ready: false, sameOrigin: false, win: null, doc: null, pending: [] };
+      this.__ptHoldLoad();
       st.win = __frameWindow(id, st);
       __frames.set(id, st);
       __frameOps.push({ op: 'open', id, src, name: __ptGetA(this, 'name') || '', w: box[0] || 300, h: box[1] || 150 });
@@ -1799,6 +1854,7 @@
       Object.defineProperty(this, '__ptFrameId', { value: id, configurable: true, enumerable: false });
       const box = __ptJSON.parse(globalThis.__pt_frameBoxOf ? __pt_frameBoxOf(this) : '[300,150]');
       const st = { el: this, ready: false, sameOrigin: false, win: null, doc: null, pending: [] };
+      this.__ptHoldLoad();
       st.win = __frameWindow(id, st);
       __frames.set(id, st);
       __frameOps.push({ op: 'open', id, src: String(url), name: __ptGetA(this, 'name') || '', w: box[0] || 300, h: box[1] || 150, method, body, contentType });
@@ -3737,8 +3793,11 @@
     if (at === '@import') {
       const href = __s_slice(/url\(\s*["']?([^"')]*)["']?\s*\)|["']([^"']*)["']/.exec(prelude) || [], 1).find((x) => x !== undefined) || '';
       const r = common(Object.create(__ruleProto('CSSImportRule')), RULE_TYPE.import);
-      return own(r, { href, layerName: null, supportsText: null, styleSheet: null,
-                      media: __mediaList(''), cssText: '@import url("' + href + '");' });
+      const media = __s_trim(__s_replace(__s_slice(prelude, 7), /^\s*(url\(\s*(["']?)[^)]*?\2\s*\)|"[^"]*"|'[^']*')/i, ''));
+      own(r, { href, layerName: null, supportsText: null, media: __mediaList(media),
+               cssText: '@import url("' + href + '")' + (media ? ' ' + media : '') + ';' });
+      Object.defineProperty(r, 'styleSheet', { value: null, writable: true, enumerable: true, configurable: true });
+      return r;
     }
     if (at === '@media' || at === '@supports') {
       const name = at === '@media' ? 'CSSMediaRule' : 'CSSSupportsRule';
@@ -3862,8 +3921,60 @@
       Object.defineProperty(sheet, '__ptText', { value: text, writable: true, enumerable: false, configurable: true });
       const rules = __cssParse(text).map((p) => __makeRule(p, sheet, null)).filter(Boolean);
       Object.defineProperty(sheet, 'cssRules', { value: __cssRuleList(rules), enumerable: true, configurable: true });
+      __startImports(sheet, rules, 0);
     }
     return sheet;
+  }
+
+  // `@import`: Chrome fetches every import as soon as the sheet is parsed
+  // (media or not), as a style request with the importing sheet as referrer;
+  // the imported rules sit in the cascade at the rule's place. `done` settles
+  // when the whole import tree has arrived, which the owner's `load` and the
+  // document's wait for.
+  let __importGen = 0;
+  const __IMPORT_DEPTH = 16;
+  function __startImports(sheet, rules, depth) {
+    let list = null;
+    for (const r of rules) {
+      if (r.type === RULE_TYPE.import) (list || (list = [])).push(r);
+      else if (r.type !== RULE_TYPE.charset) break;   // imports only lead a sheet
+    }
+    const done = list && depth < __IMPORT_DEPTH && typeof globalThis.__pt_subresourceText === 'function'
+      ? Promise.all(list.map((r) => __loadImport(sheet, r, depth)))
+      : Promise.resolve();
+    if (list && depth === 0 && sheet.ownerNode && sheet.ownerNode.__ptLocal === 'style') {
+      const rel = __holdDcl(sheet.ownerNode);
+      done.then(rel, rel);
+    }
+    Object.defineProperty(sheet, '__ptImports', { value: done, writable: true, enumerable: false, configurable: true });
+    return done;
+  }
+  function __loadImport(sheet, rule, depth) {
+    const from = sheet.href || null;
+    let abs;
+    try { abs = new URL(rule.href, from || document.baseURI).href; } catch (e) { return Promise.resolve(); }
+    // A cycle loads nothing more: the browser drops an import of a sheet already
+    // on the chain.
+    for (let s2 = sheet; s2; s2 = s2.parentStyleSheet) if (s2.href === abs) return Promise.resolve();
+    const rel = __holdLoad('import ' + abs);
+    return __pt_subresourceText(abs, 'css', from)
+      .then((text) => {
+        if (typeof text !== 'string') return null;
+        const child = Object.create(__link('CSSStyleSheet', __sheetProto));
+        for (const [k, v] of [['ownerNode', null], ['href', abs], ['type', 'text/css'], ['title', null],
+          ['media', rule.media], ['parentStyleSheet', sheet], ['ownerRule', rule]]) {
+          Object.defineProperty(child, k, { value: v, enumerable: true, configurable: true });
+        }
+        Object.defineProperty(child, 'disabled', { value: false, writable: true, enumerable: true, configurable: true });
+        Object.defineProperty(child, '__ptText', { value: text, writable: true, enumerable: false, configurable: true });
+        const kids = __cssParse(text).map((p) => __makeRule(p, child, null)).filter(Boolean);
+        Object.defineProperty(child, 'cssRules', { value: __cssRuleList(kids), enumerable: true, configurable: true });
+        rule.styleSheet = child;
+        __importGen++;
+        __markDirty();
+        return __startImports(child, kids, depth + 1);
+      })
+      .then(() => { rel(); }, () => { rel(); });
   }
   const __sheetListProto = {
     get [Symbol.toStringTag]() { return 'StyleSheetList'; },
@@ -6977,9 +7088,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // In steps, resumable: a listener the engine stops for running too long
   // ends only its own step, and the engine calls again for the rest (the
   // page still gets `load`, as in Chrome).
-  globalThis.__pt_finishLoad = (resume) => {
+  // `upto` stops after that many steps: the engine holds `load` while the
+  // loads it waits for are still coming.
+  globalThis.__pt_finishLoad = (resume, upto) => {
     const steps = [__finishDcl, __finishLoadEvent, __finishPageshow];
-    for (let i = resume ? document.__ptFinishAt | 0 : 0; i < steps.length; i++) {
+    const end = upto === undefined ? steps.length : Math.min(upto, steps.length);
+    for (let i = resume ? document.__ptFinishAt | 0 : 0; i < end; i++) {
       document.__ptFinishAt = i + 1;
       steps[i]();
     }
@@ -7905,6 +8019,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const ev = { type: ok ? 'load' : 'error', target: el, currentTarget: el, isTrusted: true };
     // dispatchEvent calls `on…` itself; calling it separately fires twice.
     try { el.dispatchEvent && el.dispatchEvent(ev); } catch (e) {}
+    try { el.__ptReleaseLoad(); } catch (e) {}
   };
 
   // Tear down a frame whose element left the document, and let the element be
@@ -7912,6 +8027,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   const __ptDisconnectFrame = (el) => {
     const id = el.__ptFrameId;
     if (!id) return;
+    try { el.__ptReleaseLoad(); } catch (e) {}
     __frames.delete(id);
     try { Object.defineProperty(el, '__ptFrameId', { value: 0, configurable: true, enumerable: false }); } catch (e) {}
     __frameOps.push({ op: 'close', id });
@@ -7951,6 +8067,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     for (const op of st.pending.splice(0)) __pushFrameOp(op);
     const ev = { type: 'load', target: st.el, currentTarget: st.el, isTrusted: true };
     try { st.el.dispatchEvent && st.el.dispatchEvent(ev); } catch (e) {}
+    try { st.el.__ptReleaseLoad(); } catch (e) {}
   };
 
   globalThis.__pt_frameFailed = (id) => {
@@ -7959,6 +8076,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __frames.delete(id);
     const ev = { type: 'error', target: st.el, currentTarget: st.el, isTrusted: true };
     try { st.el.dispatchEvent && st.el.dispatchEvent(ev); } catch (e) {}
+    try { st.el.__ptReleaseLoad(); } catch (e) {}
   };
 
   // A `message` event arriving from the other side of a frame boundary.
@@ -8563,8 +8681,15 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // there can be more than one document (see `__rulesFor`).
   function __gatherRules(docEl, out) {
     const state = { order: out.length };
+    const faces = [];
     const take = (root, rules) => {
       for (const r of rules || []) {
+        if (r.type === 5) { if (root === docEl) faces.push(r); continue; }   // @font-face
+        if (r.type === 3) {                           // @import
+          const sub = r.styleSheet;
+          if (sub && (!r.media || !r.media.mediaText || __mediaApplies(r.media.mediaText))) take(root, sub.cssRules);
+          continue;
+        }
         if (r.type === 4 || r.type === 12) {          // @media / @supports
           if (r.type !== 4 || __mediaApplies(r.conditionText)) take(root, r.cssRules);
           continue;
@@ -8581,13 +8706,16 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       for (const n of (node.__ptKids || [])) {
         if (n.nodeType !== ELEMENT_NODE) continue;
         if ((n.tagName === 'STYLE' || (n.tagName === 'LINK' && n.__ptSheetText)) && n.sheet) {
-          take(root, n.sheet.cssRules);
+          // `<link media="print">` is fetched but styles nothing on screen.
+          const media = __ptGetA(n, 'media');
+          if (!media || __mediaApplies(media)) take(root, n.sheet.cssRules);
         }
         if (n.__ptShadow) sheetsOf(n.__ptShadow, n.__ptShadow);
         sheetsOf(n, root);
       }
     };
     sheetsOf(docEl, docEl);
+    out.faces = faces;
     return out;
   }
 
@@ -8703,7 +8831,344 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return hit;
   }
 
+  // A `url()` computes to an absolute address, resolved against the sheet
+  // that declared it (a linked or imported sheet's own URL, else the
+  // document's base); the sheet is also the referrer when it is fetched.
+  const __cssAbsMemo = new Map();
+  const __cssUrlRef = new Map();
+  const __CSS_URL = /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)\s]*))\s*\)/g;
+  function __cssAbs(v, rule) {
+    if (__s_indexOf(v, 'url(') < 0) return v;
+    let sheet = rule && rule.parentStyleSheet;
+    while (sheet && !sheet.href && sheet.parentStyleSheet) sheet = sheet.parentStyleSheet;
+    const href = (sheet && sheet.href) || null;
+    const base = href || String(document.baseURI || '');
+    const key = base + '\n' + v;
+    let hit = __cssAbsMemo.get(key);
+    if (hit !== undefined) return hit;
+    hit = __s_replace(v, __CSS_URL, (m, a, b, c) => {
+      const raw = a !== undefined ? a : b !== undefined ? b : c;
+      // Fragment-only references (`url(#clip)`) point into the document.
+      if (!raw || __s_charCodeAt(raw, 0) === 35) return m;
+      let abs;
+      try { abs = new URL(raw, base).href; } catch (e) { return m; }
+      if (href) __cssUrlRef.set(abs, href);
+      return 'url("' + abs + '")';
+    });
+    if (__cssAbsMemo.size > 4096) __cssAbsMemo.clear();
+    __cssAbsMemo.set(key, hit);
+    return hit;
+  }
+
+  // What Chrome requests as it styles the page: background images of
+  // rendered elements (not under `display: none`). Read off each element's
+  // cascade, which the engine keeps per element until a mutation reaches it,
+  // so a second pass only looks at what changed.
+  let __cssScanAt = -1;
+  let __cssScanSeen = new WeakMap();
+  // `::before` / `::after` boxes exist when their `content` is not none; a
+  // background of one is fetched then (measured in Chrome 151). Only rules
+  // that can take part are indexed, keyed like the cascade, and only when one
+  // of them carries an image.
+  let __pseudoFrom = null, __pseudoIx = null;
+  const __PSEUDO_TAIL = /^(.*?)::?(before|after)\s*$/i;
+  function __pseudoIndex(rules) {
+    if (__pseudoFrom === rules) return __pseudoIx;
+    const keyed = new Map(), any = [];
+    let images = false;
+    for (const r of rules) {
+      const m = __PSEUDO_TAIL.exec(r.sel);
+      if (!m) continue;
+      const d = __ruleMap(r);
+      if (!d) continue;
+      let bg = d.get('background-image');
+      if (bg == null) { const sh = d.get('background'); if (sh != null) bg = sh; }
+      const content = d.get('content');
+      if (bg == null && content == null) continue;
+      if (bg != null && __s_indexOf(String(bg), 'url(') >= 0) images = true;
+      const base = __s_trim(m[1]) || '*';
+      const entry = { r, sel: base, which: __s_toLowerCase(m[2]), bg: bg == null ? null : __cssAbs(String(bg), r.rule),
+                      content: content == null ? null : __s_trim(String(content)) };
+      const k = __ruleKey(base);
+      if (k == null) any.push(entry);
+      else { let l = keyed.get(k); if (!l) keyed.set(k, (l = [])); l.push(entry); }
+    }
+    __pseudoFrom = rules;
+    __pseudoIx = images ? { keyed, any } : null;
+    return __pseudoIx;
+  }
+  function __pseudoImages(e, ix, de) {
+    const hits = [];
+    const test = (x) => {
+      try {
+        if (x.__ptSel === undefined) x.__ptSel = __selCompiled(x.sel) || null;
+        if (x.__ptSel && __bloomMayMatch(x.__ptSel, __ancBloom(e)) && __selAny(x.__ptSel, e, __CASCADE_CTX)) hits.push(x);
+      } catch (err) {}
+    };
+    for (const x of ix.any) test(x);
+    const by = (k) => { const l = ix.keyed.get(k); if (l) for (const x of l) test(x); };
+    if (e === de) by('r');
+    by('t' + __s_toLowerCase(String(e.localName || '')));
+    const id = __ptGetA(e, 'id');
+    if (id) by('i' + id);
+    const set = __ptClassSet(e);
+    if (set) for (const c of set) if (c) by('c' + c);
+    if (e.__ptAttrs) for (const name of e.__ptAttrs.keys()) by('a' + __s_toLowerCase(String(name)));
+    if (!hits.length) return;
+    hits.sort((a, b) => (a.r.spec - b.r.spec) || (a.r.order - b.r.order));
+    for (const which of ['before', 'after']) {
+      let content = null, bg = null;
+      for (const x of hits) {
+        if (x.which !== which) continue;
+        if (x.content != null) content = x.content;
+        if (x.bg != null) bg = x.bg;
+      }
+      if (content == null || bg == null || /^(none|normal)$/i.test(content)) continue;
+      __cssImagesOf(new Map([['background-image', bg]]));
+    }
+  }
+
+  function __cssImagesOf(cs) {
+    const v = cs.get('background-image');
+    if (v == null || __s_indexOf(String(v), 'url(') < 0) return;
+    // `image-set()` offers alternatives; a 1x screen takes the first.
+    const out = [];
+    for (const part of __ptCssParts(String(v))) {
+      __CSS_URL.lastIndex = 0;
+      if (/^(-webkit-)?image-set\(/i.test(part)) {
+        const m = __CSS_URL.exec(part);
+        if (m) out.push(m[1] !== undefined ? m[1] : m[2] !== undefined ? m[2] : m[3]);
+        continue;
+      }
+      let m;
+      while ((m = __CSS_URL.exec(part))) out.push(m[1] !== undefined ? m[1] : m[2] !== undefined ? m[2] : m[3]);
+    }
+    __CSS_URL.lastIndex = 0;
+    for (const u of out) {
+      if (!u || !/^https?:/i.test(u)) continue;
+      const rel = __holdLoad('css-image ' + u);
+      __pt_subresource(u, 'css-image', __cssUrlRef.get(u) || null).then(rel, rel);
+    }
+  }
+
+  // The document's `@font-face` rules as the FontFace objects `document.fonts`
+  // holds, one per rule for the rule's life.
+  const __faceOfRule = new WeakMap();
+  let __facesFrom = null, __facesList = [];
+  const __unquote = (v) => __s_replace(__s_trim(String(v)), /^(["'])(.*)\1$/, '$2');
+  function __cssFaces() {
+    const de = globalThis.document && document.documentElement;
+    if (!de || typeof globalThis.__pt_cssFontFace !== 'function') return [];
+    const hit = __gatherRulesCached(de);
+    if (__facesFrom === hit) return __facesList;
+    const out = [];
+    for (const rule of hit.faces || []) {
+      let face = __faceOfRule.get(rule);
+      if (!face) {
+        const m = __ruleMap({ rule });
+        const family = m && m.get('font-family');
+        const src = m && m.get('src');
+        if (family == null || src == null) continue;
+        let sheet = rule.parentStyleSheet;
+        while (sheet && !sheet.href && sheet.parentStyleSheet) sheet = sheet.parentStyleSheet;
+        const href = (sheet && sheet.href) || null;
+        const desc = {};
+        for (const [k, css] of [['style', 'font-style'], ['weight', 'font-weight'], ['stretch', 'font-stretch'],
+          ['unicodeRange', 'unicode-range'], ['variant', 'font-variant'], ['featureSettings', 'font-feature-settings'],
+          ['variationSettings', 'font-variation-settings'], ['display', 'font-display'], ['ascentOverride', 'ascent-override'],
+          ['descentOverride', 'descent-override'], ['lineGapOverride', 'line-gap-override'], ['sizeAdjust', 'size-adjust']]) {
+          const v = m.get(css);
+          if (v != null) desc[k] = __s_trim(String(v));
+        }
+        face = __pt_cssFontFace(__unquote(family), String(src), desc, href || String(document.baseURI || ''), href);
+        __faceOfRule.set(rule, face);
+      }
+      out.push(face);
+    }
+    __facesFrom = hit;
+    __facesList = out;
+    return out;
+  }
+  Object.defineProperty(globalThis, '__pt_cssFaces', { value: __cssFaces, configurable: true, enumerable: false });
+  // Parse the document's sheets, which starts their imports (a body sheet's
+  // imports hold `DOMContentLoaded`). Styling, and with it CSS images and
+  // fonts, comes after.
+  globalThis.__pt_cssSheets = () => {
+    const de = globalThis.document && document.documentElement;
+    if (de) __gatherRulesCached(de);
+  };
+
+  // Which face a family list asks for: the first family that is a declared
+  // face, unless a family before it is installed (the browser stops there).
+  const __GENERIC = new Set(['serif', 'sans-serif', 'monospace', 'cursive', 'fantasy', 'system-ui', 'emoji', 'math',
+    'fangsong', 'ui-serif', 'ui-sans-serif', 'ui-monospace', 'ui-rounded']);
+  // Without the font files (a build without `render`), the families Chrome 151
+  // finds on the Linux profile, measured: the canvas substitution table.
+  const __PROFILE_FAMILIES = new Set(['sans-serif', 'serif', 'monospace', 'system-ui', 'arial', 'helvetica',
+    'times new roman', 'times', 'courier new', 'courier', 'liberation sans', 'liberation serif', 'liberation mono',
+    'dejavu sans', 'dejavu serif', 'dejavu sans mono', 'noto sans mono', 'arimo', 'tinos', 'cousine', 'cantarell']);
+  const __familyHere = new Map();
+  function __familyInstalled(name, quoted) {
+    const low = __s_toLowerCase(name);
+    // A quoted generic is a family name nobody has.
+    if (quoted && __GENERIC.has(low)) return false;
+    let hit = __familyHere.get(low);
+    if (hit === undefined) {
+      hit = typeof globalThis.__pt_fontFamily === 'function' ? !!__pt_fontFamily(low) : __PROFILE_FAMILIES.has(low);
+      __familyHere.set(low, hit);
+    }
+    return hit;
+  }
+  const __familyLists = new Map();
+  function __familyList(v) {
+    let hit = __familyLists.get(v);
+    if (hit) return hit;
+    hit = [];
+    for (const raw of __s_split(String(v), ',')) {
+      const t = __s_trim(raw);
+      if (!t) continue;
+      const quoted = /^["']/.test(t);
+      hit.push([__s_toLowerCase(__unquote(t)), quoted]);
+    }
+    if (__familyLists.size > 2048) __familyLists.clear();
+    __familyLists.set(v, hit);
+    return hit;
+  }
+  // Faces of one family for this style and weight, as Chrome's matching picks
+  // them: same style first, then the nearest weight.
+  function __facesFor(byFamily, fam, italic, weight) {
+    const list = byFamily.get(fam);
+    if (!list || list.length < 2) return list || null;
+    const want = italic ? 'italic' : 'normal';
+    let pool = list.filter((x) => (/italic|oblique/.test(x.style) ? 'italic' : 'normal') === want);
+    if (!pool.length) pool = list;
+    let best = null, bestD = Infinity;
+    for (const x of pool) { const d = Math.abs(x.weight - weight); if (d < bestD) { bestD = d; best = x.weight; } }
+    return pool.filter((x) => x.weight === best);
+  }
+  const __WEIGHT = { normal: 400, bold: 700, lighter: 100, bolder: 900 };
+  const __weightOf = (v) => { const t = __s_toLowerCase(__s_trim(String(v || 'normal'))); return __WEIGHT[t] || parseFloat(t) || 400; };
+  // The face's `unicode-range` against the characters it would draw.
+  function __rangeHits(range, text) {
+    if (!range || /^u\+0-10ffff$/i.test(range)) return true;
+    const spans = [];
+    for (const part of __s_split(range, ',')) {
+      const m = /^\s*u\+([0-9a-f?]+)(?:-([0-9a-f]+))?\s*$/i.exec(part);
+      if (!m) continue;
+      if (__s_indexOf(m[1], '?') >= 0) spans.push([parseInt(__s_replace(m[1], /\?/g, '0'), 16), parseInt(__s_replace(m[1], /\?/g, 'f'), 16)]);
+      else spans.push([parseInt(m[1], 16), parseInt(m[2] || m[1], 16)]);
+    }
+    for (const ch of text) {
+      const c = ch.codePointAt(0);
+      for (const [a, b] of spans) if (c >= a && c <= b) return true;
+    }
+    return false;
+  }
+  // The element's own text, the characters its font draws.
+  function __ownText(e) {
+    let t = '';
+    for (const k of (e.__ptKids || [])) if (k.nodeType === TEXT_NODE) t += k.data;
+    return __s_trim(t);
+  }
+
+  // The engine calls this on every turn of its loop and after animation
+  // frames; a pass runs only when the tree changed, and at most every
+  // max(100 ms, 4x its last cost) unless `force` (the look before `load`).
+  const __perfNow = globalThis.performance && typeof performance.now === 'function'
+    ? performance.now.bind(performance) : Date.now;
+  let __cssScanNext = 0;
+  globalThis.__pt_cssLoads = (force) => {
+    const doc = globalThis.document;
+    const de = doc && doc.documentElement;
+    if (!de || !__rendered || typeof globalThis.__pt_subresource !== 'function') return;
+    const at = __layoutSeq + ':' + LAYOUT.W + 'x' + LAYOUT.H;
+    if (__cssScanAt === at) return;
+    const t0 = __perfNow();
+    if (!force && t0 < __cssScanNext) return;
+    __cssScanAt = at;
+    __collectHidden();
+    // Web fonts still waiting for text that uses them. Measured in Chrome 151:
+    // a face is requested when a rendered element's family list reaches it
+    // (text or not); it holds `load` when it is the first family and the
+    // element has text to draw.
+    // Every face takes part in matching (a family already loading still ends
+    // the list); the walk runs only while one is still unloaded.
+    let byFamily = null, unloaded = false;
+    const info = globalThis.__pt_faceInfo;
+    for (const face of __cssFaces()) {
+      const o = info && info(face);
+      if (!o) continue;
+      if (o.status === 'unloaded') unloaded = true;
+      const fam = __s_toLowerCase(o.family);
+      if (!byFamily) byFamily = new Map();
+      let l = byFamily.get(fam);
+      if (!l) byFamily.set(fam, (l = []));
+      l.push({ face, style: __s_toLowerCase(o.style), weight: __weightOf(o.weight), range: o.unicodeRange });
+    }
+    if (!unloaded) byFamily = null;
+    const fontsOf = (e, fams, italic, weight) => {
+      for (let i = 0; i < fams.length; i++) {
+        const [name, quoted] = fams[i];
+        const faces = __facesFor(byFamily, name, italic, weight);
+        if (faces) {
+          const text = __ownText(e);
+          for (const x of faces) {
+            if (x.range && !/^u\+0-10ffff$/i.test(x.range) && !__rangeHits(x.range, text)) continue;
+            const p = __pt_faceLoad(x.face);
+            if (i === 0 && text) { const rel = __holdLoad('font ' + name); p.then(rel, rel); }
+          }
+          return;
+        }
+        if (__familyInstalled(name, quoted)) return;
+      }
+    };
+    // Inherited font state rides along the walk: family list, italic, weight.
+    const ROOT_FAMILY = __familyList('Times New Roman');
+    const seen = __cssScanSeen;
+    const pseudo = __pseudoIndex(__rules);
+    const els = [de], famS = [ROOT_FAMILY], itS = [false], wS = [400];
+    while (els.length) {
+      const e = els.pop(), pf = famS.pop(), pi = itS.pop(), pw = wS.pop();
+      if (__isUnboxed(e)) continue;
+      const cs = __cascadeFor(e);
+      if (seen.get(e) !== cs) {
+        seen.set(e, cs);
+        __cssImagesOf(cs);
+        if (pseudo) __pseudoImages(e, pseudo, de);
+      }
+      let fams = pf, italic = pi, weight = pw;
+      if (byFamily) {
+        const f = cs.get('font-family');
+        if (f != null) fams = __familyList(f);
+        const st = cs.get('font-style');
+        if (st != null) italic = /italic|oblique/i.test(String(st));
+        const w = cs.get('font-weight');
+        const tag = e.localName;
+        if (w != null) {
+          const t = __s_toLowerCase(__s_trim(String(w)));
+          weight = t === 'bolder' ? (pw < 350 ? 400 : pw < 550 ? 700 : 900)
+            : t === 'lighter' ? (pw < 550 ? 100 : pw < 750 ? 400 : 700) : __weightOf(t);
+        } else if (tag === 'b' || tag === 'strong' || tag === 'th' || /^h[1-6]$/.test(tag)) {
+          weight = pw < 550 ? 700 : 900;   // UA sheet: bolder
+        }
+        if (st == null && (tag === 'i' || tag === 'em' || tag === 'cite' || tag === 'var' || tag === 'address')) italic = true;
+        fontsOf(e, fams, italic, weight);
+      }
+      const kids = e.__ptKids;
+      if (kids) {
+        for (let i = kids.length - 1; i >= 0; i--) {
+          if (kids[i].nodeType !== ELEMENT_NODE) continue;
+          els.push(kids[i]); famS.push(fams); itS.push(italic); wS.push(weight);
+        }
+      }
+    }
+    __cssScanNext = __perfNow() + Math.max(100, 4 * (__perfNow() - t0));
+  };
+  // Once per tree state and viewport (media rules follow the viewport).
+  let __hiddenAt = -1, __hiddenW = -1, __hiddenH = -1;
   function __collectHidden() {
+    if (__hiddenAt === __layoutSeq && __hiddenW === LAYOUT.W && __hiddenH === LAYOUT.H) return;
+    __hiddenAt = __layoutSeq; __hiddenW = LAYOUT.W; __hiddenH = LAYOUT.H;
     __rules = [];
     __passBloom = new WeakMap();
     __passFont = new WeakMap();
@@ -8855,11 +9320,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // change replaces a sheet's `cssRules`, and `@media` follows the viewport.
   let __gatherKey = null, __gatherHit = null;
   function __gatherRulesCached(docEl) {
-    const key = [docEl, LAYOUT.W, LAYOUT.H];
+    const key = [docEl, LAYOUT.W, LAYOUT.H, __importGen];
     const scan = (node, root) => {
       for (const n of (node.__ptKids || [])) {
         if (n.nodeType !== ELEMENT_NODE) continue;
-        if ((n.tagName === 'STYLE' || (n.tagName === 'LINK' && n.__ptSheetText)) && n.sheet) key.push(root, n.sheet.cssRules);
+        if ((n.tagName === 'STYLE' || (n.tagName === 'LINK' && n.__ptSheetText)) && n.sheet) key.push(root, n.sheet.cssRules, __ptGetA(n, 'media'));
         if (n.__ptShadow) scan(n.__ptShadow, n.__ptShadow);
         scan(n, root);
       }
@@ -8958,15 +9423,15 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     };
     const noteAll = (d) => {
       const raw = __declRaw.get(d);
-      if (raw) { const m = raw(); for (const [n, v] of m) note(n, String(__cssPreciseGet(m, n))); return; }
+      if (raw) { const m = raw(); for (const [n, v] of m) note(n, __cssAbs(String(__cssPreciseGet(m, n)), null)); return; }
       for (let i = 0; i < d.length; i++) {
         const n = d.item(i);
-        note(n, d.getPropertyValue(n));
+        note(n, __cssAbs(d.getPropertyValue(n), null));
       }
     };
     for (const r of won) {
       const m = __ruleMap(r);
-      if (m) for (const [n, v] of m) note(n, String(v));
+      if (m) for (const [n, v] of m) note(n, __cssAbs(String(v), r.rule));
     }
     const own = el.__ptStyle || (__ptHasA(el, 'style') ? el.style : null);
     if (own) noteAll(own);
