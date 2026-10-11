@@ -12906,9 +12906,15 @@ mod tests {
         let inside = done["inWorker"].as_f64().unwrap_or(f64::MAX);
         println!("worker chain: {inside:.0} ms inside the worker, {wall:.0} ms of wall clock");
         // 20 steps of 5 ms is 100 ms of work. Loose threshold: catch a return to the old
-        // order of magnitude, not jitter.
+        // order of magnitude, not jitter. The machine's own sleep sets the floor: on the
+        // macOS runner (a VM) 20 sleeps of 4 ms take ~330 ms in plain C, at any QoS.
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+        let oversleep = (t.elapsed().as_secs_f64() * 1000.0 - 80.0).max(0.0);
         assert!(
-            wall < 600.0,
+            wall < 600.0 + 2.0 * oversleep,
             "a worker's own timer chain must not wait for the page: {done}"
         );
     }
