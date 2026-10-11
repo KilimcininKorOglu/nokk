@@ -305,6 +305,7 @@ impl EngineInner {
             urgency: None,
             omit_credentials: false,
             initiator: None,
+            referrer_policy: None,
             method: "GET".into(),
             url: nokk_net::GEO_LOOKUP_URL.to_string(),
             headers,
@@ -854,6 +855,7 @@ impl Engine {
             bootstrap,
             storage,
             doc_hints: std::sync::Mutex::new(Vec::new()),
+            doc_policy: std::sync::Mutex::new(HashMap::new()),
             frame_init_scripts: std::sync::Mutex::new(Vec::new()),
             worker_init_scripts: std::sync::Mutex::new(Vec::new()),
             init_scripts: std::sync::Mutex::new(Vec::new()),
@@ -939,6 +941,7 @@ impl Engine {
             urgency: None,
             omit_credentials: false,
             initiator: None,
+            referrer_policy: None,
             method: "GET".into(),
             url: url.to_string(),
             headers,
@@ -1020,6 +1023,9 @@ pub struct BrowserContext {
     /// `<meta http-equiv="Accept-CH">`; they go on its same-origin
     /// subresources and end with it.
     doc_hints: std::sync::Mutex<Vec<String>>,
+    /// Each document's referrer policy by context: its response's
+    /// `Referrer-Policy` header, then a `<meta name="referrer">` in its markup.
+    doc_policy: std::sync::Mutex<HashMap<usize, String>>,
     /// What outlives a document but not the tab, carried from one document's
     /// context to the next: per origin its `localStorage`, `sessionStorage` and
     /// IndexedDB (`{local, session, idb}`), and under `""` the tab's history
@@ -1729,6 +1735,29 @@ impl BrowserContext {
         if v.trim().is_empty() { None } else { Some(v.to_string()) }
     }
 
+    /// The referrer policy of the document in `context`, if it set one.
+    fn referrer_policy_of(&self, context: usize) -> Option<String> {
+        self.doc_policy.lock().ok()?.get(&context).cloned()
+    }
+
+    /// The policy a document sets: its `Referrer-Policy` header, overridden by
+    /// a `<meta name="referrer">` in the markup (the parser meets it later).
+    fn note_referrer_policy(&self, index: usize, url: &str, html: &str) {
+        let header = self
+            .requests
+            .lock()
+            .ok()
+            .and_then(|log| log.iter().rev().find(|r| r.url == url).and_then(|r| r.headers.get("referrer-policy").cloned()))
+            .and_then(|v| nokk_net::referrer_policy_token(&v));
+        let meta = meta_referrer(html);
+        if let Ok(mut m) = self.doc_policy.lock() {
+            match meta.or(header) {
+                Some(p) => { m.insert(index, p); }
+                None => { m.remove(&index); }
+            }
+        }
+    }
+
     /// Charset declared by the document response's `Content-Type`, if any.
     fn document_charset(&self, url: &str) -> Option<String> {
         let log = self.requests.lock().ok()?;
@@ -1785,6 +1814,7 @@ impl BrowserContext {
                 }
             }
         }
+        self.note_referrer_policy(index, base_url, html);
         let t_parse = std::time::Instant::now();
         tracing::debug!(target: "nokk::load", bytes = html.len(), "parse start");
         let page = nokk_dom::parse(html);
@@ -5101,6 +5131,11 @@ impl BrowserContext {
             third_party: r["storageAccess"].as_bool().unwrap_or(false),
             user_activated: false,
             initiator,
+            // A `fetch()` names its own; otherwise the document's.
+            referrer_policy: r["policy"]
+                .as_str()
+                .and_then(nokk_net::referrer_policy_token)
+                .or_else(|| self.referrer_policy_of(context)),
         };
         let method = req_method(&req);
         Prepared::Send(Box::new(req), FetchInfo { context, id, url, method, kind, sent })
@@ -5497,6 +5532,7 @@ impl BrowserContext {
             urgency: Self::wire_kind(resource_type).1,
             omit_credentials: Self::wire_kind(resource_type).2,
             initiator: None,
+            referrer_policy: self.referrer_policy_of(self.idx()),
             // A navigation nobody's page asked for is one a person asked for.
             third_party: false,
             user_activated: resource_type == "document" && referrer.is_none(),
@@ -5798,6 +5834,39 @@ const HOLD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const SHEETS_WAIT_ASYNC: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// A preloaded script: when it was requested and the task awaiting it.
+/// `<meta name="referrer" content="…">` in a document's markup: the last one
+/// with a policy Chrome understands.
+fn meta_referrer(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut found = None;
+    let mut at = 0;
+    while let Some(i) = lower[at..].find("<meta") {
+        let start = at + i;
+        let end = lower[start..].find('>').map(|e| start + e).unwrap_or(lower.len());
+        let tag = &lower[start..end];
+        at = end;
+        let attr = |name: &str| -> Option<String> {
+            let k = tag.find(&format!("{name}="))? + name.len() + 1;
+            let rest = &tag[k..];
+            let (q, body) = match rest.chars().next()? {
+                c @ ('"' | '\'') => (Some(c), &rest[1..]),
+                _ => (None, rest),
+            };
+            let v = match q {
+                Some(c) => body.split(c).next()?,
+                None => body.split(|c: char| c.is_whitespace() || c == '/').next()?,
+            };
+            Some(v.trim().to_string())
+        };
+        if attr("name").as_deref() == Some("referrer") {
+            if let Some(p) = attr("content").and_then(|c| nokk_net::referrer_policy_token(&c)) {
+                found = Some(p);
+            }
+        }
+    }
+    found
+}
+
 /// One step of a document's script plan.
 #[derive(Clone, Copy)]
 enum Step {

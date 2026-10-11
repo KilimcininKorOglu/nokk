@@ -34,3 +34,7 @@ url = "2"
 brotli = "8"
 flate2 = "1"
 zstd = "0.13"
+
+# The public suffix list, compiled in: a site (registrable domain) decides
+# `Sec-Fetch-Site: same-site`, as in Chrome.
+psl = "2"

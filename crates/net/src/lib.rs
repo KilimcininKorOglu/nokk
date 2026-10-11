@@ -298,6 +298,10 @@ pub struct Request {
     /// stylesheet's imports, images and fonts). It decides `Sec-Fetch-Site`
     /// and `Origin`.
     pub initiator: Option<String>,
+    /// The referrer policy in force (the document's `Referrer-Policy` header
+    /// or `<meta name="referrer">`, or a `fetch()`'s own); `None` is Chrome's
+    /// default, `strict-origin-when-cross-origin`.
+    pub referrer_policy: Option<String>,
 }
 
 /// The destination a request is for, in the sense `Sec-Fetch-Dest` means it.
@@ -651,20 +655,53 @@ fn origin_of(url: &str) -> Option<String> {
     Some(format!("{scheme}://{host}"))
 }
 
-/// The `Referer` Chrome sends under its default policy,
-/// `strict-origin-when-cross-origin`: the full address (no fragment) to the
-/// same origin, only the origin elsewhere, nothing from https to http.
-fn referrer_for(referer: &str, url: &str) -> Option<String> {
+/// The `Referer` sent under a referrer policy (Referrer Policy spec; Chrome's
+/// default is `strict-origin-when-cross-origin`): the full address has no
+/// fragment, the origin form ends in `/`, a downgrade is https to http.
+fn referrer_for(referer: &str, url: &str, policy: Option<&str>) -> Option<String> {
     let full = referer.split('#').next().unwrap_or(referer);
     let from = origin_of(full)?;
-    if full.starts_with("https://") && url.starts_with("http://") {
-        return None;
+    let same = origin_of(url).is_some_and(|o| o.eq_ignore_ascii_case(&from));
+    let downgrade = full.starts_with("https://") && url.starts_with("http://");
+    let origin = || Some(format!("{from}/"));
+    let whole = || Some(full.to_string());
+    match policy.unwrap_or("strict-origin-when-cross-origin") {
+        "no-referrer" => None,
+        "unsafe-url" => whole(),
+        "origin" => origin(),
+        "same-origin" => if same { whole() } else { None },
+        "strict-origin" => if downgrade { None } else { origin() },
+        "origin-when-cross-origin" => if same { whole() } else { origin() },
+        "no-referrer-when-downgrade" => if downgrade { None } else { whole() },
+        _ => if same { whole() } else if downgrade { None } else { origin() },
     }
-    if origin_of(url).is_some_and(|o| o.eq_ignore_ascii_case(&from)) {
-        Some(full.to_string())
-    } else {
-        Some(format!("{from}/"))
-    }
+}
+
+/// The last policy token Chrome understands in a `Referrer-Policy` value (a
+/// comma list; unknown tokens are skipped), lowercased.
+pub fn referrer_policy_token(value: &str) -> Option<String> {
+    const KNOWN: [&str; 8] = ["no-referrer", "no-referrer-when-downgrade", "same-origin", "origin",
+        "strict-origin", "origin-when-cross-origin", "strict-origin-when-cross-origin", "unsafe-url"];
+    value
+        .split(',')
+        .map(|t| t.trim().to_ascii_lowercase())
+        .rfind(|t| KNOWN.contains(&t.as_str()))
+}
+
+/// Whether two URLs are the same site: same scheme and the same registrable
+/// domain by the public suffix list (or the same host where there is none, as
+/// for an IP address).
+fn same_site_of(a: &str, b: &str) -> bool {
+    let parts = |u: &str| -> Option<(String, String)> {
+        let parsed = url::Url::parse(u).ok()?;
+        let host = parsed.host_str()?.to_ascii_lowercase();
+        let site = match parsed.host()? {
+            url::Host::Domain(d) => psl::domain_str(d).map(str::to_string).unwrap_or_else(|| d.to_string()),
+            _ => host,
+        };
+        Some((parsed.scheme().to_string(), site))
+    };
+    matches!((parts(a), parts(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// Whether `referer` and `url` are the same origin — the difference between
@@ -734,6 +771,7 @@ impl FingerprintClient {
             // opened by a driver. One the page made carries where it came from.
             RequestKind::Document if !has_referer => "none",
             _ if same_origin => "same-origin",
+            _ if asker.is_some_and(|a| same_site_of(a, &req.url)) => "same-site",
             _ => "cross-site",
         };
         // `Accept` is the page's to set on `fetch`/XHR — it is not a forbidden
@@ -914,7 +952,7 @@ impl FingerprintClient {
                 continue;
             }
             if lk == "referer" {
-                if let Some(r) = referrer_for(v, &req.url) {
+                if let Some(r) = referrer_for(v, &req.url, req.referrer_policy.as_deref()) {
                     rb = rb.header(k, r);
                 }
                 continue;
@@ -1107,10 +1145,29 @@ mod tests {
     #[test]
     fn referrer_is_trimmed_as_chrome_does_by_default() {
         let page = "https://a.example/path/page?q=1#frag";
-        assert_eq!(referrer_for(page, "https://a.example/x.png").as_deref(), Some("https://a.example/path/page?q=1"));
-        assert_eq!(referrer_for(page, "https://cdn.example/x.png").as_deref(), Some("https://a.example/"));
-        assert_eq!(referrer_for(page, "http://a.example/x.png"), None);
-        assert_eq!(referrer_for("http://127.0.0.1:8799/c?x", "http://localhost:8799/i.png").as_deref(), Some("http://127.0.0.1:8799/"));
+        assert_eq!(referrer_for(page, "https://a.example/x.png", None).as_deref(), Some("https://a.example/path/page?q=1"));
+        assert_eq!(referrer_for(page, "https://cdn.example/x.png", None).as_deref(), Some("https://a.example/"));
+        assert_eq!(referrer_for(page, "http://a.example/x.png", None), None);
+        assert_eq!(referrer_for("http://127.0.0.1:8799/c?x", "http://localhost:8799/i.png", None).as_deref(), Some("http://127.0.0.1:8799/"));
+        assert_eq!(referrer_for(page, "https://cdn.example/x.png", Some("unsafe-url")).as_deref(), Some("https://a.example/path/page?q=1"));
+        assert_eq!(referrer_for(page, "https://a.example/x.png", Some("origin")).as_deref(), Some("https://a.example/"));
+        assert_eq!(referrer_for(page, "https://cdn.example/x.png", Some("same-origin")), None);
+        assert_eq!(referrer_for(page, "https://a.example/x.png", Some("no-referrer")), None);
+        assert_eq!(referrer_policy_token("unsafe-url, bogus, origin").as_deref(), Some("origin"));
+        assert_eq!(referrer_policy_token("bogus"), None);
+    }
+
+    #[test]
+    fn sites_follow_the_public_suffix_list() {
+        assert!(same_site_of("https://www.example.com/a", "https://static.example.com/b"));
+        assert!(!same_site_of("http://www.example.com/", "https://www.example.com/"));
+        assert!(same_site_of("https://a.example.co.uk/", "https://b.example.co.uk/"));
+        assert!(!same_site_of("https://a.co.uk/", "https://b.co.uk/"));
+        assert!(!same_site_of("https://alice.github.io/", "https://bob.github.io/"));
+        assert!(!same_site_of("http://127.0.0.1:1/", "http://127.0.0.2:1/"));
+        // A private-section suffix: each name under it is a site of its own,
+        // and Chrome says `cross-site` between them (measured).
+        assert!(!same_site_of("https://httpbin.org/", "https://www.httpbin.org/headers"));
     }
 
     fn req(method: &str, url: &str) -> Request {
@@ -1127,6 +1184,7 @@ mod tests {
             urgency: None,
             omit_credentials: false,
             initiator: None,
+            referrer_policy: None,
         }
     }
 

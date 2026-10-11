@@ -8095,7 +8095,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     // `init` on top. It was turned into the string "[object Request]".
     const parts = url !== null && typeof url === 'object' && typeof globalThis.__pt_requestParts === 'function' ? globalThis.__pt_requestParts(url) : null;
     if (parts) {
-      const merged = { method: parts.method, headers: parts.headers, credentials: parts.credentials, mode: parts.mode, cache: parts.cache, redirect: parts.redirect, signal: parts.signal };
+      const merged = { method: parts.method, headers: parts.headers, credentials: parts.credentials, mode: parts.mode, cache: parts.cache, redirect: parts.redirect, signal: parts.signal, referrerPolicy: parts.referrerPolicy };
       const pb = parts.body && (parts.body.bytes || (typeof parts.body.text === 'string' ? parts.body.text : null));
       if (pb != null) merged.body = pb;
       for (const k in opts) merged[k] = opts[k];
@@ -8154,6 +8154,8 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       headers: hdrs,
       // A blob worker's requests carry no referrer.
       noReferrer: !!globalThis.__ptNoReferrer,
+      // `fetch(url, { referrerPolicy })` overrides the document's policy.
+      policy: opts.referrerPolicy ? String(opts.referrerPolicy) : null,
       body, bodyB64,
       // A frame granted access to its cookies marks its requests: the browser
       // adds a separate header to them.
@@ -9781,7 +9783,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   globalThis.__pt_requestParts = (r) => {
     const st = REQ.get(r);
     if (!st) return null;
-    return { url: st.url, method: st.method, headers: st.headers, body: st.body, signal: st.signal, credentials: st.credentials, mode: st.mode, cache: st.cache, redirect: st.redirect, referrer: st.referrer };
+    return { url: st.url, method: st.method, headers: st.headers, body: st.body, signal: st.signal, credentials: st.credentials, mode: st.mode, cache: st.cache, redirect: st.redirect, referrer: st.referrer, referrerPolicy: st.referrerPolicy };
   };
 
   if (!globalThis.BroadcastChannel) {
