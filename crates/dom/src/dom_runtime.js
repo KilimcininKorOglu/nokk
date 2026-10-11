@@ -556,6 +556,7 @@
       child.__ptParent = this;
       __markDirty(this);
       __styleTouch(this, true);
+      __hasNoteTree(child);
       __mutation(__childListRecord(this, [child], [], child.previousSibling, child.nextSibling));
       // A frame only becomes a browsing context once it is in the document — and
       // the frame is rarely the node being inserted. A widget builds its tree
@@ -576,7 +577,7 @@
           'NotFoundError');
       }
       const prev = this.__ptKids[i - 1] || null, next = this.__ptKids[i + 1] || null;
-      this.__ptKids.splice(i, 1); child.__ptParent = null; __markDirty(this); __styleTouch(this, true);
+      this.__ptKids.splice(i, 1); child.__ptParent = null; __markDirty(this); __styleTouch(this, true); __hasNoteTree(child);
       __mutation(__childListRecord(this, [], [child], prev, next));
       // A removed frame is a closed browsing context. Without this its V8 context
       // outlives the element forever — a widget that replaces its iframe on a
@@ -1181,6 +1182,7 @@
       else if (name === 'srcdoc' && this.__ptLocal === 'iframe') v = __pt_ttSink('TrustedHTML', 'HTMLIFrameElement srcdoc', v, "Failed to execute 'setAttribute' on 'Element'");
       this.__ptAttrs.set(name, String(v));
       __styleTouch(this);
+      __hasNoteAttr(name, old, String(v));
       if (this.__ptUpgraded) {
         const watched = this.constructor && this.constructor.observedAttributes;
         if (Array.isArray(watched) && __s_indexOf(watched, name) >= 0) {
@@ -1198,6 +1200,7 @@
       this.__ptAttrs.delete(name);
       __markDirty(this);
       __styleTouch(this);
+      __hasNoteAttr(name, old, null);
       __mutation({ type: 'attributes', target: this, attributeName: name, attributeNamespace: null,
         oldValue: old === undefined ? null : old, addedNodes: [], removedNodes: [],
         previousSibling: null, nextSibling: null });
@@ -1954,6 +1957,7 @@
       this.__ptShadow = sr;
       __markDirty(this);
       __styleTouch(this);
+      __hasMut.any = true;
       return sr;
     }
     getAnimations() { return []; }
@@ -5109,7 +5113,7 @@
     const old = node.__ptKids;
     if (!old || !old.length) return;
     node.__ptKids = [];
-    for (const c of old) c.__ptParent = null;
+    for (const c of old) { c.__ptParent = null; __hasNoteTree(c); }
     __markDirty(node);
     __styleTouch(node, true);
     __mutation(__childListRecord(node, [], old, null, null));
@@ -8737,6 +8741,73 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // before a sibling combinator. Ancestors through `:has()` are handled at
   // revalidation. Until the rules are known, the parent.
   let __sibAny = true, __sibOnChildren = true;
+  // What the mutations since the last style pass touched, for `:has()`:
+  // inserted and removed subtrees, attribute names with old and new values.
+  // A `:has()` whose argument none of them could match keeps its anchors'
+  // styles (Blink does the same with its invalidation sets).
+  const __hasMut = { any: false, nodes: [], attrs: [] };
+  function __hasNoteTree(n) {
+    if (__hasMut.any || !n) return;
+    if (__hasMut.nodes.length >= 256) { __hasMut.any = true; __hasMut.nodes = []; return; }
+    __hasMut.nodes.push(n);
+  }
+  function __hasNoteAttr(name, oldV, newV) {
+    if (__hasMut.any) return;
+    if (__hasMut.attrs.length >= 256) { __hasMut.any = true; __hasMut.attrs = []; return; }
+    __hasMut.attrs.push([__s_toLowerCase(String(name)), oldV == null ? null : String(oldV), newV == null ? null : String(newV)]);
+  }
+  const __attrTest = (sel, v) => {
+    if (v == null) return false;
+    const want = sel.value;
+    if (sel.op == null) return true;
+    const a = sel.i ? __s_toLowerCase(v) : v, b = sel.i ? __s_toLowerCase(want) : want;
+    switch (sel.op) {
+      case '=': return a === b;
+      case '~=': return __s_split(a, /\s+/).includes(b);
+      case '|=': return a === b || __s_slice(a, 0, b.length + 1) === b + '-';
+      case '^=': return !!b && __s_slice(a, 0, b.length) === b;
+      case '$=': return !!b && __s_slice(a, a.length - b.length) === b;
+      case '*=': return !!b && __s_indexOf(a, b) >= 0;
+      default: return true;
+    }
+  };
+  // Whether the recorded mutations can change any `:has()` result.
+  function __hasMutRelevant(A) {
+    const M = __hasMut;
+    if (M.any || !A || A.any) return true;
+    if (A.sibling && M.nodes.length) return true;
+    const elemHits = (e) => {
+      if (A.tags.size && A.tags.has(__s_toLowerCase(String(e.localName || '')))) return true;
+      const id = __ptGetA(e, 'id');
+      if (id && A.ids.has(id)) return true;
+      if (A.classes.size) { const set = __ptClassSet(e); if (set) for (const c of set) if (A.classes.has(c)) return true; }
+      if (A.attrs.length && e.__ptAttrs) {
+        for (const sel of A.attrs) { const v = e.__ptAttrs.get(sel.name); if (v !== undefined && __attrTest(sel, v)) return true; }
+      }
+      return false;
+    };
+    let budget = 20000;
+    for (const n of M.nodes) {
+      const stack = [n];
+      while (stack.length) {
+        const e = stack.pop();
+        if (--budget < 0) return true;
+        if (e.nodeType === ELEMENT_NODE && elemHits(e)) return true;
+        const kids = e.__ptKids;
+        if (kids) for (const k of kids) if (k.nodeType === ELEMENT_NODE || k.nodeType === 11) stack.push(k);
+      }
+    }
+    for (const [name, oldV, newV] of M.attrs) {
+      if (name === 'class') {
+        const a = new Set(__s_split(oldV || '', /\s+/)), b = new Set(__s_split(newV || '', /\s+/));
+        for (const c of a) if (c && !b.has(c) && A.classes.has(c)) return true;
+        for (const c of b) if (c && !a.has(c) && A.classes.has(c)) return true;
+      }
+      if (name === 'id' && ((oldV && A.ids.has(oldV)) || (newV && A.ids.has(newV)))) return true;
+      for (const sel of A.attrs) if (sel.name === name && __attrTest(sel, oldV) !== __attrTest(sel, newV)) return true;
+    }
+    return false;
+  }
   function __styleTouch(node, children) {
     if (__styleAllStale || !node) return;
     const up = children ? __sibOnChildren : __sibAny;
@@ -8753,8 +8824,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __styleVolatile = new WeakSet();
     const why = (k) => { __lstats['stale_' + k] = (__lstats['stale_' + k] | 0) + 1; };
     if (__styleRulesSeen !== __rules) { __styleAllStale = true; why('rules'); }
-    const H = __rules && __rules.__ptHas;
-    if (H && __styleTouched.length && !__styleAllStale) {
+    const HA = __rules && __rules.__ptHas;
+    const H = HA && __styleTouched.length && !__styleAllStale ? __hasEffective(HA) : null;
+    __hasMut.any = false; __hasMut.nodes = []; __hasMut.attrs = [];
+    if (H) {
       if (H.any) { __styleAllStale = true; why('hasAny'); }
       else {
         const anchors = new Set();
@@ -9349,8 +9422,49 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     let found = false;
     // `sib`: anchors of `:has(+ …)`/`:has(~ …)`, which a change reaches
     // through their following siblings; `tilde` when any is `~`.
-    const H = { any: false, tags: new Set(), classes: new Set(), ids: new Set(),
-      sib: { tags: new Set(), classes: new Set(), ids: new Set() }, hasSib: false, tilde: false };
+    // One item per `:has()` compound: where its anchors are (keys, sibling or
+    // parent reach, or anywhere) and what its argument matches on. Each style
+    // pass keeps only the items a recorded mutation can reach
+    // (`__hasEffective`).
+    const items = [];
+    let H = null;
+    // What a `:has()` argument can match on, all its compounds: a mutation
+    // that touches none of these keys cannot change the result. Focus and
+    // hover come through the focus/hover paths; any other pseudo-class, a
+    // compound with nothing to key on, or a nested selector list makes any
+    // mutation count.
+    const STATE_OK = /^:(focus|focus-visible|focus-within|hover|active|visited|link|any-link)$/i;
+    const newArg = () => ({ any: false, sibling: false, tags: new Set(), classes: new Set(), ids: new Set(), attrs: [] });
+    const noteArg = (A, arg) => {
+      if (A.any) return;
+      if (/[+~]/.test(__s_replace(__s_replace(arg, /\[[^\]]*\]/g, ''), /\([^()]*\)/g, ''))) A.sibling = true;
+      for (const [, comp] of compounds(__s_trim(__s_replace(arg, /^\s*[>+~]\s*/, '')))) {
+        let rest = comp, keyed = false;
+        rest = __s_replace(rest, /\[\s*([\w-]+)\s*(?:([~|^$*]?=)\s*(?:"([^"]*)"|'([^']*)'|([^\]\s]*))\s*(i|s)?)?\s*\]/gi,
+          (m, name, op, q1, q2, bare, flag) => {
+            A.attrs.push({ name: __s_toLowerCase(name), op: op || null, value: q1 != null ? q1 : q2 != null ? q2 : (bare || ''), i: flag === 'i' || flag === 'I' });
+            keyed = true; return '';
+          });
+        rest = __s_replace(rest, /#([\w-]+)/g, (m, id) => { A.ids.add(id); keyed = true; return ''; });
+        rest = __s_replace(rest, /\.([\w-]+)/g, (m, c) => { A.classes.add(c); keyed = true; return ''; });
+        rest = __s_replace(rest, /^([a-zA-Z][\w-]*)/, (m, t) => { A.tags.add(__s_toLowerCase(t)); keyed = true; return ''; });
+        rest = __s_replace(rest, /:[\w-]+(?!\()/g, (m) => (STATE_OK.test(m) ? '' : m));
+        if (__s_trim(rest) !== '' || !keyed) { A.any = true; return; }
+      }
+    };
+    const hasArgs = (A, text) => {
+      const low = __s_toLowerCase(text);
+      let at = 0;
+      for (;;) {
+        const i = __s_indexOf(low, ':has(', at);
+        if (i < 0) return;
+        let d = 1, j = i + 5;
+        for (; j < text.length && d; j++) { if (text[j] === '(') d++; else if (text[j] === ')') d--; }
+        const arg = __s_slice(text, i + 5, j - 1);
+        for (const one of __s_split(arg, /,(?![^()]*\))/)) noteArg(A, one);
+        at = j;
+      }
+    };
     // A compound's keys: its id, else a class, else its tag. Parentheses
     // (`:has(…)`, `:not(…)`) are not looked into, except a leading
     // `:is()`/`:where()`: the element matches one of its alternatives, so the
@@ -9399,10 +9513,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const text = String(r.sel || '');
       if (__s_indexOf(__s_toLowerCase(text), ':has(') < 0) continue;
       found = true;
-      if (H.any) continue;
       for (const part of __s_split(text, /,(?![^()]*\))/)) {
         const cs = compounds(__s_trim(part));
-        for (let i = 0; i < cs.length && !H.any; i++) {
+        for (let i = 0; i < cs.length; i++) {
           const comp = cs[i][1];
           const lower = __s_toLowerCase(comp);
           if (__s_indexOf(lower, ':has(') < 0) continue;
@@ -9422,17 +9535,36 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
             }
             above = !!key;
           }
+          const arg = newArg();
+          hasArgs(arg, comp);
           // `:has(> x)` with nothing to key on: the anchor is the parent of
           // a changed child, one level up.
-          if (!key && !sibling && /^\s*>\s*[^\s>+~()]+\s*\)\s*$/.test(inner)) { H.parentAny = true; continue; }
-          if (!key) { H.any = true; break; }
-          const into = sibling && !above ? H.sib : H;
-          if (sibling && !above) { H.hasSib = true; if (/^\s*~/.test(inner)) H.tilde = true; }
-          for (const [set, v] of key) into[set].add(v);
+          if (!key && !sibling && /^\s*>\s*[^\s>+~()]+\s*\)\s*$/.test(inner)) { items.push({ arg, parentAny: true }); continue; }
+          if (!key) { items.push({ arg, any: true }); continue; }
+          items.push({ arg, key, sib: sibling && !above, tilde: /^\s*~/.test(inner) });
         }
       }
     }
-    return found ? H : null;
+    return found ? { items } : null;
+  }
+  // The anchors to look for after the mutations recorded since the last
+  // pass: the union over the `:has()` items whose argument they can reach.
+  // Null when none can.
+  function __hasEffective(HA) {
+    let H = null;
+    for (const it of HA.items) {
+      if (!__hasMutRelevant(it.arg)) continue;
+      if (!H) {
+        H = { any: false, parentAny: false, tags: new Set(), classes: new Set(), ids: new Set(),
+          sib: { tags: new Set(), classes: new Set(), ids: new Set() }, hasSib: false, tilde: false };
+      }
+      if (it.any) { H.any = true; break; }
+      if (it.parentAny) { H.parentAny = true; continue; }
+      const into = it.sib ? H.sib : H;
+      if (it.sib) { H.hasSib = true; if (it.tilde) H.tilde = true; }
+      for (const [set, v] of it.key) into[set].add(v);
+    }
+    return H;
   }
   function __hasAnchorMatch(e, H) {
     if (H.tags.size && H.tags.has(__s_toLowerCase(String(e.localName || '')))) return true;
@@ -9931,18 +10063,28 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const all = words.join(' ');
       return [{ text: all, width: Math.round(__textWidth(all, fs, family, bold, false) * 64) / 64 }];
     }
-    let line = '';
-    for (const w of words) {
-      const next = line ? line + ' ' + w : w;
-      const width = __textWidth(next, fs, family, bold, false);
-      if (line && width > maxWidth) {
-        out.push({ text: line, width: __textWidth(line, fs, family, bold, false) });
-        line = w;
+    // Words are shaped one at a time (Chrome caches a run per word), so a
+    // line is its words and the spaces between them: each word is measured
+    // once, not every prefix of the line again (quadratic in the words).
+    const ceil64 = (v) => Math.ceil(v * 64 - 1e-6) / 64;
+    const space = __textMetrics(' ', fs, family, bold, false)[0] || 0;
+    let start = 0, acc = __textMetrics(words[0], fs, family, bold, false)[0] || 0;
+    const flush = (end) => {
+      const text = words.slice(start, end).join(' ');
+      out.push({ text, width: __textWidth(text, fs, family, bold, false) });
+    };
+    for (let i = 1; i < words.length; i++) {
+      const w = __textMetrics(words[i], fs, family, bold, false)[0] || 0;
+      const next = acc + space + w;
+      if (ceil64(next) > maxWidth) {
+        flush(i);
+        start = i;
+        acc = w;
       } else {
-        line = next;
+        acc = next;
       }
     }
-    if (line) out.push({ text: line, width: __textWidth(line, fs, family, bold, false) });
+    flush(words.length);
     // Line widths are kept in 1/64 px too.
     for (const l of out) l.width = Math.round(l.width * 64) / 64;
     return out;
@@ -10157,7 +10299,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return { y, widest };
   }
 
-  // Move an already laid-out box with everything inside it.
+  // Move an already laid-out box with everything inside it. The box moves at
+  // once; what is inside moves when the pass ends (`__layoutSettle`), by the
+  // offsets collected on the way down: moving the subtree here copied every
+  // box below once per level a move happened on (63% of a Wikipedia layout).
   function __ptShiftBox(el, x, y) {
     const b = el.__ptBox;
     if (!b) return;
@@ -10165,20 +10310,32 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (!dx && !dy) return;
     // A moved box is a new object: layout results are kept by reference
     // (see `__layoutOne`) and must not change under them.
-    const walk = (node) => {
-      const old = node.__ptBox;
-      if (old) {
-        const nb = node.__ptBox = Object.assign({}, old);
-        nb.x += dx; nb.y += dy;
-        nb.cx += dx; nb.cy += dy;
-        if (nb.lineTop != null) nb.lineTop += dy;
+    const nb = el.__ptBox = Object.assign({}, b);
+    nb.x += dx; nb.y += dy;
+    nb.cx += dx; nb.cy += dy;
+    if (nb.lineTop != null) nb.lineTop += dy;
+    const off = el.__ptOff;
+    if (off) { off[0] += dx; off[1] += dy; } else el.__ptOff = [dx, dy];
+  }
+  // Apply the moves `__ptShiftBox` left pending: one walk down the tree,
+  // each box moved by what its ancestors moved since it was laid out.
+  function __layoutSettle(root) {
+    const stack = [root, 0, 0];
+    while (stack.length) {
+      const ay = stack.pop(), ax = stack.pop(), node = stack.pop();
+      let cx = ax, cy = ay;
+      const b = node.__ptBox;
+      if (b && node.__ptBoxV === __layoutBuilt && (ax || ay)) {
+        const nb = node.__ptBox = Object.assign({}, b);
+        nb.x += ax; nb.y += ay;
+        nb.cx += ax; nb.cy += ay;
+        if (nb.lineTop != null) nb.lineTop += ay;
       }
-      for (const k of (node.__ptKids || [])) if (k.nodeType === ELEMENT_NODE) walk(k);
-      if (node.__ptShadow) {
-        for (const k of (node.__ptShadow.__ptKids || [])) if (k.nodeType === ELEMENT_NODE) walk(k);
-      }
-    };
-    walk(el);
+      const off = node.__ptOff;
+      if (off) { cx += off[0]; cy += off[1]; node.__ptOff = null; }
+      for (const k of (node.__ptKids || [])) if (k.nodeType === ELEMENT_NODE) stack.push(k, cx, cy);
+      if (node.__ptShadow) for (const k of (node.__ptShadow.__ptKids || [])) if (k.nodeType === ELEMENT_NODE) stack.push(k, cx, cy);
+    }
   }
 
   // Flex and grid lay a child out more than once (measure, then place), so
@@ -10208,17 +10365,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (hit) {
       const dx = originX - hit.ox, dy = originY - hit.oy;
       if (__on64(dx) && __on64(dy)) {
-        for (const [node, box, defH] of hit.snap) {
-          let b = box;
-          if (dx || dy) {
-            b = Object.assign({}, box);
-            b.x += dx; b.y += dy; b.cx += dx; b.cy += dy;
-            if (b.lineTop != null) b.lineTop += dy;
-          }
-          node.__ptBox = b;
+        for (const [node, box, defH, off] of hit.snap) {
+          node.__ptBox = box;
           node.__ptBoxV = __layoutBuilt;
           node.__ptDefH = defH;
+          node.__ptOff = off ? [off[0], off[1]] : null;
         }
+        // The subtree moves with its root, pending like any other move.
+        if ((dx || dy) && el.__ptBox) __ptShiftBox(el, el.__ptBox.x + dx, el.__ptBox.y + dy);
         for (const n of hit.seq) __boxes.push(n);
         for (const [n, b] of hit.tells) __ptTellLogged(n, b);
         return el.__ptBox;
@@ -10238,7 +10392,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (seen.has(n)) continue;
       seen.add(n);
       seq.push(n);
-      if (n.__ptBox) snap.push([n, n.__ptBox, n.__ptDefH]);
+      if (n.__ptBox) snap.push([n, n.__ptBox, n.__ptDefH, n.__ptOff ? [n.__ptOff[0], n.__ptOff[1]] : null]);
     }
     if (!mine) __layoutMemo.set(el, (mine = new Map()));
     // Kept across passes now: a few constraint sets per element, not all of
@@ -10250,6 +10404,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   function __layoutOneRaw(el, originX, originY, availW, strut, forced) {
     __lstats.layoutEls++;
+    el.__ptOff = null;
     // Document order, not after children: hit testing scans from the end and a
     // deeper element must come after its parent.
     __boxes.push(el);
@@ -10874,6 +11029,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __layoutForget();
     __tellLog = [];
     __layoutOne(de, 0, 0, LAYOUT.W);
+    __layoutSettle(de);
     // In quirks mode the root and body stretch to the viewport: an empty
     // 300x150 frame gives `html` 150 and body 134, not a line height. Frames
     // without a doctype (`about:blank`, `srcdoc`) are common.
@@ -11572,23 +11728,30 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     'margin-block-end', 'margin-inline-start', 'margin-inline-end', 'margin', 'margin-block', 'margin-inline',
     'webkit-margin-before', 'webkit-margin-after', 'webkit-margin-start', 'webkit-margin-end']);
   const __computedState = new WeakMap();
+  // Per element: the stamp of the tree state the answer below was checked
+  // at; reads between two changes go straight to it.
+  const __computedStamp = () => __layoutSeq * 1e7 + LAYOUT.W * 1e3 + LAYOUT.H;
   function __computedNow(el) {
     let st = __computedState.get(el);
-    if (!st) { st = { cs: null, style: null, geoAt: -1, geo: null }; __computedState.set(el, st); }
+    if (!st) { st = { cs: null, style: null, geoAt: -1, geo: null, at: -1, names: null }; __computedState.set(el, st); }
+    const stamp = __computedStamp();
+    if (st.at === stamp && st.style) return st;
+    st.at = stamp;
+    st.names = null;
     const rendered = el.isConnected && __inFlatTree(el)
       && (!el.ownerDocument || el.ownerDocument === document || !!el.ownerDocument.defaultView);
     // Not rendered: empty answers, rebuilt only after the tree changed.
     if (!rendered) {
       if (st.cs !== null || st.seq !== __layoutSeq || !st.style) { st.cs = null; st.seq = __layoutSeq; st.style = __computedBuild(el, false); }
-      return { st, style: st.style };
+      return st;
     }
     __styleBegin();
     const cs = __cascadeFor(el);
     if (st.cs !== cs || !st.style) { st.cs = cs; st.style = __computedBuild(el, false); st.geoAt = -1; st.geo = null; }
-    return { st, style: st.style };
+    return st;
   }
   function __computedValue(el, key) {
-    const { st, style } = __computedNow(el);
+    const st = __computedNow(el), style = st.style;
     if (!st.cs) return style.map.get(key);
     // Custom properties are readable via `getPropertyValue('--name')` but not
     // enumerated; read straight from the element's variables.
@@ -11612,9 +11775,13 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     return read(style);
   }
   function __computedNames(el) {
-    if (!el || el.nodeType !== ELEMENT_NODE || !el.isConnected) return [];
-    if (el.ownerDocument && el.ownerDocument !== document && !el.ownerDocument.defaultView) return [];
-    return CS_ORDER;
+    if (!el || el.nodeType !== ELEMENT_NODE) return [];
+    const st = __computedState.get(el);
+    if (st && st.names && st.at === __computedStamp()) return st.names;
+    let names = CS_ORDER;
+    if (!el.isConnected || (el.ownerDocument && el.ownerDocument !== document && !el.ownerDocument.defaultView)) names = [];
+    if (st && st.at === __computedStamp()) st.names = names;
+    return names;
   }
   // A map's face over the live values, for the prototype's methods.
   const __computedView = (el) => ({
@@ -11662,11 +11829,12 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   globalThis.getComputedStyle = (el, pseudo) => {
     const proto = __inlineStyleProto();
     const target = Object.create(proto);
+    const view = __computedView(el);
     const reader = {
       computed: true, el,
       get names() { return __computedNames(el); },
-      get map() { return __computedView(el); },
-      read: () => __computedView(el),
+      get map() { return view; },
+      read: () => view,
       write: () => { throw __readOnly("Failed to set the 'cssFloat' property on 'CSSStyleDeclaration': These styles are computed, and therefore read-only."); },
     };
     __cssReaders.set(target, reader);

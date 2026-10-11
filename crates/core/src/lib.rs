@@ -11014,6 +11014,77 @@ mod tests {
         }
     }
 
+    /// `:has()` restyles only on mutations its argument can see, and then
+    /// exactly as a full recomputation does: classes added and removed deep
+    /// down, a sibling inserted after the anchor, attribute values, ids;
+    /// unrelated attributes change nothing.
+    #[tokio::test]
+    async fn has_invalidation_by_argument_keys() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><head><style>
+              .box:has(.on) { color: rgb(255, 0, 0) }
+              .a:has(+ .b) { color: rgb(0, 128, 0) }
+              .c:has([data-k="v"]) { color: rgb(0, 0, 255) }
+              .d:has(#target) { color: rgb(1, 2, 3) }
+            </style></head><body>
+              <div class="box"><p><span id="deep">x</span></p></div>
+              <div id="list"><div class="a">a</div></div>
+              <div class="c"><i id="ci">c</i></div>
+              <div class="d"><u id="du">d</u></div>
+            </body></html>"#,
+        )
+        .await
+        .unwrap();
+        let out = ctx
+            .evaluate(
+                r#"(() => {
+                  const q = (s) => document.querySelector(s);
+                  const col = () => ['.box', '.a', '.c', '.d'].map((s) => getComputedStyle(q(s)).color).join(' ');
+                  const steps = [
+                    () => q('#deep').classList.add('on'),
+                    () => q('#deep').setAttribute('data-z', '1'),
+                    () => q('#deep').classList.remove('on'),
+                    () => { const b = document.createElement('div'); b.className = 'b'; q('#list').appendChild(b); },
+                    () => q('#list .b').remove(),
+                    () => q('#ci').setAttribute('data-k', 'v'),
+                    () => q('#ci').setAttribute('data-k', 'w'),
+                    () => q('#du').id = 'target',
+                    () => q('#target').id = 'du',
+                  ];
+                  const out = [col()];
+                  for (const f of steps) {
+                    f();
+                    const inc = col();
+                    __pt_styleFlush();
+                    const full = col();
+                    out.push(inc === full ? inc : 'MISMATCH ' + inc + ' / ' + full);
+                  }
+                  return JSON.stringify(out);
+                })()"#,
+            )
+            .await
+            .unwrap();
+        let got: Vec<String> = serde_json::from_str(out.as_str().unwrap()).unwrap();
+        let black = "rgb(0, 0, 0)";
+        let want = [
+            format!("{black} {black} {black} {black}"),
+            format!("rgb(255, 0, 0) {black} {black} {black}"),
+            format!("rgb(255, 0, 0) {black} {black} {black}"),
+            format!("{black} {black} {black} {black}"),
+            format!("{black} rgb(0, 128, 0) {black} {black}"),
+            format!("{black} {black} {black} {black}"),
+            format!("{black} {black} rgb(0, 0, 255) {black}"),
+            format!("{black} {black} {black} {black}"),
+            format!("{black} {black} {black} rgb(1, 2, 3)"),
+            format!("{black} {black} {black} {black}"),
+        ];
+        assert_eq!(got, want);
+    }
+
     /// Streams, Response and AbortSignal behave as in Chrome 151 (values captured
     /// there). The old streams said "done" when the queue was empty though the
     /// source would write more, so a response streamed in parts ended early
