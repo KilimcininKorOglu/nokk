@@ -306,6 +306,7 @@ impl EngineInner {
             omit_credentials: false,
             initiator: None,
             referrer_policy: None,
+            credentials_include: None,
             method: "GET".into(),
             url: nokk_net::GEO_LOOKUP_URL.to_string(),
             headers,
@@ -942,6 +943,7 @@ impl Engine {
             omit_credentials: false,
             initiator: None,
             referrer_policy: None,
+            credentials_include: None,
             method: "GET".into(),
             url: url.to_string(),
             headers,
@@ -5125,7 +5127,7 @@ impl BrowserContext {
             body,
             kind: Self::wire_kind(&kind).0,
             urgency: Self::wire_kind(&kind).1,
-            omit_credentials: Self::wire_kind(&kind).2,
+            omit_credentials: Self::wire_kind(&kind).2 || r["credentials"].as_str() == Some("omit"),
             // The frame was granted access to its cookies: from now on a browser marks its
             // requests with `sec-fetch-storage-access`.
             third_party: r["storageAccess"].as_bool().unwrap_or(false),
@@ -5136,6 +5138,7 @@ impl BrowserContext {
                 .as_str()
                 .and_then(nokk_net::referrer_policy_token)
                 .or_else(|| self.referrer_policy_of(context)),
+            credentials_include: r["credentials"].as_str().map(|c| c == "include"),
         };
         let method = req_method(&req);
         Prepared::Send(Box::new(req), FetchInfo { context, id, url, method, kind, sent })
@@ -5202,7 +5205,7 @@ impl BrowserContext {
                             format!("__pt_imageMeta({quoted}, {w}, {h}, {cors});{bytes}")
                         })
                         .unwrap_or_default()
-                } else if matches!(kind.as_str(), "img" | "image" | "image-low" | "css-image")
+                } else if matches!(kind.as_str(), "img" | "image" | "image-low" | "css-image" | "image-cors" | "image-cors-low")
                     && !is_image_bytes(&resp.body, &resp.headers)
                 {
                     // Not a picture at all: Chrome fires `error` on the element.
@@ -5442,11 +5445,15 @@ impl BrowserContext {
             "module" | "link-module" => (K::ModuleScript, Some(1), false),
             "worker" => (K::Worker, None, false),
             "xhr" | "fetch" => (K::Xhr, None, false),
+            "fetch-nocors" => (K::XhrNoCors, None, false),
+            "preflight" => (K::Preflight, None, true),
             "beacon" => (K::Beacon, None, false),
             // An `<img>` in the document starts Medium, one made by script or
             // preloaded starts Low; the tab icon is High.
             "img" | "image" => (K::Subresource, Some(2), false),
             "image-low" | "link-image" | "css-image" => (K::Subresource, Some(3), false),
+            "image-cors" => (K::ImageCors, Some(2), false),
+            "image-cors-low" => (K::ImageCors, Some(3), false),
             "icon" => (K::Subresource, Some(1), false),
             "stylesheet" | "link-style" | "css" => (K::Style, Some(0), false),
             "link-script" => (K::Script, Some(1), false),
@@ -5533,6 +5540,7 @@ impl BrowserContext {
             omit_credentials: Self::wire_kind(resource_type).2,
             initiator: None,
             referrer_policy: self.referrer_policy_of(self.idx()),
+            credentials_include: None,
             // A navigation nobody's page asked for is one a person asked for.
             third_party: false,
             user_activated: resource_type == "document" && referrer.is_none(),
@@ -11083,6 +11091,93 @@ mod tests {
             format!("{black} {black} {black} {black}"),
         ];
         assert_eq!(got, want);
+    }
+
+    /// CORS as Chrome 151 applies it (measured on the same stand): a
+    /// cross-origin read needs `Access-Control-Allow-Origin` and sees only the
+    /// safelisted headers; a non-simple request is preceded by an OPTIONS
+    /// preflight, remembered per URL; `no-cors` reads an opaque answer and
+    /// sends no `Origin`; credentialed cross-site loads say so in
+    /// `Sec-Fetch-Storage-Access`.
+    #[tokio::test]
+    async fn cors_as_in_chrome() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = log.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let mut first = req.split_whitespace();
+                    let (method, path) = (first.next().unwrap_or("").to_string(), first.next().unwrap_or("").to_string());
+                    let lower = req.to_ascii_lowercase();
+                    let origin = lower.lines().any(|l| l.starts_with("origin:"));
+                    let sfsa = lower.lines().find(|l| l.starts_with("sec-fetch-storage-access:")).map(|l| l[25..].trim().to_string()).unwrap_or_default();
+                    seen.lock().unwrap().push(format!("{method} {path} origin={origin} sfsa={sfsa}"));
+                    let mut extra = String::from("X-Custom: yes\r\nCache-Control: no-cache\r\n");
+                    if path.starts_with("/star") || path.starts_with("/pre") {
+                        extra.push_str("Access-Control-Allow-Origin: *\r\n");
+                    }
+                    if path.starts_with("/pre") && method == "OPTIONS" {
+                        extra.push_str("Access-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: x-token\r\n");
+                    }
+                    let (ctype, body) = if path == "/" { ("text/html", "<html><body>p</body></html>") } else { ("application/json", "{}") };
+                    let head = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: {ctype}\r\n{extra}Content-Length: {}\r\n\r\n{body}", body.len());
+                    let _ = stream.write_all(head.as_bytes()).await;
+                });
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&format!("http://127.0.0.1:{port}/")).await.unwrap();
+        let _ = ctx
+            .evaluate(&format!(
+                r#"(async () => {{
+                  const X = 'http://localhost:{port}';
+                  const o = {{}};
+                  const t = async (k, f) => {{ try {{ o[k] = await f(); }} catch (e) {{ o[k] = e.name + ': ' + e.message; }} }};
+                  await t('none', async () => (await fetch(X + '/none')).status);
+                  await t('star', async () => {{ const r = await fetch(X + '/star'); return [r.type, [...r.headers.keys()].sort().join('|')].join(' '); }});
+                  await t('pre', async () => (await fetch(X + '/pre', {{ method: 'PUT', headers: {{ 'X-Token': '1' }}, body: 'x' }})).status);
+                  await t('pre2', async () => (await fetch(X + '/pre', {{ method: 'PUT', headers: {{ 'X-Token': '1' }}, body: 'x' }})).status);
+                  await t('nocors', async () => {{ const r = await fetch(X + '/none?nc', {{ mode: 'no-cors' }}); return r.type + ' ' + r.status; }});
+                  await t('cred', async () => (await fetch(X + '/star?cred', {{ credentials: 'include' }})).status);
+                  window.__cors = JSON.stringify(o);
+                }})()"#
+            ))
+            .await;
+        let mut out = Value::Null;
+        for _ in 0..50 {
+            let _ = ctx.run_event_loop().await;
+            out = ctx.evaluate("window.__cors || ''").await.unwrap_or(Value::Null);
+            if out.as_str().is_some_and(|s| !s.is_empty()) {
+                break;
+            }
+        }
+        let o: Value = serde_json::from_str(out.as_str().unwrap()).unwrap();
+        assert_eq!(o["none"], "TypeError: Failed to fetch", "{o}");
+        assert_eq!(o["star"], "cors cache-control|content-length|content-type", "{o}");
+        assert_eq!(o["pre"], 200, "{o}");
+        assert_eq!(o["pre2"], 200, "{o}");
+        assert_eq!(o["nocors"], "opaque 0", "{o}");
+        assert_eq!(o["cred"], "TypeError: Failed to fetch", "a wildcard does not admit credentials: {o}");
+        let log = log.lock().unwrap().clone();
+        let count = |p: &str| log.iter().filter(|l| l.starts_with(p)).count();
+        assert_eq!(count("OPTIONS /pre "), 1, "one preflight, then the cache: {log:?}");
+        assert_eq!(count("PUT /pre "), 2, "{log:?}");
+        assert!(log.iter().any(|l| l == "GET /none?nc origin=false sfsa="), "no-cors carries no Origin: {log:?}");
+        assert!(log.iter().any(|l| l == "GET /star?cred origin=true sfsa=active"), "{log:?}");
     }
 
     /// Streams, Response and AbortSignal behave as in Chrome 151 (values captured

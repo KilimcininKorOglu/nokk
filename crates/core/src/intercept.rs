@@ -83,8 +83,9 @@ fn resource_type(kind: RequestKind) -> &'static str {
     match kind {
         RequestKind::Document | RequestKind::Iframe => "Document",
         RequestKind::Script | RequestKind::ModuleScript => "Script",
-        RequestKind::Xhr => "Fetch",
-        RequestKind::Subresource => "Image",
+        RequestKind::Xhr | RequestKind::XhrNoCors => "Fetch",
+        RequestKind::Preflight => "Preflight",
+        RequestKind::Subresource | RequestKind::ImageCors => "Image",
         RequestKind::Style => "Stylesheet",
         RequestKind::Font => "Font",
         RequestKind::Manifest => "Manifest",

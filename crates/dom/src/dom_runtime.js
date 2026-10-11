@@ -1277,8 +1277,12 @@
         return;
       }
       if (typeof globalThis.__pt_subresource !== 'function') return;
-      // In the document an image starts Medium; one made by script, Low.
-      __pt_subresource(url, this.isConnected ? 'image' : 'image-low').then(
+      // In the document an image starts Medium; one made by script, Low. With
+      // `crossorigin` it is a CORS load: an answer that does not allow this
+      // origin is an `error`.
+      const co = __ptGetA(this, 'crossorigin');
+      const corsCreds = co === null ? null : (__s_toLowerCase(__s_trim(co)) === 'use-credentials' ? 'include' : 'same-origin');
+      __pt_subresource(url, corsCreds ? (this.isConnected ? 'image-cors' : 'image-cors-low') : (this.isConnected ? 'image' : 'image-low'), null, corsCreds).then(
         () => { this.__ptImgDone = true; this.__ptFireLoad(!(globalThis.__pt_imageIsBad && __pt_imageIsBad(url))); },
         () => { this.__ptImgDone = true; this.__ptFireLoad(false); },
       );

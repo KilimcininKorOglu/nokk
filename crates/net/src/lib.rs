@@ -302,6 +302,10 @@ pub struct Request {
     /// or `<meta name="referrer">`, or a `fetch()`'s own); `None` is Chrome's
     /// default, `strict-origin-when-cross-origin`.
     pub referrer_policy: Option<String>,
+    /// A page `fetch`/XHR's credentials mode as it said (`include` is
+    /// `credentials: 'include'` or `withCredentials`); `None` takes the
+    /// destination's default (an image, a script or a stylesheet includes them).
+    pub credentials_include: Option<bool>,
 }
 
 /// The destination a request is for, in the sense `Sec-Fetch-Dest` means it.
@@ -337,6 +341,12 @@ pub enum RequestKind {
     Beacon,
     /// A dedicated or shared worker's script.
     Worker,
+    /// `fetch(url, { mode: 'no-cors' })` across origins.
+    XhrNoCors,
+    /// An image with a `crossorigin` attribute: a CORS load.
+    ImageCors,
+    /// The CORS preflight (`OPTIONS`) before a non-simple cross-origin request.
+    Preflight,
 }
 
 const DOC_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7";
@@ -346,7 +356,7 @@ impl RequestKind {
     fn accept(self) -> &'static str {
         match self {
             RequestKind::Document | RequestKind::Iframe | RequestKind::Prefetch => DOC_ACCEPT,
-            RequestKind::Subresource => "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            RequestKind::Subresource | RequestKind::ImageCors => "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
             RequestKind::Style => "text/css,*/*;q=0.1",
             _ => "*/*",
         }
@@ -361,11 +371,13 @@ impl RequestKind {
             RequestKind::ModuleScript => ("script", "cors"),
             RequestKind::Xhr | RequestKind::PreloadFetch => ("empty", "cors"),
             RequestKind::Subresource => ("image", "no-cors"),
+            RequestKind::ImageCors => ("image", "cors"),
             RequestKind::Style => ("style", "no-cors"),
             RequestKind::Font => ("font", "cors"),
             RequestKind::Manifest => ("manifest", "cors"),
-            RequestKind::Prefetch | RequestKind::Beacon => ("empty", "no-cors"),
+            RequestKind::Prefetch | RequestKind::Beacon | RequestKind::XhrNoCors => ("empty", "no-cors"),
             RequestKind::Worker => ("worker", "same-origin"),
+            RequestKind::Preflight => ("empty", "cors"),
         }
     }
 
@@ -374,8 +386,8 @@ impl RequestKind {
         match self {
             RequestKind::Document | RequestKind::Iframe | RequestKind::Style => 0,
             RequestKind::Script | RequestKind::ModuleScript | RequestKind::Xhr | RequestKind::PreloadFetch
-            | RequestKind::Font | RequestKind::Worker => 1,
-            RequestKind::Subresource | RequestKind::Manifest => 2,
+            | RequestKind::Font | RequestKind::Worker | RequestKind::XhrNoCors | RequestKind::Preflight => 1,
+            RequestKind::Subresource | RequestKind::ImageCors | RequestKind::Manifest => 2,
             RequestKind::Prefetch | RequestKind::Beacon => 4,
         }
     }
@@ -395,7 +407,7 @@ impl RequestKind {
 
     /// Element-initiated CORS loads carry `Origin` even same-origin.
     fn always_origin(self) -> bool {
-        matches!(self, RequestKind::ModuleScript | RequestKind::Font | RequestKind::PreloadFetch)
+        matches!(self, RequestKind::ModuleScript | RequestKind::Font | RequestKind::PreloadFetch | RequestKind::ImageCors)
     }
 }
 
@@ -517,6 +529,10 @@ pub struct FingerprintClient {
     /// Hints each origin asked for with `Accept-CH`, and their values.
     hint_store: Arc<client_hints::HintStore>,
     hint_values: Arc<HintValues>,
+    /// The emulation's own header values (User-Agent, Accept-Encoding,
+    /// Accept-Language): a CORS preflight carries these and nothing else of
+    /// the default set.
+    defaults: Arc<wreq::header::HeaderMap>,
 }
 
 /// Header names the emulation profile owns; caller-supplied values for these are
@@ -593,6 +609,7 @@ impl FingerprintClient {
         // it sends none. The profile put it on every request; ours goes on
         // per request (see `send_once`).
         emulation.headers.remove("priority");
+        let defaults = Arc::new(emulation.headers.clone());
         // Post-quantum sigalgs: Chrome 151 advertises ML-DSA-44/65/87
         // (0904/0905/0906) first, `wreq-util` does not, so the third JA4 part
         // matched no real browser. Only our BoringSSL knows these names (see
@@ -638,6 +655,7 @@ impl FingerprintClient {
             jar,
             hint_store: Arc::default(),
             hint_values: Arc::new(config.hints.clone()),
+            defaults,
         })
     }
 }
@@ -750,6 +768,17 @@ impl FingerprintClient {
             "OPTIONS" => self.inner.request(wreq::Method::OPTIONS, &req.url),
             other => return Err(NetError::Connect(format!("unsupported method {other}"))),
         };
+        // A CORS preflight is the network service's own request: no client
+        // hints, no cookies, only the profile's identity headers (measured).
+        let preflight = req.kind == RequestKind::Preflight;
+        if preflight {
+            rb = rb.default_headers(false);
+            for name in ["user-agent", "accept-encoding", "accept-language"] {
+                if let Some(v) = self.defaults.get(name) {
+                    rb = rb.header(name, v.clone());
+                }
+            }
+        }
         // The emulation ships one header set — a navigation's — for every request.
         // Correct the parts that vary by destination, and put them on the wire in
         // Chrome's order: `orig_headers` decides that, and without it our added
@@ -783,6 +812,7 @@ impl FingerprintClient {
         // frame (Chrome's default delegation policy is `self`).
         let request_origin = origin_of(&req.url);
         let hint_scope = client_hints::secure(&req.url)
+            && !preflight
             && !req.third_party
             && (req.kind == RequestKind::Document || same_origin);
         let mut extra_hints: Vec<&'static str> = match (&request_origin, hint_scope) {
@@ -826,7 +856,14 @@ impl FingerprintClient {
         if req.kind == RequestKind::Prefetch {
             rb = rb.header("sec-purpose", "prefetch");
         }
-        if req.omit_credentials {
+        // Credentials: a page's own request across origins goes without
+        // cookies unless it asked (`credentials: 'include'`, `withCredentials`);
+        // element loads in `no-cors` mode include them; a preflight never does.
+        let include = req.credentials_include.unwrap_or(
+            !matches!(req.kind, RequestKind::ModuleScript | RequestKind::Font | RequestKind::PreloadFetch
+                | RequestKind::Xhr | RequestKind::XhrNoCors | RequestKind::ImageCors),
+        ) && !preflight;
+        if req.omit_credentials || preflight || (!same_origin && !include) {
             rb = rb.cookie_provider(Arc::new(wreq::cookie::Jar::default()));
         }
         if plain_http {
@@ -834,7 +871,10 @@ impl FingerprintClient {
         }
         // Chrome sends `Origin` on every non-GET and every cross-origin
         // request; Cloudflare checks it first.
-        let wants_origin = req.method != "GET" && req.method != "HEAD" || !same_origin || req.kind.always_origin();
+        // A `no-cors` load (an image, a script) carries none across origins.
+        let wants_origin = req.method != "GET" && req.method != "HEAD"
+            || (!same_origin && mode == "cors")
+            || req.kind.always_origin();
         let page_origin = asker.and_then(origin_of);
         let mut sent_origin = false;
         if wants_origin && !req.kind.navigates() {
@@ -912,7 +952,11 @@ impl FingerprintClient {
         }
         // Storage access to own cookies inside a third-party frame: Chrome
         // sends a separate header there, never on a first-party page.
-        let storage_access = req.third_party && same_origin && !req.kind.navigates();
+        // So does a cross-site request that carries cookies: Chrome 151 marks
+        // it `active` (third-party cookies are allowed in its default profile).
+        let storage_access = !req.kind.navigates()
+            && ((req.third_party && same_origin)
+                || (site == "cross-site" && include && !req.omit_credentials));
         if storage_access {
             rb = rb.header("sec-fetch-storage-access", "active");
         }
@@ -933,6 +977,18 @@ impl FingerprintClient {
             "priority",
         ] {
             order.insert(name);
+        }
+        if preflight {
+            order = wreq::header::OrigHeaderMap::new();
+            if plain_http {
+                order.insert("host");
+                order.insert("connection");
+            }
+            for name in ["accept", "access-control-request-method", "access-control-request-headers", "origin",
+                "user-agent", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-dest", "referer", "accept-encoding",
+                "accept-language", "priority"] {
+                order.insert(name);
+            }
         }
         rb = rb.orig_headers(order);
 
@@ -1061,8 +1117,11 @@ impl FingerprintClient {
             .ok()
             .and_then(|t| *t)
             .map(|t| t.duration_since(started).as_secs_f64() * 1000.0);
+        // Uncompressed, the length is still the body's and Chrome shows it.
+        if !encoding.is_empty() {
+            headers.remove("content-length");
+        }
         headers.remove("content-encoding");
-        headers.remove("content-length");
         Ok((
             Response {
                 status,
@@ -1185,6 +1244,7 @@ mod tests {
             omit_credentials: false,
             initiator: None,
             referrer_policy: None,
+            credentials_include: None,
         }
     }
 

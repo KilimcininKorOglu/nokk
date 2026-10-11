@@ -8148,9 +8148,35 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         body = String(b);
       }
     }
+    const method = __s_toUpperCase(opts.method || 'GET');
+    // CORS, as Chrome applies it to a page's own requests (measured): a
+    // cross-origin `fetch`/XHR is checked against the answer's
+    // Access-Control-* headers and sees only the safelisted ones; anything
+    // beyond a simple request asks first (an OPTIONS preflight, remembered
+    // per URL for its Max-Age); `no-cors` gets an opaque answer.
+    let cors = null, wireKind = kind || 'fetch';
+    const page = kind === 'fetch' || kind === 'xhr';
+    const creds = String(opts.credentials || 'same-origin');
+    if (page) {
+      const mode = kind === 'xhr' ? 'cors' : String(opts.mode || 'cors');
+      const cross = crossOrigin(url);
+      if (cross) {
+        if (mode === 'same-origin') return Promise.reject(__pt_mkErr(TypeError, 'Failed to fetch'));
+        if (mode === 'no-cors') {
+          if (!SIMPLE_METHODS.has(method)) {
+            return Promise.reject(__pt_mkErr(TypeError, "Failed to execute 'fetch' on 'Window': '" + method + "' is unsupported in no-cors mode."));
+          }
+          for (const k of Object.keys(hdrs)) if (!safelisted(k, hdrs[k])) delete hdrs[k];
+          cors = { opaque: true };
+          wireKind = 'fetch-nocors';
+        } else {
+          cors = { origin: pageOrigin(), creds };
+        }
+      }
+    }
     const req = {
       id, url: String(url),
-      method: __s_toUpperCase(opts.method || 'GET'),
+      method,
       headers: hdrs,
       // A blob worker's requests carry no referrer.
       noReferrer: !!globalThis.__ptNoReferrer,
@@ -8160,13 +8186,84 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       // A frame granted access to its cookies marks its requests: the browser
       // adds a separate header to them.
       storageAccess: !!globalThis.__ptStorageAccess,
-      kind: kind || 'fetch',
+      kind: wireKind,
+      credentials: page ? creds : null,
     };
-    return new Promise((resolve, reject) => {
-      pending.set(id, { resolve, reject, url: req.url });
+    const send = () => new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject, url: req.url, cors });
       queue.push(req);
     });
+    if (cors && !cors.opaque) {
+      const unsafe = Object.keys(hdrs).filter((k) => !safelisted(k, hdrs[k])).map((k) => __s_toLowerCase(k)).sort();
+      if (!SIMPLE_METHODS.has(method) || unsafe.length) return preflight(req.url, method, unsafe, creds).then(send);
+    }
+    return send();
   };
+  // The request side of CORS (Fetch spec, as Chrome implements it).
+  const SIMPLE_METHODS = new Set(['GET', 'HEAD', 'POST']);
+  const SAFE_TYPES = new Set(['application/x-www-form-urlencoded', 'multipart/form-data', 'text/plain']);
+  const UNSAFE_BYTE = /[\x00-\x08\x0a-\x1f"():<>?@[\\\]{}\x7f]/;
+  const safelisted = (name, value) => {
+    const n = __s_toLowerCase(String(name)), v = String(value);
+    if (v.length > 128) return false;
+    if (n === 'accept') return !UNSAFE_BYTE.test(v);
+    if (n === 'accept-language' || n === 'content-language') return /^[0-9A-Za-z *,\-.;=]*$/.test(v);
+    if (n === 'content-type') return !UNSAFE_BYTE.test(v) && SAFE_TYPES.has(__s_trim(__s_toLowerCase(__s_split(v, ';')[0])));
+    if (n === 'range') return /^bytes=\d+-\d*$/.test(v);
+    return false;
+  };
+  const pageOrigin = () => { try { return String(globalThis.location.origin); } catch (e) { return 'null'; } };
+  const crossOrigin = (url) => {
+    try {
+      const base = (globalThis.document && document.baseURI) || globalThis.location.href;
+      const t = new globalThis.URL(String(url), base);
+      if (t.protocol !== 'http:' && t.protocol !== 'https:') return false;
+      const o = pageOrigin();
+      return o === 'null' || t.origin !== o;
+    } catch (e) { return false; }
+  };
+  // Whether an answer lets this origin read it.
+  const corsAllows = (headers, origin, creds) => {
+    const acao = headers['access-control-allow-origin'];
+    if (acao == null) return false;
+    if (creds === 'include') return acao === origin && headers['access-control-allow-credentials'] === 'true';
+    return acao === '*' || acao === origin;
+  };
+  const preflights = new Map();
+  const preflight = (url, method, names, creds) => {
+    const origin = pageOrigin();
+    const key = origin + ' ' + url + ' ' + creds;
+    const now = Date.now();
+    const hit = preflights.get(key);
+    if (hit && hit.until > now && (SIMPLE_METHODS.has(method) || hit.methods.has(method) || hit.anyMethod)
+      && names.every((n) => hit.headers.has(n) || hit.anyHeader)) return Promise.resolve();
+    const id = fid++;
+    const headers = { 'Access-Control-Request-Method': method };
+    if (names.length) headers['Access-Control-Request-Headers'] = names.join(',');
+    return new Promise((resolve, reject) => {
+      pending.set(id, { url, preflight: { resolve, reject, origin, creds, method, names, key } });
+      queue.push({ id, url, method: 'OPTIONS', headers, body: null, kind: 'preflight', noReferrer: !!globalThis.__ptNoReferrer });
+    });
+  };
+  // The answer to a preflight: allowed, or `Failed to fetch` for the request.
+  const settlePreflight = (p, status, lower) => {
+    const f = p.preflight;
+    const list = (v) => new Set(__s_split(String(v || ''), ',').map((x) => __s_trim(x)).filter(Boolean));
+    const methods = list(lower['access-control-allow-methods']);
+    const hdrs = new Set([...list(lower['access-control-allow-headers'])].map((x) => __s_toLowerCase(x)));
+    const wild = f.creds !== 'include';
+    const anyMethod = wild && methods.has('*'), anyHeader = wild && hdrs.has('*');
+    const ok = status >= 200 && status < 300 && corsAllows(lower, f.origin, f.creds)
+      && (SIMPLE_METHODS.has(f.method) || methods.has(f.method) || anyMethod)
+      && f.names.every((n) => hdrs.has(n) || anyHeader);
+    if (!ok) { f.reject(__pt_mkErr(TypeError, 'Failed to fetch')); return; }
+    let age = parseInt(lower['access-control-max-age'], 10);
+    if (!(age >= 0)) age = 5;
+    preflights.set(f.key, { until: Date.now() + Math.min(age, 7200) * 1000, methods, headers: hdrs, anyMethod, anyHeader });
+    f.resolve();
+  };
+  // Response headers a cross-origin reader sees.
+  const CORS_SAFE_RESPONSE = new Set(['cache-control', 'content-language', 'content-length', 'content-type', 'expires', 'last-modified', 'pragma']);
   Object.defineProperty(globalThis, '__pt_engineFetch', { value: engineFetch, configurable: true, enumerable: false });
   globalThis.fetch = (url, opts) => engineFetch(url, opts, 'fetch');
 
@@ -8180,13 +8277,16 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   // one time more than it is ever meant to be sent.
   const subresources = new Map();
   // `referrer`: a stylesheet asking for its imports, images and fonts.
-  globalThis.__pt_subresource = (url, kind, referrer) => {
+  // `credentials`: an element's CORS load (`crossorigin`), checked like a
+  // page's own request across origins.
+  globalThis.__pt_subresource = (url, kind, referrer, credentials) => {
     url = String(url);
     const seen = subresources.get(url);
     if (seen) return seen;
     const id = fid++;
-    queue.push({ id, url, method: 'GET', headers: {}, body: null, kind: kind || 'image', referrer: referrer || null });
-    const p = new Promise((resolve, reject) => { pending.set(id, { resolve, reject, url }); });
+    queue.push({ id, url, method: 'GET', headers: {}, body: null, kind: kind || 'image', referrer: referrer || null, credentials: credentials || null });
+    const cors = credentials && crossOrigin(url) ? { origin: pageOrigin(), creds: credentials } : null;
+    const p = new Promise((resolve, reject) => { pending.set(id, { resolve, reject, url, cors }); });
     subresources.set(url, p);
     // A failure is not worth remembering: a browser retries a broken image.
     p.catch(() => { subresources.delete(url); });
@@ -8238,6 +8338,24 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     const p = pending.get(id); if (!p) return; pending.delete(id);
     if (globalThis.__pt_encTrace) { try { (globalThis.__pt_parentConsole || console).error('[fetch] ' + Math.round(performance.now()) + 'ms #' + id + ' resp ' + status + ' len=' + (body == null ? 0 : (body.byteLength || body.length || 0)) + ' ' + __s_slice(String(p.url), -60) + ' hdrs=' + __s_slice(JSON.stringify(headers), 0, 300) + ((body && (body.byteLength || body.length || 0) < 500) ? ' body=' + __s_slice(JSON.stringify(typeof body === 'string' ? body : new TextDecoder().decode(body)), 0, 400) : '')); } catch (e) {} }
     const lower = {}; for (const k in headers) lower[__s_toLowerCase(k)] = headers[k];
+    if (p.preflight) { settlePreflight(p, status, lower); return; }
+    // A page never reads `Set-Cookie`.
+    delete lower['set-cookie']; delete lower['set-cookie2'];
+    if (p.cors && p.cors.opaque) {
+      p.resolve(globalThis.__pt_makeResponse({ status: 0, statusText: '', url: '', type: 'opaque', redirected: false,
+        headers: new globalThis.Headers({}), bytes: null, text: '' }));
+      return;
+    }
+    if (p.cors) {
+      if (!corsAllows(lower, p.cors.origin, p.cors.creds)) {
+        globalThis.__pt_lastFetchError = 'CORS: no Access-Control-Allow-Origin for ' + p.cors.origin;
+        p.reject(__pt_mkErr(TypeError, 'Failed to fetch'));
+        return;
+      }
+      const expose = __s_split(String(lower['access-control-expose-headers'] || ''), ',').map((x) => __s_toLowerCase(__s_trim(x)));
+      const all = expose.includes('*') && p.cors.creds !== 'include';
+      for (const k of Object.keys(lower)) if (!CORS_SAFE_RESPONSE.has(k) && !all && !expose.includes(k)) delete lower[k];
+    }
     // A real Response, as the browser gives: its fields read from the
     // prototype, a body stream, blob() and formData(). It was a plain object
     // with `_body` and `_bytes` showing as own properties.
@@ -8263,7 +8381,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     // uri" would have travelled to them as our signature. The detail stays
     // here, for a debugger to read.
     globalThis.__pt_lastFetchError = msg;
-    p.reject(__pt_mkErr(TypeError, 'Failed to fetch'));
+    (p.preflight ? p.preflight.reject : p.reject)(__pt_mkErr(TypeError, 'Failed to fetch'));
   };
 
   // XMLHttpRequest layered on the same queue -------------------------------
@@ -8481,7 +8599,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       const encTrace = !!globalThis.__pt_encTrace;
       const bodyLen = body == null ? 0 : (typeof body === 'string' ? body.length : (body.byteLength || body.size || 0));
       if (encTrace) { try { (globalThis.__pt_parentConsole || console).error('[xhr] ' + Math.round(performance.now()) + 'ms ' + b.method + ' ' + __s_slice(String(b.url), 0, 110) + ' body=' + bodyLen); } catch (e) {} }
-      globalThis.__pt_engineFetch(b.url, { method: b.method, headers, body }, 'xhr')
+      globalThis.__pt_engineFetch(b.url, { method: b.method, headers, body, credentials: b.withCredentials ? 'include' : 'same-origin' }, 'xhr')
         .then(async (r) => {
           if (b.aborted) return;
           b.status = r.status; b.statusText = r.statusText; b.responseURL = r.url || b.url;
