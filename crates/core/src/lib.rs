@@ -11180,6 +11180,54 @@ mod tests {
         assert!(log.iter().any(|l| l == "GET /star?cred origin=true sfsa=active"), "{log:?}");
     }
 
+    /// Listener options and message ports as Chrome 151 answers (values
+    /// captured there): one entry per callback, `once`, `passive`, `signal`,
+    /// `handleEvent` objects, a listener removed mid-dispatch skipped; a port
+    /// opens on `start()` or `onmessage`, not on `addEventListener`.
+    #[tokio::test]
+    async fn event_listeners_and_ports_as_in_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>").await.unwrap();
+        let out = ctx
+            .evaluate(
+                r#"(() => {
+                  const run = (t) => {
+                    const r = [];
+                    const f = () => r.push('f');
+                    t.addEventListener('x', f); t.addEventListener('x', f);
+                    t.addEventListener('x', () => r.push('once'), { once: true });
+                    const obj = { handleEvent(e) { r.push('obj:' + (this === obj)); } };
+                    t.addEventListener('x', obj);
+                    const ac = new AbortController(); t.addEventListener('x', () => r.push('sig'), { signal: ac.signal });
+                    let pass = null; t.addEventListener('x', (e) => { e.preventDefault(); pass = e.defaultPrevented; }, { passive: true });
+                    const g = () => r.push('g-removed'); t.addEventListener('x', () => t.removeEventListener('x', g)); t.addEventListener('x', g);
+                    t.dispatchEvent(new Event('x', { cancelable: true }));
+                    ac.abort();
+                    t.dispatchEvent(new Event('x', { cancelable: true }));
+                    r.push('passiveDP:' + pass);
+                    return r.join(',');
+                  };
+                  const c = new MessageChannel(); const got = [];
+                  c.port2.addEventListener('message', (e) => got.push(e.data + ':' + (e.target === c.port2)), { once: true });
+                  c.port1.postMessage('a'); c.port1.postMessage('b');
+                  window.__ports = got;
+                  window.__portStart = () => c.port2.start();
+                  return JSON.stringify([run(new EventTarget()), run(document.createElement('div'))]);
+                })()"#,
+            )
+            .await
+            .unwrap();
+        let want = "f,once,obj:true,sig,f,obj:true,passiveDP:false";
+        assert_eq!(out, Value::String(format!("[\"{want}\",\"{want}\"]")));
+        let _ = ctx.run_event_loop().await;
+        assert_eq!(ctx.evaluate("JSON.stringify(__ports)").await.unwrap(), Value::String("[]".into()), "not started yet");
+        let _ = ctx.evaluate("__portStart()").await;
+        let _ = ctx.run_event_loop().await;
+        assert_eq!(ctx.evaluate("JSON.stringify(__ports)").await.unwrap(), Value::String("[\"a:true\"]".into()));
+    }
+
     /// Streams, Response and AbortSignal behave as in Chrome 151 (values captured
     /// there). The old streams said "done" when the queue was empty though the
     /// source would write more, so a response streamed in parts ended early

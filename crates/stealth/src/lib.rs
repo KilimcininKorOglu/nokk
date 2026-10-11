@@ -8928,26 +8928,22 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     // A pair of ports, each delivering to the other. Messages arrive in a
     // microtask (never synchronously), and a port that has not been `start`ed
     // queues them — both of which real code depends on.
-    const __MessagePort = globalThis.MessagePort = class MessagePort {
+    // An EventTarget, as in Chrome: listeners, `once`, `dispatchEvent` and the
+    // event's target come from it. Only `start()` or setting `onmessage`
+    // opens the queue; `addEventListener` alone does not (measured).
+    const __MessagePort = globalThis.MessagePort = class MessagePort extends globalThis.EventTarget {
       constructor() {
+        super();
         Object.defineProperty(this, '__pt', {
           // `remote`: the other end lives in another frame; the engine carries the message.
-          value: { peer: null, remote: null, started: false, queue: [], onmessage: null, listeners: [] },
+          value: { peer: null, remote: null, started: false, queue: [], onmessage: null, onmessageerror: null },
           enumerable: false,
         });
       }
       get onmessage() { return this.__pt.onmessage; }
-      set onmessage(fn) { this.__pt.onmessage = fn; this.start(); }
-      addEventListener(type, fn) {
-        if (type !== 'message' || typeof fn !== 'function') return;
-        this.__pt.listeners.push(fn);
-        this.start();
-      }
-      removeEventListener(type, fn) {
-        const l = this.__pt.listeners, i = __s_indexOf(l, fn);
-        if (i >= 0) l.splice(i, 1);
-      }
-      dispatchEvent() { return true; }
+      set onmessage(fn) { this.__pt.onmessage = typeof fn === 'function' ? fn : null; this.start(); }
+      get onmessageerror() { return this.__pt.onmessageerror; }
+      set onmessageerror(fn) { this.__pt.onmessageerror = typeof fn === 'function' ? fn : null; }
       start() {
         const st = this.__pt;
         if (st.started) return;
@@ -8977,11 +8973,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         if (typeof globalThis.__pt_addTask === 'function') globalThis.__pt_addTask(deliver, 0); else setTimeout(deliver, 0);
       }
       __ptDeliver(ev) {
-        const st = this.__pt;
-        // A handler's exception reaches window.onerror, as in the browser.
-        const report = (e) => { if (typeof globalThis.__pt_reportError === 'function') globalThis.__pt_reportError(e, 'message'); };
-        try { if (typeof st.onmessage === 'function') st.onmessage.call(this, ev); } catch (e) { report(e); }
-        for (const fn of __s_slice(st.listeners)) { try { fn.call(this, ev); } catch (e) { report(e); } }
+        this.dispatchEvent(ev);
       }
     };
     globalThis.MessageChannel = class MessageChannel {
@@ -9906,16 +9898,17 @@ const FETCH_TEMPLATE: &str = r#"(() => {
 
   if (!globalThis.BroadcastChannel) {
     const __bcRooms = new Map();
-    globalThis.BroadcastChannel = class BroadcastChannel {
+    globalThis.BroadcastChannel = class BroadcastChannel extends globalThis.EventTarget {
       constructor(name) {
+        super();
         __pt_write(this, 'name', String(name));
         this.onmessage = null; this.onmessageerror = null;
-        Object.defineProperty(this, '__pt', { value: { closed: false, listeners: [] }, enumerable: false });
+        Object.defineProperty(this, '__pt', { value: { closed: false }, enumerable: false });
         if (!__bcRooms.has(this.name)) __bcRooms.set(this.name, new Set());
         __bcRooms.get(this.name).add(this);
       }
       postMessage(data) {
-        if (this.__pt.closed) throw __pt_mkErr(globalThis.DOMException || Error, 'channel is closed', 'InvalidStateError');
+        if (this.__pt.closed) throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'postMessage' on 'BroadcastChannel': Channel is closed", 'InvalidStateError');
         const peers = __bcRooms.get(this.name);
         if (!peers) return;
         for (const p of peers) {
@@ -9923,15 +9916,13 @@ const FETCH_TEMPLATE: &str = r#"(() => {
           // The browser's broadcast goes through another thread and arrives a
           // few milliseconds after timers.
           setTimeout(() => {
-            const ev = { type: 'message', data, origin: (globalThis.location && location.origin) || '', lastEventId: '', source: null, ports: [], isTrusted: true, target: p, currentTarget: p };
-            try { if (typeof p.onmessage === 'function') p.onmessage(ev); } catch (e) {}
-            for (const fn of __s_slice(p.__pt.listeners)) { try { fn.call(p, ev); } catch (e) {} }
+            if (p.__pt.closed) return;
+            const ev = new globalThis.MessageEvent('message', { data, origin: (globalThis.location && location.origin) || '', lastEventId: '', source: null, ports: [] });
+            if (globalThis.__pt_trustEvent) { try { __pt_trustEvent(ev); } catch (e) {} }
+            globalThis.EventTarget.prototype.dispatchEvent.call(p, ev);
           }, 5);
         }
       }
-      addEventListener(t, fn) { if (t === 'message' && typeof fn === 'function') this.__pt.listeners.push(fn); }
-      removeEventListener(t, fn) { const l = this.__pt.listeners, i = __s_indexOf(l, fn); if (i >= 0) l.splice(i, 1); }
-      dispatchEvent() { return true; }
       close() { this.__pt.closed = true; const r = __bcRooms.get(this.name); if (r) r.delete(this); }
     };
   }
@@ -9971,18 +9962,20 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   const wsLive = new Map();       // id -> socket
   const wsState = new WeakMap();  // socket -> internals
 
+  // The socket's events are the browser's own: an `Event`, a `MessageEvent`,
+  // a `CloseEvent`, trusted, dispatched through EventTarget (listeners, `once`,
+  // the `on…` handler).
   const wsFire = (sock, type, evt) => {
     const st = wsState.get(sock); if (!st) return;
-    evt = Object.assign({
-      target: sock, currentTarget: sock, srcElement: sock, isTrusted: true,
-      eventPhase: 2, bubbles: false, cancelable: false,
-      timeStamp: globalThis.performance ? performance.now() : 0,
-    }, evt);
-    const on = st['on' + type];
-    try { if (typeof on === 'function') on.call(sock, evt); } catch (e) {}
-    for (const fn of __s_slice(st.listeners.get(type) || [])) {
-      try { fn.call(sock, evt); } catch (e) {}
-    }
+    let ev = null;
+    try {
+      if (type === 'message') ev = new globalThis.MessageEvent('message', { data: evt.data, origin: evt.origin, lastEventId: '', source: null, ports: [] });
+      else if (type === 'close' && typeof globalThis.CloseEvent === 'function') ev = new globalThis.CloseEvent('close', { code: evt.code, reason: evt.reason, wasClean: evt.wasClean });
+      else ev = new globalThis.Event(type);
+    } catch (e) {}
+    if (!ev) return;
+    if (globalThis.__pt_trustEvent) { try { __pt_trustEvent(ev); } catch (e) {} }
+    globalThis.EventTarget.prototype.dispatchEvent.call(sock, ev);
   };
 
   globalThis.__pt_drainWsQueue = () => wsOps.splice(0);
@@ -10017,9 +10010,10 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     wsFire(sock, 'close', { type: 'close', code: 1006, reason: '', wasClean: false });
   };
 
-  globalThis.WebSocket = class WebSocket {
+  globalThis.WebSocket = class WebSocket extends globalThis.EventTarget {
     constructor(url, protocols) {
       if (arguments.length < 1) throw __pt_mkErr(TypeError, "Failed to construct 'WebSocket': 1 argument required, but only 0 present.");
+      super();
       // ws:/wss: only. http(s) is upgraded as the URL parser does; anything else
       // is a SyntaxError, exactly as in a browser.
       const base = globalThis.location ? String(location.href) : 'https://localhost/';
@@ -10035,7 +10029,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       const id = wsid++;
       wsState.set(this, {
         id, url: abs, protocol: '', extensions: '', binaryType: 'blob',
-        bufferedAmount: 0, readyState: 0, listeners: new Map(),
+        bufferedAmount: 0, readyState: 0,
         origin: __s_replace(__s_replace(abs, /^ws/, 'http'), /^([a-z]+:\/\/[^/]*).*$/, '$1'),
         onopen: null, onmessage: null, onclose: null, onerror: null,
       });
@@ -10064,17 +10058,6 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       __pt_write(st, 'readyState', 2);
       wsOps.push({ op: 'close', id: st.id, code: code == null ? 1000 : (code | 0), reason: reason == null ? '' : String(reason) });
     }
-    addEventListener(type, fn) {
-      if (typeof fn !== 'function') return;
-      const st = wsState.get(this), k = String(type);
-      if (!st.listeners.has(k)) st.listeners.set(k, []);
-      st.listeners.get(k).push(fn);
-    }
-    removeEventListener(type, fn) {
-      const l = wsState.get(this).listeners.get(String(type)); if (!l) return;
-      const i = __s_indexOf(l, fn); if (i >= 0) l.splice(i, 1);
-    }
-    dispatchEvent(evt) { wsFire(this, evt && evt.type, evt); return true; }
   };
   // WebIDL attributes: accessors on the prototype (enumerable there, absent from
   // the instance), so `Object.keys(ws)` is `[]` like a real socket's.

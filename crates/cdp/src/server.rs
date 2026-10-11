@@ -2164,9 +2164,11 @@ async fn remote_eval(
         // between, during which *other* concurrently-dispatched commands run on
         // the same context. A shared global would be clobbered mid-flight (two
         // overlapping evaluates racing on it), so each call gets a unique slot.
-        let slot = format!("__cdp_{}", IDS.fetch_add(1, Ordering::Relaxed));
+        // A hidden name: `__pt*` globals are kept out of the page's view, and
+        // the slot lives on the page's global while it waits.
+        let slot = format!("__pt_cdp{}", IDS.fetch_add(1, Ordering::Relaxed));
         let setup = format!(
-            "globalThis.{slot} = {{ done: false, v: undefined }}; \
+            "Object.defineProperty(globalThis, '{slot}', {{ value: {{ done: false, v: undefined }}, configurable: true, enumerable: false, writable: true }}); \
              Promise.resolve((0, eval)({src})).then(\
                v => {{ globalThis.{slot}.v = v; globalThis.{slot}.done = true; }}, \
                e => {{ globalThis.{slot}.v = String(e); globalThis.{slot}.done = true; }});"
@@ -2179,9 +2181,11 @@ async fn remote_eval(
         // setTimeout(r, 1000))` — which is what every `waitForTimeout` compiles
         // down to — really does take a second, and reading the slot after a single
         // turn would hand the caller back an unsettled promise.
+        // A value that was not a promise is settled already: answer at once,
+        // as Chrome does, before any of the page's tasks run (a timer the
+        // expression set — a navigation, say — fires after the reply).
         let deadline = std::time::Instant::now() + AWAIT_PROMISE_TIMEOUT;
         loop {
-            let _ = ctx.run_event_loop().await;
             let settled = matches!(
                 ctx.evaluate(&format!("String(globalThis.{slot}.done)")).await,
                 Ok(Value::String(ref s)) if s == "true"
@@ -2189,6 +2193,7 @@ async fn remote_eval(
             if settled || std::time::Instant::now() >= deadline {
                 break;
             }
+            let _ = ctx.run_event_loop().await;
             // Nothing runnable this instant: sleep until the page's next timer is
             // due (capped, so a promise settled by I/O is not missed for long).
             let nap = ctx

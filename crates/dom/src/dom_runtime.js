@@ -471,6 +471,53 @@
   }
 
   // ---- Node -----------------------------------------------------------------
+  // Listener bookkeeping as the DOM spec has it, for nodes and other targets:
+  // one entry per (callback, capture); `once` removes it before the call;
+  // `passive` makes `preventDefault` a no-op; an aborted `signal` removes it;
+  // a listener removed during a dispatch is not called; an object listener
+  // gets its `handleEvent` called with itself as `this`.
+  const __ptListenOpts = (opts) => {
+    if (opts === true || opts === false || opts == null || typeof opts !== 'object') return { cap: opts === true, once: false, passive: false, signal: null };
+    return { cap: !!opts.capture, once: !!opts.once, passive: !!opts.passive, signal: opts.signal || null };
+  };
+  function __ptAddListener(t, store, type, fn, opts) {
+    if (!fn) return;
+    const o = __ptListenOpts(opts);
+    if (o.signal && o.signal.aborted) return;
+    const l = store[type] || (store[type] = []);
+    for (const e of l) if (e.fn === fn && e.cap === o.cap) return;
+    const entry = { fn, cap: o.cap, once: o.once, passive: o.passive, removed: false };
+    l.push(entry);
+    if (o.signal && typeof o.signal.addEventListener === 'function') {
+      o.signal.addEventListener('abort', () => __ptDropListener(store, type, entry));
+    }
+  }
+  function __ptDropListener(store, type, entry) {
+    entry.removed = true;
+    const l = store[type];
+    if (l) store[type] = l.filter((e) => e !== entry);
+  }
+  function __ptRemoveListener(store, type, fn, opts) {
+    const cap = __ptListenOpts(opts).cap;
+    const l = store && store[type]; if (!l) return;
+    for (const e of l) if (e.fn === fn && e.cap === cap) { __ptDropListener(store, type, e); return; }
+  }
+  function __ptCallListener(node, e, event, label) {
+    if (e.removed) return;
+    if (e.once) __ptDropListener(node.__ptLis, event.type, e);
+    __ptEvSet(event, 'currentTarget', node);
+    if (e.passive) __ptEvSet(event, '__ptPassive', true);
+    try {
+      if (typeof e.fn === 'function') e.fn.call(node, event);
+      else if (e.fn && typeof e.fn.handleEvent === 'function') e.fn.handleEvent(event);
+      else if (e.fn) throw __pt_mkErr(TypeError, "The 'handleEvent' property of the event listener is not callable.");
+    } catch (x) {
+      __pt_reportError(x, label + ' ' + event.type);
+    } finally {
+      if (e.passive) __ptEvSet(event, '__ptPassive', false);
+    }
+  }
+
   class Node {
     constructor(type) {
       // Backing fields are __pt-prefixed (and therefore filtered out of every
@@ -649,7 +696,6 @@
     addEventListener(type, fn, opts) {
       __needArgs(arguments.length, 2, 'addEventListener', 'EventTarget');
       if (!fn) return;
-      const cap = !!(opts && (opts === true || opts.capture));
       // A handler property is queued where it was assigned: if `onload` was
       // set before the first listener, Chrome calls it first. The assignment
       // cannot be intercepted (`on…` is a plain property), but here we can see
@@ -660,12 +706,10 @@
       if (this.__ptOnFirst[type] === undefined) {
         this.__ptOnFirst[type] = typeof this['on' + type] === 'function';
       }
-      (this.__ptLis[type] || (this.__ptLis[type] = [])).push({ fn, cap });
+      __ptAddListener(this, this.__ptLis, type, fn, opts);
     }
     removeEventListener(type, fn, opts) {
-      const cap = !!(opts && (opts === true || opts.capture));
-      const l = this.__ptLis[type]; if (!l) return;
-      this.__ptLis[type] = l.filter(e => !(e.fn === fn && e.cap === cap));
+      __ptRemoveListener(this.__ptLis, type, fn, opts);
     }
     __ptDispatch(event) {
       __ptEvSet(event, 'target', this);
@@ -708,8 +752,7 @@
             if (event.__ptStopImm) break;
             if (phase === 1 && !e.cap) continue;
             if (phase === 3 && e.cap) continue;
-            __ptEvSet(event, 'currentTarget', node);
-            try { e.fn.call(node, event); } catch (x) { __pt_reportError(x, 'listener ' + event.type); }
+            __ptCallListener(node, e, event, 'listener');
           }
         }
         // An ancestor's handler property (`document.onmousemove`,
@@ -743,8 +786,7 @@
         for (const e of __s_slice(l)) {
           if (event.__ptStopImm) break;
           if (!!e.cap !== capture) continue;
-          __ptEvSet(event, 'currentTarget', this);
-          try { e.fn.call(this, event); } catch (x) { __pt_reportError(x, 'listener ' + event.type); }
+          __ptCallListener(this, e, event, 'listener');
         }
       };
       if (!event.__ptStop) atTarget(true);
@@ -789,7 +831,7 @@
 
   function fireCapture(node, event) {
     const l = node.__ptLis && node.__ptLis[event.type]; if (!l) return;
-    for (const e of __s_slice(l)) { if (!e.cap) continue; if (event.__ptStopImm) break; __ptEvSet(event, 'currentTarget', node); try { e.fn.call(node, event); } catch (x) { __pt_reportError(x, 'capture ' + event.type); } }
+    for (const e of __s_slice(l)) { if (!e.cap) continue; if (event.__ptStopImm) break; __ptCallListener(node, e, event, 'capture'); }
   }
 
   // These three methods live on `EventTarget.prototype`, once for all targets,
@@ -813,7 +855,6 @@
         ['addEventListener', function addEventListener(type, fn, opts) {
           __needArgs(arguments.length, 2, 'addEventListener', 'EventTarget');
           const t = self_(this); if (!fn) return;
-          const cap = !!(opts && (opts === true || opts.capture));
           // Same ordering bookkeeping as for nodes: was `on…` set before the
           // first listener.
           try {
@@ -824,14 +865,12 @@
               t.__ptOnFirst[type] = typeof t['on' + type] === 'function';
             }
           } catch (e) {}
-          const l = store(t); (l[type] = l[type] || []).push({ fn, cap, once: !!(opts && opts.once) });
+          __ptAddListener(t, store(t), type, fn, opts);
         }],
         ['removeEventListener', function removeEventListener(type, fn, opts) {
           __needArgs(arguments.length, 2, 'removeEventListener', 'EventTarget');
           const t = self_(this);
-          const cap = !!(opts && (opts === true || opts.capture));
-          const l = t.__ptLis && t.__ptLis[type]; if (!l) return;
-          t.__ptLis[type] = l.filter((e) => !(e.fn === fn && e.cap === cap));
+          __ptRemoveListener(t.__ptLis, type, fn, opts);
         }],
         ['dispatchEvent', function dispatchEvent(event) {
           const t = self_(this);
@@ -2585,7 +2624,7 @@
       };
       this.__ptStop = false; this.__ptStopImm = false;
     }
-    preventDefault() { if (this.cancelable) this.__ptE.defaultPrevented = true; }
+    preventDefault() { if (this.cancelable && !(this.__ptE && this.__ptE.__ptPassive)) this.__ptE.defaultPrevented = true; }
     stopPropagation() { this.__ptStop = true; }
     stopImmediatePropagation() { this.__ptStop = true; this.__ptStopImm = true; }
     // The path of the current dispatch; empty outside it, as in Chrome. Nodes
