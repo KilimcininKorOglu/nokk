@@ -92,6 +92,12 @@ pub struct EngineConfig {
     /// reused `cf_clearance` was minted under. Bounded by what wreq-util ships (an
     /// unavailable version falls back to the default).
     pub chrome_major: u32,
+    /// Do not load images, as Chrome with `imagesEnabled=false`: no request for
+    /// an `<img>`, a CSS background or an image preload, no `load`/`error` on
+    /// the element, `complete` stays false. Saves traffic and time where the
+    /// pictures do not matter. The challenge platform's own images still load:
+    /// a solve needs them.
+    pub no_images: bool,
 }
 
 impl Default for EngineConfig {
@@ -106,6 +112,7 @@ impl Default for EngineConfig {
             rotate_fingerprint: false,
             geoip_timezone: false,
             chrome_major: nokk_net::DEFAULT_CHROME_MAJOR,
+            no_images: false,
         }
     }
 }
@@ -123,6 +130,8 @@ struct EngineInner {
     /// Drop subresource requests to tracker/ad/analytics domains (see
     /// [`EngineConfig::block_trackers`]).
     block_trackers: bool,
+    /// [`EngineConfig::no_images`].
+    no_images: bool,
     /// Directory where named session jars are persisted (`None` = in-memory only).
     session_store: Option<PathBuf>,
     /// Icon addresses that failed for a profile (storage partition): Chrome
@@ -674,6 +683,7 @@ impl Engine {
                 client_config: config.client,
                 use_real_network: config.use_real_network,
                 block_trackers: config.block_trackers,
+                no_images: config.no_images,
                 client_pool: Mutex::new(HashMap::new()),
                 session_store: config.session_store,
                 sessions: Mutex::new(HashMap::new()),
@@ -1755,6 +1765,11 @@ impl BrowserContext {
             );
             let _ = self.eval_in(index, &js).await;
         }
+        if self.engine.no_images {
+            let _ = self
+                .eval_in(index, "Object.defineProperty(globalThis, '__pt_noImages', { value: true, configurable: true, enumerable: false });")
+                .await;
+        }
         // Then the client's own "on new document" scripts, still before the
         // document exists — a frame gets its set from `apply_frame_ops`, the page
         // gets its own here. After the page's scripts would be too late to matter.
@@ -2046,6 +2061,9 @@ impl BrowserContext {
             .ok()
             .and_then(|v| v.as_str().and_then(|s| serde_json::from_str::<Vec<String>>(s).ok()))
             .unwrap_or_default();
+        // Images off: Chrome then asks for `/favicon.ico` only, not the
+        // declared icons (measured with `imagesEnabled=false`).
+        let listed = if self.engine.no_images { Vec::new() } else { listed };
         let urls = if listed.is_empty() {
             let o = origin_of(page);
             if o.is_empty() || o == "null" {
@@ -5102,6 +5120,14 @@ impl BrowserContext {
                             format!("__pt_imageMeta({quoted}, {w}, {h}, {cors});{bytes}")
                         })
                         .unwrap_or_default()
+                } else if matches!(kind.as_str(), "img" | "image" | "image-low" | "css-image")
+                    && !is_image_bytes(&resp.body, &resp.headers)
+                {
+                    // Not a picture at all: Chrome fires `error` on the element.
+                    format!(
+                        "typeof __pt_imageBad === 'function' && __pt_imageBad({});",
+                        serde_json::to_string(&url).unwrap()
+                    )
                 } else {
                     String::new()
                 };
@@ -5646,7 +5672,7 @@ pub(crate) fn next_request_id() -> String {
 /// so a bare context (no stealth bootstrap, as in some tests) answers with empty
 /// queues instead of throwing.
 const DRAIN_IO: &str = "__ptJSON.stringify({\
-    css: (typeof __pt_cssLoads === 'function' && __pt_cssLoads(), 0),\
+    css: (typeof __pt_cssLoads === 'function' && __pt_cssLoads(), typeof __pt_lazyCheck === 'function' && __pt_lazyCheck(), 0),\
     fetch: typeof __pt_drainFetchQueue === 'function' ? __ptJSON.parse(__pt_drainFetchQueue()) : [],\
     ws: typeof __pt_drainWsQueue === 'function' ? __pt_drainWsQueue() : [],\
     frames: typeof __pt_drainFrameQueue === 'function' ? __pt_drainFrameQueue() : [],\
@@ -5765,6 +5791,24 @@ fn location_setter(u: &str) -> Option<String> {
 /// `naturalWidth`/`naturalHeight`; no pixels are decoded. Unknown or truncated
 /// data gives `None`, and the image then keeps the zero size it has before a
 /// browser has finished decoding.
+/// Whether a response decodes as an image in Chrome: a format `image_size`
+/// reads, or SVG, ICO, AVIF/HEIF, JPEG XL by their signatures.
+fn is_image_bytes(bytes: &[u8], headers: &std::collections::BTreeMap<String, String>) -> bool {
+    if image_size(bytes).is_some() || bytes.starts_with(b"\x00\x00\x01\x00") || bytes.starts_with(b"\xff\x0a")
+        || bytes.starts_with(b"\x00\x00\x00\x0cJXL ")
+    {
+        return true;
+    }
+    if bytes.get(4..8) == Some(b"ftyp") {
+        return matches!(bytes.get(8..12), Some(b"avif" | b"avis" | b"heic" | b"heix" | b"mif1" | b"msf1"));
+    }
+    let svg_type = headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("content-type") && v.to_ascii_lowercase().starts_with("image/svg+xml")
+    });
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]).to_ascii_lowercase();
+    svg_type && head.contains("<svg")
+}
+
 fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
     let be32 = |i: usize| -> Option<u32> {
         Some(u32::from_be_bytes(bytes.get(i..i + 4)?.try_into().ok()?))
@@ -10734,6 +10778,77 @@ mod tests {
         assert!(has(&format!("/css/img/bg.png {root}/css/i.css")), "{log:?}");
         assert!(has(&format!("/f.ttf {page}")), "{log:?}");
         assert!(!log.iter().any(|l| l.starts_with("/u.ttf")), "an unused face is not fetched: {log:?}");
+    }
+
+    /// `loading="lazy"` as Chrome 151 measured it: an image within 1250px of
+    /// the viewport loads after `load`, a farther one only once scrolled near;
+    /// with images switched off nothing is requested and nothing fires.
+    #[tokio::test]
+    async fn lazy_images_and_images_off_as_in_chrome() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = log.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                    seen.lock().unwrap().push(path.clone());
+                    let png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89";
+                    let (ctype, body): (&str, Vec<u8>) = if path.ends_with(".png") {
+                        ("image/png", png.to_vec())
+                    } else {
+                        ("text/html", br#"<html><body style="margin:0"><div style="height:9000px"></div>
+                            <img id=near loading=lazy src=/near.png style="position:absolute;top:2000px">
+                            <img id=far loading=lazy src=/far.png style="position:absolute;top:4000px">
+                            <img id=eager src=/eager.png></body></html>"#.to_vec())
+                    };
+                    let head = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n", body.len());
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        for no_images in [false, true] {
+            log.lock().unwrap().clear();
+            let engine = Engine::new(EngineConfig {
+                pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+                use_real_network: true,
+                no_images,
+                ..Default::default()
+            })
+            .expect("engine");
+            let ctx = engine.new_context().await.unwrap();
+            ctx.navigate(&format!("http://127.0.0.1:{}/", addr.port())).await.unwrap();
+            for _ in 0..5 {
+                let _ = ctx.run_event_loop().await;
+            }
+            let before = log.lock().unwrap().clone();
+            let _ = ctx.evaluate("scrollTo(0, 2000)").await;
+            for _ in 0..5 {
+                let _ = ctx.run_event_loop().await;
+            }
+            let after = log.lock().unwrap().clone();
+            let state = ctx
+                .evaluate("JSON.stringify(['near', 'far', 'eager'].map((id) => document.getElementById(id).complete))")
+                .await
+                .unwrap();
+            let has = |l: &[String], p: &str| l.iter().any(|x| x == p);
+            if no_images {
+                assert!(!after.iter().any(|p| p.ends_with(".png") && p != "/favicon.ico"), "{after:?}");
+                assert_eq!(state, Value::String("[false,false,false]".into()));
+            } else {
+                assert!(has(&before, "/eager.png") && has(&before, "/near.png") && !has(&before, "/far.png"), "{before:?}");
+                assert!(has(&after, "/far.png"), "scrolled near: {after:?}");
+                assert_eq!(state, Value::String("[true,true,true]".into()));
+            }
+        }
     }
 
     /// Streams, Response and AbortSignal behave as in Chrome 151 (values captured

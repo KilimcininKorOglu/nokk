@@ -8216,6 +8216,11 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     if (cors) imageCors.add(String(url));
   };
   globalThis.__pt_imageSizeOf = (url) => imageSizes.get(String(url)) || null;
+  // Answers that are not pictures (an HTML error page, a stylesheet): the
+  // element gets `error`, as in Chrome.
+  const imageBad = new Set();
+  Object.defineProperty(globalThis, '__pt_imageBad', { value: (url) => { imageBad.add(String(url)); }, configurable: true, enumerable: false });
+  Object.defineProperty(globalThis, '__pt_imageIsBad', { value: (url) => imageBad.has(String(url)), configurable: true, enumerable: false });
   // Whether the server lets others read this image: decides whether it
   // taints a canvas it is drawn on.
   globalThis.__pt_imageCorsOk = (url) => imageCors.has(String(url));

@@ -17,6 +17,8 @@ export interface LaunchOptions {
   geoipTimezone?: boolean;
   /** Load ad/analytics/tracker subresources (blocked by default). */
   allowTrackers?: boolean;
+  /** Do not load images (`<img>`, CSS backgrounds, image preloads). */
+  noImages?: boolean;
   /** Chrome major version to emulate (TLS + JS together), e.g. 148. */
   chromeVersion?: number;
   /**

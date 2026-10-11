@@ -111,6 +111,7 @@ class NokkServer {
  * @param {boolean} [opts.rotateFingerprint]
  * @param {boolean} [opts.geoipTimezone]
  * @param {boolean} [opts.allowTrackers]
+ * @param {boolean} [opts.noImages]               do not load images
  * @param {number}  [opts.chromeVersion]          e.g. 148
  * @param {boolean|number} [opts.autoSolve]       solve Cloudflare challenges on every
  *                                                 navigation before it reports the load;
@@ -130,6 +131,7 @@ async function launch(opts = {}) {
   if (opts.rotateFingerprint) args.push("--rotate-fingerprint");
   if (opts.geoipTimezone) args.push("--geoip-timezone");
   if (opts.allowTrackers) args.push("--allow-trackers");
+  if (opts.noImages) args.push("--no-images");
   if (opts.chromeVersion != null) args.push("--chrome-version", String(opts.chromeVersion));
   if (opts.autoSolve === true) args.push("--auto-solve");
   else if (typeof opts.autoSolve === "number") args.push("--auto-solve", String(opts.autoSolve));

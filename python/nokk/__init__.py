@@ -139,6 +139,7 @@ def _build_command(
     rotate_fingerprint: bool,
     geoip_timezone: bool,
     allow_trackers: bool,
+    no_images: bool,
     auto_solve: Union[bool, float, None],
     args: Optional[Sequence[str]],
 ) -> List[str]:
@@ -157,6 +158,8 @@ def _build_command(
         cmd.append("--geoip-timezone")
     if allow_trackers:
         cmd.append("--allow-trackers")
+    if no_images:
+        cmd.append("--no-images")
     if auto_solve is True:
         cmd.append("--auto-solve")
     elif auto_solve not in (None, False):
@@ -271,6 +274,7 @@ def launch(
     rotate_fingerprint: bool = False,
     geoip_timezone: bool = False,
     allow_trackers: bool = False,
+    no_images: bool = False,
     auto_solve: Union[bool, float, None] = None,
     args: Optional[Sequence[str]] = None,
     env: Optional[Mapping[str, str]] = None,
@@ -293,6 +297,8 @@ def launch(
         proxy's exit IP.
     :param allow_trackers: load ad/analytics/tracker subresources (blocked by
         default).
+    :param no_images: do not load images (``<img>``, CSS backgrounds, image
+        preloads), as Chrome with images switched off.
     :param auto_solve: solve Cloudflare challenges (an interstitial or a
         Turnstile widget) on every navigation before it reports the load.
         ``True`` gives each a 30 s budget; a number is the budget in seconds.
@@ -312,6 +318,7 @@ def launch(
         rotate_fingerprint=rotate_fingerprint,
         geoip_timezone=geoip_timezone,
         allow_trackers=allow_trackers,
+        no_images=no_images,
         auto_solve=auto_solve,
         args=args,
     )
@@ -430,6 +437,7 @@ async def launch_async(
     rotate_fingerprint: bool = False,
     geoip_timezone: bool = False,
     allow_trackers: bool = False,
+    no_images: bool = False,
     auto_solve: Union[bool, float, None] = None,
     args: Optional[Sequence[str]] = None,
     env: Optional[Mapping[str, str]] = None,
@@ -449,6 +457,7 @@ async def launch_async(
         rotate_fingerprint=rotate_fingerprint,
         geoip_timezone=geoip_timezone,
         allow_trackers=allow_trackers,
+        no_images=no_images,
         auto_solve=auto_solve,
         args=args,
     )

@@ -53,7 +53,7 @@ const { chromium } = require("playwright");
 Starts the CDP server on a free port and resolves to a `NokkServer`. Options
 (all optional): `host`, `port`, `workers`, `maxContexts`, `proxy`,
 `sessionStore`, `rotateFingerprint`, `geoipTimezone`, `allowTrackers`,
-`chromeVersion`, `autoSolve`, `args`, `env`, `timeout`.
+`noImages`, `chromeVersion`, `autoSolve`, `args`, `env`, `timeout`.
 
 ```js
 // Each browser context looks like a different machine, timezone matched to its proxy:

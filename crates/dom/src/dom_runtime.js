@@ -71,6 +71,65 @@
     return () => { if (!done) { done = true; __loadHold.n--; __loadHold.live.delete(tag); } };
   };
   globalThis.__pt_loadHolds = () => __loadHold.n;
+  // Images switched off by the engine's option: nothing is requested and
+  // nothing fires, as in Chrome with `imagesEnabled=false`. A challenge's own
+  // images still load; its checks need them.
+  const __imageSkipped = (url) => !!globalThis.__pt_noImages
+    && !/\/cdn-cgi\/challenge-platform\/|^https:\/\/challenges\.cloudflare\.com\//.test(String(url));
+  // `loading="lazy"` images and frames wait until their box comes within
+  // 1250px (images) or 2500px (frames) of the viewport: Chrome 151 on a
+  // 4G-class connection, measured at 942px of window (an image at 2150px
+  // loads, at 2250px not; a frame at 3430px loads, at 3445px not). They
+  // never hold `load`; one without a box (`display: none`, not in the
+  // document) never loads. The engine looks after `load`, on each turn and
+  // whenever the tree, the scroll or the viewport changed.
+  const __lazyPending = new Set();
+  const __LAZY_MARGIN = 1250, __LAZY_FRAME_MARGIN = 2500;
+  const __lazyDeferred = (el) => {
+    if (el.__ptLazyGo) return false;
+    if (__s_toLowerCase(__s_trim(String(__ptGetA(el, 'loading') || ''))) !== 'lazy') return false;
+    __lazyPending.add(el);
+    return true;
+  };
+  // At most every max(100 ms, 4x its last cost): it lays the page out, and a
+  // page that changes itself every frame would pay a layout per turn.
+  let __lazyAt = '', __lazyNext = 0;
+  globalThis.__pt_lazyCheck = () => {
+    if (!__lazyPending.size) return;
+    const doc = globalThis.document;
+    if (!doc || (doc.__ptFinishAt | 0) < 2) return;
+    const vw = globalThis.innerWidth || LAYOUT.W, vh = globalThis.innerHeight || LAYOUT.H;
+    const sx = __scrollPos[0], sy = __scrollPos[1];
+    const at = __layoutSeq + ':' + sx + ',' + sy + ':' + vw + 'x' + vh;
+    if (at === __lazyAt) return;
+    const t0 = __perfNow();
+    if (t0 < __lazyNext) return;
+    __lazyAt = at;
+    try { __lazyRun(sx, sy, vw, vh); } finally { __lazyNext = __perfNow() + Math.max(100, 4 * (__perfNow() - t0)); }
+  };
+  function __lazyRun(sx, sy, vw, vh) {
+    const go = [];
+    for (const el of __lazyPending) {
+      if (!el.isConnected) { __lazyPending.delete(el); continue; }
+      const eager = __s_toLowerCase(__s_trim(String(__ptGetA(el, 'loading') || ''))) !== 'lazy';
+      const b = eager ? null : __boxOf(el);
+      if (!eager) {
+        if (!b) continue;
+        const m = el.__ptLocal === 'iframe' ? __LAZY_FRAME_MARGIN : __LAZY_MARGIN;
+        if (b.y > sy + vh + m || b.y + b.h < sy - m) continue;
+        if (b.x > sx + vw + m || b.x + b.w < sx - m) continue;
+      }
+      go.push(el);
+    }
+    for (const el of go) {
+      __lazyPending.delete(el);
+      Object.defineProperty(el, '__ptLazyGo', { value: true, configurable: true, enumerable: false });
+      try {
+        if (el.__ptLocal === 'img') el.__ptLoadImage();
+        else if (el.__ptLocal === 'iframe') el.__ptConnectFrame();
+      } catch (e) {}
+    }
+  }
   Object.defineProperty(globalThis, '__pt_loadHoldList', { value: () => [...__loadHold.live].map((t) => String(t.what)), configurable: true, enumerable: false });
   Object.defineProperty(globalThis, '__pt_holdLoad', { value: __holdLoad, configurable: true, enumerable: false });
   // A stylesheet in the body, with its imports, holds the parser and so
@@ -1178,6 +1237,10 @@
       let url = raw;
       try { url = new URL(raw, document.baseURI || location.href).href; } catch (e) {}
       if (this.__ptImgAt === url) return;                 // same URL: do not load twice
+      // A new address ends the old decode: Chrome rejects what waited on it.
+      if (this.__ptDecodeWait) __imgDecodeSettle(this, false);
+      if (__imageSkipped(url)) return;
+      if (__lazyDeferred(this)) return;
       Object.defineProperty(this, '__ptImgAt', { value: url, configurable: true, enumerable: false });
       Object.defineProperty(this, '__ptImgDone', { value: false, writable: true, configurable: true, enumerable: false });
       if (__s_toLowerCase(String(__ptGetA(this, 'loading') || '')) !== 'lazy') this.__ptHoldLoad();
@@ -1210,7 +1273,7 @@
       if (typeof globalThis.__pt_subresource !== 'function') return;
       // In the document an image starts Medium; one made by script, Low.
       __pt_subresource(url, this.isConnected ? 'image' : 'image-low').then(
-        () => { this.__ptImgDone = true; this.__ptFireLoad(true); },
+        () => { this.__ptImgDone = true; this.__ptFireLoad(!(globalThis.__pt_imageIsBad && __pt_imageIsBad(url))); },
         () => { this.__ptImgDone = true; this.__ptFireLoad(false); },
       );
     }
@@ -1222,6 +1285,10 @@
       // the event, so `isTrusted` is true; an untrusted frame or image load is
       // a tell.
       try { this.dispatchEvent && this.dispatchEvent(__ptTrust(new Event(type))); } catch (e) {}
+      if (this.__ptLocal === 'img') {
+        Object.defineProperty(this, '__ptImgOk', { value: !!ok, writable: true, configurable: true, enumerable: false });
+        __imgDecodeSettle(this, !!ok);
+      }
       this.__ptReleaseLoad();
     }
     // The element's load delays the document's until its own event has fired.
@@ -1312,6 +1379,7 @@
         : rel === 'manifest' ? 'manifest'
         : as === 'script' ? 'link-script' : as === 'style' ? 'link-style' : as === 'font' ? 'link-font'
         : as === 'image' ? 'link-image' : as === 'fetch' ? 'link-fetch' : 'link';
+      if (kind === 'link-image' && __imageSkipped(url)) return;
       // A markup stylesheet blocks the scripts after it until parsed; otherwise
       // they measure an unstyled page (Turnstile's api.js reported the
       // wrapper at the right edge instead of centred).
@@ -1831,6 +1899,7 @@
         }
         return;
       }
+      if (__lazyDeferred(this)) return;
       const id = __nextFrameId++;
       Object.defineProperty(this, '__ptFrameId', { value: id, configurable: true, enumerable: false });
       // The element size travels with the request: the frame context must know
@@ -5688,6 +5757,45 @@
       enumerable: true, configurable: true,
     });
   }
+  // `decode()` as Chrome answers it: resolved once the image has loaded,
+  // `EncodingError` with no `src`, for something that is not an image, or when
+  // `src` changes while it waits; an image not loading (a far lazy one,
+  // images switched off) leaves it pending.
+  function __imgDecodeSettle(el, ok) {
+    const list = el.__ptDecodeWait;
+    if (!list || !list.length) return;
+    el.__ptDecodeWait = null;
+    for (const w of list) {
+      if (ok) w.resolve();
+      else w.reject(__pt_mkErr(globalThis.DOMException || Error, 'The source image cannot be decoded.', 'EncodingError'));
+    }
+  }
+  {
+    const proto = globalThis.HTMLImageElement && HTMLImageElement.prototype;
+    if (proto) {
+      const decode = { decode() {
+        if (!(this instanceof HTMLImageElement)) throw __pt_mkErr(TypeError, 'Illegal invocation');
+        const el = this;
+        return new Promise((resolve, reject) => {
+          if (!__ptGetA(el, 'src')) {
+            reject(__pt_mkErr(globalThis.DOMException || Error, 'The source image cannot be decoded.', 'EncodingError'));
+            return;
+          }
+          if (el.__ptImgDone) {
+            if (el.__ptImgOk) resolve();
+            else reject(__pt_mkErr(globalThis.DOMException || Error, 'The source image cannot be decoded.', 'EncodingError'));
+            return;
+          }
+          if (!el.__ptDecodeWait) Object.defineProperty(el, '__ptDecodeWait', { value: [], writable: true, configurable: true, enumerable: false });
+          el.__ptDecodeWait.push({ resolve, reject });
+        });
+      } }.decode;
+      Object.defineProperty(proto, 'decode', {
+        value: globalThis.__pt_native ? __pt_native(decode) : decode,
+        writable: true, enumerable: true, configurable: true,
+      });
+    }
+  }
   // `complete` is true when there is nothing to load or loading finished, and
   // false while in flight: right after setting `src` it is `false`, and turns
   // `true` with the event.
@@ -8989,7 +9097,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     __CSS_URL.lastIndex = 0;
     for (const u of out) {
-      if (!u || !/^https?:/i.test(u)) continue;
+      if (!u || !/^https?:/i.test(u) || __imageSkipped(u)) continue;
       const rel = __holdLoad('css-image ' + u);
       __pt_subresource(u, 'css-image', __cssUrlRef.get(u) || null).then(rel, rel);
     }

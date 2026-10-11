@@ -135,6 +135,7 @@ Nobody passes selectors: the engine finds and presses the checkbox itself.
 | `rotate_fingerprint` | `False` | Give each browser context its own coherent fingerprint (OS/UA/screen/WebGL + matching TLS). |
 | `geoip_timezone` | `False` | Derive each context's timezone/locale from its proxy's exit IP. |
 | `allow_trackers` | `False` | Load ad/analytics/tracker subresources (blocked by default). |
+| `no_images` | `False` | Do not load images (`<img>`, CSS backgrounds, image preloads). |
 | `auto_solve` | `None` | Solve Cloudflare challenges on every navigation; `True` = 30 s budget, a number = seconds. |
 | `args` | `None` | Extra raw CLI arguments passed to the binary. |
 | `timeout` | `30.0` | Seconds to wait for the server to accept connections. |

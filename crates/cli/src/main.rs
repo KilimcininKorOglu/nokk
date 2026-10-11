@@ -129,6 +129,12 @@ struct Cli {
     #[arg(long, env = "NOKK_ALLOW_TRACKERS")]
     allow_trackers: bool,
 
+    /// Do not load images (`<img>`, CSS backgrounds, image preloads), as Chrome
+    /// does with images switched off: less traffic and faster pages when the
+    /// pictures do not matter. A Cloudflare challenge's own images still load.
+    #[arg(long, env = "NOKK_NO_IMAGES")]
+    no_images: bool,
+
     /// Give each browser context its own coherent fingerprint (OS, UA, screen,
     /// WebGL, and a matching TLS emulation), selected deterministically from the
     /// context's identity. Off by default; useful when driving many isolated
@@ -423,6 +429,7 @@ impl Cli {
             use_real_network: true,
             session_store: self.session_store.clone(),
             block_trackers: !self.allow_trackers,
+            no_images: self.no_images,
             rotate_fingerprint: self.rotate_fingerprint,
             geoip_timezone: self.geoip_timezone,
             chrome_major: self
