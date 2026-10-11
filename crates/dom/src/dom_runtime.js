@@ -49,6 +49,10 @@
   // An engine task (load on readiness, CSP violation, script error) is not a
   // page timer: it must not consume a setTimeout id.
   const __ptLater = (f, d) => (typeof globalThis.__pt_addTask === 'function' ? __pt_addTask(f, d || 0) : setTimeout(f, d || 0));
+  // Layout kept between passes and what a change dropped from it (declared
+  // first: the tree is mutated before the layout code below is reached).
+  let __layoutMemo = new WeakMap();
+  let __layoutDirty = [], __layoutAllDirty = true;
   // Loads the document's `load` event waits for, as Chrome measured: images
   // (hidden and unattached ones too, not lazy ones), frames, stylesheets and
   // their imports, inserted scripts, CSS images of rendered elements, fonts
@@ -488,7 +492,7 @@
       const i = (ref === null || ref === undefined) ? -1 : __s_indexOf(this.__ptKids, ref);
       if (i < 0) this.__ptKids.push(child); else this.__ptKids.splice(i, 0, child);
       child.__ptParent = this;
-      __markDirty();
+      __markDirty(this);
       __styleTouch(this, true);
       __mutation(__childListRecord(this, [child], [], child.previousSibling, child.nextSibling));
       // A frame only becomes a browsing context once it is in the document — and
@@ -510,7 +514,7 @@
           'NotFoundError');
       }
       const prev = this.__ptKids[i - 1] || null, next = this.__ptKids[i + 1] || null;
-      this.__ptKids.splice(i, 1); child.__ptParent = null; __markDirty(); __styleTouch(this, true);
+      this.__ptKids.splice(i, 1); child.__ptParent = null; __markDirty(this); __styleTouch(this, true);
       __mutation(__childListRecord(this, [], [child], prev, next));
       // A removed frame is a closed browsing context. Without this its V8 context
       // outlives the element forever — a widget that replaces its iframe on a
@@ -873,7 +877,7 @@
     get data() { return this.__ptData; }
     // New text means new layout, and `:empty` sees it in the parent's style.
     // Text matches no selector: a change is layout work, not style work.
-    set data(v) { this.__ptData = String(v); if (this.__ptParent) __markDirty(); }
+    set data(v) { this.__ptData = String(v); if (this.__ptParent) __markDirty(this.__ptParent); }
     get nodeName() { return '#text'; }
     get nodeValue() { return this.data; }
     set nodeValue(v) { this.data = String(v); }
@@ -1122,7 +1126,7 @@
             [name, old === undefined ? null : old, String(v), null]);
         }
       }
-      __markDirty();
+      __markDirty(this);
       __mutation({ type: 'attributes', target: this, attributeName: name, attributeNamespace: null,
         oldValue: old === undefined ? null : old, addedNodes: [], removedNodes: [],
         previousSibling: null, nextSibling: null });
@@ -1130,7 +1134,7 @@
     removeAttribute(n) {
       const name = __attrName(this, n), old = this.__ptAttrs.get(name);
       this.__ptAttrs.delete(name);
-      __markDirty();
+      __markDirty(this);
       __styleTouch(this);
       __mutation({ type: 'attributes', target: this, attributeName: name, attributeNamespace: null,
         oldValue: old === undefined ? null : old, addedNodes: [], removedNodes: [],
@@ -1876,7 +1880,7 @@
       sr.__ptSerializable = !!init.serializable;
       sr.__ptSlotAssignment = init.slotAssignment === 'manual' ? 'manual' : 'named';
       this.__ptShadow = sr;
-      __markDirty();
+      __markDirty(this);
       __styleTouch(this);
       return sr;
     }
@@ -2046,7 +2050,7 @@
     // input/textarea typing works; harmless on other elements.
     get value() { return this.__ptValue !== undefined ? this.__ptValue : (__ptGetA(this, 'value') || ''); }
     // Form state is styled (`:checked ~ x`, `:placeholder-shown`): new layout.
-    set value(v) { this.__ptValue = String(v); __markDirty(); }
+    set value(v) { this.__ptValue = String(v); __markDirty(this); }
     // Common form-field surface, reflected from attributes — drivers gate `fill`
     // and `select` on these (an input with no `type`/`disabled`/`readOnly` fails
     // Playwright's fillability check).
@@ -2100,7 +2104,7 @@
       try { return globalThis.__pt_imageSizeOf ? __pt_imageSizeOf(this.__ptImgAt) : null; } catch (e) { return null; }
     }
     get checked() { return this.__ptChecked !== undefined ? this.__ptChecked : __ptHasA(this, 'checked'); }
-    set checked(v) { this.__ptChecked = !!v; __markDirty(); }
+    set checked(v) { this.__ptChecked = !!v; __markDirty(this); }
     get selectionStart() { return String(this.value || '').length; }
     get selectionEnd() { return String(this.value || '').length; }
     select() {}
@@ -4107,7 +4111,7 @@
         const s = st(this); if (!s) return;
         if (s.computed) throw __pt_mkErr(globalThis.DOMException || Error, "Failed to set the 'cssText' property on 'CSSStyleDeclaration': These styles are computed, and therefore read-only.", 'NoModificationAllowedError');
         if (s.el && s.el.setAttribute) __ptSetA(s.el, 'style', String(v));
-        __markDirty();
+        __markDirty(s.el || null);
       });
     try {
       Object.defineProperty(proto, Symbol.iterator, {
@@ -4229,7 +4233,7 @@
       if (!el) __styleAllStale = true;
       if (el && el.setAttribute) __ptSetA(el, 'style', text);
       reindex(__styleNames(m));
-      __markDirty();
+      __markDirty(el || null);
     };
     // Chrome's shape: methods and `length` on the prototype; own properties are
     // the CSS property names, all 703, in the same order.
@@ -5034,7 +5038,7 @@
     if (!old || !old.length) return;
     node.__ptKids = [];
     for (const c of old) c.__ptParent = null;
-    __markDirty();
+    __markDirty(node);
     __styleTouch(node, true);
     __mutation(__childListRecord(node, [], old, null, null));
     let frameLeft = false;
@@ -5543,7 +5547,7 @@
     const O_ = proto('HTMLOptionElement');
     defPair(O_, 'selected', function () { return isSelected(this); }, function (v) {
       this.__ptSelected = !!v;
-      __markDirty();
+      __markDirty(this);
       if (v) { let p = this.parentNode; if (p && isTag(p, 'optgroup')) p = p.parentNode; if (p && isTag(p, 'select') && !__ptHasA(p, 'multiple')) for (const o of selOptions(p)) if (o !== this) o.__ptSelected = false; }
     });
     defPair(O_, 'value', function () { return optValue(this); }, function (v) { __ptSetA(this, 'value', String(v)); });
@@ -7297,7 +7301,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     get willValidate() { return __candidate(this); },
     checkValidity() { const r = __validity(this); if (__candidate(this) && !r.valid) { __fireInvalid(this); return false; } return true; },
     reportValidity() { const r = __validity(this); if (__candidate(this) && !r.valid) { __fireInvalid(this); return false; } return true; },
-    setCustomValidity(m) { if (arguments.length < 1) throw __pt_mkErr(TypeError, "Failed to execute 'setCustomValidity' on '" + (this.constructor && this.constructor.name) + "': 1 argument required, but only 0 present."); __customValidity.set(this, String(m)); __markDirty(); },
+    setCustomValidity(m) { if (arguments.length < 1) throw __pt_mkErr(TypeError, "Failed to execute 'setCustomValidity' on '" + (this.constructor && this.constructor.name) + "': 1 argument required, but only 0 present."); __customValidity.set(this, String(m)); __markDirty(this); },
   };
   for (const name of ['HTMLInputElement', 'HTMLTextAreaElement', 'HTMLSelectElement', 'HTMLButtonElement', 'HTMLFieldSetElement', 'HTMLOutputElement', 'HTMLObjectElement']) {
     const C = globalThis[name];
@@ -7748,6 +7752,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (on === __rendered) return;
     __rendered = on;
     __layoutBuilt = -1;
+    __layoutAllDirty = true;
   };
 
   // Relayout this document. Called from another realm: the page measures its
@@ -7779,6 +7784,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       } catch (e) {}
     }
     __layoutBuilt = -1;   // recompute boxes for the new size
+    __layoutAllDirty = true;
   };
   let __layoutSeq = 0;      // bumped on every DOM mutation
   let __layoutBuilt = -1;   // __layoutSeq the current boxes were built at
@@ -7787,8 +7793,30 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   let __mouseDownEl = null;
   let __hoverEl = null; // element the pointer is currently over
 
-  function __markDirty() {
+  // A change for layout: with the node it happened at, only that node's and
+  // its ancestors' kept layouts are dropped (`__layoutOne`); without one,
+  // all of them.
+  function __markDirty(node) {
     __layoutSeq++;
+    if (__layoutAllDirty) return;
+    if (!node || __layoutDirty.length >= 4000) { __layoutAllDirty = true; __layoutDirty = []; return; }
+    __layoutDirty.push(node);
+  }
+  // Drop the kept layouts a change reaches: the node and every box around it.
+  function __layoutForget() {
+    if (__layoutAllDirty) {
+      __layoutMemo = new WeakMap();
+      __layoutAllDirty = false;
+      __layoutDirty = [];
+      return;
+    }
+    for (const node of __layoutDirty) {
+      for (let n = node; n; n = n.parentNode || n.__ptHost || null) {
+        if (!__layoutMemo.delete(n) && n.nodeType === ELEMENT_NODE && n.__ptLayoutUp === __layoutBuilt) break;
+        if (n.nodeType === ELEMENT_NODE) n.__ptLayoutUp = __layoutBuilt;
+      }
+    }
+    __layoutDirty = [];
   }
 
   // --- MutationObserver ---------------------------------------------------
@@ -8659,23 +8687,24 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       __styleCache = new WeakMap();
       __styleTouched = [];
       __styleAllStale = false;
+      __layoutAllDirty = true;
       return null;
     }
     const drop = (n) => {
       __lstats.dropped++;
       __styleCache.delete(n);
+      __layoutMemo.delete(n);
       for (const k of (n.__ptKids || [])) if (k.nodeType === ELEMENT_NODE) drop(k);
       if (n.__ptShadow) for (const k of (n.__ptShadow.__ptKids || [])) if (k.nodeType === ELEMENT_NODE) drop(k);
     };
     const roots = __styleTouched;
-    for (const r of roots) drop(r);
+    for (const r of roots) { drop(r); if (!__layoutAllDirty) __layoutDirty.push(r); }
     __styleTouched = [];
     return roots;
   }
   // Font size and inherited values walk the ancestors and are asked many
   // times per pass; cache them for the cascade's lifetime.
   let __passFont = new WeakMap();
-  let __passInherit = new WeakMap();
   let __passCustom = new WeakMap();
   // Hidden by the cascade: `display: none`, or with `invisible` also
   // `visibility: hidden`/`collapse`. Read off the element's cascade, which is
@@ -9189,7 +9218,6 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __rules = [];
     __passBloom = new WeakMap();
     __passFont = new WeakMap();
-    __passInherit = new WeakMap();
     __passCustom = new WeakMap();
     __foreignRules = new WeakMap();
     const doc = globalThis.document;
@@ -9443,6 +9471,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const sub = __ptSubstVars(v, vars);
       if (sub != null) take(n, sub);
     }
+    out.__ptVars = vars;
     if (volatile) { __styleVolatile.add(el); __stylePass.set(el, out); } else __styleCache.set(el, out);
     return out;
   }
@@ -9455,7 +9484,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const parent = el.parentNode && el.parentNode.nodeType === ELEMENT_NODE ? el.parentNode
       : (el.parentNode && el.parentNode.host) || null;
     let base = null;
-    if (parent) { __cascadeFor(parent); base = __passCustom.get(parent) || null; }
+    // The parent's variables: from this pass, or kept with its cascade when
+    // that came from the cache (a change below it does not recompute it).
+    if (parent) { const pc = __cascadeFor(parent); base = __passCustom.get(parent) || pc.__ptVars || null; }
     if (!mine || !mine.size) {
       const same = base || Object.create(null);
       __passCustom.set(el, same);
@@ -10041,12 +10072,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   // Flex and grid lay a child out more than once (measure, then place), so
   // nested containers repeated whole subtrees exponentially: 60 s on a store
-  // locator page. Within one pass, a call with the same constraints as an
-  // earlier one restores that result instead, moved to the new origin. Only
+  // locator page. A call with the same constraints as an earlier one (in this
+  // pass, or an earlier one if no change reached the element since, see
+  // `__layoutForget`) restores that result instead, moved to the new origin. Only
   // moves on the 1/64 px grid: lengths are floored to it, and such a move
   // floors the same as a fresh layout (off-grid positions may differ in the
   // last bit of the double).
-  let __layoutMemo = new WeakMap();
   // Frames told their size during this pass, in order: a restored subtree
   // tells them again exactly as a fresh layout would.
   let __tellLog = [];
@@ -10099,6 +10130,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (n.__ptBox) snap.push([n, n.__ptBox, n.__ptDefH]);
     }
     if (!mine) __layoutMemo.set(el, (mine = new Map()));
+    // Kept across passes now: a few constraint sets per element, not all of
+    // them ever seen.
+    else if (mine.size >= 8) mine.clear();
     mine.set(key, { ox: originX, oy: originY, snap, seq, tells });
     return ret;
   }
@@ -10726,7 +10760,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       }
     } catch (e) {}
     if (!__rendered) return;
-    __layoutMemo = new WeakMap();
+    __layoutForget();
     __tellLog = [];
     __layoutOne(de, 0, 0, LAYOUT.W);
     // In quirks mode the root and body stretch to the viewport: an empty
@@ -10843,22 +10877,23 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     '-webkit-border-vertical-spacing', '-webkit-ruby-position',
     '-webkit-tap-highlight-color', '-webkit-text-combine',
   ]);
-  /// Value of an inherited property: the nearest ancestor that sets it.
+  /// Value of an inherited property: the nearest ancestor that sets it. One
+  /// step at a time, each answer kept with the element's cascade (dropped
+  /// with it), so a tree costs one lookup per element and property, not one
+  /// walk to the root.
   const __inheritedValue = (el, prop) => {
-    let own = el && el.nodeType === ELEMENT_NODE ? __passInherit.get(el) : null;
-    if (own) {
-      const hit = own.get(prop);
-      if (hit !== undefined) return hit;
-    }
+    if (!el || el.nodeType !== ELEMENT_NODE) return null;
+    const cs = __cascadeFor(el);
+    const own = cs.__ptInh || (cs.__ptInh = new Map());
+    const hit = own.get(prop);
+    if (hit !== undefined) return hit;
+    const p = el.parentNode;
     let out = null;
-    for (let e = el && el.parentNode; e && e.nodeType === ELEMENT_NODE; e = e.parentNode) {
-      const raw = __cascadeFor(e).get(prop);
-      if (raw != null) { out = __resolveLength(raw, prop, __usedFontSize(e), e); break; }
+    if (p && p.nodeType === ELEMENT_NODE) {
+      const raw = __cascadeFor(p).get(prop);
+      out = raw != null ? __resolveLength(raw, prop, __usedFontSize(p), p) : __inheritedValue(p, prop);
     }
-    if (el && el.nodeType === ELEMENT_NODE) {
-      if (!own) { own = new Map(); __passInherit.set(el, own); }
-      own.set(prop, out);
-    }
+    own.set(prop, out);
     return out;
   };
 
@@ -11114,7 +11149,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   // boxes (auto margins, percentages).
   function __computedBuild(el, withLayout) {
     const flags = { auto: false, pct: null };
-    const map = new Map();
+    let map = new Map();
     // An element outside the rendered tree has no computed style: Chrome
     // returns '' for every property and `length` 0.
     const connected = !!(el && el.nodeType === ELEMENT_NODE && el.isConnected);
@@ -11132,7 +11167,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       __addShorthands(map);
       return { map, names, flags };
     }
-    for (const k of CS_ORDER) map.set(k, CS_BASE[k]);
+    map = new Map(__csBaseMap());
     const tag = (el && el.localName) || 'div';
     if (CS_DISPLAY[tag] === 'inline' || CS_INLINE) {
       const inlineish = CS_DISPLAY[tag] === 'inline';
@@ -11152,7 +11187,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         if (cascade.has(prop)) continue;
         const v = __inheritedValue(el, prop);
         if (v == null) continue;
-        const pairs = __ptExpand(prop, v);
+        const pairs = __expandMemo(prop, v);
         if (pairs) { for (const [k, val] of pairs) if (map.has(k)) map.set(k, val); continue; }
         if (map.has(prop)) map.set(prop, v);
       }
@@ -11172,7 +11207,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       const written = new Set();
       for (const [n, raw] of cascade) {
         const v = __resolveLength(raw, n, fs, el);
-        const pairs = __ptExpand(n, v);
+        const pairs = __expandMemo(n, v);
         if (pairs) {
           for (const [k, val] of pairs) { put(k, val); written.add(k); }
           continue;
@@ -11212,9 +11247,9 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         }
       }
       // Any sRGB colour is normalised to `rgb(…)`.
-      for (const k of map.keys()) {
-        if (k !== 'color' && !__s_endsWith(k, '-color')) continue;
-        const norm = globalThis.__pt_cssColour && globalThis.__pt_cssColour(map.get(k));
+      for (const k of __CS_COLOUR_KEYS) {
+        if (!map.has(k)) continue;
+        const norm = __colourMemo(map.get(k));
         if (norm) map.set(k, norm);
       }
       // `currentColor` is the initial value of several properties; Chrome
@@ -11345,23 +11380,54 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       }
     }
     // Numbers print with six significant digits: `138.828125px` -> `138.828px`.
-    for (const k of map.keys()) {
-      const v = map.get(k);
-      if (typeof v === 'string' && v && /\d/.test(v) && !(__s_charCodeAt(k, 0) === 45 && __s_charCodeAt(k, 1) === 45)) {
-        try { map.set(k, __cssNumbers(v)); } catch (e) {}
+    for (const [k, v] of map) {
+      if (typeof v === 'string' && v && !(__s_charCodeAt(k, 0) === 45 && __s_charCodeAt(k, 1) === 45)) {
+        const n = __numbersMemo(v);
+        if (n !== v) map.set(k, n);
       }
     }
     const names = [...map.keys()];
-    __addShorthands(map);
-    // Custom properties are readable via `getPropertyValue('--name')` but not
-    // enumerated.
-    if (el && el.nodeType === ELEMENT_NODE) {
-      const vars = __passCustom.get(el);
-      if (vars) for (const k in vars) if (typeof vars[k] === 'string') map.set(k, vars[k]);
-    }
+    // Shorthands are assembled when one is asked for (`__computedValue`).
     if (flags.pct) flags.pct = __geoClosure(flags.pct);
-    return { map, names, flags };
+    return { map, names, flags, sh: false };
   }
+  // Strings repeat across elements (`0px`, `rgb(0, 0, 0)`): formatting is
+  // remembered per string.
+  const __CS_COLOUR_KEYS = [];
+  const __memoOf = (f) => {
+    const m = new Map();
+    return (v) => {
+      let hit = m.get(v);
+      if (hit !== undefined) return hit;
+      try { hit = f(v); } catch (e) { hit = v; }
+      if (m.size > 8192) m.clear();
+      m.set(v, hit);
+      return hit;
+    };
+  };
+  // Shorthand expansion by property and value; the pairs are shared, read only.
+  const __expandMemoMap = new Map();
+  const __expandMemo = (prop, v) => {
+    const key = prop + '\u0000' + v;
+    let hit = __expandMemoMap.get(key);
+    if (hit !== undefined) return hit;
+    hit = __ptExpand(prop, v) || null;
+    if (__expandMemoMap.size > 8192) __expandMemoMap.clear();
+    __expandMemoMap.set(key, hit);
+    return hit;
+  };
+  const __numbersMemo = __memoOf((v) => (/\d/.test(v) ? __cssNumbers(v) : v));
+  const __colourMemo = __memoOf((v) => (globalThis.__pt_cssColour ? globalThis.__pt_cssColour(v) || null : null));
+  let __CS_BASE_MAP = null;
+  const __csBaseMap = () => {
+    if (__CS_BASE_MAP) return __CS_BASE_MAP;
+    __CS_BASE_MAP = new Map();
+    for (const k of CS_ORDER) {
+      __CS_BASE_MAP.set(k, CS_BASE[k]);
+      if (k === 'color' || __s_endsWith(k, '-color')) __CS_COLOUR_KEYS.push(k);
+    }
+    return __CS_BASE_MAP;
+  };
   // Every name whose answer follows from these longhands: logical mirrors,
   // shorthands, `-webkit-` aliases.
   function __geoClosure(keys) {
@@ -11413,13 +11479,26 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   function __computedValue(el, key) {
     const { st, style } = __computedNow(el);
     if (!st.cs) return style.map.get(key);
+    // Custom properties are readable via `getPropertyValue('--name')` but not
+    // enumerated; read straight from the element's variables.
+    if (__s_charCodeAt(key, 0) === 45 && __s_charCodeAt(key, 1) === 45) {
+      const v = st.cs.__ptVars && st.cs.__ptVars[key];
+      return typeof v === 'string' ? v : undefined;
+    }
     const f = style.flags;
+    const read = (r) => {
+      const v = r.map.get(key);
+      if (v !== undefined || r.sh) return v;
+      r.sh = true;
+      __addShorthands(r.map);
+      return r.map.get(key);
+    };
     if (__GEO_ALWAYS.has(key) || (f.auto && __GEO_MARGIN.has(key)) || (f.pct && f.pct.has(key))) {
       __relayout();
       if (st.geoAt !== __layoutBuilt || !st.geo) { st.geo = __computedBuild(el, true); st.geoAt = __layoutBuilt; }
-      return st.geo.map.get(key);
+      return read(st.geo);
     }
-    return style.map.get(key);
+    return read(style);
   }
   function __computedNames(el) {
     if (!el || el.nodeType !== ELEMENT_NODE || !el.isConnected) return [];
