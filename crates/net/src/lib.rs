@@ -348,6 +348,9 @@ pub enum RequestKind {
     /// `<video>` and `<audio>` sources: a Range request for the whole file.
     Video,
     Audio,
+    /// `<link rel=prerender>`: Chrome's no-state prefetch, a navigation's
+    /// request marked `Sec-Purpose: prefetch`.
+    Prerender,
     /// The CORS preflight (`OPTIONS`) before a non-simple cross-origin request.
     Preflight,
 }
@@ -358,7 +361,7 @@ impl RequestKind {
     /// The `Accept` a browser sends for this destination.
     fn accept(self) -> &'static str {
         match self {
-            RequestKind::Document | RequestKind::Iframe | RequestKind::Prefetch => DOC_ACCEPT,
+            RequestKind::Document | RequestKind::Iframe | RequestKind::Prefetch | RequestKind::Prerender => DOC_ACCEPT,
             RequestKind::Subresource | RequestKind::ImageCors => "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
             RequestKind::Style => "text/css,*/*;q=0.1",
             _ => "*/*",
@@ -368,7 +371,7 @@ impl RequestKind {
     /// `Sec-Fetch-Dest` / `-Mode`, measured from Chrome.
     fn sec_fetch(self) -> (&'static str, &'static str) {
         match self {
-            RequestKind::Document => ("document", "navigate"),
+            RequestKind::Document | RequestKind::Prerender => ("document", "navigate"),
             RequestKind::Iframe => ("iframe", "navigate"),
             RequestKind::Script => ("script", "no-cors"),
             RequestKind::ModuleScript => ("script", "cors"),
@@ -394,7 +397,7 @@ impl RequestKind {
             | RequestKind::Font | RequestKind::Worker | RequestKind::XhrNoCors | RequestKind::Preflight => 1,
             RequestKind::Subresource | RequestKind::ImageCors | RequestKind::Manifest => 2,
             RequestKind::Video | RequestKind::Audio => 3,
-            RequestKind::Prefetch | RequestKind::Beacon => 4,
+            RequestKind::Prefetch | RequestKind::Beacon | RequestKind::Prerender => 4,
         }
     }
 
@@ -408,7 +411,7 @@ impl RequestKind {
 
     /// A navigation (top or frame): navigation headers and order.
     fn navigates(self) -> bool {
-        matches!(self, RequestKind::Document | RequestKind::Iframe)
+        matches!(self, RequestKind::Document | RequestKind::Iframe | RequestKind::Prerender)
     }
 
     /// Element-initiated CORS loads carry `Origin` even same-origin.
@@ -866,7 +869,7 @@ impl FingerprintClient {
             let value = if req.kind.incremental() { format!("u={u}, i") } else { format!("u={u}") };
             rb = rb.header("priority", value);
         }
-        if req.kind == RequestKind::Prefetch {
+        if matches!(req.kind, RequestKind::Prefetch | RequestKind::Prerender) {
             rb = rb.header("sec-purpose", "prefetch");
         }
         // Credentials: a page's own request across origins goes without
@@ -957,6 +960,9 @@ impl FingerprintClient {
             order.insert("user-agent");
         }
         order.insert("accept");
+        if req.kind == RequestKind::Prerender {
+            order.insert("sec-purpose");
+        }
         // A restart for `Critical-CH` adds the hints after `accept`.
         if critical_retry && !subresource {
             for name in client_hints::BASE.iter().chain(client_hints::NAVIGATION_ORDER.iter().filter(|n| extra_hints.contains(n))) {

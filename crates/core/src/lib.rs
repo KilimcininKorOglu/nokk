@@ -987,6 +987,9 @@ enum Deliver {
     Worker(nokk_pool::WorkerId, usize),
 }
 
+/// A request on its way: what it was, and the task bringing the answer.
+type Sending = (FetchInfo, tokio::task::JoinHandle<Result<nokk_net::Response, NetError>>);
+
 struct InFlight {
     deliver: Deliver,
     info: FetchInfo,
@@ -2006,6 +2009,7 @@ impl BrowserContext {
                 self.frames_take_a_turn().await;
                 let is_async = page.script_modes.get(idx) == Some(&nokk_dom::ScriptMode::Async);
                 self.wait_for_blocking_sheets(index, if is_async { SHEETS_WAIT_ASYNC } else { SHEETS_WAIT }).await;
+                self.send_early_fetches(index, base_url).await;
             }
             // `<script nomodule>` is addressed to a browser without modules. We
             // have them, so we are not the audience — and a site that ships both
@@ -2338,6 +2342,27 @@ impl BrowserContext {
             self.apply_ws_ops(&base, &ws_ops).await;
             let delivered = self.deliver_ws_events(index).await?;
 
+            // The round's requests go out first: the frames, scripts and imports
+            // below can take a second, and a font or stylesheet asked for this turn
+            // must not wait for them (GitHub's `load` waited 2 s on a font that
+            // was never sent while `import()` chunks loaded one by one). The
+            // answers are settled after them, in step 5.
+            let mut sent: Vec<(Vec<String>, Vec<Sending>)> = Vec::new();
+            for batch in reqs.chunks(MAX_FETCHES) {
+                let mut settles = Vec::new();
+                let mut out = Vec::new();
+                for r in batch {
+                    match self.prepare_fetch(index, &base, r) {
+                        Prepared::Settled(js) => settles.push(js),
+                        Prepared::Send(req, info) => {
+                            let client = self.client.clone();
+                            out.push((info, tokio::spawn(async move { client.send(*req).await })));
+                        }
+                    }
+                }
+                sent.push((settles, out));
+            }
+
             // 4. Frames the page just connected get built now — that is cheap, and
             //    a widget polls `contentWindow` the instant it inserts one. Scripts
             //    it inserted run here too, before the round's fetches: everything
@@ -2368,6 +2393,12 @@ impl BrowserContext {
                             op["body"].as_str().unwrap_or("").to_string(),
                         ));
                         let post_ref = post.as_ref().map(|(c, b)| (c.as_str(), b.as_str()));
+                        // The old document's requests die with it.
+                        for (_, out) in &sent {
+                            for (_, h) in out {
+                                h.abort();
+                            }
+                        }
                         if let Err(e) = Box::pin(self.navigate_inner(&to, from.as_deref(), post_ref)).await {
                             tracing::debug!(url = %to, error = %e, "self-navigation failed");
                         }
@@ -2402,18 +2433,7 @@ impl BrowserContext {
             // Each answer reaches the page as it arrives, as in a browser: a fast
             // response is not held behind the slowest of its round (Wikipedia's `load`
             // waited six seconds behind images nobody waited for).
-            for batch in reqs.chunks(MAX_FETCHES) {
-                let mut settles = Vec::new();
-                let mut out: Vec<(FetchInfo, tokio::task::JoinHandle<Result<nokk_net::Response, NetError>>)> = Vec::new();
-                for r in batch {
-                    match self.prepare_fetch(index, &base, r) {
-                        Prepared::Settled(js) => settles.push(js),
-                        Prepared::Send(req, info) => {
-                            let client = self.client.clone();
-                            out.push((info, tokio::spawn(async move { client.send(*req).await })));
-                        }
-                    }
-                }
+            for (mut settles, mut out) in sent {
                 let grace = std::time::Instant::now() + PAGE_FETCH_GRACE;
                 loop {
                     let mut i = 0;
@@ -4380,20 +4400,44 @@ impl BrowserContext {
                 asked.extend(more.into_iter().map(|(id, _, r, sp)| (id, index, r, sp)));
             }
         }
+        // The referrer is the address the module was compiled under, so a
+        // relative specifier resolves against it exactly as in a browser.
+        let targets: Vec<Option<String>> = asked.iter().map(|(_, _, r, sp)| resolve_url(r, sp)).collect();
+        // All roots load together, as in a browser; one after another cost GitHub
+        // a second and a half per round of chunks.
+        // One request per address and realm (the module map), however many ask.
+        let mut unique: Vec<(usize, String)> = Vec::new();
+        for (t, a) in targets.iter().zip(&asked) {
+            if let Some(t) = t {
+                if !unique.iter().any(|(i, u)| *i == a.1 && u == t) {
+                    unique.push((a.1, t.clone()));
+                }
+            }
+        }
+        let got = self
+            .with_frames_live(futures_util::future::join_all(
+                unique.iter().map(|(i, t)| self.fetch_text_in(*i, t, "module", None)),
+            ))
+            .await;
+        let fetched: Vec<Option<Result<(String, String), String>>> = targets
+            .iter()
+            .zip(&asked)
+            .map(|(t, a)| {
+                let t = t.as_ref()?;
+                let k = unique.iter().position(|(i, u)| *i == a.1 && u == t)?;
+                Some(got[k].as_ref().map(|v| v.clone()).map_err(|e| e.to_string()))
+            })
+            .collect();
         let mut served = 0;
-        for (id, index, referrer, specifier) in asked {
-            // The referrer is the address the module was compiled under, so a
-            // relative specifier resolves against it exactly as in a browser.
-            let outcome = match resolve_url(&referrer, &specifier) {
+        for ((id, index, _, specifier), got) in asked.into_iter().zip(fetched) {
+            let outcome = match got {
                 None => Err(format!(
                     "Failed to resolve module specifier '{specifier}'"
                 )),
-                Some(target) => match self.with_frames_live(self.fetch_text_in(index, &target, "module", None)).await {
-                    Err(e) => Err(format!("Failed to fetch dynamically imported module: {e}")),
-                    Ok((final_url, code)) => match self.run_module(index, &final_url, code).await {
-                        Err(e) => Err(e.to_string()),
-                        Ok(()) => Ok(final_url),
-                    },
+                Some(Err(e)) => Err(format!("Failed to fetch dynamically imported module: {e}")),
+                Some(Ok((final_url, code))) => match self.run_module(index, &final_url, code).await {
+                    Err(e) => Err(e.to_string()),
+                    Ok(()) => Ok(final_url),
                 },
             };
             let settle = outcome.as_ref().map(|u| u.as_str()).map_err(Clone::clone);
@@ -5036,6 +5080,33 @@ impl BrowserContext {
 
     /// Deliver replies that have arrived: record the request and settle the promise
     /// where it was made.
+    /// Between the document's scripts: a style pass (throttled as on every turn),
+    /// then whatever the page has asked for goes out now and is answered by a later
+    /// turn. A browser's network does not wait for the parser: GitHub's second font
+    /// went out at 0.5 s in Chrome and only after `DOMContentLoaded` here.
+    async fn send_early_fetches(&self, index: usize, base: &str) {
+        const EARLY: &str = "typeof __pt_drainFetchQueue === 'function' ? __pt_drainFetchQueue() : '[]'";
+        let reqs: Vec<Value> = match self.eval_in(index, EARLY).await {
+            Ok(Value::String(q)) => serde_json::from_str(&q).unwrap_or_default(),
+            _ => return,
+        };
+        let doc = Some(self.doc_seq.load(std::sync::atomic::Ordering::Acquire));
+        for r in &reqs {
+            match self.prepare_fetch(index, base, r) {
+                Prepared::Settled(js) => {
+                    let _ = self.eval_in(index, &js).await;
+                }
+                Prepared::Send(req, info) => {
+                    let client = self.client.clone();
+                    let handle = tokio::spawn(async move { client.send(*req).await });
+                    if let Ok(mut v) = self.inflight.lock() {
+                        v.push(InFlight { deliver: Deliver::Frame(index), info, handle, doc });
+                    }
+                }
+            }
+        }
+    }
+
     async fn settle_inflight(&self) -> Result<usize, EngineError> {
         let done: Vec<InFlight> = match self.inflight.lock() {
             Ok(mut v) => {
@@ -5487,6 +5558,7 @@ impl BrowserContext {
             "font" => (K::Font, Some(0), false),
             "link-fetch" => (K::PreloadFetch, None, false),
             "prefetch" => (K::Prefetch, None, false),
+            "prerender" => (K::Prerender, None, false),
             // A manifest is fetched with credentials `omit`.
             "manifest" => (K::Manifest, None, true),
             _ => (K::Xhr, None, false),
@@ -5858,9 +5930,11 @@ const SHEETS_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 const SHEETS_LEFT: &str = "globalThis.__ptBlockingSheets | 0";
 /// Loads `DOMContentLoaded` waits for (stylesheets in the body).
 const DCL_HOLDS: &str = "typeof __pt_dclHolds === 'function' ? __pt_dclHolds() : 0";
-/// Loads `load` waits for. The style pass that starts CSS images and fonts runs
-/// once before the wait and then with every turn of the loop (`DRAIN_IO`).
-const LOAD_HOLDS: &str = "typeof __pt_loadHolds === 'function' ? __pt_loadHolds() : 0";
+/// Loads `load` waits for. Each look runs the style pass first, throttled, and
+/// unthrottled once nothing is left: what an import that just arrived styles
+/// must start loading before `load` can go out, but a page that changes its
+/// tree on every turn must not pay a full pass per look.
+const LOAD_HOLDS: &str = "typeof __pt_loadHoldsStyled === 'function' ? __pt_loadHoldsStyled() : 0";
 /// The longest a lifecycle event is held for loads that do not come.
 const HOLD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// An async script does not wait for stylesheets in a browser. It waits briefly here so
@@ -10015,6 +10089,50 @@ mod tests {
         assert_eq!(out["has"], 1, "{out}");
         assert_eq!(out["form"], serde_json::json!(["d", "e"]), "{out}");
         assert_eq!(out["scope"], 3, "{out}");
+    }
+
+    /// Cascade layers and `!important` (a later layer wins a normal declaration,
+    /// an earlier one an important one), rules keyed by their `:is()`/`:where()`
+    /// arguments, and Chrome's serialization of colours and font families.
+    #[tokio::test]
+    async fn cascade_layers_importance_and_is_keys() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<html><head><style>
+               @layer base, theme;
+               @layer theme { #a { color: rgb(0, 0, 255); } }
+               @layer base { #a { color: rgb(255, 0, 0); } #b { color: rgb(255, 0, 0) !important; } }
+               @layer theme { #b { color: rgb(0, 128, 0) !important; } }
+               #c { color: rgb(0, 0, 255) !important; }
+               #c { color: rgb(255, 0, 0); }
+               .box :is(.x, .y) { margin-left: 7px; }
+               :where(.u) { padding-left: 3px; }
+               #d { color: rgb(255 0 0 / 50%); font-family: 'Arial', \"Helvetica Neue\", sans-serif; }
+             </style></head><body><div id=a></div><div id=b></div><div id=c></div>\
+             <div class=box><span id=x class=\"x y\"></span><span id=y class=y></span></div>\
+             <span id=z class=x></span><div id=u class=u></div><div id=d></div></body></html>",
+        )
+        .await
+        .unwrap();
+        let out = probe(
+            &ctx,
+            "(() => { const cs = (id) => getComputedStyle(document.getElementById(id));
+               return __ptJSON.stringify({
+                 a: cs('a').color, b: cs('b').color, c: cs('c').color,
+                 is: [cs('x').marginLeft, cs('y').marginLeft, cs('z').marginLeft], u: cs('u').paddingLeft,
+                 d: [cs('d').color, cs('d').fontFamily],
+               }); })()",
+        )
+        .await;
+        assert_eq!(out["a"], "rgb(0, 0, 255)", "{out}");
+        assert_eq!(out["b"], "rgb(255, 0, 0)", "{out}");
+        assert_eq!(out["c"], "rgb(0, 0, 255)", "{out}");
+        assert_eq!(out["is"], serde_json::json!(["7px", "7px", "0px"]), "{out}");
+        assert_eq!(out["u"], "3px", "{out}");
+        assert_eq!(out["d"], serde_json::json!(["rgba(255, 0, 0, 0.5)", "Arial, \"Helvetica Neue\", sans-serif"]), "{out}");
     }
 
     /// Modern CSS values: `var()` with fallback, registered custom properties,

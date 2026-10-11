@@ -8289,9 +8289,13 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     const p = new Promise((resolve, reject) => { pending.set(id, { resolve, reject, url, cors }); });
     subresources.set(url, p);
     // A failure is not worth remembering: a browser retries a broken image.
-    p.catch(() => { subresources.delete(url); });
+    p.then(() => { subresourcesDone.add(url); }, () => { subresources.delete(url); });
     return p;
   };
+  // Addresses whose answer is in: a style pass asking for one again holds
+  // nothing (the document's `load` must not wait on a settled load).
+  const subresourcesDone = new Set();
+  Object.defineProperty(globalThis, '__pt_subresourceDone', { value: (url) => subresourcesDone.has(String(url)), configurable: true, enumerable: false });
   // The body of a subresource as text (null when it failed), read once and
   // shared: an import and a font face may name the same address.
   const subresourceTexts = new Map();

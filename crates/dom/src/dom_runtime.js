@@ -71,6 +71,12 @@
     return () => { if (!done) { done = true; __loadHold.n--; __loadHold.live.delete(tag); } };
   };
   globalThis.__pt_loadHolds = () => __loadHold.n;
+  Object.defineProperty(globalThis, '__pt_loadHoldsStyled', { value: () => {
+    if (typeof globalThis.__pt_cssLoads !== 'function') return __loadHold.n;
+    __pt_cssLoads();
+    if (__loadHold.n === 0) __pt_cssLoads(true);
+    return __loadHold.n;
+  }, configurable: true, enumerable: false });
   // Images switched off by the engine's option: nothing is requested and
   // nothing fires, as in Chrome with `imagesEnabled=false`. A challenge's own
   // images still load; its checks need them.
@@ -1397,13 +1403,21 @@
       // after load, see the engine), `apple-touch-icon` is not fetched by
       // desktop Chrome, and the rest (`alternate`, `canonical`,
       // `dns-prefetch`) make no request.
-      if (!/^(stylesheet|preload|prefetch|modulepreload|manifest)$/.test(rel)) return;
+      if (!/^(stylesheet|preload|prefetch|modulepreload|manifest|prerender)$/.test(rel)) return;
       const raw = __ptGetA(this, 'href');
       if (!raw) return;
       let url = raw;
       try { url = new URL(raw, document.baseURI || location.href).href; } catch (e) {}
       if (this.__ptLinkAt === url) return;
       Object.defineProperty(this, '__ptLinkAt', { value: url, configurable: true, enumerable: false });
+      // `prerender` is Chrome's no-state prefetch: the page's document asked
+      // for as a navigation would, same-origin only (measured), nothing kept.
+      if (rel === 'prerender') {
+        let same = false;
+        try { same = new URL(url).origin === location.origin; } catch (e) {}
+        if (same && typeof globalThis.__pt_subresource === 'function') __pt_subresource(url, 'prerender').catch(() => {});
+        return;
+      }
       // A stylesheet in a data URL is still a stylesheet, parsed without the
       // network.
       if (__s_slice(url, 0, 5) === 'data:') {
@@ -3193,11 +3207,60 @@
     const at = (i) => wide ? parseInt(__s_slice(h, i * 2, i * 2 + 2), 16)
                            : parseInt(h[i] + h[i], 16);
     const [r, g, b] = [at(0), at(1), at(2)];
-    if (h.length === 4 || h.length === 8) {
-      const a = at(3) / 255;
-      return 'rgba(' + r + ', ' + g + ', ' + b + ', ' + (Math.round(a * 100) / 100) + ')';
-    }
+    if (h.length === 4 || h.length === 8) return __cssRgb(r, g, b, at(3));
     return 'rgb(' + r + ', ' + g + ', ' + b + ')';
+  });
+  // A colour as Chrome serializes a legacy one: `rgb(r, g, b)`, or `rgba(…)`
+  // with the alpha byte in the fewest decimals that give it back (221 is
+  // 0.867, 128 is 0.5).
+  const __cssAlpha = (byte) => {
+    const a2 = Math.round(byte / 255 * 100) / 100;
+    return Math.round(a2 * 255) === byte ? a2 : Math.round(byte / 255 * 1000) / 1000;
+  };
+  const __cssRgb = (r, g, b, alphaByte) => (alphaByte == null || alphaByte === 255
+    ? 'rgb(' + r + ', ' + g + ', ' + b + ')'
+    : 'rgba(' + r + ', ' + g + ', ' + b + ', ' + __cssAlpha(alphaByte) + ')');
+  // `rgb()`, `rgba()`, `hsl()`, `hsla()` in either syntax (commas, or spaces
+  // and a slash) to that form; anything it cannot read stays as written.
+  const __CSS_COLOR_FN = /\b(rgba?|hsla?)\(\s*([^()]*?)\s*\)/gi;
+  const __cssColorFn = (v) => __s_replace(v, __CSS_COLOR_FN, (m, fn, args) => {
+    const f = __s_toLowerCase(fn);
+    let parts, alpha = null;
+    if (__s_indexOf(args, ',') >= 0) {
+      parts = __s_split(args, ',').map((x) => __s_trim(x));
+      if (parts.length === 4) alpha = parts.pop();
+    } else {
+      const [main, a] = __s_split(args, '/').map((x) => __s_trim(x));
+      parts = __s_split(main, /\s+/).filter(Boolean);
+      if (a !== undefined) alpha = a;
+    }
+    if (parts.length !== 3) return m;
+    const num = (x) => (/^-?(\d+\.?\d*|\.\d+)(e-?\d+)?%?$/i.test(x) ? parseFloat(x) : NaN);
+    const clamp = (x) => Math.min(255, Math.max(0, Math.round(x)));
+    let rgb;
+    if (f[0] === 'r') {
+      rgb = parts.map((x) => { const n = num(x); return __s_endsWith(x, '%') ? clamp(n * 2.55) : clamp(n); });
+    } else {
+      const hm = /^(-?[\d.]+)(deg|rad|grad|turn)?$/i.exec(parts[0]);
+      if (!hm || !__s_endsWith(parts[1], '%') || !__s_endsWith(parts[2], '%')) return m;
+      let h = parseFloat(hm[1]);
+      const unit = __s_toLowerCase(hm[2] || 'deg');
+      if (unit === 'rad') h = h * 180 / Math.PI; else if (unit === 'grad') h = h * 0.9; else if (unit === 'turn') h *= 360;
+      h = ((h % 360) + 360) % 360;
+      const sat = Math.min(1, Math.max(0, num(parts[1]) / 100)), lig = Math.min(1, Math.max(0, num(parts[2]) / 100));
+      const k = (n) => (n + h / 30) % 12;
+      const a = sat * Math.min(lig, 1 - lig);
+      const ch = (n) => lig - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1));
+      rgb = [ch(0), ch(8), ch(4)].map((x) => clamp(x * 255));
+    }
+    if (rgb.some((x) => Number.isNaN(x))) return m;
+    let byte = 255;
+    if (alpha != null) {
+      const an = num(alpha);
+      if (Number.isNaN(an)) return m;
+      byte = Math.round(Math.min(1, Math.max(0, __s_endsWith(alpha, '%') ? an / 100 : an)) * 255);
+    }
+    return __cssRgb(rgb[0], rgb[1], rgb[2], byte);
   });
   // `.9` prints as `0.9`, inside functions too:
   // `cubic-bezier(.55, .085, …)` -> `cubic-bezier(0.55, 0.085, …)`.
@@ -3391,10 +3454,69 @@
     if ((__s_charCodeAt(prop, 0) === 45 && __s_charCodeAt(prop, 1) === 45) || prop === 'unicode-range') return r;
     try { return __cssNumbers(r); } catch (e) { return r; }
   };
+  const __CSS_COLOR_PROP = /(^|-)(color|fill|stroke|background|border|outline|shadow|column-rule|text-decoration|caret|accent)(-|$)/;
+  const __CSS_NAMED_COLORS = new Set(['aliceblue', 'antiquewhite', 'aqua', 'aquamarine', 'azure', 'beige', 'bisque', 'black',
+    'blanchedalmond', 'blue', 'blueviolet', 'brown', 'burlywood', 'cadetblue', 'chartreuse', 'chocolate', 'coral',
+    'cornflowerblue', 'cornsilk', 'crimson', 'cyan', 'darkblue', 'darkcyan', 'darkgoldenrod', 'darkgray', 'darkgreen',
+    'darkgrey', 'darkkhaki', 'darkmagenta', 'darkolivegreen', 'darkorange', 'darkorchid', 'darkred', 'darksalmon',
+    'darkseagreen', 'darkslateblue', 'darkslategray', 'darkslategrey', 'darkturquoise', 'darkviolet', 'deeppink',
+    'deepskyblue', 'dimgray', 'dimgrey', 'dodgerblue', 'firebrick', 'floralwhite', 'forestgreen', 'fuchsia', 'gainsboro',
+    'ghostwhite', 'gold', 'goldenrod', 'gray', 'green', 'greenyellow', 'grey', 'honeydew', 'hotpink', 'indianred', 'indigo',
+    'ivory', 'khaki', 'lavender', 'lavenderblush', 'lawngreen', 'lemonchiffon', 'lightblue', 'lightcoral', 'lightcyan',
+    'lightgoldenrodyellow', 'lightgray', 'lightgreen', 'lightgrey', 'lightpink', 'lightsalmon', 'lightseagreen',
+    'lightskyblue', 'lightslategray', 'lightslategrey', 'lightsteelblue', 'lightyellow', 'lime', 'limegreen', 'linen',
+    'magenta', 'maroon', 'mediumaquamarine', 'mediumblue', 'mediumorchid', 'mediumpurple', 'mediumseagreen',
+    'mediumslateblue', 'mediumspringgreen', 'mediumturquoise', 'mediumvioletred', 'midnightblue', 'mintcream',
+    'mistyrose', 'moccasin', 'navajowhite', 'navy', 'oldlace', 'olive', 'olivedrab', 'orange', 'orangered', 'orchid',
+    'palegoldenrod', 'palegreen', 'paleturquoise', 'palevioletred', 'papayawhip', 'peachpuff', 'peru', 'pink', 'plum',
+    'powderblue', 'purple', 'rebeccapurple', 'red', 'rosybrown', 'royalblue', 'saddlebrown', 'salmon', 'sandybrown',
+    'seagreen', 'seashell', 'sienna', 'silver', 'skyblue', 'slateblue', 'slategray', 'slategrey', 'snow', 'springgreen',
+    'steelblue', 'tan', 'teal', 'thistle', 'tomato', 'turquoise', 'violet', 'wheat', 'white', 'whitesmoke', 'yellow',
+    'yellowgreen']);
+  // A family list as Chrome writes it: a name that is one identifier bare, any
+  // other name quoted (words, a leading digit, a quoted keyword such as
+  // "serif"), strings kept as they are inside.
+  const __FONT_KEYWORDS = new Set(['serif', 'sans-serif', 'monospace', 'cursive', 'fantasy', 'system-ui', 'emoji', 'math',
+    'fangsong', 'ui-serif', 'ui-sans-serif', 'ui-monospace', 'ui-rounded', 'inherit', 'initial', 'unset', 'revert',
+    'revert-layer', 'default']);
+  const __cssFontFamily = (value) => {
+    const out = [];
+    let i = 0;
+    const v = String(value);
+    while (i < v.length) {
+      while (i < v.length && /[\s,]/.test(v[i])) i++;
+      if (i >= v.length) break;
+      let name = '', quoted = false;
+      if (v[i] === '"' || v[i] === "'") {
+        const q = v[i++];
+        quoted = true;
+        while (i < v.length && v[i] !== q) { if (v[i] === '\\' && i + 1 < v.length) i++; name += v[i++]; }
+        i++;
+        while (i < v.length && v[i] !== ',') i++;
+      } else {
+        const start = i;
+        while (i < v.length && v[i] !== ',') i++;
+        name = __s_replace(__s_trim(__s_slice(v, start, i)), /\s+/g, ' ');
+      }
+      const ident = /^-?[_a-zA-Z\u0080-\uffff][_a-zA-Z0-9\u0080-\uffff-]*$/.test(name);
+      const keep = quoted && __FONT_KEYWORDS.has(__s_toLowerCase(name));
+      out.push(ident && !keep ? name : '"' + __s_replace(name, /["\\]/g, '\\$&') + '"');
+    }
+    return out.join(', ');
+  };
   const __cssValueRaw = (prop, value) => {
     // Custom property values are stored as written.
     if (__s_charCodeAt(prop, 0) === 45 && __s_charCodeAt(prop, 1) === 45) return __s_trim(String(value));
-    let v = __cssZero(__cssHex(__s_replace(__s_trim(String(value)), /\s+/g, ' ')));
+    if (prop === 'font-family' && __s_indexOf(String(value), 'var(') < 0) return __cssFontFamily(value);
+    let v = __cssZero(__cssColorFn(__cssHex(__s_replace(__s_trim(String(value)), /\s+/g, ' '))));
+    // Colour keywords print in lower case in properties that take a colour
+    // (a font family named `Red` keeps its case).
+    if (__CSS_COLOR_PROP.test(prop)) {
+      v = __s_replace(v, /(^|[\s,(])([A-Za-z]+)(?=$|[\s,)])/g, (m, pre, w) => {
+        const low = __s_toLowerCase(w);
+        return low !== w && (low === 'currentcolor' || low === 'transparent' || __CSS_NAMED_COLORS.has(low)) ? pre + low : m;
+      });
+    }
     if (prop === 'animation') return __cssAnimation(v);
     if (prop === 'box-shadow' || prop === 'text-shadow') return __cssShadow(v);
     if (prop === 'outline') return __cssOutline(v);
@@ -3537,10 +3659,18 @@
       if (colon <= 0) continue;
       const prop = __cssKey(__s_slice(decl, 0, colon));
       // A property written twice moves to the later position: Chrome removes
-      // and re-appends on overwrite.
+      // and re-appends on overwrite. `!important` is the declaration's
+      // priority, not part of its value.
       if (prop) {
+        let raw = __s_slice(decl, colon + 1);
+        const im = /!\s*important\s*$/i.exec(raw);
+        if (im) raw = __s_slice(raw, 0, im.index);
+        // A later normal declaration does not undo an earlier important one.
+        if (!im && map.__ptImp && map.__ptImp.has(prop)) continue;
         map.delete(prop);
-        map.set(prop, __cssValue(prop, __s_slice(decl, colon + 1)));
+        map.set(prop, __cssValue(prop, raw));
+        if (im) __cssImp(map).add(prop);
+        else if (map.__ptImp) map.__ptImp.delete(prop);
       }
     }
     return map;
@@ -3918,10 +4048,30 @@
     if (at === '@import') {
       const href = __s_slice(/url\(\s*["']?([^"')]*)["']?\s*\)|["']([^"']*)["']/.exec(prelude) || [], 1).find((x) => x !== undefined) || '';
       const r = common(Object.create(__ruleProto('CSSImportRule')), RULE_TYPE.import);
-      const media = __s_trim(__s_replace(__s_slice(prelude, 7), /^\s*(url\(\s*(["']?)[^)]*?\2\s*\)|"[^"]*"|'[^']*')/i, ''));
-      own(r, { href, layerName: null, supportsText: null, media: __mediaList(media),
-               cssText: '@import url("' + href + '")' + (media ? ' ' + media : '') + ';' });
+      let media = __s_trim(__s_replace(__s_slice(prelude, 7), /^\s*(url\(\s*(["']?)[^)]*?\2\s*\)|"[^"]*"|'[^']*')/i, ''));
+      // `layer` or `layer(name)` puts the imported rules in a cascade layer.
+      let layerName = null;
+      const lm = /^layer(?:\(\s*([^)]*?)\s*\))?(?=\s|$)/i.exec(media);
+      if (lm) { layerName = lm[1] || ''; media = __s_trim(__s_slice(media, lm[0].length)); }
+      own(r, { href, layerName, supportsText: null, media: __mediaList(media),
+               cssText: '@import url("' + href + '")' + (lm ? ' ' + lm[0] : '') + (media ? ' ' + media : '') + ';' });
+      if (lm) Object.defineProperty(r, '__ptLayer', { value: layerName, configurable: true });
       Object.defineProperty(r, 'styleSheet', { value: null, writable: true, enumerable: true, configurable: true });
+      return r;
+    }
+    if (at === '@layer') {
+      const names = __s_trim(__s_slice(prelude, 6));
+      if (parsed.statement || parsed.body == null) {
+        const list = __s_split(names, ',').map((x) => __s_trim(x)).filter(Boolean);
+        const r = common(Object.create(__ruleProto('CSSLayerStatementRule')), 0);
+        own(r, { nameList: Object.freeze(list.slice()), cssText: '@layer ' + list.join(', ') + ';' });
+        Object.defineProperty(r, '__ptLayerNames', { value: list, configurable: true });
+        return r;
+      }
+      const r = common(Object.create(__ruleProto('CSSLayerBlockRule')), 0);
+      const kids = __cssParse(parsed.body || '').map((p) => __makeRule(p, sheet, r)).filter(Boolean);
+      own(r, { name: names, cssRules: __cssRuleList(kids), cssText: __cssGroup('@layer' + (names ? ' ' + names : ''), kids, false) });
+      Object.defineProperty(r, '__ptLayerBlock', { value: true, configurable: true });
       return r;
     }
     if (at === '@media' || at === '@supports') {
@@ -3963,7 +4113,7 @@
     const r = common(Object.create(__ruleProto('CSSStyleRule')), RULE_TYPE.style);
     const decls = __cssDecls(parsed.body || '');
     const sel = __cssSelector(prelude);
-    const body = __styleEntries(decls).map(([k, v]) => k + ': ' + v + ';').join(' ');
+    const body = __styleEntries(decls).map(([k, v]) => k + ': ' + v + (decls.__ptImp && decls.__ptImp.has(k) ? ' !important' : '') + ';').join(' ');
     own(r, { selectorText: sel });
     // A rule's declaration (~700 properties) is built lazily: building it for
     // thousands of rules cost ~800 ms per stylesheet. The cascade reads the
@@ -9118,26 +9268,43 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   // Rules of one tree: its stylesheets flattened into a list. Separate because
   // there can be more than one document (see `__rulesFor`).
+  // Layer rank of rules outside any layer: above every layer.
+  const __UNLAYERED = 1e9;
   function __gatherRules(docEl, out) {
-    const state = { order: out.length };
+    const state = { order: out.length, anon: 0 };
     const faces = [];
-    const take = (root, rules) => {
+    // Cascade layers in the order they are first named (a statement, a block
+    // or an import); a nested one is `outer.inner`.
+    const layers = new Map();
+    const layerOf = (outer, name) => {
+      const full = outer ? outer + '.' + name : name;
+      if (!layers.has(full)) layers.set(full, layers.size);
+      return full;
+    };
+    const take = (root, rules, layer) => {
       for (const r of rules || []) {
         if (r.type === 5) { if (root === docEl) faces.push(r); continue; }   // @font-face
         if (r.type === 3) {                           // @import
           const sub = r.styleSheet;
-          if (sub && (!r.media || !r.media.mediaText || __mediaApplies(r.media.mediaText))) take(root, sub.cssRules);
+          const into = r.__ptLayer == null ? layer : layerOf(layer, r.__ptLayer || ('\u0000' + (state.anon++)));
+          if (sub && (!r.media || !r.media.mediaText || __mediaApplies(r.media.mediaText))) take(root, sub.cssRules, into);
           continue;
         }
         if (r.type === 4 || r.type === 12) {          // @media / @supports
-          if (r.type !== 4 || __mediaApplies(r.conditionText)) take(root, r.cssRules);
+          if (r.type !== 4 || __mediaApplies(r.conditionText)) take(root, r.cssRules, layer);
+          continue;
+        }
+        if (r.__ptLayerNames) { for (const n of r.__ptLayerNames) layerOf(layer, n); continue; }   // @layer a, b;
+        if (r.__ptLayerBlock) {                       // @layer a { … }
+          take(root, r.cssRules, layerOf(layer, r.name || ('\u0000' + (state.anon++))));
           continue;
         }
         if (r.type !== 1 || !r.selectorText) continue;
+        const rank = layer == null ? __UNLAYERED : layers.get(layer);
         for (const one of __selSplit(r.selectorText)) {
           const sel = __s_trim(one);
           if (!sel) continue;
-          out.push({ root, sel, spec: __specificity(sel), order: state.order++, rule: r });
+          out.push({ root, sel, spec: __specificity(sel), order: state.order++, rule: r, layer: rank });
         }
       }
     };
@@ -9147,7 +9314,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         if ((n.tagName === 'STYLE' || (n.tagName === 'LINK' && n.__ptSheetText)) && n.sheet) {
           // `<link media="print">` is fetched but styles nothing on screen.
           const media = __ptGetA(n, 'media');
-          if (!media || __mediaApplies(media)) take(root, n.sheet.cssRules);
+          if (!media || __mediaApplies(media)) take(root, n.sheet.cssRules, null);
         }
         if (n.__ptShadow) sheetsOf(n.__ptShadow, n.__ptShadow);
         sheetsOf(n, root);
@@ -9185,6 +9352,28 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (depth === 0) flat += c;
     }
     if (__s_indexOf(flat, '\\') >= 0) return null;
+    // `:is(.a, .b)` / `:where(…)` with nothing else to key on: each
+    // alternative's key, when every one has one (a rule then sits in each).
+    if (/^:(?:is|where)(?::|$)/i.test(flat)) {
+      const open = __s_indexOf(comp, '(');
+      let d = 0, from = open + 1;
+      const alts = [];
+      for (let i = open; i < comp.length; i++) {
+        const c = comp[i];
+        if (c === '\\') { i++; continue; }
+        if (c === '(' || c === '[') d++;
+        else if (c === ')' || c === ']') { d--; if (d === 0) { alts.push(__s_slice(comp, from, i)); break; } }
+        else if (c === ',' && d === 1) { alts.push(__s_slice(comp, from, i)); from = i + 1; }
+      }
+      const keys = [];
+      for (const a of alts) {
+        const k = __ruleKey(__s_trim(a));
+        if (k == null) return null;
+        if (typeof k === 'string') { if (!keys.includes(k)) keys.push(k); }
+        else for (const x of k) if (!keys.includes(x)) keys.push(x);
+      }
+      return keys.length === 1 ? keys[0] : keys.length ? keys : null;
+    }
     let m = /#([\w-]+)/.exec(flat);
     if (m) return 'i' + m[1];
     m = /\.([\w-]+)/.exec(flat);
@@ -9205,14 +9394,21 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   function __ruleIndex(rules) {
     let ix = __ruleIndexes.get(rules);
     if (ix && ix.n === rules.length) return ix;
-    ix = { n: rules.length, keyed: new Map(), any: [] };
-    for (const r of rules) {
-      const k = __ruleKey(r.sel);
-      if (k == null) { ix.any.push(r); continue; }
+    // `scoped`: some rule belongs to a shadow tree; without one every rule
+    // applies to every element of the document and no filtering is needed.
+    ix = { n: rules.length, keyed: new Map(), any: [], scoped: false, multi: false };
+    const put = (k, r) => {
       if (k[0] === 'a') ix.attrs = true;
       let list = ix.keyed.get(k);
       if (!list) ix.keyed.set(k, (list = []));
       list.push(r);
+    };
+    for (const r of rules) {
+      if (r.root && r.root.nodeType === 11) ix.scoped = true;
+      const k = __ruleKey(r.sel);
+      if (k == null) ix.any.push(r);
+      else if (typeof k === 'string') put(k, r);
+      else { ix.multi = true; for (const x of k) put(x, r); }
     }
     __ruleIndexes.set(rules, ix);
     return ix;
@@ -9236,18 +9432,43 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const root = __treeRootOf(el);
     const docEl = el.ownerDocument && el.ownerDocument.documentElement;
     const inScope = (r) => !r.root || r.root === root || (root === docEl && r.root === docEl) || (root && root.nodeType !== 11 && r.root && r.root.nodeType !== 11);
-    const out = ix.any.filter(inScope);
-    const add = (k) => { const l = ix.keyed.get(k); if (l) for (const r of l) if (inScope(r)) out.push(r); };
+    // A rule under several keys is taken once (`:is(.a, .b)` on `.a.b`).
+    const all = !ix.scoped && !!root && root.nodeType !== 11;
+    const id = __ptGetA(el, 'id');
+    const cls = __ptGetA(el, 'class');
+    // Elements alike in tag, id, classes and attribute names have the same
+    // candidates (a list's thousand items cost one lookup). Read-only list.
+    let memoKey = null;
+    if (all) {
+      memoKey = (el === docEl ? 'R' : '') + el.localName + '\x00' + (id || '') + '\x00' + (cls || '');
+      if (ix.attrs && el.__ptAttrs) for (const name of el.__ptAttrs.keys()) memoKey += '\x00' + name;
+      const hit = ix.memo && ix.memo.get(memoKey);
+      if (hit) return hit;
+    }
+    const out = all ? ix.any.slice() : ix.any.filter(inScope);
+    const once = ix.multi ? new Set() : null;
+    const add = (k) => {
+      const l = ix.keyed.get(k);
+      if (!l) return;
+      for (let i = 0; i < l.length; i++) {
+        const r = l[i];
+        if (!all && !inScope(r)) continue;
+        if (once) { if (once.has(r)) continue; once.add(r); }
+        out.push(r);
+      }
+    };
     if (el === docEl) add('r');
     add('t' + __s_toLowerCase(String(el.localName || '')));
-    const id = __ptGetA(el, 'id');
     if (id) add('i' + id);
-    const cls = __ptGetA(el, 'class');
     if (cls) {
       const seen = new Set();
       for (const c of __s_split(cls, /[\t\n\f\r ]+/)) if (c && !seen.has(c)) { seen.add(c); add('c' + c); }
     }
     if (ix.attrs && el.__ptAttrs) for (const name of el.__ptAttrs.keys()) add('a' + __s_toLowerCase(String(name)));
+    if (memoKey !== null) {
+      if (!ix.memo || ix.memo.size >= 4096) ix.memo = new Map();
+      ix.memo.set(memoKey, out);
+    }
     return out;
   }
 
@@ -9329,7 +9550,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const entry = { r, sel: base, which: __s_toLowerCase(m[2]), bg: bg == null ? null : __cssAbs(String(bg), r.rule),
                       content: content == null ? null : __s_trim(String(content)) };
       const k = __ruleKey(base);
-      if (k == null) any.push(entry);
+      if (typeof k !== 'string') any.push(entry);
       else { let l = keyed.get(k); if (!l) keyed.set(k, (l = [])); l.push(entry); }
     }
     __pseudoFrom = rules;
@@ -9354,7 +9575,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (set) for (const c of set) if (c) by('c' + c);
     if (e.__ptAttrs) for (const name of e.__ptAttrs.keys()) by('a' + __s_toLowerCase(String(name)));
     if (!hits.length) return;
-    hits.sort((a, b) => (a.r.spec - b.r.spec) || (a.r.order - b.r.order));
+    hits.sort((a, b) => (a.r.layer - b.r.layer) || (a.r.spec - b.r.spec) || (a.r.order - b.r.order));
     for (const which of ['before', 'after']) {
       let content = null, bg = null;
       for (const x of hits) {
@@ -9385,6 +9606,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __CSS_URL.lastIndex = 0;
     for (const u of out) {
       if (!u || !/^https?:/i.test(u) || __imageSkipped(u)) continue;
+      if (globalThis.__pt_subresourceDone && __pt_subresourceDone(u)) continue;
       const rel = __holdLoad('css-image ' + u);
       __pt_subresource(u, 'css-image', __cssUrlRef.get(u) || null).then(rel, rel);
     }
@@ -9516,6 +9738,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   const __perfNow = globalThis.performance && typeof performance.now === 'function'
     ? performance.now.bind(performance) : Date.now;
   let __cssScanNext = 0;
+  const __fontHeld = new WeakSet();
   globalThis.__pt_cssLoads = (force) => {
     const doc = globalThis.document;
     const de = doc && doc.documentElement;
@@ -9554,7 +9777,13 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
           for (const x of faces) {
             if (x.range && !/^u\+0-10ffff$/i.test(x.range) && !__rangeHits(x.range, text)) continue;
             const p = __pt_faceLoad(x.face);
-            if (i === 0 && text) { const rel = __holdLoad('font ' + name); p.then(rel, rel); }
+            const st2 = info && info(x.face);
+            // One hold per face, however many elements wait for it.
+            if (i === 0 && text && st2 && st2.status === 'loading' && !__fontHeld.has(x.face)) {
+              __fontHeld.add(x.face);
+              const rel = __holdLoad('font ' + name);
+              p.then(rel, rel);
+            }
           }
           return;
         }
@@ -9874,7 +10103,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       } catch (e) {}
       if (ok) won.push(r);
     }
-    won.sort((a, b) => (a.spec - b.spec) || (a.order - b.order));
+    // Cascade order (CSS Cascade 5): layers by their order, unlayered rules
+    // above them, then specificity and source order.
+    won.sort((a, b) => (a.layer - b.layer) || (a.spec - b.spec) || (a.order - b.order));
     // Shorthands are expanded here, not on output: layout, used font size and
     // computed style all need `font: 14px/1.5 Georgia` to set `font-size`.
     const take = (n, v) => {
@@ -9889,20 +10120,42 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (__s_charCodeAt(n, 0) === 45 && __s_charCodeAt(n, 1) === 45) mine.set(n, v);
       else decls.push([n, v]);
     };
-    const noteAll = (d) => {
+    const noteAll = (d, important) => {
       const raw = __declRaw.get(d);
-      if (raw) { const m = raw(); for (const [n, v] of m) note(n, __cssAbs(String(__cssPreciseGet(m, n)), null)); return; }
+      if (raw) {
+        const m = raw(), I = m.__ptImp;
+        for (const [n] of m) if (!!(I && I.has(n)) === important) note(n, __cssAbs(String(__cssPreciseGet(m, n)), null));
+        return;
+      }
+      if (important) return;
       for (let i = 0; i < d.length; i++) {
         const n = d.item(i);
         note(n, __cssAbs(d.getPropertyValue(n), null));
       }
     };
+    // Normal declarations: the rules in cascade order, then the style
+    // attribute. Important ones after all of them: unlayered rules, layers
+    // in reverse (an earlier layer's `!important` wins), the attribute last.
+    let anyImportant = false;
     for (const r of won) {
       const m = __ruleMap(r);
-      if (m) for (const [n, v] of m) note(n, __cssAbs(String(v), r.rule));
+      if (!m) continue;
+      const I = m.__ptImp;
+      if (I && I.size) anyImportant = true;
+      for (const [n, v] of m) if (!I || !I.has(n)) note(n, __cssAbs(String(v), r.rule));
     }
     const own = el.__ptStyle || (__ptHasA(el, 'style') ? el.style : null);
-    if (own) noteAll(own);
+    if (own) noteAll(own, false);
+    if (anyImportant) {
+      const imp = won.filter((r) => { const m = __ruleMap(r); return m && m.__ptImp && m.__ptImp.size; });
+      const rank = (r) => (r.layer === __UNLAYERED ? -1 : __UNLAYERED - r.layer);
+      imp.sort((a, b) => (rank(a) - rank(b)) || (a.spec - b.spec) || (a.order - b.order));
+      for (const r of imp) {
+        const m = __ruleMap(r), I = m.__ptImp;
+        for (const [n, v] of m) if (I.has(n)) note(n, __cssAbs(String(v), r.rule));
+      }
+    }
+    if (own) noteAll(own, true);
     const vars = __customsFor(el, mine);
     // `inherit` takes the parent's cascaded value; `initial` and `unset` act
     // as if unset (`* { box-sizing: inherit }` must propagate `border-box`).
@@ -11724,6 +11977,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
           if (M) map.set('transform', 'matrix(' + M.map(__cssNum1).join(', ') + ')');
         }
       }
+      // A family list substituted from a variable prints like a written one.
+      { const ff = map.get('font-family'); if (ff && /["']/.test(ff)) map.set('font-family', __cssFontFamily(ff)); }
       // Any sRGB colour is normalised to `rgb(…)`.
       for (const k of __CS_COLOUR_KEYS) {
         if (!map.has(k)) continue;
