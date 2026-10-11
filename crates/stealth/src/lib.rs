@@ -8323,6 +8323,10 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   const imageBad = new Set();
   Object.defineProperty(globalThis, '__pt_imageBad', { value: (url) => { imageBad.add(String(url)); }, configurable: true, enumerable: false });
   Object.defineProperty(globalThis, '__pt_imageIsBad', { value: (url) => imageBad.has(String(url)), configurable: true, enumerable: false });
+  // Likewise an answer to a `<video>`/`<audio>` that no demuxer opens.
+  const mediaBad = new Set();
+  Object.defineProperty(globalThis, '__pt_mediaBad', { value: (url) => { mediaBad.add(String(url)); }, configurable: true, enumerable: false });
+  Object.defineProperty(globalThis, '__pt_mediaIsBad', { value: (url) => mediaBad.has(String(url)), configurable: true, enumerable: false });
   // Whether the server lets others read this image: decides whether it
   // taints a canvas it is drawn on.
   globalThis.__pt_imageCorsOk = (url) => imageCors.has(String(url));

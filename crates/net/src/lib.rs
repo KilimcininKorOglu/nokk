@@ -345,6 +345,9 @@ pub enum RequestKind {
     XhrNoCors,
     /// An image with a `crossorigin` attribute: a CORS load.
     ImageCors,
+    /// `<video>` and `<audio>` sources: a Range request for the whole file.
+    Video,
+    Audio,
     /// The CORS preflight (`OPTIONS`) before a non-simple cross-origin request.
     Preflight,
 }
@@ -372,6 +375,8 @@ impl RequestKind {
             RequestKind::Xhr | RequestKind::PreloadFetch => ("empty", "cors"),
             RequestKind::Subresource => ("image", "no-cors"),
             RequestKind::ImageCors => ("image", "cors"),
+            RequestKind::Video => ("video", "no-cors"),
+            RequestKind::Audio => ("audio", "no-cors"),
             RequestKind::Style => ("style", "no-cors"),
             RequestKind::Font => ("font", "cors"),
             RequestKind::Manifest => ("manifest", "cors"),
@@ -388,6 +393,7 @@ impl RequestKind {
             RequestKind::Script | RequestKind::ModuleScript | RequestKind::Xhr | RequestKind::PreloadFetch
             | RequestKind::Font | RequestKind::Worker | RequestKind::XhrNoCors | RequestKind::Preflight => 1,
             RequestKind::Subresource | RequestKind::ImageCors | RequestKind::Manifest => 2,
+            RequestKind::Video | RequestKind::Audio => 3,
             RequestKind::Prefetch | RequestKind::Beacon => 4,
         }
     }
@@ -771,6 +777,13 @@ impl FingerprintClient {
         // A CORS preflight is the network service's own request: no client
         // hints, no cookies, only the profile's identity headers (measured).
         let preflight = req.kind == RequestKind::Preflight;
+        // A media load asks for the bytes as they are, from the start: Blink's
+        // media loader puts `Accept-Encoding` in its header map and the
+        // network service adds `Range` (measured).
+        let media = matches!(req.kind, RequestKind::Video | RequestKind::Audio);
+        if media {
+            rb = rb.header("accept-encoding", "identity;q=1, *;q=0").header("range", "bytes=0-");
+        }
         if preflight {
             rb = rb.default_headers(false);
             for name in ["user-agent", "accept-encoding", "accept-language"] {
@@ -915,6 +928,9 @@ impl FingerprintClient {
             if req.kind == RequestKind::Prefetch {
                 names.push("sec-purpose".into());
             }
+            if media {
+                names.insert(0, "accept-encoding".into());
+            }
             names.extend(client_hints::BLINK_INSERT_ORDER.iter().filter(|n| sends_hint(n)).map(|n| n.to_string()));
             names.push("user-agent".into());
             for name in client_hints::blink_map_order(&names) {
@@ -976,7 +992,13 @@ impl FingerprintClient {
             "accept-language",
             "priority",
         ] {
+            if media && name == "accept-encoding" {
+                continue;
+            }
             order.insert(name);
+        }
+        if media {
+            order.insert("range");
         }
         if preflight {
             order = wreq::header::OrigHeaderMap::new();

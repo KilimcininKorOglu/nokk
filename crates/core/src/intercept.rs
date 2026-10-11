@@ -85,6 +85,7 @@ fn resource_type(kind: RequestKind) -> &'static str {
         RequestKind::Script | RequestKind::ModuleScript => "Script",
         RequestKind::Xhr | RequestKind::XhrNoCors => "Fetch",
         RequestKind::Preflight => "Preflight",
+        RequestKind::Video | RequestKind::Audio => "Media",
         RequestKind::Subresource | RequestKind::ImageCors => "Image",
         RequestKind::Style => "Stylesheet",
         RequestKind::Font => "Font",

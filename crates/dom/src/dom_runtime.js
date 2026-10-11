@@ -214,6 +214,7 @@
     // assignment: the order can be either.
     else if (n.__ptLocal === 'link' && n.__ptLoadLink) n.__ptLoadLink();
     else if (n.__ptLocal === 'img' && n.__ptLoadImage) n.__ptLoadImage();
+    else if ((n.__ptLocal === 'video' || n.__ptLocal === 'audio') && globalThis.__pt_mediaLoad) __pt_mediaLoad(n, true);
     if (n.nodeType === ELEMENT_NODE && __customs.has(n.__ptLocal)) {
       if (!n.__ptUpgraded) __customUpgrade(n, __customs.get(n.__ptLocal));
       else __customCallback(n, 'connectedCallback');
@@ -1222,6 +1223,7 @@
       this.__ptAttrs.set(name, String(v));
       __styleTouch(this);
       __hasNoteAttr(name, old, String(v));
+      if (name === 'src' && (this.__ptLocal === 'video' || this.__ptLocal === 'audio') && globalThis.__pt_mediaLoad) __pt_mediaLoad(this);
       if (this.__ptUpgraded) {
         const watched = this.constructor && this.constructor.observedAttributes;
         if (Array.isArray(watched) && __s_indexOf(watched, name) >= 0) {
@@ -6326,6 +6328,7 @@
     const M = globalThis.HTMLMediaElement && globalThis.HTMLMediaElement.prototype;
     if (M) {
       try { Object.defineProperty(M, 'canPlayType', { value: canPlay, writable: true, enumerable: true, configurable: true }); } catch (e) {}
+      __mediaInstall(M, canPlay);
     }
     // Gamepads: Chrome returns four empty slots, not nothing; pages read `.length`.
     const N = globalThis.Navigator && globalThis.Navigator.prototype;
@@ -6348,6 +6351,171 @@
         });
       } catch (e) {}
     }
+  }
+
+  // Media elements as Chrome 151 keeps them (values measured): a state per
+  // element, the resource selection with `loadstart`, then a Range request
+  // (`preload="none"` stops at `suspend`), `progress` and `suspend` when the
+  // answer is in, then the metadata events for something that looks like
+  // media, or `error` (MediaError 4) for anything else. The document's `load`
+  // waits for it. Nothing is decoded or played: `play()` answers as Chrome
+  // does with no playable source.
+  function __mediaInstall(M, canPlay) {
+    const V = globalThis.HTMLVideoElement && HTMLVideoElement.prototype;
+    const state = new WeakMap();
+    const st = (el) => {
+      let s = state.get(el);
+      if (!s) {
+        s = { networkState: 0, readyState: 0, currentSrc: '', error: null, paused: true, ended: false, seeking: false,
+          volume: 1, muted: null, playbackRate: 1, defaultPlaybackRate: 1, currentTime: 0, at: null, gen: 0,
+          tracks: null, remote: null, ranges: null };
+        state.set(el, s);
+      }
+      return s;
+    };
+    const nat = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
+    const acc = (P, name, get, set) => {
+      if (!P) return;
+      const d = Object.getOwnPropertyDescriptor(P, name);
+      try {
+        Object.defineProperty(P, name, {
+          get: nat(get, 'get ' + name), set: set ? nat(set, 'set ' + name) : (d && d.set) || undefined,
+          enumerable: d ? d.enumerable : true, configurable: true,
+        });
+      } catch (e) {}
+    };
+    const meth = (P, name, f, len) => {
+      try { Object.defineProperty(f, 'length', { value: len | 0, configurable: true }); } catch (e) {}
+      try { Object.defineProperty(P, name, { value: nat(f, name), writable: true, enumerable: true, configurable: true }); } catch (e) {}
+    };
+    // Instances of the interfaces as they stand when first made: the shape
+    // pass replaces their prototypes after this runs, so their members are
+    // set then.
+    const shaped = new WeakSet();
+    const mk = (iface, members) => {
+      const C = globalThis[iface];
+      const P = C && C.prototype;
+      if (!P) return {};
+      if (members && !shaped.has(P)) { shaped.add(P); members(P); }
+      return Object.create(P);
+    };
+    // Empty time ranges; `start`/`end` on an empty one throw as in Chrome.
+    const rangeState = new WeakMap();
+    const rangeMembers = (TR) => {
+      acc(TR, 'length', function () { const l = rangeState.get(this); return l ? l.length : 0; });
+      for (const which of ['start', 'end']) {
+        meth(TR, which, function (i) {
+          const l = rangeState.get(this) || [];
+          const k = Number(i);
+          if (!(k >= 0 && k < l.length)) {
+            throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute '" + which + "' on 'TimeRanges': The index provided (" + (k >>> 0) + ") is greater than or equal to the maximum bound (" + l.length + ').', 'IndexSizeError');
+          }
+          return l[k][which === 'start' ? 0 : 1];
+        }, 1);
+      }
+    };
+    const ranges = () => { const r = mk('TimeRanges', rangeMembers); rangeState.set(r, []); return r; };
+    const errState = new WeakMap();
+    const errMembers = (ME) => {
+      acc(ME, 'code', function () { const e = errState.get(this); return e ? e[0] : 0; });
+      acc(ME, 'message', function () { const e = errState.get(this); return e ? e[1] : ''; });
+    };
+    const mediaError = (code, message) => { const e = mk('MediaError', errMembers); errState.set(e, [code, message]); return e; };
+    const trackMembers = (TTL) => acc(TTL, 'length', function () { return 0; });
+    const fire = (el, type) => { try { el.dispatchEvent(__ptTrust(new Event(type))); } catch (e) {} };
+    // The source the selection algorithm takes: `src`, else the first
+    // `<source>` whose type can play.
+    const pick = (el) => {
+      const src = __ptGetA(el, 'src');
+      if (src !== null) return src;
+      for (const k of (el.__ptKids || [])) {
+        if (k.__ptLocal !== 'source') continue;
+        const s2 = __ptGetA(k, 'src');
+        if (!s2) continue;
+        const type = __ptGetA(k, 'type');
+        if (type && canPlay(type) === '') continue;
+        return s2;
+      }
+      return null;
+    };
+    const load = (el, connecting) => {
+      const s = st(el);
+      const raw = pick(el);
+      if (raw === null) return;
+      let url = raw;
+      try { url = new URL(raw, document.baseURI || location.href).href; } catch (e) {}
+      if (connecting && s.at === url) return;
+      s.at = url;
+      const gen = ++s.gen;
+      s.error = null; s.readyState = 0; s.currentSrc = ''; s.networkState = 3;
+      const tag = el.__ptLocal;
+      const preload = __s_toLowerCase(String(__ptGetA(el, 'preload') || ''));
+      const holdRel = preload === 'none' ? null : __holdLoad(tag + ' ' + url);
+      __ptLater(() => {
+        if (s.gen !== gen) { if (holdRel) holdRel(); return; }
+        s.currentSrc = url; s.networkState = 2;
+        fire(el, 'loadstart');
+        if (preload === 'none') { s.networkState = 1; fire(el, 'suspend'); return; }
+        const done = (ok, text) => {
+          if (s.gen !== gen) { if (holdRel) holdRel(); return; }
+          fire(el, 'progress');
+          s.networkState = 1; fire(el, 'suspend');
+          // The engine read the bytes' signature (the text here is lossy).
+          if (ok && !(globalThis.__pt_mediaIsBad && __pt_mediaIsBad(url))) {
+            s.readyState = 1; fire(el, 'durationchange'); fire(el, 'loadedmetadata');
+            s.readyState = 4; fire(el, 'loadeddata'); fire(el, 'canplay'); fire(el, 'canplaythrough');
+          } else {
+            s.error = mediaError(4, 'PipelineStatus::DEMUXER_ERROR_COULD_NOT_OPEN: FFmpegDemuxer: open context failed');
+            s.networkState = 3;
+            fire(el, 'error');
+          }
+          if (holdRel) holdRel();
+        };
+        if (typeof globalThis.__pt_subresourceText !== 'function') { done(false, null); return; }
+        globalThis.__pt_subresourceText(url, tag).then((t) => done(t != null, t), () => done(false, null));
+      }, 0);
+    };
+    Object.defineProperty(globalThis, '__pt_mediaLoad', { value: load, configurable: true, enumerable: false });
+    acc(M, 'networkState', function () { return st(this).networkState; });
+    acc(M, 'readyState', function () { return st(this).readyState; });
+    acc(M, 'currentSrc', function () { return st(this).currentSrc; });
+    acc(M, 'error', function () { return st(this).error; });
+    acc(M, 'paused', function () { return st(this).paused; });
+    acc(M, 'ended', function () { return st(this).ended; });
+    acc(M, 'seeking', function () { return st(this).seeking; });
+    acc(M, 'duration', function () { return NaN; });
+    acc(M, 'currentTime', function () { return st(this).currentTime; }, function (v) { st(this).currentTime = Number(v) || 0; });
+    acc(M, 'volume', function () { return st(this).volume; }, function (v) {
+      const x = Number(v);
+      if (!(x >= 0 && x <= 1)) throw __pt_mkErr(globalThis.DOMException || Error, "Failed to set the 'volume' property on 'HTMLMediaElement': The volume provided (" + v + ') is outside the range [0, 1].', 'IndexSizeError');
+      st(this).volume = x;
+    });
+    acc(M, 'muted', function () { const s = st(this); return s.muted === null ? __ptHasA(this, 'muted') : s.muted; }, function (v) { st(this).muted = !!v; });
+    acc(M, 'playbackRate', function () { return st(this).playbackRate; }, function (v) { st(this).playbackRate = Number(v); });
+    acc(M, 'defaultPlaybackRate', function () { return st(this).defaultPlaybackRate; }, function (v) { st(this).defaultPlaybackRate = Number(v); });
+    for (const n of ['buffered', 'played', 'seekable']) acc(M, n, function () { return ranges(); });
+    acc(M, 'textTracks', function () { const s = st(this); return s.tracks || (s.tracks = mk('TextTrackList', trackMembers)); });
+    acc(M, 'remote', function () { const s = st(this); return s.remote || (s.remote = mk('RemotePlayback')); });
+    acc(M, 'controlsList', function () { return makeClassList(this, 'controlslist'); });
+    acc(M, 'sinkId', function () { return ''; });
+    acc(M, 'webkitAudioDecodedByteCount', function () { return 0; });
+    acc(M, 'webkitVideoDecodedByteCount', function () { return 0; });
+    for (const n of ['videoWidth', 'videoHeight', 'webkitDecodedFrameCount', 'webkitDroppedFrameCount']) acc(V, n, function () { return 0; });
+    meth(M, 'load', function load_() { load(this, false); }, 0);
+    meth(M, 'pause', function pause() {
+      const s = st(this);
+      if (!s.paused) { s.paused = true; __ptLater(() => { fire(this, 'timeupdate'); fire(this, 'pause'); }, 0); }
+    }, 0);
+    meth(M, 'play', function play() {
+      const s = st(this);
+      // Nothing here plays: with no source that opens, Chrome rejects this way.
+      if (s.error || s.networkState === 3 || s.readyState < 1) {
+        return Promise.reject(__pt_mkErr(globalThis.DOMException || Error, 'The element has no supported sources.', 'NotSupportedError'));
+      }
+      s.paused = false;
+      __ptLater(() => { fire(this, 'play'); fire(this, 'playing'); }, 0);
+      return Promise.resolve();
+    }, 0);
   }
 
   // `hidden` is a reflected HTMLElement attribute present on every element.

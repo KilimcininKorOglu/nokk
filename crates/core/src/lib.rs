@@ -1440,6 +1440,17 @@ impl BrowserContext {
                 .load_html("about:blank", "<html><head></head><body></body></html>")
                 .await;
         }
+        // A `data:` URL is a document of its own, decoded here: a driver may open
+        // one, the page itself may not (Chrome blocks a renderer's top-level
+        // navigation to `data:`).
+        if url.len() >= 5 && url[..5].eq_ignore_ascii_case("data:") {
+            if referrer.is_some() {
+                tracing::debug!("a page's own navigation to a data: URL is blocked, as in Chrome");
+                return Ok(());
+            }
+            let html = data_url_document(url).ok_or_else(|| EngineError::Js("malformed data: URL".into()))?;
+            return self.load_html(url, &html).await;
+        }
         if let Ok(mut n) = self.nav_started.lock() {
             *n = Some(std::time::Instant::now());
         }
@@ -1624,7 +1635,7 @@ impl BrowserContext {
                     );
                 }
                 if out["hist"].is_number() {
-                    c.insert(String::new(), out["hist"].clone());
+                    c.insert(TAB_HISTORY.to_string(), out["hist"].clone());
                 }
             }
         }
@@ -1685,8 +1696,15 @@ impl BrowserContext {
     async fn carry_in(&self, base_url: &str) {
         let v = {
             let Ok(c) = self.carry.lock() else { return };
-            let mut v = c.get(&origin_of(base_url)).cloned().unwrap_or_else(|| serde_json::json!({}));
-            if let Some(h) = c.get("") {
+            // A document without an origin of its own (`data:`, `about:blank`)
+            // gets only the tab's history.
+            let origin = origin_of(base_url);
+            let mut v = (!origin.is_empty() && origin != "null")
+                .then(|| c.get(&origin).cloned())
+                .flatten()
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let Some(h) = c.get(TAB_HISTORY) {
                 v["hist"] = h.clone();
             }
             v
@@ -5205,6 +5223,11 @@ impl BrowserContext {
                             format!("__pt_imageMeta({quoted}, {w}, {h}, {cors});{bytes}")
                         })
                         .unwrap_or_default()
+                } else if matches!(kind.as_str(), "video" | "audio") && !is_media_bytes(&resp.body) {
+                    format!(
+                        "typeof __pt_mediaBad === 'function' && __pt_mediaBad({});",
+                        serde_json::to_string(&url).unwrap()
+                    )
                 } else if matches!(kind.as_str(), "img" | "image" | "image-low" | "css-image" | "image-cors" | "image-cors-low")
                     && !is_image_bytes(&resp.body, &resp.headers)
                 {
@@ -5453,6 +5476,9 @@ impl BrowserContext {
             "img" | "image" => (K::Subresource, Some(2), false),
             "image-low" | "link-image" | "css-image" => (K::Subresource, Some(3), false),
             "image-cors" => (K::ImageCors, Some(2), false),
+            // `<video>`/`<audio>`: Low, measured.
+            "video" => (K::Video, Some(3), false),
+            "audio" => (K::Audio, Some(3), false),
             "image-cors-low" => (K::ImageCors, Some(3), false),
             "icon" => (K::Subresource, Some(1), false),
             "stylesheet" | "link-style" | "css" => (K::Style, Some(0), false),
@@ -5842,6 +5868,55 @@ const HOLD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const SHEETS_WAIT_ASYNC: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// A preloaded script: when it was requested and the task awaiting it.
+/// The document a top-level `data:` URL shows: its HTML as is, anything else
+/// as text the way Chrome's text viewer wraps it. The media type defaults to
+/// `text/plain`.
+fn data_url_document(url: &str) -> Option<String> {
+    let rest = &url[5..];
+    let comma = rest.find(',')?;
+    let (meta, payload) = (&rest[..comma], &rest[comma + 1..]);
+    let meta_l = meta.to_ascii_lowercase();
+    let bytes: Vec<u8> = if meta_l.trim_end().ends_with(";base64") {
+        use base64::Engine as _;
+        let clean: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        let decoded = percent_decode(clean.as_bytes());
+        base64::engine::general_purpose::STANDARD
+            .decode(&decoded)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&decoded))
+            .ok()?
+    } else {
+        percent_decode(payload.as_bytes())
+    };
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let mime = meta_l.split(';').next().unwrap_or("").trim().to_string();
+    if mime == "text/html" || mime == "application/xhtml+xml" {
+        return Some(text);
+    }
+    let escaped = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    Some(format!(
+        "<html><head><meta name=\"color-scheme\" content=\"light dark\"></head><body><pre style=\"word-wrap: break-word; white-space: pre-wrap;\">{escaped}</pre></body></html>"
+    ))
+}
+
+/// `%XX` escapes to bytes; anything else as is.
+fn percent_decode(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%' && i + 2 < input.len() {
+            if let (Some(a), Some(b)) = (hex(input[i + 1]), hex(input[i + 2])) {
+                out.push(a * 16 + b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(input[i]);
+        i += 1;
+    }
+    out
+}
+
 /// `<meta name="referrer" content="…">` in a document's markup: the last one
 /// with a policy Chrome understands.
 fn meta_referrer(html: &str) -> Option<String> {
@@ -5874,6 +5949,10 @@ fn meta_referrer(html: &str) -> Option<String> {
     }
     found
 }
+
+/// The key the tab's history length is kept under among the per-origin
+/// carries: no origin has a space in it.
+const TAB_HISTORY: &str = " history";
 
 /// One step of a document's script plan.
 #[derive(Clone, Copy)]
@@ -5962,6 +6041,18 @@ fn location_setter(u: &str) -> Option<String> {
 /// `naturalWidth`/`naturalHeight`; no pixels are decoded. Unknown or truncated
 /// data gives `None`, and the image then keeps the zero size it has before a
 /// browser has finished decoding.
+/// Whether a response opens as media: the containers Chrome's demuxer reads,
+/// by their signatures (MP4/MOV, WebM/Matroska, MP3, Ogg, FLAC, WAV, AAC ADTS).
+fn is_media_bytes(b: &[u8]) -> bool {
+    b.get(4..8) == Some(b"ftyp")
+        || b.starts_with(b"\x1a\x45\xdf\xa3")
+        || b.starts_with(b"ID3")
+        || b.starts_with(b"OggS")
+        || b.starts_with(b"fLaC")
+        || (b.starts_with(b"RIFF") && b.get(8..12) == Some(b"WAVE"))
+        || (b.len() > 1 && b[0] == 0xff && (b[1] & 0xe0) == 0xe0)
+}
+
 /// Whether a response decodes as an image in Chrome: a format `image_size`
 /// reads, or SVG, ICO, AVIF/HEIF, JPEG XL by their signatures.
 fn is_image_bytes(bytes: &[u8], headers: &std::collections::BTreeMap<String, String>) -> bool {
@@ -11226,6 +11317,80 @@ mod tests {
         let _ = ctx.evaluate("__portStart()").await;
         let _ = ctx.run_event_loop().await;
         assert_eq!(ctx.evaluate("JSON.stringify(__ports)").await.unwrap(), Value::String("[\"a:true\"]".into()));
+    }
+
+    /// `<video>` as Chrome 151 loads it (values measured): a Range request
+    /// with `identity` encoding, `loadstart`/`progress`/`suspend`, then
+    /// MediaError 4 for bytes no demuxer opens; `preload="none"` stops at
+    /// `suspend`; the element's state reads like Chrome's.
+    #[tokio::test]
+    async fn media_elements_as_in_chrome() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = log.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let lower = req.to_ascii_lowercase();
+                    let h = |name: &str| lower.lines().find(|l| l.starts_with(name)).map(|l| l[name.len()..].trim().to_string()).unwrap_or_default();
+                    seen.lock().unwrap().push(format!("{path} range={} enc={}", h("range:"), h("accept-encoding:")));
+                    let body = if path == "/" { "<html><body></body></html>" } else { "not media" };
+                    let head = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                    let _ = stream.write_all(head.as_bytes()).await;
+                });
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&format!("http://127.0.0.1:{port}/")).await.unwrap();
+        let _ = ctx
+            .evaluate(
+                r#"(() => {
+                  window.__ev = [];
+                  const v = document.createElement('video');
+                  window.__first = [v.readyState, v.networkState, v.paused, String(v.duration), v.currentSrc, v.buffered.length, v.volume].join(',');
+                  for (const t of ['loadstart', 'progress', 'suspend', 'error']) v.addEventListener(t, () => __ev.push('v:' + t));
+                  v.src = '/x.mp4'; document.body.appendChild(v);
+                  const n = document.createElement('video'); n.preload = 'none';
+                  for (const t of ['loadstart', 'suspend']) n.addEventListener(t, () => __ev.push('n:' + t));
+                  n.src = '/n.mp4'; document.body.appendChild(n);
+                  window.__v = v;
+                })()"#,
+            )
+            .await;
+        for _ in 0..10 {
+            let _ = ctx.run_event_loop().await;
+        }
+        let out = ctx
+            .evaluate("JSON.stringify([__first, __ev.join(' '), __v.error && __v.error.code, __v.networkState, __v.currentSrc.endsWith('/x.mp4')])")
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            Value::String(r#"["0,0,true,NaN,,0,1","v:loadstart n:loadstart n:suspend v:progress v:suspend v:error",4,3,true]"#.into())
+        );
+        let log = log.lock().unwrap().clone();
+        assert!(log.iter().any(|l| l == "/x.mp4 range=bytes=0- enc=identity;q=1, *;q=0"), "{log:?}");
+        assert!(!log.iter().any(|l| l.starts_with("/n.mp4")), "preload=none fetches nothing: {log:?}");
+        // A top-level `data:` URL opens as a document.
+        ctx.navigate("data:text/html,<title>D</title><p>x%20y</p>").await.unwrap();
+        assert_eq!(
+            ctx.evaluate("JSON.stringify([document.title, document.body.textContent, location.origin])").await.unwrap(),
+            Value::String(r#"["D","x y","null"]"#.into())
+        );
     }
 
     /// Streams, Response and AbortSignal behave as in Chrome 151 (values captured
