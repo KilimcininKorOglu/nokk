@@ -221,7 +221,7 @@
     else if (n.__ptLocal === 'link' && n.__ptLoadLink) n.__ptLoadLink();
     else if (n.__ptLocal === 'img' && n.__ptLoadImage) n.__ptLoadImage();
     else if ((n.__ptLocal === 'video' || n.__ptLocal === 'audio') && globalThis.__pt_mediaLoad) __pt_mediaLoad(n, true);
-    if (n.nodeType === ELEMENT_NODE && __customs.has(n.__ptLocal)) {
+    if (n.__ptType === ELEMENT_NODE && __customs.has(n.__ptLocal)) {
       if (!n.__ptUpgraded) __customUpgrade(n, __customs.get(n.__ptLocal));
       else __customCallback(n, 'connectedCallback');
     }
@@ -541,33 +541,33 @@
     get firstChild() { return this.__ptKids[0] || null; }
     get lastChild() { return this.__ptKids[this.__ptKids.length - 1] || null; }
     get nextSibling() {
-      const p = this.parentNode; if (!p) return null;
+      const p = this.__ptParent; if (!p) return null;
       const i = __s_indexOf(p.__ptKids, this); return p.__ptKids[i + 1] || null;
     }
     get previousSibling() {
-      const p = this.parentNode; if (!p) return null;
+      const p = this.__ptParent; if (!p) return null;
       const i = __s_indexOf(p.__ptKids, this); return p.__ptKids[i - 1] || null;
     }
     hasChildNodes() { return this.__ptKids.length > 0; }
-    contains(n) { for (; n; n = n.parentNode) if (n === this) return true; return false; }
+    contains(n) { for (; n; n = n.__ptParent) if (n === this) return true; return false; }
     // Walks out through a shadow host too: a node inside an attached shadow tree
     // is connected, even though the root itself has no parent.
     // The base URL is the document's; for `about:blank` it is the creator's.
     get baseURI() {
-      const d = this.nodeType === 9 ? this : (this.ownerDocument || null);
+      const d = this.__ptType === 9 ? this : (this.ownerDocument || null);
       if (d && typeof d.__ptBaseURI === 'function') return d.__ptBaseURI();
       const href = (globalThis.location && globalThis.location.href) || 'about:blank';
       return href === 'about:blank' && typeof globalThis.__pt_inheritedBase === 'string' ? globalThis.__pt_inheritedBase : href;
     }
     get isConnected() {
-      for (let n = this; n; n = n.parentNode || n.__ptHost) {
-        if (n.nodeType === DOCUMENT_NODE) return true;
+      for (let n = this; n; n = n.__ptParent || n.__ptHost) {
+        if (n.__ptType === DOCUMENT_NODE) return true;
       }
       return false;
     }
     getRootNode(opts) {
       let n = this;
-      while (n.parentNode || (n.__ptHost && opts && opts.composed)) n = n.parentNode || n.__ptHost;
+      while (n.__ptParent || (n.__ptHost && opts && opts.composed)) n = n.__ptParent || n.__ptHost;
       return n;
     }
 
@@ -575,7 +575,7 @@
       __needArgs(arguments.length, 1, 'appendChild', 'Node');
       __needNode(child, 1, 'appendChild');
       // A node cannot contain itself or its ancestor.
-      for (let p = this; p; p = p.parentNode) {
+      for (let p = this; p; p = p.__ptParent) {
         if (p === child) {
           throw __pt_mkErr(globalThis.DOMException || Error, 
             "Failed to execute 'appendChild' on 'Node': The new child element contains the parent.",
@@ -594,15 +594,15 @@
         __needChild(this, ref, 'insertBefore',
           'The node before which the new node is to be inserted is not a child of this node.');
       }
-      if (child.nodeType === DOCUMENT_FRAGMENT_NODE) {
+      if (child.__ptType === DOCUMENT_FRAGMENT_NODE) {
         for (const c of __s_slice(child.__ptKids)) this.insertBefore(c, ref);
         return child;
       }
-      if (child.parentNode) __ptDrop.call(child.parentNode, child);
+      if (child.__ptParent) __ptDrop.call(child.__ptParent, child);
       // A node from another document is adopted: it and its subtree get the
       // new parent's ownerDocument, as in Chrome.
       try {
-        const doc = this.nodeType === 9 ? this : this.__ptDoc;
+        const doc = this.__ptType === 9 ? this : this.__ptDoc;
         if (doc && child.__ptDoc !== doc) __walkTree(child, (n) => { if (n.__ptDoc !== doc) n.__ptDoc = doc; });
       } catch (e) {}
       const i = (ref === null || ref === undefined) ? -1 : __s_indexOf(this.__ptKids, ref);
@@ -685,15 +685,15 @@
 
     get textContent() {
       // A document and doctype have none: null, not the page's joined text.
-      if (this.nodeType === 9 || this.nodeType === 10) return null;
+      if (this.__ptType === 9 || this.__ptType === 10) return null;
       // Text, comment, processing instruction: their data (Chrome's Node.textContent).
-      if (this.nodeType === 3 || this.nodeType === 4 || this.nodeType === 7) return this.data;
-      if (this.nodeType === 8) return this.data;
+      if (this.__ptType === 3 || this.__ptType === 4 || this.__ptType === 7) return this.data;
+      if (this.__ptType === 8) return this.data;
       let s = ''; for (const c of this.__ptKids) s += c.textContent; return s;
     }
     set textContent(v) {
-      if (this.nodeType === 9 || this.nodeType === 10) return;
-      if (this.nodeType === 3 || this.nodeType === 4 || this.nodeType === 7 || this.nodeType === 8) { this.data = String(v); return; }
+      if (this.__ptType === 9 || this.__ptType === 10) return;
+      if (this.__ptType === 3 || this.__ptType === 4 || this.__ptType === 7 || this.__ptType === 8) { this.data = String(v); return; }
       if (this.__ptLocal === 'script') v = __pt_ttSink('TrustedScript', 'HTMLScriptElement textContent', v, "Failed to set the 'textContent' property on 'HTMLScriptElement'");
       __ptDropKids(this);
       if (v !== '') __ptAdd.call(this, new Text(String(v)));
@@ -734,18 +734,18 @@
       for (let n = this; n; ) {
         if (local && n !== this) break;
         path.push(n); targets.push(tgt);
-        if (n.nodeType === 11 && n.host) {
+        if (n.__ptType === 11 && n.host) {
           if (!event.composed) break;
           n = n.host; tgt = n; continue;
         }
-        if (n.nodeType === 9) {
+        if (n.__ptType === 9) {
           const w = n.defaultView;
           if (w && event.type !== 'load') { path.push(w); targets.push(tgt); }
           break;
         }
         // Not a node: an IndexedDB request bubbles to its transaction, then
         // to the database.
-        n = n.nodeType === undefined ? (__ptEventParents.get(n) || null) : n.parentNode;
+        n = n.__ptType === undefined ? (__ptEventParents.get(n) || null) : n.__ptParent;
       }
       __ptEvSet(event, '__ptPathNow', path);
       const fireAt = (i, phase) => {
@@ -969,7 +969,7 @@
     try { Object.defineProperty(ev, key, { value, configurable: true, writable: true }); } catch (e) {}
   };
 
-  const __removeSelf = function remove() { if (this.parentNode) this.parentNode.removeChild(this); };
+  const __removeSelf = function remove() { if (this.__ptParent) this.__ptParent.removeChild(this); };
 
   Object.defineProperties(Node.prototype, {
     nodeType: accessor('nodeType', function () { return this.__ptType; }, function (v) { this.__ptType = v; }),
@@ -1017,11 +1017,11 @@
     get [Symbol.toStringTag]() { return 'DocumentFragment'; }
     // Fragments are cloneable too; `importNode` and `<template>` content need it.
     __ptShallowClone() { const f = new DocumentFragment(); f.__ptDoc = this.ownerDocument; return f; }
-    get children() { return __collection(this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE)); }
-    get childElementCount() { return this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE).length; }
-    get firstElementChild() { return this.__ptKids.find((n) => n.nodeType === ELEMENT_NODE) || null; }
+    get children() { return __collection(this.__ptKids.filter((n) => n.__ptType === ELEMENT_NODE)); }
+    get childElementCount() { return this.__ptKids.filter((n) => n.__ptType === ELEMENT_NODE).length; }
+    get firstElementChild() { return this.__ptKids.find((n) => n.__ptType === ELEMENT_NODE) || null; }
     get lastElementChild() {
-      const k = this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE);
+      const k = this.__ptKids.filter((n) => n.__ptType === ELEMENT_NODE);
       return k.length ? k[k.length - 1] : null;
     }
     getElementById(id) { return firstMatch(this, (e) => __ptGetA(e, 'id') === String(id)); }
@@ -1078,7 +1078,7 @@
     }
     // A collection, not an array: `document.children` is an HTMLCollection,
     // and `Object.prototype.toString` says so.
-    get children() { return __collection(this.__ptKids.filter(n => n.nodeType === ELEMENT_NODE)); }
+    get children() { return __collection(this.__ptKids.filter(n => n.__ptType === ELEMENT_NODE)); }
     get firstElementChild() { return this.children[0] || null; }
     get lastElementChild() { const c = this.children; return c[c.length - 1] || null; }
     get childElementCount() { return this.children.length; }
@@ -1183,7 +1183,7 @@
     }
     upgrade(root) {
       __walkTree(root, (el) => {
-        if (el.nodeType !== ELEMENT_NODE) return;
+        if (el.__ptType !== ELEMENT_NODE) return;
         const C = __customs.get(el.__ptLocal);
         if (C) __customUpgrade(el, C);
       });
@@ -1480,7 +1480,7 @@
               __markDirty();
               // The sheet is parsed now and its imports start; its `load`
               // waits for them, as Chrome's does.
-              try { imports = __sheetFor(this).__ptImports; } catch (e) {}
+              try { imports = __cssom.get(__sheetFor(this)).imports; } catch (e) {}
             }
             const finish = () => { release(); if (this.__ptFireLoad) this.__ptFireLoad(true); };
             if (imports) imports.then(finish, finish); else finish();
@@ -1564,7 +1564,7 @@
     set enctype(v) { __ptSetA(this, 'enctype', v); }
     get elements() {
       const out = [];
-      __walkTree(this, (n) => { if (n && n.nodeType === ELEMENT_NODE && /^(input|select|textarea|button|fieldset|object|output)$/.test(n.__ptLocal || '') && !(n.__ptLocal === 'input' && __inputType(n) === 'image')) out.push(n); });
+      __walkTree(this, (n) => { if (n && n.__ptType === ELEMENT_NODE && /^(input|select|textarea|button|fieldset|object|output)$/.test(n.__ptLocal || '') && !(n.__ptLocal === 'input' && __inputType(n) === 'image')) out.push(n); });
       return __collection(out);
     }
     get length() { return this.__ptLocal === 'form' ? this.elements.length : undefined; }
@@ -1622,7 +1622,7 @@
     submit() { this.__ptSubmit(null); }
     requestSubmit(submitter) {
       if (this.__ptLocal !== 'form') return;
-      if (submitter !== undefined && submitter !== null && !(submitter && submitter.nodeType === ELEMENT_NODE)) throw __pt_mkErr(TypeError, "Failed to execute 'requestSubmit' on 'HTMLFormElement': parameter 1 is not of type 'HTMLElement'.");
+      if (submitter !== undefined && submitter !== null && !(submitter && submitter.__ptType === ELEMENT_NODE)) throw __pt_mkErr(TypeError, "Failed to execute 'requestSubmit' on 'HTMLFormElement': parameter 1 is not of type 'HTMLElement'.");
       // The browser sends `submit`, so it is trusted even when a script asked
       // for submission (`isTrusted` true in Chrome).
       const ev = __ptTrust(new (globalThis.SubmitEvent || Event)('submit', { bubbles: true, cancelable: true, submitter: submitter || null }));
@@ -1710,12 +1710,12 @@
     get htmlFor() { return __ptGetA(this, 'for') || ''; }
     set htmlFor(v) { __ptSetA(this, 'for', v); }
 
-    get children() { return __collection(this.__ptKids.filter(n => n.nodeType === ELEMENT_NODE)); }
+    get children() { return __collection(this.__ptKids.filter(n => n.__ptType === ELEMENT_NODE)); }
     get childElementCount() { return this.children.length; }
     get firstElementChild() { return this.children[0] || null; }
     get lastElementChild() { const c = this.children; return c[c.length - 1] || null; }
-    get nextElementSibling() { let n = this.nextSibling; while (n && n.nodeType !== ELEMENT_NODE) n = n.nextSibling; return n; }
-    get previousElementSibling() { let n = this.previousSibling; while (n && n.nodeType !== ELEMENT_NODE) n = n.previousSibling; return n; }
+    get nextElementSibling() { let n = this.nextSibling; while (n && n.__ptType !== ELEMENT_NODE) n = n.nextSibling; return n; }
+    get previousElementSibling() { let n = this.previousSibling; while (n && n.__ptType !== ELEMENT_NODE) n = n.previousSibling; return n; }
 
     append(...ns) { for (const n of ns) this.appendChild(typeof n === 'string' ? new Text(n) : n); }
     prepend(...ns) { for (const n of ns.reverse()) this.insertBefore(typeof n === 'string' ? new Text(n) : n, this.firstChild); }
@@ -1749,7 +1749,7 @@
     closest(sel) {
       __needArgs(arguments.length, 1, 'closest', 'Element');
       __checkSelector(sel, 'closest', 'Element');
-      for (let e = this; e; e = e.parentNode) if (e.nodeType === ELEMENT_NODE && matchesSelector(e, sel, this)) return e;
+      for (let e = this; e; e = e.__ptParent) if (e.__ptType === ELEMENT_NODE && matchesSelector(e, sel, this)) return e;
       return null;
     }
     matches(sel) {
@@ -1843,7 +1843,7 @@
         // Hidden itself or by any ancestor (through shadow hosts): Chrome
         // gives such a frame's window 0x0.
         let hidden = false;
-        for (let p = this; p && p.nodeType === ELEMENT_NODE; p = p.parentNode && p.parentNode.nodeType === 11 && p.parentNode.__ptHost ? p.parentNode.__ptHost : p.parentNode) {
+        for (let p = this; p && p.__ptType === ELEMENT_NODE; p = p.__ptParent && p.__ptParent.__ptType === 11 && p.__ptParent.__ptHost ? p.__ptParent.__ptHost : p.__ptParent) {
           if (String((p.style && p.style.display) || '') === 'none' || __ptHasA(p, 'hidden')) { hidden = true; break; }
         }
         // Chrome does not lay out a boxless (0x0) cross-site frame: its empty
@@ -1859,8 +1859,8 @@
         if (globalThis.__pt_srcdocTrace) {
           try {
             const chain = [];
-            for (let p = this; p; p = p.parentNode && p.parentNode.nodeType === 11 && p.parentNode.__ptHost ? (chain.push('#shadow'), p.parentNode.__ptHost) : p.parentNode) {
-              if (p.nodeType !== 1) { chain.push('#' + p.nodeType); break; }
+            for (let p = this; p; p = p.__ptParent && p.__ptParent.__ptType === 11 && p.__ptParent.__ptHost ? (chain.push('#shadow'), p.__ptParent.__ptHost) : p.__ptParent) {
+              if (p.__ptType !== 1) { chain.push('#' + p.__ptType); break; }
               chain.push(p.localName + (p.id ? '#' + p.id : '') + (p.getAttribute('style') ? '[' + p.getAttribute('style') + ']' : '') + (p.className ? '.' + __s_slice(String(p.className), 0, 30) : ''));
             }
             let cs = ''; try { const c = getComputedStyle(this); cs = [c.display, c.width, c.height, c.visibility, c.position, c.left, c.top].join(','); } catch (e) {}
@@ -2053,8 +2053,8 @@
         let inHead = true;
         for (const n of nodes) {
           if (inHead) {
-            if (n.nodeType === 3 && !/\S/.test(n.data)) continue;
-            if (n.nodeType === 8 || (n.nodeType === 1 && HEADISH.has(n.localName))) { __ptAdd.call(head, n); continue; }
+            if (n.__ptType === 3 && !/\S/.test(n.data)) continue;
+            if (n.__ptType === 8 || (n.__ptType === 1 && HEADISH.has(n.localName))) { __ptAdd.call(head, n); continue; }
             inHead = false;
           }
           __ptAdd.call(body, n);
@@ -2083,8 +2083,8 @@
       const nodes = parseFragment(String(html));
       if (pos === 'beforeend') for (const n of nodes) __ptAdd.call(this, n);
       else if (pos === 'afterbegin') for (const n of nodes.reverse()) __ptInsert.call(this, n, this.firstChild);
-      else if (pos === 'beforebegin') for (const n of nodes) __ptInsert.call(this.parentNode, n, this);
-      else if (pos === 'afterend') for (const n of nodes.reverse()) __ptInsert.call(this.parentNode, n, this.nextSibling);
+      else if (pos === 'beforebegin') for (const n of nodes) __ptInsert.call(this.__ptParent, n, this);
+      else if (pos === 'afterend') for (const n of nodes.reverse()) __ptInsert.call(this.__ptParent, n, this.nextSibling);
     }
 
     // Synthetic layout (no real rendering): rendered elements report a non-empty
@@ -2099,7 +2099,7 @@
       const o = options || {};
       const view = globalThis.getComputedStyle;
       if (!this.isConnected || typeof view !== 'function') return false;
-      for (let e = this; e && e.nodeType === ELEMENT_NODE; e = e.parentElement) {
+      for (let e = this; e && e.__ptType === ELEMENT_NODE; e = e.parentElement) {
         let st; try { st = view(e); } catch (x) { st = null; }
         if (!st) continue;
         if (String(st.display) === 'none') return false;
@@ -2112,7 +2112,7 @@
       }
       return true;
     }
-    get parentElement() { const p = this.parentNode; return p && p.nodeType === ELEMENT_NODE ? p : null; }
+    get parentElement() { const p = this.__ptParent; return p && p.__ptType === ELEMENT_NODE ? p : null; }
     // Layout-metric accessors derived from the synthetic box. `documentElement`'s
     // client size is the viewport (drivers clamp click boxes to it).
     // `clientWidth` is the content box plus padding, no borders, as an
@@ -2295,16 +2295,16 @@
     // with `document.replaceChild(html, documentElement)` and reads it back.
     get documentElement() {
       const kids = this.__ptKids;
-      for (let i = 0; i < kids.length; i++) if (kids[i].nodeType === ELEMENT_NODE) return kids[i];
+      for (let i = 0; i < kids.length; i++) if (kids[i].__ptType === ELEMENT_NODE) return kids[i];
       return null;
     }
     // The document's ParentNode members are its own: `children` lives on
     // `Document.prototype` (otherwise the surface installs an empty stub).
-    get children() { return __collection(this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE)); }
-    get childElementCount() { return this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE).length; }
-    get firstElementChild() { return this.__ptKids.find((n) => n.nodeType === ELEMENT_NODE) || null; }
+    get children() { return __collection(this.__ptKids.filter((n) => n.__ptType === ELEMENT_NODE)); }
+    get childElementCount() { return this.__ptKids.filter((n) => n.__ptType === ELEMENT_NODE).length; }
+    get firstElementChild() { return this.__ptKids.find((n) => n.__ptType === ELEMENT_NODE) || null; }
     get lastElementChild() {
-      const k = this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE);
+      const k = this.__ptKids.filter((n) => n.__ptType === ELEMENT_NODE);
       return k.length ? k[k.length - 1] : null;
     }
     set documentElement(v) { this.__ptDocEl = v; }
@@ -2350,7 +2350,7 @@
     // The whole stack under the point, from the deepest to `<html>`.
     elementsFromPoint(x, y) {
       const out = [];
-      for (let e = __elementFromPoint(x, y); e && e.nodeType === ELEMENT_NODE; e = e.parentNode) out.push(e);
+      for (let e = __elementFromPoint(x, y); e && e.__ptType === ELEMENT_NODE; e = e.__ptParent) out.push(e);
       // A point inside the viewport always hits at least <html>.
       if (!out.length && this.documentElement && x >= 0 && y >= 0 && x < (globalThis.innerWidth || 0) && y < (globalThis.innerHeight || 0)) out.push(this.documentElement);
       return out;
@@ -2530,7 +2530,7 @@
     importNode(node, deep) {
       __needArgs(arguments.length, 1, 'importNode', 'Document');
       __needNode(node, 1, 'importNode', 'Document');
-      if (node.nodeType === DOCUMENT_NODE) {
+      if (node.__ptType === DOCUMENT_NODE) {
         throw __pt_mkErr(globalThis.DOMException || Error, 
           "Failed to execute 'importNode' on 'Document': The node provided is a document, " +
           "which may not be imported.", 'NotSupportedError');
@@ -2543,12 +2543,12 @@
     adoptNode(node) {
       __needArgs(arguments.length, 1, 'adoptNode', 'Document');
       __needNode(node, 1, 'adoptNode', 'Document');
-      if (node.nodeType === DOCUMENT_NODE) {
+      if (node.__ptType === DOCUMENT_NODE) {
         throw __pt_mkErr(globalThis.DOMException || Error, 
           "Failed to execute 'adoptNode' on 'Document': The node provided is a document, " +
           "which may not be adopted.", 'NotSupportedError');
       }
-      if (node.parentNode) node.parentNode.removeChild(node);
+      if (node.__ptParent) node.__ptParent.removeChild(node);
       __walkTree(node, (n) => { n.__ptDoc = this; });
       return node;
     }
@@ -2588,9 +2588,9 @@
     write(...args) {
       const nodes = parseFragment(args.map((a) => String(__pt_ttSink('TrustedHTML', 'Document write', a, "Failed to execute 'write' on 'Document'"))).join(''));
       const cur = this.currentScript;
-      if (cur && cur.parentNode) {
+      if (cur && cur.__ptParent) {
         const ref = cur.nextSibling;
-        for (const n of nodes) cur.parentNode.insertBefore(n, ref);
+        for (const n of nodes) cur.__ptParent.insertBefore(n, ref);
       } else {
         const host = this.body || this.documentElement;
         if (host) for (const n of nodes) host.appendChild(n);
@@ -2652,8 +2652,8 @@
       for (let i = 0; i < p.length; i++) {
         const n = p[i];
         out.push(n);
-        if (n.nodeType === 11 && n.mode === 'closed' && cur && cur !== n && !(n.contains && n.contains(cur))) hidden = true;
-        if (hidden && n.nodeType === 11) { out.length = 0; hidden = false; }
+        if (n.__ptType === 11 && n.mode === 'closed' && cur && cur !== n && !(n.contains && n.contains(cur))) hidden = true;
+        if (hidden && n.__ptType === 11) { out.length = 0; hidden = false; }
       }
       return out;
     }
@@ -3509,6 +3509,14 @@
     if (__s_charCodeAt(prop, 0) === 45 && __s_charCodeAt(prop, 1) === 45) return __s_trim(String(value));
     if (prop === 'font-family' && __s_indexOf(String(value), 'var(') < 0) return __cssFontFamily(value);
     let v = __cssZero(__cssColorFn(__cssHex(__s_replace(__s_trim(String(value)), /\s+/g, ' '))));
+    // `url(x)` prints quoted, as Chrome serializes it.
+    if (__s_indexOf(v, 'url(') >= 0) v = __s_replace(v, __CSS_URL_ANY, (m, a, b, c) => 'url("' + __s_replace(a !== undefined ? a : b !== undefined ? b : c, /["\\]/g, '\\$&') + '")');
+    // A font source list: `format()` and `local()` take strings.
+    if (prop === 'src') {
+      v = __s_replace(v, /\b(format|tech)\(\s*'([^']*)'\s*\)/gi, (m, f, x) => f + '("' + x + '")');
+      v = __s_replace(v, /\blocal\(\s*(?:'([^']*)'|"([^"]*)"|([^)]*?))\s*\)/gi, (m, a, b, c) => 'local("' + __s_trim(a !== undefined ? a : b !== undefined ? b : c) + '")');
+      v = __s_replace(v, /\s*,\s*/g, ', ');
+    }
     // Colour keywords print in lower case in properties that take a colour
     // (a font family named `Red` keeps its case).
     if (__CSS_COLOR_PROP.test(prop)) {
@@ -3581,8 +3589,18 @@
       tok += c;
     }
     flush();
+    // A box shorthand prints as few values as say the same.
+    if (__CSS_BOX.has(prop) && __s_indexOf(out, '(') < 0) {
+      const p4 = __s_split(__s_trim(out), ' ');
+      if (p4.length >= 2 && p4.length <= 4) {
+        const t = p4[0], r = p4[1], b = p4[2] !== undefined ? p4[2] : t, l = p4[3] !== undefined ? p4[3] : r;
+        out = l !== r ? [t, r, b, l].join(' ') : b !== t ? [t, r, b].join(' ') : r !== t ? [t, r].join(' ') : t;
+      }
+    }
     return out;
   };
+  const __CSS_URL_ANY = /url\(\s*(?:'([^']*)'|"([^"]*)"|([^)"'\s]*))\s*\)/gi;
+  const __CSS_BOX = new Set(['margin', 'padding', 'inset', 'border-width', 'scroll-margin', 'scroll-padding']);
   const __cssSelector = (sel) => __s_replace(__s_replace(__s_replace(__s_trim(String(sel)), /\s+/g, ' '), /\s*([>+~])\s*/g, ' $1 '), /\s*,\s*/g, ', ');
   const __cssPrelude = (p) => __s_replace(__s_replace(__s_trim(String(p)), /\s+/g, ' '), /:\s*/g, ': ');
 
@@ -3967,19 +3985,6 @@
     return px;
   }
 
-  // A declaration built on first read: thousands of rules, few ever asked.
-  const __lazyStyle = (r, decls) => {
-    Object.defineProperty(r, 'style', {
-      get() {
-        const d = __cssDeclaration(decls);
-        Object.defineProperty(this, 'style', { value: d, enumerable: true, configurable: true });
-        return d;
-      },
-      enumerable: true, configurable: true,
-    });
-    return r;
-  };
-
   const __ruleListProto = {
     get [Symbol.toStringTag]() { return 'CSSRuleList'; },
     get length() { return this.__ptLen | 0; },
@@ -4030,131 +4035,354 @@
     __ruleProtos.set(name, p);
     return p;
   };
+  // CSSOM objects carry no own properties in Chrome: every member is an
+  // accessor on the interface prototype. Their state lives here. A rule's
+  // declarations, selector and text are worked out on first read: GitHub
+  // ships 15 000 rules, and building them all cost half a second.
+  const __cssom = new WeakMap();
+  const __om = (o) => {
+    const s = __cssom.get(o);
+    if (!s) throw __pt_mkErr(TypeError, 'Illegal invocation');
+    return s;
+  };
+  const __ruleDecls = (st) => st.decls || (st.decls = __cssDecls(st.body || ''));
+  const __ruleSel = (st) => (st.sel != null ? st.sel : (st.sel = __cssSelector(st.prelude || '')));
+  const __ruleStyle = (st) => st.style || (st.style = __cssDeclaration(__ruleDecls(st)));
+  const __ruleList = (st) => st.list || (st.list = __cssRuleList(st.kids || []));
+  const __declsText = (m) => __styleEntries(m)
+    .map(([k, v]) => k + ': ' + v + (m.__ptImp && m.__ptImp.has(k) ? ' !important' : '') + ';').join(' ');
   // A rule with children prints on several lines, one per child, indented two
   // spaces. `@keyframes` keeps a space after the opening brace, `@media` does
   // not, as in Chrome.
   const __cssGroup = (prelude, kids, pad) => prelude + ' {' + (pad ? ' ' : '') + '\n'
-    + kids.map((k) => '  ' + __s_replace(String(k.cssText), /\n/g, '\n  ')).join('\n')
+    + kids.map((k) => '  ' + __s_replace(__ruleText(__cssom.get(k)), /\n/g, '\n  ')).join('\n')
     + '\n}';
+  function __ruleText(st) {
+    switch (st.kind) {
+      case 'style': { const b = __declsText(__ruleDecls(st)); return __ruleSel(st) + ' { ' + (b ? b + ' ' : '') + '}'; }
+      case 'font-face': return '@font-face { ' + __declsText(__ruleDecls(st)) + ' }';
+      case 'keyframe': return st.keyText + ' { ' + __declsText(__ruleDecls(st)) + ' }';
+      case 'media': case 'supports': return __cssGroup(st.at + ' ' + st.cond, st.kids, false);
+      case 'layer-block': return __cssGroup('@layer' + (st.name ? ' ' + st.name : ''), st.kids, false);
+      case 'keyframes': return __cssGroup('@keyframes ' + st.name, st.kids, true);
+      case 'container': return __cssGroup('@container ' + st.cond, st.kids, false);
+      case 'page': { const b = __declsText(__ruleDecls(st)); return '@page' + (st.sel ? ' ' + st.sel : '') + ' { ' + (b ? b + ' ' : '') + '}'; }
+      case 'property': {
+        const m = __ruleDecls(st), out = [];
+        for (const k of ['syntax', 'inherits', 'initial-value']) if (m.has(k)) out.push(k + ': ' + __propertyDescriptor(k, m.get(k)) + ';');
+        return '@property ' + st.name + ' { ' + (out.length ? out.join(' ') + ' ' : '') + '}';
+      }
+      case 'counter-style': { const b = __declsText(__ruleDecls(st)); return '@counter-style ' + st.name + ' { ' + (b ? b + ' ' : '') + '}'; }
+      default: return st.text;
+    }
+  }
+  // `@property` descriptors: the syntax is a string in double quotes.
+  const __propertyDescriptor = (k, v) => {
+    v = __s_trim(String(v));
+    if (k === 'syntax') { const m = /^(['"])(.*)\1$/.exec(v); return '"' + (m ? m[2] : v) + '"'; }
+    return v;
+  };
+  // Keyframe selectors: `from` is 0%, `to` 100%, a list is comma-spaced.
+  const __keyText = (p) => __s_split(__s_trim(String(p)), ',').map((x) => {
+    const t = __s_toLowerCase(__s_trim(x));
+    return t === 'from' ? '0%' : t === 'to' ? '100%' : t;
+  }).join(', ');
+  // A media query list: one space around `and`, `: ` in features, `, `
+  // between queries.
+  const __mediaText = (q) => __s_replace(__s_replace(__s_replace(__s_trim(String(q)), /\s+/g, ' '), /\s*:\s*/g, ': '), /\s*,\s*/g, ', ');
+  // A selector or a rule list changed through the CSSOM: the rule list and
+  // every cascade are rebuilt.
+  const __cssomChanged = () => { __importGen++; __markDirty(); };
+  // `insertRule` on a sheet or a grouping rule: Chrome's index checks.
+  const __ruleInsert = (st, text, index, owner, sheet, parent, iface) => {
+    const list = st.kids || st.rules;
+    const at = index === undefined ? 0 : Number(index) >>> 0;
+    if (at > list.length) {
+      throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'insertRule' on '" + iface + "': The index provided (" + at + ') is larger than the maximum index (' + list.length + ').', 'IndexSizeError');
+    }
+    const parsed = __cssParse(String(text))[0];
+    const rule = parsed && __makeRule(parsed, sheet, parent);
+    if (!rule) {
+      throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'insertRule' on '" + iface + "': Failed to parse the rule '" + String(text) + "'.", 'SyntaxError');
+    }
+    const next = list.slice();
+    next.splice(at, 0, rule);
+    if (st.kids) st.kids = next; else st.rules = next;
+    st.list = null;
+    __cssomChanged();
+    return at;
+  };
+  const __ruleDelete = (st, index, iface) => {
+    const list = st.kids || st.rules;
+    const at = Number(index) >>> 0;
+    if (at >= list.length) {
+      throw __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'deleteRule' on '" + iface + "': The index provided (" + at + ') is larger than the maximum index (' + Math.max(0, list.length - 1) + ').', 'IndexSizeError');
+    }
+    const next = list.slice();
+    next.splice(at, 1);
+    if (st.kids) st.kids = next; else st.rules = next;
+    st.list = null;
+    __cssomChanged();
+  };
+  // A sheet made with `new CSSStyleSheet()` gets its state on first use.
+  const __sheetOm = (o) => {
+    let s = __cssom.get(o);
+    if (s) return s;
+    const P = globalThis.CSSStyleSheet && globalThis.CSSStyleSheet.prototype;
+    if (!P || o === null || typeof o !== 'object' || o === P || !Object.prototype.isPrototypeOf.call(P, o)) {
+      throw __pt_mkErr(TypeError, 'Illegal invocation');
+    }
+    s = { owner: null, href: null, title: null, media: __mediaList(''), parent: null, ownerRule: null,
+          disabled: false, text: null, rules: [], list: null, imports: Promise.resolve() };
+    __cssom.set(o, s);
+    return s;
+  };
+  const __sheetRuleList = (st) => st.list || (st.list = __cssRuleList(st.rules));
+  const __cssomMembers = {
+    CSSRule: {
+      get type() { return __om(this).type; },
+      get cssText() { return __ruleText(__om(this)); },
+      set cssText(v) { __om(this); },
+      get parentRule() { return __om(this).parent; },
+      get parentStyleSheet() { return __om(this).sheet; },
+    },
+    CSSStyleRule: {
+      get selectorText() { return __ruleSel(__om(this)); },
+      set selectorText(v) {
+        const st = __om(this);
+        const sel = __cssSelector(String(v));
+        if (!sel || !__selCompiled(sel)) return;
+        st.sel = sel;
+        __cssomChanged();
+      },
+      get style() { return __ruleStyle(__om(this)); },
+      set style(v) { __ruleStyle(__om(this)).cssText = String(v); },
+      get cssRules() { return __ruleList(__om(this)); },
+      insertRule() { __om(this); return 0; },
+      deleteRule() { __om(this); },
+    },
+    CSSGroupingRule: {
+      get cssRules() { return __ruleList(__om(this)); },
+      insertRule(rule, index) { const st = __om(this); return __ruleInsert(st, rule, index, this, st.sheet, this, 'CSSGroupingRule'); },
+      deleteRule(index) { __ruleDelete(__om(this), index, 'CSSGroupingRule'); },
+    },
+    CSSConditionRule: {
+      get conditionText() { return __om(this).cond; },
+    },
+    CSSMediaRule: {
+      get media() { const st = __om(this); return st.media || (st.media = __mediaList(st.cond)); },
+    },
+    CSSImportRule: {
+      get href() { return __om(this).href; },
+      get media() { return __om(this).media; },
+      get styleSheet() { return __om(this).styleSheet; },
+      get layerName() { return __om(this).layer; },
+      get supportsText() { __om(this); return null; },
+    },
+    CSSFontFaceRule: {
+      get style() { return __ruleStyle(__om(this)); },
+    },
+    CSSKeyframesRule: {
+      get name() { return __om(this).name; },
+      set name(v) { __om(this).name = String(v); },
+      get cssRules() { return __ruleList(__om(this)); },
+      get length() { return __om(this).kids.length; },
+      appendRule() { __om(this); },
+      deleteRule() { __om(this); },
+      findRule() { __om(this); return null; },
+    },
+    CSSKeyframeRule: {
+      get keyText() { return __om(this).keyText; },
+      set keyText(v) { __om(this).keyText = __keyText(v); },
+      get style() { return __ruleStyle(__om(this)); },
+    },
+    CSSLayerBlockRule: {
+      get name() { return __om(this).name; },
+    },
+    CSSContainerRule: {
+      get containerName() { return __om(this).containerName; },
+      get containerQuery() { return __om(this).containerQuery; },
+    },
+    CSSPageRule: {
+      get selectorText() { return __om(this).sel || ''; },
+      get style() { return __ruleStyle(__om(this)); },
+    },
+    CSSPropertyRule: {
+      get name() { return __om(this).name; },
+      get syntax() { const m = __ruleDecls(__om(this)); return m.has('syntax') ? __s_slice(__propertyDescriptor('syntax', m.get('syntax')), 1, -1) : ''; },
+      get inherits() { const m = __ruleDecls(__om(this)); return __s_toLowerCase(__s_trim(String(m.get('inherits') || ''))) === 'true'; },
+      get initialValue() { const m = __ruleDecls(__om(this)); return m.has('initial-value') ? __s_trim(String(m.get('initial-value'))) : null; },
+    },
+    CSSCounterStyleRule: {
+      get name() { return __om(this).name; },
+    },
+    CSSLayerStatementRule: {
+      get nameList() { const st = __om(this); return st.frozen || (st.frozen = Object.freeze(st.names.slice())); },
+    },
+    StyleSheet: {
+      get type() { __sheetOm(this); return 'text/css'; },
+      get href() { return __sheetOm(this).href; },
+      get ownerNode() { return __sheetOm(this).owner; },
+      get parentStyleSheet() { return __sheetOm(this).parent; },
+      get title() { return __sheetOm(this).title; },
+      get media() { return __sheetOm(this).media; },
+      get disabled() { return __sheetOm(this).disabled; },
+      set disabled(v) { const st = __sheetOm(this); if (st.disabled !== !!v) { st.disabled = !!v; __cssomChanged(); } },
+    },
+    CSSStyleSheet: {
+      get [Symbol.toStringTag]() { return 'CSSStyleSheet'; },
+      get ownerRule() { return __sheetOm(this).ownerRule; },
+      get cssRules() { return __sheetRuleList(__sheetOm(this)); },
+      get rules() { return __sheetRuleList(__sheetOm(this)); },
+      insertRule(text, index) { return __ruleInsert(__sheetOm(this), text, index, this, this, null, 'CSSStyleSheet'); },
+      deleteRule(index) { __ruleDelete(__sheetOm(this), index, 'CSSStyleSheet'); },
+      addRule(sel, decl, index) {
+        const st = __sheetOm(this);
+        __ruleInsert(st, sel + ' { ' + (decl || '') + ' }', index === undefined ? st.rules.length : index, this, this, null, 'CSSStyleSheet');
+        return -1;
+      },
+      removeRule(index) { __ruleDelete(__sheetOm(this), index === undefined ? 0 : index, 'CSSStyleSheet'); },
+      replaceSync(text) {
+        const st = __sheetOm(this);
+        st.rules = __topRules(String(text), this, true);
+        st.list = null;
+        __cssomChanged();
+      },
+      replace(text) { this.replaceSync(text); return Promise.resolve(this); },
+    },
+  };
+  // Members go onto the interface prototypes once, when the first sheet is
+  // made (after the bootstrap has shaped them).
+  let __cssomLinked = false;
+  const __cssomLink = () => {
+    if (__cssomLinked) return;
+    __cssomLinked = true;
+    for (const name of Object.keys(__cssomMembers)) __link(name, __cssomMembers[name]);
+  };
+  const __newRule = (iface, st) => {
+    __cssomLink();
+    const r = Object.create(__ruleProto(iface));
+    __cssom.set(r, st);
+    return r;
+  };
 
   function __makeRule(parsed, sheet, parent) {
     const prelude = parsed.prelude || '';
     const at = __s_charCodeAt(prelude, 0) === 64 ? __s_toLowerCase(__s_split(prelude, /[\s({]/)[0]) : '';
-    const own = (r, props) => { for (const k of Object.keys(props)) Object.defineProperty(r, k, { value: props[k], enumerable: true, configurable: true }); return r; };
-    const common = (r, type) => own(r, {
-      type, parentStyleSheet: sheet, parentRule: parent || null,
-    });
+    const base = (kind, type) => ({ kind, type, sheet, parent: parent || null });
 
     if (at === '@import') {
       const href = __s_slice(/url\(\s*["']?([^"')]*)["']?\s*\)|["']([^"']*)["']/.exec(prelude) || [], 1).find((x) => x !== undefined) || '';
-      const r = common(Object.create(__ruleProto('CSSImportRule')), RULE_TYPE.import);
       let media = __s_trim(__s_replace(__s_slice(prelude, 7), /^\s*(url\(\s*(["']?)[^)]*?\2\s*\)|"[^"]*"|'[^']*')/i, ''));
       // `layer` or `layer(name)` puts the imported rules in a cascade layer.
-      let layerName = null;
+      let layer = null;
       const lm = /^layer(?:\(\s*([^)]*?)\s*\))?(?=\s|$)/i.exec(media);
-      if (lm) { layerName = lm[1] || ''; media = __s_trim(__s_slice(media, lm[0].length)); }
-      own(r, { href, layerName, supportsText: null, media: __mediaList(media),
-               cssText: '@import url("' + href + '")' + (lm ? ' ' + lm[0] : '') + (media ? ' ' + media : '') + ';' });
-      if (lm) Object.defineProperty(r, '__ptLayer', { value: layerName, configurable: true });
-      Object.defineProperty(r, 'styleSheet', { value: null, writable: true, enumerable: true, configurable: true });
-      return r;
+      if (lm) { layer = lm[1] || ''; media = __s_trim(__s_slice(media, lm[0].length)); }
+      const st = base('import', RULE_TYPE.import);
+      Object.assign(st, { href, layer, media: __mediaList(media), styleSheet: null,
+        text: '@import url("' + href + '")' + (lm ? ' ' + lm[0] : '') + (media ? ' ' + media : '') + ';' });
+      return __newRule('CSSImportRule', st);
     }
     if (at === '@layer') {
       const names = __s_trim(__s_slice(prelude, 6));
       if (parsed.statement || parsed.body == null) {
         const list = __s_split(names, ',').map((x) => __s_trim(x)).filter(Boolean);
-        const r = common(Object.create(__ruleProto('CSSLayerStatementRule')), 0);
-        own(r, { nameList: Object.freeze(list.slice()), cssText: '@layer ' + list.join(', ') + ';' });
-        Object.defineProperty(r, '__ptLayerNames', { value: list, configurable: true });
-        return r;
+        const st = base('layer-statement', 0);
+        Object.assign(st, { names: list, text: '@layer ' + list.join(', ') + ';' });
+        return __newRule('CSSLayerStatementRule', st);
       }
-      const r = common(Object.create(__ruleProto('CSSLayerBlockRule')), 0);
-      const kids = __cssParse(parsed.body || '').map((p) => __makeRule(p, sheet, r)).filter(Boolean);
-      own(r, { name: names, cssRules: __cssRuleList(kids), cssText: __cssGroup('@layer' + (names ? ' ' + names : ''), kids, false) });
-      Object.defineProperty(r, '__ptLayerBlock', { value: true, configurable: true });
+      const st = base('layer-block', 0);
+      st.name = names;
+      const r = __newRule('CSSLayerBlockRule', st);
+      st.kids = __cssParse(parsed.body || '').map((p) => __makeRule(p, sheet, r)).filter(Boolean);
       return r;
     }
     if (at === '@media' || at === '@supports') {
-      const name = at === '@media' ? 'CSSMediaRule' : 'CSSSupportsRule';
-      const r = common(Object.create(__ruleProto(name)), at === '@media' ? RULE_TYPE.media : RULE_TYPE.supports);
-      const cond = __cssPrelude(__s_trim(__s_slice(prelude, at.length)));
-      const kids = __cssParse(parsed.body || '').map((p) => __makeRule(p, sheet, r)).filter(Boolean);
-      own(r, { cssRules: __cssRuleList(kids), conditionText: cond });
-      if (at === '@media') own(r, { media: __mediaList(cond) });
-      return own(r, { cssText: __cssGroup(at + ' ' + cond, kids, false) });
+      const st = base(at === '@media' ? 'media' : 'supports', at === '@media' ? RULE_TYPE.media : RULE_TYPE.supports);
+      // A media query is normalized; a supports condition stays as written.
+      const raw = __s_trim(__s_slice(prelude, at.length));
+      Object.assign(st, { at, cond: at === '@media' ? __mediaText(raw) : raw });
+      const r = __newRule(at === '@media' ? 'CSSMediaRule' : 'CSSSupportsRule', st);
+      st.kids = __cssParse(parsed.body || '').map((p) => __makeRule(p, sheet, r)).filter(Boolean);
+      return r;
     }
     if (at === '@keyframes' || at === '@-webkit-keyframes') {
-      const r = common(Object.create(__ruleProto('CSSKeyframesRule')), RULE_TYPE.keyframes);
-      const kids = __cssParse(parsed.body || '').map((p) => {
-        const k = common(Object.create(__ruleProto('CSSKeyframeRule')), RULE_TYPE.keyframe);
-        const decls = __cssDecls(p.body || '');
-        return own(__lazyStyle(k, decls), { keyText: __cssPrelude(p.prelude),
-                        cssText: __cssPrelude(p.prelude) + ' { '
-                          + __styleEntries(decls).map(([a2, b2]) => a2 + ': ' + b2 + ';').join(' ') + ' }' });
+      const st = base('keyframes', RULE_TYPE.keyframes);
+      st.name = __s_trim(__s_slice(prelude, at.length));
+      const r = __newRule('CSSKeyframesRule', st);
+      st.kids = __cssParse(parsed.body || '').map((p) => {
+        const k = base('keyframe', RULE_TYPE.keyframe);
+        Object.assign(k, { parent: r, keyText: __keyText(p.prelude), body: p.body || '' });
+        return __newRule('CSSKeyframeRule', k);
       });
-      const name = __s_trim(__s_slice(prelude, at.length));
-      return own(r, { name, length: kids.length, cssRules: __cssRuleList(kids),
-                      appendRule() {}, deleteRule() {}, findRule() { return null; },
-                      cssText: __cssGroup('@keyframes ' + name, kids, true) });
+      // A keyframes rule reads its keyframes by index, as own properties.
+      for (let i = 0; i < st.kids.length; i++) {
+        Object.defineProperty(r, String(i), { value: st.kids[i], enumerable: true, configurable: true });
+      }
+      return r;
     }
     if (at === '@font-face') {
-      const r = common(Object.create(__ruleProto('CSSFontFaceRule')), RULE_TYPE['font-face']);
-      const decls = __cssDecls(parsed.body || '');
-      return own(__lazyStyle(r, decls), {
-                      cssText: '@font-face { '
-                        + __styleEntries(decls).map(([a2, b2]) => a2 + ': ' + b2 + ';').join(' ') + ' }' });
+      const st = base('font-face', RULE_TYPE['font-face']);
+      st.body = parsed.body || '';
+      return __newRule('CSSFontFaceRule', st);
+    }
+    if (at === '@container') {
+      const st = base('container', 0);
+      const raw = __s_trim(__s_slice(prelude, at.length));
+      // An optional name, then the query.
+      const nm = /^(?!not\b|\()([-\w]+)\s+/i.exec(raw);
+      st.containerName = nm ? nm[1] : '';
+      st.containerQuery = __mediaText(nm ? __s_slice(raw, nm[0].length) : raw);
+      st.cond = (st.containerName ? st.containerName + ' ' : '') + st.containerQuery;
+      const r = __newRule('CSSContainerRule', st);
+      st.kids = __cssParse(parsed.body || '').map((p) => __makeRule(p, sheet, r)).filter(Boolean);
+      return r;
+    }
+    if ((at === '@page' || at === '@property' || at === '@counter-style') && !parsed.statement) {
+      const kind = at === '@page' ? 'page' : at === '@property' ? 'property' : 'counter-style';
+      const st = base(kind, at === '@page' ? RULE_TYPE.page : at === '@counter-style' ? 11 : 0);
+      const rest = __s_trim(__s_slice(prelude, at.length));
+      if (kind === 'page') st.sel = __s_replace(rest, /\s+/g, ' '); else st.name = rest;
+      st.body = parsed.body || '';
+      return __newRule(kind === 'page' ? 'CSSPageRule' : kind === 'property' ? 'CSSPropertyRule' : 'CSSCounterStyleRule', st);
     }
     if (at) {
       // Chrome reads `@charset` and drops it; it is not in the rule list.
       if (/^@charset\b/i.test(prelude)) return null;
-      const r = common(Object.create(__ruleProto('CSSRule')), RULE_TYPE.charset);
-      return own(r, { cssText: prelude + (parsed.statement ? ';' : ' { }') });
+      const st = base('other', RULE_TYPE.charset);
+      st.text = prelude + (parsed.statement ? ';' : ' { }');
+      return __newRule('CSSRule', st);
     }
-    const r = common(Object.create(__ruleProto('CSSStyleRule')), RULE_TYPE.style);
-    const decls = __cssDecls(parsed.body || '');
-    const sel = __cssSelector(prelude);
-    const body = __styleEntries(decls).map(([k, v]) => k + ': ' + v + (decls.__ptImp && decls.__ptImp.has(k) ? ' !important' : '') + ';').join(' ');
-    own(r, { selectorText: sel });
-    // A rule's declaration (~700 properties) is built lazily: building it for
-    // thousands of rules cost ~800 ms per stylesheet. The cascade reads the
-    // declaration map directly.
-    Object.defineProperty(r, 'style', {
-      get() {
-        const d = __cssDeclaration(decls);
-        Object.defineProperty(this, 'style', { value: d, enumerable: true, configurable: true });
-        return d;
-      },
-      enumerable: true, configurable: true,
-    });
-    Object.defineProperty(r, '__ptDecls', { value: decls, enumerable: false, configurable: true });
-    return own(r, { cssRules: __cssRuleList([]), insertRule() { return 0; }, deleteRule() {},
-                    cssText: sel + ' { ' + (body ? body + ' ' : '') + '}' });
+    const st = base('style', RULE_TYPE.style);
+    st.prelude = prelude;
+    st.body = parsed.body || '';
+    st.sel = null;
+    return __newRule('CSSStyleRule', st);
   }
 
-  const __sheetProto = {
-    get [Symbol.toStringTag]() { return 'CSSStyleSheet'; },
-    get rules() { return this.cssRules; },
-    insertRule(text, index) {
-      const parsed = __cssParse(String(text))[0];
-      if (!parsed) return 0;
-      const arr = [...this.cssRules];
-      const at = index === undefined ? 0 : Math.min(index | 0, arr.length);
-      arr.splice(at, 0, __makeRule(parsed, this, null));
-      Object.defineProperty(this, 'cssRules', { value: __cssRuleList(arr), enumerable: true, configurable: true });
-      return at;
-    },
-    deleteRule(index) {
-      const arr = [...this.cssRules];
-      arr.splice(index | 0, 1);
-      Object.defineProperty(this, 'cssRules', { value: __cssRuleList(arr), enumerable: true, configurable: true });
-    },
-    addRule(sel, decl, index) { return this.insertRule(sel + ' { ' + (decl || '') + ' }', index), -1; },
-    removeRule(index) { this.deleteRule(index); },
-    replaceSync(text) {
-      const rules = __cssParse(String(text)).map((p) => __makeRule(p, this, null)).filter(Boolean);
-      Object.defineProperty(this, 'cssRules', { value: __cssRuleList(rules), enumerable: true, configurable: true });
-    },
-    replace(text) { this.replaceSync(text); return Promise.resolve(this); },
+  // A sheet's top-level rules. `@import` counts only before every other rule
+  // (`@charset` aside), `@layer` statements included once an import was seen;
+  // a constructed sheet takes none.
+  const __topRules = (text, sheet, constructed) => {
+    const out = [];
+    let lead = true, imported = false;
+    for (const p of __cssParse(text)) {
+      const r = __makeRule(p, sheet, null);
+      if (!r) continue;
+      const kind = __cssom.get(r).kind;
+      if (kind === 'import') { if (!lead || constructed) continue; imported = true; }
+      else if (kind !== 'layer-statement' || imported) lead = false;
+      out.push(r);
+    }
+    return out;
+  };
+  // A sheet's rules for the engine: its state, never the page-facing list.
+  const __sheetRules = (sheet) => { const st = sheet && __cssom.get(sheet); return st && !st.disabled ? st.rules : null; };
+  // The sheet's own address, or the nearest importing sheet's (the base a
+  // `url()` in it resolves against).
+  const __sheetHref = (sheet) => {
+    for (let st = sheet && __cssom.get(sheet); st; st = st.parent && __cssom.get(st.parent)) if (st.href) return st.href;
+    return null;
   };
   // A sheet lives on its element: pages compare
   // `document.styleSheets[0] === document.styleSheets[0]`, and rules are
@@ -4174,29 +4402,26 @@
     return '';
   };
   function __sheetFor(owner) {
-    const proto = __link('CSSStyleSheet', __sheetProto);
+    __cssomLink();
     const text = owner.__ptLocal === 'style'
       ? String(owner.textContent || '')
       : String(owner.__ptSheetText || '');
     let sheet = owner.__ptSheet;
     if (!sheet) {
-      sheet = Object.create(proto);
+      sheet = Object.create(__ruleProto('CSSStyleSheet'));
       Object.defineProperty(owner, '__ptSheet', { value: sheet, writable: true, enumerable: false });
-      const href = owner.__ptLocal === 'link' ? (owner.href || null) : null;
-      Object.defineProperty(sheet, 'ownerNode', { value: owner, enumerable: true, configurable: true });
-      Object.defineProperty(sheet, 'href', { value: href, enumerable: true, configurable: true });
-      Object.defineProperty(sheet, 'type', { value: 'text/css', enumerable: true, configurable: true });
-      Object.defineProperty(sheet, 'disabled', { value: false, writable: true, enumerable: true, configurable: true });
-      Object.defineProperty(sheet, 'title', { value: __ptGetA(owner, 'title'), enumerable: true, configurable: true });
-      Object.defineProperty(sheet, 'media', { value: __mediaList(__ptGetA(owner, 'media') || ''), enumerable: true, configurable: true });
-      Object.defineProperty(sheet, 'parentStyleSheet', { value: null, enumerable: true, configurable: true });
-      Object.defineProperty(sheet, 'ownerRule', { value: null, enumerable: true, configurable: true });
+      __cssom.set(sheet, {
+        owner, href: owner.__ptLocal === 'link' ? (owner.href || null) : null,
+        title: __ptGetA(owner, 'title'), media: __mediaList(__ptGetA(owner, 'media') || ''),
+        parent: null, ownerRule: null, disabled: false, text: null, rules: [], list: null, imports: Promise.resolve(),
+      });
     }
-    if (sheet.__ptText !== text) {
-      Object.defineProperty(sheet, '__ptText', { value: text, writable: true, enumerable: false, configurable: true });
-      const rules = __cssParse(text).map((p) => __makeRule(p, sheet, null)).filter(Boolean);
-      Object.defineProperty(sheet, 'cssRules', { value: __cssRuleList(rules), enumerable: true, configurable: true });
-      __startImports(sheet, rules, 0);
+    const st = __cssom.get(sheet);
+    if (st.text !== text) {
+      st.text = text;
+      st.rules = __topRules(text, sheet, false);
+      st.list = null;
+      __startImports(sheet, st.rules, 0);
     }
     return sheet;
   }
@@ -4211,43 +4436,42 @@
   function __startImports(sheet, rules, depth) {
     let list = null;
     for (const r of rules) {
-      if (r.type === RULE_TYPE.import) (list || (list = [])).push(r);
-      else if (r.type !== RULE_TYPE.charset) break;   // imports only lead a sheet
+      const kind = __cssom.get(r).kind;
+      if (kind === 'import') (list || (list = [])).push(r);
+      else if (kind !== 'layer-statement') break;   // imports only lead a sheet
     }
     const done = list && depth < __IMPORT_DEPTH && typeof globalThis.__pt_subresourceText === 'function'
       ? Promise.all(list.map((r) => __loadImport(sheet, r, depth)))
       : Promise.resolve();
-    if (list && depth === 0 && sheet.ownerNode && sheet.ownerNode.__ptLocal === 'style') {
-      const rel = __holdDcl(sheet.ownerNode);
+    const st = __cssom.get(sheet);
+    if (list && depth === 0 && st.owner && st.owner.__ptLocal === 'style') {
+      const rel = __holdDcl(st.owner);
       done.then(rel, rel);
     }
-    Object.defineProperty(sheet, '__ptImports', { value: done, writable: true, enumerable: false, configurable: true });
+    st.imports = done;
     return done;
   }
   function __loadImport(sheet, rule, depth) {
-    const from = sheet.href || null;
+    const from = __cssom.get(sheet).href || null;
+    const rst = __cssom.get(rule);
     let abs;
-    try { abs = new URL(rule.href, from || document.baseURI).href; } catch (e) { return Promise.resolve(); }
+    try { abs = new URL(rst.href, from || document.baseURI).href; } catch (e) { return Promise.resolve(); }
     // A cycle loads nothing more: the browser drops an import of a sheet already
     // on the chain.
-    for (let s2 = sheet; s2; s2 = s2.parentStyleSheet) if (s2.href === abs) return Promise.resolve();
+    for (let s2 = __cssom.get(sheet); s2; s2 = s2.parent && __cssom.get(s2.parent)) if (s2.href === abs) return Promise.resolve();
     const rel = __holdLoad('import ' + abs);
     return __pt_subresourceText(abs, 'css', from)
       .then((text) => {
         if (typeof text !== 'string') return null;
-        const child = Object.create(__link('CSSStyleSheet', __sheetProto));
-        for (const [k, v] of [['ownerNode', null], ['href', abs], ['type', 'text/css'], ['title', null],
-          ['media', rule.media], ['parentStyleSheet', sheet], ['ownerRule', rule]]) {
-          Object.defineProperty(child, k, { value: v, enumerable: true, configurable: true });
-        }
-        Object.defineProperty(child, 'disabled', { value: false, writable: true, enumerable: true, configurable: true });
-        Object.defineProperty(child, '__ptText', { value: text, writable: true, enumerable: false, configurable: true });
-        const kids = __cssParse(text).map((p) => __makeRule(p, child, null)).filter(Boolean);
-        Object.defineProperty(child, 'cssRules', { value: __cssRuleList(kids), enumerable: true, configurable: true });
-        rule.styleSheet = child;
+        const child = Object.create(__ruleProto('CSSStyleSheet'));
+        const cst = { owner: null, href: abs, title: null, media: rst.media, parent: sheet, ownerRule: rule,
+                      disabled: false, text, rules: [], list: null, imports: Promise.resolve() };
+        __cssom.set(child, cst);
+        cst.rules = __topRules(text, child, false);
+        rst.styleSheet = child;
         __importGen++;
         __markDirty();
-        return __startImports(child, kids, depth + 1);
+        return __startImports(child, cst.rules, depth + 1);
       })
       .then(() => { rel(); }, () => { rel(); });
   }
@@ -4548,7 +4772,7 @@
   }
   function __tagsNS(root, ns, local) {
     const L = String(local), N = ns === null ? null : String(ns);
-    return collect(root, (e) => (L === '*' || e.__ptLocal === L || e.localName === L)
+    return collect(root, (e) => (L === '*' || e.__ptLocal === L || e.__ptLocal === L)
       && (N === '*' || (e.namespaceURI || null) === (N === '' ? null : N)));
   }
   function collect(root, pred) {
@@ -4571,7 +4795,7 @@
     const own = [];
     const visit = (n) => {
       for (const c of (n.__ptKids || [])) {
-        if (c.nodeType !== ELEMENT_NODE) continue;
+        if (c.__ptType !== ELEMENT_NODE) continue;
         if (__ptHasSheet(c)) own.push(c);
         visit(c);
       }
@@ -4585,7 +4809,7 @@
   }
   function walk(node, visit) {
     for (const c of node.__ptKids) {
-      if (c.nodeType === ELEMENT_NODE) { visit(c); walk(c, visit); }
+      if (c.__ptType === ELEMENT_NODE) { visit(c); walk(c, visit); }
     }
   }
 
@@ -4657,7 +4881,7 @@
         const c = s[i];
         if (c === '*') {
           i++; any = true;
-          if (s[i] === '|') { i++; if (s[i] === '*') i++; else { const n = __s_toLowerCase(ident()); spec[2]++; tests.push((e) => e.localName === n); } }
+          if (s[i] === '|') { i++; if (s[i] === '*') i++; else { const n = __s_toLowerCase(ident()); spec[2]++; tests.push((e) => e.__ptLocal === n); } }
           continue;
         }
         if (c === '|') { i++; continue; }
@@ -4667,7 +4891,7 @@
           if (s[i] === '|' && s[i + 1] !== '=') { i++; if (s[i] === '*') { i++; any = true; continue; } n = ident(); }
           const low = __s_toLowerCase(n);
           spec[2]++; any = true;
-          tests.push((e) => e.localName === low || (e.__ptNS && e.__ptNS !== 'http://www.w3.org/1999/xhtml' && e.localName === n));
+          tests.push((e) => e.__ptLocal === low || (e.__ptNS && e.__ptNS !== 'http://www.w3.org/1999/xhtml' && e.__ptLocal === n));
           continue;
         }
         if (c === '#') { i++; const n = ident(); if (!n) fail(); spec[0]++; toks.push('i' + n); tests.push((e) => e.id === n); any = true; continue; }
@@ -4787,7 +5011,7 @@
     return list(false);
   }
 
-  const __parentEl = (e) => { const p = e.parentNode; return p && p.nodeType === ELEMENT_NODE ? p : null; };
+  const __parentEl = (e) => { const p = e.__ptParent; return p && p.__ptType === ELEMENT_NODE ? p : null; };
 
   // Ancestor filter, as browsers do it: a 256-bit set of the id and class
   // tokens on an element's ancestors. A rule whose ancestor compounds need a
@@ -4827,8 +5051,8 @@
     }
     return false;
   }
-  const __prevEl = (e) => { let p = e.previousSibling; while (p && p.nodeType !== ELEMENT_NODE) p = p.previousSibling; return p; };
-  const __nextEl = (e) => { let p = e.nextSibling; while (p && p.nodeType !== ELEMENT_NODE) p = p.nextSibling; return p; };
+  const __prevEl = (e) => { let p = e.previousSibling; while (p && p.__ptType !== ELEMENT_NODE) p = p.previousSibling; return p; };
+  const __nextEl = (e) => { let p = e.nextSibling; while (p && p.__ptType !== ELEMENT_NODE) p = p.nextSibling; return p; };
 
   function __selMatchComplex(el, cx, idx, ctx) {
     if (!cx.comps[idx](el, ctx)) return false;
@@ -4905,12 +5129,12 @@
   const __TEXTISH = /^(text|search|url|tel|email|password|date|month|week|time|datetime-local|number)$/;
   const __inputType = (e) => __s_toLowerCase(String(__ptGetA(e, 'type') || 'text'));
   const __isDisabled = (e) => {
-    if (!__FORM_CTL.has(e.localName)) return false;
+    if (!__FORM_CTL.has(e.__ptLocal)) return false;
     if (__ptHasA(e, 'disabled')) return true;
     for (let p = __parentEl(e); p; p = __parentEl(p)) {
-      if (p.localName === 'fieldset' && __ptHasA(p, 'disabled')) {
+      if (p.__ptLocal === 'fieldset' && __ptHasA(p, 'disabled')) {
         // Except what is inside the first legend.
-        const legend = [...p.children].find((k) => k.localName === 'legend');
+        const legend = [...p.children].find((k) => k.__ptLocal === 'legend');
         if (!(legend && legend.contains(e))) return true;
       }
     }
@@ -4918,7 +5142,7 @@
   };
   const __valueOf = (e) => { try { return String(e.value == null ? '' : e.value); } catch (x) { return ''; } };
   const __isInvalid = (e) => {
-    const t = e.localName;
+    const t = e.__ptLocal;
     if (t === 'form' || t === 'fieldset') {
       let bad = false;
       walk(e, (k) => { if (!bad && __isInvalid(k)) bad = true; });
@@ -4934,13 +5158,13 @@
     const sib = (e, dir, same) => {
       let n = 1;
       for (let p = dir < 0 ? __prevEl(e) : __nextEl(e); p; p = dir < 0 ? __prevEl(p) : __nextEl(p)) {
-        if (!same || p.localName === e.localName) n++;
+        if (!same || p.__ptLocal === e.__ptLocal) n++;
       }
       return n;
     };
     switch (name) {
       case 'root': return { spec: B, test: (e) => !!e.ownerDocument && e === e.ownerDocument.documentElement };
-      case 'scope': return { spec: B, test: (e, ctx) => (ctx && ctx.scope && ctx.scope.nodeType === ELEMENT_NODE ? e === ctx.scope : !!e.ownerDocument && e === e.ownerDocument.documentElement) };
+      case 'scope': return { spec: B, test: (e, ctx) => (ctx && ctx.scope && ctx.scope.__ptType === ELEMENT_NODE ? e === ctx.scope : !!e.ownerDocument && e === e.ownerDocument.documentElement) };
       case 'is': case 'matches': case '-webkit-any': case 'where': {
         const list = __selForgiving(arg || '');
         return { spec: name === 'where' ? [0, 0, 0] : __maxSpec(list),
@@ -4976,9 +5200,9 @@
           },
         };
       }
-      case 'first-child': return { spec: B, test: (e) => !__prevEl(e) && !!e.parentNode };
-      case 'last-child': return { spec: B, test: (e) => !__nextEl(e) && !!e.parentNode };
-      case 'only-child': return { spec: B, test: (e) => !__prevEl(e) && !__nextEl(e) && !!e.parentNode };
+      case 'first-child': return { spec: B, test: (e) => !__prevEl(e) && !!e.__ptParent };
+      case 'last-child': return { spec: B, test: (e) => !__nextEl(e) && !!e.__ptParent };
+      case 'only-child': return { spec: B, test: (e) => !__prevEl(e) && !__nextEl(e) && !!e.__ptParent };
       case 'first-of-type': return { spec: B, test: (e) => sib(e, -1, true) === 1 };
       case 'last-of-type': return { spec: B, test: (e) => sib(e, 1, true) === 1 };
       case 'only-of-type': return { spec: B, test: (e) => sib(e, -1, true) === 1 && sib(e, 1, true) === 1 };
@@ -4993,28 +5217,28 @@
         return {
           spec,
           test: (e, ctx) => {
-            if (!e.parentNode) return false;
+            if (!e.__ptParent) return false;
             if (of && !__selAny(of, e, ctx)) return false;
             let n = 1;
             for (let p = last ? __nextEl(e) : __prevEl(e); p; p = last ? __nextEl(p) : __prevEl(p)) {
-              if (type ? p.localName === e.localName : !of || __selAny(of, p, ctx)) n++;
+              if (type ? p.__ptLocal === e.__ptLocal : !of || __selAny(of, p, ctx)) n++;
             }
             return __nthOk(ab, n);
           },
         };
       }
-      case 'empty': return { spec: B, test: (e) => !(e.__ptKids || []).some((k) => k.nodeType === ELEMENT_NODE || ((k.nodeType === TEXT_NODE || k.nodeType === 4) && k.data !== '')) };
-      case 'checked': return { spec: B, test: (e) => (e.localName === 'input' && /^(checkbox|radio)$/.test(__inputType(e)) && !!e.checked) || (e.localName === 'option' && !!e.selected) };
-      case 'indeterminate': return { spec: B, test: (e) => e.localName === 'input' && __inputType(e) === 'checkbox' && !!e.indeterminate };
-      case 'default': return { spec: B, test: (e) => (e.localName === 'input' && /^(checkbox|radio)$/.test(__inputType(e)) && __ptHasA(e, 'checked')) || (e.localName === 'option' && __ptHasA(e, 'selected')) };
+      case 'empty': return { spec: B, test: (e) => !(e.__ptKids || []).some((k) => k.__ptType === ELEMENT_NODE || ((k.__ptType === TEXT_NODE || k.__ptType === 4) && k.data !== '')) };
+      case 'checked': return { spec: B, test: (e) => (e.__ptLocal === 'input' && /^(checkbox|radio)$/.test(__inputType(e)) && !!e.checked) || (e.__ptLocal === 'option' && !!e.selected) };
+      case 'indeterminate': return { spec: B, test: (e) => e.__ptLocal === 'input' && __inputType(e) === 'checkbox' && !!e.indeterminate };
+      case 'default': return { spec: B, test: (e) => (e.__ptLocal === 'input' && /^(checkbox|radio)$/.test(__inputType(e)) && __ptHasA(e, 'checked')) || (e.__ptLocal === 'option' && __ptHasA(e, 'selected')) };
       case 'disabled': return { spec: B, test: (e) => __isDisabled(e) };
-      case 'enabled': return { spec: B, test: (e) => __FORM_CTL.has(e.localName) && !__isDisabled(e) };
-      case 'required': return { spec: B, test: (e) => /^(input|select|textarea)$/.test(e.localName) && __ptHasA(e, 'required') };
-      case 'optional': return { spec: B, test: (e) => /^(input|select|textarea)$/.test(e.localName) && !__ptHasA(e, 'required') };
+      case 'enabled': return { spec: B, test: (e) => __FORM_CTL.has(e.__ptLocal) && !__isDisabled(e) };
+      case 'required': return { spec: B, test: (e) => /^(input|select|textarea)$/.test(e.__ptLocal) && __ptHasA(e, 'required') };
+      case 'optional': return { spec: B, test: (e) => /^(input|select|textarea)$/.test(e.__ptLocal) && !__ptHasA(e, 'required') };
       case 'read-write': case 'read-only': {
         const rw = (e) => {
-          if (e.localName === 'textarea') return !__ptHasA(e, 'readonly') && !__isDisabled(e);
-          if (e.localName === 'input') return __TEXTISH.test(__inputType(e)) && !__ptHasA(e, 'readonly') && !__isDisabled(e);
+          if (e.__ptLocal === 'textarea') return !__ptHasA(e, 'readonly') && !__isDisabled(e);
+          if (e.__ptLocal === 'input') return __TEXTISH.test(__inputType(e)) && !__ptHasA(e, 'readonly') && !__isDisabled(e);
           for (let p = e; p; p = __parentEl(p)) {
             const v = __ptGetA(p, 'contenteditable');
             if (v != null) return v !== 'false';
@@ -5023,10 +5247,10 @@
         };
         return { spec: B, test: name === 'read-write' ? rw : (e) => !rw(e) };
       }
-      case 'placeholder-shown': return { spec: B, test: (e) => (e.localName === 'input' || e.localName === 'textarea') && __ptHasA(e, 'placeholder') && __valueOf(e) === '' };
-      case 'valid': return { spec: B, test: (e) => /^(input|select|textarea|form|fieldset)$/.test(e.localName) && !__isInvalid(e) };
+      case 'placeholder-shown': return { spec: B, test: (e) => (e.__ptLocal === 'input' || e.__ptLocal === 'textarea') && __ptHasA(e, 'placeholder') && __valueOf(e) === '' };
+      case 'valid': return { spec: B, test: (e) => /^(input|select|textarea|form|fieldset)$/.test(e.__ptLocal) && !__isInvalid(e) };
       case 'invalid': return { spec: B, test: (e) => __isInvalid(e) };
-      case 'link': case 'any-link': case '-webkit-any-link': return { spec: B, test: (e) => (e.localName === 'a' || e.localName === 'area') && __ptHasA(e, 'href') };
+      case 'link': case 'any-link': case '-webkit-any-link': return { spec: B, test: (e) => (e.__ptLocal === 'a' || e.__ptLocal === 'area') && __ptHasA(e, 'href') };
       case 'focus': return { spec: B, test: (e) => { const d = e.ownerDocument; return !!d && d.__ptActive === e; } };
       case 'focus-within': return { spec: B, test: (e) => { const d = e.ownerDocument; const a = d && d.__ptActive; return !!a && (a === e || e.contains(a)); } };
       case 'target': return { spec: B, test: (e) => { try { const h = decodeURIComponent(__s_slice(String(globalThis.location && globalThis.location.hash || ''), 1)); return !!h && e.id === h; } catch (x) { return false; } } };
@@ -5050,8 +5274,8 @@
           return want === 'ltr';
         } };
       }
-      case 'open': return { spec: B, test: (e) => (e.localName === 'details' || e.localName === 'dialog') && __ptHasA(e, 'open') };
-      case 'defined': return { spec: B, test: (e) => __s_indexOf(e.localName, '-') < 0 || !!(globalThis.customElements && globalThis.customElements.get && globalThis.customElements.get(e.localName)) };
+      case 'open': return { spec: B, test: (e) => (e.__ptLocal === 'details' || e.__ptLocal === 'dialog') && __ptHasA(e, 'open') };
+      case 'defined': return { spec: B, test: (e) => __s_indexOf(e.__ptLocal, '-') < 0 || !!(globalThis.customElements && globalThis.customElements.get && globalThis.customElements.get(e.__ptLocal)) };
       case 'host': case 'host-context': case 'state':
         return { spec: B, test: __SEL_NEVER };
     }
@@ -5245,7 +5469,7 @@
   // before doing anything, with this exact text. The Cloudflare challenge
   // calls `replaceChild` with bad arguments and checks the answer.
   const __needNode = (v, n, method, iface) => {
-    if (v !== null && typeof v === 'object' && typeof v.nodeType === 'number') return;
+    if (v !== null && typeof v === 'object' && typeof v.__ptType === 'number') return;
     throw __pt_mkErr(TypeError, "Failed to execute '" + method + "' on '" + (iface || 'Node') + "': " +
       "parameter " + n + " is not of type 'Node'.");
   };
@@ -5259,7 +5483,7 @@
   };
 
   function matchesSelector(el, selector, scope) {
-    if (!el || el.nodeType !== ELEMENT_NODE) return false;
+    if (!el || el.__ptType !== ELEMENT_NODE) return false;
     const list = __selCompiled(selector);
     return !!list && __selAny(list, el, { scope: scope || null });
   }
@@ -5280,10 +5504,10 @@
   const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
   const esc = (s, attr) => __s_replace(s, attr ? /[&<>"]/g : /[&<>]/g, c => ESC[c]);
   function serializeNode(n, withShadow) {
-    if (n.nodeType === TEXT_NODE) return esc(n.data, false);
-    if (n.nodeType === COMMENT_NODE) return `<!--${n.data}-->`;
-    if (n.nodeType !== ELEMENT_NODE) return n.__ptKids.map((c) => serializeNode(c, withShadow)).join('');
-    const tag = n.localName;
+    if (n.__ptType === TEXT_NODE) return esc(n.data, false);
+    if (n.__ptType === COMMENT_NODE) return `<!--${n.data}-->`;
+    if (n.__ptType !== ELEMENT_NODE) return n.__ptKids.map((c) => serializeNode(c, withShadow)).join('');
+    const tag = n.__ptLocal;
     let attrs = '';
     for (const { name, value } of n.attributes) attrs += ` ${name}="${esc(value, true)}"`;
     if (VOID.has(tag)) return `<${tag}${attrs}>`;
@@ -5342,14 +5566,14 @@
   // reset resets, link navigates. Applies to trusted mouse clicks too (the
   // solver and `--click`), not just `button.click()`.
   function __ptActivate(target) {
-    for (let el = target; el && el.nodeType === 1; el = el.parentNode) {
+    for (let el = target; el && el.__ptType === 1; el = el.__ptParent) {
       const tag = el.__ptLocal;
       if ((tag === 'button' || tag === 'input') && __ptHasA(el, 'disabled')) return;
       const btype = tag === 'button' ? __s_toLowerCase(String(__ptGetA(el, 'type') || 'submit'))
         : tag === 'input' ? __inputType(el) : null;
       if (btype === 'submit' || btype === 'image' || btype === 'reset') {
         if (tag === 'button' && btype !== 'submit' && btype !== 'reset') return;
-        let f = el.parentNode; while (f && f.__ptLocal !== 'form') f = f.parentNode;
+        let f = el.__ptParent; while (f && f.__ptLocal !== 'form') f = f.__ptParent;
         const formId = __ptGetA(el, 'form');
         if (formId && globalThis.document) f = document.getElementById(formId) || f;
         if (!f) return;
@@ -5426,7 +5650,7 @@
         if (!m) { put(top(), text('<')); i++; continue; }
         const tag = __s_toLowerCase(m[1]);
         if (close) {
-          for (let s = stack.length - 1; s > 0; s--) if (__s_toLowerCase(String(stack[s].localName)) === tag) { stack.length = s; break; }
+          for (let s = stack.length - 1; s > 0; s--) if (__s_toLowerCase(String(stack[s].__ptLocal)) === tag) { stack.length = s; break; }
         } else if (tag === 'html' || tag === 'head' || tag === 'body') {
           // Fragment parsing: Chrome does not insert these tags, their content
           // moves into the current parent (`div.innerHTML =
@@ -5436,13 +5660,13 @@
           // <p>, `<li>` closes an open <li>, etc. (`<p>a<p>b` gives two siblings).
           const CLOSES_P = new Set(['address', 'article', 'aside', 'blockquote', 'details', 'dialog', 'div', 'dl', 'fieldset', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hgroup', 'hr', 'main', 'menu', 'nav', 'ol', 'p', 'pre', 'section', 'table', 'ul']);
           const SELF_CLOSES = { li: ['li'], dt: ['dt', 'dd'], dd: ['dt', 'dd'], option: ['option', 'optgroup'], optgroup: ['optgroup'], tr: ['tr', 'td', 'th'], td: ['td', 'th'], th: ['td', 'th'], thead: ['tbody', 'tfoot', 'thead'], tbody: ['tbody', 'tfoot', 'thead'], tfoot: ['tbody', 'tfoot', 'thead'] };
-          if (CLOSES_P.has(tag)) { for (let s = stack.length - 1; s > 0; s--) { if (stack[s].localName === 'p') { stack.length = s; break; } if (CLOSES_P.has(stack[s].localName) && stack[s].localName !== 'p') break; } }
+          if (CLOSES_P.has(tag)) { for (let s = stack.length - 1; s > 0; s--) { if (stack[s].__ptLocal === 'p') { stack.length = s; break; } if (CLOSES_P.has(stack[s].__ptLocal) && stack[s].__ptLocal !== 'p') break; } }
           const closes = SELF_CLOSES[tag];
-          if (closes) { for (let s = stack.length - 1; s > 0; s--) { const ln = stack[s].localName; if (__s_indexOf(closes, ln) >= 0) { stack.length = s; break; } if (ln === 'table' || ln === 'ul' || ln === 'ol' || ln === 'select' || ln === 'dl') break; } }
+          if (closes) { for (let s = stack.length - 1; s > 0; s--) { const ln = stack[s].__ptLocal; if (__s_indexOf(closes, ln) >= 0) { stack.length = s; break; } if (ln === 'table' || ln === 'ul' || ln === 'ol' || ln === 'select' || ln === 'dl') break; } }
           // Implied table wrappers: `<table><tr>` gets a `<tbody>`, a `<td>`
           // without a row gets a `<tr>`; `table.tBodies[0].rows` always exists.
           if (tag === 'tr' || tag === 'td' || tag === 'th') {
-            const tl = top().localName;
+            const tl = top().__ptLocal;
             if (tag === 'tr' && tl === 'table') { const tb = elem('tbody'); put(top(), tb); stack.push(tb); }
             else if ((tag === 'td' || tag === 'th') && (tl === 'table' || tl === 'tbody' || tl === 'thead' || tl === 'tfoot')) {
               if (tl === 'table') { const tb = elem('tbody'); put(top(), tb); stack.push(tb); }
@@ -5532,7 +5756,7 @@
   const document = new Document();
   globalThis.document = document;
   // Standard Node type constants, on the constructor and the prototype — drivers
-  // check `node.nodeType !== Node.ELEMENT_NODE` before acting on a node.
+  // check `node.__ptType !== Node.ELEMENT_NODE` before acting on a node.
   const NODE_TYPES = {
     ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4,
     // Types 5 and 6 are no longer created, but Node keeps the constants and
@@ -5550,7 +5774,7 @@
   // Node members that belong on Node, not Element; the fingerprinter counts
   // this level.
   const __nodeName = function () {
-    switch (this.nodeType) {
+    switch (this.__ptType) {
       case 1: return this.tagName;
       case 3: return '#text';
       case 8: return '#comment';
@@ -5561,20 +5785,20 @@
     }
   };
   const __nodeMembers = {
-    baseURI: { get: function () { const d = this.nodeType === 9 ? this : this.ownerDocument; return (d && d.URL) || (globalThis.location && location.href) || 'about:blank'; } },
+    baseURI: { get: function () { const d = this.__ptType === 9 ? this : this.ownerDocument; return (d && d.URL) || (globalThis.location && location.href) || 'about:blank'; } },
     nodeName: { get: __nodeName },
-    parentElement: { get: function () { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; } },
+    parentElement: { get: function () { const p = this.__ptParent; return p && p.__ptType === 1 ? p : null; } },
     nodeValue: {
-      get: function () { return (this.nodeType === 3 || this.nodeType === 8) ? this.data : null; },
-      set: function (v) { if (this.nodeType === 3 || this.nodeType === 8) this.data = String(v); },
+      get: function () { return (this.__ptType === 3 || this.__ptType === 8) ? this.data : null; },
+      set: function (v) { if (this.__ptType === 3 || this.__ptType === 8) this.data = String(v); },
     },
     isSameNode: { value: function isSameNode(other) { return this === other; } },
     isEqualNode: {
       value: function isEqualNode(other) {
-        if (!other || this.nodeType !== other.nodeType) return false;
+        if (!other || this.__ptType !== other.__ptType) return false;
         if (this.nodeName !== other.nodeName) return false;
-        if (this.nodeType === 3 || this.nodeType === 8) return this.data === other.data;
-        if (this.nodeType === 1) {
+        if (this.__ptType === 3 || this.__ptType === 8) return this.data === other.data;
+        if (this.__ptType === 1) {
           const a = this.attributes || [], b = other.attributes || [];
           if (a.length !== b.length) return false;
           for (let i = 0; i < a.length; i++) {
@@ -5593,7 +5817,7 @@
         if (!other) return 1;
         if (this.contains && this.contains(other)) return 20;   // CONTAINED_BY | FOLLOWING
         if (other.contains && other.contains(this)) return 10;  // CONTAINS | PRECEDING
-        const root = (n) => { while (n.parentNode) n = n.parentNode; return n; };
+        const root = (n) => { while (n.__ptParent) n = n.__ptParent; return n; };
         if (root(this) !== root(other)) return 35;              // DISCONNECTED | IMPLEMENTATION_SPECIFIC | PRECEDING
         const order = [];
         (function walk(n) { order.push(n); for (const c of n.childNodes) walk(c); })(root(this));
@@ -5605,7 +5829,7 @@
         const kids = this.childNodes;
         for (let i = kids.length - 1; i > 0; i--) {
           const cur = kids[i], prev = kids[i - 1];
-          if (cur.nodeType === 3 && prev.nodeType === 3) { prev.data += cur.data; this.removeChild(cur); }
+          if (cur.__ptType === 3 && prev.__ptType === 3) { prev.data += cur.data; this.removeChild(cur); }
         }
         for (const c of this.childNodes) if (c.normalize) __s_normalize(c);
       },
@@ -5722,9 +5946,9 @@
     const proto = (n) => __ifaceProto.get(n);
     const defGet = (P, k, get) => { if (!P) return; try { Object.defineProperty(P, k, { get, enumerable: true, configurable: true }); } catch (e) {} };
     const defFn = (P, k, fn) => { if (!P) return; try { Object.defineProperty(P, k, { value: fn, writable: true, enumerable: true, configurable: true }); } catch (e) {} };
-    const kids = (el) => (el && el.__ptKids ? el.__ptKids : []).filter((k) => k.nodeType === ELEMENT_NODE);
+    const kids = (el) => (el && el.__ptKids ? el.__ptKids : []).filter((k) => k.__ptType === ELEMENT_NODE);
     const local = (el) => __s_toLowerCase(String(el.__ptLocal || ''));
-    const isTag = (el, ...names) => el && el.nodeType === ELEMENT_NODE && __s_includes(names, local(el));
+    const isTag = (el, ...names) => el && el.__ptType === ELEMENT_NODE && __s_includes(names, local(el));
     const branded = (arr, name) => {
       const c = __collection(arr);
       try { const I = globalThis[name]; if (I && I.prototype) Object.setPrototypeOf(c, I.prototype); } catch (e) {}
@@ -5764,19 +5988,19 @@
     const R = proto('HTMLTableRowElement');
     defGet(R, 'cells', function () { return __collection(kids(this).filter((k) => isTag(k, 'td', 'th'))); });
     defGet(R, 'rowIndex', function () {
-      let t = this.parentNode;
-      if (t && isTag(t, 'thead', 'tbody', 'tfoot')) t = t.parentNode;
+      let t = this.__ptParent;
+      if (t && isTag(t, 'thead', 'tbody', 'tfoot')) t = t.__ptParent;
       if (!t || !isTag(t, 'table')) return -1;
       return __s_indexOf(tableRows(t), this);
     });
     defGet(R, 'sectionRowIndex', function () {
-      const p = this.parentNode;
+      const p = this.__ptParent;
       if (!p || !isTag(p, 'table', 'thead', 'tbody', 'tfoot')) return -1;
       return __s_indexOf(kids(p).filter((k) => isTag(k, 'tr')), this);
     });
     const C = proto('HTMLTableCellElement');
     defGet(C, 'cellIndex', function () {
-      const p = this.parentNode;
+      const p = this.__ptParent;
       if (!p || !isTag(p, 'tr')) return -1;
       return __s_indexOf(kids(p).filter((k) => isTag(k, 'td', 'th')), this);
     });
@@ -5799,7 +6023,7 @@
     };
     const selSetLength = (sel, n) => {
       const opts = selOptions(sel); n = Math.max(0, n >>> 0);
-      if (n < opts.length) { for (const o of __s_slice(opts, n)) o.parentNode && o.parentNode.removeChild(o); }
+      if (n < opts.length) { for (const o of __s_slice(opts, n)) o.__ptParent && o.__ptParent.removeChild(o); }
       else for (let i = opts.length; i < n; i++) sel.appendChild(sel.ownerDocument.createElement('option'));
     };
     globalThis.__pt_selSetLength = selSetLength;
@@ -5819,7 +6043,7 @@
     defPair(O_, 'selected', function () { return isSelected(this); }, function (v) {
       this.__ptSelected = !!v;
       __markDirty(this);
-      if (v) { let p = this.parentNode; if (p && isTag(p, 'optgroup')) p = p.parentNode; if (p && isTag(p, 'select') && !__ptHasA(p, 'multiple')) for (const o of selOptions(p)) if (o !== this) o.__ptSelected = false; }
+      if (v) { let p = this.__ptParent; if (p && isTag(p, 'optgroup')) p = p.__ptParent; if (p && isTag(p, 'select') && !__ptHasA(p, 'multiple')) for (const o of selOptions(p)) if (o !== this) o.__ptSelected = false; }
     });
     defPair(O_, 'value', function () { return optValue(this); }, function (v) { __ptSetA(this, 'value', String(v)); });
     defPair(O_, 'text', function () { return __s_trim(__s_replace(String(this.textContent || ''), /\s+/g, ' ')); }, function (v) { this.textContent = String(v); });
@@ -5848,7 +6072,7 @@
     const formOf = (el) => {
       const id = __ptGetA(el, 'form');
       if (id != null && el.ownerDocument && el.ownerDocument.getElementById) return el.ownerDocument.getElementById(id) || null;
-      for (let p = el.parentNode; p; p = p.parentNode) { if (isTag(p, 'form')) return p; if (p.nodeType === 11 && p.__ptHost) { p = p.__ptHost; } }
+      for (let p = el.__ptParent; p; p = p.__ptParent) { if (isTag(p, 'form')) return p; if (p.__ptType === 11 && p.__ptHost) { p = p.__ptHost; } }
       return null;
     };
     const formControls = (form) => {
@@ -5856,7 +6080,7 @@
       const doc = form.ownerDocument;
       const root = doc && doc.documentElement ? doc.documentElement : form;
       __walkTree(root, (n) => {
-        if (!n || n.nodeType !== ELEMENT_NODE || !LISTED.has(local(n))) return;
+        if (!n || n.__ptType !== ELEMENT_NODE || !LISTED.has(local(n))) return;
         if (local(n) === 'input' && __s_toLowerCase(String(__ptGetA(n, 'type') || '')) === 'image') return;
         if (formOf(n) === form) out.push(n);
       });
@@ -5875,7 +6099,7 @@
         const f = __ptGetA(n, 'for');
         if (f != null) { if (f === el.id) out.push(n); return; }
         let found = null;
-        __walkTree(n, (m) => { if (!found && m !== n && m.nodeType === ELEMENT_NODE && LABELABLE.has(local(m)) && !(local(m) === 'input' && __s_toLowerCase(String(__ptGetA(m, 'type') || '')) === 'hidden')) found = m; });
+        __walkTree(n, (m) => { if (!found && m !== n && m.__ptType === ELEMENT_NODE && LABELABLE.has(local(m)) && !(local(m) === 'input' && __s_toLowerCase(String(__ptGetA(m, 'type') || '')) === 'hidden')) found = m; });
         if (found === el) out.push(n);
       });
       return out;
@@ -5891,7 +6115,7 @@
     for (const n of ['HTMLButtonElement', 'HTMLInputElement', 'HTMLOutputElement', 'HTMLSelectElement', 'HTMLTextAreaElement', 'HTMLFieldSetElement', 'HTMLObjectElement', 'HTMLLabelElement', 'HTMLLegendElement']) {
       const P = proto(n);
       defGet(P, 'form', function () {
-        if (local(this) === 'legend') { const p = this.parentNode; return p && isTag(p, 'fieldset') ? formOf(p) : null; }
+        if (local(this) === 'legend') { const p = this.__ptParent; return p && isTag(p, 'fieldset') ? formOf(p) : null; }
         if (local(this) === 'label') { const c = this.control; return c ? formOf(c) : null; }
         return formOf(this);
       });
@@ -5901,7 +6125,7 @@
       const f = __ptGetA(this, 'for');
       if (f != null) { const el = this.ownerDocument && this.ownerDocument.getElementById ? this.ownerDocument.getElementById(f) : null; return el && LABELABLE.has(local(el)) ? el : null; }
       let found = null;
-      __walkTree(this, (m) => { if (!found && m !== this && m.nodeType === ELEMENT_NODE && LABELABLE.has(local(m)) && !(local(m) === 'input' && __s_toLowerCase(String(__ptGetA(m, 'type') || '')) === 'hidden')) found = m; });
+      __walkTree(this, (m) => { if (!found && m !== this && m.__ptType === ELEMENT_NODE && LABELABLE.has(local(m)) && !(local(m) === 'input' && __s_toLowerCase(String(__ptGetA(m, 'type') || '')) === 'hidden')) found = m; });
       return found;
     });
     // Members that look reflected but are not, as in Chrome.
@@ -5934,7 +6158,7 @@
     const M = proto('HTMLMapElement');
     defGet(M, 'areas', function () { const out = []; __walkTree(this, (n) => { if (isTag(n, 'area')) out.push(n); }); return __collection(out); });
     const O = proto('HTMLOptionElement');
-    defGet(O, 'index', function () { let p = this.parentNode; if (p && isTag(p, 'optgroup')) p = p.parentNode; return p && isTag(p, 'select') ? __s_indexOf(selOptions(p), this) : 0; });
+    defGet(O, 'index', function () { let p = this.__ptParent; if (p && isTag(p, 'optgroup')) p = p.__ptParent; return p && isTag(p, 'select') ? __s_indexOf(selOptions(p), this) : 0; });
   }
   globalThis.__pt_elementProto = (tag) => {
     tag = __s_toLowerCase(String(tag));
@@ -6172,7 +6396,7 @@
       return L;
     };
     const outline = (el) => {
-      const t = __s_toLowerCase(el.localName || '');
+      const t = __s_toLowerCase(el.__ptLocal || '');
       if (t === 'path') return pathPoints(__ptGetA(el, 'd'));
       if (t === 'line') return [[num(el, 'x1'), num(el, 'y1')], [num(el, 'x2'), num(el, 'y2')]];
       if (t === 'rect') { const x = num(el, 'x'), y = num(el, 'y'), w = num(el, 'width'), h = num(el, 'height');
@@ -6205,7 +6429,7 @@
       // The bbox needs a laid-out tree; otherwise stylesheet rules are not
       // collected yet and text is measured in the wrong face.
       __relayout();
-      const t = __s_toLowerCase(this.localName || '');
+      const t = __s_toLowerCase(this.__ptLocal || '');
       if (t === 'text' || t === 'tspan') {
         // Text bbox: width measured and rounded up to 1/64 px, ascent and
         // height from font metrics (verified at three sizes). Size and face come
@@ -6237,7 +6461,7 @@
         const s32 = fr(s), inv = fr(1 / s32);
         return svgRect(fr(fr(fr(x * s32) - over) * inv), fr(fr(fr(y * s32) - asc) * inv), fr(w * inv), fr((asc + desc) * inv));
       }
-      const kids = [...(this.__ptKids || [])].filter((k) => k.nodeType === ELEMENT_NODE);
+      const kids = [...(this.__ptKids || [])].filter((k) => k.__ptType === ELEMENT_NODE);
       if (!outline(this).length && kids.length) {
         // A group's bbox is the union of its children's, each in its own
         // transform; float32 numbers, as in Chrome.
@@ -6318,7 +6542,7 @@
     };
     const __svgScale = (el) => {
       let s = 1;
-      for (let n = el; n && n.nodeType === ELEMENT_NODE; n = n.parentNode) {
+      for (let n = el; n && n.__ptType === ELEMENT_NODE; n = n.__ptParent) {
         s *= __svgOwnScale(n);
         if (n.__ptLocal === 'svg') break;
       }
@@ -6836,7 +7060,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (!isHtml) Object.defineProperty(doc, '__ptXml', { value: true, writable: true, configurable: true });
       const nodes = isHtml ? parseFragment(String(markup == null ? '' : markup)) : (() => {
         const r = this.parseXml(doc, String(markup == null ? '' : markup));
-        let root = r.nodes.find((n) => n.nodeType === ELEMENT_NODE);
+        let root = r.nodes.find((n) => n.__ptType === ELEMENT_NODE);
         if (r.error) {
           // Chrome's parse error (libxml2): <parsererror> as the root's first
           // child, or html/body/parsererror without a root.
@@ -6850,7 +7074,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         }
         return r.nodes;
       })();
-      let root = nodes.find((n) => n.nodeType === ELEMENT_NODE && n.localName === 'html');
+      let root = nodes.find((n) => n.__ptType === ELEMENT_NODE && n.__ptLocal === 'html');
       if (!root && isHtml) {
         root = doc.createElement('html');
         const head = doc.createElement('head');
@@ -6859,7 +7083,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         __ptAdd.call(root, body);
         for (const n of nodes) __ptAdd.call(body, n);
       } else if (!root) {
-        root = nodes.find((n) => n.nodeType === ELEMENT_NODE) || doc.createElement('html');
+        root = nodes.find((n) => n.__ptType === ELEMENT_NODE) || doc.createElement('html');
       } else if (isHtml) {
         if (!__tags(root, 'head')[0]) __ptInsert.call(root, doc.createElement('head'), root.firstChild);
         if (!__tags(root, 'body')[0]) __ptAdd.call(root, doc.createElement('body'));
@@ -6963,16 +7187,16 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     },
     serializeXml(node) {
       // A whole document serializes as its root element with xmlns.
-      if (node && node.nodeType === 9 && node.documentElement) node = node.documentElement;
+      if (node && node.__ptType === 9 && node.documentElement) node = node.documentElement;
       const one = (n, root) => {
-        if (n.nodeType === TEXT_NODE) return esc(String(n.data), false);
-        if (n.nodeType === COMMENT_NODE) return '<!--' + n.data + '-->';
-        if (n.nodeType !== ELEMENT_NODE) {
+        if (n.__ptType === TEXT_NODE) return esc(String(n.data), false);
+        if (n.__ptType === COMMENT_NODE) return '<!--' + n.data + '-->';
+        if (n.__ptType !== ELEMENT_NODE) {
           // Fragment children (shadow root included) are each a root: xmlns on
           // every top-level element, as in Chrome.
           return (n.__ptKids || []).map((c) => one(c, root)).join('');
         }
-        const tag = n.localName;
+        const tag = n.__ptLocal;
         let attrs = '';
         if (root && !(n.ownerDocument && n.ownerDocument.__ptXml)) attrs += ' xmlns="http://www.w3.org/1999/xhtml"';
         for (const { name, value } of n.attributes) attrs += ' ' + name + '="' + esc(String(value), true) + '"';
@@ -6981,7 +7205,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         return '<' + tag + attrs + '>' + kids + '</' + tag + '>';
       };
       // Fragment and shadow root: their top-level children are roots (xmlns).
-      return one(node, node && (node.nodeType === ELEMENT_NODE || node.nodeType === DOCUMENT_FRAGMENT_NODE));
+      return one(node, node && (node.__ptType === ELEMENT_NODE || node.__ptType === DOCUMENT_FRAGMENT_NODE));
     },
   };
 
@@ -6997,7 +7221,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (!doc || !doc.documentElement) return out;
       // Light tree only: Chrome does not count frames inside shadow roots.
       const walk = (n) => {
-        if (n.nodeType === ELEMENT_NODE && (n.__ptLocal === 'iframe' || n.__ptLocal === 'frame')) out.push(n);
+        if (n.__ptType === ELEMENT_NODE && (n.__ptLocal === 'iframe' || n.__ptLocal === 'frame')) out.push(n);
         for (const k of (n.__ptKids || [])) walk(k);
       };
       walk(doc.documentElement);
@@ -7430,7 +7654,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     // The header arrives after the tree is installed: hide the nonces already
     // in it (Facebook's loader compares the attribute with the property).
     if (__csp.headerDelivered && globalThis.document && document.documentElement) {
-      __walkTree(document.documentElement, (n) => { try { if (n && n.nodeType === ELEMENT_NODE && typeof n.__ptHideNonce === 'function') n.__ptHideNonce(); } catch (e) {} });
+      __walkTree(document.documentElement, (n) => { try { if (n && n.__ptType === ELEMENT_NODE && typeof n.__ptHideNonce === 'function') n.__ptHideNonce(); } catch (e) {} });
     }
     __cspWrapEval();
   };
@@ -7438,9 +7662,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // Document meta policy: applied as soon as the markup is parsed.
   globalThis.__pt_cspFromMeta = (root) => {
     try {
-      if (__csp.headerDelivered) __walkTree(root, (n) => { try { if (n && n.nodeType === ELEMENT_NODE && typeof n.__ptHideNonce === 'function') n.__ptHideNonce(); } catch (e) {} });
+      if (__csp.headerDelivered) __walkTree(root, (n) => { try { if (n && n.__ptType === ELEMENT_NODE && typeof n.__ptHideNonce === 'function') n.__ptHideNonce(); } catch (e) {} });
       const metas = [];
-      __walkTree(root, (n) => { if (n && n.nodeType === ELEMENT_NODE && __s_toLowerCase(String(n.__ptLocal || '')) === 'meta' && __s_toLowerCase(String(__ptGetA(n, 'http-equiv') || '')) === 'content-security-policy') metas.push(n); });
+      __walkTree(root, (n) => { if (n && n.__ptType === ELEMENT_NODE && __s_toLowerCase(String(n.__ptLocal || '')) === 'meta' && __s_toLowerCase(String(__ptGetA(n, 'http-equiv') || '')) === 'content-security-policy') metas.push(n); });
       for (const m of metas) { const c = __ptGetA(m, 'content'); if (c) __pt_applyCsp(c, 'meta'); }
     } catch (e) {}
   };
@@ -7457,7 +7681,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   globalThis.__pt_writeDocument = (html) => {
     try { Object.defineProperty(document, '__ptMarkup', { value: String(html == null ? '' : html), configurable: true, writable: true }); } catch (e) {}
     const nodes = parseFragment(String(html == null ? '' : html));
-    let root = nodes.find((n) => n.nodeType === 1 && n.tagName === 'HTML');
+    let root = nodes.find((n) => n.__ptType === 1 && n.tagName === 'HTML');
     if (!root) {
       root = document.createElement('html');
       for (const n of nodes) root.appendChild(n);
@@ -7503,6 +7727,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       } catch (e) {}
       const node = Object.create((globalThis.DocumentType && DocumentType.prototype) || Object.prototype);
       Object.defineProperty(node, '__ptE', { value: {}, enumerable: false, writable: true });
+      Object.defineProperty(node, '__ptType', { value: 10, enumerable: false, writable: true });
+      Object.defineProperty(node, '__ptParent', { value: document, enumerable: false, writable: true });
       for (const [k, v] of [['name', String(dt.name || 'html')], ['publicId', String(dt.publicId || '')],
                             ['systemId', String(dt.systemId || '')], ['nodeName', String(dt.name || 'html')],
                             ['nodeType', 10], ['nodeValue', null], ['textContent', null],
@@ -7650,7 +7876,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   const __customValidity = new WeakMap();
   const __validityObj = new WeakMap();
   const __candidate = (e) => {
-    const t = e.localName;
+    const t = e.__ptLocal;
     if (t === 'input') {
       const ty = __inputType(e);
       if (/^(hidden|reset|button)$/.test(ty)) return false;
@@ -7662,7 +7888,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (ty !== 'submit') return false;
     } else if (t !== 'select') return false;
     if (__isDisabled(e)) return false;
-    for (let p = __parentEl(e); p; p = __parentEl(p)) if (p.localName === 'datalist') return false;
+    for (let p = __parentEl(e); p; p = __parentEl(p)) if (p.__ptLocal === 'datalist') return false;
     return true;
   };
   const __EMAIL_LOCAL = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+$/;
@@ -7688,7 +7914,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (!name) return e.checked;
     const root = e.form || (e.getRootNode ? e.getRootNode() : document);
     let found = false;
-    try { walk(root, (k) => { if (!found && k.localName === 'input' && __inputType(k) === 'radio' && __ptGetA(k, 'name') === name && k.checked) found = true; }); } catch (x) {}
+    try { walk(root, (k) => { if (!found && k.__ptLocal === 'input' && __inputType(k) === 'radio' && __ptGetA(k, 'name') === name && k.checked) found = true; }); } catch (x) {}
     return found;
   };
   const __validity = (e) => {
@@ -7697,7 +7923,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const custom = __customValidity.get(e) || '';
     if (custom) { out.customError = true; }
     if (!__candidate(e)) { out.valid = !out.customError; out.message = ''; return out; }
-    const t = e.localName;
+    const t = e.__ptLocal;
     const ty = t === 'input' ? __inputType(e) : t;
     const v = t === 'button' ? '' : __valueOf(e);
     if (__ptHasA(e, 'required') && t !== 'button') {
@@ -7763,7 +7989,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   const __fireInvalid = (e) => { const ev = new Event('invalid', { cancelable: true }); __ptTrust(ev); e.dispatchEvent(ev); };
   const __controlsOf = (form) => {
     const out = [];
-    walk(form, (k) => { if (k !== form && /^(input|select|textarea|button|fieldset|output|object)$/.test(k.localName)) out.push(k); });
+    walk(form, (k) => { if (k !== form && /^(input|select|textarea|button|fieldset|output|object)$/.test(k.__ptLocal)) out.push(k); });
     return out;
   };
   const __vMethods = {
@@ -8177,8 +8403,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (t === 'function') return { type: 'function', objectId: id, className: 'Function', description: (v.name ? 'function ' + v.name : 'function') + '() { [native code] }' };
     let subtype, className = (v.constructor && v.constructor.name) || 'Object', description = className;
     if (Array.isArray(v)) { subtype = 'array'; className = 'Array'; description = 'Array(' + v.length + ')'; }
-    else if (v.nodeType === 1) { subtype = 'node'; description = v.localName || 'element'; }
-    else if (v.nodeType) { subtype = 'node'; description = __s_toLowerCase(v.nodeName || 'node'); }
+    else if (v.__ptType === 1) { subtype = 'node'; description = v.__ptLocal || 'element'; }
+    else if (v.__ptType) { subtype = 'node'; description = __s_toLowerCase(v.nodeName || 'node'); }
     return { type: 'object', subtype, objectId: id, className, description };
   };
   globalThis.__pt_objGet = (id) => __ptObjs.get(id);
@@ -8195,11 +8421,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   };
   globalThis.__pt_nodeById = (id) => __ptNodes.get(id) || null;
   globalThis.__pt_describe = (n) => {
-    if (n == null || !n.nodeType) return null;
+    if (n == null || !n.__ptType) return null;
     const attrs = [];
     if (n.attributes) for (const a of n.attributes) { attrs.push(a.name); attrs.push(a.value); }
     return {
-      backendNodeId: globalThis.__pt_nodeId(n), nodeId: 0, nodeType: n.nodeType,
+      backendNodeId: globalThis.__pt_nodeId(n), nodeId: 0, nodeType: n.__ptType,
       nodeName: n.nodeName || '', localName: n.localName || '', nodeValue: n.nodeValue || '',
       childNodeCount: (n.__ptKids || []).length, attributes: attrs
     };
@@ -8287,9 +8513,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       return;
     }
     for (const node of __layoutDirty) {
-      for (let n = node; n; n = n.parentNode || n.__ptHost || null) {
-        if (!__layoutMemo.delete(n) && n.nodeType === ELEMENT_NODE && n.__ptLayoutUp === __layoutBuilt) break;
-        if (n.nodeType === ELEMENT_NODE) n.__ptLayoutUp = __layoutBuilt;
+      for (let n = node; n; n = n.__ptParent || n.__ptHost || null) {
+        if (!__layoutMemo.delete(n) && n.__ptType === ELEMENT_NODE && n.__ptLayoutUp === __layoutBuilt) break;
+        if (n.__ptType === ELEMENT_NODE) n.__ptLayoutUp = __layoutBuilt;
       }
     }
     __layoutDirty = [];
@@ -8689,7 +8915,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // hides is skipped without ever reaching the callback), then the caller's
   // filter, which may be a function or an object with `acceptNode`.
   const __ptVerdict = (walker, node) => {
-    if (!((1 << (node.nodeType - 1)) & walker.__ptShow)) return FILTER_SKIP;
+    if (!((1 << (node.__ptType - 1)) & walker.__ptShow)) return FILTER_SKIP;
     const f = walker.__ptFilter;
     if (!f) return FILTER_ACCEPT;
     const v = typeof f === 'function' ? f(node) : (f.acceptNode ? f.acceptNode(node) : FILTER_ACCEPT);
@@ -8699,7 +8925,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // The node after `node` in document order, without leaving `root`.
   const __ptFollowing = (node, root, skipChildren) => {
     if (!skipChildren && node.__ptKids && node.__ptKids.length) return node.__ptKids[0];
-    for (let n = node; n && n !== root; n = n.parentNode) {
+    for (let n = node; n && n !== root; n = n.__ptParent) {
       if (n.nextSibling) return n.nextSibling;
     }
     return null;
@@ -8736,7 +8962,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
           while (prev.__ptKids && prev.__ptKids.length) prev = prev.__ptKids[prev.__ptKids.length - 1];
           node = prev;
         } else {
-          node = node.parentNode;
+          node = node.__ptParent;
           if (!node || node === this.__ptRoot) return null;
         }
         if (__ptVerdict(this, node) === FILTER_ACCEPT) { this.__ptCur = node; return node; }
@@ -8745,7 +8971,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     parentNode() {
       for (let n = this.__ptCur; n && n !== this.__ptRoot; ) {
-        n = n.parentNode;
+        n = n.__ptParent;
         if (!n) return null;
         if (__ptVerdict(this, n) === FILTER_ACCEPT) { this.__ptCur = n; return n; }
         if (n === this.__ptRoot) break;
@@ -8832,11 +9058,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     Object.assign(r, {
       setStart(n, o) { start = n; startOff = o | 0; },
       setEnd(n, o) { end = n; endOff = o | 0; },
-      setStartBefore(n) { start = n.parentNode || n; startOff = 0; },
-      setStartAfter(n) { start = n.parentNode || n; startOff = 0; },
-      setEndBefore(n) { end = n.parentNode || n; endOff = 0; },
-      setEndAfter(n) { end = n.parentNode || n; endOff = 0; },
-      selectNode(n) { start = end = n.parentNode || n; startOff = 0; endOff = 0; },
+      setStartBefore(n) { start = n.__ptParent || n; startOff = 0; },
+      setStartAfter(n) { start = n.__ptParent || n; startOff = 0; },
+      setEndBefore(n) { end = n.__ptParent || n; endOff = 0; },
+      setEndAfter(n) { end = n.__ptParent || n; endOff = 0; },
+      selectNode(n) { start = end = n.__ptParent || n; startOff = 0; endOff = 0; },
       selectNodeContents(n) { start = end = n; startOff = 0; endOff = (n.childNodes || []).length; },
       collapse(toStart) { if (toStart) { end = start; endOff = startOff; } else { start = end; startOff = endOff; } },
       cloneRange() { const c = __range(); c.setStart(start, startOff); c.setEnd(end, endOff); return c; },
@@ -8846,9 +9072,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       // Chrome returns one rect per line, which shows how the text wrapped.
       getClientRects() {
         const node = start;
-        const el = node && node.nodeType === ELEMENT_NODE ? node
-                 : (node && node.parentNode) || null;
-        const b = el && el.nodeType === ELEMENT_NODE ? __boxOf(el) : null;
+        const el = node && node.__ptType === ELEMENT_NODE ? node
+                 : (node && node.__ptParent) || null;
+        const b = el && el.__ptType === ELEMENT_NODE ? __boxOf(el) : null;
         if (!b) return __ptRectList([]);
         const h = (b.asc || 0) + (b.desc || 0);
         const rows = (b.lines && b.lines.length ? b.lines : [{ width: b.cw }]);
@@ -8954,7 +9180,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       // the tag's interface name.
       Object.defineProperty(C.prototype, Symbol.toStringTag, name
         ? { value: name, configurable: true }
-        : { get: function () { if (this === C.prototype) return C === Element ? 'Element' : 'Node'; return this.nodeType === ELEMENT_NODE ? __tagFor(this) : 'Node'; }, configurable: true });
+        : { get: function () { if (this === C.prototype) return C === Element ? 'Element' : 'Node'; return this.__ptType === ELEMENT_NODE ? __tagFor(this) : 'Node'; }, configurable: true });
     } catch (e) {}
   }
 
@@ -8965,21 +9191,21 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // nodes being inserted, as the DOM standard's "viable sibling" rule says.
   const __asNodes = (ns) => ns.map((n) => (typeof n === 'string' ? new Text(n) : n));
   const __afterSelf = function after(...ns) {
-    const p = this.parentNode; if (!p) return;
+    const p = this.__ptParent; if (!p) return;
     let ref = this.nextSibling; while (ref && __s_includes(ns, ref)) ref = ref.nextSibling;
     for (const n of __asNodes(ns)) p.insertBefore(n, ref);
   };
   const __beforeSelf = function before(...ns) {
-    const p = this.parentNode; if (!p) return;
+    const p = this.__ptParent; if (!p) return;
     let prev = this.previousSibling; while (prev && __s_includes(ns, prev)) prev = prev.previousSibling;
     const ref = prev ? prev.nextSibling : p.firstChild;
     for (const n of __asNodes(ns)) p.insertBefore(n, ref);
   };
   const __replaceSelf = function replaceWith(...ns) {
-    const p = this.parentNode; if (!p) return;
+    const p = this.__ptParent; if (!p) return;
     let ref = this.nextSibling; while (ref && __s_includes(ns, ref)) ref = ref.nextSibling;
     const nodes = __asNodes(ns);
-    if (this.parentNode === p && !__s_includes(nodes, this)) p.removeChild(this);
+    if (this.__ptParent === p && !__s_includes(nodes, this)) p.removeChild(this);
     for (const n of nodes) p.insertBefore(n, ref);
   };
   for (const C of [Element, Text, Comment]) {
@@ -9138,7 +9364,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (M.any || !A || A.any) return true;
     if (A.sibling && M.nodes.length) return true;
     const elemHits = (e) => {
-      if (A.tags.size && A.tags.has(__s_toLowerCase(String(e.localName || '')))) return true;
+      if (A.tags.size && A.tags.has(__s_toLowerCase(String(e.__ptLocal || '')))) return true;
       const id = __ptGetA(e, 'id');
       if (id && A.ids.has(id)) return true;
       if (A.classes.size) { const set = __ptClassSet(e); if (set) for (const c of set) if (A.classes.has(c)) return true; }
@@ -9153,9 +9379,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       while (stack.length) {
         const e = stack.pop();
         if (--budget < 0) return true;
-        if (e.nodeType === ELEMENT_NODE && elemHits(e)) return true;
+        if (e.__ptType === ELEMENT_NODE && elemHits(e)) return true;
         const kids = e.__ptKids;
-        if (kids) for (const k of kids) if (k.nodeType === ELEMENT_NODE || k.nodeType === 11) stack.push(k);
+        if (kids) for (const k of kids) if (k.__ptType === ELEMENT_NODE || k.__ptType === 11) stack.push(k);
       }
     }
     for (const [name, oldV, newV] of M.attrs) {
@@ -9172,7 +9398,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   function __styleTouch(node, children) {
     if (__styleAllStale || !node) return;
     const up = children ? __sibOnChildren : __sibAny;
-    const root = up ? (node.parentNode || node) : node;
+    const root = up ? (node.__ptParent || node) : node;
     if (__styleTouched.length >= 2000) { __styleAllStale = true; __styleTouched = []; return; }
     __styleTouched.push(root);
   }
@@ -9204,12 +9430,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         let bounded = true;
         if (H.parentAny) {
           for (const r of __styleTouched.slice()) {
-            const p = r && r.parentNode;
-            if (p && p.nodeType === ELEMENT_NODE) anchors.add(p);
+            const p = r && r.__ptParent;
+            if (p && p.__ptType === ELEMENT_NODE) anchors.add(p);
           }
         }
         for (const r of __styleTouched) {
-          for (let a = r; a && a.nodeType === ELEMENT_NODE; a = a.parentNode) {
+          for (let a = r; a && a.__ptType === ELEMENT_NODE; a = a.__ptParent) {
             if (!anchors.has(a) && __hasAnchorMatch(a, H)) anchors.add(a);
             if (H.hasSib && !sibOf(a)) bounded = false;
           }
@@ -9239,8 +9465,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       __lstats.dropped++;
       __styleCache.delete(n);
       __layoutMemo.delete(n);
-      for (const k of (n.__ptKids || [])) if (k.nodeType === ELEMENT_NODE) drop(k);
-      if (n.__ptShadow) for (const k of (n.__ptShadow.__ptKids || [])) if (k.nodeType === ELEMENT_NODE) drop(k);
+      for (const k of (n.__ptKids || [])) if (k.__ptType === ELEMENT_NODE) drop(k);
+      if (n.__ptShadow) for (const k of (n.__ptShadow.__ptKids || [])) if (k.__ptType === ELEMENT_NODE) drop(k);
     };
     const roots = __styleTouched;
     for (const r of roots) { drop(r); if (!__layoutAllDirty) __layoutDirty.push(r); }
@@ -9283,25 +9509,31 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     };
     const take = (root, rules, layer) => {
       for (const r of rules || []) {
-        if (r.type === 5) { if (root === docEl) faces.push(r); continue; }   // @font-face
-        if (r.type === 3) {                           // @import
-          const sub = r.styleSheet;
-          const into = r.__ptLayer == null ? layer : layerOf(layer, r.__ptLayer || ('\u0000' + (state.anon++)));
-          if (sub && (!r.media || !r.media.mediaText || __mediaApplies(r.media.mediaText))) take(root, sub.cssRules, into);
+        const st = __cssom.get(r);
+        if (!st) continue;
+        const kind = st.kind;
+        if (kind === 'font-face') { if (root === docEl) faces.push(r); continue; }
+        if (kind === 'import') {
+          const sub = __sheetRules(st.styleSheet);
+          const into = st.layer == null ? layer : layerOf(layer, st.layer || ('\u0000' + (state.anon++)));
+          const mt = st.media.mediaText;
+          if (sub && (!mt || __mediaApplies(mt))) take(root, sub, into);
           continue;
         }
-        if (r.type === 4 || r.type === 12) {          // @media / @supports
-          if (r.type !== 4 || __mediaApplies(r.conditionText)) take(root, r.cssRules, layer);
+        if (kind === 'media' || kind === 'supports') {
+          if (kind !== 'media' || __mediaApplies(st.cond)) take(root, st.kids, layer);
           continue;
         }
-        if (r.__ptLayerNames) { for (const n of r.__ptLayerNames) layerOf(layer, n); continue; }   // @layer a, b;
-        if (r.__ptLayerBlock) {                       // @layer a { … }
-          take(root, r.cssRules, layerOf(layer, r.name || ('\u0000' + (state.anon++))));
+        if (kind === 'layer-statement') { for (const n of st.names) layerOf(layer, n); continue; }   // @layer a, b;
+        if (kind === 'layer-block') {                 // @layer a { … }
+          take(root, st.kids, layerOf(layer, st.name || ('\u0000' + (state.anon++))));
           continue;
         }
-        if (r.type !== 1 || !r.selectorText) continue;
+        if (kind !== 'style') continue;
+        const selText = __ruleSel(st);
+        if (!selText) continue;
         const rank = layer == null ? __UNLAYERED : layers.get(layer);
-        for (const one of __selSplit(r.selectorText)) {
+        for (const one of __selSplit(selText)) {
           const sel = __s_trim(one);
           if (!sel) continue;
           out.push({ root, sel, spec: __specificity(sel), order: state.order++, rule: r, layer: rank });
@@ -9310,11 +9542,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     };
     const sheetsOf = (node, root) => {
       for (const n of (node.__ptKids || [])) {
-        if (n.nodeType !== ELEMENT_NODE) continue;
+        if (n.__ptType !== ELEMENT_NODE) continue;
         if ((n.tagName === 'STYLE' || (n.tagName === 'LINK' && n.__ptSheetText)) && n.sheet) {
           // `<link media="print">` is fetched but styles nothing on screen.
           const media = __ptGetA(n, 'media');
-          if (!media || __mediaApplies(media)) take(root, n.sheet.cssRules, null);
+          if (!media || __mediaApplies(media)) take(root, __sheetRules(n.sheet), null);
         }
         if (n.__ptShadow) sheetsOf(n.__ptShadow, n.__ptShadow);
         sheetsOf(n, root);
@@ -9404,7 +9636,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       list.push(r);
     };
     for (const r of rules) {
-      if (r.root && r.root.nodeType === 11) ix.scoped = true;
+      if (r.root && r.root.__ptType === 11) ix.scoped = true;
       const k = __ruleKey(r.sel);
       if (k == null) ix.any.push(r);
       else if (typeof k === 'string') put(k, r);
@@ -9420,9 +9652,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   function __treeRootOf(el) {
     let n = el;
     while (n) {
-      const p = n.parentNode;
-      if (!p) return n.nodeType === 11 && n.__ptHost ? n : (n.ownerDocument && n.ownerDocument.documentElement) || n;
-      if (p.nodeType === 11 && p.__ptHost) return p;
+      const p = n.__ptParent;
+      if (!p) return n.__ptType === 11 && n.__ptHost ? n : (n.ownerDocument && n.ownerDocument.documentElement) || n;
+      if (p.__ptType === 11 && p.__ptHost) return p;
       n = p;
     }
     return null;
@@ -9431,16 +9663,16 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const ix = __ruleIndex(__rulesFor(el.ownerDocument));
     const root = __treeRootOf(el);
     const docEl = el.ownerDocument && el.ownerDocument.documentElement;
-    const inScope = (r) => !r.root || r.root === root || (root === docEl && r.root === docEl) || (root && root.nodeType !== 11 && r.root && r.root.nodeType !== 11);
+    const inScope = (r) => !r.root || r.root === root || (root === docEl && r.root === docEl) || (root && root.__ptType !== 11 && r.root && r.root.__ptType !== 11);
     // A rule under several keys is taken once (`:is(.a, .b)` on `.a.b`).
-    const all = !ix.scoped && !!root && root.nodeType !== 11;
+    const all = !ix.scoped && !!root && root.__ptType !== 11;
     const id = __ptGetA(el, 'id');
     const cls = __ptGetA(el, 'class');
     // Elements alike in tag, id, classes and attribute names have the same
     // candidates (a list's thousand items cost one lookup). Read-only list.
     let memoKey = null;
     if (all) {
-      memoKey = (el === docEl ? 'R' : '') + el.localName + '\x00' + (id || '') + '\x00' + (cls || '');
+      memoKey = (el === docEl ? 'R' : '') + el.__ptLocal + '\x00' + (id || '') + '\x00' + (cls || '');
       if (ix.attrs && el.__ptAttrs) for (const name of el.__ptAttrs.keys()) memoKey += '\x00' + name;
       const hit = ix.memo && ix.memo.get(memoKey);
       if (hit) return hit;
@@ -9458,7 +9690,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       }
     };
     if (el === docEl) add('r');
-    add('t' + __s_toLowerCase(String(el.localName || '')));
+    add('t' + __s_toLowerCase(String(el.__ptLocal || '')));
     if (id) add('i' + id);
     if (cls) {
       const seen = new Set();
@@ -9474,12 +9706,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   /// A rule's declarations as written.
   function __ruleMap(rr) {
-    const rule = rr.rule;
-    if (!rule) return null;
-    if (rule.__ptDecls) return rule.__ptDecls;
-    const d = rule.style;
-    const raw = d && __declRaw.get(d);
-    return raw ? raw() : null;
+    const st = rr.rule && __cssom.get(rr.rule);
+    return st ? __ruleDecls(st) : null;
   }
 
   function __rulesFor(doc) {
@@ -9499,9 +9727,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   const __CSS_URL = /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)\s]*))\s*\)/g;
   function __cssAbs(v, rule) {
     if (__s_indexOf(v, 'url(') < 0) return v;
-    let sheet = rule && rule.parentStyleSheet;
-    while (sheet && !sheet.href && sheet.parentStyleSheet) sheet = sheet.parentStyleSheet;
-    const href = (sheet && sheet.href) || null;
+    const rst = rule && __cssom.get(rule);
+    const href = rst ? __sheetHref(rst.sheet) : null;
     const base = href || String(document.baseURI || '');
     const key = base + '\n' + v;
     let hit = __cssAbsMemo.get(key);
@@ -9568,7 +9795,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     for (const x of ix.any) test(x);
     const by = (k) => { const l = ix.keyed.get(k); if (l) for (const x of l) test(x); };
     if (e === de) by('r');
-    by('t' + __s_toLowerCase(String(e.localName || '')));
+    by('t' + __s_toLowerCase(String(e.__ptLocal || '')));
     const id = __ptGetA(e, 'id');
     if (id) by('i' + id);
     const set = __ptClassSet(e);
@@ -9630,9 +9857,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         const family = m && m.get('font-family');
         const src = m && m.get('src');
         if (family == null || src == null) continue;
-        let sheet = rule.parentStyleSheet;
-        while (sheet && !sheet.href && sheet.parentStyleSheet) sheet = sheet.parentStyleSheet;
-        const href = (sheet && sheet.href) || null;
+        const href = __sheetHref(__cssom.get(rule).sheet);
         const desc = {};
         for (const [k, css] of [['style', 'font-style'], ['weight', 'font-weight'], ['stretch', 'font-stretch'],
           ['unicodeRange', 'unicode-range'], ['variant', 'font-variant'], ['featureSettings', 'font-feature-settings'],
@@ -9728,7 +9953,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // The element's own text, the characters its font draws.
   function __ownText(e) {
     let t = '';
-    for (const k of (e.__ptKids || [])) if (k.nodeType === TEXT_NODE) t += k.data;
+    for (const k of (e.__ptKids || [])) if (k.__ptType === TEXT_NODE) t += k.data;
     return __s_trim(t);
   }
 
@@ -9811,7 +10036,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         const st = cs.get('font-style');
         if (st != null) italic = /italic|oblique/i.test(String(st));
         const w = cs.get('font-weight');
-        const tag = e.localName;
+        const tag = e.__ptLocal;
         if (w != null) {
           const t = __s_toLowerCase(__s_trim(String(w)));
           weight = t === 'bolder' ? (pw < 350 ? 400 : pw < 550 ? 700 : 900)
@@ -9825,7 +10050,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const kids = e.__ptKids;
       if (kids) {
         for (let i = kids.length - 1; i >= 0; i--) {
-          if (kids[i].nodeType !== ELEMENT_NODE) continue;
+          if (kids[i].__ptType !== ELEMENT_NODE) continue;
           els.push(kids[i]); famS.push(fams); itS.push(italic); wS.push(weight);
         }
       }
@@ -10007,7 +10232,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return H;
   }
   function __hasAnchorMatch(e, H) {
-    if (H.tags.size && H.tags.has(__s_toLowerCase(String(e.localName || '')))) return true;
+    if (H.tags.size && H.tags.has(__s_toLowerCase(String(e.__ptLocal || '')))) return true;
     if (H.ids.size) { const id = __ptGetA(e, 'id'); if (id && H.ids.has(id)) return true; }
     if (H.classes.size) { const set = __ptClassSet(e); if (set) for (const c of set) if (H.classes.has(c)) return true; }
     return false;
@@ -10020,8 +10245,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const key = [docEl, LAYOUT.W, LAYOUT.H, __importGen];
     const scan = (node, root) => {
       for (const n of (node.__ptKids || [])) {
-        if (n.nodeType !== ELEMENT_NODE) continue;
-        if ((n.tagName === 'STYLE' || (n.tagName === 'LINK' && n.__ptSheetText)) && n.sheet) key.push(root, n.sheet.cssRules, __ptGetA(n, 'media'));
+        if (n.__ptType !== ELEMENT_NODE) continue;
+        if ((n.tagName === 'STYLE' || (n.tagName === 'LINK' && n.__ptSheetText)) && n.sheet) key.push(root, __sheetRules(n.sheet), __ptGetA(n, 'media'));
         if (n.__ptShadow) scan(n.__ptShadow, n.__ptShadow);
         scan(n, root);
       }
@@ -10066,13 +10291,13 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // Matching only reads the context; one object serves every test.
   const __CASCADE_CTX = Object.freeze({ scope: null });
   function __cascadeFor(el) {
-    if (!el || el.nodeType !== ELEMENT_NODE) return new Map();
+    if (!el || el.__ptType !== ELEMENT_NODE) return new Map();
     const hit = __styleCache.get(el) || __stylePass.get(el);
     if (hit) return hit;
     // State-dependent ancestors make this one state-dependent too.
     let volatile = el.ownerDocument !== globalThis.document;
-    const up = el.parentNode;
-    if (!volatile && up && up.nodeType === ELEMENT_NODE) { __cascadeFor(up); volatile = __styleVolatile.has(up); }
+    const up = el.__ptParent;
+    if (!volatile && up && up.__ptType === ELEMENT_NODE) { __cascadeFor(up); volatile = __styleVolatile.has(up); }
     const out = new Map();
     __lstats.cascades++;
     // SVG presentation attributes are declarations of the lowest weight:
@@ -10160,8 +10385,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     // `inherit` takes the parent's cascaded value; `initial` and `unset` act
     // as if unset (`* { box-sizing: inherit }` must propagate `border-box`).
     const parentOf = () => {
-      const p = el.parentNode;
-      return p && p.nodeType === ELEMENT_NODE ? __cascadeFor(p) : null;
+      const p = el.__ptParent;
+      return p && p.__ptType === ELEMENT_NODE ? __cascadeFor(p) : null;
     };
     for (let k = 0; k < decls.length; k++) {
       const v = __s_toLowerCase(__s_trim(String(decls[k][1])));
@@ -10188,8 +10413,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   function __customsFor(el, mine) {
     const hit = __passCustom.get(el);
     if (hit) return hit;
-    const parent = el.parentNode && el.parentNode.nodeType === ELEMENT_NODE ? el.parentNode
-      : (el.parentNode && el.parentNode.host) || null;
+    const parent = el.__ptParent && el.__ptParent.__ptType === ELEMENT_NODE ? el.__ptParent
+      : (el.__ptParent && el.__ptParent.host) || null;
     let base = null;
     // The parent's variables: from this pass, or kept with its cascade when
     // that came from the cache (a change below it does not recompute it).
@@ -10556,7 +10781,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   const __OWN_TEXT = (el) => {
     let t = '';
-    for (const c of (el.__ptKids || [])) if (c.nodeType === TEXT_NODE) t += c.data || '';
+    for (const c of (el.__ptKids || [])) if (c.__ptType === TEXT_NODE) t += c.data || '';
     return __s_trim(__s_replace(t, /\s+/g, ' '));
   };
 
@@ -10637,10 +10862,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   /// widget's report).
   function __maxContentW(el, depth) {
     depth = depth || 0;
-    if (depth > 40 || !el || el.nodeType !== ELEMENT_NODE || __isUnboxed(el)) return 0;
+    if (depth > 40 || !el || el.__ptType !== ELEMENT_NODE || __isUnboxed(el)) return 0;
     const cs = __cascadeFor(el);
     const fs = __usedFontSize(el);
-    const tag = __s_toLowerCase(el.localName || '');
+    const tag = __s_toLowerCase(el.__ptLocal || '');
     const len = (n) => __lengthPx(cs.get(n), fs, null);
     const bbox = /^border-box$/i.test(__s_trim(String(cs.get('box-sizing') || '')));
     const pad = (len('padding-left') || 0) + (len('padding-right') || 0)
@@ -10664,7 +10889,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     let inner = text ? __textWidth(text, fs, family, bold, false) : 0;
     const kids = [];
     for (const c of (el.__ptKids || [])) {
-      if (c.nodeType !== ELEMENT_NODE || __isUnboxed(c)) continue;
+      if (c.__ptType !== ELEMENT_NODE || __isUnboxed(c)) continue;
       const p = __s_toLowerCase(String(__cascadeFor(c).get('position') || 'static'));
       if (p !== 'absolute' && p !== 'fixed') kids.push(c);
     }
@@ -10695,7 +10920,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   }
 
   function __isInlineLevel(el) {
-    const tag = __s_toLowerCase(el.localName || '');
+    const tag = __s_toLowerCase(el.__ptLocal || '');
     const d = __s_toLowerCase(String(__cascadeFor(el).get('display') || CS_DISPLAY[tag] || 'block'));
     return /^inline(-block|-flex|-grid|-table)?$/.test(d);
   }
@@ -10705,7 +10930,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   const __ATOMIC_TAGS = new Set(['img', 'input', 'button', 'select', 'textarea', 'svg',
     'canvas', 'video', 'audio', 'object', 'embed', 'iframe', 'meter', 'progress']);
   function __isAtomicInline(el) {
-    const tag = __s_toLowerCase(el.localName || '');
+    const tag = __s_toLowerCase(el.__ptLocal || '');
     const d = __s_toLowerCase(String(__cascadeFor(el).get('display') || CS_DISPLAY[tag] || 'block'));
     return d !== 'inline' || __ATOMIC_TAGS.has(tag);
   }
@@ -10746,7 +10971,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const cs = __cascadeFor(el);
       const cfs = __usedFontSize(el);
       const m = (name) => __lengthPx(cs.get(name), cfs, availW) || 0;
-      const kids = (el.__ptKids || []).filter((k) => k.nodeType === ELEMENT_NODE);
+      const kids = (el.__ptKids || []).filter((k) => k.__ptType === ELEMENT_NODE);
       const it = {
         el, box, atomic: __isAtomicInline(el),
         text: !!__s_trim(String(__OWN_TEXT(el) || '')) || kids.length > 0,
@@ -10797,8 +11022,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       }
       const off = node.__ptOff;
       if (off) { cx += off[0]; cy += off[1]; node.__ptOff = null; }
-      for (const k of (node.__ptKids || [])) if (k.nodeType === ELEMENT_NODE) stack.push(k, cx, cy);
-      if (node.__ptShadow) for (const k of (node.__ptShadow.__ptKids || [])) if (k.nodeType === ELEMENT_NODE) stack.push(k, cx, cy);
+      for (const k of (node.__ptKids || [])) if (k.__ptType === ELEMENT_NODE) stack.push(k, cx, cy);
+      if (node.__ptShadow) for (const k of (node.__ptShadow.__ptKids || [])) if (k.__ptType === ELEMENT_NODE) stack.push(k, cx, cy);
     }
   }
 
@@ -10820,10 +11045,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   const __on64 = (v) => typeof v === 'number' && Number.isInteger(v * 64) && Math.abs(v) < 2 ** 40;
   function __layoutOne(el, originX, originY, availW, strut, forced) {
     if (forced && forced.cb) return __layoutOneRaw(el, originX, originY, availW, strut, forced);
-    const up = el.parentNode;
+    const up = el.__ptParent;
     const key = availW + '|' + (strut ? strut.line + ',' + strut.asc + ',' + strut.desc : '-') + '|'
       + (forced ? (forced.w === undefined ? 'u' : forced.w) + ',' + (forced.h === undefined ? 'u' : forced.h) + ',' + (forced.block ? 1 : 0) : '-')
-      + '|' + (up && up.nodeType === ELEMENT_NODE ? up.__ptDefH : '-');
+      + '|' + (up && up.__ptType === ELEMENT_NODE ? up.__ptDefH : '-');
     let mine = __layoutMemo.get(el);
     const hit = mine && mine.get(key);
     if (hit) {
@@ -10874,7 +11099,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __boxes.push(el);
     const cs = __cascadeFor(el);
     const fs = __usedFontSize(el);
-    const tag = __s_toLowerCase(el.localName || '');
+    const tag = __s_toLowerCase(el.__ptLocal || '');
     // Font is inherited; without it a `<span>` was measured in the fallback
     // face and word widths and line heights were off.
     let familyRaw = cs.get('font-family');
@@ -10945,11 +11170,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const inH = (v) => (v == null ? null : bbox ? Math.max(0, v - pt_ - pb - bt - bb) : v);
     // Percent heights are relative to the parent's set height; the root's is
     // the viewport.
-    const up = el.parentNode;
+    const up = el.__ptParent;
     // An absolute child resolves percentages against the containing block the
     // parent passed (its padding box), not the page.
     const __cb = (position === 'absolute' || position === 'fixed') && forced && forced.cb ? forced.cb : null;
-    const baseH = __cb && __cb.h != null ? __cb.h : (up && up.nodeType === ELEMENT_NODE
+    const baseH = __cb && __cb.h != null ? __cb.h : (up && up.__ptType === ELEMENT_NODE
       ? (up.__ptDefH != null ? up.__ptDefH : null) : LAYOUT.H);
     if (__cb && __cb.w != null) availW = __cb.w;
     const explicitW = inW(len('width', availW));
@@ -11015,7 +11240,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const kids = [];
     if (el.__ptShadow) for (const c of el.__ptShadow.__ptKids) kids.push(c);
     for (const c of (el.__ptKids || [])) kids.push(c);
-    const boxedKids = kids.filter((c) => c.nodeType === ELEMENT_NODE && !__isUnboxed(c));
+    const boxedKids = kids.filter((c) => c.__ptType === ELEMENT_NODE && !__isUnboxed(c));
 
     // An inline element shrinks to its children, or else to its own text
     // measured in the real face.
@@ -11081,7 +11306,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       // A grid with no set width inside a flex or grid parent (or an inline
       // grid) shrinks to content: auto columns take the widest child, no free
       // space.
-      const parentDisp = __s_toLowerCase(String((el.parentNode && el.parentNode.nodeType === ELEMENT_NODE ? __cascadeFor(el.parentNode).get('display') : '') || ''));
+      const parentDisp = __s_toLowerCase(String((el.__ptParent && el.__ptParent.__ptType === ELEMENT_NODE ? __cascadeFor(el.__ptParent).get('display') : '') || ''));
       const shrinkGrid = !forcedW && explicitW == null && (inlineish || /flex|grid/.test(parentDisp));
       if (autos.length) {
         flow.forEach((c, i) => {
@@ -11098,7 +11323,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (frTotal) cols.forEach((t, k) => { if (t.fr) widths[k] = freeW * t.fr / frTotal; });
       else if (autos.length && !shrinkGrid) { for (const k of autos) widths[k] += freeW / autos.length; freeW = 0; }
       const totalW = widths.reduce((a, w) => a + w, 0) + colGap * Math.max(0, n - 1);
-      if (globalThis.__pt_gridTrace) { try { (globalThis.__pt_parentConsole || console).error('[grid] ' + __ptJSON.stringify({ tag: el.localName, id: el.id, availW, cw, shrinkGrid, forcedW: !!forcedW, explicitW, n, place, widths, totalW, want })); } catch (e) {} }
+      if (globalThis.__pt_gridTrace) { try { (globalThis.__pt_parentConsole || console).error('[grid] ' + __ptJSON.stringify({ tag: el.__ptLocal, id: el.id, availW, cw, shrinkGrid, forcedW: !!forcedW, explicitW, n, place, widths, totalW, want })); } catch (e) {} }
       const jc = __s_toLowerCase(String(cs.get('justify-content') || 'normal'));
       const slackW = Math.max(0, cw - totalW);
       const leadX = jc === 'center' ? slackW / 2 : (jc === 'end' || jc === 'flex-end' || jc === 'right') ? slackW : 0;
@@ -11613,14 +11838,14 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   /// with it), so a tree costs one lookup per element and property, not one
   /// walk to the root.
   const __inheritedValue = (el, prop) => {
-    if (!el || el.nodeType !== ELEMENT_NODE) return null;
+    if (!el || el.__ptType !== ELEMENT_NODE) return null;
     const cs = __cascadeFor(el);
     const own = cs.__ptInh || (cs.__ptInh = new Map());
     const hit = own.get(prop);
     if (hit !== undefined) return hit;
-    const p = el.parentNode;
+    const p = el.__ptParent;
     let out = null;
-    if (p && p.nodeType === ELEMENT_NODE) {
+    if (p && p.__ptType === ELEMENT_NODE) {
       const raw = __cascadeFor(p).get(prop);
       out = raw != null ? __resolveLength(raw, prop, __usedFontSize(p), p) : __inheritedValue(p, prop);
     }
@@ -11855,20 +12080,20 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   function __inFlatTree(el) {
     let n = el;
     for (let guard = 0; n && guard < 10000; guard++) {
-      const p = n.parentNode;
+      const p = n.__ptParent;
       // The root is a document (the caller checks which one via ownerDocument:
       // in a realm the tree root and the global `document` differ).
-      if (!p) return n.nodeType === 9;
-      if (p.nodeType === ELEMENT_NODE && p.__ptShadow) {
+      if (!p) return n.__ptType === 9;
+      if (p.__ptType === ELEMENT_NODE && p.__ptShadow) {
         const sr = p.__ptShadow;
-        const want = n.nodeType === ELEMENT_NODE ? (__ptGetA(n, 'slot') || '') : '';
+        const want = n.__ptType === ELEMENT_NODE ? (__ptGetA(n, 'slot') || '') : '';
         let slot = null;
-        try { __walkTree(sr, (x) => { if (!slot && x.nodeType === ELEMENT_NODE && x.__ptLocal === 'slot' && (__ptGetA(x, 'name') || '') === want) slot = x; }); } catch (e) {}
+        try { __walkTree(sr, (x) => { if (!slot && x.__ptType === ELEMENT_NODE && x.__ptLocal === 'slot' && (__ptGetA(x, 'name') || '') === want) slot = x; }); } catch (e) {}
         if (!slot) return false;
         n = slot;
         continue;
       }
-      if (p.nodeType === 11 && p.__ptHost) { n = p.__ptHost; continue; }
+      if (p.__ptType === 11 && p.__ptHost) { n = p.__ptHost; continue; }
       n = p;
     }
     return false;
@@ -11883,7 +12108,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     let map = new Map();
     // An element outside the rendered tree has no computed style: Chrome
     // returns '' for every property and `length` 0.
-    const connected = !!(el && el.nodeType === ELEMENT_NODE && el.isConnected);
+    const connected = !!(el && el.__ptType === ELEMENT_NODE && el.isConnected);
     // A windowless document (DOMParser, createHTMLDocument): empty, length 0.
     // A node in the window but outside the flat tree (unslotted shadow host
     // child): names present, values empty.
@@ -11899,7 +12124,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       return { map, names, flags };
     }
     map = new Map(__csBaseMap());
-    const tag = (el && el.localName) || 'div';
+    const tag = (el && el.__ptLocal) || 'div';
     if (CS_DISPLAY[tag] === 'inline' || CS_INLINE) {
       const inlineish = CS_DISPLAY[tag] === 'inline';
       if (inlineish) for (const [k, v] of Object.entries(CS_INLINE)) map.set(k, v);
@@ -12003,9 +12228,9 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       }
       // A flex item is blockified and its initial min size becomes `auto`.
       try {
-        const parent = el.parentNode;
-        const pd = parent && parent.nodeType === ELEMENT_NODE
-          ? String(__cascadeFor(parent).get('display') || CS_DISPLAY[parent.localName] || '')
+        const parent = el.__ptParent;
+        const pd = parent && parent.__ptType === ELEMENT_NODE
+          ? String(__cascadeFor(parent).get('display') || CS_DISPLAY[parent.__ptLocal] || '')
           : '';
         if (/^(flex|inline-flex|grid|inline-grid)$/.test(pd)) {
           if (!written.has('display') && /^(inline|inline-block)$/.test(String(map.get('display')))) {
@@ -12043,7 +12268,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         map.set('line-height', (Math.round(px * 1e4) / 1e4) + 'px');
       }
       // Links have a UA default style, visible in computed style.
-      if (el.localName === 'a' && __ptHasA(el, 'href')) {
+      if (el.__ptLocal === 'a' && __ptHasA(el, 'href')) {
         if (!written.has('cursor')) map.set('cursor', 'pointer');
         if (!written.has('text-decoration-line')) map.set('text-decoration-line', 'underline');
       }
@@ -12069,7 +12294,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       if (el) map.set('font-size', __usedFontSize(el) + 'px');
     } catch (e) {}
     try {
-      if (el && el.nodeType === ELEMENT_NODE) {
+      if (el && el.__ptType === ELEMENT_NODE) {
         if (__isUnboxed(el)) map.set('display', 'none');
         const b = withLayout ? __boxOf(el) : null;
         if (b) {
@@ -12093,7 +12318,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     // `length` or indexed names. Flex/grid items, out-of-flow boxes
     // (`absolute`, `fixed`, `float`) and the root are blockified: Chrome
     // prints `grid` where `inline-grid` was written.
-    if (el && el.nodeType === ELEMENT_NODE) {
+    if (el && el.__ptType === ELEMENT_NODE) {
       const BLOCKIFY = { inline: 'block', 'inline-block': 'block', 'inline-flex': 'flex', 'inline-grid': 'grid', 'inline-table': 'table', 'inline-flow-root': 'flow-root', 'list-item': null };
       const d = map.get('display');
       const to = BLOCKIFY[d];
@@ -12102,10 +12327,10 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         const pos = map.get('position');
         if (pos === 'absolute' || pos === 'fixed') why = true;
         if (map.get('float') && map.get('float') !== 'none') why = true;
-        let p = el.parentNode;
-        while (!why && p && p.nodeType === ELEMENT_NODE) {
-          const pd = __s_toLowerCase(__s_trim(String(__cascadeFor(p).get('display') || CS_DISPLAY[p.localName] || '')));
-          if (pd === 'contents') { p = p.parentNode; continue; }
+        let p = el.__ptParent;
+        while (!why && p && p.__ptType === ELEMENT_NODE) {
+          const pd = __s_toLowerCase(__s_trim(String(__cascadeFor(p).get('display') || CS_DISPLAY[p.__ptLocal] || '')));
+          if (pd === 'contents') { p = p.__ptParent; continue; }
           if (/^(inline-)?(flex|grid)$/.test(pd)) why = true;
           break;
         }
@@ -12241,7 +12466,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     return read(style);
   }
   function __computedNames(el) {
-    if (!el || el.nodeType !== ELEMENT_NODE) return [];
+    if (!el || el.__ptType !== ELEMENT_NODE) return [];
     const st = __computedState.get(el);
     if (st && st.names && st.at === __computedStamp()) return st.names;
     let names = CS_ORDER;
@@ -12517,7 +12742,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
 
   /// Font size in effect on an element (inherited; `em` resolves against it).
   function __usedFontSize(el) {
-    if (el && el.nodeType === ELEMENT_NODE) {
+    if (el && el.__ptType === ELEMENT_NODE) {
       const hit = __passFont.get(el);
       if (hit !== undefined) return hit;
       const v = __usedFontSizeRaw(el);
@@ -12535,9 +12760,9 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   function __usedFontSizeRaw(el) {
     let size = 16;
     const chain = [];
-    for (let e = el; e && e.nodeType === ELEMENT_NODE; e = e.parentNode) chain.push(e);
+    for (let e = el; e && e.__ptType === ELEMENT_NODE; e = e.__ptParent) chain.push(e);
     // Form controls do not inherit the page font size; the UA gives their own.
-    const own = (el && el.localName) || '';
+    const own = (el && el.__ptLocal) || '';
     if (own === 'input' || own === 'button' || own === 'select' || own === 'textarea') {
       size = UA_FORM_FONT;
       const raw = __cascadeFor(el).get('font-size');
@@ -12553,7 +12778,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     for (let i = chain.length - 1; i >= 0; i--) {
       const raw = __cascadeFor(chain[i]).get('font-size');
       if (raw == null) {
-        const f = UA_FONT_SIZE[__s_toLowerCase(chain[i].localName || '')];
+        const f = UA_FONT_SIZE[__s_toLowerCase(chain[i].__ptLocal || '')];
         if (f) size *= f;
         continue;
       }
@@ -12626,14 +12851,14 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
 
   /// Content width of the element's containing block.
   function __containingWidth(el) {
-    const parent = el && el.parentNode;
-    if (!parent || parent.nodeType !== ELEMENT_NODE) return LAYOUT.W;
+    const parent = el && el.__ptParent;
+    if (!parent || parent.__ptType !== ELEMENT_NODE) return LAYOUT.W;
     const b = parent.__ptBoxV === __layoutBuilt ? parent.__ptBox : null;
     return b ? b.cw : LAYOUT.W;
   }
 
   function __boxOf(el) {
-    if (!el || el.nodeType !== ELEMENT_NODE) return null;
+    if (!el || el.__ptType !== ELEMENT_NODE) return null;
     const doc = el.ownerDocument;
     if (doc && doc !== globalThis.document) {
       // A node of another document is laid out by its own realm; ask its
@@ -12884,7 +13109,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   }
 
   function __focusableAncestor(el) {
-    for (let e = el; e && e.nodeType === ELEMENT_NODE; e = e.parentNode) {
+    for (let e = el; e && e.__ptType === ELEMENT_NODE; e = e.__ptParent) {
       const t = e.tagName;
       if (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT' || t === 'BUTTON') return e;
       if (t === 'A' && __ptHasA(e, 'href')) return e;
@@ -12904,7 +13129,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   // for reading rendered text.
   const __INNERTEXT_SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'HEAD', 'TITLE']);
   function __innerText(el) {
-    if (!el || el.nodeType !== ELEMENT_NODE) return '';
+    if (!el || el.__ptType !== ELEMENT_NODE) return '';
     // A non-rendered element returns its `textContent`, styles and scripts
     // included: in Chrome `d.style.display='none'; d.innerText` gives
     // ".z{color:red}text".
@@ -12914,8 +13139,8 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     if (__INNERTEXT_SKIP.has(el.tagName)) return '';
     let s = '';
     for (const c of el.__ptKids) {
-      if (c.nodeType === TEXT_NODE) s += c.data;
-      else if (c.nodeType === ELEMENT_NODE && !__isHiddenEl(c)) s += ' ' + __innerText(c);
+      if (c.__ptType === TEXT_NODE) s += c.data;
+      else if (c.__ptType === ELEMENT_NODE && !__isHiddenEl(c)) s += ' ' + __innerText(c);
     }
     return __s_trim(__s_replace(s, /\s+/g, ' '));
   }
@@ -12946,7 +13171,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     const seen = [];
     const scan = (root, shadowed) => {
       for (const n of (root.__ptKids || [])) {
-        if (n.nodeType !== ELEMENT_NODE) continue;
+        if (n.__ptType !== ELEMENT_NODE) continue;
         if (!__isHiddenEl(n)) {
           const role = (n.getAttribute && __ptGetA(n, 'role')) || '';
           const type = (n.getAttribute && __ptGetA(n, 'type')) || '';
@@ -12958,7 +13183,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
             // overlay); a human clicks the nearest wrapper with a real box.
             let r = n.getBoundingClientRect();
             if (!(r.width > 0 && r.height > 0)) {
-              for (let a = n.parentNode; a && a.nodeType === ELEMENT_NODE; a = a.parentNode) {
+              for (let a = n.__ptParent; a && a.__ptType === ELEMENT_NODE; a = a.__ptParent) {
                 const ar = a.getBoundingClientRect();
                 if (ar.width > 0 && ar.height > 0 && ar.width <= 400 && ar.height <= 200) { r = ar; break; }
               }
@@ -12987,7 +13212,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     const out = [];
     const walk = (n, depth) => {
       for (let c = n.firstChild; c; c = c.nextSibling) {
-        if (c.nodeType !== ELEMENT_NODE) continue;
+        if (c.__ptType !== ELEMENT_NODE) continue;
         const t = c.tagName;
         if (t === 'INPUT' || t === 'LABEL' || t === 'BUTTON' || (c.getAttribute && __ptGetA(c, 'role'))) {
           let r = null; try { r = c.getBoundingClientRect(); } catch (e) {}
@@ -13013,7 +13238,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     let out = '';
     try {
       __walkTree(globalThis.document, (n) => {
-        if (out || !n || n.nodeType !== ELEMENT_NODE) return;
+        if (out || !n || n.__ptType !== ELEMENT_NODE) return;
         if ((n.__ptLocal === 'input' || n.__ptLocal === 'textarea') && /^(cf-turnstile-response|g-recaptcha-response)$/.test(__ptGetA(n, 'name') || '')) { const v = n.value; if (v) out = String(v); }
       });
     } catch (e) {}
@@ -13028,7 +13253,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       out.url = String((globalThis.location && location.href) || '');
       out.inter = /Just a moment/.test(out.title);
       __walkTree(globalThis.document, (n) => {
-        if (!n || n.nodeType !== ELEMENT_NODE) return;
+        if (!n || n.__ptType !== ELEMENT_NODE) return;
         const t = n.__ptLocal;
         if (t === 'iframe' && /challenges\.cloudflare\.com/.test(__ptGetA(n, 'src') || '')) out.widget = true;
         // A reCAPTCHA checkbox (Google's /sorry/ page among others); the invisible
@@ -13051,7 +13276,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   globalThis.__pt_frameRectById = (id) => {
     const walk = (n) => {
       for (let c = n.firstChild; c; c = c.nextSibling) {
-        if (c.nodeType !== ELEMENT_NODE) continue;
+        if (c.__ptType !== ELEMENT_NODE) continue;
         if (c.__ptLocal === 'iframe' && c.__ptFrameId === id) return c;
         const inShadow = c.__ptShadow ? walk(c.__ptShadow) : null;
         if (inShadow) return inShadow;
@@ -13067,7 +13292,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   };
 
   globalThis.__pt_hitFrame = (x, y) => {
-    for (let el = __elementFromPoint(x, y); el && el.nodeType === ELEMENT_NODE; el = el.parentNode) {
+    for (let el = __elementFromPoint(x, y); el && el.__ptType === ELEMENT_NODE; el = el.__ptParent) {
       if (el.__ptLocal === 'iframe' && el.__ptFrameId) {
         const r = el.getBoundingClientRect();
         // One to one, as in a real window: a frame does not scale its content,
@@ -13083,7 +13308,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   /// The control a label activates: the one named by `for`, or the first
   /// control inside the label; null if none.
   function __labelFor(el) {
-    for (let e = el; e && e.nodeType === ELEMENT_NODE; e = e.parentNode) {
+    for (let e = el; e && e.__ptType === ELEMENT_NODE; e = e.__ptParent) {
       if (e.tagName !== 'LABEL') continue;
       const id = e.getAttribute && __ptGetA(e, 'for');
       if (id) {

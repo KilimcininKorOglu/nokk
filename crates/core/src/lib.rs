@@ -10091,6 +10091,49 @@ mod tests {
         assert_eq!(out["scope"], 3, "{out}");
     }
 
+    /// CSSOM as in Chrome 151: rules and sheets carry no own properties (a
+    /// keyframes rule only its index), every member is a prototype accessor, and
+    /// rule text is Chrome's (quoted urls, `0%` keyframes, condition text, the
+    /// `@import`s after other rules dropped, `@page`/`@property` rules).
+    #[tokio::test]
+    async fn cssom_rules_are_shaped_and_printed_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><head></head><body></body></html>").await.unwrap();
+        let out = probe(
+            &ctx,
+            r#"(() => { const s = document.createElement('style');
+               s.textContent = "@import url(a.css); @layer x; @import 'b.css'; a{background-image:url(x.png);margin:0 0 0 0} @keyframes k{from{opacity:0}to{opacity:1}} @supports (display:grid){b{color:red}} @media (max-width : 2px),print{c{color:red}} @page{margin:1cm} @property --x{syntax:'<length>';inherits:false;initial-value:0px}";
+               document.head.appendChild(s);
+               const rs = [...s.sheet.cssRules];
+               let illegal = '';
+               try { Object.getOwnPropertyDescriptor(CSSRule.prototype, 'cssText').get.call({}); } catch (e) { illegal = e.message; }
+               return __ptJSON.stringify({ own: rs.map((r) => Object.getOwnPropertyNames(r).length), sheetOwn: Object.getOwnPropertyNames(s.sheet).length,
+                 names: rs.map((r) => r.constructor.name), text: rs.map((r) => r.cssText), illegal,
+                 same: s.sheet.cssRules === s.sheet.cssRules && rs[2].style === rs[2].style }); })()"#,
+        )
+        .await;
+        assert_eq!(out["own"], serde_json::json!([0, 0, 0, 2, 0, 0, 0, 0]), "{out}");
+        assert_eq!(out["sheetOwn"], 0, "{out}");
+        assert_eq!(out["illegal"], "Illegal invocation", "{out}");
+        assert_eq!(out["same"], true, "{out}");
+        assert_eq!(
+            out["text"],
+            serde_json::json!([
+                "@import url(\"a.css\");",
+                "@layer x;",
+                "a { background-image: url(\"x.png\"); margin: 0px; }",
+                "@keyframes k { \n  0% { opacity: 0; }\n  100% { opacity: 1; }\n}",
+                "@supports (display:grid) {\n  b { color: red; }\n}",
+                "@media (max-width: 2px), print {\n  c { color: red; }\n}",
+                "@page { margin: 1cm; }",
+                "@property --x { syntax: \"<length>\"; inherits: false; initial-value: 0px; }"
+            ]),
+            "{out}"
+        );
+    }
+
     /// Cascade layers and `!important` (a later layer wins a normal declaration,
     /// an earlier one an important one), rules keyed by their `:is()`/`:where()`
     /// arguments, and Chrome's serialization of colours and font families.
