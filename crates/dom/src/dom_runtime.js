@@ -93,18 +93,21 @@
   };
   // At most every max(100 ms, 4x its last cost): it lays the page out, and a
   // page that changes itself every frame would pay a layout per turn.
-  let __lazyAt = '', __lazyNext = 0;
+  let __lazyAt = '', __lazyNext = 0, __lazyView = '';
   globalThis.__pt_lazyCheck = () => {
     if (!__lazyPending.size) return;
     const doc = globalThis.document;
     if (!doc || (doc.__ptFinishAt | 0) < 2) return;
     const vw = globalThis.innerWidth || LAYOUT.W, vh = globalThis.innerHeight || LAYOUT.H;
     const sx = __scrollPos[0], sy = __scrollPos[1];
-    const at = __layoutSeq + ':' + sx + ',' + sy + ':' + vw + 'x' + vh;
+    const view = sx + ',' + sy + ':' + vw + 'x' + vh;
+    const at = __layoutSeq + ':' + view;
     if (at === __lazyAt) return;
     const t0 = __perfNow();
-    if (t0 < __lazyNext) return;
+    // A scroll or a resize is looked at at once; only tree changes wait.
+    if (t0 < __lazyNext && view === __lazyView) return;
     __lazyAt = at;
+    __lazyView = view;
     try { __lazyRun(sx, sy, vw, vh); } finally { __lazyNext = __perfNow() + Math.max(100, 4 * (__perfNow() - t0)); }
   };
   function __lazyRun(sx, sy, vw, vh) {

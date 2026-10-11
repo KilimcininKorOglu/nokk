@@ -1823,15 +1823,27 @@ impl BrowserContext {
                 .copied()
                 .unwrap_or(nokk_dom::ScriptMode::Blocking)
         };
+        // Then the `async` scripts already fetched when parsing ends, the
+        // deferred ones in order, `DOMContentLoaded`, and the remaining `async`
+        // scripts as they arrive: Chrome's DOMContentLoaded does not wait for an
+        // async script still on the network, its `load` does.
         let n = page.scripts.len();
-        let blocking = (0..n).filter(|&i| mode_of(i) == nokk_dom::ScriptMode::Blocking);
-        let later = (0..n)
-            .filter(|&i| mode_of(i) == nokk_dom::ScriptMode::Async)
-            .chain((0..n).filter(|&i| mode_of(i) == nokk_dom::ScriptMode::Defer));
-        let plan: Vec<Option<usize>> = blocking
-            .map(Some)
-            .chain(std::iter::once(None))
-            .chain(later.map(Some))
+        let asyncs: Vec<usize> = (0..n).filter(|&i| mode_of(i) == nokk_dom::ScriptMode::Async).collect();
+        let mut plan: std::collections::VecDeque<Step> = (0..n)
+            .filter(|&i| mode_of(i) == nokk_dom::ScriptMode::Blocking)
+            .map(Step::Script)
+            .chain([Step::ParseDone, Step::AsyncReady])
+            .chain((0..n).filter(|&i| mode_of(i) == nokk_dom::ScriptMode::Defer).map(Step::Script))
+            .chain([Step::Dcl])
+            .collect();
+        let mut late: Vec<usize> = Vec::new();
+        let srcs: Vec<Option<String>> = page
+            .scripts
+            .iter()
+            .map(|s| match s {
+                nokk_dom::Script::External(src) | nokk_dom::Script::ExternalModule(src) => Some(src.clone()),
+                _ => None,
+            })
             .collect();
         // Preload scanner: a browser finds a document's external scripts while parsing and
         // requests them all at once, executing in its own order. Fetching each only when
@@ -1873,10 +1885,63 @@ impl BrowserContext {
                 preload.insert(abs, (started, handle));
             }
         }
-        for step in plan {
-            let Some(idx) = step else {
-                let _ = self.eval_in(index, "__pt_parseDone()").await;
-                continue;
+        let finish = |upto: u8| async move {
+            for attempt in 0..3 {
+                let call = format!("__pt_finishLoad({}, {upto});", attempt > 0 || upto > 1);
+                match self.eval_in(index, &call).await {
+                    Ok(_) => break,
+                    Err(e) => tracing::warn!(error = %e, "a load event listener was stopped; the page goes on"),
+                }
+            }
+        };
+        let top = index == self.idx();
+        while let Some(step) = plan.pop_front() {
+            let idx = match step {
+                Step::Script(idx) => idx,
+                Step::ParseDone => {
+                    let _ = self.eval_in(index, "__pt_parseDone()").await;
+                    continue;
+                }
+                Step::AsyncReady => {
+                    // Fetched by now: run before the deferred scripts. A frame has
+                    // no preload scanner of its own; its async scripts run here.
+                    let mut ready = Vec::new();
+                    for &i in &asyncs {
+                        let fetched = match &page.scripts[i] {
+                            nokk_dom::Script::External(src) | nokk_dom::Script::ExternalModule(src) => resolve_url(base_url, src)
+                                .and_then(|abs| preload.get(&abs).map(|(_, h)| h.is_finished()))
+                                .unwrap_or(true),
+                            _ => true,
+                        };
+                        if fetched || !top { ready.push(i); } else { late.push(i); }
+                    }
+                    for i in ready.into_iter().rev() {
+                        plan.push_front(Step::Script(i));
+                    }
+                    continue;
+                }
+                Step::Dcl => {
+                    // Lifecycle: DOMContentLoaded here, `load` after the loop.
+                    // Top page only for the waits: a frame's loads are served by the
+                    // page's loop, which a frame must not re-enter.
+                    if top {
+                        let _ = self.eval_in(index, "typeof __pt_cssSheets === 'function' && __pt_cssSheets()").await;
+                        self.wait_for_holds(index, DCL_HOLDS, HOLD_WAIT).await;
+                        self.flush_resource_timings(index).await;
+                    }
+                    finish(1).await;
+                    plan.push_back(Step::Late);
+                    continue;
+                }
+                Step::Late => {
+                    // The async scripts still out, each when its answer is in; the page
+                    // lives meanwhile.
+                    if let Some(i) = self.next_arrived(base_url, &preload, &mut late, &srcs).await {
+                        plan.push_back(Step::Script(i));
+                        plan.push_back(Step::Late);
+                    }
+                    continue;
+                }
             };
             let script = &page.scripts[idx];
             tracing::debug!(target: "nokk::load", idx, kind = match script {
@@ -2011,24 +2076,6 @@ impl BrowserContext {
         // a listener stopped for running too long (azure.microsoft.com relays
         // out its sticky header for a minute). Chrome would still show the
         // page, so the load goes on.
-        let finish = |upto: u8| async move {
-            for attempt in 0..3 {
-                let call = format!("__pt_finishLoad({}, {upto});", attempt > 0 || upto > 1);
-                match self.eval_in(index, &call).await {
-                    Ok(_) => break,
-                    Err(e) => tracing::warn!(error = %e, "a load event listener was stopped; the page goes on"),
-                }
-            }
-        };
-        // Top page only: a frame's loads are served by the page's loop, which a
-        // frame must not re-enter.
-        let top = index == self.idx();
-        if top {
-            let _ = self.eval_in(index, "typeof __pt_cssSheets === 'function' && __pt_cssSheets()").await;
-            self.wait_for_holds(index, DCL_HOLDS, HOLD_WAIT).await;
-            self.flush_resource_timings(index).await;
-        }
-        finish(1).await;
         if top {
             let _ = self.eval_in(index, "typeof __pt_cssLoads === 'function' && __pt_cssLoads(true)").await;
             self.wait_for_holds(index, LOAD_HOLDS, HOLD_WAIT).await;
@@ -5297,6 +5344,40 @@ impl BrowserContext {
     }
 
     /// A script requested by the preload scanner, or fetched now if it was not preloaded.
+    /// The next late `async` script whose answer has arrived, waiting with
+    /// the page's loop running (its timers and events go on, as in a browser
+    /// between DOMContentLoaded and the script). `None` when none is left.
+    async fn next_arrived(
+        &self,
+        base_url: &str,
+        preload: &HashMap<String, Preloaded>,
+        late: &mut Vec<usize>,
+        page_scripts: &[Option<String>],
+    ) -> Option<usize> {
+        loop {
+            if late.is_empty() {
+                return None;
+            }
+            let pos = late.iter().position(|&i| {
+                page_scripts
+                    .get(i)
+                    .and_then(|src| src.as_deref())
+                    .and_then(|src| resolve_url(base_url, src))
+                    .and_then(|abs| preload.get(&abs).map(|(_, h)| h.is_finished()))
+                    .unwrap_or(true)
+            });
+            if let Some(p) = pos {
+                return Some(late.remove(p));
+            }
+            let worked: u32 = Box::pin(self.run_event_loop_waiting(std::time::Duration::ZERO, None))
+                .await
+                .unwrap_or_default();
+            if worked == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+    }
+
     async fn take_preloaded(
         &self,
         pre: Option<Preloaded>,
@@ -5717,6 +5798,19 @@ const HOLD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const SHEETS_WAIT_ASYNC: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// A preloaded script: when it was requested and the task awaiting it.
+/// One step of a document's script plan.
+#[derive(Clone, Copy)]
+enum Step {
+    Script(usize),
+    ParseDone,
+    /// Decide which `async` scripts have arrived by the end of parsing.
+    AsyncReady,
+    /// `DOMContentLoaded`.
+    Dcl,
+    /// The next `async` script still out, when it arrives.
+    Late,
+}
+
 type Preloaded = (
     std::time::Instant,
     tokio::task::JoinHandle<Result<nokk_net::Response, NetError>>,
