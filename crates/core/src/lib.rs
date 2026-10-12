@@ -10091,6 +10091,30 @@ mod tests {
         assert_eq!(out["scope"], 3, "{out}");
     }
 
+    /// `DOMContentLoaded` reaches a window listener once, by bubbling from the
+    /// document; an uncaught error is one trusted `error` event, and the window's
+    /// `onerror` gets (message, source, line, column, error). As Chrome 151 does.
+    #[tokio::test]
+    async fn dcl_bubbles_to_the_window_once_and_onerror_gets_five_arguments() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<html><head><script>window.__w = []; window.addEventListener('DOMContentLoaded', (e) => __w.push('win:' + (e.target === document)));\
+             document.addEventListener('DOMContentLoaded', () => __w.push('doc'));\
+             window.__e = []; window.onerror = (m, u, l, c, err) => { __e.push('on:' + m + ':' + (err instanceof Error)); };\
+             window.addEventListener('error', (ev) => __e.push('lis:' + ev.message + ':' + ev.isTrusted));\
+             setTimeout(() => { throw new Error('boom'); }, 0);</script></head><body></body></html>",
+        )
+        .await
+        .unwrap();
+        ctx.run_event_loop().await.unwrap();
+        let out = probe(&ctx, "__ptJSON.stringify({ w: __w, e: __e })").await;
+        assert_eq!(out["w"], serde_json::json!(["doc", "win:true"]), "{out}");
+        assert_eq!(out["e"], serde_json::json!(["on:Uncaught Error: boom:true", "lis:Uncaught Error: boom:true"]), "{out}");
+    }
+
     /// CSSOM as in Chrome 151: rules and sheets carry no own properties (a
     /// keyframes rule only its index), every member is a prototype accessor, and
     /// rule text is Chrome's (quoted urls, `0%` keyframes, condition text, the

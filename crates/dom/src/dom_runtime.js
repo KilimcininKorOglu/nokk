@@ -768,7 +768,7 @@
           let on; try { on = node['on' + event.type]; } catch (x) {}
           if (typeof on === 'function') {
             __ptEvSet(event, 'currentTarget', node);
-            try { on.call(node, event); } catch (x) { __pt_reportError(x, 'listener ' + event.type); }
+            try { __ptCallOn(node, on, event); } catch (x) { __pt_reportError(x, 'listener ' + event.type); }
           }
         }
       };
@@ -784,7 +784,7 @@
         const on = this['on' + event.type];
         if (typeof on === 'function') {
           __ptEvSet(event, 'currentTarget', this);
-          try { on.call(this, event); } catch (e) { __pt_reportError(e, 'listener ' + event.type); }
+          try { __ptCallOn(this, on, event); } catch (e) { __pt_reportError(e, 'listener ' + event.type); }
         }
       };
       // At the target, capture listeners first, then the rest (Chrome >= 89).
@@ -820,22 +820,33 @@
   globalThis.__pt_reportError = (e, where) => {
     __reported++;
     const msg = 'Uncaught ' + String((e && e.name ? e.name + ': ' + e.message : e));
-    try {
-      const on = globalThis.onerror;
-      if (typeof on === 'function') {
-        on.call(globalThis, msg, (e && e.fileName) || (globalThis.location && location.href) || '',
-                (e && e.lineNumber) || 0, (e && e.columnNumber) || 0, e);
-      }
-    } catch (x) {}
+    // One trusted `error` event on the window; its `onerror` gets the five
+    // arguments (see `__ptCallOn`).
     try {
       if (globalThis.ErrorEvent && globalThis.dispatchEvent) {
-        const ev = new ErrorEvent('error', { message: msg, error: e });
+        const ev = __ptTrust(new ErrorEvent('error', {
+          message: msg, error: e, cancelable: true,
+          filename: (e && e.fileName) || (globalThis.location && location.href) || '',
+          lineno: (e && e.lineNumber) || 0, colno: (e && e.columnNumber) || 0,
+        }));
         globalThis.dispatchEvent(ev);
       }
     } catch (x) {}
     try { console.error(msg + (where ? ' (' + where + ')' : ''), (e && e.stack) || ''); } catch (x) {}
   };
 
+  // An event handler property. The window's `onerror` is called with
+  // (message, source, line, column, error) for an ErrorEvent, and `true`
+  // from it cancels the event; any other handler gets the event (its return
+  // value does not cancel here yet: doing so broke udemy.com's app).
+  function __ptCallOn(t, on, event) {
+    if (event.type === 'error' && t === globalThis && globalThis.ErrorEvent && event instanceof globalThis.ErrorEvent) {
+      const r = on.call(t, event.message, event.filename, event.lineno, event.colno, event.error);
+      if (r === true) event.preventDefault();
+      return;
+    }
+    on.call(t, event);
+  }
   function fireCapture(node, event) {
     const l = node.__ptLis && node.__ptLis[event.type]; if (!l) return;
     for (const e of __s_slice(l)) { if (!e.cap) continue; if (event.__ptStopImm) break; __ptCallListener(node, e, event, 'capture'); }
@@ -5504,12 +5515,14 @@
   const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
   const esc = (s, attr) => __s_replace(s, attr ? /[&<>"]/g : /[&<>]/g, c => ESC[c]);
   function serializeNode(n, withShadow) {
-    if (n.__ptType === TEXT_NODE) return esc(n.data, false);
-    if (n.__ptType === COMMENT_NODE) return `<!--${n.data}-->`;
+    // Internal fields only: a page may shadow `attributes`, `data` or `tagName`
+    // on an element (skyscanner does on an iframe); Chrome's serializer is native.
+    if (n.__ptType === TEXT_NODE) return esc(n.__ptData, false);
+    if (n.__ptType === COMMENT_NODE) return `<!--${n.__ptData}-->`;
     if (n.__ptType !== ELEMENT_NODE) return n.__ptKids.map((c) => serializeNode(c, withShadow)).join('');
     const tag = n.__ptLocal;
     let attrs = '';
-    for (const { name, value } of n.attributes) attrs += ` ${name}="${esc(value, true)}"`;
+    for (const [name, value] of n.__ptAttrs) attrs += ` ${name}="${esc(value, true)}"`;
     if (VOID.has(tag)) return `<${tag}${attrs}>`;
     // `<template>` serializes its content; a serializable shadow root
     // (getHTML with serializableShadowRoots) as <template shadowrootmode>.
@@ -7189,8 +7202,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       // A whole document serializes as its root element with xmlns.
       if (node && node.__ptType === 9 && node.documentElement) node = node.documentElement;
       const one = (n, root) => {
-        if (n.__ptType === TEXT_NODE) return esc(String(n.data), false);
-        if (n.__ptType === COMMENT_NODE) return '<!--' + n.data + '-->';
+        if (n.__ptType === TEXT_NODE) return esc(String(n.__ptData), false);
+        if (n.__ptType === COMMENT_NODE) return '<!--' + n.__ptData + '-->';
         if (n.__ptType !== ELEMENT_NODE) {
           // Fragment children (shadow root included) are each a root: xmlns on
           // every top-level element, as in Chrome.
@@ -7199,7 +7212,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         const tag = n.__ptLocal;
         let attrs = '';
         if (root && !(n.ownerDocument && n.ownerDocument.__ptXml)) attrs += ' xmlns="http://www.w3.org/1999/xhtml"';
-        for (const { name, value } of n.attributes) attrs += ' ' + name + '="' + esc(String(value), true) + '"';
+        for (const [name, value] of n.__ptAttrs) attrs += ' ' + name + '="' + esc(String(value), true) + '"';
         const kids = (n.__ptKids || []).map((c) => one(c, false)).join('');
         if (!kids && VOID_XML.has(tag)) return '<' + tag + attrs + ' />';
         return '<' + tag + attrs + '>' + kids + '</' + tag + '>';
@@ -7819,17 +7832,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     // Lifecycle events come from the browser: `e.isTrusted` is true, and
     // pages check it first.
     const dcl = __ptTrust(new Event('DOMContentLoaded', { bubbles: true }));
+    // It bubbles from the document to the window, where it is most often
+    // listened for (Turnstile's api.js), once.
     document.dispatchEvent(dcl);
-    // The event bubbles from document to window, where it is most often
-    // listened for: Turnstile's api.js sets up auto-render via
-    // `window.addEventListener('DOMContentLoaded', …)`. Window and document are
-    // separate targets here, so dispatch it on the window explicitly.
-    try {
-      if (globalThis.dispatchEvent) {
-        try { dcl.target = document; dcl.currentTarget = globalThis; } catch (e) {}
-        globalThis.dispatchEvent(dcl);
-      }
-    } catch (e) {}
     __ptMark('dclEnd');
   };
   const __finishLoadEvent = () => {
@@ -8423,7 +8428,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   globalThis.__pt_describe = (n) => {
     if (n == null || !n.__ptType) return null;
     const attrs = [];
-    if (n.attributes) for (const a of n.attributes) { attrs.push(a.name); attrs.push(a.value); }
+    if (n.__ptType === ELEMENT_NODE && n.__ptAttrs) for (const [name, value] of n.__ptAttrs) { attrs.push(name); attrs.push(value); }
     return {
       backendNodeId: globalThis.__pt_nodeId(n), nodeId: 0, nodeType: n.__ptType,
       nodeName: n.nodeName || '', localName: n.localName || '', nodeValue: n.nodeValue || '',
