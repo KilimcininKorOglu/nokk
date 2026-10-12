@@ -837,15 +837,16 @@
 
   // An event handler property. The window's `onerror` is called with
   // (message, source, line, column, error) for an ErrorEvent, and `true`
-  // from it cancels the event; any other handler gets the event (its return
-  // value does not cancel here yet: doing so broke udemy.com's app).
+  // from it cancels the event; any other handler gets the event, and
+  // `false` from it cancels.
   function __ptCallOn(t, on, event) {
     if (event.type === 'error' && t === globalThis && globalThis.ErrorEvent && event instanceof globalThis.ErrorEvent) {
       const r = on.call(t, event.message, event.filename, event.lineno, event.colno, event.error);
       if (r === true) event.preventDefault();
       return;
     }
-    on.call(t, event);
+    const r = on.call(t, event);
+    if (r === false && event.cancelable) event.preventDefault();
   }
   function fireCapture(node, event) {
     const l = node.__ptLis && node.__ptLis[event.type]; if (!l) return;

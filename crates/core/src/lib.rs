@@ -10091,6 +10091,28 @@ mod tests {
         assert_eq!(out["scope"], 3, "{out}");
     }
 
+    /// URL paths keep empty segments and a trailing slash, and resolve `.`/`..`
+    /// (also `%2e`) as WHATWG says. Dropping the slash of `/en/` made Next.js
+    /// rewrite udemy.com's home to its 404 page. Expected values from Chrome 151.
+    #[tokio::test]
+    async fn url_paths_keep_trailing_slashes_and_empty_segments() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>").await.unwrap();
+        let out = probe(
+            &ctx,
+            r#"__ptJSON.stringify([["https://www.udemy.com/en/"],["/x/","https://example.com"],["https://example.com/a//b/"],["../c","https://example.com/a/b/"],["./","https://example.com/a/b"],["..","https://example.com/a/b/c"],["https://example.com/a/%2e%2E/b/."],["https://example.com/.."],["?q=1","https://example.com/a/"]].map(([u, b]) => new URL(u, b).href))"#,
+        )
+        .await;
+        assert_eq!(
+            out,
+            serde_json::json!(["https://www.udemy.com/en/", "https://example.com/x/", "https://example.com/a//b/", "https://example.com/a/c",
+                "https://example.com/a/", "https://example.com/a/", "https://example.com/b/", "https://example.com/", "https://example.com/a/?q=1"]),
+            "{out}"
+        );
+    }
+
     /// `DOMContentLoaded` reaches a window listener once, by bubbling from the
     /// document; an uncaught error is one trusted `error` event, and the window's
     /// `onerror` gets (message, source, line, column, error). As Chrome 151 does.

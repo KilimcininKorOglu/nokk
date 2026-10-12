@@ -14525,18 +14525,21 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const pct = (c) => Array.from(new TextEncoder().encode(c)).map((b) => '%' + __s_padStart(__s_toUpperCase(b.toString(16)), 2, '0')).join('');
     const encQuery = (q, special) => __s_replace(q, special ? /[^\x21-\x7e]|[#"<>']/g : /[^\x21-\x7e]|[#"<>]/g, pct);
     const encFrag = (f) => __s_replace(f, /[^\x21-\x7e]|["<>`]/g, pct);
+    // WHATWG path segments: `.` and `..` (also as `%2e`) are resolved, a
+    // trailing one leaves a trailing slash; empty segments stay (`/en/` keeps
+    // its slash, `/a//b` its double slash, as in Chrome).
     const normPath = (p) => {
       const abs = __s_startsWith(p, '/');
+      const segs = __s_split(abs ? __s_slice(p, 1) : p, '/');
       const out = [];
-      for (const seg of __s_split(p, '/')) {
-        if (seg === '.' || (seg === '' && out.length && abs)) continue;
-        if (seg === '..') { out.pop(); continue; }
+      for (let i = 0; i < segs.length; i++) {
+        const seg = segs[i], low = __s_toLowerCase(seg), last = i === segs.length - 1;
+        if (low === '..' || low === '.%2e' || low === '%2e.' || low === '%2e%2e') { out.pop(); if (last) out.push(''); continue; }
+        if (low === '.' || low === '%2e') { if (last) out.push(''); continue; }
         out.push(seg);
       }
-      let r = out.join('/');
-      if (abs && !__s_startsWith(r, '/')) r = '/' + r;
-      if (/\/(\.|\.\.)$/.test(p) && !__s_endsWith(r, '/')) r += '/';
-      return r || (abs ? '/' : '');
+      const r = out.join('/');
+      return abs ? '/' + r : r;
     };
     const URL_STATE = new WeakMap();
     // URL params: editing them (`append`, `set`, `delete`, `sort`) changes the
