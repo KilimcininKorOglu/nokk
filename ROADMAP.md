@@ -401,18 +401,21 @@ ceiling.
 The goal: on the same machine, every page nokk loads costs less memory **and is ready
 sooner** than in Chrome 151. Memory is already ahead; speed is not, on heavy pages.
 
-Baseline, early October 2026 (before the work below), 8-core Linux, median of three runs.
-Peak PSS of the whole process tree (Chrome counts only its own processes) and wall time to
-a loaded page. To be measured again on an idle machine; the committed benchmark below will
-produce it.
+Measured 2026-10-12 with [`tools/bench/bench.py`](tools/bench/bench.py) on an 8-core Linux
+box at load average ~2: median of three runs, peak PSS of the whole process tree (for
+Chrome only its own processes) and wall time from start to a loaded page, nokk against
+Chrome 151 headless. The early-October baseline is in brackets.
 
 | Page | nokk memory | Chrome memory | nokk time | Chrome time |
 |---|---|---|---|---|
-| example.com | 74 MB | 262 MB | 0.3 s | 1.2 s |
-| Hacker News | 82 MB | 351 MB | 1.2 s | 2.2 s |
-| Wikipedia article | 245 MB | 366 MB | 5.4 s | 1.6 s |
-| github.com | 200 MB | 446 MB | 5.5 s | 2.8 s |
-| bbc.com/news | 395 MB | 536 MB | 10.6 s | 7.4 s |
+| example.com | 76 MB (74) | 318 MB | 0.4 s (0.3) | 1.6 s |
+| Hacker News | 92 MB (82) | 378 MB | 1.4 s (1.2) | 2.3 s |
+| Wikipedia article | 338 MB (245) | 464 MB | 5.1 s (5.4) | 2.2 s |
+| github.com | 281 MB (200) | 525 MB | 4.6 s (5.5) | 2.5 s |
+| bbc.com/news | 294 MB (395) | 624 MB | 9.0 s (10.6) | 5.9 s |
+
+Memory is still well under Chrome everywhere, but Wikipedia and GitHub gained 80–90 MB
+since the baseline; the cause is not measured yet and is the next memory item.
 
 ### Memory
 
@@ -470,9 +473,11 @@ Open:
 - ⬜ **Style, selectors and layout in Rust.** They run in JS on one thread today; native
   data structures and parallel style would close most of the gap to Chrome on heavy
   pages. A large change, planned after the current release line settles.
-- ⬜ **A committed benchmark**: `tools/bench` with fixed pages, nokk against Chrome on
-  the same machine, memory and time, run for every release; the README table comes
-  from it.
+- ✅ **A committed benchmark**: [`tools/bench/bench.py`](tools/bench/bench.py) loads fixed
+  pages in nokk and Chrome on the same machine and prints the table above. Left: run it
+  for every release.
+- ⬜ **Why Wikipedia and GitHub take 80–90 MB more than in early October**, and bring it
+  back down.
 
 ## Testing & benchmarks (Phase 8)
 
