@@ -20,7 +20,7 @@ Legend: ✅ done · 🟡 partial / in progress · ⬜ planned
 | 7 | Scaling & concurrency (100–1000 contexts under a memory ceiling) | ⬜ |
 | 8 | Testing, benchmarks, fingerprint regression suite | 🟡 |
 | — | Performance: less memory and faster than Chrome on the same machine | 🟡 |
-| 9 | Packaging & release (crates.io, Docker, prebuilt binaries) | ⬜ |
+| 9 | Packaging & release (crates.io, Docker, prebuilt binaries) | 🟡 |
 
 ## Cloudflare challenges ✅
 
@@ -212,7 +212,9 @@ Move to native (Rust):
   port that delivers each message exactly once. Frames start workers of their own —
   which is where a challenge collects — and a worker ends when it calls `close()`,
   when its frame goes, or when the page navigates. `OffscreenCanvas` maps to a
-  detached `<canvas>`, reusing its 2D/WebGL contexts; `SharedWorker` is still a shim.
+  detached `<canvas>`, reusing its 2D/WebGL contexts. `SharedWorker` is real too
+  (`SharedWorkerGlobalScope`, `connect`, a port), one instance per page; it is not yet
+  shared between pages of the same origin.
 - ✅ **`WebSocket` in the page.** Was the top gap in both senses: a socket-driven
   app loaded, executed and then silently did nothing, while `typeof WebSocket ===
   'undefined'` separated us from every browser since 2011 in one line. Now real, per
@@ -229,8 +231,7 @@ Move to native (Rust):
   Tested against an in-process echo server (open → send → echo → server push →
   clean 1000) and a dead port (`error` then `close` 1006). Left: `bufferedAmount`,
   overflow backpressure, and CDP `Network.webSocket*` events (P1), then
-  `EventSource`, which is still `undefined` (P2). The sibling engine (obscura) has
-  neither.
+  `EventSource` (P2).
 - 🟡 **Optional real rendering (`render` / `webgl` Cargo features)** — off-screen
   **rasterization** bridged via `natives.rs`, **off by default** so the standard build stays
   light and a feature build produces genuine pixels for harder anti-bot. `render` (2D, done):
@@ -307,13 +308,17 @@ against live Puppeteer and Playwright.
 - ✅ **CSS selector engine** — attribute operators (`^= $= *= ~= |= =`) parse correctly,
   and `matches()`/`closest()` honor descendant/child combinators (right-to-left match with
   backtracking) instead of testing only the rightmost compound. `querySelector`/`All`
-  already handled combinators. Regression-tested. (Sibling `+`/`~` and `:pseudo` classes
-  still unimplemented.)
+  already handled combinators. Regression-tested. Sibling combinators, structural and
+  state pseudo-classes, `:is()`/`:where()`/`:not()`/`:has()` followed.
 - ✅ **`document.write` / `writeln`** — insert parsed markup at the calling script's
   position (`document.currentScript` tracked per script), so the classic
   `<script>document.write(x)</script>` idiom populates in place instead of no-op'ing.
-  (Dynamically written `<script>` tags are inserted but not executed.)
-- ⬜ **`window`-targeted `DOMContentLoaded`** and a more complete event path.
+  A `<script>` written this way runs.
+- ✅ **The event path as in the DOM spec.** Listener options (`once`, `passive`,
+  `signal`, `handleEvent`), one listener per callback, removal during dispatch;
+  `DOMContentLoaded` reaches a window listener once, by bubbling from the document; an
+  uncaught error is one trusted `error` event and `window.onerror` gets its five
+  arguments; `MessagePort`, `BroadcastChannel` and `WebSocket` dispatch real events.
 - 🟡 **Playwright compatibility** (`chromium.connectOverCDP`) — the read *and* interaction
   surface works: `newPage`, `goto`, `evaluate` (with args), `$eval`/`$$eval`, `getAttribute`,
   `textContent`, `content`, `count`, `waitForSelector` (incl. default `visible`), `isVisible`,
@@ -388,15 +393,18 @@ ceiling.
 - ⬜ **Enforce per-host / per-proxy / global connection limits** in the network layer.
 - ⬜ **Context recycling & isolate churn** under sustained 100–1000 concurrent load.
 - ⬜ **Navigation task queue + per-proxy concurrency caps** with fair scheduling.
-- ⬜ Settle fetches dropped past the per-navigation cap instead of leaving promises pending.
+- ✅ No fetch is dropped past a per-round cap: a round's requests all go out, in
+  batches, and each answer reaches the page as it arrives.
 
 ## Performance: lighter and faster than Chrome
 
 The goal: on the same machine, every page nokk loads costs less memory **and is ready
 sooner** than in Chrome 151. Memory is already ahead; speed is not, on heavy pages.
 
-Baseline, October 2026, 8-core Linux, median of three runs. Peak PSS of the whole process
-tree (Chrome counts only its own processes) and wall time to a loaded page:
+Baseline, early October 2026 (before the work below), 8-core Linux, median of three runs.
+Peak PSS of the whole process tree (Chrome counts only its own processes) and wall time to
+a loaded page. To be measured again on an idle machine; the committed benchmark below will
+produce it.
 
 | Page | nokk memory | Chrome memory | nokk time | Chrome time |
 |---|---|---|---|---|
@@ -416,31 +424,52 @@ tree (Chrome counts only its own processes) and wall time to a loaded page:
   layer ends. A Cloudflare interstitial solve peaks at ~400 MB (Chrome ~720 MB).
 - ✅ **Heavy pages keep styles between layout passes**, collect under memory pressure, and
   spare frames follow demand (a large Elementor page: live heap 197 → 128 MB).
+- ✅ **No runaway allocation on facebook.com / instagram.com.** The layout memo stored a
+  subtree's nodes with duplicates, doubling at each flex level. Held open for 40 s, both
+  pages now stay flat at ~320 MB and drop to ~240 MB once idle.
+- ✅ **CSS rules cost nothing until read.** A rule keeps its source text; its
+  declarations, selector and `cssText` are built on first use, and rules and sheets
+  carry no own properties (as in Chrome). GitHub's 15,000 rules: 0.6 s → 0.09 s.
 - ⬜ **Lazy interfaces, as in Blink.** Build an interface's prototype and its members on
   first access rather than all ~1000 at context creation; the floor now is ~110 bytes per
   member function. Target: under 2 MB per context.
 - ⬜ **Per-page heap on heavy pages** (target: half of Chrome's): DOM nodes as fewer JS
-  objects, CSS rule objects out of dictionary mode, subresource bodies not kept after
-  use, script sources dropped once compiled.
-- ⬜ **Runaway allocation on facebook.com / instagram.com**: after load a page timer grows
-  the heap by ~100 MB every 60 ms of live data. Find and fix the loop.
+  objects, subresource bodies not kept after use, script sources dropped once compiled.
 - ⬜ **Backpressure**: new contexts wait while the machine is low on memory instead of
   pushing it into the OOM killer.
 
 ### Speed
 
-- ⬜ **Layout without thrashing.** A script that writes a style and reads a height in a
-  loop gets a full relayout per read; azure.microsoft.com spends half a minute there.
-  Lay out only the dirty subtree and reuse boxes that did not change.
-- ⬜ **`:has()` invalidation.** Any `:has()` rule now drops every cascade at each style
-  pass (azure: 23,000 rules, 108 with `:has`). Invalidate only when a mutation touches
-  something a `:has` argument can match. Measured: 65 s → 44 s on azure from this alone.
-- ⬜ **Faster cascade.** Index rules by id, class and tag; share computed style between
-  siblings with the same classes and parent, as Blink does.
-- ⬜ **Wikipedia in 5.4 s vs 1.6 s**: profile and fix the main cost before anything else
-  on this list is called done.
-- ⬜ **`window.length` / `frames[i]`** walk the whole DOM on each read (jQuery reads
-  `window.length` often); keep a live list of frames.
+Done:
+- ✅ **Layout kept between passes.** A mutation marks its subtree dirty and only that is
+  laid out again; subtrees move by offsets settled once per pass instead of being copied
+  at every level. Wikipedia: a mutation plus layout 2.6 s → 13–42 ms, a full layout
+  2.9 s → 1 s.
+- ✅ **`:has()` invalidation.** A mutation restyles only the anchors a `:has()` argument
+  can match, keyed by tag, class, id and attribute (azure.microsoft.com: full drops per
+  pass 43 → 2).
+- ✅ **Rule index.** Rules are bucketed by the id, class, tag or attribute of their
+  rightmost compound, `:is()`/`:where()` by their arguments' keys; elements alike in tag,
+  id, classes and attribute names share one candidate list; an ancestor Bloom filter
+  rejects most of the rest. Computed style is live and lazy (values on read, layout only
+  for sizes).
+- ✅ **`window.length` / `frames[i]`** read a live list of frames (20,000 reads:
+  3973 ms → 1 ms).
+- ✅ **The engine reads node fields directly.** Its own style, selector and layout code went
+  through the page-facing accessors (with their brand checks): 5.6 million calls per
+  GitHub load, now 0.18 million.
+- ✅ **Requests go out when asked.** A round's requests leave before its scripts and
+  `import()` chunks, requests queued while the document's scripts run leave between them,
+  and `import()` roots load in parallel.
+- ✅ **IndexedDB in Rust, timers in a heap, messages as engine tasks** (10,000 port
+  messages in 35 ms, were 2,000 in 11.5 s).
+
+Open:
+- ⬜ **Share computed style between siblings** with the same classes and parent, as
+  Blink does. The cascade is now the main cost on heavy pages (~0.25 ms per element).
+- ⬜ **Style, selectors and layout in Rust.** They run in JS on one thread today; native
+  data structures and parallel style would close most of the gap to Chrome on heavy
+  pages. A large change, planned after the current release line settles.
 - ⬜ **A committed benchmark**: `tools/bench` with fixed pages, nokk against Chrome on
   the same machine, memory and time, run for every release; the README table comes
   from it.
@@ -452,23 +481,29 @@ tree (Chrome counts only its own processes) and wall time to a loaded page:
   Chrome are in [Performance](#performance-lighter-and-faster-than-chrome).
 - 🟡 Live challenge check: [`tools/cf-check.sh`](tools/cf-check.sh) runs the five public
   Cloudflare targets and prints a verdict, time and final title for each.
+- 🟡 Anti-bot corpus: 126 public sites across 15 categories, nokk against headless Chrome
+  and curl from the same IP (a page passes at 15 KB of real content without a vendor
+  gate). The harness is not in the repository yet.
+- ✅ The whole test suite passes on Linux x64 (every push), and on Linux arm64, macOS on
+  Apple Silicon and Windows x64 (on build and dependency changes, and on demand).
 - ⬜ A fixture-based WAF-challenge test suite (offline replay of real challenge pages).
 - ⬜ Load test: sustained thousand-context throughput and tail latency.
 
 ## Packaging & release (Phase 9)
 
 Already shipping:
-- 🟡 Prebuilt Linux binary + Docker image (`ghcr.io`), built by the tag-triggered
-  [release workflow](.github/workflows/release.yml). (macOS/Windows binaries: planned.)
+- ✅ Prebuilt binaries for Linux x64 and arm64, macOS on Apple Silicon and Windows x64, a
+  Linux build with real canvas/WebGL pixels, and Docker images (`ghcr.io`), built by the
+  tag-triggered [release workflow](.github/workflows/release.yml).
 
 > ⚠️ **RC dependency.** After the Chrome-emulation bump 137→148 (needed for `cf_clearance`
 > replay), the workspace depends on **release-candidate** crates: `wreq = "6.0.0-rc.29"` and
 > `wreq-util = "3.0.0-rc.14"` (wreq-util 2.x capped at Chrome 137). Prebuilt-binary/Docker
 > releases are fine (they bundle the locked versions), but **move to wreq 6.0 stable before a
 > crates.io publish or a stable release tag** — then re-run build/test/clippy for any final
-> API drift. Checked 2026-10-02: no stable 6.0 yet (latest `6.0.0-rc.31`, wreq-util
-> `3.0.0-rc.14`); a move to another RC would gain nothing and risks the TLS fingerprint,
-> which matches Chrome 151 today.
+> API drift. Checked 2026-10-12: no stable 6.0 yet (latest `6.0.0-rc.31`); a move to
+> another RC would gain nothing and risks the TLS fingerprint, which matches Chrome 151
+> today.
 
 ### Distribution channels
 
@@ -493,7 +528,8 @@ value-to-effort:
   matching GitHub Release asset) and exposes `launch(opts)` → `server.wsEndpoint` for
   `puppeteer.connect` / `chromium.connectOverCDP`, plus `npx nokk` to run the server and a
   `.d.ts`. `launch({ autoSolve })` and `solveChallenge(page)` / `challengeState(page)` take
-  Cloudflare challenges on (Puppeteer page, Playwright page or a raw CDP session). Remaining: macOS/Windows binaries for those platforms (Linux x64 only today).
+  Cloudflare challenges on (Puppeteer page, Playwright page or a raw CDP session). Binaries
+  for Linux x64/arm64, macOS on Apple Silicon and Windows x64.
 - 🟡 **PyPI** (`pip`) — **published**: [`pip install nokk`](https://pypi.org/project/nokk/)
   works (name claimed, published on every `v*` tag by
   [`python-wheels.yml`](.github/workflows/python-wheels.yml), which syncs the PEP 440 version
@@ -508,8 +544,8 @@ value-to-effort:
   bullseye ([`.github/bullseye-build.Dockerfile`](.github/bullseye-build.Dockerfile)) —
   manylinux_2_31, glibc floor 2.30 — and published on tag; only the very first release went out as a
   manual `twine upload`. Native PyO3 bindings are
-  a heavier follow-up with unclear benefit (the interface is CDP). macOS/Windows wheels wait
-  on those binaries.
+  a heavier follow-up with unclear benefit (the interface is CDP). Wheels for Linux
+  x64/arm64, macOS on Apple Silicon and Windows x64.
 - 🟡 **MCP server** (`nokk[mcp]`) — nokk as a [Model Context Protocol](https://modelcontextprotocol.io)
   stdio server (`python -m nokk.mcp`), so an AI agent (Claude Desktop/Code, …)
   browses through the stealth engine instead of a headful browser anti-bots flag. A minimal
@@ -524,13 +560,11 @@ value-to-effort:
   nokk` fetches the prebuilt binary instead of compiling. Needs the release-artifact
   naming `binstall` expects.
 - ⬜ **Docker Hub** mirror of the GHCR images (wider discovery than GHCR alone).
-- ⬜ **Homebrew** tap/formula (macOS/Linux CLI): `brew install nokk` — after macOS binaries
-  exist.
+- ⬜ **Homebrew** tap/formula (macOS/Linux CLI): `brew install nokk` (the macOS binary is
+  in every release).
 - ⬜ **AUR / Debian** packaging — lower priority, community-driven.
 
-Cross-cutting prerequisites: macOS + Windows prebuilt binaries in the release workflow
-(most non-Docker channels need them), and a stable CLI/endpoint contract the wrappers can
-depend on.
+Cross-cutting prerequisite: a stable CLI/endpoint contract the wrappers can depend on.
 
 - ⬜ Getting-started guide (README expansion + per-channel quickstarts).
 

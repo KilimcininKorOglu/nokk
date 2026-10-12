@@ -80,22 +80,14 @@ So: **Rust owns** the connection, the frame queues, and the lifecycle.
 `[native code]` masking — where iteration is cheap and the masking machinery
 already lives.
 
-### What the sibling project does (nothing — check it anyway)
+### Why this is a design problem here
 
-[obscura](https://github.com/h4ckf0r0day/obscura), the closest comparable engine,
-has **no page-level `WebSocket` either**: no `WebSocket` in its `bootstrap.js`, no
-`op_ws*` in its ops table, no `deno_websocket` extension, and `tokio-tungstenite`
-appears only for its own CDP server — exactly our situation. So there is nothing
-to borrow here, and shipping it makes nokk the first of the two to have it.
-
-Their runtime is worth noting anyway, because it explains why this is cheaper for
-them than for us: obscura is built on **`deno_core`**, so JS awaits Rust directly
-(`await Deno.core.ops.op_fetch_url(...)`, `#[op2(async)]` on the Rust side) and the
-event loop is a real futures executor. A long-lived socket there is an extension
-with an async op and a resource table entry. We drive rusty_v8 ourselves with a
-turn-based pump, which buys the fine-grained fairness and watchdog control our
-concurrency story depends on — and is precisely what makes server-push a design
-problem rather than a library call. That tradeoff is the next section.
+Engines built on `deno_core` get this almost for free: JS awaits Rust directly and the
+event loop is a real futures executor, so a long-lived socket is an extension with an
+async op and a resource table entry. We drive rusty_v8 ourselves with a turn-based
+pump, which buys the fine-grained fairness and watchdog control our concurrency story
+depends on — and is precisely what makes server-push a design problem rather than a
+library call. That tradeoff is the next section.
 
 ## The actual hard part: the event loop
 
