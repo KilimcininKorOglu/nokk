@@ -468,10 +468,29 @@ Done:
   and `import()` roots load in parallel.
 - ✅ **IndexedDB in Rust, timers in a heap, messages as engine tasks** (10,000 port
   messages in 35 ms, were 2,000 in 11.5 s).
+- ✅ **Less matching per element.** The ancestor filter holds tags and attribute names as
+  well as ids and classes (1024 bits) and reads ancestors past `+`/`~`; rules that cannot
+  match here (pseudo-elements, states the engine never has) are no candidates. GitHub:
+  rules passing the filter 161,000 → 68,000 per load, matched set unchanged.
+- ✅ **Style sharing between alike siblings**: one cascade for siblings with the same tag,
+  id, classes and attributes when the few rules that could tell them apart (position,
+  `+`/`~`, `:empty`, focus, form state) agree for each of them.
+- ✅ **Targeted restyles.** An added or removed sheet restyles only the elements its rules
+  are keyed by (as Blink's rule-set invalidation), unless a rule has no key or `:has()`;
+  a focus change restyles the elements losing and gaining focus (it restyled nothing
+  before: `input:focus` did not apply after `focus()`).
+- ✅ **`compareDocumentPosition` by ancestor chains** instead of a walk over the whole
+  tree per call (jQuery's sort on Wikipedia was quadratic: 0.3 s of a load).
 
 Open:
-- ⬜ **Share computed style between siblings** with the same classes and parent, as
-  Blink does. The cascade is now the main cost on heavy pages (~0.25 ms per element).
+- ⬜ **Matching is still the cascade's main cost** (GitHub ~0.08 ms per element, Chrome
+  well under that); siblings differ in attribute values often enough (links) that
+  sharing reaches a few percent of elements. Next: a matched-properties cache (one
+  computed result per matched rule set and parent), then native matching.
+- ⬜ **Two cascade differences found on the way, both older than this work:** a percentage
+  `max-width` on a GitHub image differs between an incremental and a full style pass,
+  and a sheet inserted before the others with only `@layer b, a;` reorders layers here
+  but not in Chrome 151 (which keeps the old order until reload).
 - ⬜ **Style, selectors and layout in Rust.** They run in JS on one thread today; native
   data structures and parallel style would close most of the gap to Chrome on heavy
   pages. A large change, planned after the current release line settles.

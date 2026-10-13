@@ -10258,6 +10258,74 @@ mod tests {
         assert_eq!(out["css"], serde_json::json!(["2px", "5px", "4px", "3px"]), "{out}");
     }
 
+    /// Alike siblings share a cascade only where no rule can tell them apart
+    /// (position, `+`, `:empty`, attribute values, focus); a focus change and
+    /// an added or removed sheet restyle what they reach; `compareDocumentPosition`
+    /// orders by ancestor chains. Values from Chrome 151 on the same markup.
+    #[tokio::test]
+    async fn shared_styles_focus_and_sheet_changes_match_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<html><head><style>
+               li { color: rgb(0, 0, 0); }
+               li:first-child { color: rgb(255, 0, 0); }
+               li:nth-child(3) { color: rgb(0, 128, 0); }
+               li + li + li + li { margin-left: 4px; }
+               .x li:last-child { padding-left: 2px; }
+               ul > :empty { margin-top: 1px; }
+               [data-k=a] { margin-right: 3px; }
+               input:focus { margin-left: 9px; }
+             </style></head><body>\
+             <ul class=x><li>a</li><li>b</li><li>c</li><li>d</li><li></li></ul>\
+             <div><span data-k=a>s</span><span data-k=b>s</span><input id=i><input id=j></div>\
+             <p id=late>late</p></body></html>",
+        )
+        .await
+        .unwrap();
+        let out = probe(
+            &ctx,
+            "(() => {
+               const cs = (e, p) => getComputedStyle(e).getPropertyValue(p);
+               const $ = (id) => document.getElementById(id);
+               const r = {};
+               r.li = [...document.querySelectorAll('li')].map((e) => [cs(e, 'color'), cs(e, 'margin-left'), cs(e, 'padding-left'), cs(e, 'margin-top')].join(' '));
+               r.sp = [...document.querySelectorAll('span')].map((e) => cs(e, 'margin-right')).join(' ');
+               $('i').focus();
+               r.focus = [cs($('i'), 'margin-left'), cs($('j'), 'margin-left')].join(' ');
+               $('j').focus();
+               r.focus2 = [cs($('i'), 'margin-left'), cs($('j'), 'margin-left')].join(' ');
+               const late = $('late');
+               r.late = [cs(late, 'color')];
+               const s1 = document.createElement('style'); s1.textContent = '#late { color: rgb(3, 4, 5); }'; document.head.appendChild(s1);
+               r.late.push(cs(late, 'color'));
+               s1.remove();
+               r.late.push(cs(late, 'color'));
+               const li = document.querySelectorAll('li');
+               r.pos = [li[0].compareDocumentPosition(li[3]), li[3].compareDocumentPosition(li[0]), document.body.compareDocumentPosition(li[2]), li[2].firstChild.compareDocumentPosition($('i'))];
+               return __ptJSON.stringify(r); })()",
+        )
+        .await;
+        assert_eq!(
+            out["li"],
+            serde_json::json!([
+                "rgb(255, 0, 0) 0px 0px 0px",
+                "rgb(0, 0, 0) 0px 0px 0px",
+                "rgb(0, 128, 0) 0px 0px 0px",
+                "rgb(0, 0, 0) 4px 0px 0px",
+                "rgb(0, 0, 0) 4px 2px 1px"
+            ]),
+            "{out}"
+        );
+        assert_eq!(out["sp"], "3px 0px", "{out}");
+        assert_eq!(out["focus"], "9px 0px", "{out}");
+        assert_eq!(out["focus2"], "0px 9px", "{out}");
+        assert_eq!(out["late"], serde_json::json!(["rgb(0, 0, 0)", "rgb(3, 4, 5)", "rgb(0, 0, 0)"]), "{out}");
+        assert_eq!(out["pos"], serde_json::json!([4, 2, 20, 4]), "{out}");
+    }
+
     /// Modern CSS values: `var()` with fallback, registered custom properties,
     /// `calc()`/`min()`/`clamp()`, `dvh`, root `rem`, `box-sizing: inherit` and grid
     /// with `gap`. Numbers from Chrome 151 on the same markup (1920x942 window).
