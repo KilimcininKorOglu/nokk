@@ -10224,6 +10224,40 @@ mod tests {
         assert_eq!(out["d"], serde_json::json!(["rgba(255, 0, 0, 0.5)", "Arial, \"Helvetica Neue\", sans-serif"]), "{out}");
     }
 
+    /// Selector names as Chrome reads them, in queries and in style sheets: hex
+    /// escapes with their trailing space (`#\31 23`), escaped punctuation,
+    /// non-ASCII names, the `i` flag and namespaces. Counts from Chrome 151.
+    #[tokio::test]
+    async fn selector_names_escapes_and_flags_match_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<html><head><style>
+               #\\31 23 { padding-left: 2px; }
+               .a\\:b { margin-left: 5px; }
+               .\\61 \\:b { margin-top: 4px; }
+               .\u{43f}\u{440} { margin-right: 3px; }
+             </style></head><body><div id=123 class=\"a:b \u{43f}\u{440} x-y_z\" data-k=VaL>\
+             <span class=c1>t</span><p id=q>p</p></div></body></html>",
+        )
+        .await
+        .unwrap();
+        let out = probe(
+            &ctx,
+            "(() => {
+               const qs = ['#\\\\31 23', '.a\\\\:b', '.\u{43f}\u{440}', '.x-y_z', '[data-k=\"val\" i]', '[data-k=\"val\"]',
+                 '*|div', '*|span.c1', 'div > .c1 + p#q', ':is(.c1, #q)', '.\\\\61 \\\\:b', '.c\\\\31', 'div.-x'];
+               const n = qs.map((q) => { try { return document.querySelectorAll(q).length; } catch (e) { return e.name; } });
+               const cs = getComputedStyle(document.querySelector('div'));
+               return __ptJSON.stringify({ n, css: [cs.paddingLeft, cs.marginLeft, cs.marginTop, cs.marginRight] }); })()",
+        )
+        .await;
+        assert_eq!(out["n"], serde_json::json!([1, 1, 1, 1, 1, 0, 1, 1, 1, 2, 1, 1, 0]), "{out}");
+        assert_eq!(out["css"], serde_json::json!(["2px", "5px", "4px", "3px"]), "{out}");
+    }
+
     /// Modern CSS values: `var()` with fallback, registered custom properties,
     /// `calc()`/`min()`/`clamp()`, `dvh`, root `rem`, `box-sizing: inherit` and grid
     /// with `gap`. Numbers from Chrome 151 on the same markup (1920x942 window).

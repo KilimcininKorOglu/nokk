@@ -414,8 +414,10 @@ Chrome 151 headless. The early-October baseline is in brackets.
 | github.com | 281 MB (200) | 525 MB | 4.6 s (5.5) | 2.5 s |
 | bbc.com/news | 294 MB (395) | 624 MB | 9.0 s (10.6) | 5.9 s |
 
-Memory is still well under Chrome everywhere, but Wikipedia and GitHub gained 80–90 MB
-since the baseline; the cause is not measured yet and is the next memory item.
+Memory is still well under Chrome everywhere. Wikipedia and GitHub gained 80–90 MB on
+the baseline: the load event now waits for fonts, as in Chrome, so the cascade is built
+during load (the early-October build never built it on GitHub). That cost has since been
+cut by 25–50 MB per page (below).
 
 ### Memory
 
@@ -476,8 +478,12 @@ Open:
 - ✅ **A committed benchmark**: [`tools/bench/bench.py`](tools/bench/bench.py) loads fixed
   pages in nokk and Chrome on the same machine and prints the table above. Left: run it
   for every release.
-- ⬜ **Why Wikipedia and GitHub take 80–90 MB more than in early October**, and bring it
-  back down.
+- ✅ **Why Wikipedia and GitHub took 80–90 MB more than in early October.** The cascade
+  is now built during load. Its parse kept the parser's scope alive in every selector
+  test, names were built one character at a time (chains of cons strings), pushed-to
+  arrays kept room for 17 entries, and moved layout boxes were copied into dictionary
+  mode. Live heap after a GitHub load 98 → 66 MB, Wikipedia 107 → 92 MB; peak
+  296 → 248 MB on GitHub, 272 → 246 MB on BBC, 333 → 317 MB on Wikipedia, same time.
 
 ## Testing & benchmarks (Phase 8)
 

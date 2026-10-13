@@ -4830,6 +4830,7 @@
   // pseudo-classes (chess.com puts all its variables in `:root { … }`).
   const __selCache = new Map();
   const __SEL_NEVER = () => false;
+  const __SEL_ANY = () => true;
 
   /// Selector list -> top-level parts (commas inside parens, brackets and
   /// quotes do not split).
@@ -4850,23 +4851,58 @@
     return out.map((x) => __s_trim(x));
   }
 
+  // Name code points: [A-Za-z0-9_-] and everything from U+00A0 up.
+  const __selNameCh = (c) => c >= 0xa0 || (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c === 95 || c === 45;
+  // Match tests are built here, outside the parser: a closure made inside it
+  // would keep the whole parse scope alive for every rule.
+  const __tLocal = (n) => (e) => e.__ptLocal === n;
+  const __tTag = (low, n) => (e) => e.__ptLocal === low || (e.__ptNS && e.__ptNS !== 'http://www.w3.org/1999/xhtml' && e.__ptLocal === n);
+  const __tId = (n) => (e) => e.id === n;
+  const __tClass = (n) => (e) => { const set = __ptClassSet(e); return set !== null && set.has(n); };
+  const __tScope = (e, ctx) => !!(ctx && ctx.scope) && e === ctx.scope;
+  const __tAll = (tests) => {
+    const n = tests.length;
+    return (e, ctx) => { for (let k = 0; k < n; k++) if (!tests[k](e, ctx)) return false; return true; };
+  };
+  function __tAttr(nm, name, op, want, ci) {
+    return (e) => {
+      let a = __ptGetA(e, nm);
+      if (a == null && nm !== name) a = __ptGetA(e, name);
+      if (a == null) return false;
+      if (!op) return true;
+      if (ci) a = __s_toLowerCase(a);
+      switch (op) {
+        case '=': return a === want;
+        case '^=': return want !== '' && __s_startsWith(a, want);
+        case '$=': return want !== '' && __s_endsWith(a, want);
+        case '*=': return want !== '' && __s_indexOf(a, want) >= 0;
+        case '~=': return want !== '' && !/\s/.test(want) && __s_indexOf(__s_split(a, /[\t\n\f\r ]+/), want) >= 0;
+        case '|=': return a === want || __s_startsWith(a, want + '-');
+      }
+      return false;
+    };
+  }
+
   function __selParse(src) {
     let i = 0;
     const s = String(src);
     const ws = () => { const a = i; while (i < s.length && /\s/.test(s[i])) i++; return i > a; };
-    const identStart = (c) => c != null && (/[A-Za-z_ -￿-]/.test(c) || c === '\\');
+    const identStart = (c) => c != null && (c === '\\' || (__selNameCh(__s_charCodeAt(c, 0)) && !/[0-9]/.test(c)));
+    // Runs of plain characters are sliced, not appended one by one: a name
+    // built char by char stays a chain of cons strings as long as the rule.
     const ident = () => {
-      let out = '';
+      let out = '', a = i;
       while (i < s.length) {
-        const c = s[i];
-        if (c === '\\') {
+        if (s[i] === '\\') {
+          out += __s_slice(s, a, i);
           const hex = /^[0-9a-fA-F]{1,6}\s?/.exec(__s_slice(s, i + 1, i + 8));
           if (hex) { out += String.fromCodePoint(parseInt(hex[0], 16) || 0xfffd); i += 1 + hex[0].length; }
           else { out += s[i + 1] || ''; i += 2; }
-        } else if (/[\w -￿-]/.test(c)) { out += c; i++; }
+          a = i;
+        } else if (__selNameCh(__s_charCodeAt(s, i))) i++;
         else break;
       }
-      return out;
+      return out === '' ? __s_slice(s, a, i) : out + __s_slice(s, a, i);
     };
     const fail = () => { throw new SyntaxError('selector'); };
     // Paren content as a string, respecting nesting and quotes.
@@ -4893,7 +4929,7 @@
         const c = s[i];
         if (c === '*') {
           i++; any = true;
-          if (s[i] === '|') { i++; if (s[i] === '*') i++; else { const n = __s_toLowerCase(ident()); spec[2]++; tests.push((e) => e.__ptLocal === n); } }
+          if (s[i] === '|') { i++; if (s[i] === '*') i++; else { spec[2]++; tests.push(__tLocal(__s_toLowerCase(ident()))); } }
           continue;
         }
         if (c === '|') { i++; continue; }
@@ -4903,13 +4939,13 @@
           if (s[i] === '|' && s[i + 1] !== '=') { i++; if (s[i] === '*') { i++; any = true; continue; } n = ident(); }
           const low = __s_toLowerCase(n);
           spec[2]++; any = true;
-          tests.push((e) => e.__ptLocal === low || (e.__ptNS && e.__ptNS !== 'http://www.w3.org/1999/xhtml' && e.__ptLocal === n));
+          tests.push(__tTag(low, n));
           continue;
         }
-        if (c === '#') { i++; const n = ident(); if (!n) fail(); spec[0]++; toks.push('i' + n); tests.push((e) => e.id === n); any = true; continue; }
+        if (c === '#') { i++; const n = ident(); if (!n) fail(); spec[0]++; toks.push('i' + n); tests.push(__tId(n)); any = true; continue; }
         if (c === '.') {
           i++; const n = ident(); if (!n) fail(); spec[1]++; toks.push('c' + n);
-          tests.push((e) => { const set = __ptClassSet(e); return set !== null && set.has(n); });
+          tests.push(__tClass(n));
           any = true; continue;
         }
         if (c === '[') {
@@ -4937,22 +4973,7 @@
           const nm = __s_toLowerCase(name);
           const ci = flag === 'i';
           const want = ci ? __s_toLowerCase(val) : val;
-          tests.push((e) => {
-            let a = __ptGetA(e, nm);
-            if (a == null && nm !== name) a = __ptGetA(e, name);
-            if (a == null) return false;
-            if (!op) return true;
-            if (ci) a = __s_toLowerCase(a);
-            switch (op) {
-              case '=': return a === want;
-              case '^=': return want !== '' && __s_startsWith(a, want);
-              case '$=': return want !== '' && __s_endsWith(a, want);
-              case '*=': return want !== '' && __s_indexOf(a, want) >= 0;
-              case '~=': return want !== '' && !/\s/.test(want) && __s_indexOf(__s_split(a, /[\t\n\f\r ]+/), want) >= 0;
-              case '|=': return a === want || __s_startsWith(a, want + '-');
-            }
-            return false;
-          });
+          tests.push(__tAttr(nm, name, op, want, ci));
           continue;
         }
         if (c === ':' && s[i + 1] === ':') {
@@ -4973,13 +4994,12 @@
           tests.push(r.test); any = true;
           continue;
         }
-        if (c === '&') { i++; any = true; spec[1]++; tests.push((e, ctx) => !!(ctx && ctx.scope) && e === ctx.scope); continue; }
+        if (c === '&') { i++; any = true; spec[1]++; tests.push(__tScope); continue; }
         break;
       }
       if (!any) fail();
       const n = tests.length;
-      const test = n === 0 ? () => true : n === 1 ? tests[0]
-        : (e, ctx) => { for (let k = 0; k < n; k++) if (!tests[k](e, ctx)) return false; return true; };
+      const test = n === 0 ? __SEL_ANY : n === 1 ? tests[0] : __tAll(tests.slice());
       return { test, spec, toks };
     };
     // Complex selector; `relative` is for `:has()`, which may start with a
@@ -5007,7 +5027,7 @@
       // reached from it through descendant and child combinators only.
       const need = [];
       for (let k = comps.length - 2; k >= 0 && (combs[k] === ' ' || combs[k] === '>'); k--) need.push(...toks[k]);
-      return { comps, combs, spec, lead, needH: need.length ? need.map(__bloomHash) : null };
+      return { comps: comps.slice(), combs: combs.slice(), spec, lead, needH: need.length ? need.map(__bloomHash) : null };
     };
     const list = (relative) => {
       const out = [];
@@ -5018,7 +5038,7 @@
         break;
       }
       if (i < s.length) fail();
-      return out;
+      return out.slice();
     };
     return list(false);
   }
@@ -5316,7 +5336,9 @@
   // `:nth-*` is an+b, `:has()` non-empty; two combinators in a row and an
   // unknown namespace prefix are errors; an unclosed `[` at the end is closed
   // implicitly.
-  const __SEL_IDENT = /^(?:-?(?:[_a-zA-Z\u00A0-\uFFFF]|\\[^\n]|\\$)(?:[-_a-zA-Z0-9\u00A0-\uFFFF]|\\[^\n]|\\$)*|--(?:[-_a-zA-Z0-9\u00A0-\uFFFF]|\\[^\n]|\\$)*)/;
+  // An escape is up to six hex digits and one optional white space (`#\31 23`
+  // is id "123"), else any one character.
+  const __SEL_IDENT = /^(?:-?(?:[_a-zA-Z\u00A0-\uFFFF]|\\[0-9a-fA-F]{1,6}[ \t\n\r\f]?|\\[^\n]|\\$)(?:[-_a-zA-Z0-9\u00A0-\uFFFF]|\\[0-9a-fA-F]{1,6}[ \t\n\r\f]?|\\[^\n]|\\$)*|--(?:[-_a-zA-Z0-9\u00A0-\uFFFF]|\\[0-9a-fA-F]{1,6}[ \t\n\r\f]?|\\[^\n]|\\$)*)/;
   const __SEL_PC_PLAIN = new Set(['-webkit-any-link', '-webkit-autofill', '-webkit-drag', '-webkit-full-page-media', '-webkit-full-screen', '-webkit-full-screen-ancestor', '-webkit-scrollbar', 'active', 'active-view-transition', 'any-link', 'autofill', 'checked', 'corner-present', 'current', 'decrement', 'default', 'defined', 'disabled', 'double-button', 'empty', 'enabled', 'end', 'first-child', 'first-of-type', 'focus', 'focus-visible', 'focus-within', 'fullscreen', 'future', 'horizontal', 'host', 'hover', 'in-range', 'increment', 'indeterminate', 'interest-source', 'interest-target', 'invalid', 'last-child', 'last-of-type', 'link', 'modal', 'no-button', 'only-child', 'only-of-type', 'open', 'optional', 'out-of-range', 'past', 'picture-in-picture', 'placeholder-shown', 'popover-open', 'read-only', 'read-write', 'required', 'root', 'scope', 'single-button', 'start', 'target', 'target-current', 'user-invalid', 'user-valid', 'valid', 'vertical', 'visited', 'window-inactive', 'xr-overlay']);
   const __SEL_PC_FUNC = new Set(['active-view-transition-type', 'dir', 'has', 'host', 'host-context', 'is', 'lang', 'not', 'nth-child', 'nth-last-child', 'nth-last-of-type', 'nth-of-type', 'state', 'where', '-webkit-any']);
   const __SEL_PE_PLAIN = new Set(['after', 'backdrop', 'before', 'checkmark', 'column', 'cue', 'details-content', 'file-selector-button', 'first-letter', 'first-line', 'grammar-error', 'marker', 'picker-icon', 'placeholder', 'scroll-marker', 'scroll-marker-group', 'search-text', 'selection', 'spelling-error', 'target-text', 'view-transition', '-webkit-calendar-picker-indicator', '-webkit-color-swatch', '-webkit-color-swatch-wrapper', '-webkit-date-and-time-value', '-webkit-datetime-edit', '-webkit-datetime-edit-ampm-field', '-webkit-datetime-edit-day-field', '-webkit-datetime-edit-fields-wrapper', '-webkit-datetime-edit-hour-field', '-webkit-datetime-edit-millisecond-field', '-webkit-datetime-edit-minute-field', '-webkit-datetime-edit-month-field', '-webkit-datetime-edit-second-field', '-webkit-datetime-edit-text', '-webkit-datetime-edit-week-field', '-webkit-datetime-edit-year-field', '-webkit-details-marker', '-webkit-file-upload-button', '-webkit-inner-spin-button', '-webkit-input-placeholder', '-webkit-media-controls', '-webkit-media-controls-current-time-display', '-webkit-media-controls-enclosure', '-webkit-media-controls-fullscreen-button', '-webkit-media-controls-mute-button', '-webkit-media-controls-overlay-enclosure', '-webkit-media-controls-overlay-play-button', '-webkit-media-controls-panel', '-webkit-media-controls-play-button', '-webkit-media-controls-time-remaining-display', '-webkit-media-controls-timeline', '-webkit-media-controls-toggle-closed-captions-button', '-webkit-media-controls-volume-slider', '-webkit-media-slider-container', '-webkit-media-slider-thumb', '-webkit-media-text-track-container', '-webkit-media-text-track-display', '-webkit-media-text-track-region', '-webkit-media-text-track-region-container', '-webkit-meter-bar', '-webkit-meter-even-less-good-value', '-webkit-meter-inner-element', '-webkit-meter-optimum-value', '-webkit-meter-suboptimum-value', '-webkit-progress-bar', '-webkit-progress-inner-element', '-webkit-progress-value', '-webkit-resizer', '-webkit-scrollbar', '-webkit-scrollbar-button', '-webkit-scrollbar-corner', '-webkit-scrollbar-thumb', '-webkit-scrollbar-track', '-webkit-scrollbar-track-piece', '-webkit-search-cancel-button', '-webkit-search-decoration', '-webkit-slider-container', '-webkit-slider-runnable-track', '-webkit-slider-thumb', '-webkit-textfield-decoration-container']);
@@ -9648,6 +9670,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       else if (typeof k === 'string') put(k, r);
       else { ix.multi = true; for (const x of k) put(x, r); }
     }
+    // Buckets at their length: a pushed-to array keeps room for 17 entries.
+    for (const [k, l] of ix.keyed) ix.keyed.set(k, l.slice());
+    ix.any = ix.any.slice();
     __ruleIndexes.set(rules, ix);
     return ix;
   }
@@ -9705,7 +9730,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (ix.attrs && el.__ptAttrs) for (const name of el.__ptAttrs.keys()) add('a' + __s_toLowerCase(String(name)));
     if (memoKey !== null) {
       if (!ix.memo || ix.memo.size >= 4096) ix.memo = new Map();
-      ix.memo.set(memoKey, out);
+      const keep = out.slice();
+      ix.memo.set(memoKey, keep);
+      return keep;
     }
     return out;
   }
@@ -10998,6 +11025,21 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // once; what is inside moves when the pass ends (`__layoutSettle`), by the
   // offsets collected on the way down: moving the subtree here copied every
   // box below once per level a move happened on (63% of a Wikipedia layout).
+  // A box moved by (dx, dy), built with the layout literal's shape:
+  // `Object.assign({}, box)` leaves a 23-field copy in dictionary mode, three
+  // times larger and slower to read.
+  function __boxAt(b, dx, dy) {
+    return {
+      x: b.x + dx, y: b.y + dy, w: b.w, h: b.h,
+      cw: b.cw, ch: b.ch, cx: b.cx + dx, cy: b.cy + dy,
+      bx: b.bx, by: b.by, mb: b.mb,
+      mt: b.mt, mr: b.mr, ml: b.ml,
+      line: b.line, inline: b.inline, lineTop: b.lineTop != null ? b.lineTop + dy : b.lineTop, lines: b.lines,
+      asc: b.asc, desc: b.desc,
+      sw: b.sw, sh: b.sh,
+      bar: b.bar,
+    };
+  }
   function __ptShiftBox(el, x, y) {
     const b = el.__ptBox;
     if (!b) return;
@@ -11005,10 +11047,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (!dx && !dy) return;
     // A moved box is a new object: layout results are kept by reference
     // (see `__layoutOne`) and must not change under them.
-    const nb = el.__ptBox = Object.assign({}, b);
-    nb.x += dx; nb.y += dy;
-    nb.cx += dx; nb.cy += dy;
-    if (nb.lineTop != null) nb.lineTop += dy;
+    el.__ptBox = __boxAt(b, dx, dy);
     const off = el.__ptOff;
     if (off) { off[0] += dx; off[1] += dy; } else el.__ptOff = [dx, dy];
   }
@@ -11021,10 +11060,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       let cx = ax, cy = ay;
       const b = node.__ptBox;
       if (b && node.__ptBoxV === __layoutBuilt && (ax || ay)) {
-        const nb = node.__ptBox = Object.assign({}, b);
-        nb.x += ax; nb.y += ay;
-        nb.cx += ax; nb.cy += ay;
-        if (nb.lineTop != null) nb.lineTop += ay;
+        node.__ptBox = __boxAt(b, ax, ay);
       }
       const off = node.__ptOff;
       if (off) { cx += off[0]; cy += off[1]; node.__ptOff = null; }
@@ -11045,7 +11081,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // tells them again exactly as a fresh layout would.
   let __tellLog = [];
   function __ptTellLogged(el, box) {
-    __tellLog.push([el, box && Object.assign({}, box)]);
+    __tellLog.push([el, box && __boxAt(box, 0, 0)]);
     __ptTellFrame(el, box);
   }
   const __on64 = (v) => typeof v === 'number' && Number.isInteger(v * 64) && Math.abs(v) < 2 ** 40;
@@ -11060,10 +11096,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (hit) {
       const dx = originX - hit.ox, dy = originY - hit.oy;
       if (__on64(dx) && __on64(dy)) {
-        for (const [node, box, defH, off] of hit.snap) {
-          node.__ptBox = box;
+        const snap = hit.snap;
+        for (let k = 0; k < snap.length; k += 4) {
+          const node = snap[k], off = snap[k + 3];
+          node.__ptBox = snap[k + 1];
           node.__ptBoxV = __layoutBuilt;
-          node.__ptDefH = defH;
+          node.__ptDefH = snap[k + 2];
           node.__ptOff = off ? [off[0], off[1]] : null;
         }
         // The subtree moves with its root, pending like any other move.
@@ -11087,13 +11125,15 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (seen.has(n)) continue;
       seen.add(n);
       seq.push(n);
-      if (n.__ptBox) snap.push([n, n.__ptBox, n.__ptDefH, n.__ptOff ? [n.__ptOff[0], n.__ptOff[1]] : null]);
+      // Flat (node, box, defH, off) runs: one array per entry instead of five.
+      if (n.__ptBox) snap.push(n, n.__ptBox, n.__ptDefH, n.__ptOff ? [n.__ptOff[0], n.__ptOff[1]] : null);
     }
     if (!mine) __layoutMemo.set(el, (mine = new Map()));
     // Kept across passes now: a few constraint sets per element, not all of
     // them ever seen.
     else if (mine.size >= 8) mine.clear();
-    mine.set(key, { ox: originX, oy: originY, snap, seq, tells });
+    // Copies at their length: a pushed-to array keeps spare room.
+    mine.set(key, { ox: originX, oy: originY, snap: snap.slice(), seq: seq.slice(), tells });
     return ret;
   }
 
