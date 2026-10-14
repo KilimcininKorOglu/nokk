@@ -1187,6 +1187,9 @@
       if (typeof ctor !== 'function') throw __pt_mkErr(TypeError, 'constructor is not a constructor');
       __customs.set(name, ctor);
       const doc = globalThis.document;
+      // `:defined` may now match: style is asked again. Rules added since
+      // the last pass marked it themselves.
+      if (doc && doc.documentElement && __readsDefined(__rules)) __markDirty(doc.documentElement);
       if (doc && doc.documentElement) {
         for (const el of __docTags(doc, name)) __customUpgrade(el, ctor);
       }
@@ -4721,23 +4724,41 @@
     return d;
   };
 
+  // A `style` attribute's declarations as a map, priority kept beside it:
+  // `getPropertyValue` answers without `!important`, `getPropertyPriority`
+  // with it.
+  function __parseStyleText(text) {
+    const m = new Map();
+    for (const part of __s_split(text, ';')) {
+      const i = __s_indexOf(part, ':');
+      if (i < 0) continue;
+      const k = __cssKey(__s_slice(part, 0, i));
+      let v = __s_trim(__s_slice(part, i + 1));
+      const im = /!\s*important\s*$/i.exec(v);
+      if (im) v = __s_trim(__s_slice(v, 0, im.index));
+      if (k) { m.set(k, v); if (im) __cssImp(m).add(k); }
+    }
+    return m;
+  }
+  // Read-only parses for the engine, by attribute text: siblings often carry
+  // the same text. Cleared whole when large.
+  let __styleTextParsed = new Map();
+  function __styleTextMap(text) {
+    let m = __styleTextParsed.get(text);
+    if (m === undefined) {
+      if (__styleTextParsed.size >= 4096) __styleTextParsed = new Map();
+      m = __parseStyleText(text);
+      __styleTextParsed.set(text, m);
+    }
+    return m;
+  }
+
   function makeStyle(el) {
     let cachedText = null, cachedMap = new Map();
     const read = () => {
       const text = String((el && el.getAttribute && __ptGetA(el, 'style')) || '');
       if (text === cachedText) return cachedMap;
-      const m = new Map();
-      for (const part of __s_split(text, ';')) {
-        const i = __s_indexOf(part, ':');
-        if (i < 0) continue;
-        const k = __cssKey(__s_slice(part, 0, i));
-        let v = __s_trim(__s_slice(part, i + 1));
-        // Priority is stored beside the value: `getPropertyValue` answers
-        // without `!important`, `getPropertyPriority` with it.
-        const im = /!\s*important\s*$/i.exec(v);
-        if (im) v = __s_trim(__s_slice(v, 0, im.index));
-        if (k) { m.set(k, v); if (im) __cssImp(m).add(k); }
-      }
+      const m = __parseStyleText(text);
       cachedText = text; cachedMap = m;
       return m;
     };
@@ -9329,9 +9350,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   }
   // An element's inline style as the engine's raw map, or null when it has
   // none (no `style` attribute and the page never touched `.style`).
+  // Without `.style` touched it is the attribute parsed, not a declaration
+  // object (700 own properties) built for the engine's eyes only.
   function __inlineDecls(el) {
-    const s = el.__ptStyle || (__ptHasA(el, 'style') ? el.style : null);
-    if (!s) return null;
+    const s = el.__ptStyle;
+    if (!s) {
+      const t = el.__ptAttrs ? el.__ptAttrs.get('style') : undefined;
+      return t === undefined ? null : __styleTextMap(t);
+    }
     const raw = __declRaw.get(s);
     return raw ? raw() : null;
   }
@@ -9481,6 +9507,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   }
   const __STATE_PSEUDO = /:(checked|indeterminate|valid|invalid|user-valid|user-invalid|in-range|out-of-range|placeholder-shown)\b/i;
   let __styleWorld = '';
+  let __styleDefined = 0;
   let __styleActive = null;
   // At the start of a pass: drop what mutations since the last one reached.
   // What a new rule list changes, as Blink's rule-set invalidation: the keys
@@ -9496,12 +9523,27 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const l = byRule.get(r.rule);
       if (l) l.push(r); else byRule.set(r.rule, [r]);
     }
-    const keys = new Set(), kept = [];
+    const keys = new Set(), kept = [], probe = [];
+    const docEl = __docElement(globalThis.document);
     const note = (r) => {
-      if (__s_indexOf(r.sel, ':has(') >= 0) return false;
-      const k = __ruleKey(r.sel);
-      if (k == null) return false;
-      if (typeof k === 'string') keys.add(k); else for (const x of k) keys.add(x);
+      // `::before`/`::after` restyle their element (their images load with
+      // it); other rules that never match here change nothing.
+      const pm = __PSEUDO_TAIL.exec(r.sel);
+      if (!pm && !__ruleLive(r)) return true;
+      const sel = pm ? (__s_trim(pm[1]) || '*') : r.sel;
+      // The key is the subject's, `:has()` or not: the cascade looks the
+      // rule up by it.
+      const k = __ruleKey(sel);
+      if (k != null) {
+        if (typeof k === 'string') keys.add(k); else for (const x of k) keys.add(x);
+        return true;
+      }
+      // No key (`.a > *`): the elements it matches now, in the document only;
+      // an unkeyed `:has()` could search every subtree.
+      if (r.root !== docEl || probe.length >= 32 || __s_indexOf(sel, ':has(') >= 0) return false;
+      const list = __selCompiled(sel);
+      if (!list) return false;
+      probe.push(list);
       return true;
     };
     for (const r of cur) {
@@ -9524,14 +9566,18 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const p = kept[idx[i - 1] + 1], q = kept[idx[i] + 1];
       if ((p.layer - q.layer || p.order - q.order) >= 0) return null;
     }
+    if (probe.length) keys.__ptProbe = probe;
     return keys;
   }
-  // Elements carrying any of `keys`, in the document and its shadow trees.
+  // Elements carrying any of `keys` or matching a selector of `keys.__ptProbe`,
+  // in the document and its shadow trees.
   function __elementsWithKeys(de, keys) {
     const out = [];
     let attrs = false;
     for (const k of keys) if (k[0] === 'a') { attrs = true; break; }
+    const probe = keys.__ptProbe;
     const has = (e) => {
+      if (probe) for (let i = 0; i < probe.length; i++) { try { if (__selAny(probe[i], e, __CASCADE_CTX)) return true; } catch (x) { return true; } }
       if (keys.has('t' + __s_toLowerCase(String(e.__ptLocal || '')))) return true;
       if (e === de && keys.has('r')) return true;
       const id = __ptGetA(e, 'id');
@@ -9554,6 +9600,22 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return out;
   }
 
+  // 0 when no rule reads `:defined`, 2 when one also reads siblings or
+  // `:has()`, else 1.
+  function __readsDefined(rules) {
+    if (!rules) return 2;
+    if (rules.__ptDefined === undefined) {
+      let v = 0;
+      for (const r of rules) {
+        const t = __s_toLowerCase(String(r.sel));
+        if (__s_indexOf(t, ':defined') < 0) continue;
+        v = 1;
+        if (__s_indexOf(t, ':has(') >= 0 || /[+~]/.test(__s_replace(t, /\[[^\]]*\]/g, ''))) { v = 2; break; }
+      }
+      rules.__ptDefined = v;
+    }
+    return rules.__ptDefined;
+  }
   // Whether a focus change can restyle more than the element and its subtree.
   function __focusReach(rules) {
     if (!rules) return true;
@@ -9579,7 +9641,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const keys = __rulesChanged(__styleRulesSeen, __rules);
       const de = globalThis.document && globalThis.document.documentElement;
       if (!keys || !de) { __styleAllStale = true; why('rules'); }
-      else { why('rulesKeyed'); if (keys.size) ruleRoots = __elementsWithKeys(de, keys); }
+      else { why('rulesKeyed'); if (keys.size || keys.__ptProbe) ruleRoots = __elementsWithKeys(de, keys); }
     } else if (__styleRulesSeen !== __rules) why('rules');
     const HA = __rules && __rules.__ptHas;
     const H = HA && __styleTouched.length && !__styleAllStale ? __hasEffective(HA) : null;
@@ -9588,16 +9650,22 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (H.any) { __styleAllStale = true; why('hasAny'); }
       else {
         const anchors = new Set();
+        // Previous element siblings: the nearest for `+`, all for `~`. A walk
+        // stops at a sibling an earlier one saw (everything before it was
+        // seen too), so each parent's children are read once per pass. By
+        // the engine's child lists, not `previousElementSibling`.
+        const sibSeen = new Set();
         const sibOf = (a) => {
-          // Previous element siblings: the nearest for `+`, up to 64 for `~`.
-          let n = 0;
-          for (let p = a.previousElementSibling; p; p = p.previousElementSibling) {
+          const up = a.__ptParent, kids = up && up.__ptKids;
+          if (!kids) return;
+          for (let i = kids.indexOf(a) - 1; i >= 0; i--) {
+            const p = kids[i];
+            if (p.__ptType !== ELEMENT_NODE) continue;
+            if (H.tilde) { if (sibSeen.has(p)) return; sibSeen.add(p); }
             if (!anchors.has(p) && __hasAnchorMatch(p, H.sib)) anchors.add(p);
-            if (!H.tilde || ++n >= 64) return n < 64 || !p.previousElementSibling;
+            if (!H.tilde) return;
           }
-          return true;
         };
-        let bounded = true;
         if (H.parentAny) {
           for (const r of __styleTouched.slice()) {
             const p = r && r.__ptParent;
@@ -9607,18 +9675,17 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         for (const r of __styleTouched) {
           for (let a = r; a && a.__ptType === ELEMENT_NODE; a = a.__ptParent) {
             if (!anchors.has(a) && __hasAnchorMatch(a, H)) anchors.add(a);
-            if (H.hasSib && !sibOf(a)) bounded = false;
+            if (H.hasSib) sibOf(a);
           }
         }
-        if (!bounded) { __styleAllStale = true; why('hasSibFar'); }
-        else for (const a of anchors) __styleTouched.push(a);
+        for (const a of anchors) __styleTouched.push(a);
       }
     }
     if (ruleRoots) for (const e of ruleRoots) __styleTouched.push(e);
     const doc = globalThis.document;
     let hash = '';
     try { hash = String(globalThis.location && globalThis.location.hash || ''); } catch (e) {}
-    const world = hash + '|' + __customs.size;
+    const world = hash;
     if (world !== __styleWorld) { __styleAllStale = true; why('world'); }
     else if (doc && doc.__ptActive !== __styleActive) {
       // Only the elements losing and gaining focus restyle (with what they
@@ -9630,6 +9697,21 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         for (const e of [__styleActive, doc.__ptActive]) if (e && e.__ptType === ELEMENT_NODE && e.__ptDoc === doc) __styleTouched.push(e);
       }
     }
+    // A definition changes style only through `:defined`: the elements of
+    // the new names restyle, or all when such a rule reads siblings or
+    // `:has()`.
+    const nDefined = __customs.size;
+    if (nDefined !== __styleDefined && !__styleAllStale && __readsDefined(__rules)) {
+      const de = doc && doc.documentElement;
+      if (!de || nDefined < __styleDefined || __readsDefined(__rules) === 2) { __styleAllStale = true; why('defined'); }
+      else {
+        const keys = new Set();
+        let i = 0;
+        for (const n of __customs.keys()) if (i++ >= __styleDefined) keys.add('t' + n);
+        for (const e of __elementsWithKeys(de, keys)) __styleTouched.push(e);
+      }
+    }
+    __styleDefined = nDefined;
     __styleWorld = world;
     __styleActive = doc ? doc.__ptActive : null;
     __styleRulesSeen = __rules;
@@ -9676,6 +9758,30 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // there can be more than one document (see `__rulesFor`).
   // Layer rank of rules outside any layer: above every layer.
   const __UNLAYERED = 1e9;
+  // A style rule's selector list split, with specificities, as (sel, spec)
+  // runs. Every added sheet regathers all rules; this keeps it to a lookup.
+  // `__ptSib`: 1 when a selector has a sibling combinator outside brackets
+  // and parentheses (`~=` and `2n+1` are not combinators), 2 when it also
+  // reads children (`:empty`, `:has()`, `:blank`).
+  const __selPartsOf = new WeakMap();
+  function __selParts(r, selText) {
+    const hit = __selPartsOf.get(r);
+    if (hit !== undefined && hit.__ptText === selText) return hit;
+    const out = [];
+    let sib = 0;
+    for (const one of __selSplit(selText)) {
+      const sel = __s_trim(one);
+      if (!sel) continue;
+      out.push(sel, __specificity(sel));
+      const bare = __s_replace(__s_replace(sel, /\[[^\]]*\]/g, ''), /\([^()]*\)/g, '');
+      if (/[+~]/.test(bare)) sib = Math.max(sib, /:(empty|has|blank)\b/i.test(sel) ? 2 : 1);
+    }
+    const parts = out.slice();
+    parts.__ptText = selText;
+    parts.__ptSib = sib;
+    __selPartsOf.set(r, parts);
+    return parts;
+  }
   function __gatherRules(docEl, out) {
     const state = { order: out.length, anon: 0 };
     const faces = [];
@@ -9713,10 +9819,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         const selText = __ruleSel(st);
         if (!selText) continue;
         const rank = layer == null ? __UNLAYERED : layers.get(layer);
-        for (const one of __selSplit(selText)) {
-          const sel = __s_trim(one);
-          if (!sel) continue;
-          out.push({ root, sel, spec: __specificity(sel), order: state.order++, rule: r, layer: rank });
+        const parts = __selParts(r, selText);
+        if (parts.__ptSib > out.__ptSib) out.__ptSib = parts.__ptSib;
+        for (let i = 0; i < parts.length; i += 2) {
+          out.push({ root, sel: parts[i], spec: parts[i + 1], order: state.order++, rule: r, layer: rank });
         }
       }
     };
@@ -10459,18 +10565,13 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const old = __gatherKey;
     if (old && old.length === key.length && old.every((v, i) => v === key[i])) return __gatherHit;
     __gatherKey = key;
-    __gatherHit = __gatherRules(docEl, []);
+    const g0 = __perfNow();
+    const into = [];
+    into.__ptSib = 0;
+    __gatherHit = __gatherRules(docEl, into);
+    __lstats.gathers++; __lstats.gatherRules += __gatherHit.length; __lstats.gatherMs += __perfNow() - g0;
     __gatherHit.__ptHas = __hasAnchors(__gatherHit);
-    // Sibling combinators outside brackets and parentheses (`~=` and `2n+1`
-    // are not combinators).
-    let sib = false, sibChildren = false;
-    for (const r of __gatherHit) {
-      const bare = __s_replace(__s_replace(String(r.sel || ''), /\[[^\]]*\]/g, ''), /\([^()]*\)/g, '');
-      if (!/[+~]/.test(bare)) continue;
-      sib = true;
-      if (/:(empty|has|blank)\b/i.test(String(r.sel || ''))) { sibChildren = true; break; }
-    }
-    __sibAny = sib; __sibOnChildren = sibChildren;
+    __sibAny = __gatherHit.__ptSib > 0; __sibOnChildren = __gatherHit.__ptSib > 1;
     return __gatherHit;
   }
 
@@ -10608,18 +10709,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (__s_charCodeAt(n, 0) === 45 && __s_charCodeAt(n, 1) === 45) mine.set(n, v);
       else decls.push([n, v]);
     };
-    const noteAll = (d, important) => {
-      const raw = __declRaw.get(d);
-      if (raw) {
-        const m = raw(), I = m.__ptImp;
-        for (const [n] of m) if (!!(I && I.has(n)) === important) note(n, __cssAbs(String(__cssPreciseGet(m, n)), null));
-        return;
-      }
-      if (important) return;
-      for (let i = 0; i < d.length; i++) {
-        const n = d.item(i);
-        note(n, __cssAbs(d.getPropertyValue(n), null));
-      }
+    const noteAll = (m, important) => {
+      const I = m.__ptImp;
+      for (const [n] of m) if (!!(I && I.has(n)) === important) note(n, __cssAbs(String(__cssPreciseGet(m, n)), null));
     };
     // Normal declarations: the rules in cascade order, then the style
     // attribute. Important ones after all of them: unlayered rules, layers
@@ -10632,7 +10724,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (I && I.size) anyImportant = true;
       for (const [n, v] of m) if (!I || !I.has(n)) note(n, __cssAbs(String(v), r.rule));
     }
-    const own = el.__ptStyle || (__ptHasA(el, 'style') ? el.style : null);
+    const own = __inlineDecls(el);
     if (own) noteAll(own, false);
     if (anyImportant) {
       const imp = won.filter((r) => { const m = __ruleMap(r); return m && m.__ptImp && m.__ptImp.size; });
@@ -11973,7 +12065,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   // Cost counters for profiling the style and layout engine (always on: a few
   // integer increments). `__pt_layoutStats()` reads them.
-  const __lstats = { relayouts: 0, cascades: 0, allStale: 0, dropped: 0, layoutEls: 0, cssScans: 0, cssScanEls: 0, cssScanMs: 0, shared: 0 };
+  const __lstats = { relayouts: 0, cascades: 0, allStale: 0, dropped: 0, layoutEls: 0, cssScans: 0, cssScanEls: 0, cssScanMs: 0, shared: 0, gathers: 0, gatherRules: 0, gatherMs: 0 };
   Object.defineProperty(globalThis, '__pt_layoutStats', { value: () => Object.assign({}, __lstats), configurable: true, enumerable: false });
   // Drop every cached cascade: checks compare incremental styles with a
   // full recomputation.

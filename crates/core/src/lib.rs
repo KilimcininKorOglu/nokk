@@ -10326,6 +10326,93 @@ mod tests {
         assert_eq!(out["pos"], serde_json::json!([4, 2, 20, 4]), "{out}");
     }
 
+    /// `customElements.define` restyles what `:defined` reaches (it did not
+    /// until another mutation); unkeyed rules (`#k > *`) and `:has()` rules
+    /// added and removed restyle their subjects; `:has(~ x)` past 64
+    /// siblings. Values from Chrome 151.
+    #[tokio::test]
+    async fn defined_and_unkeyed_rule_changes_match_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let script = "(() => {
+            const $ = (id) => document.getElementById(id), cs = (id, p) => getComputedStyle($(id))[p];
+            const r = [];
+            const read = () => r.push([cs('a', 'color'), cs('s', 'marginLeft'), cs('p', 'paddingTop'), cs('i', 'marginTop'), cs('i', 'marginBottom')].join(' '));
+            read();
+            customElements.define('x-a', class extends HTMLElement {}); read();
+            customElements.define('x-b', class extends HTMLElement {}); read();
+            customElements.define('x-c', class extends HTMLElement {}); read();
+            $('k').className = 'k'; read();
+            const st = document.createElement('style');
+            st.textContent = '#k > * { margin-bottom: 3px } x-a:has(+ x-b) { color: rgb(9, 9, 9) }';
+            document.head.appendChild(st); read();
+            st.remove(); read();
+            return r.join(' | '); })()";
+        let mut got = Vec::new();
+        for sib in ["+ p", "p"] {
+            let ctx = engine.new_context().await.unwrap();
+            ctx.load_html(
+                "https://example.com/",
+                &format!(
+                    "<html><head><style>
+                       x-a {{ color: rgb(1, 1, 1) }} x-a:not(:defined) {{ color: rgb(200, 0, 0) }}
+                       x-b:defined span {{ margin-left: 5px }}
+                       x-c:defined {sib} {{ padding-top: 7px }}
+                       .k > * {{ margin-top: 1px }}
+                     </style></head><body><x-a id=a></x-a><x-b id=b><span id=s>t</span></x-b>\
+                     <x-c id=c></x-c><p id=p>p</p><div id=k><i id=i></i></div></body></html>"
+                ),
+            )
+            .await
+            .unwrap();
+            got.push(ctx.evaluate(script).await.unwrap());
+        }
+        assert_eq!(
+            got[0],
+            "rgb(200, 0, 0) 0px 0px 0px 0px | rgb(1, 1, 1) 0px 0px 0px 0px | rgb(1, 1, 1) 5px 0px 0px 0px | \
+             rgb(1, 1, 1) 5px 7px 0px 0px | rgb(1, 1, 1) 5px 7px 1px 0px | rgb(9, 9, 9) 5px 7px 1px 3px | \
+             rgb(1, 1, 1) 5px 7px 1px 0px"
+        );
+        assert_eq!(
+            got[1],
+            "rgb(200, 0, 0) 0px 0px 0px 0px | rgb(1, 1, 1) 0px 0px 0px 0px | rgb(1, 1, 1) 5px 0px 0px 0px | \
+             rgb(1, 1, 1) 5px 0px 0px 0px | rgb(1, 1, 1) 5px 0px 1px 0px | rgb(9, 9, 9) 5px 0px 1px 3px | \
+             rgb(1, 1, 1) 5px 0px 1px 0px"
+        );
+        // `:has(~ x)` reaches back past any number of siblings.
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<html><head><style>
+               .t:has(~ .m) { color: rgb(5, 6, 7) } .u:has(+ .m) { margin-left: 2px } .w:has(~ b) { padding-left: 3px }
+             </style></head><body><div id=d></div></body></html>",
+        )
+        .await
+        .unwrap();
+        let sib = ctx
+            .evaluate(
+                "(() => {
+                   const d = document.getElementById('d');
+                   for (let i = 0; i < 150; i++) { const e = document.createElement('i'); if (i === 0) e.className = 't w'; if (i === 148) e.className = 'u'; d.appendChild(e); }
+                   const k = d.children, cs = (e, p) => getComputedStyle(e)[p], r = [];
+                   const read = () => r.push([cs(k[0], 'color'), cs(k[148], 'marginLeft'), cs(k[0], 'paddingLeft')].join(' '));
+                   read();
+                   k[149].className = 'm'; read();
+                   k[149].className = ''; read();
+                   k[70].className = 'm'; read();
+                   d.appendChild(document.createElement('b')); read();
+                   d.lastChild.remove(); k[70].remove(); read();
+                   return r.join(' | '); })()",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sib,
+            "rgb(0, 0, 0) 0px 0px | rgb(5, 6, 7) 2px 0px | rgb(0, 0, 0) 0px 0px | rgb(5, 6, 7) 0px 0px | \
+             rgb(5, 6, 7) 0px 3px | rgb(0, 0, 0) 0px 0px"
+        );
+    }
+
     /// Modern CSS values: `var()` with fallback, registered custom properties,
     /// `calc()`/`min()`/`clamp()`, `dvh`, root `rem`, `box-sizing: inherit` and grid
     /// with `gap`. Numbers from Chrome 151 on the same markup (1920x942 window).

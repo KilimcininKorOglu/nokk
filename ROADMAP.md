@@ -481,6 +481,18 @@ Done:
   before: `input:focus` did not apply after `focus()`).
 - ✅ **`compareDocumentPosition` by ancestor chains** instead of a walk over the whole
   tree per call (jQuery's sort on Wikipedia was quadratic: 0.3 s of a load).
+- ✅ **Fewer full restyles.** A sheet whose rules have no key (`.a > *`) restyles the
+  elements those rules match now; keyed `:has()` rules restyle by their key; rules that
+  never match here change nothing; defining a custom element restyles its elements, and
+  only when a rule reads `:defined` (it restyled everything, or nothing until the next
+  mutation: `x-a:not(:defined)` kept applying after `define`); `:has(~ x)` walks each
+  parent's children once per pass instead of giving up past 64 siblings (GitHub's
+  `<head>` has more, so every inserted `<style>` restyled the page). Ten added sheets on a
+  saved Wikipedia article: 108,000 cascades and 2.3–3.6 s → 9,000 and 0.6–0.8 s.
+- ✅ **No style objects for the engine's own reads.** The cascade and the box test read a
+  `style` attribute parsed by its text (shared between alike elements), not a page-facing
+  declaration with 700 properties built for each element; rule gathering keeps each
+  rule's split selectors, specificities and combinator flags.
 
 Open:
 - ⬜ **Matching is still the cascade's main cost** (GitHub ~0.08 ms per element, Chrome
