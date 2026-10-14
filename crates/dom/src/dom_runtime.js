@@ -1051,10 +1051,10 @@
       const k = this.__ptKids.filter((n) => n.__ptType === ELEMENT_NODE);
       return k.length ? k[k.length - 1] : null;
     }
-    getElementById(id) { return firstMatch(this, (e) => __ptGetA(e, 'id') === String(id)); }
+    getElementById(id) { const want = String(id); return firstMatch(this, (e) => __ptGetA(e, 'id') === want); }
     querySelector(sel) {
       __needArgs(arguments.length, 1, 'querySelector', this.constructor && this.constructor.name || 'Element');
-      return query(this, __checkSelector(sel, 'querySelector', this.constructor && this.constructor.name || 'Element'))[0] || null;
+      return queryFirst(this, __checkSelector(sel, 'querySelector', this.constructor && this.constructor.name || 'Element'));
     }
     querySelectorAll(sel) {
       const who = this.constructor && this.constructor.name || 'Element';
@@ -1118,18 +1118,12 @@
     get styleSheets() { return __styleSheetList(__sheetOwners(this)); }
     get adoptedStyleSheets() { return this.__ptAdopted || (this.__ptAdopted = []); }
     set adoptedStyleSheets(v) { this.__ptAdopted = v; }
-    getElementById(id) { return firstMatch(this, (e) => __ptGetA(e, 'id') === String(id)); }
+    getElementById(id) { const want = String(id); return firstMatch(this, (e) => __ptGetA(e, 'id') === want); }
     getElementsByTagName(t) { return __collection(__tags(this, t)); }
-    getElementsByClassName(c) {
-      const cs = __s_split(String(c), /\s+/).filter(Boolean);
-      return __collection(collect(this, (e) => {
-        const own = __s_split(e.__ptAttrs.get('class') || '', /\s+/);
-        return cs.every((x) => __s_indexOf(own, x) >= 0);
-      }));
-    }
+    getElementsByClassName(c) { return __collection(__byClass(this, c)); }
     querySelector(sel) {
       __needArgs(arguments.length, 1, 'querySelector', this.constructor && this.constructor.name || 'Element');
-      return query(this, __checkSelector(sel, 'querySelector', this.constructor && this.constructor.name || 'Element'))[0] || null;
+      return queryFirst(this, __checkSelector(sel, 'querySelector', this.constructor && this.constructor.name || 'Element'));
     }
     querySelectorAll(sel) {
       const who = this.constructor && this.constructor.name || 'Element';
@@ -1760,16 +1754,10 @@
     // Element has no getElementById; only document and fragment do.
     getElementsByTagName(t) { return __collection(__tags(this, t)); }
     getElementsByTagNameNS(ns, local) { return __collection(__tagsNS(this, ns, local)); }
-    getElementsByClassName(c) {
-      const cs = __s_split(String(c), /\s+/).filter(Boolean);
-      return __collection(collect(this, (e) => {
-        const own = __s_split(e.__ptAttrs.get('class') || '', /\s+/);
-        return cs.length > 0 && cs.every((x) => __s_indexOf(own, x) >= 0);
-      }));
-    }
+    getElementsByClassName(c) { return __collection(__byClass(this, c)); }
     querySelector(sel) {
       __needArgs(arguments.length, 1, 'querySelector', this.constructor && this.constructor.name || 'Element');
-      return query(this, __checkSelector(sel, 'querySelector', this.constructor && this.constructor.name || 'Element'))[0] || null;
+      return queryFirst(this, __checkSelector(sel, 'querySelector', this.constructor && this.constructor.name || 'Element'));
     }
     querySelectorAll(sel) {
       const who = this.constructor && this.constructor.name || 'Element';
@@ -2390,11 +2378,13 @@
       return out;
     }
     get nodeName() { return '#document'; }
-    get head() { return this.documentElement && __tags(this.documentElement, 'head')[0] || null; }
-    get body() { return this.documentElement && __tags(this.documentElement, 'body')[0] || null; }
-    get title() { const t = this.documentElement ? __tags(this.documentElement, 'title')[0] : null; return t ? __s_trim(t.textContent) : ''; }
+    // Children of <html> only, as the spec has it: a <body> anywhere else is
+    // not the body (Chrome answers null), and no tree walk per read.
+    get head() { return __htmlChild(this, 'head', null); }
+    get body() { return __htmlChild(this, 'body', 'frameset'); }
+    get title() { const t = __docTitle(this); return t ? __s_trim(t.textContent) : ''; }
     set title(v) {
-      let t = this.documentElement ? __tags(this.documentElement, 'title')[0] : null;
+      let t = __docTitle(this);
       if (!t) { t = this.createElement('title'); (this.head || this.documentElement || this).appendChild(t); }
       t.textContent = String(v);
     }
@@ -2589,15 +2579,9 @@
 
     // Walk from the document itself: <html> is a descendant too (otherwise
     // getElementsByTagName('*') was one short and an id on <html> was not found).
-    getElementById(id) { return firstMatch(this, (e) => __ptGetA(e, 'id') === String(id)); }
+    getElementById(id) { const want = String(id); return firstMatch(this, (e) => __ptGetA(e, 'id') === want); }
     getElementsByTagName(t) { return __collection(__tags(this, t)); }
-    getElementsByClassName(c) {
-      const cs = __s_split(String(c), /\s+/).filter(Boolean);
-      return __collection(collect(this, (e) => {
-        const own = __s_split((e.__ptAttrs && e.__ptAttrs.get('class')) || '', /\s+/);
-        return cs.length > 0 && cs.every((x) => __s_indexOf(own, x) >= 0);
-      }));
-    }
+    getElementsByClassName(c) { return __collection(__byClass(this, c)); }
     getElementsByName(n) {
       const want = String(n);
       return __staticNodeList(collect(this, (e) => e.__ptAttrs && e.__ptAttrs.get('name') === want));
@@ -2606,7 +2590,7 @@
     querySelector(s) {
       __needArgs(arguments.length, 1, 'querySelector', 'Document');
       __checkSelector(s, 'querySelector', 'Document');
-      return query(this, s)[0] || null;
+      return queryFirst(this, s);
     }
     querySelectorAll(s) {
       __needArgs(arguments.length, 1, 'querySelectorAll', 'Document');
@@ -4856,8 +4840,37 @@
     return own;
   }
 
-  function firstMatch(root, pred) {
-    let found = null; walk(root, e => { if (!found && pred(e)) found = e; }); return found;
+  // Stops at the first match in tree order.
+  function firstMatch(node, pred) {
+    for (const c of node.__ptKids) {
+      if (c.__ptType !== ELEMENT_NODE) continue;
+      if (pred(c)) return c;
+      const r = firstMatch(c, pred);
+      if (r) return r;
+    }
+    return null;
+  }
+  const __isHtmlEl = (e) => e.__ptNS === undefined || e.__ptNS === 'http://www.w3.org/1999/xhtml';
+  function __htmlChild(doc, a, b) {
+    const de = doc.documentElement;
+    if (!de || de.__ptLocal !== 'html' || !__isHtmlEl(de)) return null;
+    for (const c of de.__ptKids) {
+      if (c.__ptType === ELEMENT_NODE && (c.__ptLocal === a || c.__ptLocal === b) && __isHtmlEl(c)) return c;
+    }
+    return null;
+  }
+  const __docTitle = (doc) => (doc.documentElement ? firstMatch(doc.documentElement, (e) => e.__ptLocal === 'title') : null);
+  // Class names split on ASCII whitespace only, as in Chrome (a no-break
+  // space is part of the name); the element side is the cached class set.
+  function __byClass(root, c) {
+    const cs = __s_split(String(c), /[\t\n\f\r ]+/).filter(Boolean);
+    if (!cs.length) return [];
+    return collect(root, (e) => {
+      const set = __ptClassSet(e);
+      if (set === null) return false;
+      for (let i = 0; i < cs.length; i++) if (!set.has(cs[i])) return false;
+      return true;
+    });
   }
   function walk(node, visit) {
     for (const c of node.__ptKids) {
@@ -4897,7 +4910,8 @@
   // would keep the whole parse scope alive for every rule.
   const __tLocal = (n) => (e) => e.__ptLocal === n;
   const __tTag = (low, n) => (e) => e.__ptLocal === low || (e.__ptNS && e.__ptNS !== 'http://www.w3.org/1999/xhtml' && e.__ptLocal === n);
-  const __tId = (n) => (e) => e.id === n;
+  // The attribute, not `e.id`: a page-visible getter behind a brand check.
+  const __tId = (n) => (e) => __ptGetA(e, 'id') === n;
   const __tClass = (n) => (e) => { const set = __ptClassSet(e); return set !== null && set.has(n); };
   const __tScope = (e, ctx) => !!(ctx && ctx.scope) && e === ctx.scope;
   const __tAll = (tests) => {
@@ -5593,6 +5607,12 @@
     }
     results.item = (i) => results[i] || null;
     return results;
+  }
+  function queryFirst(root, selector) {
+    const list = __selCompiled(selector);
+    if (!list) return null;
+    const ctx = { scope: root };
+    return firstMatch(root, (e) => __selAny(list, e, ctx));
   }
 
   // ---- HTML serialization (innerHTML getter) --------------------------------

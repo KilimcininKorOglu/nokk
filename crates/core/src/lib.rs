@@ -10413,6 +10413,41 @@ mod tests {
         );
     }
 
+    /// `document.body`/`head` are children of `<html>` only, class names split on
+    /// ASCII whitespace, the first match in tree order. Values from Chrome 151.
+    #[tokio::test]
+    async fn tree_lookups_match_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>").await.unwrap();
+        let got = ctx
+            .evaluate(
+                "(() => { const d = document.implementation.createHTMLDocument('T1'), o = [];
+                   d.documentElement.appendChild(d.createElement('frameset')); o.push(String(d.body));
+                   d.body.remove(); o.push(String(d.body));
+                   d.documentElement.insertBefore(d.createElement('frameset'), d.head); o.push(String(d.body), d.title);
+                   d.title = 'X'; o.push(d.title, d.head.children.length);
+                   const a = d.body.appendChild(d.createElement('div'));
+                   a.innerHTML = '<p class=q id=w><b class=\"q r\"></b></p><i class=\"m\\u00a0n\"></i><u class=\" m  n \"></u><s class=\"n\\vk\"></s><p id=w class=z></p>';
+                   o.push(a.getElementsByClassName('').length, a.getElementsByClassName('q r').length, d.getElementsByClassName(' ').length,
+                     a.getElementsByClassName('m').length, a.getElementsByClassName('m\\u00a0n').length, a.getElementsByClassName('n\\vk').length,
+                     d.getElementById('w').className, a.querySelector('#w').className, a.querySelector('b, p').tagName, a.querySelector('#w > b').className);
+                   const div = d.createElement('div'); d.documentElement.appendChild(div);
+                   while (d.body) d.body.remove(); div.appendChild(d.createElement('body'));
+                   const h = d.head; d.documentElement.removeChild(h); div.appendChild(h);
+                   o.push(String(d.body), String(d.head));
+                   return o.join(' | '); })()",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            "[object HTMLBodyElement] | [object HTMLFrameSetElement] | [object HTMLFrameSetElement] | T1 | X | 1 | \
+             0 | 1 | 0 | 1 | 1 | 1 | q | q | P | q r | null | null"
+        );
+    }
+
     /// Modern CSS values: `var()` with fallback, registered custom properties,
     /// `calc()`/`min()`/`clamp()`, `dvh`, root `rem`, `box-sizing: inherit` and grid
     /// with `gap`. Numbers from Chrome 151 on the same markup (1920x942 window).
