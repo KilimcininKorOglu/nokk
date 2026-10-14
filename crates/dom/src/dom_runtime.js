@@ -624,7 +624,7 @@
       if (i < 0) this.__ptKids.push(child); else this.__ptKids.splice(i, 0, child);
       child.__ptParent = this;
       __markDirty(this);
-      __styleTouch(this, true);
+      __styleTouchKids(this, child);
       __hasNoteTree(child);
       __mutation(__childListRecord(this, [child], [], child.previousSibling, child.nextSibling));
       // A frame only becomes a browsing context once it is in the document — and
@@ -646,7 +646,7 @@
           'NotFoundError');
       }
       const prev = this.__ptKids[i - 1] || null, next = this.__ptKids[i + 1] || null;
-      this.__ptKids.splice(i, 1); child.__ptParent = null; __markDirty(this); __styleTouch(this, true); __hasNoteTree(child);
+      this.__ptKids.splice(i, 1); child.__ptParent = null; __markDirty(this); __styleTouchKids(this, null); __hasNoteTree(child);
       __mutation(__childListRecord(this, [], [child], prev, next));
       // A removed frame is a closed browsing context. Without this its V8 context
       // outlives the element forever — a widget that replaces its iframe on a
@@ -1251,7 +1251,7 @@
       if (name === 'src' && this.__ptLocal === 'script') v = __pt_ttSink('TrustedScriptURL', 'HTMLScriptElement src', v, "Failed to execute 'setAttribute' on 'Element'");
       else if (name === 'srcdoc' && this.__ptLocal === 'iframe') v = __pt_ttSink('TrustedHTML', 'HTMLIFrameElement srcdoc', v, "Failed to execute 'setAttribute' on 'Element'");
       this.__ptAttrs.set(name, String(v));
-      __styleTouch(this);
+      __styleTouchAttr(this, name, old, String(v));
       __hasNoteAttr(name, old, String(v));
       if (name === 'src' && (this.__ptLocal === 'video' || this.__ptLocal === 'audio') && globalThis.__pt_mediaLoad) __pt_mediaLoad(this);
       if (this.__ptUpgraded) {
@@ -1270,7 +1270,7 @@
       const name = __attrName(this, n), old = this.__ptAttrs.get(name);
       this.__ptAttrs.delete(name);
       __markDirty(this);
-      __styleTouch(this);
+      __styleTouchAttr(this, name, old, null);
       __hasNoteAttr(name, old, null);
       __mutation({ type: 'attributes', target: this, attributeName: name, attributeNamespace: null,
         oldValue: old === undefined ? null : old, addedNodes: [], removedNodes: [],
@@ -3619,7 +3619,211 @@
   };
   const __CSS_URL_ANY = /url\(\s*(?:'([^']*)'|"([^"]*)"|([^)"'\s]*))\s*\)/gi;
   const __CSS_BOX = new Set(['margin', 'padding', 'inset', 'border-width', 'scroll-margin', 'scroll-padding']);
-  const __cssSelector = (sel) => __s_replace(__s_replace(__s_replace(__s_trim(String(sel)), /\s+/g, ' '), /\s*([>+~])\s*/g, ' $1 '), /\s*,\s*/g, ', ');
+  // A selector list as Chrome prints it (CSSOM "serialize a selector"):
+  // names re-escaped, attribute values as double-quoted strings, An+B in
+  // its shortest form, pseudo names lowercased, `:before` as `::before`, a
+  // universal selector dropped where other simple selectors follow. With
+  // `display`, type and attribute names are lowercased too (an HTML
+  // document's `selectorText`); the cascade keeps their case for SVG names.
+  // The regex version this replaces spaced `~=` like a combinator, and the
+  // rule then had no key and restyled the whole page when added.
+  const __SEL_LIST_ARGS = new Set(['is', 'not', 'where', 'has', 'matches', '-webkit-any', 'host', 'host-context', 'slotted', 'cue']);
+  function __cssIdentOut(v) {
+    let out = '';
+    for (let k = 0; k < v.length; k++) {
+      const c = __s_charCodeAt(v, k), ch = v[k];
+      if (c === 0) out += '�';
+      else if ((c >= 1 && c <= 0x1f) || c === 0x7f || (c >= 48 && c <= 57 && (k === 0 || (k === 1 && v[0] === '-')))) out += '\\' + c.toString(16) + ' ';
+      else if (k === 0 && ch === '-' && v.length === 1) out += '\\-';
+      else if (c >= 0x80 || ch === '-' || ch === '_' || (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)) out += ch;
+      else out += '\\' + ch;
+    }
+    return out;
+  }
+  function __cssStringOut(v) {
+    let out = '"';
+    for (let k = 0; k < v.length; k++) {
+      const c = __s_charCodeAt(v, k), ch = v[k];
+      if (c === 0) out += '�';
+      else if ((c >= 1 && c <= 0x1f) || c === 0x7f) out += '\\' + c.toString(16) + ' ';
+      else if (ch === '"' || ch === '\\') out += '\\' + ch;
+      else out += ch;
+    }
+    return out + '"';
+  }
+  const __nthOut = (ab) => {
+    const [a, b] = ab;
+    if (a === 0) return String(b);
+    const an = a === 1 ? 'n' : a === -1 ? '-n' : a + 'n';
+    return b > 0 ? an + '+' + b : b < 0 ? an + String(b) : an;
+  };
+  // Comments go (outside strings) and U+0000 reads as U+FFFD, as the CSS
+  // tokenizer has it.
+  const __selPre = (t) => {
+    if (__s_indexOf(t, '/*') < 0 && __s_indexOf(t, '\0') < 0) return t;
+    return __s_replace(t, /("(?:[^"\\]|\\[\s\S])*"?|'(?:[^'\\]|\\[\s\S])*'?)|\/\*[\s\S]*?(?:\*\/|$)|\0/g,
+      (m, str) => (str !== undefined ? __s_replace(str, /\0/g, '\ufffd') : m === '\0' ? '\ufffd' : ''));
+  };
+  function __selSerialize(text, display) {
+    const s = __selPre(String(text)), n = s.length;
+    let i = 0;
+    const ws = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f';
+    const skipWs = () => { while (i < n && ws(s[i])) i++; };
+    const nameStart = (k) => {
+      const c = s[k];
+      if (c === undefined) return false;
+      if (c === '\\') return s[k + 1] !== undefined && s[k + 1] !== '\n';
+      return __s_charCodeAt(s, k) >= 0x80 || c === '-' || c === '_' || /[a-zA-Z0-9]/.test(c);
+    };
+    const escape = () => {
+      // At a backslash: the escaped code point.
+      i++;
+      if (i >= n) return '�';
+      let hex = '';
+      while (hex.length < 6 && i < n && /[0-9a-fA-F]/.test(s[i])) hex += s[i++];
+      if (hex) {
+        if (i < n && ws(s[i])) { if (s[i] === '\r' && s[i + 1] === '\n') i++; i++; }
+        const c = parseInt(hex, 16);
+        return c === 0 || c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff) ? '�' : String.fromCodePoint(c);
+      }
+      return s[i++];
+    };
+    const ident = () => {
+      let v = '';
+      while (i < n && nameStart(i)) v += s[i] === '\\' ? escape() : s[i++];
+      return v;
+    };
+    const string = () => {
+      const q = s[i++];
+      let v = '';
+      while (i < n && s[i] !== q) {
+        if (s[i] === '\\') { if (s[i + 1] === '\n') { i += 2; continue; } v += escape(); } else v += s[i++];
+      }
+      i++;
+      return v;
+    };
+    // Up to the `)` closing the current function, nesting and strings kept.
+    const rawArg = () => {
+      const start = i;
+      let depth = 0;
+      while (i < n) {
+        const c = s[i];
+        if (c === '\\') { i += 2; continue; }
+        if (c === '"' || c === "'") { string(); continue; }
+        if (c === '(') depth++;
+        else if (c === ')') { if (depth === 0) break; depth--; }
+        i++;
+      }
+      return __s_slice(s, start, i);
+    };
+    const lowName = (v) => (display ? __s_toLowerCase(v) : v);
+    const attr = () => {
+      i++;
+      skipWs();
+      let ns = '', name;
+      if (s[i] === '*' && s[i + 1] === '|') { ns = '*|'; i += 2; name = ident(); }
+      else if (s[i] === '|') { i++; name = ident(); }
+      else {
+        name = ident();
+        if (s[i] === '|' && s[i + 1] !== '=') { ns = __cssIdentOut(name) + '|'; i++; name = ident(); }
+      }
+      skipWs();
+      let op = '';
+      if (s[i] === '=') { op = '='; i++; }
+      else if (s[i + 1] === '=' && '~|^$*'.includes(s[i])) { op = s[i] + '='; i += 2; }
+      let out = '[' + ns + __cssIdentOut(lowName(name));
+      if (op) {
+        skipWs();
+        const v = s[i] === '"' || s[i] === "'" ? string() : ident();
+        skipWs();
+        const flag = nameStart(i) ? __s_toLowerCase(ident()) : '';
+        skipWs();
+        out += op + __cssStringOut(v) + (flag ? ' ' + flag : '');
+      }
+      if (s[i] === ']') i++;
+      return out + ']';
+    };
+    const pseudo = () => {
+      i++;
+      let el = false;
+      if (s[i] === ':') { el = true; i++; }
+      const low = __s_toLowerCase(ident());
+      if (!el && __SEL_LEGACY_PE.has(low)) el = true;
+      const pre = el ? '::' : ':';
+      if (s[i] !== '(') return pre + low;
+      i++;
+      let inner;
+      if (__SEL_LIST_ARGS.has(low)) { skipWs(); inner = list(true); }
+      else {
+        const raw = __s_trim(rawArg());
+        inner = raw;
+        if (/^nth-/.test(low)) {
+          const m = /^(.*?)\s+of\s+(.*)$/.exec(raw);
+          const ab = __nthParse(m ? m[1] : raw);
+          if (ab) inner = __nthOut(ab) + (m ? ' of ' + __selSerialize(m[2], display) : '');
+        }
+      }
+      if (s[i] === ')') i++;
+      return pre + low + '(' + inner + ')';
+    };
+    const compound = () => {
+      let type = null;
+      if (s[i] === '*' || s[i] === '|' || nameStart(i)) {
+        let first = s[i] === '*' ? (i++, '*') : s[i] === '|' ? null : ident();
+        if (s[i] === '|' && s[i + 1] !== '=') {
+          i++;
+          const local = s[i] === '*' ? (i++, '*') : ident();
+          const t = local === '*' ? '*' : __cssIdentOut(lowName(local));
+          type = first === '*' ? t : (first === null ? '' : __cssIdentOut(first)) + '|' + t;
+        } else type = first === '*' ? '*' : __cssIdentOut(lowName(first));
+      }
+      let rest = '';
+      for (;;) {
+        const c = s[i];
+        if (c === '.') { i++; rest += '.' + __cssIdentOut(ident()); }
+        else if (c === '#') { i++; rest += '#' + __cssIdentOut(ident()); }
+        else if (c === '[') rest += attr();
+        else if (c === ':') rest += pseudo();
+        else if (c === '&') { i++; rest += '&'; }
+        else break;
+      }
+      if (type === '*' && rest) type = '';
+      return (type || '') + rest;
+    };
+    const complex = (inParens) => {
+      let out = '', gap = false;
+      while (i < n) {
+        const c = s[i];
+        if (c === ',' || (inParens && c === ')')) break;
+        if (ws(c)) { i++; gap = true; continue; }
+        if (c === '>' || c === '+' || c === '~') {
+          i++;
+          out = out ? out + ' ' + c + ' ' : c + ' ';
+          gap = false;
+          continue;
+        }
+        const start = i;
+        const part = compound();
+        if (i === start) { out += c; i++; continue; }
+        if (gap && out && out[out.length - 1] !== ' ') out += ' ';
+        gap = false;
+        out += part;
+      }
+      return __s_trim(out);
+    };
+    const list = (inParens) => {
+      const parts = [];
+      for (;;) {
+        skipWs();
+        parts.push(complex(inParens));
+        if (s[i] === ',') { i++; continue; }
+        break;
+      }
+      return parts.join(', ');
+    };
+    try { return list(false); } catch (e) { return __s_trim(s); }
+  }
+  const __cssSelector = (sel) => __selSerialize(sel, false);
   const __cssPrelude = (p) => __s_replace(__s_replace(__s_trim(String(p)), /\s+/g, ' '), /:\s*/g, ': ');
 
   // Parsing: prelude up to `{` or `;`, then the body with nesting depth.
@@ -4065,6 +4269,7 @@
   };
   const __ruleDecls = (st) => st.decls || (st.decls = __cssDecls(st.body || ''));
   const __ruleSel = (st) => (st.sel != null ? st.sel : (st.sel = __cssSelector(st.prelude || '')));
+  const __ruleSelText = (st) => (st.selText != null ? st.selText : (st.selText = __selSerialize(__ruleSel(st), true)));
   const __ruleStyle = (st) => st.style || (st.style = __cssDeclaration(__ruleDecls(st)));
   const __ruleList = (st) => st.list || (st.list = __cssRuleList(st.kids || []));
   const __declsText = (m) => __styleEntries(m)
@@ -4077,7 +4282,7 @@
     + '\n}';
   function __ruleText(st) {
     switch (st.kind) {
-      case 'style': { const b = __declsText(__ruleDecls(st)); return __ruleSel(st) + ' { ' + (b ? b + ' ' : '') + '}'; }
+      case 'style': { const b = __declsText(__ruleDecls(st)); return __ruleSelText(st) + ' { ' + (b ? b + ' ' : '') + '}'; }
       case 'font-face': return '@font-face { ' + __declsText(__ruleDecls(st)) + ' }';
       case 'keyframe': return st.keyText + ' { ' + __declsText(__ruleDecls(st)) + ' }';
       case 'media': case 'supports': return __cssGroup(st.at + ' ' + st.cond, st.kids, false);
@@ -4165,12 +4370,13 @@
       get parentStyleSheet() { return __om(this).sheet; },
     },
     CSSStyleRule: {
-      get selectorText() { return __ruleSel(__om(this)); },
+      get selectorText() { return __ruleSelText(__om(this)); },
       set selectorText(v) {
         const st = __om(this);
         const sel = __cssSelector(String(v));
         if (!sel || !__selCompiled(sel)) return;
         st.sel = sel;
+        st.selText = null;
         __cssomChanged();
       },
       get style() { return __ruleStyle(__om(this)); },
@@ -4905,6 +5111,18 @@
   }
 
   // Name code points: [A-Za-z0-9_-] and everything from U+00A0 up.
+  // What matching read around an element, kept on its parent: 1 the
+  // children's positions (`:first-child`, `:nth-*`), 2 their siblings (`+`,
+  // `~`, `:nth-child(of S)`); on the element itself, 4 its children
+  // (`:empty`). A change of children or an attribute restyles past the
+  // element only where these say a rule looked (Blink keeps the same
+  // "affected by" flags).
+  const __kidDeps = new WeakMap();
+  const __kidMark = (p, bit) => {
+    if (!p) return;
+    const f = __kidDeps.get(p) | 0;
+    if (!(f & bit)) __kidDeps.set(p, f | bit);
+  };
   const __selNameCh = (c) => c >= 0xa0 || (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c === 95 || c === 45;
   // Match tests are built here, outside the parser: a closure made inside it
   // would keep the whole parse scope alive for every rule.
@@ -5170,6 +5388,7 @@
       const comb = cx.lead || ' ';
       if (comb === '>') return __parentEl(el) === a;
       if (comb === ' ') { for (let p = __parentEl(el); p; p = __parentEl(p)) if (p === a) return true; return false; }
+      __kidMark(el.__ptParent, 2);
       if (comb === '+') return __prevEl(el) === a;
       for (let p = __prevEl(el); p; p = __prevEl(p)) if (p === a) return true;
       return false;
@@ -5180,6 +5399,7 @@
       for (let p = __parentEl(el); p; p = __parentEl(p)) if (__selMatchComplex(p, cx, idx - 1, ctx)) return true;
       return false;
     }
+    __kidMark(el.__ptParent, 2);
     if (comb === '+') { const p = __prevEl(el); return !!p && __selMatchComplex(p, cx, idx - 1, ctx); }
     for (let p = __prevEl(el); p; p = __prevEl(p)) if (__selMatchComplex(p, cx, idx - 1, ctx)) return true;
     return false;
@@ -5307,12 +5527,12 @@
           },
         };
       }
-      case 'first-child': return { spec: B, test: (e) => !__prevEl(e) && !!e.__ptParent };
-      case 'last-child': return { spec: B, test: (e) => !__nextEl(e) && !!e.__ptParent };
-      case 'only-child': return { spec: B, test: (e) => !__prevEl(e) && !__nextEl(e) && !!e.__ptParent };
-      case 'first-of-type': return { spec: B, test: (e) => sib(e, -1, true) === 1 };
-      case 'last-of-type': return { spec: B, test: (e) => sib(e, 1, true) === 1 };
-      case 'only-of-type': return { spec: B, test: (e) => sib(e, -1, true) === 1 && sib(e, 1, true) === 1 };
+      case 'first-child': return { spec: B, test: (e) => { __kidMark(e.__ptParent, 1); return !__prevEl(e) && !!e.__ptParent; } };
+      case 'last-child': return { spec: B, test: (e) => { __kidMark(e.__ptParent, 1); return !__nextEl(e) && !!e.__ptParent; } };
+      case 'only-child': return { spec: B, test: (e) => { __kidMark(e.__ptParent, 1); return !__prevEl(e) && !__nextEl(e) && !!e.__ptParent; } };
+      case 'first-of-type': return { spec: B, test: (e) => { __kidMark(e.__ptParent, 1); return sib(e, -1, true) === 1; } };
+      case 'last-of-type': return { spec: B, test: (e) => { __kidMark(e.__ptParent, 1); return sib(e, 1, true) === 1; } };
+      case 'only-of-type': return { spec: B, test: (e) => { __kidMark(e.__ptParent, 1); return sib(e, -1, true) === 1 && sib(e, 1, true) === 1; } };
       case 'nth-child': case 'nth-last-child': case 'nth-of-type': case 'nth-last-of-type': {
         let expr = String(arg || ''), of = null;
         const m = /^(.*?)\s+of\s+(.*)$/i.exec(expr);
@@ -5325,6 +5545,7 @@
           spec,
           test: (e, ctx) => {
             if (!e.__ptParent) return false;
+            __kidMark(e.__ptParent, of ? 3 : 1);
             if (of && !__selAny(of, e, ctx)) return false;
             let n = 1;
             for (let p = last ? __nextEl(e) : __prevEl(e); p; p = last ? __nextEl(p) : __prevEl(p)) {
@@ -5334,7 +5555,7 @@
           },
         };
       }
-      case 'empty': return { spec: B, test: (e) => !(e.__ptKids || []).some((k) => k.__ptType === ELEMENT_NODE || ((k.__ptType === TEXT_NODE || k.__ptType === 4) && k.data !== '')) };
+      case 'empty': return { spec: B, test: (e) => { __kidMark(e, 4); return !(e.__ptKids || []).some((k) => k.__ptType === ELEMENT_NODE || ((k.__ptType === TEXT_NODE || k.__ptType === 4) && k.data !== '')); } };
       case 'checked': return { spec: B, test: (e) => (e.__ptLocal === 'input' && /^(checkbox|radio)$/.test(__inputType(e)) && !!e.checked) || (e.__ptLocal === 'option' && !!e.selected) };
       case 'indeterminate': return { spec: B, test: (e) => e.__ptLocal === 'input' && __inputType(e) === 'checkbox' && !!e.indeterminate };
       case 'default': return { spec: B, test: (e) => (e.__ptLocal === 'input' && /^(checkbox|radio)$/.test(__inputType(e)) && __ptHasA(e, 'checked')) || (e.__ptLocal === 'option' && __ptHasA(e, 'selected')) };
@@ -5651,7 +5872,7 @@
     node.__ptKids = [];
     for (const c of old) { c.__ptParent = null; __hasNoteTree(c); }
     __markDirty(node);
-    __styleTouch(node, true);
+    __styleTouchKids(node, null);
     __mutation(__childListRecord(node, [], old, null, null));
     let frameLeft = false;
     for (const c of old) __walkTree(c, (f) => {
@@ -9444,13 +9665,6 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   let __styleTouched = [];
   let __styleAllStale = true;
   let __styleRulesSeen = null;
-  // What a change at a node can restyle: the node and everything below it
-  // (inheritance, descendant selectors). Its parent's subtree only when
-  // siblings can depend on it: for an attribute change, any `+`/`~` rule;
-  // for a change of its children, a rule with `:empty`/`:has()`/`:blank`
-  // before a sibling combinator. Ancestors through `:has()` are handled at
-  // revalidation. Until the rules are known, the parent.
-  let __sibAny = true, __sibOnChildren = true;
   // What the mutations since the last style pass touched, for `:has()`:
   // inserted and removed subtrees, attribute names with old and new values.
   // A `:has()` whose argument none of them could match keeps its anchors'
@@ -9518,12 +9732,86 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     return false;
   }
-  function __styleTouch(node, children) {
+  function __styleTouch(node) {
     if (__styleAllStale || !node) return;
-    const up = children ? __sibOnChildren : __sibAny;
-    const root = up ? (node.__ptParent || node) : node;
+    const up = node.__ptParent;
+    const root = up && (__kidDeps.get(up) & 2) ? up : node;
     if (__styleTouched.length >= 2000) { __styleAllStale = true; __styleTouched = []; return; }
     __styleTouched.push(root);
+  }
+  // Nodes a change reached without restyling anything: `:has()` still looks
+  // at their ancestors.
+  let __styleSeeds = [], __styleSeedsLost = false;
+  function __styleSeed(node) {
+    if (__styleSeedsLost) return;
+    if (__styleSeeds.length >= 2000) { __styleSeedsLost = true; __styleSeeds = []; return; }
+    __styleSeeds.push(node);
+  }
+  // A child inserted or removed: the new child's subtree, all the children
+  // when a rule read their positions or siblings, the parent too when a rule
+  // read whether it is empty.
+  function __styleTouchKids(p, child) {
+    if (__styleAllStale || !p) return;
+    const f = __kidDeps.get(p) | 0;
+    if (f & 4) { const up = p.__ptParent; __styleTouch(up && (__kidDeps.get(up) & 2) ? up : p); }
+    else if (f & 3) __styleTouch(p);
+    else if (child && child.__ptType === ELEMENT_NODE && child.__ptParent === p) { __styleTouch(child); __styleSeed(p); }
+    else __styleSeed(p);
+  }
+  // An attribute change restyles nothing when no rule names it: a class, an
+  // id or a data-* attribute (no rule reads those except by selector).
+  function __styleTouchAttr(el, name, oldV, newV) {
+    if (__styleAllStale) return;
+    if ((oldV == null ? null : oldV) === (newV == null ? null : newV) || __attrInert(el, name, oldV, newV)) { __styleSeed(el); return; }
+    __styleTouch(el);
+  }
+  const __CLASS_WS = /[\t\n\f\r ]+/;
+  function __attrInert(el, name, oldV, newV) {
+    if (el.__ptDoc !== globalThis.document) return false;
+    const isData = __s_slice(name, 0, 5) === 'data-';
+    if (name !== 'class' && name !== 'id' && !isData) return false;
+    const F = __ruleFeatures(__rules);
+    if (F.any) return false;
+    if (isData) return !F.attrs.has(name);
+    if (name === 'id') return !(oldV && F.ids.has(oldV)) && !(newV && F.ids.has(newV));
+    if (F.attrs.has('class')) return false;
+    const a = oldV ? __s_split(oldV, __CLASS_WS) : [], b = newV ? __s_split(newV, __CLASS_WS) : [];
+    for (const c of a) if (c && F.cls.has(c) && __s_indexOf(b, c) < 0) return false;
+    for (const c of b) if (c && F.cls.has(c) && __s_indexOf(a, c) < 0) return false;
+    return true;
+  }
+  // Every class, id and attribute name the rules mention anywhere in a
+  // selector (`:not()`, `:has()` and `:is()` included), escapes decoded
+  // (`.md\:flex`). A name may be collected that is none (inside an attribute
+  // value), never missed.
+  const __FEAT_NAME = '((?:[-_a-zA-Z0-9\\u0080-\\uffff]|\\\\[0-9a-fA-F]{1,6}[ \\t\\n\\f\\r]?|\\\\[^\\n\\r\\f0-9a-fA-F])+)';
+  const __FEAT_CLS = new RegExp('\\.' + __FEAT_NAME, 'g');
+  const __FEAT_ID = new RegExp('#' + __FEAT_NAME, 'g');
+  const __FEAT_ATTR = new RegExp('\\[\\s*(?:[^\\]|=\\s]*\\|)?' + __FEAT_NAME, 'g');
+  const __FEAT_ESC = /\\(?:([0-9a-fA-F]{1,6})[ \t\n\f\r]?|([^\n\r\f0-9a-fA-F]))/g;
+  const __featUnescape = (t) => (__s_indexOf(t, '\\') < 0 ? t : __s_replace(t, __FEAT_ESC, (m, hex, ch) => {
+    if (ch !== undefined) return ch;
+    const c = parseInt(hex, 16);
+    return c === 0 || c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff) ? '\ufffd' : String.fromCodePoint(c);
+  }));
+  const __featScan = (re, t, into, low) => {
+    re.lastIndex = 0;
+    for (let m = re.exec(t); m; m = re.exec(t)) {
+      const v = __featUnescape(m[1]);
+      into.add(low ? __s_toLowerCase(v) : v);
+    }
+  };
+  function __ruleFeatures(rules) {
+    if (rules.__ptFeat) return rules.__ptFeat;
+    const F = { any: false, cls: new Set(), ids: new Set(), attrs: new Set() };
+    for (const r of rules) {
+      const t = String(r.sel);
+      __featScan(__FEAT_CLS, t, F.cls, false);
+      __featScan(__FEAT_ID, t, F.ids, false);
+      __featScan(__FEAT_ATTR, t, F.attrs, true);
+    }
+    Object.defineProperty(rules, '__ptFeat', { value: F, configurable: true, enumerable: false });
+    return F;
   }
   const __STATE_PSEUDO = /:(checked|indeterminate|valid|invalid|user-valid|user-invalid|in-range|out-of-range|placeholder-shown)\b/i;
   let __styleWorld = '';
@@ -9591,7 +9879,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   }
   // Elements carrying any of `keys` or matching a selector of `keys.__ptProbe`,
   // in the document and its shadow trees.
-  function __elementsWithKeys(de, keys) {
+  // With `every`, each such element, nested ones too; else the topmost (a
+  // dropped element takes its subtree along).
+  function __elementsWithKeys(de, keys, every) {
     const out = [];
     let attrs = false;
     for (const k of keys) if (k[0] === 'a') { attrs = true; break; }
@@ -9610,13 +9900,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const walk = (n) => {
       for (const k of (n.__ptKids || [])) {
         if (k.__ptType !== ELEMENT_NODE) continue;
-        // A dropped element takes its subtree along.
-        if (has(k)) { out.push(k); continue; }
+        if (has(k)) { out.push(k); if (!every) continue; }
         if (k.__ptShadow) walk(k.__ptShadow);
         walk(k);
       }
     };
-    if (has(de)) out.push(de); else { if (de.__ptShadow) walk(de.__ptShadow); walk(de); }
+    const top = has(de);
+    if (top) out.push(de);
+    if (!top || every) { if (de.__ptShadow) walk(de.__ptShadow); walk(de); }
     return out;
   }
 
@@ -9661,10 +9952,13 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const keys = __rulesChanged(__styleRulesSeen, __rules);
       const de = globalThis.document && globalThis.document.documentElement;
       if (!keys || !de) { __styleAllStale = true; why('rules'); }
-      else { why('rulesKeyed'); if (keys.size || keys.__ptProbe) ruleRoots = __elementsWithKeys(de, keys); }
+      else { why('rulesKeyed'); if (keys.size || keys.__ptProbe) ruleRoots = __elementsWithKeys(de, keys, true); }
     } else if (__styleRulesSeen !== __rules) why('rules');
     const HA = __rules && __rules.__ptHas;
-    const H = HA && __styleTouched.length && !__styleAllStale ? __hasEffective(HA) : null;
+    const seeds = __styleSeeds, seedsLost = __styleSeedsLost;
+    __styleSeeds = []; __styleSeedsLost = false;
+    let H = HA && (__styleTouched.length || seeds.length || seedsLost) && !__styleAllStale ? __hasEffective(HA) : null;
+    if (H && seedsLost) H = { any: true };
     __hasMut.any = false; __hasMut.nodes = []; __hasMut.attrs = [];
     if (H) {
       if (H.any) { __styleAllStale = true; why('hasAny'); }
@@ -9691,17 +9985,22 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
             const p = r && r.__ptParent;
             if (p && p.__ptType === ELEMENT_NODE) anchors.add(p);
           }
+          for (const r of seeds) {
+            if (r.__ptType === ELEMENT_NODE) anchors.add(r);
+            const p = r.__ptParent;
+            if (p && p.__ptType === ELEMENT_NODE) anchors.add(p);
+          }
         }
-        for (const r of __styleTouched) {
+        for (const r of __styleTouched.concat(seeds)) {
           for (let a = r; a && a.__ptType === ELEMENT_NODE; a = a.__ptParent) {
             if (!anchors.has(a) && __hasAnchorMatch(a, H)) anchors.add(a);
             if (H.hasSib) sibOf(a);
           }
         }
-        for (const a of anchors) __styleTouched.push(a);
+        // An anchor whose siblings were read restyles them too.
+        for (const a of anchors) { const up = a.__ptParent; __styleTouched.push(up && (__kidDeps.get(up) & 2) ? up : a); }
       }
     }
-    if (ruleRoots) for (const e of ruleRoots) __styleTouched.push(e);
     const doc = globalThis.document;
     let hash = '';
     try { hash = String(globalThis.location && globalThis.location.hash || ''); } catch (e) {}
@@ -9753,7 +10052,41 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const roots = __styleTouched;
     for (const r of roots) { drop(r); if (!__layoutAllDirty) __layoutDirty.push(r); }
     __styleTouched = [];
+    // A changed rule changes what its subject elements match, nothing below
+    // them except through inheritance (`inherit`, `var()`, inherited
+    // properties read off the ancestors). Each is cascaded again at once;
+    // its subtree is dropped only when the result differs (Blink stops a
+    // recalc the same way when the inherited values did not change).
+    if (ruleRoots) {
+      const gone = new Set(roots);
+      const under = (e) => { for (let a = e; a; a = a.__ptParent || a.__ptHost || null) if (gone.has(a)) return true; return false; };
+      for (const e of ruleRoots) {
+        const old = __styleCache.get(e);
+        if (old !== undefined) {
+          __styleCache.delete(e);
+          if (__cascadeSame(old, __cascadeFor(e))) continue;
+        } else if (under(e)) continue;
+        drop(e);
+        gone.add(e);
+        if (!__layoutAllDirty) __layoutDirty.push(e);
+      }
+    }
     return roots;
+  }
+  function __cascadeSame(a, b) {
+    if (a === b) return true;
+    if (a.size !== b.size) return false;
+    for (const [k, v] of a) if (b.get(k) !== v) return false;
+    // Variables chain to the parent's: the same parent object and the same
+    // own values, or counted as changed (GitHub has thousands at the root;
+    // walking the chain per element cost seconds).
+    const x = a.__ptVars, y = b.__ptVars;
+    if (x === y) return true;
+    if (!x || !y || Object.getPrototypeOf(x) !== Object.getPrototypeOf(y)) return false;
+    const kx = Object.keys(x), ky = Object.keys(y);
+    if (kx.length !== ky.length) return false;
+    for (const k of kx) if (x[k] !== y[k] || !Object.prototype.hasOwnProperty.call(y, k)) return false;
+    return true;
   }
   // Font size and inherited values walk the ancestors and are asked many
   // times per pass; cache them for the cascade's lifetime.
@@ -9780,25 +10113,18 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   const __UNLAYERED = 1e9;
   // A style rule's selector list split, with specificities, as (sel, spec)
   // runs. Every added sheet regathers all rules; this keeps it to a lookup.
-  // `__ptSib`: 1 when a selector has a sibling combinator outside brackets
-  // and parentheses (`~=` and `2n+1` are not combinators), 2 when it also
-  // reads children (`:empty`, `:has()`, `:blank`).
   const __selPartsOf = new WeakMap();
   function __selParts(r, selText) {
     const hit = __selPartsOf.get(r);
     if (hit !== undefined && hit.__ptText === selText) return hit;
     const out = [];
-    let sib = 0;
     for (const one of __selSplit(selText)) {
       const sel = __s_trim(one);
       if (!sel) continue;
       out.push(sel, __specificity(sel));
-      const bare = __s_replace(__s_replace(sel, /\[[^\]]*\]/g, ''), /\([^()]*\)/g, '');
-      if (/[+~]/.test(bare)) sib = Math.max(sib, /:(empty|has|blank)\b/i.test(sel) ? 2 : 1);
     }
     const parts = out.slice();
     parts.__ptText = selText;
-    parts.__ptSib = sib;
     __selPartsOf.set(r, parts);
     return parts;
   }
@@ -9840,7 +10166,6 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         if (!selText) continue;
         const rank = layer == null ? __UNLAYERED : layers.get(layer);
         const parts = __selParts(r, selText);
-        if (parts.__ptSib > out.__ptSib) out.__ptSib = parts.__ptSib;
         for (let i = 0; i < parts.length; i += 2) {
           out.push({ root, sel: parts[i], spec: parts[i + 1], order: state.order++, rule: r, layer: rank });
         }
@@ -10586,12 +10911,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (old && old.length === key.length && old.every((v, i) => v === key[i])) return __gatherHit;
     __gatherKey = key;
     const g0 = __perfNow();
-    const into = [];
-    into.__ptSib = 0;
-    __gatherHit = __gatherRules(docEl, into);
+    __gatherHit = __gatherRules(docEl, []);
     __lstats.gathers++; __lstats.gatherRules += __gatherHit.length; __lstats.gatherMs += __perfNow() - g0;
     __gatherHit.__ptHas = __hasAnchors(__gatherHit);
-    __sibAny = __gatherHit.__ptSib > 0; __sibOnChildren = __gatherHit.__ptSib > 1;
     return __gatherHit;
   }
 

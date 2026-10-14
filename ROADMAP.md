@@ -492,7 +492,20 @@ Done:
 - ✅ **No style objects for the engine's own reads.** The cascade and the box test read a
   `style` attribute parsed by its text (shared between alike elements), not a page-facing
   declaration with 700 properties built for each element; rule gathering keeps each
-  rule's split selectors, specificities and combinator flags.
+  rule's split selectors and specificities.
+- ✅ **A change restyles what the rules read.** Matching marks a parent whose children
+  were tested by position (`:first-child`, `:nth-*`) or by sibling (`+`, `~`), and an
+  element tested with `:empty`; an inserted child restyles alone unless its parent is
+  marked (every `appendChild` into `<body>` restyled the page). A class, id or `data-*`
+  that no rule names restyles nothing (a class on `<html>` cost a full restyle and
+  relayout: 300 ms on a saved Wikipedia article, 250–430 ms on GitHub; now 35 and 7 ms).
+  A changed rule recomputes the elements it is keyed by, and their subtrees only when
+  the result differs. Live bbc.com/news: 10,000 cascades to 4,600.
+- ✅ **`selectorText` as Chrome prints it.** A serializer instead of regexes: attribute
+  values double-quoted, An+B shortest, names re-escaped, pseudo and type names
+  lowercased, comments dropped. The old one spaced `~=` like a combinator, so
+  `[typeof~='mw:File/Thumb']` never matched (Wikipedia's figures were not tables) and
+  each such rule restyled the whole page when added.
 
 Open:
 - ⬜ **Matching is still the cascade's main cost** (GitHub ~0.08 ms per element, Chrome

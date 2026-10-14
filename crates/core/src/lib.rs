@@ -10448,6 +10448,113 @@ mod tests {
         );
     }
 
+    /// `selectorText` as Chrome 151 prints it: attribute values double-quoted
+    /// (`~=` is not a combinator), An+B shortest, names re-escaped, pseudo and
+    /// type names lowercased, `:before` as `::before`. Pairs from Chrome.
+    #[tokio::test]
+    async fn selector_text_serializes_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><head></head><body></body></html>").await.unwrap();
+        let pairs = r##"[["[rel~='mw:x']::before", "[rel~=\"mw:x\"]::before"], ["a[rel ~= 'y'] b", "a[rel~=\"y\"] b"], ["[x|=a]~p", "[x|=\"a\"] ~ p"], ["[x^=a] + [y$=b]~[z*=c]", "[x^=\"a\"] + [y$=\"b\"] ~ [z*=\"c\"]"], ["[title='a\"b']", "[title=\"a\\\"b\"]"], ["[title='a\\\\b']", "[title=\"a\\\\b\"]"], ["[data-x=a i]", "[data-x=\"a\" i]"], ["[data-x=\"a\"i]", "[data-x=\"a\" i]"], [":nth-child( 2n + 1 )", ":nth-child(2n+1)"], [":nth-child(2N+1 of .a,.b)", ":nth-child(2n+1 of .a, .b)"], [":nth-child(even)", ":nth-child(2n)"], [":nth-child(+5)", ":nth-child(5)"], [":nth-child(0n+0)", ":nth-child(0)"], [":nth-child(odd of a>b)", ":nth-child(2n+1 of a > b)"], [":is(a,b)>c", ":is(a, b) > c"], [":not( .a , .b )", ":not(.a, .b)"], [":has(>img)", ":has(> img)"], [":has( + p)", ":has(+ p)"], [":has(a,b ~ c)", ":has(a, b ~ c)"], ["a  >  b", "a > b"], ["a\n\tb", "a b"], ["*|a", "a"], ["[|att]", "[att]"], [".\\61 b", ".ab"], ["DIV.Foo", "div.Foo"], ["A:HOVER", "a:hover"], ["p::BEFORE", "p::before"], [":Is(A)", ":is(a)"], ["a,b", "a, b"], ["a , b", "a, b"], ["[ data-x ]", "[data-x]"], ["[data-x= \"v\" ]", "[data-x=\"v\"]"], ["[DATA-X]", "[data-x]"], ["p:first-line", "p::first-line"], ["p:before", "p::before"], ["[x='']", "[x=\"\"]"], ["[x=\"\\0\"]", "[x=\"\ufffd\"]"], ["[x=\"\\a\"]", "[x=\"\\a \"]"], ["[x=a\\ b]", "[x=\"a b\"]"], ["[x=\"\\41\"]", "[x=\"A\"]"], [":nth-child(2n+ 1)", ":nth-child(2n+1)"], [":nth-child(2n +1)", ":nth-child(2n+1)"], ["foreignObject", "foreignobject"], ["[viewBox]", "[viewbox]"], ["linearGradient > STOP", "lineargradient > stop"], ["svg FOREIGNOBJECT", "svg foreignobject"], ["a[href$='.PDF' I]", "a[href$=\".PDF\" i]"], ["a:NOT(.B)", "a:not(.B)"], ["::Part(Foo)", "::part(Foo)"], [":HAS(> A)", ":has(> a)"], ["a:-webkit-any(b,c)", "a:-webkit-any(b, c)"], [":host(DIV)", ":host(div)"], ["::slotted(SPAN)", "::slotted(span)"], ["::cue(B)", "::cue(b)"], ["p:first-letter", "p::first-letter"], [":nth-child(3n - 2)", ":nth-child(3n-2)"], [":nth-child(-n- 2)", ":nth-child(-n-2)"], [":nth-child(n+0)", ":nth-child(n)"], [":nth-child(1n+0)", ":nth-child(n)"], [":nth-child(-1n+1)", ":nth-child(-n+1)"], [":nth-child(+n)", ":nth-child(n)"], [":nth-child(+n+1)", ":nth-child(n+1)"], ["a/**/>b", "a > b"], ["*.a", ".a"], ["*#b", "#b"], ["*[c]", "[c]"], ["a  ,  b  ,c", "a, b, c"], ["*::before", "::before"], ["*:hover", ":hover"], ["*|*", "*"], ["[title=\"a > b\"]", "[title=\"a > b\"]"], ["li:nth-last-of-type(-n+3)", "li:nth-last-of-type(-n+3)"], [":nth-child(-2n-1)", ":nth-child(-2n-1)"], [":nth-of-type(n)", ":nth-of-type(n)"], [":where(.a)", ":where(.a)"], ["[*|att]", "[*|att]"], ["|a", "|a"], [".a\\:b", ".a\\:b"], ["#\\31 23", "#\\31 23"], [".a\\ b", ".a\\ b"]]"##;
+        let got = ctx
+            .evaluate(&format!(
+                "(() => {{ const bad = [];
+                   for (const [sel, want] of {pairs}) {{
+                     const s = document.createElement('style'); s.textContent = sel + ' {{ color: red }}'; document.head.appendChild(s);
+                     const r = s.sheet.cssRules[0], got = r ? r.selectorText : null; s.remove();
+                     if (got !== want) bad.push(sel + ' => ' + got + ' (want ' + want + ')');
+                   }}
+                   return JSON.stringify(bad); }})()"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(got, "[]");
+    }
+
+    /// Children inserted and removed, classes, ids and data attributes changed:
+    /// what restyles goes by what the rules read (`:first-child`, `+`/`~`,
+    /// `:empty`, `:nth-child(of)`, `:has()`), as in Chrome 151 on this page.
+    #[tokio::test]
+    async fn mutations_restyle_what_rules_read() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", r##"<!doctype html><html><head><style>
+#a > li:first-child { color: rgb(1, 0, 0) }
+#a > li:last-child { margin-left: 3px }
+#a > li:nth-child(2n) { padding-top: 2px }
+#b > .x + i { color: rgb(0, 2, 0) }
+#b > .x ~ u { margin-left: 4px }
+#c:empty { color: rgb(0, 0, 3) }
+#c:empty + p { margin-left: 5px }
+#d > s:nth-child(1 of .k) { color: rgb(4, 4, 4) }
+#e:has(> *) { color: rgb(5, 0, 5) }
+.on #f { color: rgb(6, 6, 0) }
+#g[data-m] { margin-left: 7px }
+#h:only-child { padding-left: 8px }
+#j:first-of-type b { color: rgb(9, 0, 0) }
+</style></head><body>
+<ul id=a><li id=a1>1</li><li id=a2>2</li></ul>
+<div id=b><span id=b0></span><i id=b1></i><u id=b2></u></div>
+<div id=cw><div id=c></div><p id=cp>p</p></div>
+<div id=d><s id=d1></s><s id=d2 class=k></s></div>
+<div id=e></div>
+<div id=fw><span id=f>f</span></div>
+<div id=g></div>
+<div id=hw><span id=h></span></div>
+<div id=jw><p id=j><b id=jb>b</b></p></div>
+</body></html>"##).await.unwrap();
+        let got = ctx.evaluate(r##"(() => {
+  const $ = (id) => document.getElementById(id), cs = (e, p) => getComputedStyle(typeof e === 'string' ? $(e) : e)[p];
+  const r = [];
+  const read = (tag) => r.push(tag + ':' + [cs('a1','color'), cs('a2','marginLeft'), cs('a2','paddingTop'), cs($('a').firstElementChild,'color'),
+    cs('b1','color'), cs('b2','marginLeft'), cs('c','color'), cs('cp','marginLeft'), cs('d1','color'), cs('d2','color'),
+    cs('e','color'), cs('f','color'), cs('g','marginLeft'), cs('h','paddingLeft'), cs('jb','color')].join(','));
+  read('0');
+  const n = document.createElement('li'); $('a').insertBefore(n, $('a1')); read('1');
+  $('a').appendChild(document.createElement('li')); read('2');
+  $('b0').className = 'x'; read('3');
+  $('b0').className = ''; read('4');
+  $('c').appendChild(document.createTextNode('t')); read('5');
+  $('c').textContent = ''; read('6');
+  $('d1').className = 'k'; read('7');
+  $('e').appendChild(document.createElement('i')); read('8');
+  $('e').firstChild.remove(); read('9');
+  document.body.className = 'on'; read('10');
+  document.body.className = 'zzz'; read('11');
+  $('g').setAttribute('data-m', ''); read('12');
+  $('g').setAttribute('data-unused', '1'); read('13');
+  $('hw').appendChild(document.createElement('em')); read('14');
+  $('hw').lastChild.remove(); read('15');
+  $('jw').insertBefore(document.createElement('p'), $('j')); read('16');
+  $('jw').firstChild.remove(); read('17');
+  return r.join('\n');
+})()"##).await.unwrap();
+        let want = [
+            "0:rgb(1, 0, 0),3px,2px,rgb(1, 0, 0),rgb(0, 0, 0),0px,rgb(0, 0, 3),5px,rgb(0, 0, 0),rgb(4, 4, 4),rgb(0, 0, 0),rgb(0, 0, 0),0px,8px,rgb(9, 0, 0)",
+            "1:rgb(0, 0, 0),3px,0px,rgb(1, 0, 0),rgb(0, 0, 0),0px,rgb(0, 0, 3),5px,rgb(0, 0, 0),rgb(4, 4, 4),rgb(0, 0, 0),rgb(0, 0, 0),0px,8px,rgb(9, 0, 0)",
+            "2:rgb(0, 0, 0),0px,0px,rgb(1, 0, 0),rgb(0, 0, 0),0px,rgb(0, 0, 3),5px,rgb(0, 0, 0),rgb(4, 4, 4),rgb(0, 0, 0),rgb(0, 0, 0),0px,8px,rgb(9, 0, 0)",
+            "3:rgb(0, 0, 0),0px,0px,rgb(1, 0, 0),rgb(0, 2, 0),4px,rgb(0, 0, 3),5px,rgb(0, 0, 0),rgb(4, 4, 4),rgb(0, 0, 0),rgb(0, 0, 0),0px,8px,rgb(9, 0, 0)",
+            "4:rgb(0, 0, 0),0px,0px,rgb(1, 0, 0),rgb(0, 0, 0),0px,rgb(0, 0, 3),5px,rgb(0, 0, 0),rgb(4, 4, 4),rgb(0, 0, 0),rgb(0, 0, 0),0px,8px,rgb(9, 0, 0)",
+            "5:rgb(0, 0, 0),0px,0px,rgb(1, 0, 0),rgb(0, 0, 0),0px,rgb(0, 0, 0),0px,rgb(0, 0, 0),rgb(4, 4, 4),rgb(0, 0, 0),rgb(0, 0, 0),0px,8px,rgb(9, 0, 0)",
+            "6:rgb(0, 0, 0),0px,0px,rgb(1, 0, 0),rgb(0, 0, 0),0px,rgb(0, 0, 3),5px,rgb(0, 0, 0),rgb(4, 4, 4),rgb(0, 0, 0),rgb(0, 0, 0),0px,8px,rgb(9, 0, 0)",
+            "7:rgb(0, 0, 0),0px,0px,rgb(1, 0, 0),rgb(0, 0, 0),0px,rgb(0, 0, 3),5px,rgb(4, 4, 4),rgb(0, 0, 0),rgb(0, 0, 0),rgb(0, 0, 0),0px,8px,rgb(9, 0, 0)",
+            "8:rgb(0, 0, 0),0px,0px,rgb(1, 0, 0),rgb(0, 0, 0),0px,rgb(0, 0, 3),5px,rgb(4, 4, 4),rgb(0, 0, 0),rgb(5, 0, 5),rgb(0, 0, 0),0px,8px,rgb(9, 0, 0)",
+            "9:rgb(0, 0, 0),0px,0px,rgb(1, 0, 0),rgb(0, 0, 0),0px,rgb(0, 0, 3),5px,rgb(4, 4, 4),rgb(0, 0, 0),rgb(0, 0, 0),rgb(0, 0, 0),0px,8px,rgb(9, 0, 0)",
+            "10:rgb(0, 0, 0),0px,0px,rgb(1, 0, 0),rgb(0, 0, 0),0px,rgb(0, 0, 3),5px,rgb(4, 4, 4),rgb(0, 0, 0),rgb(0, 0, 0),rgb(6, 6, 0),0px,8px,rgb(9, 0, 0)",
+            "11:rgb(0, 0, 0),0px,0px,rgb(1, 0, 0),rgb(0, 0, 0),0px,rgb(0, 0, 3),5px,rgb(4, 4, 4),rgb(0, 0, 0),rgb(0, 0, 0),rgb(0, 0, 0),0px,8px,rgb(9, 0, 0)",
+            "12:rgb(0, 0, 0),0px,0px,rgb(1, 0, 0),rgb(0, 0, 0),0px,rgb(0, 0, 3),5px,rgb(4, 4, 4),rgb(0, 0, 0),rgb(0, 0, 0),rgb(0, 0, 0),7px,8px,rgb(9, 0, 0)",
+            "13:rgb(0, 0, 0),0px,0px,rgb(1, 0, 0),rgb(0, 0, 0),0px,rgb(0, 0, 3),5px,rgb(4, 4, 4),rgb(0, 0, 0),rgb(0, 0, 0),rgb(0, 0, 0),7px,8px,rgb(9, 0, 0)",
+            "14:rgb(0, 0, 0),0px,0px,rgb(1, 0, 0),rgb(0, 0, 0),0px,rgb(0, 0, 3),5px,rgb(4, 4, 4),rgb(0, 0, 0),rgb(0, 0, 0),rgb(0, 0, 0),7px,0px,rgb(9, 0, 0)",
+            "15:rgb(0, 0, 0),0px,0px,rgb(1, 0, 0),rgb(0, 0, 0),0px,rgb(0, 0, 3),5px,rgb(4, 4, 4),rgb(0, 0, 0),rgb(0, 0, 0),rgb(0, 0, 0),7px,8px,rgb(9, 0, 0)",
+            "16:rgb(0, 0, 0),0px,0px,rgb(1, 0, 0),rgb(0, 0, 0),0px,rgb(0, 0, 3),5px,rgb(4, 4, 4),rgb(0, 0, 0),rgb(0, 0, 0),rgb(0, 0, 0),7px,8px,rgb(0, 0, 0)",
+            "17:rgb(0, 0, 0),0px,0px,rgb(1, 0, 0),rgb(0, 0, 0),0px,rgb(0, 0, 3),5px,rgb(4, 4, 4),rgb(0, 0, 0),rgb(0, 0, 0),rgb(0, 0, 0),7px,8px,rgb(9, 0, 0)",
+        ];
+        assert_eq!(got, want.join("\n"));
+    }
+
     /// Modern CSS values: `var()` with fallback, registered custom properties,
     /// `calc()`/`min()`/`clamp()`, `dvh`, root `rem`, `box-sizing: inherit` and grid
     /// with `gap`. Numbers from Chrome 151 on the same markup (1920x942 window).
