@@ -9317,6 +9317,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   const __moActive = new Set();
   let __moScheduled = false;
 
+  // Bookkeeping left behind, for tests: registrations (transient ones too)
+  // and observers waiting for delivery.
+  Object.defineProperty(globalThis, '__pt_moStats', { value: () => ({ regs: __moLive, active: __moActive.size }), configurable: true, enumerable: false });
   function __moActivate(st) {
     __moActive.add(st);
     if (!__moScheduled) { __moScheduled = true; queueMicrotask(__moDeliver); }

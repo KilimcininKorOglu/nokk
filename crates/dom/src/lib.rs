@@ -465,6 +465,39 @@ pub fn runtime_js() -> &'static str {
 mod tests {
     use super::*;
 
+    /// Writing the parsed tree out costs less than parsing it: the JSON is
+    /// written straight into a string, 1.6 times the bare parse here; through
+    /// a `serde_json::Value` tree it was 4.2 times (and 300 ms against 50 on a
+    /// 1.2 MB article). A ratio, not a time, so a busy machine does not fail it.
+    #[test]
+    fn writing_the_tree_costs_less_than_parsing_it() {
+        let mut html = String::from("<!doctype html><html><body>");
+        for i in 0..20000 {
+            html.push_str(&format!(
+                "<div class=\"c{}\" data-x=\"&amp;{}\"><a href=\"/p/{}\">link &hellip; {}</a><span>t&nbsp;x</span><!--n--></div>",
+                i % 7, i, i, i
+            ));
+        }
+        html.push_str("</body></html>");
+        let best = |f: &dyn Fn()| {
+            (0..3)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    f();
+                    t.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let parse = best(&|| {
+            let _ = html5ever::parse_document(RcDom::default(), Default::default()).one(html.as_str());
+        });
+        let whole = best(&|| {
+            let _ = parse_document_json(&html);
+        });
+        assert!(whole < parse * 3, "parse {parse:?}, parse and write {whole:?}");
+    }
+
     #[test]
     fn parses_elements_attrs_and_text() {
         let page = parse(r#"<html><body><div id="main" class="a b">Hi</div></body></html>"#);

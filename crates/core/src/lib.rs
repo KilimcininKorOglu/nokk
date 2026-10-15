@@ -11254,6 +11254,43 @@ frame same window: true mark 7 focus in
 typeof function len 2 doc function frag function"##.into()), "mv");
     }
 
+    /// Mutation observers leave nothing behind: registrations go with
+    /// `disconnect`, a removed node's transient registrations with the next
+    /// delivery, and nothing lists the observers themselves (every observer a
+    /// page ever made was kept in a list for the life of the page). With no
+    /// observer a mutation costs no ancestor walk.
+    #[tokio::test]
+    async fn mutation_observers_leave_nothing_behind() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<!doctype html><body></body>").await.unwrap();
+        ctx.evaluate(r#"(async () => {
+          const out = [];
+          const root = document.createElement('div'); document.body.append(root);
+          let seen = 0;
+          const obs = [];
+          for (let i = 0; i < 2000; i++) {
+            const box = document.createElement('div'), kid = document.createElement('span');
+            box.append(kid); root.append(box);
+            const mo = new MutationObserver((l) => { seen += l.length; });
+            mo.observe(box, { childList: true, subtree: true, attributes: true });
+            kid.remove(); kid.setAttribute('x', '1');
+            obs.push(mo);
+          }
+          out.push(JSON.stringify(__pt_moStats()));
+          await new Promise((r) => setTimeout(r, 0));
+          out.push(seen, JSON.stringify(__pt_moStats()));
+          for (const mo of obs) mo.disconnect();
+          out.push(JSON.stringify(__pt_moStats()));
+          for (let i = 0; i < 2000; i++) new MutationObserver(() => {});
+          out.push(JSON.stringify(__pt_moStats()));
+          globalThis.__out = out.join(' ');
+        })()"#).await.unwrap();
+        let got = pump_until(&ctx, "globalThis.__out || ''", 40).await;
+        assert_eq!(got, Value::String(r#"{"regs":4000,"active":2000} 4000 {"regs":2000,"active":0} {"regs":0,"active":0} {"regs":0,"active":0}"#.into()));
+    }
+
     /// Trees thousands deep, built by a script, as Chrome 151 handles them on
     /// a page with `<p>std</p>`: at 20,000 levels `querySelectorAll`,
     /// `textContent`, `innerHTML` and `cloneNode` answer (they overflowed the
