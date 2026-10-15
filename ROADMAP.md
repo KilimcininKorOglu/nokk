@@ -517,8 +517,21 @@ Done:
   lowercased, comments dropped. The old one spaced `~=` like a combinator, so
   `[typeof~='mw:File/Thumb']` never matched (Wikipedia's figures were not tables) and
   each such rule restyled the whole page when added.
+- ✅ **A layout is a third cheaper.** A kept layout is a tree (the element's result and
+  its children's entries) instead of a flat copy of the whole subtree per element:
+  228,000 records for 12,800 elements on a Wikipedia article. Font sizes fold down
+  from the parent's instead of walking every ancestor per element; lengths are
+  parsed once per value text; word widths are kept per font, then per word. The one
+  layout a live Wikipedia load needs (to find the lazy images in view): 416 to 292 ms;
+  peak memory 350 to 328 MB.
 
 Open:
+- ⬜ **Layout differences found on a font-size page** (Chrome 151, same page): text
+  before a block child makes no line (`<div>a<div>b</div></div>` is 34px shorter);
+  a `0.67em` heading margin is not snapped to 1/64 px, so later boxes sit off the
+  grid and move by 36.988 instead of 37 when a 37px block is inserted above; `<pre>`
+  under a `calc()`-sized 26px parent is 13px (Chrome 26px); `font-size` prints 4
+  decimals (`8.3333px`, Chrome `8.33333px`).
 - ⬜ **Matching is still the cascade's main cost** (GitHub ~0.08 ms per element, Chrome
   well under that); siblings differ in attribute values often enough (links) that
   sharing reaches a few percent of elements. Next: a matched-properties cache (one

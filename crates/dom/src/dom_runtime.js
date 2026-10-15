@@ -129,7 +129,8 @@
     if (t0 < __lazyNext && view === __lazyView) return;
     __lazyAt = at;
     __lazyView = view;
-    try { __lazyRun(sx, sy, vw, vh); } finally { __lazyNext = __perfNow() + Math.max(100, 4 * (__perfNow() - t0)); }
+    __lstats.lazyRuns++;
+    try { __lazyRun(sx, sy, vw, vh); } finally { __lstats.lazyMs += __perfNow() - t0; __lazyNext = __perfNow() + Math.max(100, 4 * (__perfNow() - t0)); }
   };
   function __lazyRun(sx, sy, vw, vh) {
     const go = [];
@@ -10336,6 +10337,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // Font size and inherited values walk the ancestors and are asked many
   // times per pass; cache them for the cascade's lifetime.
   let __passFont = new WeakMap();
+  let __passFold = new WeakMap();
   let __passCustom = new WeakMap();
   // Hidden by the cascade: `display: none`, or with `invisible` also
   // `visibility: hidden`/`collapse`. Read off the element's cascade, which is
@@ -10967,6 +10969,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __rules = [];
     __passBloom = new WeakMap();
     __passFont = new WeakMap();
+    __passFold = new WeakMap();
     __passCustom = new WeakMap();
     __foreignRules = new WeakMap();
     const doc = globalThis.document;
@@ -11634,22 +11637,34 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   const __CALC_FN = /(?:^|[^\w-])(?:-webkit-)?(?:calc|min|max|clamp)\(/i;
 
+  // Values parsed once by their text, resolved per call: layout asks for
+  // twenty lengths per element, mostly the same few strings.
+  let __lengthParsed = new Map();
+  const __LENGTH_NONE = { none: true };
+  function __lengthParse(raw) {
+    const v = __s_trim(raw);
+    const m = /^(-?(?:\d+\.?\d*|\.\d+))([a-z%]*)$/i.exec(v);
+    if (m) {
+      const u = __s_toLowerCase(m[2]);
+      // Viewport units and percentages are kept at 1/64 px precision.
+      return { n: parseFloat(m[1]), u, fine: u === '%' || /v/.test(u), calc: null };
+    }
+    if (__CALC_FN.test(v)) return { n: 0, u: '', fine: true, calc: v };
+    return __LENGTH_NONE;
+  }
   function __lengthPx(raw, fs, base) {
     if (raw == null) return null;
-    const v = __s_trim(String(raw));
-    let m;
-    if ((m = /^(-?(?:\d+\.?\d*|\.\d+))([a-z%]*)$/i.exec(v))) {
-      const u = __s_toLowerCase(m[2]);
-      const px = __unitPx(parseFloat(m[1]), u, fs, base);
-      if (px == null) return null;
-      // Viewport units and percentages are kept at 1/64 px precision.
-      return u === '%' || /v/.test(u) ? Math.round(px * 64) / 64 : px;
+    const key = typeof raw === 'string' ? raw : String(raw);
+    let p = __lengthParsed.get(key);
+    if (p === undefined) {
+      if (__lengthParsed.size >= 4096) __lengthParsed = new Map();
+      p = __lengthParse(key);
+      __lengthParsed.set(key, p);
     }
-    if (__CALC_FN.test(v)) {
-      const px = __ptCalcPx(v, fs, base);
-      return px == null ? null : Math.round(px * 64) / 64;
-    }
-    return null;
+    if (p === __LENGTH_NONE) return null;
+    const px = p.calc !== null ? __ptCalcPx(p.calc, fs, base) : __unitPx(p.n, p.u, fs, base);
+    if (px == null) return null;
+    return p.fine ? Math.round(px * 64) / 64 : px;
   }
 
   // `line-height: normal` and baseline ascent come from the face, not a fixed
@@ -11669,15 +11684,21 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // fallback), and layout re-measures the same words on every mutation. The
   // result depends only on string and font; cache it, and restart when full so
   // the map does not grow on pages printing unique text.
-  const __widths = new Map();
+  // By font, then by text: a line's words share one font key.
+  let __widths = new Map(), __widthsN = 0;
   // SVG whitespace collapses: newlines dropped, tabs become spaces, runs
   // squeezed, ends trimmed. `<text>  ii  </text>` measures as "ii".
   const __svgText = (el) => __s_trim(__s_replace(__s_replace(__s_replace(String((el && el.textContent) || ''), /[\r\n]/g, ''), /\t/g, ' '), / +/g, ' '));
 
-  function __textMetrics(text, fs, family, bold, italic) {
-    const t = String(text);
-    const key = fs + '|' + (family || 'sans-serif') + '|' + (bold ? 1 : 0) + (italic ? 1 : 0) + '|' + t;
-    const hit = __widths.get(key);
+  function __fontWidths(fs, family, bold, italic) {
+    const key = fs + '|' + (family || 'sans-serif') + '|' + (bold ? 1 : 0) + (italic ? 1 : 0);
+    let byText = __widths.get(key);
+    if (byText === undefined) __widths.set(key, (byText = new Map()));
+    return byText;
+  }
+  function __textMetricsIn(byText, text, fs, family, bold, italic) {
+    const t = typeof text === 'string' ? text : String(text);
+    const hit = byText.get(t);
     if (hit !== undefined) return hit;
     let m = null;
     if (typeof __pt_canvasMeasureText === 'function') {
@@ -11685,9 +11706,17 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       catch (e) {}
     }
     if (!m) m = [t.length * fs * 0.5, 0, t.length * fs * 0.5, fs * 0.9, fs * 0.2, fs * 0.9, fs * 0.2, fs * 1.15];
-    if (__widths.size > 20000) __widths.clear();
-    __widths.set(key, m);
+    // Restart when full, so pages printing unique text do not grow it.
+    if (++__widthsN > 20000) {
+      __widths = new Map();
+      __widthsN = 1;
+      byText = __fontWidths(fs, family, bold, italic);
+    }
+    byText.set(t, m);
     return m;
+  }
+  function __textMetrics(text, fs, family, bold, italic) {
+    return __textMetricsIn(__fontWidths(fs, family, bold, italic), text, fs, family, bold, italic);
   }
 
   function __textWidth(text, fs, family, bold, italic) {
@@ -11711,14 +11740,15 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     // line is its words and the spaces between them: each word is measured
     // once, not every prefix of the line again (quadratic in the words).
     const ceil64 = (v) => Math.ceil(v * 64 - 1e-6) / 64;
-    const space = __textMetrics(' ', fs, family, bold, false)[0] || 0;
-    let start = 0, acc = __textMetrics(words[0], fs, family, bold, false)[0] || 0;
+    const byText = __fontWidths(fs, family, bold, false);
+    const space = __textMetricsIn(byText, ' ', fs, family, bold, false)[0] || 0;
+    let start = 0, acc = __textMetricsIn(byText, words[0], fs, family, bold, false)[0] || 0;
     const flush = (end) => {
       const text = words.slice(start, end).join(' ');
       out.push({ text, width: __textWidth(text, fs, family, bold, false) });
     };
     for (let i = 1; i < words.length; i++) {
-      const w = __textMetrics(words[i], fs, family, bold, false)[0] || 0;
+      const w = __textMetricsIn(byText, words[i], fs, family, bold, false)[0] || 0;
       const next = acc + space + w;
       if (ceil64(next) > maxWidth) {
         flush(i);
@@ -12007,61 +12037,105 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __ptTellFrame(el, box);
   }
   const __on64 = (v) => typeof v === 'number' && Number.isInteger(v * 64) && Math.abs(v) < 2 ** 40;
-  function __layoutOne(el, originX, originY, availW, strut, forced) {
-    if (forced && forced.cb) return __layoutOneRaw(el, originX, originY, availW, strut, forced);
-    const up = el.__ptParent;
-    const key = availW + '|' + (strut ? strut.line + ',' + strut.asc + ',' + strut.desc : '-') + '|'
-      + (forced ? (forced.w === undefined ? 'u' : forced.w) + ',' + (forced.h === undefined ? 'u' : forced.h) + ',' + (forced.block ? 1 : 0) : '-')
-      + '|' + (up && up.__ptType === ELEMENT_NODE ? up.__ptDefH : '-');
-    let mine = __layoutMemo.get(el);
-    const hit = mine && mine.get(key);
-    if (hit) {
-      const dx = originX - hit.ox, dy = originY - hit.oy;
-      if (__on64(dx) && __on64(dy)) {
-        const snap = hit.snap;
-        for (let k = 0; k < snap.length; k += 4) {
-          const node = snap[k], off = snap[k + 3];
-          node.__ptBox = snap[k + 1];
-          node.__ptBoxV = __layoutBuilt;
-          node.__ptDefH = snap[k + 2];
-          node.__ptOff = off ? [off[0], off[1]] : null;
-        }
-        // The subtree moves with its root, pending like any other move.
-        if ((dx || dy) && el.__ptBox) __ptShiftBox(el, el.__ptBox.x + dx, el.__ptBox.y + dy);
-        for (const n of hit.seq) __boxes.push(n);
-        for (const [n, b] of hit.tells) __ptTellLogged(n, b);
-        return el.__ptBox;
+  // A kept layout is a tree: the element's own result and, per child laid
+  // out under it (in first-call order), the child's last entry and where
+  // the child ended up (the parent may move it after). A flat copy of the
+  // whole subtree per element cost depth x size: 228,000 records for 12,800
+  // elements on a Wikipedia article.
+  // `__layoutKids`: the children laid out so far by the call in progress
+  // (a Map), `true` while it has none yet, null outside a layout.
+  let __layoutKids = null;
+  const __NO_KIDS = [];
+  const __offCopy = (off) => (off ? [off[0], off[1]] : null);
+  // Mostly empty, and the first write of an engine field on an element
+  // defines a property: unset stays unset.
+  const __setDefH = (el, v) => { if (v != null || el.__ptDefH != null) el.__ptDefH = v; };
+  const __setOff = (el, v) => { if (v || el.__ptOff) el.__ptOff = v; };
+  function __layoutRestore(ent, el) {
+    __boxes.push(el);
+    const kids = ent.kids;
+    for (let i = 0; i < kids.length; i += 5) {
+      const c = kids[i];
+      __layoutRestore(kids[i + 1], c);
+      if (kids[i + 2]) {
+        c.__ptBox = kids[i + 2];
+        c.__ptBoxV = __layoutBuilt;
+        __setDefH(c, kids[i + 3]);
+        __setOff(c, __offCopy(kids[i + 4]));
       }
     }
-    const start = __boxes.length, tellStart = __tellLog.length;
-    const ret = __layoutOneRaw(el, originX, originY, availW, strut, forced);
-    const tells = __s_slice(__tellLog, tellStart);
-    // Each node once: a child laid out twice (measure, then place) appeared
-    // twice, its parent's list doubled that, and so on up the tree; replaying
-    // copied it all back. Deep flex trees (facebook.com) grew the heap by
-    // gigabytes a second.
-    const seq = [], snap = [];
-    const seen = new Set();
-    for (let i = start; i < __boxes.length; i++) {
-      const n = __boxes[i];
-      if (seen.has(n)) continue;
-      seen.add(n);
-      seq.push(n);
-      // Flat (node, box, defH, off) runs: one array per entry instead of five.
-      if (n.__ptBox) snap.push(n, n.__ptBox, n.__ptDefH, n.__ptOff ? [n.__ptOff[0], n.__ptOff[1]] : null);
+    if (ent.box) {
+      el.__ptBox = ent.box;
+      el.__ptBoxV = __layoutBuilt;
+      __setDefH(el, ent.defH);
+      __setOff(el, __offCopy(ent.off));
     }
-    if (!mine) __layoutMemo.set(el, (mine = new Map()));
-    // Kept across passes now: a few constraint sets per element, not all of
-    // them ever seen.
-    else if (mine.size >= 8) mine.clear();
-    // Copies at their length: a pushed-to array keeps spare room.
-    mine.set(key, { ox: originX, oy: originY, snap: snap.slice(), seq: seq.slice(), tells });
+  }
+  function __layoutOne(el, originX, originY, availW, strut, forced) {
+    // Absolute children are placed against a containing block the key does
+    // not hold: laid out fresh, never kept on their own.
+    const keep = !(forced && forced.cb);
+    let key = null, mine;
+    if (keep) {
+      const up = el.__ptParent;
+      key = availW + '|' + (strut ? strut.line + ',' + strut.asc + ',' + strut.desc : '-') + '|'
+        + (forced ? (forced.w === undefined ? 'u' : forced.w) + ',' + (forced.h === undefined ? 'u' : forced.h) + ',' + (forced.block ? 1 : 0) : '-')
+        + '|' + (up && up.__ptType === ELEMENT_NODE ? (up.__ptDefH == null ? null : up.__ptDefH) : '-');
+      mine = __layoutMemo.get(el);
+      const hit = mine && mine.get(key);
+      if (hit) {
+        const dx = originX - hit.ox, dy = originY - hit.oy;
+        if (__on64(dx) && __on64(dy)) {
+          __layoutRestore(hit, el);
+          // The subtree moves with its root, pending like any other move.
+          if ((dx || dy) && el.__ptBox) __ptShiftBox(el, el.__ptBox.x + dx, el.__ptBox.y + dy);
+          for (const [n, b] of hit.tells) __ptTellLogged(n, b);
+          if (__layoutKids !== null) {
+            if (__layoutKids === true) __layoutKids = new Map();
+            __layoutKids.set(el, hit);
+          }
+          return el.__ptBox;
+        }
+      }
+    }
+    const outer = __layoutKids, tellStart = __tellLog.length;
+    __layoutKids = true;
+    let ret, kids;
+    try {
+      ret = __layoutOneRaw(el, originX, originY, availW, strut, forced);
+    } finally {
+      kids = __layoutKids;
+      __layoutKids = outer;
+    }
+    const list = [];
+    if (kids !== true) {
+      for (const [c, e] of kids) list.push(c, e, c.__ptBox, c.__ptDefH, __offCopy(c.__ptOff));
+    }
+    const ent = {
+      ox: originX, oy: originY, box: el.__ptBox, defH: el.__ptDefH, off: __offCopy(el.__ptOff),
+      // At their length: a pushed-to array keeps spare room.
+      kids: list.length ? list.slice() : __NO_KIDS,
+      tells: __tellLog.length > tellStart ? __s_slice(__tellLog, tellStart) : __NO_KIDS,
+    };
+    if (outer !== null) {
+      if (outer === true) __layoutKids = new Map();
+      __layoutKids.set(el, ent);
+    }
+    if (keep) {
+      if (!mine) __layoutMemo.set(el, (mine = new Map()));
+      // Kept across passes now: a few constraint sets per element, not all of
+      // them ever seen.
+      else if (mine.size >= 8) mine.clear();
+      mine.set(key, ent);
+    }
     return ret;
   }
 
+  const __MARGIN_SIDES = ['margin-top', 'margin-right', 'margin-bottom', 'margin-left'];
+  const __PADDING_SIDES = ['padding-top', 'padding-right', 'padding-bottom', 'padding-left'];
   function __layoutOneRaw(el, originX, originY, availW, strut, forced) {
     __lstats.layoutEls++;
-    el.__ptOff = null;
+    __setOff(el, null);
     // Document order, not after children: hit testing scans from the end and a
     // deeper element must come after its parent.
     __boxes.push(el);
@@ -12084,25 +12158,25 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     const bold = /(^|\s)(bold|[5-9]00)(\s|$)/i.test(String(weight || ''));
     const len = (name, base) => __lengthPx(cs.get(name), fs, base);
-    const side = (prefix, suffix) => {
+    const side = (prefix, names) => {
+      const one = [len(names[0], availW), len(names[1], availW), len(names[2], availW), len(names[3], availW)];
       const all = cs.get(prefix);
-      const one = ['top', 'right', 'bottom', 'left'].map((k) => len(prefix + '-' + k, availW));
       if (all != null) {
         const parts = __s_split(__s_trim(String(all)), /\s+/);
-        const pick = (i) => parts[[0, 1, 2, 3].map((k) => Math.min(k, parts.length - 1))[i]];
-        ['top', 'right', 'bottom', 'left'].forEach((k, i) => {
-          if (one[i] == null) one[i] = __lengthPx(pick(i), fs, availW);
-        });
+        for (let i = 0; i < 4; i++) {
+          if (one[i] == null) one[i] = __lengthPx(parts[Math.min(i, parts.length - 1)], fs, availW);
+        }
       }
       return one;
     };
-    const rawM = side('margin');
+    const rawM = side('margin', __MARGIN_SIDES);
     // An author 0 is a set value: `body { margin: 0 }` must not get the UA 8px.
-    const setM = rawM.map((v) => v != null);
-    let [mt, mr, mb, ml] = rawM.map((v) => v || 0);
-    let [pt_, pr, pb, pl] = side('padding').map((v) => v || 0);
-    let [bt, br, bb, bl] = ['top', 'right', 'bottom', 'left']
-      .map((k) => len('border-' + k + '-width', availW) || 0);
+    const setM = [rawM[0] != null, rawM[1] != null, rawM[2] != null, rawM[3] != null];
+    let mt = rawM[0] || 0, mr = rawM[1] || 0, mb = rawM[2] || 0, ml = rawM[3] || 0;
+    const rawP = side('padding', __PADDING_SIDES);
+    let pt_ = rawP[0] || 0, pr = rawP[1] || 0, pb = rawP[2] || 0, pl = rawP[3] || 0;
+    let bt = len('border-top-width', availW) || 0, br = len('border-right-width', availW) || 0,
+      bb = len('border-bottom-width', availW) || 0, bl = len('border-left-width', availW) || 0;
     const borderAll = cs.get('border') || cs.get('border-width');
     if (borderAll != null && !bt && !br && !bb && !bl) {
       const m = /(-?[\d.]+)px/.exec(String(borderAll));
@@ -12147,7 +12221,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (__cb && __cb.w != null) availW = __cb.w;
     const explicitW = inW(len('width', availW));
     const explicitH = inH(len('height', baseH));
-    el.__ptDefH = explicitH;
+    __setDefH(el, explicitH);
     const frame = tag === 'iframe' || tag === 'img' || tag === 'canvas' || tag === 'video';
     const attrW = frame && el.getAttribute ? __lengthPx(__ptGetA(el, 'width'), fs, availW) : null;
     const attrH = frame && el.getAttribute ? __lengthPx(__ptGetA(el, 'height'), fs, availW) : null;
@@ -12658,7 +12732,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   // Cost counters for profiling the style and layout engine (always on: a few
   // integer increments). `__pt_layoutStats()` reads them.
-  const __lstats = { relayouts: 0, cascades: 0, allStale: 0, dropped: 0, layoutEls: 0, cssScans: 0, cssScanEls: 0, cssScanMs: 0, shared: 0, gathers: 0, gatherRules: 0, gatherMs: 0 };
+  const __lstats = { relayouts: 0, cascades: 0, allStale: 0, dropped: 0, layoutEls: 0, cssScans: 0, cssScanEls: 0, cssScanMs: 0, shared: 0, gathers: 0, gatherRules: 0, gatherMs: 0, relayoutMs: 0, lazyRuns: 0, lazyMs: 0 };
   Object.defineProperty(globalThis, '__pt_layoutStats', { value: () => Object.assign({}, __lstats), configurable: true, enumerable: false });
   // Drop every cached cascade: checks compare incremental styles with a
   // full recomputation.
@@ -12685,8 +12759,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (!__rendered) return;
     __layoutForget();
     __tellLog = [];
+    const r0 = __perfNow();
     __layoutOne(de, 0, 0, LAYOUT.W);
     __layoutSettle(de);
+    __lstats.relayoutMs += __perfNow() - r0;
     // In quirks mode the root and body stretch to the viewport: an empty
     // 300x150 frame gives `html` 150 and body 134, not a line height. Frames
     // without a doctype (`about:blank`, `srcdoc`) are common.
@@ -13725,41 +13801,66 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     'x-large': 24, 'xx-large': 32, 'xxx-large': 48,
   };
 
-  function __usedFontSizeRaw(el) {
-    let size = 16;
+  // One element's `font-size` applied to the size it inherits.
+  function __fontSizeStep(e, size) {
+    const raw = __cascadeFor(e).get('font-size');
+    if (raw == null) {
+      const f = UA_FONT_SIZE[__s_toLowerCase(e.__ptLocal || '')];
+      return f ? size * f : size;
+    }
+    let v = __s_toLowerCase(__s_trim(String(raw)));
+    // `rem` on the root means the initial font size, not its own.
+    if (e.ownerDocument && e === e.ownerDocument.documentElement) v = __s_replace(v, /(\d)rem\b/g, '$1em');
+    if (FONT_KEYWORDS[v]) return FONT_KEYWORDS[v];
+    if (v === 'smaller') return size / 1.2;
+    if (v === 'larger') return size * 1.2;
+    // `em`, percentages, `calc()` and `clamp()` resolve against the parent's size.
+    const px = __lengthPx(v, size, size);
+    return px != null && px >= 0 ? px : size;
+  }
+  // Every `font-size` from the root down applied to 16px, unrounded: the
+  // parent's, kept for the pass, with the element's own on top. Walking the
+  // whole chain per element was a sixth of a Wikipedia layout.
+  function __fontFold(el) {
     const chain = [];
-    for (let e = el; e && e.__ptType === ELEMENT_NODE; e = e.__ptParent) chain.push(e);
+    let size = 16;
+    for (let e = el; e && e.__ptType === ELEMENT_NODE; e = e.__ptParent) {
+      const hit = __passFold.get(e);
+      if (hit !== undefined) { size = hit; break; }
+      chain.push(e);
+    }
+    for (let i = chain.length - 1; i >= 0; i--) {
+      size = __fontSizeStep(chain[i], size);
+      __passFold.set(chain[i], size);
+    }
+    return size;
+  }
+
+  function __usedFontSizeRaw(el) {
     // Form controls do not inherit the page font size; the UA gives their own.
     const own = (el && el.__ptLocal) || '';
+    let start = 16;
     if (own === 'input' || own === 'button' || own === 'select' || own === 'textarea') {
-      size = UA_FORM_FONT;
+      start = UA_FORM_FONT;
       const raw = __cascadeFor(el).get('font-size');
-      if (raw == null) return size;
+      if (raw == null) return start;
     }
     // Monospace text uses 13px, not 16px, so `pre` without its own rule gets
     // 13px margins.
     if (own !== 'textarea' && UA_MONO.has(own)) {
-      size = 13;
+      start = 13;
       const raw = __cascadeFor(el).get('font-size');
-      if (raw == null) return size;
+      if (raw == null) return start;
     }
-    for (let i = chain.length - 1; i >= 0; i--) {
-      const raw = __cascadeFor(chain[i]).get('font-size');
-      if (raw == null) {
-        const f = UA_FONT_SIZE[__s_toLowerCase(chain[i].__ptLocal || '')];
-        if (f) size *= f;
-        continue;
-      }
-      let v = __s_toLowerCase(__s_trim(String(raw)));
-      // `rem` on the root means the initial font size, not its own.
-      const e = chain[i];
-      if (e.ownerDocument && e === e.ownerDocument.documentElement) v = __s_replace(v, /(\d)rem\b/g, '$1em');
-      if (FONT_KEYWORDS[v]) { size = FONT_KEYWORDS[v]; continue; }
-      if (v === 'smaller') { size /= 1.2; continue; }
-      if (v === 'larger') { size *= 1.2; continue; }
-      // `em`, percentages, `calc()` and `clamp()` resolve against the parent's size.
-      const px = __lengthPx(v, size, size);
-      if (px != null && px >= 0) size = px;
+    let size;
+    if (start === 16 && el && el.__ptType === ELEMENT_NODE) size = __fontFold(el);
+    else {
+      // A control with its own size starts from the UA's and folds the
+      // whole chain over it.
+      const chain = [];
+      for (let e = el; e && e.__ptType === ELEMENT_NODE; e = e.__ptParent) chain.push(e);
+      size = start;
+      for (let i = chain.length - 1; i >= 0; i--) size = __fontSizeStep(chain[i], size);
     }
     return Math.round(size * 1e4) / 1e4;
   }

@@ -10725,6 +10725,60 @@ html.dark body .d { background-color: rgb(10, 10, 10) }
         assert_eq!(got, want.join("\n"));
     }
 
+    /// Font sizes fold down the tree (`em`, `%`, `rem` on the root,
+    /// `smaller`/`larger`, keywords, a control with its own size, nested
+    /// `small`, a heading) as in Chrome 151 on this page; kept layouts moved
+    /// by a block inserted above shift by exactly its height (Chrome: 37px)
+    /// and match a full relayout after each change.
+    #[tokio::test]
+    async fn font_sizes_and_kept_layouts_match_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", r##"<!doctype html><html style="font-size: 20px"><head><style>
+body { margin: 0; font-family: sans-serif; }
+.a { font-size: 1.5em } .b { font-size: 50% } .c { font-size: 0.5rem } .e { font-size: larger }
+.f { font-size: x-large } .g { font-size: calc(1em + 2px) } input.h { font-size: 2em } .d { font-size: smaller }
+.row { display: flex; gap: 4px } .grid { display: grid; grid-template-columns: 50px auto }
+</style></head><body>
+<div id="row" class="row"><div id="r1">one</div><div id="r2">two words</div><div id="r3"><p id="r3p">three</p></div></div>
+<div id="grid" class="grid"><div id="g1">x</div><div id="g2">y y</div><div id="g3">z</div></div>
+<p id="tail">tail</p>
+<div id="a" class="a">a<div id="b" class="b">b<div id="c" class="c">c<span class="d">d<span id="e" class="e">e</span></span></div></div>
+<div id="f" class="f">f<div id="g" class="g">g<input id="h" class="h"><input id="i"><small id="k">k<small id="l">l</small></small><h1 id="m">m<sub id="n">n</sub></h1></div></div></div>
+</body></html>"##).await.unwrap();
+        let got = ctx.evaluate(r##"(() => {
+  const $ = (id) => document.getElementById(id);
+  const out = ['abcefghiklmn'.split('').map((i) => getComputedStyle($(i)).fontSize).join(' ')];
+  const ids = ['r1', 'r2', 'r3p', 'g1', 'g2', 'g3', 'tail'];
+  const rects = () => ids.map((i) => { const b = $(i).getBoundingClientRect(); return [b.x, b.y, b.width, b.height]; });
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const check = (t) => { const inc = rects(); __pt_styleFlush(); const full = rects(); out.push(t + ':' + (same(inc, full) ? 'same' : 'DIFF ' + JSON.stringify(inc) + ' ' + JSON.stringify(full))); return inc; };
+  const r0 = check('load');
+  const top = document.createElement('div'); top.style.height = '37px';
+  document.body.insertBefore(top, $('row'));
+  const r1 = check('insert');
+  out.push('shift:' + r1.map((r, i) => [r[0] - r0[i][0], r[1] - r0[i][1], r[2] - r0[i][2], r[3] - r0[i][3]].join('/')).join(' '));
+  $('r2').textContent = 'two words more';
+  $('g2').style.paddingLeft = '9px';
+  check('change');
+  top.remove();
+  const r3 = check('remove');
+  out.push('back:' + r3.map((r, i) => r[1] - r0[i][1]).join(' '));
+  return out.join('\n');
+})()"##).await.unwrap();
+        let want = [
+            "30px 15px 10px 10px 24px 26px 52px 13.3333px 21.6667px 18.0556px 52px 43.3333px",
+            "load:same",
+            "insert:same",
+            "shift:0/37/0/0 0/37/0/0 0/37/0/0 0/37/0/0 0/37/0/0 0/37/0/0 0/37/0/0",
+            "change:same",
+            "remove:same",
+            "back:0 0 0 0 0 0 0",
+        ];
+        assert_eq!(got, Value::String(want.join("\n")));
+    }
+
     /// Modern CSS values: `var()` with fallback, registered custom properties,
     /// `calc()`/`min()`/`clamp()`, `dvh`, root `rem`, `box-sizing: inherit` and grid
     /// with `gap`. Numbers from Chrome 151 on the same markup (1920x942 window).
