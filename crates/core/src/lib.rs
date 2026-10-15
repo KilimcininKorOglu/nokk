@@ -579,7 +579,10 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
 }
 
 /// For each `__pt…` name assigned anywhere in `sources` (`.__ptX = `), a setter on
-/// Object.prototype that defines the field as an own non-enumerable property.
+/// Object.prototype that defines the field as an own non-enumerable property. The
+/// getter is a function, not `undefined`: V8 has no fast path for an accessor
+/// without one, so every read of an unset field (`el.__ptNS` on an HTML element)
+/// went through the runtime, a third of the main thread on a Wikipedia article.
 fn internal_field_setters<'a>(sources: impl Iterator<Item = &'a str>) -> String {
     let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for src in sources {
@@ -604,8 +607,9 @@ fn internal_field_setters<'a>(sources: impl Iterator<Item = &'a str>) -> String 
     let list = serde_json::to_string(&names.into_iter().collect::<Vec<_>>()).unwrap_or_else(|_| "[]".into());
     format!(
         "(() => {{ const P = Object.prototype; const def = Object.defineProperty, own = Object.prototype.hasOwnProperty; \
+         const get = function () {{ return undefined; }}; \
          for (const n of {list}) {{ if (own.call(P, n)) continue; \
-         def(P, n, {{ get: undefined, set(v) {{ if (this === null || (typeof this !== 'object' && typeof this !== 'function')) return; \
+         def(P, n, {{ get, set(v) {{ if (this === null || (typeof this !== 'object' && typeof this !== 'function')) return; \
          try {{ def(this, n, {{ value: v, writable: true, enumerable: false, configurable: true }}); }} catch (e) {{}} }}, enumerable: false, configurable: true }}); }} }})();\n"
     )
 }
