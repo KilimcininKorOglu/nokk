@@ -526,6 +526,9 @@ Done:
   peak memory 350 to 328 MB.
 
 Open:
+- ⬜ **Deep trees overflow the layout's stack.** 1,500 nested `<div>`s built by a script:
+  `document.body.offsetHeight` throws `RangeError: Maximum call stack size exceeded`
+  (Chrome 151: 27034). Layout recurses per level, several frames deep.
 - ⬜ **Layout differences found on a font-size page** (Chrome 151, same page): text
   before a block child makes no line (`<div>a<div>b</div></div>` is 34px shorter);
   a `0.67em` heading margin is not snapped to 1/64 px, so later boxes sit off the

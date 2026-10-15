@@ -10725,6 +10725,36 @@ html.dark body .d { background-color: rgb(10, 10, 10) }
         assert_eq!(got, want.join("\n"));
     }
 
+    /// A layout keeps linear records and folds font sizes in linear steps: a
+    /// chain 300 deep with 1,000 paragraphs beside it lays out 1,303 elements,
+    /// keeps 2,605 records (each element once as itself, once as a child) and
+    /// takes 1,303 font-size steps. The flat copy of each subtree and the walk
+    /// over every ancestor took 48,756 of each here (+4 to 8 MB of heap, twice
+    /// the time).
+    #[tokio::test]
+    async fn layout_records_and_font_steps_stay_linear() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<!doctype html><html><body></body></html>").await.unwrap();
+        let got = ctx
+            .evaluate(
+                r#"(() => {
+                  let cur = document.body;
+                  for (let i = 0; i < 300; i++) { const d = document.createElement('div'); d.style.fontSize = i % 2 ? '1em' : '100%';
+                    d.appendChild(document.createTextNode('w' + i)); cur.appendChild(d); cur = d; }
+                  for (let i = 0; i < 1000; i++) { const p = document.createElement('p'); p.textContent = 'p' + i; document.body.appendChild(p); }
+                  const s0 = __pt_layoutStats();
+                  const h = document.body.offsetHeight;
+                  const s1 = __pt_layoutStats();
+                  const laid = s1.layoutEls - s0.layoutEls, kept = s1.keptRecords - s0.keptRecords, steps = s1.fontSteps - s0.fontSteps;
+                  return [h > 0, laid >= 1300, kept <= 2 * laid, steps <= laid].join(); })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(got, Value::String("true,true,true,true".into()));
+    }
+
     /// Font sizes fold down the tree (`em`, `%`, `rem` on the root,
     /// `smaller`/`larger`, keywords, a control with its own size, nested
     /// `small`, a heading) as in Chrome 151 on this page; kept layouts moved

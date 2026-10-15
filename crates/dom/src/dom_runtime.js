@@ -12108,8 +12108,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       __layoutKids = outer;
     }
     const list = [];
+    __lstats.keptRecords++;
     if (kids !== true) {
       for (const [c, e] of kids) list.push(c, e, c.__ptBox, c.__ptDefH, __offCopy(c.__ptOff));
+      __lstats.keptRecords += kids.size;
     }
     const ent = {
       ox: originX, oy: originY, box: el.__ptBox, defH: el.__ptDefH, off: __offCopy(el.__ptOff),
@@ -12732,7 +12734,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   // Cost counters for profiling the style and layout engine (always on: a few
   // integer increments). `__pt_layoutStats()` reads them.
-  const __lstats = { relayouts: 0, cascades: 0, allStale: 0, dropped: 0, layoutEls: 0, cssScans: 0, cssScanEls: 0, cssScanMs: 0, shared: 0, gathers: 0, gatherRules: 0, gatherMs: 0, relayoutMs: 0, lazyRuns: 0, lazyMs: 0 };
+  const __lstats = { relayouts: 0, cascades: 0, allStale: 0, dropped: 0, layoutEls: 0, cssScans: 0, cssScanEls: 0, cssScanMs: 0, shared: 0, gathers: 0, gatherRules: 0, gatherMs: 0, relayoutMs: 0, lazyRuns: 0, lazyMs: 0, keptRecords: 0, fontSteps: 0 };
   Object.defineProperty(globalThis, '__pt_layoutStats', { value: () => Object.assign({}, __lstats), configurable: true, enumerable: false });
   // Drop every cached cascade: checks compare incremental styles with a
   // full recomputation.
@@ -13803,6 +13805,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
 
   // One element's `font-size` applied to the size it inherits.
   function __fontSizeStep(e, size) {
+    __lstats.fontSteps++;
     const raw = __cascadeFor(e).get('font-size');
     if (raw == null) {
       const f = UA_FONT_SIZE[__s_toLowerCase(e.__ptLocal || '')];
