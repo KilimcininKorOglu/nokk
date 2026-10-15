@@ -501,6 +501,17 @@ Done:
   relayout: 300 ms on a saved Wikipedia article, 250–430 ms on GitHub; now 35 and 7 ms).
   A changed rule recomputes the elements it is keyed by, and their subtrees only when
   the result differs. Live bbc.com/news: 10,000 cascades to 4,600.
+- ✅ **A restyle stops where nothing below changed.** An element whose own matching
+  changed (a class on `<html>` named in a subject, a shifted sibling, a changed rule)
+  is cascaded again at once; below it only cascades that copy a parent value or read
+  variables are recomputed, and only when its result differs (Blink's local vs
+  subtree style change). A class on an ancestor restyles the elements the rules
+  naming it select; a shifted sibling restyles itself and the elements that rules
+  reading positions left of their subject select (`li:first-child a`); a `:root`
+  variable change leaves cascades that do not read variables alone. Flipping classes
+  on `<html>` and inserting siblings on a saved Wikipedia article with such rules:
+  145,000 cascades and 4.7–5.8 s to 17,000 and 1.5–1.7 s; live Wikipedia load 95,000
+  dropped styles to 10,000.
 - ✅ **`selectorText` as Chrome prints it.** A serializer instead of regexes: attribute
   values double-quoted, An+B shortest, names re-escaped, pseudo and type names
   lowercased, comments dropped. The old one spaced `~=` like a combinator, so

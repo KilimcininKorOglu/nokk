@@ -10559,6 +10559,172 @@ mod tests {
         assert_eq!(got, want.join("\n"));
     }
 
+    /// A class flipped on an ancestor (`<html>`, a wrapper) restyles the elements the
+    /// rules naming it select below it, the element itself, and nothing else, as in
+    /// Chrome 151 on this page.
+    #[tokio::test]
+    async fn class_change_on_an_ancestor_restyles_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", r##"<!doctype html><html class="h0"><head><style>
+.on .x { color: rgb(1, 0, 0) }
+.on > .y { margin-left: 2px }
+.on .p { font-size: 20px }
+.on.two .z { padding-left: 3px }
+:not(.on) > .w { padding-top: 4px }
+:is(.on, .alt) .v { padding-right: 5px }
+.on + div .s { margin-top: 6px }
+.on { border-left: 1px solid rgb(7, 7, 7); --c: rgb(8, 8, 8) }
+.k span { color: var(--c, rgb(9, 9, 9)) }
+.on .q::before { content: 'q' }
+html.dark body .d { background-color: rgb(10, 10, 10) }
+.on #ii { margin-bottom: 11px }
+.on .x .x { padding-bottom: 12px }
+</style></head><body>
+<div id=a><div id=x class="x"><span id=xs>x</span><div class=x id=xx>xx</div></div><div id=y class=y>y</div><p id=p class=p><span id=ps>ps</span></p>
+<div id=z class=z></div><div id=w class=w></div><div id=v class=v></div><div id=k class=k><span id=ks>k</span></div><i id=ii></i><b id=q class=q></b><div id=d class=d></div></div>
+<div id=sib><span id=s class=s></span></div>
+</body></html>"##).await.unwrap();
+        let got = ctx.evaluate(r##"(() => {
+  const $ = (id) => document.getElementById(id), r = [];
+  const ids = ['x', 'xs', 'xx', 'y', 'p', 'ps', 'z', 'w', 'v', 'ks', 'ii', 'd', 's', 'a'];
+  const props = ['color', 'marginLeft', 'fontSize', 'paddingLeft', 'paddingTop', 'paddingRight', 'marginTop', 'borderLeftWidth', 'backgroundColor', 'marginBottom', 'paddingBottom'];
+  const read = (t) => r.push(t + ':' + ids.map((i) => { const c = getComputedStyle($(i)); return i + '=' + props.map((p) => c[p]).join('/'); }).join(' '));
+  read('0');
+  $('a').classList.add('on'); read('on');
+  $('a').classList.add('two'); read('two');
+  $('a').classList.remove('on'); read('off');
+  $('a').classList.add('alt'); read('alt');
+  document.documentElement.classList.add('dark'); read('dark');
+  document.documentElement.classList.add('on'); read('htmlon');
+  document.documentElement.classList.remove('on', 'dark'); read('htmloff');
+  $('a').className = 'on two'; read('set');
+  $('x').classList.add('on'); read('xon');
+  $('a').classList.toggle('on'); read('toggle');
+  return r.join('\n');
+})()"##).await.unwrap();
+        let want = [
+            "0:x=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xs=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xx=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px y=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px p=rgb(0, 0, 0)/0px/16px/0px/0px/0px/16px/0px/rgba(0, 0, 0, 0)/16px/0px ps=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px z=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px w=rgb(0, 0, 0)/0px/16px/0px/4px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px v=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ks=rgb(9, 9, 9)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ii=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px d=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px s=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px a=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px",
+            "on:x=rgb(1, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xs=rgb(1, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xx=rgb(1, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/12px y=rgb(0, 0, 0)/2px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px p=rgb(0, 0, 0)/0px/20px/0px/0px/0px/20px/0px/rgba(0, 0, 0, 0)/20px/0px ps=rgb(0, 0, 0)/0px/20px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px z=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px w=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px v=rgb(0, 0, 0)/0px/16px/0px/0px/5px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ks=rgb(8, 8, 8)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ii=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/11px/0px d=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px s=rgb(0, 0, 0)/0px/16px/0px/0px/0px/6px/0px/rgba(0, 0, 0, 0)/0px/0px a=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/1px/rgba(0, 0, 0, 0)/0px/0px",
+            "two:x=rgb(1, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xs=rgb(1, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xx=rgb(1, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/12px y=rgb(0, 0, 0)/2px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px p=rgb(0, 0, 0)/0px/20px/0px/0px/0px/20px/0px/rgba(0, 0, 0, 0)/20px/0px ps=rgb(0, 0, 0)/0px/20px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px z=rgb(0, 0, 0)/0px/16px/3px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px w=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px v=rgb(0, 0, 0)/0px/16px/0px/0px/5px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ks=rgb(8, 8, 8)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ii=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/11px/0px d=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px s=rgb(0, 0, 0)/0px/16px/0px/0px/0px/6px/0px/rgba(0, 0, 0, 0)/0px/0px a=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/1px/rgba(0, 0, 0, 0)/0px/0px",
+            "off:x=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xs=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xx=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px y=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px p=rgb(0, 0, 0)/0px/16px/0px/0px/0px/16px/0px/rgba(0, 0, 0, 0)/16px/0px ps=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px z=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px w=rgb(0, 0, 0)/0px/16px/0px/4px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px v=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ks=rgb(9, 9, 9)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ii=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px d=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px s=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px a=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px",
+            "alt:x=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xs=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xx=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px y=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px p=rgb(0, 0, 0)/0px/16px/0px/0px/0px/16px/0px/rgba(0, 0, 0, 0)/16px/0px ps=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px z=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px w=rgb(0, 0, 0)/0px/16px/0px/4px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px v=rgb(0, 0, 0)/0px/16px/0px/0px/5px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ks=rgb(9, 9, 9)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ii=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px d=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px s=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px a=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px",
+            "dark:x=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xs=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xx=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px y=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px p=rgb(0, 0, 0)/0px/16px/0px/0px/0px/16px/0px/rgba(0, 0, 0, 0)/16px/0px ps=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px z=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px w=rgb(0, 0, 0)/0px/16px/0px/4px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px v=rgb(0, 0, 0)/0px/16px/0px/0px/5px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ks=rgb(9, 9, 9)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ii=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px d=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgb(10, 10, 10)/0px/0px s=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px a=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px",
+            "htmlon:x=rgb(1, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xs=rgb(1, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xx=rgb(1, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/12px y=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px p=rgb(0, 0, 0)/0px/20px/0px/0px/0px/20px/0px/rgba(0, 0, 0, 0)/20px/0px ps=rgb(0, 0, 0)/0px/20px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px z=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px w=rgb(0, 0, 0)/0px/16px/0px/4px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px v=rgb(0, 0, 0)/0px/16px/0px/0px/5px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ks=rgb(8, 8, 8)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ii=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/11px/0px d=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgb(10, 10, 10)/0px/0px s=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px a=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px",
+            "htmloff:x=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xs=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xx=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px y=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px p=rgb(0, 0, 0)/0px/16px/0px/0px/0px/16px/0px/rgba(0, 0, 0, 0)/16px/0px ps=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px z=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px w=rgb(0, 0, 0)/0px/16px/0px/4px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px v=rgb(0, 0, 0)/0px/16px/0px/0px/5px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ks=rgb(9, 9, 9)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ii=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px d=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px s=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px a=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px",
+            "set:x=rgb(1, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xs=rgb(1, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xx=rgb(1, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/12px y=rgb(0, 0, 0)/2px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px p=rgb(0, 0, 0)/0px/20px/0px/0px/0px/20px/0px/rgba(0, 0, 0, 0)/20px/0px ps=rgb(0, 0, 0)/0px/20px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px z=rgb(0, 0, 0)/0px/16px/3px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px w=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px v=rgb(0, 0, 0)/0px/16px/0px/0px/5px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ks=rgb(8, 8, 8)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ii=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/11px/0px d=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px s=rgb(0, 0, 0)/0px/16px/0px/0px/0px/6px/0px/rgba(0, 0, 0, 0)/0px/0px a=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/1px/rgba(0, 0, 0, 0)/0px/0px",
+            "xon:x=rgb(1, 0, 0)/0px/16px/0px/0px/0px/0px/1px/rgba(0, 0, 0, 0)/0px/0px xs=rgb(1, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xx=rgb(1, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/12px y=rgb(0, 0, 0)/2px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px p=rgb(0, 0, 0)/0px/20px/0px/0px/0px/20px/0px/rgba(0, 0, 0, 0)/20px/0px ps=rgb(0, 0, 0)/0px/20px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px z=rgb(0, 0, 0)/0px/16px/3px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px w=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px v=rgb(0, 0, 0)/0px/16px/0px/0px/5px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ks=rgb(8, 8, 8)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ii=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/11px/0px d=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px s=rgb(0, 0, 0)/0px/16px/0px/0px/0px/6px/0px/rgba(0, 0, 0, 0)/0px/0px a=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/1px/rgba(0, 0, 0, 0)/0px/0px",
+            "toggle:x=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/1px/rgba(0, 0, 0, 0)/0px/0px xs=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px xx=rgb(1, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px y=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px p=rgb(0, 0, 0)/0px/16px/0px/0px/0px/16px/0px/rgba(0, 0, 0, 0)/16px/0px ps=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px z=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px w=rgb(0, 0, 0)/0px/16px/0px/4px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px v=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ks=rgb(9, 9, 9)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px ii=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px d=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px s=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px a=rgb(0, 0, 0)/0px/16px/0px/0px/0px/0px/0px/rgba(0, 0, 0, 0)/0px/0px",
+        ];
+        assert_eq!(got, want.join("\n"));
+    }
+
+    /// Positions and siblings read left of the subject (`li:first-child a`,
+    /// `.k + li a`, `li:has(.m) + li a`, `li:empty + li a`) under inserts and
+    /// removals, as in Chrome 151 on this page.
+    #[tokio::test]
+    async fn positions_read_left_of_the_subject_restyle_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", r##"<!doctype html><html><head><style>
+#l > li:first-child a { color: rgb(1, 0, 0) }
+#l > li:last-child a { margin-left: 2px }
+#l > li:nth-child(2) b { padding-left: 3px }
+#l > .k + li a { margin-right: 4px }
+#l > .k ~ li b { padding-right: 5px }
+#l > li:has(.m) + li a { margin-top: 6px }
+#l > li:empty + li a { margin-bottom: 7px }
+#l > li:not(:first-child) { padding-top: 8px }
+#l > li:is(.k + *) { padding-bottom: 9px }
+</style></head><body><ul id=l><li><a>a</a><b>b</b></li><li class=k><a>a</a><b>b</b></li><li><a>a</a><b>b</b></li><li><a>a</a><b><i class=m>m</i></b></li><li><a>a</a><b>b</b></li></ul></body></html>"##).await.unwrap();
+        let got = ctx.evaluate(r##"(() => {
+  const L = document.getElementById('l'), r = [];
+  const props = ['color', 'marginLeft', 'paddingLeft', 'marginRight', 'paddingRight', 'marginTop', 'marginBottom', 'paddingTop', 'paddingBottom'];
+  const read = (t) => { const o = []; for (const e of L.querySelectorAll('*')) { const c = getComputedStyle(e); o.push(e.tagName[0] + '=' + props.map((p) => p === 'color' ? c[p].replace(/[^\d,]/g, '') : parseInt(c[p])).join('/')); } r.push(t + ':' + o.join(' ')); };
+  const li = () => { const e = document.createElement('li'); e.innerHTML = '<a>n</a><b>n</b>'; return e; };
+  read('0');
+  L.insertBefore(li(), L.firstChild); read('prepend');
+  L.appendChild(li()); read('append');
+  L.children[2].className = ''; read('unk');
+  L.children[3].className = 'k'; read('k3');
+  L.querySelector('.m').remove(); read('rm-m');
+  L.children[1].querySelector('b').appendChild(Object.assign(document.createElement('i'), { className: 'm' })); read('add-m');
+  const e = document.createElement('li'); L.insertBefore(e, L.children[2]); read('empty');
+  e.textContent = 'x'; read('filled');
+  e.textContent = ''; read('emptied');
+  L.firstElementChild.remove(); read('rmfirst');
+  L.lastElementChild.remove(); read('rmlast');
+  return r.join('\n');
+})()"##).await.unwrap();
+        let want = [
+            "0:L=0,0,0/0/0/0/0/0/0/0/0 A=1,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/3/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/9 A=0,0,0/0/0/4/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 I=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/2/0/0/0/6/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0",
+            "prepend:L=0,0,0/0/0/0/0/0/0/0/0 A=1,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/3/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/9 A=0,0,0/0/0/4/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 I=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/2/0/0/0/6/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0",
+            "append:L=0,0,0/0/0/0/0/0/0/0/0 A=1,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/3/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/9 A=0,0,0/0/0/4/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 I=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/6/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/2/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0",
+            "unk:L=0,0,0/0/0/0/0/0/0/0/0 A=1,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/3/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 I=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/6/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/2/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0",
+            "k3:L=0,0,0/0/0/0/0/0/0/0/0 A=1,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/3/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/9 A=0,0,0/0/0/4/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 I=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/6/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/2/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0",
+            "rm-m:L=0,0,0/0/0/0/0/0/0/0/0 A=1,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/3/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/9 A=0,0,0/0/0/4/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/2/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0",
+            "add-m:L=0,0,0/0/0/0/0/0/0/0/0 A=1,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/3/0/0/0/0/0/0 I=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/6/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/9 A=0,0,0/0/0/4/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/2/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0",
+            "empty:L=0,0,0/0/0/0/0/0/0/0/0 A=1,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/3/0/0/0/0/0/0 I=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/7/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/9 A=0,0,0/0/0/4/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/2/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0",
+            "filled:L=0,0,0/0/0/0/0/0/0/0/0 A=1,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/3/0/0/0/0/0/0 I=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/9 A=0,0,0/0/0/4/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/2/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0",
+            "emptied:L=0,0,0/0/0/0/0/0/0/0/0 A=1,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/3/0/0/0/0/0/0 I=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/7/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/9 A=0,0,0/0/0/4/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/2/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0",
+            "rmfirst:L=0,0,0/0/0/0/0/0/0/0/0 A=1,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 I=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/7/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/9 A=0,0,0/0/0/4/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/2/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0",
+            "rmlast:L=0,0,0/0/0/0/0/0/0/0/0 A=1,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 I=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/7/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/0/0/0/0/0/0/0/0 B=0,0,0/0/0/0/0/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/9 A=0,0,0/0/0/4/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0 L=0,0,0/0/0/0/0/0/0/8/0 A=0,0,0/2/0/0/0/0/0/0/0 B=0,0,0/0/0/0/5/0/0/0/0",
+        ];
+        assert_eq!(got, want.join("\n"));
+    }
+
+    /// `:root` variables added and removed: elements reading them follow, elements
+    /// that do not keep their cascade and read the new values, as in Chrome 151.
+    #[tokio::test]
+    async fn variables_on_the_root_restyle_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", r##"<!doctype html><html><head><style>
+:root { --a: rgb(1, 1, 1); --pad: 1px }
+.u { color: var(--a) }
+.p { padding-left: var(--pad) }
+.own { --b: var(--a); }
+.own .q { background-color: var(--b) }
+.inh { margin-left: 3px }
+.inh > i { margin-left: inherit }
+</style></head><body>
+<div id=d1 class=u><span id=s1>t</span><div id=d2 class=own><p id=q1 class=q>q</p><b id=b1>b</b></div></div>
+<div id=d3 class=p><div id=d4 class=inh><i id=i1>i</i></div></div>
+<section id=h1></section>
+</body></html>"##).await.unwrap();
+        let got = ctx.evaluate(r##"(() => {
+  const $ = (id) => document.getElementById(id), cs = (id) => getComputedStyle($(id));
+  const r = [];
+  const read = (t) => r.push(t + ':' + [cs('d1').color, cs('s1').color, cs('q1').backgroundColor, cs('b1').getPropertyValue('--b'), cs('b1').getPropertyValue('--a'),
+    cs('d3').paddingLeft, cs('i1').marginLeft, cs('h1').getPropertyValue('--a'), cs('h1').getPropertyValue('--new'), cs('s1').getPropertyValue('--pad')].join(','));
+  read('0');
+  const s = document.createElement('style'); s.textContent = ':root { --a: rgb(2, 2, 2) }'; document.head.appendChild(s); read('1');
+  s.textContent = ':root { --new: 5px }'; read('2');
+  s.textContent = ':root { --pad: 9px; --new: 6px }'; read('3');
+  s.textContent = 'html { --a: rgb(3, 3, 3) } .own { --b: rgb(4, 4, 4) }'; read('4');
+  s.textContent = 'body { --a: rgb(7, 7, 7) }'; read('5');
+  s.remove(); read('6');
+  document.styleSheets[0].insertRule(':root { --a: rgb(8, 8, 8) }', 0); read('7');
+  document.styleSheets[0].insertRule(':root { --a: rgb(9, 9, 9) }', 1); read('8');
+  return r.join('\n');
+})()"##).await.unwrap();
+        let want = [
+            "0:rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),1px,3px,rgb(1, 1, 1),,1px",
+            "1:rgb(2, 2, 2),rgb(2, 2, 2),rgb(2, 2, 2),rgb(2, 2, 2),rgb(2, 2, 2),1px,3px,rgb(2, 2, 2),,1px",
+            "2:rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),1px,3px,rgb(1, 1, 1),5px,1px",
+            "3:rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),9px,3px,rgb(1, 1, 1),6px,9px",
+            "4:rgb(1, 1, 1),rgb(1, 1, 1),rgb(4, 4, 4),rgb(4, 4, 4),rgb(1, 1, 1),1px,3px,rgb(1, 1, 1),,1px",
+            "5:rgb(7, 7, 7),rgb(7, 7, 7),rgb(7, 7, 7),rgb(7, 7, 7),rgb(7, 7, 7),1px,3px,rgb(7, 7, 7),,1px",
+            "6:rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),1px,3px,rgb(1, 1, 1),,1px",
+            "7:rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),1px,3px,rgb(1, 1, 1),,1px",
+            "8:rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),rgb(1, 1, 1),1px,3px,rgb(1, 1, 1),,1px",
+        ];
+        assert_eq!(got, want.join("\n"));
+    }
+
     /// Modern CSS values: `var()` with fallback, registered custom properties,
     /// `calc()`/`min()`/`clamp()`, `dvh`, root `rem`, `box-sizing: inherit` and grid
     /// with `gap`. Numbers from Chrome 151 on the same markup (1920x942 window).
