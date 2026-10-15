@@ -517,6 +517,24 @@ Done:
   lowercased, comments dropped. The old one spaced `~=` like a combinator, so
   `[typeof~='mw:File/Thumb']` never matched (Wikipedia's figures were not tables) and
   each such rule restyled the whole page when added.
+- ✅ **Markup is parsed by the HTML parser.** `innerHTML`, `outerHTML`,
+  `insertAdjacentHTML`, `document.write` and `DOMParser` used a hand-written JS tokenizer
+  (40 named references, `<` inside `<script>` read as a tag, no foster parenting or
+  adoption agency): 21 of 31 tricky snippets built a tree unlike Chrome's. They now go to
+  html5ever with the right context element and quirks mode, all 31 as in Chrome 151;
+  `DOMParser` keeps the doctype, comments and mode; the page's own document keeps the
+  comments and processing instructions around its root. The parse is written as JSON
+  directly (a `serde_json::Value` tree first cost 300 ms on a 1.2 MB article): a saved
+  Wikipedia article loads in 1.24 s of CPU instead of 1.49. `<?target data?>` is a
+  processing instruction as in Chrome 151 (`vendor/html5ever`, see its PATCHES.md), with
+  `createProcessingInstruction` and the data read as attributes.
+- ✅ **Text nodes, observers and serialization as in Chrome.** `CharacterData`'s
+  `appendData`/`insertData`/`deleteData`/`replaceData`/`substringData` and `Text`'s
+  `splitText`/`wholeText` were stubs; `MutationObserver` reported no text changes, gave
+  every observer the old value, wrote to the page's options object, built plain objects
+  instead of `MutationRecord`s, swallowed callback errors, missed removed subtrees and
+  kept every observer forever; `moveBefore` did nothing; `document.doctype` had ten own
+  properties; script and style text was escaped in `innerHTML` and U+00A0 was not.
 - ✅ **Deep trees answer as in Chrome.** Layout goes 64 levels per band and lays out
   what lies below from a shallow stack into the kept layouts (467 nested blocks threw
   RangeError; Chrome's tab crashes at 2,500); cascades, ancestor filters, inherited
@@ -537,10 +555,11 @@ Done:
   peak memory 350 to 328 MB.
 
 Open:
-- ⬜ **`Element.moveBefore` is a stub** that does nothing; Chrome moves the node (and
-  throws `HierarchyRequestError` "State-preserving atomic move cannot be performed on
-  nodes participating in an invalid hierarchy." across trees).
-- ⬜ **`<?pi z?>` in HTML serializes as `<!--?pi z?-->`**; Chrome 151 prints `<?pi z?>`.
+- ⬜ **Processing instruction attributes come in source order**; Chrome keeps them in a
+  hash map (rapidhash over WTF's open addressing), so with two or more its
+  `getAttributeNames()` order differs (`a="1" c="2"` gives `c, a`).
+- ⬜ **Lone surrogates in markup become U+FFFD**: `innerHTML` and `DOMParser` hand the
+  string to the parser as UTF-8; Chrome keeps them.
 - ⬜ **Layout differences found on a font-size page** (Chrome 151, same page): text
   before a block child makes no line (`<div>a<div>b</div></div>` is 34px shorter);
   a `0.67em` heading margin is not snapped to 1/64 px, so later boxes sit off the

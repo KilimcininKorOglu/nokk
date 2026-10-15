@@ -90,6 +90,7 @@ futures-util = "0.3"
 # cannot pick them. See vendor/btls-sys/PATCHES.md.
 [patch.crates-io]
 btls-sys = { path = "vendor/btls-sys" }
+html5ever = { path = "vendor/html5ever" }
 
 [profile.release]
 lto = "thin"

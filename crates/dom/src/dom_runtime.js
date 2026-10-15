@@ -613,6 +613,62 @@
     }
     return false;
   }
+  // A move (`moveBefore`) in progress: the insertion keeps the subtree as it
+  // was, frames and scripts included.
+  let __moving = false;
+  function __shadowIncludingRoot(n) {
+    while (n.__ptParent || n.__ptHost) n = n.__ptParent || n.__ptHost;
+    return n;
+  }
+  // `moveBefore`: Chrome 151 checks the arguments, then that both nodes share
+  // a shadow-including root, then the ancestor, then the reference child, then
+  // the kind of node; the move keeps frames, scripts and focus as they are,
+  // and custom elements get `connectedMoveCallback` or, without one,
+  // `disconnectedCallback` and `connectedCallback`. Observers see a removal
+  // and an insertion.
+  function __moveBefore(parent, args, iface) {
+    __needArgs(args.length, 2, 'moveBefore', iface);
+    const node = args[0];
+    let ref = args[1];
+    __needNode(node, 1, 'moveBefore', iface);
+    if (ref !== null && ref !== undefined) __needNode(ref, 2, 'moveBefore', iface);
+    else ref = null;
+    const invalid = () => __pt_mkErr(globalThis.DOMException || Error,
+      "Failed to execute 'moveBefore' on '" + iface + "': State-preserving atomic move cannot be performed on nodes participating in an invalid hierarchy.",
+      'HierarchyRequestError');
+    if (__shadowIncludingRoot(parent) !== __shadowIncludingRoot(node)) throw invalid();
+    __needNotAncestor(parent, node, 'moveBefore', iface);
+    if (ref !== null && ref.__ptParent !== parent) {
+      throw __pt_mkErr(globalThis.DOMException || Error,
+        "Failed to execute 'moveBefore' on '" + iface + "': The node before which the new node is to be inserted is not a child of this node.",
+        'NotFoundError');
+    }
+    const t = node.__ptType;
+    if (t !== ELEMENT_NODE && t !== TEXT_NODE && t !== COMMENT_NODE && t !== 4 && t !== 7) throw invalid();
+    if (ref === node) {
+      const kids = parent.__ptKids, i = __s_indexOf(kids, node);
+      ref = kids[i + 1] || null;
+    }
+    const connected = __connectedFast(parent);
+    const customs = [];
+    if (connected) __walkTree(node, (n) => { if (n.__ptUpgraded) customs.push(n); });
+    const moveCb = (n) => typeof n.connectedMoveCallback === 'function';
+    for (const n of customs) if (!moveCb(n)) __customCallback(n, 'disconnectedCallback');
+    const old = node.__ptParent;
+    if (old) {
+      const kids = old.__ptKids, i = __s_indexOf(kids, node);
+      const prev = kids[i - 1] || null, next = kids[i + 1] || null;
+      __moNodeWillDetach(old, node);
+      kids.splice(i, 1); node.__ptParent = null; __connRemovals++; __markDirty(old); __styleTouchKids(old, null, i); __hasNoteTree(node);
+      __mutation(__childListRecord(old, [], [node], prev, next));
+    }
+    __moving = true;
+    try { __ptInsert.call(parent, node, ref); } finally { __moving = false; }
+    let frames = false;
+    __walkTree(node, (n) => { if (__isFrameEl(n)) frames = true; });
+    if (frames) __framesChanged();
+    for (const n of customs) __customCallback(n, moveCb(n) ? 'connectedMoveCallback' : 'connectedCallback');
+  }
   // The same over a variadic call's nodes, all before any is inserted.
   function __needNoneAncestor(parent, nodes, method, iface) {
     for (const n of nodes) if (typeof n !== 'string') __needNotAncestor(parent, n, method, iface);
@@ -743,7 +799,7 @@
       // subtree run (a removal they make forgets it).
       const connected = __connectedFast(this);
       __connRemember(child, connected);
-      if (connected) { __connInserts++; __connectSubtree(child); }
+      if (connected) { __connInserts++; if (!__moving) __connectSubtree(child); }
       return child;
     }
     removeChild(child) {
@@ -756,6 +812,7 @@
           'NotFoundError');
       }
       const prev = this.__ptKids[i - 1] || null, next = this.__ptKids[i + 1] || null;
+      __moNodeWillDetach(this, child);
       this.__ptKids.splice(i, 1); child.__ptParent = null; __connRemovals++; __markDirty(this); __styleTouchKids(this, null, i); __hasNoteTree(child);
       __mutation(__childListRecord(this, [], [child], prev, next));
       // A removed frame is a closed browsing context. Without this its V8 context
@@ -818,13 +875,13 @@
       // A document and doctype have none: null, not the page's joined text.
       if (this.__ptType === 9 || this.__ptType === 10) return null;
       // Text, comment, processing instruction: their data (Chrome's Node.textContent).
-      if (this.__ptType === 3 || this.__ptType === 4 || this.__ptType === 7) return this.data;
-      if (this.__ptType === 8) return this.data;
+      if (this.__ptType === 3 || this.__ptType === 4 || this.__ptType === 7 || this.__ptType === 8) return this.__ptData;
       return __descText(this);
     }
     set textContent(v) {
       if (this.__ptType === 9 || this.__ptType === 10) return;
-      if (this.__ptType === 3 || this.__ptType === 4 || this.__ptType === 7 || this.__ptType === 8) { this.data = String(v); return; }
+      // [LegacyNullToEmptyString]
+      if (this.__ptType === 3 || this.__ptType === 4 || this.__ptType === 7 || this.__ptType === 8) { __cdSetAll(this, v === null ? '' : String(v)); return; }
       if (this.__ptLocal === 'script') v = __pt_ttSink('TrustedScript', 'HTMLScriptElement textContent', v, "Failed to set the 'textContent' property on 'HTMLScriptElement'");
       __ptDropKids(this);
       if (v !== '') __ptAdd.call(this, new Text(String(v)));
@@ -1123,31 +1180,234 @@
     ownerDocument: accessor('ownerDocument', function () { return this.__ptDoc; }, function (v) { this.__ptDoc = v; }),
   });
 
-  // ---- CharacterData: Text / Comment ---------------------------------------
-  class Text extends Node {
-    constructor(data) { super(TEXT_NODE); this.__ptData = String(data); }
-    get data() { return this.__ptData; }
-    // New text means new layout, and `:empty` sees it in the parent's style.
-    // Text matches no selector: a change is layout work, not style work.
-    set data(v) { this.__ptData = String(v); if (this.__ptParent) __markDirty(this.__ptParent); }
-    get nodeName() { return '#text'; }
-    get nodeValue() { return this.data; }
-    set nodeValue(v) { this.data = String(v); }
-    get textContent() { return this.data; }
-    set textContent(v) { this.data = String(v); }
-    get length() { return this.data.length; }
-    __ptShallowClone() { return new Text(this.data); }
+  // ---- CharacterData: Text / Comment / ProcessingInstruction --------------
+  // Offsets and counts are WebIDL `unsigned long`: -1 is 4294967295.
+  const __u32 = (v) => Number(v) >>> 0;
+  const __cdIndexError = (method, iface, off, len) => __pt_mkErr(globalThis.DOMException || Error,
+    "Failed to execute '" + method + "' on '" + iface + "': The offset " + off + " is greater than the node's length (" + len + ").",
+    'IndexSizeError');
+  // Replace data (DOM standard): the record carries the old value; a text
+  // change is layout work for the parent.
+  function __cdReplace(node, offset, count, data) {
+    const old = node.__ptData;
+    if (offset + count > old.length) count = old.length - offset;
+    node.__ptData = __s_slice(old, 0, offset) + data + __s_slice(old, offset + count);
+    __mutation({ type: 'characterData', target: node, attributeName: null, attributeNamespace: null,
+      oldValue: old, addedNodes: __NO_NODES, removedNodes: __NO_NODES, previousSibling: null, nextSibling: null });
+    if (node.__ptType === TEXT_NODE && node.__ptParent) __markDirty(node.__ptParent);
   }
-  class Comment extends Node {
-    constructor(data) { super(COMMENT_NODE); this.__ptData = String(data); }
+  const __cdSetAll = (node, v) => __cdReplace(node, 0, node.__ptData.length, v);
+  class CharacterData extends Node {
+    constructor(...a) {
+      if (new.target === CharacterData) throw __pt_mkErr(TypeError, "Failed to construct 'CharacterData': Illegal constructor");
+      super(a[0]);
+      this.__ptData = '';
+    }
     get data() { return this.__ptData; }
-    set data(v) { this.__ptData = String(v); }
-    get nodeName() { return '#comment'; }
-    get nodeValue() { return this.data; }
-    get textContent() { return this.data; }
-    get length() { return this.data.length; }
-    __ptShallowClone() { return new Comment(this.data); }
+    // [LegacyNullToEmptyString]
+    set data(v) { __cdSetAll(this, v === null ? '' : String(v)); }
+    get length() { return this.__ptData.length; }
+    appendData(data) {
+      __needArgs(arguments.length, 1, 'appendData', 'CharacterData');
+      __cdReplace(this, this.__ptData.length, 0, String(data));
+    }
+    insertData(offset, data) {
+      __needArgs(arguments.length, 2, 'insertData', 'CharacterData');
+      const off = __u32(offset), str = String(data), len = this.__ptData.length;
+      if (off > len) throw __cdIndexError('insertData', 'CharacterData', off, len);
+      __cdReplace(this, off, 0, str);
+    }
+    deleteData(offset, count) {
+      __needArgs(arguments.length, 2, 'deleteData', 'CharacterData');
+      const off = __u32(offset), n = __u32(count), len = this.__ptData.length;
+      if (off > len) throw __cdIndexError('deleteData', 'CharacterData', off, len);
+      __cdReplace(this, off, n, '');
+    }
+    replaceData(offset, count, data) {
+      __needArgs(arguments.length, 3, 'replaceData', 'CharacterData');
+      const off = __u32(offset), n = __u32(count), str = String(data), len = this.__ptData.length;
+      if (off > len) throw __cdIndexError('replaceData', 'CharacterData', off, len);
+      __cdReplace(this, off, n, str);
+    }
+    substringData(offset, count) {
+      __needArgs(arguments.length, 2, 'substringData', 'CharacterData');
+      const off = __u32(offset), n = __u32(count), d = this.__ptData;
+      if (off > d.length) throw __cdIndexError('substringData', 'CharacterData', off, d.length);
+      return __s_slice(d, off, off + Math.min(n, d.length - off));
+    }
   }
+  class Text extends CharacterData {
+    constructor(data) { super(TEXT_NODE); this.__ptData = data === undefined ? '' : String(data); }
+    // The data of this node and the Text nodes next to it.
+    get wholeText() {
+      const p = this.__ptParent;
+      if (!p) return this.__ptData;
+      const kids = p.__ptKids, i = __s_indexOf(kids, this);
+      let a = i, b = i;
+      while (a > 0 && (kids[a - 1].__ptType === TEXT_NODE || kids[a - 1].__ptType === 4)) a--;
+      while (b < kids.length - 1 && (kids[b + 1].__ptType === TEXT_NODE || kids[b + 1].__ptType === 4)) b++;
+      let s = '';
+      for (let k = a; k <= b; k++) s += kids[k].__ptData;
+      return s;
+    }
+    // As Blink: the data is cut first (a characterData record), then the new
+    // node goes in after this one.
+    splitText(offset) {
+      __needArgs(arguments.length, 1, 'splitText', 'Text');
+      const off = __u32(offset), d = this.__ptData;
+      if (off > d.length) {
+        throw __pt_mkErr(globalThis.DOMException || Error,
+          "Failed to execute 'splitText' on 'Text': The offset " + off + " is larger than the Text node's length.", 'IndexSizeError');
+      }
+      const nw = new Text(__s_slice(d, off));
+      nw.__ptDoc = this.__ptDoc;
+      __cdReplace(this, off, d.length - off, '');
+      const p = this.__ptParent;
+      if (p) {
+        const kids = p.__ptKids;
+        __ptInsert.call(p, nw, kids[__s_indexOf(kids, this) + 1] || null);
+      }
+      return nw;
+    }
+    __ptShallowClone() { return new Text(this.__ptData); }
+  }
+  class Comment extends CharacterData {
+    constructor(data) { super(COMMENT_NODE); this.__ptData = data === undefined ? '' : String(data); }
+    __ptShallowClone() { return new Comment(this.__ptData); }
+  }
+  // Processing instructions: from `createProcessingInstruction` and, as in
+  // Chrome 151, from `<?target data?>` in HTML. Their attributes are the
+  // data read as XML attributes (processing_instruction.cc); a data that
+  // does not parse has none.
+  const __PI_MAKE = {};
+  const __XML_NAME_START = 'A-Z_a-z:\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u02FF\u0370-\u037D\u037F-\u1FFF\u200C-\u200D\u2070-\u218F\u2C00-\u2FEF\u3001-\uD7FF\uF900-\uFDCF\uFDF0-\uFFFD';
+  const __XML_NAME = new RegExp('^[' + __XML_NAME_START + '](?:[' + __XML_NAME_START + '\\-.0-9\u00B7\u0300-\u036F\u203F-\u2040]|[\uD800-\uDB7F][\uDC00-\uDFFF])*$');
+  const __XML_NAME_AT = new RegExp('[' + __XML_NAME_START + '](?:[' + __XML_NAME_START + '\\-.0-9\u00B7\u0300-\u036F\u203F-\u2040]|[\uD800-\uDB7F][\uDC00-\uDFFF])*', 'y');
+  const __XML_REFS = { lt: '<', gt: '>', amp: '&', apos: "'", quot: '"' };
+  let __piParsed = new Map();
+  function __piAttrs(data) {
+    let hit = __piParsed.get(data);
+    if (hit !== undefined) return hit;
+    hit = __piParse(data);
+    if (__piParsed.size >= 256) __piParsed = new Map();
+    __piParsed.set(data, hit);
+    return hit;
+  }
+  // [[name, value]...] in source order (Chrome keeps a hash map: with two or
+  // more attributes its order differs), or [] when the data is not a list of
+  // attributes.
+  function __piParse(raw) {
+    const s = __s_replace(__s_replace(raw, /\r\n/g, '\n'), /\r/g, '\n');
+    const out = [], seen = new Set();
+    const ws = (c) => c === ' ' || c === '\t' || c === '\n';
+    let i = 0;
+    for (;;) {
+      const at = i;
+      while (i < s.length && ws(s[i])) i++;
+      if (i >= s.length) break;
+      if (out.length + seen.size && i === at) return [];
+      __XML_NAME_AT.lastIndex = i;
+      const m = __XML_NAME_AT.exec(s);
+      if (!m) return [];
+      const name = m[0];
+      i += name.length;
+      while (i < s.length && ws(s[i])) i++;
+      if (s[i] !== '=') return [];
+      i++;
+      while (i < s.length && ws(s[i])) i++;
+      const q = s[i];
+      if (q !== '"' && q !== "'") return [];
+      i++;
+      let v = '';
+      for (;;) {
+        if (i >= s.length) return [];
+        const c = s[i];
+        if (c === q) { i++; break; }
+        if (c === '<') return [];
+        if (c === '&') {
+          const end = __s_indexOf(s, ';', i);
+          if (end < 0) return [];
+          const ref = __s_slice(s, i + 1, end);
+          let ch;
+          if (/^#[0-9]+$/.test(ref)) ch = String.fromCodePoint(parseInt(__s_slice(ref, 1), 10));
+          else if (/^#x[0-9a-fA-F]+$/.test(ref)) ch = String.fromCodePoint(parseInt(__s_slice(ref, 2), 16));
+          else if (__XML_REFS[ref] !== undefined) ch = __XML_REFS[ref];
+          else return [];
+          v += ch;
+          i = end + 1;
+          continue;
+        }
+        v += ws(c) ? ' ' : c;
+        i++;
+      }
+      if (seen.has(name)) return [];
+      seen.add(name);
+      if (name === 'xmlns' || __s_startsWith(name, 'xmlns:')) continue;
+      out.push([name, v]);
+    }
+    return out;
+  }
+  const __piAttrValue = (v) => __s_replace(v, /[&<>"\u00A0]/g, (c) => (c === '\u00A0' ? '&nbsp;' : ESC[c]));
+  function __piWrite(pi, attrs) {
+    __cdSetAll(pi, attrs.map(([k, v]) => k + '="' + __piAttrValue(v) + '"').join(' '));
+  }
+  const __asciiLower = (s) => __s_replace(String(s), /[A-Z]/g, (c) => __s_toLowerCase(c));
+  class ProcessingInstruction extends CharacterData {
+    constructor(...a) {
+      if (a[0] !== __PI_MAKE) throw __pt_mkErr(TypeError, "Failed to construct 'ProcessingInstruction': Illegal constructor");
+      super(7);
+      this.__ptTarget = a[1];
+      this.__ptData = a[2];
+    }
+    get target() { return this.__ptTarget; }
+    get sheet() { return null; }
+    getAttribute(name) {
+      __needArgs(arguments.length, 1, 'getAttribute', 'ProcessingInstruction');
+      const n = __asciiLower(name);
+      for (const [k, v] of __piAttrs(this.__ptData)) if (k === n) return v;
+      return null;
+    }
+    getAttributeNames() { return __piAttrs(this.__ptData).map((p) => p[0]); }
+    hasAttribute(name) {
+      __needArgs(arguments.length, 1, 'hasAttribute', 'ProcessingInstruction');
+      const n = __asciiLower(name);
+      return __piAttrs(this.__ptData).some((p) => p[0] === n);
+    }
+    hasAttributes() { return __piAttrs(this.__ptData).length > 0; }
+    removeAttribute(name) {
+      __needArgs(arguments.length, 1, 'removeAttribute', 'ProcessingInstruction');
+      const n = __asciiLower(name), attrs = __piAttrs(this.__ptData).slice();
+      const i = attrs.findIndex((p) => p[0] === n);
+      if (i < 0) return;
+      attrs.splice(i, 1);
+      __piWrite(this, attrs);
+    }
+    setAttribute(name, value) {
+      __needArgs(arguments.length, 2, 'setAttribute', 'ProcessingInstruction');
+      const n = __asciiLower(name), v = String(value), attrs = __piAttrs(this.__ptData).map((p) => p.slice());
+      const hit = attrs.find((p) => p[0] === n);
+      if (hit) hit[1] = v; else attrs.push([n, v]);
+      __piWrite(this, attrs);
+    }
+    toggleAttribute(name, force) {
+      __needArgs(arguments.length, 1, 'toggleAttribute', 'ProcessingInstruction');
+      const raw = String(name);
+      if (!__XML_NAME.test(raw)) {
+        throw __pt_mkErr(globalThis.DOMException || Error,
+          "Failed to execute 'toggleAttribute' on 'ProcessingInstruction': Invalid attribute name: " + raw, 'InvalidCharacterError');
+      }
+      const n = __asciiLower(raw);
+      const there = __piAttrs(this.__ptData).some((p) => p[0] === n);
+      const on = force === undefined ? !there : !!force;
+      if (on) { if (!there) this.setAttribute(n, ''); } else this.removeAttribute(n);
+    }
+    __ptShallowClone() { return new ProcessingInstruction(__PI_MAKE, this.__ptTarget, this.__ptData); }
+  }
+  const __makePI = (doc, target, data) => {
+    const n = new ProcessingInstruction(__PI_MAKE, String(target), String(data));
+    n.__ptDoc = doc;
+    return n;
+  };
 
   // ---- Element --------------------------------------------------------------
   /// A shadow root: a fragment that carries the query surface of an element and
@@ -1192,10 +1452,7 @@
       __ptDropKids(this);
       for (const n of nodes) this.appendChild(typeof n === 'string' ? new Text(n) : n);
     }
-    moveBefore(node, child) {
-      __needNotAncestor(this, node, 'moveBefore', 'DocumentFragment');
-      return this.insertBefore(node, child);
-    }
+    moveBefore(node, child) { __moveBefore(this, arguments, 'DocumentFragment'); }
   }
 
   class ShadowRoot extends DocumentFragment {
@@ -1226,7 +1483,7 @@
       // Template markup is parsed into its content.
       const host = this.__ptLocal === 'template' ? __templateContent(this) : this;
       __ptDropKids(host);
-      for (const n of parseFragment(String(html))) __ptAdd.call(host, n);
+      for (const n of parseFragment(String(html), this.__ptHost || null)) __ptAdd.call(host, n);
     }
     // A collection, not an array: `document.children` is an HTMLCollection,
     // and `Object.prototype.toString` says so.
@@ -1346,6 +1603,7 @@
   }
 
   class Element extends Node {
+    moveBefore(node, child) { __moveBefore(this, arguments, 'Element'); }
     constructor(tag) {
       super(ELEMENT_NODE);
       // `new MyElement()` passes no tag name; the registry knows it by the
@@ -2196,30 +2454,7 @@
       // Template markup is parsed into its content.
       const host = this.__ptLocal === 'template' ? __templateContent(this) : this;
       __ptDropKids(host);
-      const nodes = parseFragment(String(html));
-      // With an <html> element as the context the parser starts "before head":
-      // the result is always a <head> and a <body>, head-only elements up front
-      // in the first. Pages build a whole template this way
-      // (`createElement('html').innerHTML = page`) and then look for its body.
-      if (this.__ptLocal === 'html') {
-        const O = globalThis.__pt_orig || {};
-        const mk = (t) => (O.createElement ? O.createElement.call(document, t) : document.createElement(t));
-        const head = mk('head'), body = mk('body');
-        const HEADISH = new Set(['title', 'meta', 'link', 'style', 'script', 'base', 'noscript', 'template', 'basefont', 'bgsound']);
-        let inHead = true;
-        for (const n of nodes) {
-          if (inHead) {
-            if (n.__ptType === 3 && !/\S/.test(n.data)) continue;
-            if (n.__ptType === 8 || (n.__ptType === 1 && HEADISH.has(n.localName))) { __ptAdd.call(head, n); continue; }
-            inHead = false;
-          }
-          __ptAdd.call(body, n);
-        }
-        __ptAdd.call(host, head);
-        __ptAdd.call(host, body);
-        return;
-      }
-      for (const n of nodes) __ptAdd.call(host, n);
+      for (const n of parseFragment(String(html), this)) __ptAdd.call(host, n);
     }
     get outerHTML() { return serializeNode(this); }
     // Rendered text (hidden subtrees excluded, whitespace collapsed) — an
@@ -2236,7 +2471,13 @@
           'SyntaxError');
       }
       html = __pt_ttSink('TrustedHTML', 'Element insertAdjacentHTML', html, "Failed to execute 'insertAdjacentHTML' on 'Element'");
-      const nodes = parseFragment(String(html));
+      // The parent is the context around the element, the element itself
+      // inside it; `<html>` (or no element) parses as `<body>`.
+      const where = __s_toLowerCase(String(pos));
+      let ctx = where === 'beforebegin' || where === 'afterend' ? this.__ptParent : this;
+      if (!ctx || ctx.__ptType !== ELEMENT_NODE || (ctx.__ptLocal === 'html' && __isHtmlEl(ctx))) ctx = null;
+      const nodes = parseFragment(String(html), ctx || this.__ptDoc || globalThis.document);
+      pos = where;
       if (pos === 'beforeend') for (const n of nodes) __ptAdd.call(this, n);
       else if (pos === 'afterbegin') for (const n of nodes.reverse()) __ptInsert.call(this, n, this.firstChild);
       else if (pos === 'beforebegin') for (const n of nodes) __ptInsert.call(this.__ptParent, n, this);
@@ -2431,6 +2672,7 @@
 
   // ---- Document -------------------------------------------------------------
   class Document extends Node {
+    moveBefore(node, child) { __moveBefore(this, arguments, 'Document'); }
     constructor() {
       super(DOCUMENT_NODE);
       this.__ptDocEl = null;
@@ -2569,7 +2811,11 @@
     get xmlVersion() { return this.__ptXml ? '1.0' : null; }
     // A page without `<!DOCTYPE>` is in quirks mode: `BackCompat` and
     // `doctype === null`.
-    get compatMode() { return this.__ptDoctype || this.__ptXml ? 'CSS1Compat' : 'BackCompat'; }
+    get compatMode() {
+      if (this.__ptXml) return 'CSS1Compat';
+      if (this.__ptMode) return this.__ptMode === 'quirks' ? 'BackCompat' : 'CSS1Compat';
+      return this.__ptDoctype ? 'CSS1Compat' : 'BackCompat';
+    }
     get doctype() { return this.__ptDoctype || null; }
     get designMode() { return 'off'; }
     set designMode(v) {}
@@ -2684,6 +2930,14 @@
     }
     createTextNode(t) { const n = new Text(t); n.__ptDoc = this; return n; }
     createComment(t) { const n = new Comment(t); n.__ptDoc = this; return n; }
+    createProcessingInstruction(target, data) {
+      __needArgs(arguments.length, 2, 'createProcessingInstruction', 'Document');
+      const t = String(target), d = String(data);
+      const bad = (m) => __pt_mkErr(globalThis.DOMException || Error, "Failed to execute 'createProcessingInstruction' on 'Document': " + m, 'InvalidCharacterError');
+      if (!__XML_NAME.test(t)) throw bad("The target provided ('" + t + "') is not a valid name.");
+      if (__s_indexOf(d, '?>') >= 0) throw bad("The data provided ('" + d + "') contains '?>'.");
+      return __makePI(this, t, d);
+    }
     createDocumentFragment() { const f = new DocumentFragment(); f.__ptDoc = this; return f; }
     createEvent() { return new Event(''); }
     // A copy of a foreign node for this document. The Cloudflare challenge
@@ -2742,7 +2996,7 @@
     // (e.g. async), it appends to <body>. Dynamically written <script> tags are
     // inserted but not executed (our script list is fixed at parse time).
     write(...args) {
-      const nodes = parseFragment(args.map((a) => String(__pt_ttSink('TrustedHTML', 'Document write', a, "Failed to execute 'write' on 'Document'"))).join(''));
+      const nodes = parseFragment(args.map((a) => String(__pt_ttSink('TrustedHTML', 'Document write', a, "Failed to execute 'write' on 'Document'"))).join(''), this);
       const cur = this.currentScript;
       if (cur && cur.__ptParent) {
         const ref = cur.nextSibling;
@@ -6031,6 +6285,10 @@
   // ---- HTML serialization (innerHTML getter) --------------------------------
   const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
   const esc = (s, attr) => __s_replace(s, attr ? /[&<>"]/g : /[&<>]/g, c => ESC[c]);
+  // HTML serialization also writes U+00A0 as `&nbsp;` (XML has no such
+  // entity), and the text of raw text elements as it is.
+  const __escHtml = (s, attr) => __s_replace(s, attr ? /[&<>"\u00A0]/g : /[&<>\u00A0]/g, (c) => (c === '\u00A0' ? '&nbsp;' : ESC[c]));
+  const __RAW_TEXT_PARENT = new Set(['style', 'script', 'xmp', 'iframe', 'noembed', 'noframes', 'plaintext', 'noscript']);
   // Internal fields only: a page may shadow `attributes`, `data` or `tagName`
   // on an element (skyscanner does on an iframe); Chrome's serializer is native.
   // Depth first with a stack of nodes and closing strings: Chrome serializes
@@ -6042,12 +6300,17 @@
     while (st.length) {
       const n = st.pop();
       if (typeof n === 'string') { out.push(n); continue; }
-      if (n.__ptType === TEXT_NODE) { out.push(esc(n.__ptData, false)); continue; }
+      if (n.__ptType === TEXT_NODE) {
+        const p = n.__ptParent;
+        out.push(p && p.__ptType === ELEMENT_NODE && __RAW_TEXT_PARENT.has(p.__ptLocal) && __isHtmlEl(p) ? n.__ptData : __escHtml(n.__ptData, false));
+        continue;
+      }
       if (n.__ptType === COMMENT_NODE) { out.push(`<!--${n.__ptData}-->`); continue; }
+      if (n.__ptType === 7) { out.push(`<?${n.__ptTarget} ${n.__ptData}?>`); continue; }
       if (n.__ptType !== ELEMENT_NODE) { pushKids(n.__ptKids); continue; }
       const tag = n.__ptLocal;
       let attrs = '';
-      for (const [name, value] of n.__ptAttrs) attrs += ` ${name}="${esc(value, true)}"`;
+      for (const [name, value] of n.__ptAttrs) attrs += ` ${name}="${__escHtml(value, true)}"`;
       if (VOID.has(tag)) { out.push(`<${tag}${attrs}>`); continue; }
       out.push(`<${tag}${attrs}>`);
       st.push(`</${tag}>`);
@@ -6075,7 +6338,7 @@
     if (!old || !old.length) return;
     node.__ptKids = [];
     __connRemovals++;
-    for (const c of old) { c.__ptParent = null; __hasNoteTree(c); }
+    for (const c of old) { __moNodeWillDetach(node, c); c.__ptParent = null; __hasNoteTree(c); }
     __markDirty(node);
     __styleTouchKids(node, null, -1);
     __mutation(__childListRecord(node, [], old, null, null));
@@ -6142,127 +6405,114 @@
     }
   }
 
-  // ---- HTML fragment parser (innerHTML setter) ------------------------------
-  // A forgiving tokenizer: handles tags, attributes (quoted/unquoted/bare),
-  // text, comments, and void/self-closing elements. Not spec-perfect, but
-  // covers the markup scripts typically inject.
+  // ---- HTML parsing for markup set by scripts --------------------------------
   const __SVG_NS = 'http://www.w3.org/2000/svg', __MATH_NS = 'http://www.w3.org/1998/Math/MathML';
-  // Case tables from the HTML spec (adjust SVG tag/attribute names).
-  const __SVG_CASE = {};
-  for (const n of ['altGlyph', 'altGlyphDef', 'altGlyphItem', 'animateColor', 'animateMotion', 'animateTransform', 'clipPath', 'feBlend', 'feColorMatrix', 'feComponentTransfer', 'feComposite', 'feConvolveMatrix', 'feDiffuseLighting', 'feDisplacementMap', 'feDistantLight', 'feDropShadow', 'feFlood', 'feFuncA', 'feFuncB', 'feFuncG', 'feFuncR', 'feGaussianBlur', 'feImage', 'feMerge', 'feMergeNode', 'feMorphology', 'feOffset', 'fePointLight', 'feSpecularLighting', 'feSpotLight', 'feTile', 'feTurbulence', 'foreignObject', 'glyphRef', 'linearGradient', 'radialGradient', 'textPath']) __SVG_CASE[__s_toLowerCase(n)] = n;
-  const __SVG_ATTR_CASE = {};
-  for (const n of ['attributeName', 'attributeType', 'baseFrequency', 'baseProfile', 'calcMode', 'clipPathUnits', 'diffuseConstant', 'edgeMode', 'filterUnits', 'glyphRef', 'gradientTransform', 'gradientUnits', 'kernelMatrix', 'kernelUnitLength', 'keyPoints', 'keySplines', 'keyTimes', 'lengthAdjust', 'limitingConeAngle', 'markerHeight', 'markerUnits', 'markerWidth', 'maskContentUnits', 'maskUnits', 'numOctaves', 'pathLength', 'patternContentUnits', 'patternTransform', 'patternUnits', 'pointsAtX', 'pointsAtY', 'pointsAtZ', 'preserveAlpha', 'preserveAspectRatio', 'primitiveUnits', 'refX', 'refY', 'repeatCount', 'repeatDur', 'requiredExtensions', 'requiredFeatures', 'specularConstant', 'specularExponent', 'spreadMethod', 'startOffset', 'stdDeviation', 'stitchTiles', 'surfaceScale', 'systemLanguage', 'tableValues', 'targetX', 'targetY', 'textLength', 'viewBox', 'viewTarget', 'xChannelSelector', 'yChannelSelector', 'zoomAndPan']) __SVG_ATTR_CASE[__s_toLowerCase(n)] = n;
   const __foreignElem = (doc, ns, name) => {
     const O = globalThis.__pt_orig || {};
     const f = O.createElementNS || Document.prototype.createElementNS;
     return f.call(doc, ns, name);
   };
-  function parseFragment(html) {
-    const doc = globalThis.document;
-    // Parsing bypasses page-visible names: in Chrome `innerHTML` does not call
-    // `createElement`, `appendChild` or `setAttribute`, and anyone wrapping
-    // them would see the calls.
-    const O = globalThis.__pt_orig || {};
-    const mk = (name, self, args) => (O[name] ? O[name].apply(self, args) : self[name].apply(self, args));
-    const frag = () => mk('createDocumentFragment', doc, []);
-    const text = (t) => mk('createTextNode', doc, [t]);
-    const note = (t) => mk('createComment', doc, [t]);
-    const elem = (t) => mk('createElement', doc, [t]);
-    const put = (parent, child) => __ptAdd.call(parent, child);
-    const attr = (el, n, v) => __ptSetAttr.call(el, n, v);
-    const root = frag();
-    const stack = [root];
-    const top = () => stack[stack.length - 1];
-    let i = 0;
-    while (i < html.length) {
-      if (html[i] === '<') {
-        if (__s_startsWith(html, '<!--', i)) {
-          const end = __s_indexOf(html, '-->', i + 4);
-          const stop = end < 0 ? html.length : end;
-          put(top(), note(__s_slice(html, i + 4, stop)));
-          i = end < 0 ? html.length : end + 3; continue;
-        }
-        // A DOCTYPE inside a fragment is a parse error the parser ignores —
-        // it never becomes text.
-        if (/^<!doctype/i.test(__s_slice(html, i, i + 9))) {
-          const end = __s_indexOf(html, '>', i);
-          i = end < 0 ? html.length : end + 1; continue;
-        }
-        const close = html[i + 1] === '/';
-        const m = /^<\/?([a-zA-Z][\w-]*)((?:[^>"']|"[^"]*"|'[^']*')*)\/?>/.exec(__s_slice(html, i));
-        if (!m) { put(top(), text('<')); i++; continue; }
-        const tag = __s_toLowerCase(m[1]);
-        if (close) {
-          for (let s = stack.length - 1; s > 0; s--) if (__s_toLowerCase(String(stack[s].__ptLocal)) === tag) { stack.length = s; break; }
-        } else if (tag === 'html' || tag === 'head' || tag === 'body') {
-          // Fragment parsing: Chrome does not insert these tags, their content
-          // moves into the current parent (`div.innerHTML =
-          // '<html><body></body></html>'` leaves it empty).
-        } else {
-          // Implied end tags as in HTML parsing: a new block tag closes an open
-          // <p>, `<li>` closes an open <li>, etc. (`<p>a<p>b` gives two siblings).
-          const CLOSES_P = new Set(['address', 'article', 'aside', 'blockquote', 'details', 'dialog', 'div', 'dl', 'fieldset', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hgroup', 'hr', 'main', 'menu', 'nav', 'ol', 'p', 'pre', 'section', 'table', 'ul']);
-          const SELF_CLOSES = { li: ['li'], dt: ['dt', 'dd'], dd: ['dt', 'dd'], option: ['option', 'optgroup'], optgroup: ['optgroup'], tr: ['tr', 'td', 'th'], td: ['td', 'th'], th: ['td', 'th'], thead: ['tbody', 'tfoot', 'thead'], tbody: ['tbody', 'tfoot', 'thead'], tfoot: ['tbody', 'tfoot', 'thead'] };
-          if (CLOSES_P.has(tag)) { for (let s = stack.length - 1; s > 0; s--) { if (stack[s].__ptLocal === 'p') { stack.length = s; break; } if (CLOSES_P.has(stack[s].__ptLocal) && stack[s].__ptLocal !== 'p') break; } }
-          const closes = SELF_CLOSES[tag];
-          if (closes) { for (let s = stack.length - 1; s > 0; s--) { const ln = stack[s].__ptLocal; if (__s_indexOf(closes, ln) >= 0) { stack.length = s; break; } if (ln === 'table' || ln === 'ul' || ln === 'ol' || ln === 'select' || ln === 'dl') break; } }
-          // Implied table wrappers: `<table><tr>` gets a `<tbody>`, a `<td>`
-          // without a row gets a `<tr>`; `table.tBodies[0].rows` always exists.
-          if (tag === 'tr' || tag === 'td' || tag === 'th') {
-            const tl = top().__ptLocal;
-            if (tag === 'tr' && tl === 'table') { const tb = elem('tbody'); put(top(), tb); stack.push(tb); }
-            else if ((tag === 'td' || tag === 'th') && (tl === 'table' || tl === 'tbody' || tl === 'thead' || tl === 'tfoot')) {
-              if (tl === 'table') { const tb = elem('tbody'); put(top(), tb); stack.push(tb); }
-              const row = elem('tr'); put(top(), row); stack.push(row);
-            }
-          }
-          // Foreign content as in HTML parsing: SVG elements inside <svg> (name
-          // case per the spec table), MathML inside <math>, HTML again inside
-          // SVG foreignObject/desc/title.
-          const parentNS = (() => {
-            const t = top(); const pns = t && t.__ptNS;
-            if (pns === __SVG_NS && (t.__ptLocal === 'foreignObject' || t.__ptLocal === 'desc' || t.__ptLocal === 'title')) return null;
-            if (pns === __MATH_NS && t.__ptLocal === 'annotation-xml') return null;
-            return pns === __SVG_NS || pns === __MATH_NS ? pns : null;
-          })();
-          const ns = parentNS || (tag === 'svg' ? __SVG_NS : tag === 'math' ? __MATH_NS : null);
-          const el = ns ? __foreignElem(doc, ns, ns === __SVG_NS ? (__SVG_CASE[tag] || tag) : tag) : elem(tag);
-          for (const am of m[2].matchAll(/([\w:-]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g)) {
-            let v = am[2] || '';
-            if (v && (v[0] === '"' || v[0] === "'")) v = __s_slice(v, 1, -1);
-            // Character references in attribute values are decoded like text:
-            // `&quot;` becomes a quote and serializes back as `&quot;`.
-            const an = __s_toLowerCase(am[1]);
-            attr(el, ns === __SVG_NS ? (__SVG_ATTR_CASE[an] || an) : an, unescapeEntities(v));
-          }
-          put(top(), el);
-          const selfClose = __s_endsWith(m[0], '/>') && (ns || VOID.has(tag)) || VOID.has(tag) && !ns;
-          if (!selfClose) stack.push(el);
-        }
-        i += m[0].length;
-      } else {
-        const next = __s_indexOf(html, '<', i);
-        const stop = next < 0 ? html.length : next;
-        const chunk = __s_slice(html, i, stop);
-        if (chunk) put(top(), text(unescapeEntities(chunk)));
-        i = stop;
-      }
+  // The HTML parser (html5ever, as Chrome parses) on markup for an element:
+  // `context` is the element whose children the markup becomes (`innerHTML`
+  // on it, `insertAdjacentHTML` around it); none means `<body>`. The nodes
+  // come back unattached, in order.
+  function parseFragment(html, context) {
+    const doc = (context && (context.__ptType === DOCUMENT_NODE ? context : context.__ptDoc)) || globalThis.document;
+    let local = 'body', ns = 'http://www.w3.org/1999/xhtml';
+    if (context && context.__ptType === ELEMENT_NODE) {
+      local = context.__ptLocal;
+      ns = context.__ptNS || 'http://www.w3.org/1999/xhtml';
     }
-    return __s_slice(root.__ptKids);
+    const mode = doc && doc.compatMode === 'BackCompat' ? 'quirks' : 'no';
+    const specs = __ptJSON.parse(__pt_parseHtmlFragment(String(html), local, ns, mode));
+    return __buildSpecs(doc, specs, null, false);
   }
-  const NAMED_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00a0', copy: '\u00a9', reg: '\u00ae', trade: '\u2122', hellip: '\u2026', mdash: '\u2014', ndash: '\u2013', laquo: '\u00ab', raquo: '\u00bb', times: '\u00d7', middot: '\u00b7', bull: '\u2022', lsquo: '\u2018', rsquo: '\u2019', ldquo: '\u201c', rdquo: '\u201d', euro: '\u20ac', pound: '\u00a3', yen: '\u00a5', cent: '\u00a2', sect: '\u00a7', deg: '\u00b0', plusmn: '\u00b1', para: '\u00b6', shy: '\u00ad', iexcl: '\u00a1', iquest: '\u00bf', larr: '\u2190', rarr: '\u2192', uarr: '\u2191', darr: '\u2193', ensp: '\u2002', emsp: '\u2003', thinsp: '\u2009', zwnj: '\u200c', zwj: '\u200d' };
-  function unescapeEntities(s) {
-    if (__s_indexOf(s, '&') < 0) return s;
-    return __s_replace(s, /&(#[xX][0-9a-fA-F]+|#[0-9]+|[a-zA-Z][a-zA-Z0-9]*);/g, (m, e) => {
-      if (e[0] === '#') {
-        const cp = e[1] === 'x' || e[1] === 'X' ? parseInt(__s_slice(e, 2), 16) : parseInt(__s_slice(e, 1), 10);
-        if (!Number.isFinite(cp) || cp <= 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return '\ufffd';
-        return String.fromCodePoint(cp);
+  // A name `createElement` refuses (`<div<div>` makes `div<div`) the parser
+  // still creates, as an unknown element.
+  const __CREATE_ELEMENT_NAME = /^[A-Za-z_:À-\u{10FFFF}][A-Za-z0-9_:.\-·À-\u{10FFFF}]*$/u;
+  function __parserElement(doc, spec) {
+    if (spec.ns) return __foreignElem(doc, spec.ns, spec.tag);
+    const O = globalThis.__pt_orig || {};
+    if (__CREATE_ELEMENT_NAME.test(spec.tag)) return (O.createElement || Document.prototype.createElement).call(doc, spec.tag);
+    const e = new Element(spec.tag);
+    if (globalThis.__pt_elementProto) { try { Object.setPrototypeOf(e, __pt_elementProto(spec.tag)); } catch (x) {} }
+    e.__ptDoc = doc;
+    return e;
+  }
+  // Nodes from the parser's specs, built without the page's own methods
+  // (Chrome's parser calls none) and without a stack frame per level. With
+  // `into` the top-level nodes are appended there, else returned. Scripts the
+  // parser builds are "already started" unless `live`: the engine runs a
+  // document's own, and markup set later (`innerHTML`) never runs.
+  function __buildSpecs(doc, specs, into, live) {
+    const out = [];
+    const st = [specs, 0, into];
+    while (st.length) {
+      const top = st.length - 3;
+      const list = st[top], i = st[top + 1], parent = st[top + 2];
+      if (i >= list.length) { st.length = top; continue; }
+      st[top + 1] = i + 1;
+      const spec = list[i];
+      let n = null;
+      if (spec.k === 't') { n = new Text(spec.v); n.__ptDoc = doc; }
+      else if (spec.k === 'c') { n = new Comment(spec.v); n.__ptDoc = doc; }
+      else if (spec.k === 'p') n = __makePI(doc, spec.t, spec.v);
+      else if (spec.k === 'd') n = __makeDoctype(doc, spec.name, spec.publicId, spec.systemId);
+      else if (spec.k === 'e') {
+        const el = __parserElement(doc, spec);
+        if (spec.tag === 'script' && !spec.ns && !live) {
+          Object.defineProperty(el, '__ptRan', { value: true, configurable: true, enumerable: false });
+          el.__ptNoForceAsync = true;
+        }
+        for (const [name, value] of spec.attrs) __ptSetA(el, name, value);
+        n = el;
+        // The parser puts template children into its content and leaves the
+        // element empty (`t.childNodes.length === 0` in Chrome too).
+        if (spec.children.length) st.push(spec.children, 0, spec.tag === 'template' && !spec.ns ? __templateContent(el) : el);
       }
-      return Object.prototype.hasOwnProperty.call(NAMED_ENTITIES, e) ? NAMED_ENTITIES[e] : m;
-    });
+      if (!n) continue;
+      if (parent) __ptAdd.call(parent, n); else out.push(n);
+    }
+    return out;
   }
-
+  // A whole document parsed into `doc` as the HTML parser builds it: doctype,
+  // comments and processing instructions around the root, the root, and the
+  // mode (quirks or not) the doctype gave.
+  function __parseDocumentInto(doc, markup, live) {
+    const r = __ptJSON.parse(__pt_parseHtmlDocument(String(markup)));
+    doc.__ptKids = [];
+    doc.__ptDocEl = null;
+    doc.__ptDoctype = null;
+    for (const n of __buildSpecs(doc, r.children, null, !!live)) {
+      if (n.__ptType === 10) {
+        n.__ptParent = doc;
+        doc.__ptKids.push(n);
+        doc.__ptDoctype = n;
+        continue;
+      }
+      __ptAdd.call(doc, n);
+      if (n.__ptType === ELEMENT_NODE) doc.__ptDocEl = n;
+    }
+    doc.__ptMode = r.mode;
+    return doc.__ptDocEl;
+  }
+  // A DocumentType: Node fields like any node, the name and ids in the
+  // interface's stored members; no own properties, as in Chrome.
+  function __makeDoctype(doc, name, publicId, systemId) {
+    const P = (globalThis.DocumentType && DocumentType.prototype) || Node.prototype;
+    const n = Object.create(P);
+    n.__ptType = 10;
+    n.__ptKids = [];
+    n.__ptParent = null;
+    n.__ptDoc = doc;
+    n.__ptLis = Object.create(null);
+    if (typeof __pt_write === 'function') {
+      __pt_write(n, 'name', String(name || ''));
+      __pt_write(n, 'publicId', String(publicId || ''));
+      __pt_write(n, 'systemId', String(systemId || ''));
+    }
+    return n;
+  }
   // ---- build DOM from the Rust-parsed tree ----------------------------------
   // `<template>` keeps its parsed content in a separate DocumentFragment,
   // `t.content`. The Cloudflare challenge builds nodes through templates.
@@ -6276,24 +6526,7 @@
   }
   globalThis.__pt_templateContent = __templateContent;
 
-  function buildNode(doc, spec) {
-    if (spec.k === 't') return doc.createTextNode(spec.v);
-    if (spec.k === 'c') return doc.createComment(spec.v);
-    const el = spec.ns ? __foreignElem(doc, spec.ns, spec.tag) : doc.createElement(spec.tag);
-    // A parser-built script is "already started": the engine runs the document's
-    // scripts itself, in document order, so connecting the tree must not run them
-    // a second time. Only what a page inserts later goes through `__ptRunScript`.
-    if (spec.tag === 'script') {
-      Object.defineProperty(el, '__ptRan', { value: true, configurable: true, enumerable: false });
-      el.__ptNoForceAsync = true;
-    }
-    for (const [name, value] of spec.attrs) __ptSetA(el, name, value);
-    // The parser puts template children into its content and leaves the
-    // element empty (`t.childNodes.length === 0` in Chrome too).
-    const into = spec.tag === 'template' ? __templateContent(el) : el;
-    for (const child of spec.children) into.appendChild(buildNode(doc, child));
-    return el;
-  }
+  const buildNode = (doc, spec) => __buildSpecs(doc, [spec], null, false)[0];
 
   // ---- install globals ------------------------------------------------------
   const document = new Document();
@@ -6320,6 +6553,8 @@
     switch (this.__ptType) {
       case 1: return this.tagName;
       case 3: return '#text';
+      case 4: return '#cdata-section';
+      case 7: return this.__ptTarget;
       case 8: return '#comment';
       case 9: return '#document';
       case 10: return this.name || 'html';
@@ -6332,15 +6567,17 @@
     nodeName: { get: __nodeName },
     parentElement: { get: function () { const p = this.__ptParent; return p && p.__ptType === 1 ? p : null; } },
     nodeValue: {
-      get: function () { return (this.__ptType === 3 || this.__ptType === 8) ? this.data : null; },
-      set: function (v) { if (this.__ptType === 3 || this.__ptType === 8) this.data = String(v); },
+      get: function () { const t = this.__ptType; return (t === 3 || t === 4 || t === 7 || t === 8) ? this.__ptData : null; },
+      // [LegacyNullToEmptyString]
+      set: function (v) { const t = this.__ptType; if (t === 3 || t === 4 || t === 7 || t === 8) __cdSetAll(this, v === null ? '' : String(v)); },
     },
     isSameNode: { value: function isSameNode(other) { return this === other; } },
     isEqualNode: {
       value: function isEqualNode(other) {
         if (!other || this.__ptType !== other.__ptType) return false;
         if (this.nodeName !== other.nodeName) return false;
-        if (this.__ptType === 3 || this.__ptType === 8) return this.data === other.data;
+        if (this.__ptType === 3 || this.__ptType === 8) return this.__ptData === other.__ptData;
+        if (this.__ptType === 7) return this.__ptTarget === other.__ptTarget && this.__ptData === other.__ptData;
         if (this.__ptType === 1) {
           const a = this.attributes || [], b = other.attributes || [];
           if (a.length !== b.length) return false;
@@ -7581,8 +7818,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   } catch (e) {}
 
   globalThis.ShadowRoot = ShadowRoot;
+  globalThis.CharacterData = CharacterData;
   globalThis.Text = Text;
   globalThis.Comment = Comment;
+  globalThis.ProcessingInstruction = ProcessingInstruction;
   globalThis.Document = Document;
   globalThis.Event = Event;
   globalThis.CustomEvent = CustomEvent;
@@ -7610,7 +7849,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       Object.defineProperty(doc, '__ptContentType', { value: kind, writable: true, configurable: true });
       const isHtml = kind === 'text/html';
       if (!isHtml) Object.defineProperty(doc, '__ptXml', { value: true, writable: true, configurable: true });
-      const nodes = isHtml ? parseFragment(String(markup == null ? '' : markup)) : (() => {
+      if (isHtml) {
+        __parseDocumentInto(doc, markup == null ? '' : markup);
+        return this.finishParsed(doc, true);
+      }
+      const nodes = (() => {
         const r = this.parseXml(doc, String(markup == null ? '' : markup));
         let root = r.nodes.find((n) => n.__ptType === ELEMENT_NODE);
         if (r.error) {
@@ -7642,6 +7885,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       }
       __ptAdd.call(doc, root);
       doc.__ptDocEl = root;
+      return this.finishParsed(doc, isHtml);
+    },
+    finishParsed(doc, isHtml) {
       __walkTree(doc, (n) => { n.__ptDoc = doc; });
       // A document from a string is complete immediately and has no window
       // (`location` own property, null); class HTMLDocument or XMLDocument.
@@ -8230,70 +8476,61 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   };
   globalThis.__pt_writeDocument = (html) => {
     try { Object.defineProperty(document, '__ptMarkup', { value: String(html == null ? '' : html), configurable: true, writable: true }); } catch (e) {}
-    const nodes = parseFragment(String(html == null ? '' : html));
-    let root = nodes.find((n) => n.__ptType === 1 && n.tagName === 'HTML');
-    if (!root) {
-      root = document.createElement('html');
-      for (const n of nodes) root.appendChild(n);
-    }
-    if (!__tags(root, 'head')[0]) root.insertBefore(document.createElement('head'), root.firstChild);
-    let body = __tags(root, 'body')[0];
-    if (!body) {
-      body = document.createElement('body');
-      // Anything the markup put outside head is body content.
-      const head = __tags(root, 'head')[0];
-      for (const n of root.childNodes.slice ? __s_slice(root.childNodes) : Array.from(root.childNodes)) {
-        if (n !== head) { root.removeChild(n); body.appendChild(n); }
-      }
-      root.appendChild(body);
-    }
+    // Parsed whole, into a detached document first: the policy is read
+    // before the tree is attached (scripts run on attach).
+    const scratch = new Document();
+    const root = __parseDocumentInto(scratch, html == null ? '' : html, true);
+    if (root) __pt_cspFromMeta(root);
     document.__ptKids = [];
     document.__ptDocEl = null;
-    // Policy before attaching the tree: scripts run on attach.
-    __pt_cspFromMeta(root);
-    document.appendChild(root);
-    document.__ptDocEl = root;
+    document.__ptDoctype = null;
+    document.__ptMode = scratch.__ptMode;
+    for (const n of __s_slice(scratch.__ptKids)) {
+      if (n.__ptType === 10) { n.__ptParent = document; n.__ptDoc = document; document.__ptKids.push(n); document.__ptDoctype = n; continue; }
+      __ptDrop.call(scratch, n);
+      __ptAdd.call(document, n);
+      if (n.__ptType === ELEMENT_NODE) document.__ptDocEl = n;
+    }
     document.__ptReady = 'complete';
     // Markup scripts run here and now, in this window.
-    for (const el of __tags(root, 'script')) {
+    if (root) for (const el of __tags(root, 'script')) {
       try { el.__ptRunScript(); } catch (e) {}
     }
     return document;
   };
 
-  globalThis.__pt_installDocument = (tree, dt, markup) => {
+  globalThis.__pt_installDocument = (tree, dt, markup, mode, before, after) => {
     if (typeof markup === 'string') { try { Object.defineProperty(document, '__ptMarkup', { value: markup, configurable: true, writable: true }); } catch (e) {} }
     document.__ptKids = [];
     document.__ptDocEl = null;
     document.__ptCurScript = null;
     // `<!DOCTYPE html>` is a node, the document's first child, not a flag.
     document.__ptDoctype = null;
-    if (dt) {
-      // `Object.prototype.toString.call(doctype)` must be `[object DocumentType]`.
-      try {
-        if (globalThis.DocumentType && !Object.getOwnPropertyDescriptor(DocumentType.prototype, Symbol.toStringTag)) {
-          Object.defineProperty(DocumentType.prototype, Symbol.toStringTag, { value: 'DocumentType', configurable: true });
-        }
-      } catch (e) {}
-      const node = Object.create((globalThis.DocumentType && DocumentType.prototype) || Object.prototype);
-      Object.defineProperty(node, '__ptE', { value: {}, enumerable: false, writable: true });
-      Object.defineProperty(node, '__ptType', { value: 10, enumerable: false, writable: true });
-      Object.defineProperty(node, '__ptParent', { value: document, enumerable: false, writable: true });
-      for (const [k, v] of [['name', String(dt.name || 'html')], ['publicId', String(dt.publicId || '')],
-                            ['systemId', String(dt.systemId || '')], ['nodeName', String(dt.name || 'html')],
-                            ['nodeType', 10], ['nodeValue', null], ['textContent', null],
-                            ['ownerDocument', document], ['parentNode', document], ['childNodes', []]]) {
-        Object.defineProperty(node, k, { get: () => v, configurable: true });
+    // `Object.prototype.toString.call(doctype)` must be `[object DocumentType]`.
+    try {
+      if (globalThis.DocumentType && !Object.getOwnPropertyDescriptor(DocumentType.prototype, Symbol.toStringTag)) {
+        Object.defineProperty(DocumentType.prototype, Symbol.toStringTag, { value: 'DocumentType', configurable: true });
       }
-      document.__ptDoctype = node;
-      document.__ptKids.push(node);
-    }
+    } catch (e) {}
+    // The document's children around the root: the doctype where it stood,
+    // comments, processing instructions.
+    const place = (n) => {
+      if (n.__ptType === 10) {
+        n.__ptParent = document;
+        document.__ptKids.push(n);
+        document.__ptDoctype = n;
+      } else __ptAdd.call(document, n);
+    };
+    if (Array.isArray(before)) for (const n of __buildSpecs(document, before, null, false)) place(n);
+    else if (dt) place(__makeDoctype(document, dt.name || 'html', dt.publicId, dt.systemId));
+    document.__ptMode = typeof mode === 'string' ? mode : null;
     if (tree && tree.k === 'e') {
       const html = buildNode(document, tree);
       __pt_cspFromMeta(html);
       document.appendChild(html);
       document.__ptDocEl = html;
     }
+    if (Array.isArray(after)) for (const n of __buildSpecs(document, after, null, false)) place(n);
     scriptNodes = __docTags(document, 'script');
     // While the document's own scripts run, readyState is 'loading'; code
     // branches on it ("not loading: start now, else wait for DOMContentLoaded").
@@ -9064,48 +9301,120 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   }
 
   // --- MutationObserver ---------------------------------------------------
-  // A stub that never fires is worse than none: a page waiting on a mutation
-  // simply stops, with no error to explain it. Records are collected on the same
-  // hooks that already mark the tree dirty and delivered in a microtask, as the
-  // spec requires (callbacks must not run inside the mutation itself).
-  const __observers = [];
+  // As Blink does it (mutation_observer.cc): registrations live on the
+  // observed nodes; a mutation walks the target's ancestors and each observer
+  // interested gets one MutationRecord, with the old value only if one of its
+  // registrations asked for it; observers are delivered in a microtask, in
+  // the order they were created; a node removed from an observed subtree
+  // keeps a transient registration until its observer is next delivered.
+  // Observers without registrations or records are not held (all of them
+  // were, for the life of the page).
+  // Registration: { st, o: options, filter: Set|null, node, transients: Set }.
+  const __moRegs = new WeakMap();
+  const __moTransient = new WeakMap();
+  let __moLive = 0;
+  let __moPriority = 0;
+  const __moActive = new Set();
   let __moScheduled = false;
 
+  function __moActivate(st) {
+    __moActive.add(st);
+    if (!__moScheduled) { __moScheduled = true; queueMicrotask(__moDeliver); }
+  }
+  function __moClearTransients(reg) {
+    for (const n of reg.transients) {
+      const list = __moTransient.get(n);
+      if (!list) continue;
+      const i = __s_indexOf(list, reg);
+      if (i >= 0) { list.splice(i, 1); __moLive--; }
+      if (!list.length) __moTransient.delete(n);
+    }
+    reg.transients.clear();
+  }
   function __moDeliver() {
     __moScheduled = false;
-    for (const o of __observers) {
-      if (!o.records.length) continue;
-      const batch = o.records.splice(0);
-      try { o.cb(batch, o.api); } catch (e) {}
+    const sts = [...__moActive].sort((a, b) => a.priority - b.priority);
+    __moActive.clear();
+    for (const st of sts) {
+      for (const reg of st.regs) if (reg.transients.size) __moClearTransients(reg);
+      if (!st.records.length) continue;
+      const batch = st.records.splice(0);
+      try { st.cb.call(st.api, batch, st.api); } catch (e) { __pt_reportError(e, 'MutationObserver'); }
     }
   }
-
-  function __moWatches(entry, rec) {
-    if (entry.target === rec.target) return true;
-    return !!entry.opts.subtree && entry.target.contains && entry.target.contains(rec.target);
-  }
-
-  function __moWants(entry, rec) {
-    if (rec.type === 'childList') return !!entry.opts.childList;
-    if (rec.type === 'attributes') {
-      if (!entry.opts.attributes) return false;
-      const filter = entry.opts.attributeFilter;
-      return !filter || filter.some(a => __s_toLowerCase(String(a)) === rec.attributeName);
+  // A node leaving a parent: every subtree registration on the parent's
+  // inclusive ancestors (transient ones too) follows it.
+  function __moNodeWillDetach(parent, node) {
+    if (!__moLive) return;
+    for (let n = parent; n; n = n.__ptParent) {
+      for (const map of [__moRegs, __moTransient]) {
+        const regs = map.get(n);
+        if (!regs) continue;
+        for (const reg of regs) {
+          if (!reg.o.subtree) continue;
+          let list = __moTransient.get(node);
+          if (!list) __moTransient.set(node, (list = []));
+          list.push(reg);
+          __moLive++;
+          reg.transients.add(node);
+          __moActivate(reg.st);
+        }
+      }
     }
-    return !!entry.opts.characterData;
   }
-
+  function __moRecord(src, old) {
+    const R = globalThis.MutationRecord;
+    if (typeof R !== 'function' || typeof __pt_write !== 'function') return Object.assign({}, src, { oldValue: old });
+    const m = Object.create(R.prototype);
+    __pt_write(m, 'type', src.type);
+    __pt_write(m, 'target', src.target);
+    __pt_write(m, 'addedNodes', src.addedNodes);
+    __pt_write(m, 'removedNodes', src.removedNodes);
+    __pt_write(m, 'previousSibling', src.previousSibling || null);
+    __pt_write(m, 'nextSibling', src.nextSibling || null);
+    __pt_write(m, 'attributeName', src.attributeName == null ? null : src.attributeName);
+    __pt_write(m, 'attributeNamespace', src.attributeNamespace == null ? null : src.attributeNamespace);
+    __pt_write(m, 'oldValue', old);
+    return m;
+  }
   function __mutation(rec) {
-    if (!__observers.length) return;
-    let queued = false;
-    for (const o of __observers) {
-      if (!o.entries.some(e => __moWatches(e, rec) && __moWants(e, rec))) continue;
-      o.records.push(rec);
-      queued = true;
+    if (!__moLive) return;
+    const type = rec.type;
+    let wants = null;
+    const consider = (reg, atTarget) => {
+      const o = reg.o;
+      if (!atTarget && !o.subtree) return;
+      if (type === 'attributes') {
+        if (!o.attributes) return;
+        if (reg.filter && (rec.attributeNamespace != null || !reg.filter.has(rec.attributeName))) return;
+      } else if (type === 'characterData') {
+        if (!o.characterData) return;
+      } else if (!o.childList) return;
+      const old = (type === 'attributes' && o.attributeOldValue) || (type === 'characterData' && o.characterDataOldValue);
+      if (!wants) wants = new Map();
+      wants.set(reg.st, !!(wants.get(reg.st) || old));
+    };
+    for (let n = rec.target; n; n = n.__ptParent) {
+      const regs = __moRegs.get(n);
+      if (regs) for (const reg of regs) consider(reg, n === rec.target);
+      const tr = __moTransient.get(n);
+      if (tr) for (const reg of tr) consider(reg, n === rec.target);
     }
-    if (queued && !__moScheduled) {
-      __moScheduled = true;
-      queueMicrotask(__moDeliver);
+    if (!wants) return;
+    const src = {
+      type, target: rec.target,
+      addedNodes: __staticNodeList(rec.addedNodes || __NO_NODES),
+      removedNodes: __staticNodeList(rec.removedNodes || __NO_NODES),
+      previousSibling: rec.previousSibling, nextSibling: rec.nextSibling,
+      attributeName: rec.attributeName, attributeNamespace: rec.attributeNamespace,
+    };
+    let withOld = null, without = null;
+    for (const [st, old] of wants) {
+      const m = old
+        ? (withOld || (withOld = __moRecord(src, rec.oldValue == null ? null : rec.oldValue)))
+        : (without || (without = __moRecord(src, null)));
+      st.records.push(m);
+      __moActivate(st);
     }
   }
 
@@ -9121,21 +9430,61 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   class MutationObserver {
     constructor(cb) {
       if (typeof cb !== 'function') throw __pt_mkErr(TypeError, "Failed to construct 'MutationObserver': parameter 1 is not of type 'Function'.");
-      const state = { cb, entries: [], records: [], api: this };
-      __observers.push(state);
+      const state = { cb, regs: [], records: [], api: this, priority: __moPriority++ };
       Object.defineProperty(this, '__ptState', { value: state, enumerable: false });
     }
-    observe(target, opts) {
-      opts = opts || {};
-      // The spec default: with neither childList nor attributes nor
-      // characterData asked for, this is a TypeError, not a silent no-op.
-      if (!opts.childList && !opts.attributes && !opts.characterData && !opts.attributeFilter) {
-        throw __pt_mkErr(TypeError, "Failed to execute 'observe' on 'MutationObserver': The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
+    observe(target, init) {
+      __needArgs(arguments.length, 1, 'observe', 'MutationObserver');
+      __needNode(target, 1, 'observe', 'MutationObserver');
+      // The dictionary, read once per member in IDL order; the page's object
+      // is not written to.
+      const d = init == null ? {} : init;
+      const has = (v) => v !== undefined;
+      const filterIn = d.attributeFilter, aovIn = d.attributeOldValue, attrsIn = d.attributes;
+      const cdIn = d.characterData, cdovIn = d.characterDataOldValue, childIn = d.childList, subIn = d.subtree;
+      const filter = has(filterIn) ? new Set(Array.from(filterIn, (x) => String(x))) : null;
+      const aov = has(aovIn) && !!aovIn;
+      const attributes = (has(attrsIn) && !!attrsIn) || (!has(attrsIn) && (has(aovIn) || has(filterIn)));
+      const cdov = has(cdovIn) && !!cdovIn;
+      const characterData = (has(cdIn) && !!cdIn) || (!has(cdIn) && has(cdovIn));
+      const childList = !!childIn, subtree = !!subIn;
+      const err = (m) => __pt_mkErr(TypeError, "Failed to execute 'observe' on 'MutationObserver': " + m);
+      if (!attributes) {
+        if (aov) throw err("The options object may only set 'attributeOldValue' to true when 'attributes' is true or not present.");
+        if (filter) throw err("The options object may only set 'attributeFilter' when 'attributes' is true or not present.");
       }
-      if (opts.attributeFilter) opts.attributes = true;
-      this.__ptState.entries.push({ target, opts });
+      if (cdov && !characterData) throw err("The options object may only set 'characterDataOldValue' to true when 'characterData' is true or not present.");
+      if (!attributes && !characterData && !childList) throw err("The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
+      const o = { childList, attributes, characterData, subtree, attributeOldValue: aov, characterDataOldValue: cdov };
+      const st = this.__ptState;
+      let regs = __moRegs.get(target);
+      const same = regs && regs.find((r) => r.st === st);
+      if (same) {
+        __moClearTransients(same);
+        same.o = o;
+        same.filter = filter;
+        return;
+      }
+      if (!regs) __moRegs.set(target, (regs = []));
+      const reg = { st, o, filter, node: target, transients: new Set() };
+      regs.push(reg);
+      st.regs.push(reg);
+      __moLive++;
     }
-    disconnect() { this.__ptState.entries = []; this.__ptState.records = []; }
+    disconnect() {
+      const st = this.__ptState;
+      for (const reg of st.regs) {
+        __moClearTransients(reg);
+        const regs = __moRegs.get(reg.node);
+        if (!regs) continue;
+        const i = __s_indexOf(regs, reg);
+        if (i >= 0) { regs.splice(i, 1); __moLive--; }
+        if (!regs.length) __moRegs.delete(reg.node);
+      }
+      st.regs = [];
+      st.records = [];
+      __moActive.delete(st);
+    }
     takeRecords() { return this.__ptState.records.splice(0); }
   }
 
@@ -9715,6 +10064,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return __s_indexOf(local, '-') > 0 || PLAIN_TAGS.has(local) ? 'HTMLElement' : 'HTMLUnknownElement';
   };
   for (const [C, name] of [[Node, 'Node'], [Element, 'Element'], [Text, 'Text'], [Comment, 'Comment'],
+    [CharacterData, 'CharacterData'], [ProcessingInstruction, 'ProcessingInstruction'],
     [Document, 'Document'], [DocumentFragment, 'DocumentFragment'], [ShadowRoot, 'ShadowRoot']]) {
     if (!C) continue;
     try {
@@ -9754,7 +10104,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (this.__ptParent === p && !__s_includes(nodes, this)) p.removeChild(this);
     for (const n of nodes) p.insertBefore(n, ref);
   };
-  for (const C of [Element, Text, Comment]) {
+  for (const C of [Element, CharacterData]) {
     Object.defineProperty(C.prototype, 'remove', { value: __removeSelf, writable: true, configurable: true });
     Object.defineProperty(C.prototype, 'after', { value: __afterSelf, writable: true, configurable: true });
     Object.defineProperty(C.prototype, 'before', { value: __beforeSelf, writable: true, configurable: true });

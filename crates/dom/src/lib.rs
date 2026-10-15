@@ -56,7 +56,7 @@ pub enum ScriptMode {
 pub struct ParsedPage {
     /// The `<html>` element serialized as a JSON tree (see module docs for the
     /// shape). Consumed by `__pt_installDocument` in [`runtime_js`].
-    pub root: Value,
+    pub root: String,
     /// Scripts to execute, in document order.
     pub scripts: Vec<Script>,
     /// When to run each of [`Self::scripts`], index for index.
@@ -69,6 +69,14 @@ pub struct ParsedPage {
     /// The source markup: inline script line numbers count from the start of
     /// the document (stack traces and CSP reports do).
     pub markup: String,
+    /// The mode the doctype set: `quirks`, `limited` or `no`
+    /// (`document.compatMode`).
+    pub mode: &'static str,
+    /// The document's other children before and after the root, as JSON
+    /// arrays: the doctype where it stood, comments, processing
+    /// instructions (`document.childNodes` lists them in Chrome).
+    pub before: String,
+    pub after: String,
 }
 
 impl ParsedPage {
@@ -80,7 +88,15 @@ impl ParsedPage {
             }),
             None => Value::Null,
         };
-        format!("globalThis.__pt_installDocument({}, {}, {});", self.root, dt, Value::String(self.markup.clone()))
+        format!(
+            "globalThis.__pt_installDocument({}, {}, {}, {}, {}, {});",
+            self.root,
+            dt,
+            Value::String(self.markup.clone()),
+            Value::String(self.mode.to_string()),
+            self.before,
+            self.after
+        )
     }
 }
 
@@ -106,14 +122,30 @@ pub fn parse(html: &str) -> ParsedPage {
         )),
         _ => None,
     });
-    let root = dom
-        .document
-        .children
-        .borrow()
-        .iter()
-        .find(|c| matches!(c.data, NodeData::Element { .. }))
-        .map(|html| serialize(html, &mut scripts, &mut script_modes))
-        .unwrap_or(Value::Null);
+    let mut root = String::with_capacity(html.len() + html.len() / 2);
+    let mut before = String::from("[");
+    let mut after = String::from("[");
+    let mut seen_root = false;
+    for c in dom.document.children.borrow().iter() {
+        if !seen_root && matches!(c.data, NodeData::Element { .. }) {
+            seen_root = true;
+            serialize(c, &mut root, &mut scripts, &mut script_modes);
+            continue;
+        }
+        let side = if seen_root { &mut after } else { &mut before };
+        let mark = side.len();
+        if side.len() > 1 {
+            side.push(',');
+        }
+        if !serialize(c, side, &mut scripts, &mut script_modes) {
+            side.truncate(mark);
+        }
+    }
+    if !seen_root {
+        root.push_str("null");
+    }
+    before.push(']');
+    after.push(']');
 
     ParsedPage {
         root,
@@ -121,11 +153,43 @@ pub fn parse(html: &str) -> ParsedPage {
         script_modes,
         doctype,
         markup: html.to_string(),
+        mode: quirks_name(dom.quirks_mode.get()),
+        before,
+        after,
     }
 }
 
-/// Serialize one node to JSON, recording any scripts encountered.
-fn serialize(node: &Handle, scripts: &mut Vec<Script>, modes: &mut Vec<ScriptMode>) -> Value {
+/// A string as a JSON string literal.
+fn push_json_str(out: &mut String, s: &str) {
+    out.push('"');
+    let bytes = s.as_bytes();
+    let mut from = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let esc: &str = match b {
+            b'"' => "\\\"",
+            b'\\' => "\\\\",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            b'\t' => "\\t",
+            0..=0x1f => "",
+            _ => continue,
+        };
+        out.push_str(&s[from..i]);
+        if esc.is_empty() {
+            out.push_str(&format!("\\u{:04x}", b));
+        } else {
+            out.push_str(esc);
+        }
+        from = i + 1;
+    }
+    out.push_str(&s[from..]);
+    out.push('"');
+}
+
+/// Write one node as JSON, recording any scripts encountered. Written
+/// straight into the string: building a `serde_json::Value` tree first cost
+/// 300 ms on a 1.2 MB article, six times the parse.
+fn serialize(node: &Handle, out: &mut String, scripts: &mut Vec<Script>, modes: &mut Vec<ScriptMode>) -> bool {
     match &node.data {
         NodeData::Element {
             name,
@@ -134,12 +198,6 @@ fn serialize(node: &Handle, scripts: &mut Vec<Script>, modes: &mut Vec<ScriptMod
             ..
         } => {
             let tag = name.local.to_string();
-            let attrs_json: Vec<Value> = attrs
-                .borrow()
-                .iter()
-                .map(|a| json!([a.name.local.to_string(), a.value.to_string()]))
-                .collect();
-
             if tag == "script" {
                 let attr = |name: &str| {
                     attrs
@@ -207,6 +265,32 @@ fn serialize(node: &Handle, scripts: &mut Vec<Script>, modes: &mut Vec<ScriptMod
                 }
             }
 
+            out.push_str("{\"k\":\"e\",\"tag\":");
+            push_json_str(out, &tag);
+            // Namespace for foreign content (SVG, MathML); without it an
+            // inline <svg> becomes HTMLUnknownElement.
+            let ns: &str = &name.ns;
+            if !(ns.is_empty() || ns == "http://www.w3.org/1999/xhtml") {
+                out.push_str(",\"ns\":");
+                push_json_str(out, ns);
+            }
+            out.push_str(",\"attrs\":[");
+            for (i, a) in attrs.borrow().iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push('[');
+                // `xlink:href`, `xml:lang`: the qualified name, as Chrome
+                // reports it.
+                match &a.name.prefix {
+                    Some(p) => push_json_str(out, &format!("{}:{}", p, a.name.local)),
+                    None => push_json_str(out, &a.name.local),
+                }
+                out.push(',');
+                push_json_str(out, &a.value);
+                out.push(']');
+            }
+            out.push_str("],\"children\":[");
             // `<template>` keeps its parsed content apart from its children
             // (html5ever puts it in `template_contents`); without it
             // `t.content` is empty.
@@ -215,28 +299,121 @@ fn serialize(node: &Handle, scripts: &mut Vec<Script>, modes: &mut Vec<ScriptMod
                 Some(contents) => contents,
                 None => node,
             };
-            let children: Vec<Value> = source
-                .children
-                .borrow()
-                .iter()
-                .map(|c| serialize(c, scripts, modes))
-                .filter(|v| !v.is_null())
-                .collect();
-
-            // Namespace for foreign content (SVG, MathML); without it an
-            // inline <svg> becomes HTMLUnknownElement.
-            let ns = name.ns.to_string();
-            if ns.is_empty() || ns == "http://www.w3.org/1999/xhtml" {
-                json!({ "k": "e", "tag": tag, "attrs": attrs_json, "children": children })
-            } else {
-                json!({ "k": "e", "tag": tag, "ns": ns, "attrs": attrs_json, "children": children })
-            }
+            serialize_children(source, out, scripts, modes);
+            out.push_str("]}");
+            true
         }
-        NodeData::Text { contents } => json!({ "k": "t", "v": contents.borrow().to_string() }),
-        NodeData::Comment { contents } => json!({ "k": "c", "v": contents.to_string() }),
-        // Document, Doctype, ProcessingInstruction: skipped.
-        _ => Value::Null,
+        NodeData::Text { contents } => {
+            out.push_str("{\"k\":\"t\",\"v\":");
+            push_json_str(out, &contents.borrow());
+            out.push('}');
+            true
+        }
+        NodeData::Comment { contents } => {
+            comment_json(out, contents);
+            true
+        }
+        NodeData::Doctype {
+            name,
+            public_id,
+            system_id,
+        } => {
+            out.push_str("{\"k\":\"d\",\"name\":");
+            push_json_str(out, name);
+            out.push_str(",\"publicId\":");
+            push_json_str(out, public_id);
+            out.push_str(",\"systemId\":");
+            push_json_str(out, system_id);
+            out.push('}');
+            true
+        }
+        // Document: nothing.
+        _ => false,
     }
+}
+
+/// A node's children, comma-separated.
+fn serialize_children(node: &Handle, out: &mut String, scripts: &mut Vec<Script>, modes: &mut Vec<ScriptMode>) {
+    let mut first = true;
+    for c in node.children.borrow().iter() {
+        let mark = out.len();
+        if !first {
+            out.push(',');
+        }
+        if serialize(c, out, scripts, modes) {
+            first = false;
+        } else {
+            out.truncate(mark);
+        }
+    }
+}
+
+/// A comment, or the processing instruction the tokenizer handed over as one
+/// (`\0target\0data`, see `vendor/html5ever`).
+fn comment_json(out: &mut String, contents: &str) {
+    if let Some(rest) = contents.strip_prefix('\0') {
+        if let Some((target, data)) = rest.split_once('\0') {
+            out.push_str("{\"k\":\"p\",\"t\":");
+            push_json_str(out, target);
+            out.push_str(",\"v\":");
+            push_json_str(out, data);
+            out.push('}');
+            return;
+        }
+    }
+    out.push_str("{\"k\":\"c\",\"v\":");
+    push_json_str(out, contents);
+    out.push('}');
+}
+
+fn quirks_name(mode: html5ever::tree_builder::QuirksMode) -> &'static str {
+    match mode {
+        html5ever::tree_builder::QuirksMode::Quirks => "quirks",
+        html5ever::tree_builder::QuirksMode::LimitedQuirks => "limited",
+        html5ever::tree_builder::QuirksMode::NoQuirks => "no",
+    }
+}
+
+/// Parse markup as `innerHTML` does: the children it gives an element named
+/// `context` in namespace `ns`, in a document in quirks mode or not. A JSON
+/// array of node specs (see [`ParsedPage`]).
+pub fn parse_fragment_json(html: &str, context: &str, ns: &str, quirks: &str) -> String {
+    use html5ever::{tree_builder::QuirksMode, LocalName, Namespace, ParseOpts, QualName};
+    let mut opts = ParseOpts::default();
+    opts.tree_builder.quirks_mode = match quirks {
+        "quirks" => QuirksMode::Quirks,
+        "limited" => QuirksMode::LimitedQuirks,
+        _ => QuirksMode::NoQuirks,
+    };
+    let name = QualName::new(None, Namespace::from(ns), LocalName::from(context));
+    let dom = html5ever::parse_fragment(RcDom::default(), opts, name, Vec::new(), true).one(html);
+    let mut scripts = Vec::new();
+    let mut modes = Vec::new();
+    let mut out = String::with_capacity(html.len() + html.len() / 2);
+    out.push('[');
+    // The fragment's nodes are the children of the `<html>` root the parser
+    // makes for them.
+    if let Some(root) = dom.document.children.borrow().first() {
+        serialize_children(root, &mut out, &mut scripts, &mut modes);
+    }
+    out.push(']');
+    out
+}
+
+/// Parse a whole document, as `DOMParser` does: its children (doctype,
+/// comments and processing instructions around the root, the root) and its
+/// mode.
+pub fn parse_document_json(html: &str) -> String {
+    let dom = html5ever::parse_document(RcDom::default(), Default::default()).one(html);
+    let mut scripts = Vec::new();
+    let mut modes = Vec::new();
+    let mut out = String::with_capacity(html.len() + html.len() / 2);
+    out.push_str("{\"children\":[");
+    serialize_children(&dom.document, &mut out, &mut scripts, &mut modes);
+    out.push_str("],\"mode\":");
+    push_json_str(&mut out, quirks_name(dom.quirks_mode.get()));
+    out.push('}');
+    out
 }
 
 /// Concatenate the direct text children of a node (used for inline scripts).
@@ -292,7 +469,8 @@ mod tests {
     fn parses_elements_attrs_and_text() {
         let page = parse(r#"<html><body><div id="main" class="a b">Hi</div></body></html>"#);
         // root is <html>; drill into body > div.
-        let html = &page.root;
+        let tree: Value = serde_json::from_str(&page.root).unwrap();
+        let html = &tree;
         assert_eq!(html["tag"], "html");
         // Find the div somewhere in the tree via a quick recursive search.
         fn find<'a>(v: &'a Value, tag: &str) -> Option<&'a Value> {

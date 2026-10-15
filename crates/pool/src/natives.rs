@@ -64,6 +64,8 @@ pub fn install(scope: &mut v8::PinScope) {
     bind(scope, "__pt_protoTemplates", proto_templates_js);
     bind(scope, "__pt_codeLike", code_like_js);
     bind(scope, "__pt_randomBytes", random_bytes);
+    bind(scope, "__pt_parseHtmlFragment", parse_html_fragment);
+    bind(scope, "__pt_parseHtmlDocument", parse_html_document);
     bind(scope, "__pt_digest", digest);
     bind(scope, "__pt_isProxy", is_proxy);
     crate::idb::install(scope);
@@ -1886,6 +1888,40 @@ fn random_bytes(
         return;
     }
     set_bytes(scope, &mut rv, &buf);
+}
+
+/// `__pt_parseHtmlFragment(html, context, ns, mode)`: the node specs
+/// `innerHTML` gives an element named `context` in namespace `ns` (a JSON
+/// array), in a document whose mode is `quirks`, `limited` or `no`. The HTML
+/// parser instead of a hand-written one in JS: 21 of 31 tricky snippets came
+/// out unlike Chrome's tree.
+fn parse_html_fragment(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let html = arg_string(scope, args.get(0));
+    let context = arg_string(scope, args.get(1));
+    let ns = arg_string(scope, args.get(2));
+    let mode = arg_string(scope, args.get(3));
+    let out = nokk_dom::parse_fragment_json(&html, &context, &ns, &mode);
+    if let Some(s) = v8::String::new(scope, &out) {
+        rv.set(s.into());
+    }
+}
+
+/// `__pt_parseHtmlDocument(html)`: a whole document's children and mode, as
+/// JSON (`DOMParser`).
+fn parse_html_document(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let html = arg_string(scope, args.get(0));
+    let out = nokk_dom::parse_document_json(&html);
+    if let Some(s) = v8::String::new(scope, &out) {
+        rv.set(s.into());
+    }
 }
 
 /// `__pt_digest(alg, data)`

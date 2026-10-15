@@ -26,6 +26,7 @@ render = ["dep:tiny-skia", "dep:ab_glyph", "dep:ttf-parser", "dep:rustybuzz"]
 webgl = ["dep:glow", "dep:khronos-egl", "dep:libloading"]
 
 [dependencies]
+nokk-dom = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }

@@ -10725,6 +10725,535 @@ html.dark body .d { background-color: rgb(10, 10, 10) }
         assert_eq!(got, want.join("\n"));
     }
 
+    /// Mutation observers as Chrome 151 delivers to them (mutation_observer.cc): option
+    /// defaults and errors, the page's options object left alone, one MutationRecord per
+    /// observer with the old value only where asked, a repeated observe replacing the
+    /// options, takeRecords and disconnect, a removed node still reported until delivery, and
+    /// a throwing callback reported. Records were plain objects with every old value, text
+    /// changes were never reported, and every observer was kept for the life of the page.
+    #[tokio::test]
+    async fn mutation_observers_deliver_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", r##"<!doctype html><p>std"##).await.unwrap();
+        ctx.evaluate(r##"(async () => { globalThis.__out = await ((async () => {
+  const r = [];
+  const tick = () => new Promise((res) => setTimeout(res, 0));
+  const t = (k, f) => { try { const v = f(); r.push(k + '=' + (v === undefined ? 'undef' : JSON.stringify(v))); } catch (e) { r.push(k + '=' + e.name + ': ' + e.message); } };
+  const fmt = (m) => [m.type, m.target.nodeName, m.attributeName, m.attributeNamespace, JSON.stringify(m.oldValue), m.addedNodes.length, m.removedNodes.length, m.previousSibling && m.previousSibling.nodeName, m.nextSibling && m.nextSibling.nodeName].join(',');
+  // option validation
+  const mo0 = new MutationObserver(() => {});
+  const d0 = document.createElement('div');
+  t('none', () => mo0.observe(d0, {}));
+  t('noopts', () => mo0.observe(d0));
+  t('notnode', () => mo0.observe({}, { childList: true }));
+  t('noargs', () => mo0.observe());
+  t('aov only', () => mo0.observe(d0, { attributeOldValue: true }));
+  t('filter only', () => mo0.observe(d0, { attributeFilter: ['a'] }));
+  t('cdov only', () => mo0.observe(d0, { characterDataOldValue: true }));
+  t('aov+attrs false', () => mo0.observe(d0, { attributes: false, attributeOldValue: true }));
+  t('filter+attrs false', () => mo0.observe(d0, { attributes: false, attributeFilter: ['a'] }));
+  t('cdov+cd false', () => mo0.observe(d0, { characterData: false, characterDataOldValue: true }));
+  { const o = { attributeFilter: ['a'] }; mo0.observe(d0, o); t('opts untouched', () => Object.keys(o)); }
+  t('ctor noarg', () => new MutationObserver());
+  t('ctor bad', () => new MutationObserver(1));
+  t('ctor call', () => MutationObserver(() => {}));
+  // record shape
+  let got = [];
+  const mo = new MutationObserver((list, obs) => { got.push(list.map(fmt).join(' ; ') + ' this=' + (obs === mo) + ' proto=' + (Object.getPrototypeOf(list[0]) === MutationRecord.prototype) + ' arr=' + Array.isArray(list)); });
+  const a = document.createElement('div'); document.body.append(a);
+  mo.observe(a, { attributes: true, childList: true, characterData: true, subtree: true });
+  a.setAttribute('x', '1'); a.setAttribute('x', '2'); a.textContent = 'hi'; a.firstChild.data = 'ho';
+  await tick();
+  r.push('noold: ' + got.join(' || ')); got = [];
+  mo.observe(a, { attributes: true, attributeOldValue: true, characterData: true, characterDataOldValue: true, subtree: true });
+  a.setAttribute('x', '3'); a.firstChild.data = 'hu'; a.appendChild(document.createElement('b'));
+  await tick();
+  r.push('reobserve replaces (childList dropped): ' + got.join(' || ')); got = [];
+  // two observers, one with old value
+  const g2 = [];
+  const mo2 = new MutationObserver((l) => g2.push(l.map(fmt).join(';')));
+  mo2.observe(a, { attributes: true });
+  a.setAttribute('x', '4');
+  await tick();
+  r.push('mo with old: ' + got.join(' || ') + ' / mo2 without: ' + g2.join('||')); got = [];
+  // takeRecords and disconnect
+  a.setAttribute('x', '5');
+  t('take', () => mo.takeRecords().map(fmt));
+  a.setAttribute('x', '6'); mo.disconnect();
+  await tick();
+  r.push('after disconnect: ' + got.length);
+  // removed subtree (transient)
+  const g3 = [];
+  const mo3 = new MutationObserver((l) => g3.push(l.map(fmt).join(';')));
+  const p = document.createElement('div'), c = document.createElement('span'); p.append(c); document.body.append(p);
+  mo3.observe(p, { attributes: true, subtree: true });
+  c.remove(); c.setAttribute('y', '1');
+  await tick();
+  c.setAttribute('y', '2');
+  await tick();
+  r.push('transient: ' + g3.join(' || '));
+  // callback error reporting
+  let errSeen = null; const oe = window.onerror; window.onerror = (m) => { errSeen = String(m); return true; };
+  const mo4 = new MutationObserver(() => { throw new Error('boom'); });
+  mo4.observe(a, { attributes: true }); a.setAttribute('z', '1');
+  await tick(); window.onerror = oe;
+  r.push('cb error -> onerror: ' + errSeen);
+  // record object
+  const g5 = []; const mo5 = new MutationObserver((l) => { const m = l[0]; g5.push([Object.getOwnPropertyNames(m).length, typeof m.addedNodes.item, Object.prototype.toString.call(m.addedNodes), m.addedNodes === m.addedNodes, String(m)].join(',')); });
+  mo5.observe(a, { childList: true }); a.append('t');
+  await tick();
+  r.push('record: ' + g5.join(''));
+  r.push('MR names: ' + Object.getOwnPropertyNames(MutationRecord.prototype).join(','));
+  return r.join('\n');
+})()); })()"##).await.unwrap();
+        let got = pump_until(&ctx, "globalThis.__out || ''", 40).await;
+        ctx.evaluate("globalThis.__out = undefined").await.unwrap();
+        assert_eq!(got, Value::String(r##"none=TypeError: Failed to execute 'observe' on 'MutationObserver': The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.
+noopts=TypeError: Failed to execute 'observe' on 'MutationObserver': The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.
+notnode=TypeError: Failed to execute 'observe' on 'MutationObserver': parameter 1 is not of type 'Node'.
+noargs=TypeError: Failed to execute 'observe' on 'MutationObserver': 1 argument required, but only 0 present.
+aov only=undef
+filter only=undef
+cdov only=undef
+aov+attrs false=TypeError: Failed to execute 'observe' on 'MutationObserver': The options object may only set 'attributeOldValue' to true when 'attributes' is true or not present.
+filter+attrs false=TypeError: Failed to execute 'observe' on 'MutationObserver': The options object may only set 'attributeFilter' when 'attributes' is true or not present.
+cdov+cd false=TypeError: Failed to execute 'observe' on 'MutationObserver': The options object may only set 'characterDataOldValue' to true when 'characterData' is true or not present.
+opts untouched=["attributeFilter"]
+ctor noarg=TypeError: Failed to construct 'MutationObserver': 1 argument required, but only 0 present.
+ctor bad=TypeError: Failed to construct 'MutationObserver': parameter 1 is not of type 'Function'.
+ctor call=TypeError: Failed to construct 'MutationObserver': Please use the 'new' operator, this DOM object constructor cannot be called as a function.
+noold: attributes,DIV,x,,null,0,0,, ; attributes,DIV,x,,null,0,0,, ; childList,DIV,,,null,1,0,, ; characterData,#text,,,null,0,0,, this=true proto=true arr=true
+reobserve replaces (childList dropped): attributes,DIV,x,,"2",0,0,, ; characterData,#text,,,"ho",0,0,, this=true proto=true arr=true
+mo with old: attributes,DIV,x,,"3",0,0,, this=true proto=true arr=true / mo2 without: attributes,DIV,x,,null,0,0,,
+take=["attributes,DIV,x,,\"4\",0,0,,"]
+after disconnect: 0
+transient: attributes,SPAN,y,,null,0,0,,
+cb error -> onerror: Uncaught Error: boom
+record: 0,function,[object NodeList],true,[object MutationRecord]
+MR names: type,target,addedNodes,removedNodes,previousSibling,nextSibling,attributeName,attributeNamespace,oldValue,constructor"##.into()), "mo");
+    }
+
+    /// CharacterData as Chrome 151: appendData, insertData, deleteData, replaceData,
+    /// substringData, splitText and wholeText with WebIDL unsigned offsets and Chrome's
+    /// errors, null data as empty, and a characterData record for each change. They were
+    /// stubs that changed nothing.
+    #[tokio::test]
+    async fn character_data_edits_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", r##"<!doctype html><p>std"##).await.unwrap();
+        let got = ctx.evaluate(r##"(() => { const r = []; const t = (k, f) => { try { r.push(k + "=" + JSON.stringify(f())); } catch (e) { r.push(k + "=" + e.name + ": " + e.message); } }; const x = () => document.createTextNode("hello"); t("append", () => { const n = x(); n.appendData("!"); return n.data; }); t("insert", () => { const n = x(); n.insertData(1, "X"); return n.data; }); t("delete", () => { const n = x(); n.deleteData(1, 2); return n.data; }); t("replace", () => { const n = x(); n.replaceData(1, 2, "Y"); return n.data; }); t("substr", () => x().substringData(1, 3)); t("substrBad", () => x().substringData(9, 1)); t("len", () => x().length); t("split", () => { const d = document.createElement("p"); d.textContent = "hello"; const b = d.firstChild.splitText(2); return [d.firstChild.data, b.data, d.childNodes.length]; }); t("whole", () => { const d = document.createElement("p"); d.append("a", "b"); return d.lastChild.wholeText; }); t("cdata", () => { const c = document.createComment("ab"); c.appendData("c"); c.deleteData(0, 1); return c.data; }); t("setData", () => { const n = x(); n.data = null; return n.data; }); t("nodeValueSet", () => { const n = x(); n.nodeValue = 5; return n.data; }); return r.join("\n"); })()"##).await.unwrap();
+        assert_eq!(got, Value::String(r##"append="hello!"
+insert="hXello"
+delete="hlo"
+replace="hYlo"
+substr="ell"
+substrBad=IndexSizeError: Failed to execute 'substringData' on 'CharacterData': The offset 9 is greater than the node's length (5).
+len=5
+split=["he","llo",2]
+whole="ab"
+cdata="bc"
+setData=""
+nodeValueSet="5""##.into()), "cd");
+        ctx.evaluate(r##"(async () => { globalThis.__out = await ((async () => {
+  const r = [];
+  const t = (k, f) => { try { r.push(k + '=' + JSON.stringify(f())); } catch (e) { r.push(k + '=' + e.name + ': ' + e.message); } };
+  const x = (s) => document.createTextNode(s === undefined ? 'hello' : s);
+  t('insBad', () => x().insertData(6, 'a'));
+  t('insEnd', () => { const n = x(); n.insertData(5, 'a'); return n.data; });
+  t('delBad', () => x().deleteData(6, 1));
+  t('delBig', () => { const n = x(); n.deleteData(2, 100); return n.data; });
+  t('delNeg', () => { const n = x(); n.deleteData(1, -1); return n.data; });
+  t('repBad', () => x().replaceData(6, 1, 'z'));
+  t('subNegCount', () => x().substringData(1, -1));
+  t('subNegOff', () => x().substringData(-1, 1));
+  t('subFloat', () => x().substringData(1.9, 2.9));
+  t('subStr', () => x().substringData('1', '2'));
+  t('subNaN', () => x().substringData(NaN, 2));
+  t('surrogate', () => x('a😀b').substringData(1, 1).length);
+  t('insArgs', () => x().insertData(1));
+  t('subArgs', () => x().substringData(1));
+  t('appArgs', () => x().appendData());
+  t('appNull', () => { const n = x(); n.appendData(null); return n.data; });
+  t('appUndef', () => { const n = x(); n.appendData(undefined); return n.data; });
+  t('splitBad', () => x().splitText(6));
+  t('splitEnd', () => { const d = document.createElement('p'); d.textContent = 'hello'; const b = d.firstChild.splitText(5); return [d.firstChild.data, b.data, d.childNodes.length]; });
+  t('splitDetached', () => { const n = x(); const b = n.splitText(2); return [n.data, b.data, b.parentNode]; });
+  t('splitNoArg', () => x().splitText());
+  t('wholeMixed', () => { const d = document.createElement('p'); d.append('a', document.createComment('c'), 'b', 'c'); return [d.childNodes[2].wholeText, d.childNodes[0].wholeText]; });
+  t('wholeCdata', () => { const d = document.createElement('p'); d.append('a', 'b'); d.insertBefore(document.createElement('i'), d.lastChild); return d.lastChild.wholeText; });
+  t('nodeValueNull', () => { const n = x(); n.nodeValue = null; return n.data; });
+  t('textContentNull', () => { const n = x(); n.textContent = null; return n.data; });
+  t('commentNull', () => { const c = document.createComment('a'); c.data = null; return c.data; });
+  t('dataUndef', () => { const n = x(); n.data = undefined; return n.data; });
+  t('lens', () => ['appendData', 'insertData', 'deleteData', 'replaceData', 'substringData'].map((m) => CharacterData.prototype[m].length).concat([Text.prototype.splitText.length]));
+  // mutation records
+  const recs = [];
+  const d = document.createElement('p'); d.textContent = 'hello'; document.body.append(d);
+  const mo = new MutationObserver((l) => { for (const m of l) recs.push(m.type + ':' + JSON.stringify(m.oldValue) + ':' + (m.target.nodeName) + ':+' + m.addedNodes.length + '-' + m.removedNodes.length); });
+  mo.observe(d, { characterData: true, characterDataOldValue: true, childList: true, subtree: true });
+  const tn = d.firstChild;
+  tn.appendData('1'); tn.insertData(0, '2'); tn.deleteData(0, 1); tn.replaceData(0, 1, 'H'); tn.data = 'z'; tn.nodeValue = 'y'; tn.textContent = 'w'; tn.splitText(0);
+  await Promise.resolve();
+  r.push('recs ' + recs.join(' | '));
+  r.push('after ' + JSON.stringify([...d.childNodes].map((n) => n.data)));
+  return r.join('\n');
+})()); })()"##).await.unwrap();
+        let got = pump_until(&ctx, "globalThis.__out || ''", 40).await;
+        ctx.evaluate("globalThis.__out = undefined").await.unwrap();
+        assert_eq!(got, Value::String(r##"insBad=IndexSizeError: Failed to execute 'insertData' on 'CharacterData': The offset 6 is greater than the node's length (5).
+insEnd="helloa"
+delBad=IndexSizeError: Failed to execute 'deleteData' on 'CharacterData': The offset 6 is greater than the node's length (5).
+delBig="he"
+delNeg="h"
+repBad=IndexSizeError: Failed to execute 'replaceData' on 'CharacterData': The offset 6 is greater than the node's length (5).
+subNegCount="ello"
+subNegOff=IndexSizeError: Failed to execute 'substringData' on 'CharacterData': The offset 4294967295 is greater than the node's length (5).
+subFloat="el"
+subStr="el"
+subNaN="he"
+surrogate=1
+insArgs=TypeError: Failed to execute 'insertData' on 'CharacterData': 2 arguments required, but only 1 present.
+subArgs=TypeError: Failed to execute 'substringData' on 'CharacterData': 2 arguments required, but only 1 present.
+appArgs=TypeError: Failed to execute 'appendData' on 'CharacterData': 1 argument required, but only 0 present.
+appNull="hellonull"
+appUndef="helloundefined"
+splitBad=IndexSizeError: Failed to execute 'splitText' on 'Text': The offset 6 is larger than the Text node's length.
+splitEnd=["hello","",2]
+splitDetached=["he","llo",null]
+splitNoArg=TypeError: Failed to execute 'splitText' on 'Text': 1 argument required, but only 0 present.
+wholeMixed=["bc","a"]
+wholeCdata="b"
+nodeValueNull=""
+textContentNull=""
+commentNull=""
+dataUndef="undefined"
+lens=[1,2,2,3,2,1]
+recs characterData:"hello":#text:+0-0 | characterData:"hello1":#text:+0-0 | characterData:"2hello1":#text:+0-0 | characterData:"hello1":#text:+0-0 | characterData:"Hello1":#text:+0-0 | characterData:"z":#text:+0-0 | characterData:"y":#text:+0-0 | characterData:"w":#text:+0-0 | childList:null:P:+1-0
+after ["","w"]"##.into()), "cd2");
+        let got = ctx.evaluate(r##"(() => ["CharacterData","Text","Comment","ProcessingInstruction","CDATASection"].map((n) => { const C = globalThis[n]; if (!C) return n + ": none"; const P = C.prototype; return n + " <" + Object.getPrototypeOf(P).constructor.name + ">: " + Object.getOwnPropertyNames(P).map((k) => { const d = Object.getOwnPropertyDescriptor(P, k); return k + (d.get ? (d.set ? "[gs]" : "[g]") : ""); }).join(","); }).join("\n"))()"##).await.unwrap();
+        assert_eq!(got, Value::String(r##"CharacterData <Node>: data[gs],length[g],previousElementSibling[g],nextElementSibling[g],after,appendData,before,deleteData,insertData,remove,replaceData,replaceWith,substringData,constructor
+Text <CharacterData>: wholeText[g],assignedSlot[g],splitText,constructor
+Comment <CharacterData>: constructor
+ProcessingInstruction <CharacterData>: target[g],sheet[g],getAttribute,getAttributeNames,hasAttribute,hasAttributes,removeAttribute,setAttribute,toggleAttribute,constructor
+CDATASection <Text>: constructor"##.into()), "cdshape");
+    }
+
+    /// Processing instructions as Chrome 151 builds them: `<?target data?>` parsed in HTML
+    /// (html_tokenizer.cc: `xml` targets and other names stay bogus comments),
+    /// createProcessingInstruction with its checks, and the data read as attributes.
+    /// createProcessingInstruction returned undefined.
+    #[tokio::test]
+    async fn processing_instructions_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", r##"<!doctype html><p>std"##).await.unwrap();
+        let got = ctx.evaluate(r##"(() => {
+  const d = document.createElement('div');
+  const show = (html) => { d.innerHTML = html; return html + ' => ' + [...d.childNodes].map((n) => n.nodeType + ':' + n.nodeName + ':' + JSON.stringify(n.nodeValue) + (n.target !== undefined ? ':t=' + n.target : '')).join(' ') + ' | ' + d.innerHTML; };
+  const r = [];
+  for (const h of ['<?pi z?>', '<?xml version="1.0"?>', '<?pi>', '<?>', '<?pi a b?>x', '<? pi ?>', '<?pi z>', '<?xml-stylesheet href="a"?>', '<!--x-->', '<!x>', '</ x>']) r.push(show(h));
+  const p = document.createProcessingInstruction('pi', 'z');
+  d.replaceChildren(p);
+  r.push('created: ' + d.innerHTML + ' textContent=' + JSON.stringify(d.textContent));
+  return r.join('\n');
+})()"##).await.unwrap();
+        assert_eq!(got, Value::String(r##"<?pi z?> => 7:pi:"z":t=pi | <?pi z?>
+<?xml version="1.0"?> => 8:#comment:"?xml version=\"1.0\"?" | <!--?xml version="1.0"?-->
+<?pi> => 7:pi:"":t=pi | <?pi ?>
+<?> => 8:#comment:"?" | <!--?-->
+<?pi a b?>x => 7:pi:"a b":t=pi 3:#text:"x" | <?pi a b?>x
+<? pi ?> => 8:#comment:"? pi ?" | <!--? pi ?-->
+<?pi z> => 7:pi:"z":t=pi | <?pi z?>
+<?xml-stylesheet href="a"?> => 8:#comment:"?xml-stylesheet href=\"a\"?" | <!--?xml-stylesheet href="a"?-->
+<!--x--> => 8:#comment:"x" | <!--x-->
+<!x> => 8:#comment:"x" | <!--x-->
+</ x> => 8:#comment:" x" | <!-- x-->
+created: <?pi z?> textContent="""##.into()), "pi");
+        let got = ctx.evaluate(r##"(() => { const p = document.createProcessingInstruction("pi", "z"); const r = [p.nodeType, p.nodeName, p.target, p.data, p.nodeValue, p.textContent, p.length, Object.getPrototypeOf(ProcessingInstruction.prototype) === CharacterData.prototype, Object.getOwnPropertyNames(ProcessingInstruction.prototype).join(","), String(p), p.isConnected]; const r2 = []; const t = (f) => { try { r2.push(String(f())); } catch (e) { r2.push(e.name + ": " + e.message); } }; t(() => document.createProcessingInstruction("1a", "z")); t(() => document.createProcessingInstruction("pi", "a?>b")); t(() => document.createProcessingInstruction("xml", "z").target); t(() => document.createProcessingInstruction("PI", "z").target); t(() => document.createProcessingInstruction()); t(() => { p.data = "q"; return p.data + "/" + p.nodeValue; }); t(() => p.cloneNode().target); t(() => { const d = document.createElement("div"); d.append(p, "x"); return d.innerHTML + "/" + d.textContent; }); t(() => new ProcessingInstruction()); return r.join(" | ") + "\n" + r2.join(" | "); })()"##).await.unwrap();
+        assert_eq!(got, Value::String(r##"7 | pi | pi | z | z | z | 1 | true | target,sheet,getAttribute,getAttributeNames,hasAttribute,hasAttributes,removeAttribute,setAttribute,toggleAttribute,constructor | [object ProcessingInstruction] | false
+InvalidCharacterError: Failed to execute 'createProcessingInstruction' on 'Document': The target provided ('1a') is not a valid name. | InvalidCharacterError: Failed to execute 'createProcessingInstruction' on 'Document': The data provided ('a?>b') contains '?>'. | xml | PI | TypeError: Failed to execute 'createProcessingInstruction' on 'Document': 2 arguments required, but only 0 present. | q/q | pi | <?pi q?>x/x | TypeError: Failed to construct 'ProcessingInstruction': Illegal constructor"##.into()), "pi2");
+        let got = ctx.evaluate(r##"(() => {
+  const r = [];
+  const t = (k, f) => { try { r.push(k + ' => ' + JSON.stringify(f())); } catch (e) { r.push(k + ' => ' + e.name + ': ' + e.message); } };
+  const mk = (data) => document.createProcessingInstruction('pi', data);
+  for (const d of ['a="1" b', "a='x y' c=2", 'a=1 a=2', 'A="1"', '  a = "1"  ', 'a="1"b="2"', 'just text', '', 'a="&amp;"', 'a="1" ?']) {
+    t('attrs[' + d + ']', () => { const p = mk(d); return [p.getAttributeNames(), p.getAttribute('a'), p.getAttribute('A'), p.hasAttribute('b'), p.hasAttributes()]; });
+  }
+  t('set', () => { const p = mk('a="1"'); p.setAttribute('b', 'x"y'); return [p.data, p.getAttributeNames()]; });
+  t('set existing', () => { const p = mk('a="1" c'); p.setAttribute('a', '2'); return p.data; });
+  t('remove', () => { const p = mk('a="1" b="2"'); p.removeAttribute('a'); return p.data; });
+  t('toggle', () => { const p = mk('a="1"'); const x = p.toggleAttribute('b'); const y = p.toggleAttribute('a'); return [x, y, p.data]; });
+  t('set on text data', () => { const p = mk('hello'); p.setAttribute('b', '1'); return p.data; });
+  t('data change', () => { const p = mk('a="1"'); p.data = 'q="2"'; return [p.getAttribute('a'), p.getAttribute('q')]; });
+  t('set invalid name', () => { const p = mk(''); p.setAttribute('1x', 'v'); return p.data; });
+  t('getAttribute arity', () => mk('').getAttribute());
+  t('sheet', () => mk('').sheet);
+  t('lengths', () => ['getAttribute', 'setAttribute', 'removeAttribute', 'toggleAttribute', 'hasAttribute', 'getAttributeNames', 'hasAttributes'].map((n) => ProcessingInstruction.prototype[n].length));
+  t('parsed', () => { const d = document.createElement('div'); d.innerHTML = '<?pi a="1" b?>'; const p = d.firstChild; return [p.data, p.getAttribute('a'), p.getAttributeNames()]; });
+  return r.join('\n');
+})()"##).await.unwrap();
+        assert_eq!(got, Value::String(r##"attrs[a="1" b] => [[],null,null,false,false]
+attrs[a='x y' c=2] => [[],null,null,false,false]
+attrs[a=1 a=2] => [[],null,null,false,false]
+attrs[A="1"] => [["A"],null,null,false,true]
+attrs[  a = "1"  ] => [["a"],"1","1",false,true]
+attrs[a="1"b="2"] => [[],null,null,false,false]
+attrs[just text] => [[],null,null,false,false]
+attrs[] => [[],null,null,false,false]
+attrs[a="&amp;"] => [["a"],"&","&",false,true]
+attrs[a="1" ?] => [[],null,null,false,false]
+set => ["a=\"1\" b=\"x&quot;y\"",["a","b"]]
+set existing => "a=\"2\""
+remove => "b=\"2\""
+toggle => [null,null,"b=\"\""]
+set on text data => "b=\"1\""
+data change => [null,"2"]
+set invalid name => "1x=\"v\""
+getAttribute arity => TypeError: Failed to execute 'getAttribute' on 'ProcessingInstruction': 1 argument required, but only 0 present.
+sheet => null
+lengths => [1,2,1,1,1,0,0]
+parsed => ["a=\"1\" b",null,[]]"##.into()), "pi3");
+        let got = ctx.evaluate(r##"(() => {
+  const r = [];
+  const mk = (data) => document.createProcessingInstruction('pi', data);
+  const show = (d) => { try { const p = mk(d); r.push(JSON.stringify(d) + ' => ' + JSON.stringify(p.getAttributeNames().map((n) => n + '=' + p.getAttribute(n.toLowerCase())))); } catch (e) { r.push(d + ' => ' + e.name); } };
+  for (const d of ['a="<"', 'a=">"', 'a="&foo;"', 'a="&#65;&#x42;"', 'x:y="1"', 'xmlns="u"', 'xmlns:p="u" p:a="1"', 'a="1"\tb="2"', 'a="1"\nb="2"', 'a="1" ', ' a="1"', 'a="x\ny"', 'a="x\ty"', 'a=""', 'é="1"', '_a="1"', '-a="1"', 'a.b="1"', 'a=" "', 'a="1"/', 'a="&lt;&gt;&apos;&quot;"']) show(d);
+  const p = mk(''); p.setAttribute('a', '<>&" \'\n\t'); r.push('serialize: ' + JSON.stringify(p.data));
+  const e = document.createElement('i'); e.setAttribute('a', '<>&" \'\n\t'); r.push('element: ' + JSON.stringify(e.outerHTML));
+  const p2 = mk('a="1"'); p2.setAttribute('B', '2'); r.push('upper set: ' + JSON.stringify([p2.data, p2.getAttributeNames()]));
+  const p3 = mk('A="1"'); p3.removeAttribute('A'); r.push('upper remove: ' + p3.data);
+  return r.join('\n');
+})()"##).await.unwrap();
+        assert_eq!(got, Value::String(r##""a=\"<\"" => []
+"a=\">\"" => ["a=>"]
+"a=\"&foo;\"" => []
+"a=\"&#65;&#x42;\"" => ["a=AB"]
+"x:y=\"1\"" => ["x:y=1"]
+"xmlns=\"u\"" => []
+"xmlns:p=\"u\" p:a=\"1\"" => ["p:a=1"]
+"a=\"1\"\tb=\"2\"" => ["a=1","b=2"]
+"a=\"1\"\nb=\"2\"" => ["a=1","b=2"]
+"a=\"1\" " => ["a=1"]
+" a=\"1\"" => ["a=1"]
+"a=\"x\ny\"" => ["a=x y"]
+"a=\"x\ty\"" => ["a=x y"]
+"a=\"\"" => ["a="]
+"é=\"1\"" => ["é=1"]
+"_a=\"1\"" => ["_a=1"]
+"-a=\"1\"" => []
+"a.b=\"1\"" => ["a.b=1"]
+"a=\" \"" => ["a= "]
+"a=\"1\"/" => []
+"a=\"&lt;&gt;&apos;&quot;\"" => ["a=<>'\""]
+serialize: "a=\"&lt;&gt;&amp;&quot;&nbsp;'\n\t\""
+element: "<i a=\"&lt;&gt;&amp;&quot;&nbsp;'\n\t\"></i>"
+upper set: ["a=\"1\" b=\"2\"",["a","b"]]
+upper remove: A="1""##.into()), "pi4b");
+    }
+
+    /// innerHTML parsed by the HTML parser as Chrome 151 parses it: named references, raw
+    /// text in script and style, foster parenting, misnested formatting, foreign content and
+    /// CDATA, duplicate attributes, bogus comments, template content, newlines and the rest.
+    /// A hand-written tokenizer gave 21 of these 31 trees differently.
+    #[tokio::test]
+    async fn inner_html_parses_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", r##"<!doctype html><p>std"##).await.unwrap();
+        let got = ctx.evaluate(r##"(() => {
+  const cases = [
+    'a&hellip;b&notin;c&frac12;d&ampx&copy e&#x41;&#0;&#xD800;',
+    '<script>if (a<b) x="</div>"</script>z',
+    '<style>p>q{}</div></style>z',
+    '<table><tr><td>1</td></tr>x<div>y</div></table>',
+    '<b><i>1</b>2</i>3',
+    '<p>1<div>2</div>3',
+    '<button><p>1</p></button>',
+    '<select><option>1<div>x</div><option>2</select>',
+    '<svg><foreignobject><p>x</p></foreignobject><clippath/><![CDATA[a<b]]></svg>',
+    '<math><mi>x</mi><annotation-xml encoding="text/html"><p>y</p></annotation-xml></math>',
+    '<a id=1 ID=2 Href=x>t</a>',
+    '<a title="unclosed>t</a>',
+    '<a href=x>y>t</a>',
+    '<textarea><b>x</b>&amp;</textarea>',
+    '<!-->a<!---->b<!-- -- -->c</ x>d<?pi z?>e<!x>',
+    '<ul><li>1<li>2</ul><dl><dt>a<dd>b<dt>c</dl>',
+    '<template><td>1</td></template>',
+    'a\r\nb\rc',
+    '<form><form><input></form></form>',
+    '<table><caption>c<td>x</table>',
+    '<div<div>x</div>',
+    '<img src=a/><br/><p/>t',
+    '<title>x<b>y</b></title><noscript><b>n</b></noscript>',
+    '<iframe><b>x</b></iframe><xmp><b>y</b></xmp>',
+    '<h1><h2>x</h2></h1>',
+    '<a><a>1</a>2</a>',
+    '<nobr>1<nobr>2',
+    '<table><td>x</td></table>',
+    '<object><param name=a></object><embed>',
+    '<frameset><frame></frameset>x',
+  ];
+  const d = document.createElement('div');
+  const dump = (n, depth) => [...n.childNodes].map((c) => {
+    const pad = '';
+    if (c.nodeType === 1) return '<' + (c.namespaceURI === 'http://www.w3.org/1999/xhtml' ? '' : c.namespaceURI.slice(-3) + ':') + c.localName + [...c.attributes].map((a) => ' ' + a.name + '=' + JSON.stringify(a.value)).join('') + '>' + dump(c.localName === 'template' ? c.content : c) + '</>';
+    return c.nodeType + ':' + JSON.stringify(c.nodeValue);
+  }).join('');
+  return cases.map((h) => { d.innerHTML = h; return dump(d); }).join('\n');
+})()"##).await.unwrap();
+        assert_eq!(got, Value::String(r##"3:"a…b∉c½d&x© eA��"
+<script>3:"if (a<b) x=\"</div>\""</>3:"z"
+<style>3:"p>q{}</div>"</>3:"z"
+3:"x"<div>3:"y"</><table><tbody><tr><td>3:"1"</></></></>
+<b><i>3:"1"</></><i>3:"2"</>3:"3"
+<p>3:"1"</><div>3:"2"</>3:"3"
+<button><p>3:"1"</></>
+<select><option>3:"1"<div>3:"x"</></><option>3:"2"</></>
+<svg:svg><svg:foreignObject><p>3:"x"</></><svg:clipPath></>3:"a<b"</>
+<hML:math><hML:mi>3:"x"</><hML:annotation-xml encoding="text/html"><p>3:"y"</></></>
+<a id="1" href="x">3:"t"</>
+
+<a href="x">3:"y>t"</>
+<textarea>3:"<b>x</b>&"</>
+8:""3:"a"8:""3:"b"8:" -- "3:"c"8:" x"3:"d"7:"z"3:"e"8:"x"
+<ul><li>3:"1"</><li>3:"2"</></><dl><dt>3:"a"</><dd>3:"b"</><dt>3:"c"</></>
+<template><td>3:"1"</></>
+3:"a\nb\nc"
+<form><input></></>
+<table><caption>3:"c"</><tbody><tr><td>3:"x"</></></></>
+<div<div>3:"x"</>
+<img src="a/"></><br></><p>3:"t"</>
+<title>3:"x<b>y</b>"</><noscript>3:"<b>n</b>"</>
+<iframe>3:"<b>x</b>"</><xmp>3:"<b>y</b>"</>
+<h1></><h2>3:"x"</>
+<a></><a>3:"1"</>3:"2"
+<nobr>3:"1"</><nobr>3:"2"</>
+<table><tbody><tr><td>3:"x"</></></></>
+<object><param name="a"></></><embed></>
+3:"x""##.into()), "ih");
+    }
+
+    /// A doctype node has no own properties (it had ten), comments around the root are the
+    /// document's children, and DOMParser builds a whole
+    /// document with its doctype, comments and mode, as in Chrome 151.
+    #[tokio::test]
+    async fn documents_and_doctypes_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", r##"<!doctype html><body><div id=a><span id=s>s</span><i id=i>i</i></div><div id=b><p id=p>p</p></div><input id=in><iframe id=f srcdoc="<b>x</b>"></iframe></body>"##).await.unwrap();
+        let got = ctx.evaluate(r##"(() => { const d = document.doctype; const r = [Object.getOwnPropertyNames(d).join(","), Object.keys(d).join(","), d.nodeName, d.name, String(d), d.parentNode === document, d.ownerDocument === document, d.childNodes.length, typeof d.remove, d.isConnected, d.nextSibling && d.nextSibling.nodeName, document.firstChild === d, document.childNodes.length, Object.getOwnPropertyNames(Object.getPrototypeOf(d)).join(",")]; const dp = new DOMParser().parseFromString("<!doctype html><!--c--><p>x", "text/html"); r.push(dp.compatMode, dp.doctype && dp.doctype.name, dp.childNodes.length, [...dp.childNodes].map((n) => n.nodeName).join("/"), dp.body.innerHTML); const dq = new DOMParser().parseFromString("<p>x", "text/html"); r.push(dq.compatMode, String(dq.doctype)); return JSON.stringify(r); })()"##).await.unwrap();
+        assert_eq!(got, Value::String(r##"["","","html","html","[object DocumentType]",true,true,0,"function",true,"HTML",true,2,"name,publicId,systemId,after,before,remove,replaceWith,constructor","CSS1Compat","html",3,"html/#comment/HTML","<p>x</p>","BackCompat","null"]"##.into()), "dt");
+        // Comments and processing instructions around the root are the
+        // document's children, the doctype where it stood (they were dropped).
+        ctx.load_html("https://example.com/", "<!-- head comment -->\n<!doctype html><!--a--><html><head></head><body>x</body></html><!--z-->\n<?pi q?>").await.unwrap();
+        let got = ctx.evaluate(r##"[...document.childNodes].map((n) => n.nodeType + ":" + n.nodeName + ":" + JSON.stringify(n.nodeValue)).join(" | ") + " || " + [...document.documentElement.childNodes].map((n) => n.nodeName).join(",") + " || " + document.compatMode"##).await.unwrap();
+        assert_eq!(got, Value::String(r##"8:#comment:" head comment " | 10:html:null | 8:#comment:"a" | 1:HTML:null | 8:#comment:"z" | 7:pi:"q" || HEAD,BODY || CSS1Compat"##.into()));
+    }
+
+    /// HTML serialization as Chrome 151: text of raw text elements as it is (script text was
+    /// escaped), U+00A0 as &nbsp; in text and attributes, processing instructions as <?target
+    /// data?>.
+    #[tokio::test]
+    async fn serialization_escapes_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", r##"<!doctype html><body><div id=a>x<!--c-->y<?pi z?><span>s<b>t</b></span><template>tt</template><svg><![CDATA[q]]></svg></div></body>"##).await.unwrap();
+        let got = ctx.evaluate(r##"(() => JSON.stringify(["script","style","xmp","iframe","noembed","noframes","plaintext","noscript","textarea","title","template"].map((t) => { const e = document.createElement(t); e.appendChild(document.createTextNode("a<b&c >")); return e.outerHTML; })))()"##).await.unwrap();
+        assert_eq!(got, Value::String(r##"["<script>a<b&c ></script>","<style>a<b&c ></style>","<xmp>a<b&c ></xmp>","<iframe>a<b&c ></iframe>","<noembed>a<b&c ></noembed>","<noframes>a<b&c ></noframes>","<plaintext>a<b&c ></plaintext>","<noscript>a<b&c ></noscript>","<textarea>a&lt;b&amp;c&nbsp;&gt;</textarea>","<title>a&lt;b&amp;c&nbsp;&gt;</title>","<template></template>"]"##.into()), "raw");
+        let got = ctx.evaluate(r##"(() => { const e = document.createElement("i"); e.setAttribute("a", "x y"); e.textContent = "p q"; const s = document.createElement("script"); s.textContent = "a b"; const st = document.createElement("style"); st.textContent = "c d"; const pre = document.createElement("pre"); pre.textContent = " "; return JSON.stringify([new XMLSerializer().serializeToString(e), e.outerHTML, s.outerHTML, st.outerHTML, pre.outerHTML]); })()"##).await.unwrap();
+        assert_eq!(got, Value::String(r##"["<i xmlns=\"http://www.w3.org/1999/xhtml\" a=\"x y\">p q</i>","<i a=\"x&nbsp;y\">p&nbsp;q</i>","<script>a b</script>","<style>c d</style>","<pre>&nbsp;</pre>"]"##.into()), "nb2");
+        let got = ctx.evaluate(r##"(() => { const a = document.getElementById("a"); const f = document.createDocumentFragment(); f.append("p", document.createComment("k"), document.createElement("i")); f.lastChild.textContent = "q"; return JSON.stringify([a.textContent, f.textContent, a.cloneNode(true).outerHTML, a.innerHTML]); })()"##).await.unwrap();
+        assert_eq!(got, Value::String(r##"["xystq","pq","<div id=\"a\">x<!--c-->y<?pi z?><span>s<b>t</b></span><template>tt</template><svg>q</svg></div>","x<!--c-->y<?pi z?><span>s<b>t</b></span><template>tt</template><svg>q</svg>"]"##.into()), "textc");
+    }
+
+    /// moveBefore as Chrome 151: its checks and errors, a removal and an insertion for
+    /// observers, connectedMoveCallback or disconnected and connected callbacks, and the
+    /// frame, its window and the focus kept. It was a stub that did nothing.
+    #[tokio::test]
+    async fn move_before_moves_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", r##"<!doctype html><body><div id=a><span id=s>s</span><i id=i>i</i></div><div id=b><p id=p>p</p></div><input id=in><iframe id=f srcdoc="<b>x</b>"></iframe></body>"##).await.unwrap();
+        ctx.evaluate(r##"(async () => { globalThis.__out = await ((async () => {
+  const r = [];
+  const $ = (id) => document.getElementById(id);
+  const t = (k, f) => { try { const v = f(); r.push(k + ': ok ' + (v === undefined ? 'undef' : String(v))); } catch (e) { r.push(k + ': ' + e.name + ': ' + e.message); } };
+  const det = () => { const x = document.createElement('div'); x.innerHTML = '<span>1</span><b>2</b>'; return x; };
+  // errors and order
+  t('detached diff roots', () => document.createElement('b').moveBefore(document.createElement('q'), null));
+  { const x = det(); t('detached same root', () => x.moveBefore(x.lastChild, x.firstChild)); r.push('  -> ' + x.innerHTML); }
+  t('connected from detached', () => $('a').moveBefore(document.createElement('q'), null));
+  t('detached from connected', () => document.createElement('b').moveBefore($('s'), null));
+  t('ancestor', () => $('s').moveBefore($('a'), null));
+  t('ref not child', () => $('a').moveBefore($('p'), $('p')));
+  t('text node', () => $('a').moveBefore($('p').firstChild, null)); r.push('  -> a=' + $('a').innerHTML + ' p=' + $('p').innerHTML);
+  t('comment', () => { const c = document.createComment('c'); $('b').appendChild(c); return $('a').moveBefore(c, null); });
+  t('fragment', () => $('a').moveBefore(document.createDocumentFragment(), null));
+  t('self ref', () => $('a').moveBefore($('i'), $('i'))); r.push('  -> ' + $('a').innerHTML);
+  t('doc', () => document.moveBefore(document.createElement('x'), null));
+  t('no args', () => $('a').moveBefore());
+  t('one arg', () => $('a').moveBefore($('i')));
+  t('not node', () => $('a').moveBefore({}, null));
+  t('ref undefined', () => $('a').moveBefore($('i'), undefined));
+  // records
+  const recs = [];
+  const mo = new MutationObserver((l) => { for (const m of l) recs.push(m.type + '@' + m.target.id + ' +' + [...m.addedNodes].map((n) => n.id || n.nodeName).join(',') + ' -' + [...m.removedNodes].map((n) => n.id || n.nodeName).join(',') + ' prev=' + (m.previousSibling && (m.previousSibling.id || m.previousSibling.nodeName)) + ' next=' + (m.nextSibling && (m.nextSibling.id || m.nextSibling.nodeName))); });
+  mo.observe(document.body, { childList: true, subtree: true });
+  $('b').moveBefore($('s'), $('p'));
+  await Promise.resolve();
+  r.push('records: ' + recs.join(' | '));
+  // custom elements
+  const log = [];
+  class XA extends HTMLElement { connectedCallback() { log.push('xa+'); } disconnectedCallback() { log.push('xa-'); } }
+  class XB extends HTMLElement { connectedCallback() { log.push('xb+'); } disconnectedCallback() { log.push('xb-'); } connectedMoveCallback() { log.push('xb~'); } }
+  customElements.define('x-a', XA); customElements.define('x-b', XB);
+  const xa = document.createElement('x-a'), xb = document.createElement('x-b');
+  $('a').append(xa, xb); log.push('|');
+  $('b').moveBefore(xa, null); $('b').moveBefore(xb, null);
+  r.push('ce: ' + log.join(' '));
+  // iframe + focus
+  const f = $('f'); const w = f.contentWindow; w.__mark = 7;
+  $('in').focus();
+  $('a').moveBefore($('in'), null); $('a').moveBefore(f, null);
+  r.push('frame same window: ' + (f.contentWindow === w) + ' mark ' + (f.contentWindow && f.contentWindow.__mark) + ' focus ' + (document.activeElement && document.activeElement.id));
+  r.push('typeof ' + typeof Element.prototype.moveBefore + ' len ' + Element.prototype.moveBefore.length + ' doc ' + typeof Document.prototype.moveBefore + ' frag ' + typeof DocumentFragment.prototype.moveBefore);
+  return r.join('\n');
+})()); })()"##).await.unwrap();
+        let got = pump_until(&ctx, "globalThis.__out || ''", 40).await;
+        ctx.evaluate("globalThis.__out = undefined").await.unwrap();
+        assert_eq!(got, Value::String(r##"detached diff roots: HierarchyRequestError: Failed to execute 'moveBefore' on 'Element': State-preserving atomic move cannot be performed on nodes participating in an invalid hierarchy.
+detached same root: ok undef
+  -> <b>2</b><span>1</span>
+connected from detached: HierarchyRequestError: Failed to execute 'moveBefore' on 'Element': State-preserving atomic move cannot be performed on nodes participating in an invalid hierarchy.
+detached from connected: HierarchyRequestError: Failed to execute 'moveBefore' on 'Element': State-preserving atomic move cannot be performed on nodes participating in an invalid hierarchy.
+ancestor: HierarchyRequestError: Failed to execute 'moveBefore' on 'Element': The new child element contains the parent.
+ref not child: NotFoundError: Failed to execute 'moveBefore' on 'Element': The node before which the new node is to be inserted is not a child of this node.
+text node: ok undef
+  -> a=<span id="s">s</span><i id="i">i</i>p p=
+comment: ok undef
+fragment: HierarchyRequestError: Failed to execute 'moveBefore' on 'Element': State-preserving atomic move cannot be performed on nodes participating in an invalid hierarchy.
+self ref: ok undef
+  -> <span id="s">s</span><i id="i">i</i>p<!--c-->
+doc: HierarchyRequestError: Failed to execute 'moveBefore' on 'Document': State-preserving atomic move cannot be performed on nodes participating in an invalid hierarchy.
+no args: TypeError: Failed to execute 'moveBefore' on 'Element': 2 arguments required, but only 0 present.
+one arg: TypeError: Failed to execute 'moveBefore' on 'Element': 2 arguments required, but only 1 present.
+not node: TypeError: Failed to execute 'moveBefore' on 'Element': parameter 1 is not of type 'Node'.
+ref undefined: ok undef
+records: childList@a + -s prev=null next=#text | childList@b +s - prev=null next=p
+ce: xa+ xb+ | xa- xa+ xb~
+frame same window: true mark 7 focus in
+typeof function len 2 doc function frag function"##.into()), "mv");
+    }
+
     /// Trees thousands deep, built by a script, as Chrome 151 handles them on
     /// a page with `<p>std</p>`: at 20,000 levels `querySelectorAll`,
     /// `textContent`, `innerHTML` and `cloneNode` answer (they overflowed the
