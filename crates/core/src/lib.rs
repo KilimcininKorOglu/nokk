@@ -10725,8 +10725,123 @@ html.dark body .d { background-color: rgb(10, 10, 10) }
         assert_eq!(got, want.join("\n"));
     }
 
+    /// Trees thousands deep, built by a script, as Chrome 151 handles them on
+    /// a page with `<p>std</p>`: at 20,000 levels `querySelectorAll`,
+    /// `textContent`, `innerHTML` and `cloneNode` answer (they overflowed the
+    /// stack past 2,500-4,500), at 10,000 `getComputedStyle` does (it
+    /// overflowed at 1,500, and past 10,000 a walk cap left elements without
+    /// style). Layout answers too: it threw RangeError at 467 levels (Chrome's
+    /// tab crashes at 2,500, which a page cannot be shown). Building and
+    /// cloning 20,000 levels walked to the root per insert: 7.5 and 15.7 s,
+    /// now well under a second each.
+    #[tokio::test]
+    async fn deep_trees_answer_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<!doctype html><p>std").await.unwrap();
+        let got = ctx
+            .evaluate(
+                r#"(() => {
+                  const chain = (n) => { document.body.replaceChildren(); const p = document.createElement('p'); p.textContent = 'std'; document.body.append(p);
+                    let cur = document.body; for (let i = 0; i < n; i++) { const d = document.createElement('div'); d.textContent = 'w'; cur.appendChild(d); cur = d; } return cur; };
+                  const r = [];
+                  const t = (f) => { try { r.push(f()); } catch (e) { r.push(e.name); } };
+                  const t0 = Date.now();
+                  chain(20000);
+                  t(() => document.querySelectorAll('div').length);
+                  t(() => document.body.textContent.length);
+                  t(() => document.body.innerHTML.length);
+                  t(() => document.body.cloneNode(true).childNodes.length);
+                  r.push(Date.now() - t0 < 8000);
+                  const deep = chain(10000);
+                  t(() => getComputedStyle(deep).color);
+                  chain(3000);
+                  t(() => typeof document.body.offsetHeight);
+                  return r.join('|'); })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(got, Value::String("20000|20003|240010|2|true|rgb(0, 0, 0)|number".into()));
+    }
+
+    /// A node inserted under itself or a descendant throws as in Chrome 151
+    /// (`insertBefore`, `replaceChild` and the convenience methods made a
+    /// cycle that hung every walk of the tree), through a shadow host too, and
+    /// before any node of a variadic call goes in.
+    #[tokio::test]
+    async fn inserting_an_ancestor_throws_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<!doctype html><body></body>").await.unwrap();
+        let got = ctx
+            .evaluate(
+                r#"(() => {
+                  const r = [];
+                  const t = (k, f) => { try { f(); r.push(k + ': ok'); } catch (e) { r.push(k + ': ' + e.name + ': ' + e.message); } };
+                  const mk = () => { const a = document.createElement('div'), b = document.createElement('span'), c = document.createElement('i'), x = document.createTextNode('x');
+                    a.appendChild(b); b.appendChild(c); b.appendChild(x); return { a, b, c, x }; };
+                  { const { a, b } = mk(); t('ib', () => b.insertBefore(a, null)); }
+                  { const { a, b } = mk(); t('ibNot', () => b.insertBefore(a, document.createElement('p'))); }
+                  { const { b } = mk(); t('ibSelf', () => b.insertBefore(b, null)); }
+                  { const { a, b, c } = mk(); t('rc', () => b.replaceChild(a, c)); }
+                  { const { a, b } = mk(); t('ac', () => b.appendChild(a)); }
+                  { const { a, b } = mk(); const sr = b.attachShadow({ mode: 'open' }); t('sr', () => sr.appendChild(a)); }
+                  { const { b } = mk(); const sr = b.attachShadow({ mode: 'open' }); t('srAppend', () => sr.append(b)); }
+                  { const { a, b } = mk(); const q = document.createElement('q'); t('append', () => b.append(q, a)); r.push('q in: ' + (q.parentNode === b)); }
+                  { const { a, b } = mk(); t('prepend', () => b.prepend(a)); }
+                  { const { a, b } = mk(); t('rcs', () => b.replaceChildren(a)); }
+                  { const { a, c } = mk(); t('before', () => c.before(a)); }
+                  { const { a, x } = mk(); t('after', () => x.after(a)); }
+                  { const { a, x } = mk(); t('rw', () => x.replaceWith(a)); }
+                  { const f = document.createDocumentFragment(); t('fragSelf', () => f.append(f)); }
+                  return r.join('\n'); })()"#,
+            )
+            .await
+            .unwrap();
+        let m = |op: &str, on: &str| format!("HierarchyRequestError: Failed to execute '{op}' on '{on}': The new child element contains the parent.");
+        let want = [
+            format!("ib: {}", m("insertBefore", "Node")),
+            format!("ibNot: {}", m("insertBefore", "Node")),
+            format!("ibSelf: {}", m("insertBefore", "Node")),
+            format!("rc: {}", m("replaceChild", "Node")),
+            format!("ac: {}", m("appendChild", "Node")),
+            format!("sr: {}", m("appendChild", "Node")),
+            format!("srAppend: {}", m("append", "DocumentFragment")),
+            format!("append: {}", m("append", "Element")),
+            "q in: false".to_string(),
+            format!("prepend: {}", m("prepend", "Element")),
+            format!("rcs: {}", m("replaceChildren", "Element")),
+            format!("before: {}", m("before", "Element")),
+            format!("after: {}", m("after", "CharacterData")),
+            format!("rw: {}", m("replaceWith", "CharacterData")),
+            "fragSelf: ok".to_string(),
+        ];
+        assert_eq!(got, Value::String(want.join("\n")));
+    }
+
+    /// `textContent` is the text of the Text descendants only, as in Chrome
+    /// 151: comments counted before (`x<!--c-->y` read "xcy").
+    #[tokio::test]
+    async fn text_content_skips_comments_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<!doctype html><body><div id=a>x<!--c-->y<span>s<b>t</b></span><template>tt</template><svg><![CDATA[q]]></svg></div></body>").await.unwrap();
+        let got = ctx
+            .evaluate(
+                r#"(() => { const f = document.createDocumentFragment(); f.append('p', document.createComment('k'), document.createElement('i')); f.lastChild.textContent = 'q';
+                  return [document.getElementById('a').textContent, f.textContent].join('|'); })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(got, Value::String("xystq|pq".into()));
+    }
+
     /// A layout keeps linear records and folds font sizes in linear steps: a
-    /// chain 300 deep with 1,000 paragraphs beside it lays out 1,303 elements,
+    /// chain 300 deep with 1,000 paragraphs beside it has 1,303 elements
+    /// (1,559 layouts: the levels above each 64-deep band are laid out twice),
     /// keeps 2,605 records (each element once as itself, once as a child) and
     /// takes 1,303 font-size steps. The flat copy of each subtree and the walk
     /// over every ancestor took 48,756 of each here (+4 to 8 MB of heap, twice

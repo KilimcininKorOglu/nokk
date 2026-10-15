@@ -517,6 +517,17 @@ Done:
   lowercased, comments dropped. The old one spaced `~=` like a combinator, so
   `[typeof~='mw:File/Thumb']` never matched (Wikipedia's figures were not tables) and
   each such rule restyled the whole page when added.
+- ✅ **Deep trees answer as in Chrome.** Layout goes 64 levels per band and lays out
+  what lies below from a shallow stack into the kept layouts (467 nested blocks threw
+  RangeError; Chrome's tab crashes at 2,500); cascades, ancestor filters, inherited
+  values, `textContent`, `innerHTML`, `cloneNode`, tree queries and rule gathering
+  walk without a frame per level (Chrome answers at 20,000 levels; we overflowed at
+  1,500-4,500); a 10,000-step cap left deeper elements without style. Inserting a node
+  under itself or a descendant throws `HierarchyRequestError` in every insertion method
+  with Chrome's wording (`insertBefore`, `replaceChild` and the convenience methods made
+  a cycle that hung the engine); `isConnected` is remembered for the last nodes, so a
+  20,000-deep chain builds in 0.2 s instead of 7.5 and clones in 0.2 s instead of 15.7.
+  `textContent` skips comments, as in Chrome.
 - ✅ **A layout is a third cheaper.** A kept layout is a tree (the element's result and
   its children's entries) instead of a flat copy of the whole subtree per element:
   228,000 records for 12,800 elements on a Wikipedia article. Font sizes fold down
@@ -526,9 +537,10 @@ Done:
   peak memory 350 to 328 MB.
 
 Open:
-- ⬜ **Deep trees overflow the layout's stack.** 1,500 nested `<div>`s built by a script:
-  `document.body.offsetHeight` throws `RangeError: Maximum call stack size exceeded`
-  (Chrome 151: 27034). Layout recurses per level, several frames deep.
+- ⬜ **`Element.moveBefore` is a stub** that does nothing; Chrome moves the node (and
+  throws `HierarchyRequestError` "State-preserving atomic move cannot be performed on
+  nodes participating in an invalid hierarchy." across trees).
+- ⬜ **`<?pi z?>` in HTML serializes as `<!--?pi z?-->`**; Chrome 151 prints `<?pi z?>`.
 - ⬜ **Layout differences found on a font-size page** (Chrome 151, same page): text
   before a block child makes no line (`<div>a<div>b</div></div>` is 34px shorter);
   a `0.67em` heading margin is not snapped to 1/64 px, so later boxes sit off the

@@ -59,6 +59,8 @@
   const __ptJSON = globalThis.__ptJSON || { stringify: JSON.stringify, parse: JSON.parse };
   const ELEMENT_NODE = 1, TEXT_NODE = 3, COMMENT_NODE = 8,
         DOCUMENT_NODE = 9, DOCUMENT_FRAGMENT_NODE = 11;
+  // Tree walks recurse this deep at most (see `walk`).
+  const __WALK_DEPTH = 256;
 
   const __pt_soon = (f) => { try { queueMicrotask(f); } catch (e) { setTimeout(f, 0); } };
   // An engine task (load on readiness, CSP violation, script error) is not a
@@ -178,12 +180,18 @@
     const s = String(n);
     return el.__ptNS === undefined || el.__ptNS === 'http://www.w3.org/1999/xhtml' ? __s_toLowerCase(s) : s;
   }
+  // Depth first without a stack frame per level; a node's children as they
+  // were right after `fn` saw it, then its shadow tree.
   function __walkTree(node, fn) {
     if (!node) return;
-    fn(node);
-    const kids = node.__ptKids;
-    if (kids) for (const c of __s_slice(kids)) __walkTree(c, fn);
-    if (node.__ptShadow) __walkTree(node.__ptShadow, fn);
+    const st = [node];
+    while (st.length) {
+      const n = st.pop();
+      fn(n);
+      if (n.__ptShadow) st.push(n.__ptShadow);
+      const kids = n.__ptKids;
+      if (kids) for (let i = kids.length - 1; i >= 0; i--) st.push(kids[i]);
+    }
   }
 
   // What connecting a subtree means for the elements that *do* something: a frame
@@ -541,6 +549,109 @@
     }
   }
 
+  const __NO_NODES = [];
+  // Whether a node is in a document, remembered for the last few nodes
+  // asked or inserted: a page building a chain appends under the node it
+  // appended before (after giving that node its text), and a walk to the
+  // root per insert made a deep tree quadratic. "In" holds until a removal,
+  // "out" until an insert into a document. Runs of (node, in, stamp), most
+  // recent first.
+  let __connRemovals = 0, __connInserts = 0;
+  const __CONN_SLOTS = 4;
+  const __connSlots = [];
+  for (let i = 0; i < __CONN_SLOTS; i++) __connSlots.push(null, false, -1);
+  function __connectedFast(node) {
+    const c = __connSlots;
+    for (let i = 0; i < c.length; i += 3) {
+      if (c[i] === node && c[i + 2] === (c[i + 1] ? __connRemovals : __connInserts)) return c[i + 1];
+    }
+    let yes = false;
+    for (let n = node; n; n = n.__ptParent || n.__ptHost) if (n.__ptType === DOCUMENT_NODE) { yes = true; break; }
+    __connRemember(node, yes);
+    return yes;
+  }
+  function __connRemember(node, yes) {
+    const c = __connSlots;
+    let at = c.length - 3;
+    for (let i = 0; i < c.length; i += 3) if (c[i] === node) { at = i; break; }
+    for (let i = at; i > 0; i -= 3) { c[i] = c[i - 3]; c[i + 1] = c[i - 2]; c[i + 2] = c[i - 1]; }
+    c[0] = node;
+    c[1] = yes;
+    c[2] = yes ? __connRemovals : __connInserts;
+  }
+
+  // Pre-insert validity, the check Chrome makes first: the node may not be
+  // the parent or a host-including ancestor of it (a cycle hung every walk
+  // over the tree). A node with no children and no shadow tree is nobody's
+  // ancestor, so a fresh node costs no walk.
+  function __needNotAncestor(parent, node, method, iface) {
+    if (!node || node.__ptType === undefined) return;
+    if (node !== parent && !(node.__ptKids && node.__ptKids.length) && !node.__ptShadow) return;
+    // Up from the parent; past 64 levels a small subtree (a fresh node with
+    // its text) is searched for the parent instead of walking up a deep tree.
+    let steps = 0;
+    for (let p = parent; p; p = p.__ptParent || p.__ptHost) {
+      if (++steps === 64 && !__subtreeHolds(node, parent, 64)) return;
+      if (p === node) {
+        throw __pt_mkErr(globalThis.DOMException || Error,
+          "Failed to execute '" + method + "' on '" + iface + "': The new child element contains the parent.",
+          'HierarchyRequestError');
+      }
+    }
+  }
+  // Whether `target` is below `root` (shadow trees included), or true when
+  // the subtree is larger than `budget` and the answer was not reached.
+  function __subtreeHolds(root, target, budget) {
+    const st = [root];
+    while (st.length) {
+      const n = st.pop();
+      if (n === target) return true;
+      if (--budget < 0) return true;
+      if (n.__ptShadow) st.push(n.__ptShadow);
+      const kids = n.__ptKids;
+      if (kids) for (let i = 0; i < kids.length; i++) st.push(kids[i]);
+    }
+    return false;
+  }
+  // The same over a variadic call's nodes, all before any is inserted.
+  function __needNoneAncestor(parent, nodes, method, iface) {
+    for (const n of nodes) if (typeof n !== 'string') __needNotAncestor(parent, n, method, iface);
+  }
+  // One node copied as `cloneNode(false)` copies it.
+  function __cloneOne(n) {
+    const c = n.__ptShallowClone();
+    // A clone carries the exact inline style numbers, not the six-digit
+    // printed ones: Chrome clones the parsed declaration, so
+    // `scale(1.000998)` stays 1.000998 though the attribute says 1.001.
+    try {
+      if (n.__ptStyle && c.style) {
+        const sr = __declRaw.get(n.__ptStyle), sm = sr && sr();
+        if (sm && sm.__ptPrecise && sm.__ptPrecise.size) {
+          const dr = __declRaw.get(c.style), dm = dr && dr();
+          if (dm) { const pm = __cssPrecise(dm); for (const [k, v] of sm.__ptPrecise) if (dm.has(k)) pm.set(k, v); }
+        }
+      }
+    } catch (e) {}
+    return c;
+  }
+  // The data of the Text (and CDATA) descendants in tree order, as
+  // `textContent` reads it: comments and processing instructions do not
+  // count, nothing a page defines on a child is asked, and depth costs no
+  // stack.
+  function __descText(node) {
+    let s = '';
+    const st = [node.__ptKids || __NO_NODES, 0];
+    while (st.length) {
+      const top = st.length - 2;
+      const kids = st[top], i = st[top + 1];
+      if (i >= kids.length) { st.length = top; continue; }
+      st[top + 1] = i + 1;
+      const c = kids[i], t = c.__ptType;
+      if (t === TEXT_NODE || t === 4) s += c.__ptData !== undefined ? c.__ptData : c.data;
+      else if (c.__ptKids && c.__ptKids.length) st.push(c.__ptKids, 0);
+    }
+    return s;
+  }
   class Node {
     constructor(type) {
       // Backing fields are __pt-prefixed (and therefore filtered out of every
@@ -590,19 +701,13 @@
     appendChild(child) {
       __needArgs(arguments.length, 1, 'appendChild', 'Node');
       __needNode(child, 1, 'appendChild');
-      // A node cannot contain itself or its ancestor.
-      for (let p = this; p; p = p.__ptParent) {
-        if (p === child) {
-          throw __pt_mkErr(globalThis.DOMException || Error, 
-            "Failed to execute 'appendChild' on 'Node': The new child element contains the parent.",
-            'HierarchyRequestError');
-        }
-      }
+      __needNotAncestor(this, child, 'appendChild', 'Node');
       return __ptInsert.call(this, child, null);
     }
     insertBefore(child, ref) {
       __needArgs(arguments.length, 2, 'insertBefore', 'Node');
       __needNode(child, 1, 'insertBefore');
+      __needNotAncestor(this, child, 'insertBefore', 'Node');
       // The second parameter is `Node?`: `undefined` is the same as `null`,
       // meaning "append".
       if (ref !== null && ref !== undefined) {
@@ -634,7 +739,11 @@
       // shadow root and then connects the host, so checking only `child` left the
       // iframe sitting there, connected and inert, and the widget waiting forever
       // for a frame that never opened.
-      if (child.isConnected) __connectSubtree(child);
+      // The child is where its parent is; remembered before scripts in the
+      // subtree run (a removal they make forgets it).
+      const connected = __connectedFast(this);
+      __connRemember(child, connected);
+      if (connected) { __connInserts++; __connectSubtree(child); }
       return child;
     }
     removeChild(child) {
@@ -647,7 +756,7 @@
           'NotFoundError');
       }
       const prev = this.__ptKids[i - 1] || null, next = this.__ptKids[i + 1] || null;
-      this.__ptKids.splice(i, 1); child.__ptParent = null; __markDirty(this); __styleTouchKids(this, null, i); __hasNoteTree(child);
+      this.__ptKids.splice(i, 1); child.__ptParent = null; __connRemovals++; __markDirty(this); __styleTouchKids(this, null, i); __hasNoteTree(child);
       __mutation(__childListRecord(this, [], [child], prev, next));
       // A removed frame is a closed browsing context. Without this its V8 context
       // outlives the element forever — a widget that replaces its iframe on a
@@ -669,6 +778,7 @@
       __needArgs(arguments.length, 2, 'replaceChild', 'Node');
       __needNode(nw, 1, 'replaceChild');
       __needNode(old, 2, 'replaceChild');
+      __needNotAncestor(this, nw, 'replaceChild', 'Node');
       __needChild(this, old, 'replaceChild',
         'The node to be replaced is not a child of this node.');
       // Replacing a node with itself leaves it in place (Turnstile probes the
@@ -678,23 +788,28 @@
       return this.removeChild(old);
     }
     cloneNode(deep) {
-      const c = this.__ptShallowClone();
-      // A clone carries the exact inline style numbers, not the six-digit
-      // printed ones: Chrome clones the parsed declaration, so
-      // `scale(1.000998)` stays 1.000998 though the attribute says 1.001.
-      try {
-        if (this.__ptStyle && c.style) {
-          const sr = __declRaw.get(this.__ptStyle), sm = sr && sr();
-          if (sm && sm.__ptPrecise && sm.__ptPrecise.size) {
-            const dr = __declRaw.get(c.style), dm = dr && dr();
-            if (dm) { const pm = __cssPrecise(dm); for (const [k, v] of sm.__ptPrecise) if (dm.has(k)) pm.set(k, v); }
-          }
+      const c = __cloneOne(this);
+      if (!deep) return c;
+      // Depth first in tree order, without a stack frame per level (Chrome
+      // clones trees thousands deep) and without asking the page's own
+      // `cloneNode` on the children: (source children, next index, copy,
+      // source) runs; a template's content follows its children.
+      const st = [this.__ptKids, 0, c, this];
+      while (st.length) {
+        const top = st.length - 4;
+        const kids = st[top], i = st[top + 1], dst = st[top + 2];
+        if (i < kids.length) {
+          st[top + 1] = i + 1;
+          const ch = kids[i], cc = __cloneOne(ch);
+          dst.appendChild(cc);
+          st.push(ch.__ptKids || __NO_NODES, 0, cc, ch);
+          continue;
         }
-      } catch (e) {}
-      if (deep) for (const ch of this.__ptKids) c.appendChild(ch.cloneNode(true));
-      if (deep && this.__ptLocal === 'template' && this.__ptContent) {
-        const into = __templateContent(c);
-        for (const ch of this.__ptContent.__ptKids) into.appendChild(ch.cloneNode(true));
+        const src = st[top + 3];
+        st.length = top;
+        if (src && src.__ptLocal === 'template' && src.__ptContent) {
+          st.push(src.__ptContent.__ptKids, 0, __templateContent(dst), null);
+        }
       }
       return c;
     }
@@ -705,7 +820,7 @@
       // Text, comment, processing instruction: their data (Chrome's Node.textContent).
       if (this.__ptType === 3 || this.__ptType === 4 || this.__ptType === 7) return this.data;
       if (this.__ptType === 8) return this.data;
-      let s = ''; for (const c of this.__ptKids) s += c.textContent; return s;
+      return __descText(this);
     }
     set textContent(v) {
       if (this.__ptType === 9 || this.__ptType === 10) return;
@@ -1062,16 +1177,25 @@
       __needArgs(arguments.length, 1, 'querySelectorAll', who);
       return __staticNodeList(query(this, __checkSelector(sel, 'querySelectorAll', who)));
     }
-    append(...nodes) { for (const n of nodes) this.appendChild(typeof n === 'string' ? new Text(n) : n); }
+    // A fragment appended to itself is let through, as in Chrome.
+    append(...nodes) {
+      __needNoneAncestor(this, nodes.filter((n) => n !== this), 'append', 'DocumentFragment');
+      for (const n of nodes) if (n !== this) this.appendChild(typeof n === 'string' ? new Text(n) : n);
+    }
     prepend(...nodes) {
+      __needNoneAncestor(this, nodes.filter((n) => n !== this), 'prepend', 'DocumentFragment');
       const first = this.__ptKids[0] || null;
-      for (const n of nodes) this.insertBefore(typeof n === 'string' ? new Text(n) : n, first);
+      for (const n of nodes) if (n !== this) this.insertBefore(typeof n === 'string' ? new Text(n) : n, first);
     }
     replaceChildren(...nodes) {
+      __needNoneAncestor(this, nodes, 'replaceChildren', 'DocumentFragment');
       __ptDropKids(this);
       for (const n of nodes) this.appendChild(typeof n === 'string' ? new Text(n) : n);
     }
-    moveBefore(node, child) { return this.insertBefore(node, child); }
+    moveBefore(node, child) {
+      __needNotAncestor(this, node, 'moveBefore', 'DocumentFragment');
+      return this.insertBefore(node, child);
+    }
   }
 
   class ShadowRoot extends DocumentFragment {
@@ -1091,7 +1215,7 @@
     getHTML(opts) { return this.__ptKids.map((n) => serializeNode(n, !!(opts && opts.serializableShadowRoots))).join(''); }
     get nodeName() { return '#document-fragment'; }
     get nodeValue() { return null; }
-    get textContent() { return this.__ptKids.map(n => n.textContent).join(''); }
+    get textContent() { return __descText(this); }
     set textContent(v) { __ptDropKids(this); if (v !== '') this.appendChild(new Text(String(v))); }
     get innerHTML() {
       const host = this.__ptLocal === 'template' ? __templateContent(this) : this;
@@ -1131,8 +1255,14 @@
       __needArgs(arguments.length, 1, 'querySelectorAll', who);
       return __staticNodeList(query(this, __checkSelector(sel, 'querySelectorAll', who)));
     }
-    append(...ns) { for (const n of ns) this.appendChild(typeof n === 'string' ? new Text(n) : n); }
-    prepend(...ns) { for (const n of ns.reverse()) this.insertBefore(typeof n === 'string' ? new Text(n) : n, this.firstChild); }
+    append(...ns) {
+      __needNoneAncestor(this, ns, 'append', 'DocumentFragment');
+      for (const n of ns) this.appendChild(typeof n === 'string' ? new Text(n) : n);
+    }
+    prepend(...ns) {
+      __needNoneAncestor(this, ns, 'prepend', 'DocumentFragment');
+      for (const n of ns.reverse()) this.insertBefore(typeof n === 'string' ? new Text(n) : n, this.firstChild);
+    }
     // DocumentOrShadowRoot: a shadow root answers like the document (Chrome
     // returns the stack up to <html>).
     elementFromPoint(x, y) { const d = globalThis.document; return d ? d.elementFromPoint(x, y) : null; }
@@ -1742,9 +1872,16 @@
     get nextElementSibling() { let n = this.nextSibling; while (n && n.__ptType !== ELEMENT_NODE) n = n.nextSibling; return n; }
     get previousElementSibling() { let n = this.previousSibling; while (n && n.__ptType !== ELEMENT_NODE) n = n.previousSibling; return n; }
 
-    append(...ns) { for (const n of ns) this.appendChild(typeof n === 'string' ? new Text(n) : n); }
-    prepend(...ns) { for (const n of ns.reverse()) this.insertBefore(typeof n === 'string' ? new Text(n) : n, this.firstChild); }
+    append(...ns) {
+      __needNoneAncestor(this, ns, 'append', 'Element');
+      for (const n of ns) this.appendChild(typeof n === 'string' ? new Text(n) : n);
+    }
+    prepend(...ns) {
+      __needNoneAncestor(this, ns, 'prepend', 'Element');
+      for (const n of ns.reverse()) this.insertBefore(typeof n === 'string' ? new Text(n) : n, this.firstChild);
+    }
     replaceChildren(...ns) {
+      __needNoneAncestor(this, ns, 'replaceChildren', 'Element');
       const nodes = ns.map((n) => (typeof n === 'string' ? new Text(n) : n));
       for (const n of nodes) if (n && n.__ptParent === this) this.removeChild(n);
       __ptDropKids(this);
@@ -5036,24 +5173,38 @@
   /// Stylesheet owners in document order.
   function __sheetOwners(root) {
     const own = [];
-    const visit = (n) => {
-      for (const c of (n.__ptKids || [])) {
-        if (c.__ptType !== ELEMENT_NODE) continue;
-        if (__ptHasSheet(c)) own.push(c);
-        visit(c);
-      }
-    };
-    visit(root);
+    walk(root, (c) => { if (__ptHasSheet(c)) own.push(c); });
     return own;
   }
 
   // Stops at the first match in tree order.
-  function firstMatch(node, pred) {
-    for (const c of node.__ptKids) {
+  // Recursion is faster on the trees pages have; below `__WALK_DEPTH`
+  // levels the rest of the walk goes on an explicit stack.
+  function firstMatch(node, pred) { return __firstMatchRec(node.__ptKids, pred, 0); }
+  function __firstMatchRec(kids, pred, depth) {
+    for (let i = 0; i < kids.length; i++) {
+      const c = kids[i];
       if (c.__ptType !== ELEMENT_NODE) continue;
       if (pred(c)) return c;
-      const r = firstMatch(c, pred);
-      if (r) return r;
+      const k = c.__ptKids;
+      if (k && k.length) {
+        const r = depth < __WALK_DEPTH ? __firstMatchRec(k, pred, depth + 1) : __firstMatchDeep(c, pred);
+        if (r) return r;
+      }
+    }
+    return null;
+  }
+  function __firstMatchDeep(node, pred) {
+    const st = [node.__ptKids, 0];
+    while (st.length) {
+      const top = st.length - 2;
+      const kids = st[top], i = st[top + 1];
+      if (i >= kids.length) { st.length = top; continue; }
+      st[top + 1] = i + 1;
+      const c = kids[i];
+      if (c.__ptType !== ELEMENT_NODE) continue;
+      if (pred(c)) return c;
+      st.push(c.__ptKids || __NO_NODES, 0);
     }
     return null;
   }
@@ -5079,9 +5230,28 @@
       return true;
     });
   }
-  function walk(node, visit) {
-    for (const c of node.__ptKids) {
-      if (c.__ptType === ELEMENT_NODE) { visit(c); walk(c, visit); }
+  // Elements below `node` in tree order, without a stack frame per level
+  // (Chrome queries trees tens of thousands deep): (children, next index)
+  // runs over the live child lists.
+  function walk(node, visit) { __walkRec(node.__ptKids || __NO_NODES, visit, 0); }
+  function __walkRec(kids, visit, depth) {
+    for (let i = 0; i < kids.length; i++) {
+      const c = kids[i];
+      if (c.__ptType !== ELEMENT_NODE) continue;
+      visit(c);
+      const k = c.__ptKids;
+      if (k && k.length) { if (depth < __WALK_DEPTH) __walkRec(k, visit, depth + 1); else __walkDeep(c, visit); }
+    }
+  }
+  function __walkDeep(node, visit) {
+    const st = [node.__ptKids || __NO_NODES, 0];
+    while (st.length) {
+      const top = st.length - 2;
+      const kids = st[top], i = st[top + 1];
+      if (i >= kids.length) { st.length = top; continue; }
+      st[top + 1] = i + 1;
+      const c = kids[i];
+      if (c.__ptType === ELEMENT_NODE) { visit(c); st.push(c.__ptKids || __NO_NODES, 0); }
     }
   }
 
@@ -5358,9 +5528,18 @@
   function __ancBloom(el) {
     const p = __parentEl(el);
     if (!p) return __BLOOM_NONE;
-    let b = __passBloom.get(p);
+    const b = __passBloom.get(p);
     if (b) return b;
-    b = Int32Array.from(__ancBloom(p));
+    // Ancestors' filters first, from the top, without a frame per level.
+    const chain = [];
+    for (let a = __parentEl(p); a && !__passBloom.get(a); a = __parentEl(a)) chain.push(a);
+    for (let i = chain.length - 1; i >= 0; i--) __ancBloomOf(chain[i]);
+    return __ancBloomOf(p);
+  }
+  // The filter of the ancestors of `p`'s children: `p`'s own on top of its
+  // parent's (already kept when called from `__ancBloom`).
+  function __ancBloomOf(p) {
+    const b = Int32Array.from(__ancBloom(p));
     __bloomAdd(b, 't' + __s_toLowerCase(String(p.__ptLocal || '')));
     if (p.__ptAttrs) for (const name of p.__ptAttrs.keys()) __bloomAdd(b, 'a' + __s_toLowerCase(String(name)));
     const id = __ptGetA(p, 'id');
@@ -5852,26 +6031,38 @@
   // ---- HTML serialization (innerHTML getter) --------------------------------
   const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
   const esc = (s, attr) => __s_replace(s, attr ? /[&<>"]/g : /[&<>]/g, c => ESC[c]);
-  function serializeNode(n, withShadow) {
-    // Internal fields only: a page may shadow `attributes`, `data` or `tagName`
-    // on an element (skyscanner does on an iframe); Chrome's serializer is native.
-    if (n.__ptType === TEXT_NODE) return esc(n.__ptData, false);
-    if (n.__ptType === COMMENT_NODE) return `<!--${n.__ptData}-->`;
-    if (n.__ptType !== ELEMENT_NODE) return n.__ptKids.map((c) => serializeNode(c, withShadow)).join('');
-    const tag = n.__ptLocal;
-    let attrs = '';
-    for (const [name, value] of n.__ptAttrs) attrs += ` ${name}="${esc(value, true)}"`;
-    if (VOID.has(tag)) return `<${tag}${attrs}>`;
-    // `<template>` serializes its content; a serializable shadow root
-    // (getHTML with serializableShadowRoots) as <template shadowrootmode>.
-    let inner = '';
-    if (withShadow && n.__ptShadow && n.__ptShadow.__ptSerializable) {
-      const sr = n.__ptShadow;
-      inner += `<template shadowrootmode="${sr.mode}"${sr.__ptDelegatesFocus ? ' shadowrootdelegatesfocus=""' : ''}${sr.__ptSerializable ? ' shadowrootserializable=""' : ''}${sr.__ptClonable ? ' shadowrootclonable=""' : ''}>${sr.__ptKids.map((c) => serializeNode(c, withShadow)).join('')}</template>`;
+  // Internal fields only: a page may shadow `attributes`, `data` or `tagName`
+  // on an element (skyscanner does on an iframe); Chrome's serializer is native.
+  // Depth first with a stack of nodes and closing strings: Chrome serializes
+  // trees thousands deep.
+  function serializeNode(root, withShadow) {
+    const out = [];
+    const st = [root];
+    const pushKids = (kids) => { for (let i = kids.length - 1; i >= 0; i--) st.push(kids[i]); };
+    while (st.length) {
+      const n = st.pop();
+      if (typeof n === 'string') { out.push(n); continue; }
+      if (n.__ptType === TEXT_NODE) { out.push(esc(n.__ptData, false)); continue; }
+      if (n.__ptType === COMMENT_NODE) { out.push(`<!--${n.__ptData}-->`); continue; }
+      if (n.__ptType !== ELEMENT_NODE) { pushKids(n.__ptKids); continue; }
+      const tag = n.__ptLocal;
+      let attrs = '';
+      for (const [name, value] of n.__ptAttrs) attrs += ` ${name}="${esc(value, true)}"`;
+      if (VOID.has(tag)) { out.push(`<${tag}${attrs}>`); continue; }
+      out.push(`<${tag}${attrs}>`);
+      st.push(`</${tag}>`);
+      // `<template>` serializes its content; a serializable shadow root
+      // (getHTML with serializableShadowRoots) as <template shadowrootmode>,
+      // before the children.
+      pushKids(tag === 'template' ? __templateContent(n).__ptKids : n.__ptKids);
+      if (withShadow && n.__ptShadow && n.__ptShadow.__ptSerializable) {
+        const sr = n.__ptShadow;
+        st.push('</template>');
+        pushKids(sr.__ptKids);
+        st.push(`<template shadowrootmode="${sr.mode}"${sr.__ptDelegatesFocus ? ' shadowrootdelegatesfocus=""' : ''}${sr.__ptSerializable ? ' shadowrootserializable=""' : ''}${sr.__ptClonable ? ' shadowrootclonable=""' : ''}>`);
+      }
     }
-    const kids = tag === 'template' ? __templateContent(n).__ptKids : n.__ptKids;
-    inner += kids.map((c) => serializeNode(c, withShadow)).join('');
-    return `<${tag}${attrs}>${inner}</${tag}>`;
+    return out.join('');
   }
 
   // Emptying a node (`textContent = ''`, `innerHTML = …`, `replaceChildren()`)
@@ -5883,6 +6074,7 @@
     const old = node.__ptKids;
     if (!old || !old.length) return;
     node.__ptKids = [];
+    __connRemovals++;
     for (const c of old) { c.__ptParent = null; __hasNoteTree(c); }
     __markDirty(node);
     __styleTouchKids(node, null, -1);
@@ -7580,11 +7772,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       cache = out; cacheSeq = __framesSeq; cacheDoc = doc;
       if (!doc || !doc.documentElement) return out;
       // Light tree only: Chrome does not count frames inside shadow roots.
-      const walk = (n) => {
-        if (n.__ptType === ELEMENT_NODE && (n.__ptLocal === 'iframe' || n.__ptLocal === 'frame')) out.push(n);
-        for (const k of (n.__ptKids || [])) walk(k);
-      };
-      walk(doc.documentElement);
+      const de = doc.documentElement;
+      if (de.__ptLocal === 'iframe' || de.__ptLocal === 'frame') out.push(de);
+      walk(de, (n) => { if (n.__ptLocal === 'iframe' || n.__ptLocal === 'frame') out.push(n); });
       return out;
     };
     const windowOf = (el) => {
@@ -9542,19 +9732,23 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // Strings become text nodes; the anchor is the nearest sibling not among the
   // nodes being inserted, as the DOM standard's "viable sibling" rule says.
   const __asNodes = (ns) => ns.map((n) => (typeof n === 'string' ? new Text(n) : n));
+  const __childIface = (n) => (n.__ptType === ELEMENT_NODE ? 'Element' : 'CharacterData');
   const __afterSelf = function after(...ns) {
     const p = this.__ptParent; if (!p) return;
+    __needNoneAncestor(p, ns, 'after', __childIface(this));
     let ref = this.nextSibling; while (ref && __s_includes(ns, ref)) ref = ref.nextSibling;
     for (const n of __asNodes(ns)) p.insertBefore(n, ref);
   };
   const __beforeSelf = function before(...ns) {
     const p = this.__ptParent; if (!p) return;
+    __needNoneAncestor(p, ns, 'before', __childIface(this));
     let prev = this.previousSibling; while (prev && __s_includes(ns, prev)) prev = prev.previousSibling;
     const ref = prev ? prev.nextSibling : p.firstChild;
     for (const n of __asNodes(ns)) p.insertBefore(n, ref);
   };
   const __replaceSelf = function replaceWith(...ns) {
     const p = this.__ptParent; if (!p) return;
+    __needNoneAncestor(p, ns, 'replaceWith', __childIface(this));
     let ref = this.nextSibling; while (ref && __s_includes(ns, ref)) ref = ref.nextSibling;
     const nodes = __asNodes(ns);
     if (this.__ptParent === p && !__s_includes(nodes, this)) p.removeChild(this);
@@ -10077,13 +10271,21 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       return false;
     };
     let seen = 0;
+    // A matched element's subtree only with `every`; a shadow tree before
+    // the children. No stack frame per level.
     const walk = (n) => {
-      for (const k of (n.__ptKids || [])) {
+      const st = [n.__ptKids || __NO_NODES, 0];
+      while (st.length) {
+        const top = st.length - 2;
+        const kids = st[top], i = st[top + 1];
+        if (i >= kids.length) { st.length = top; continue; }
+        st[top + 1] = i + 1;
+        const k = kids[i];
         if (k.__ptType !== ELEMENT_NODE) continue;
         seen++;
         if (has(k)) { out.push(k); if (!every) continue; }
-        if (k.__ptShadow) walk(k.__ptShadow);
-        walk(k);
+        st.push(k.__ptKids || __NO_NODES, 0);
+        if (k.__ptShadow) st.push(k.__ptShadow.__ptKids || __NO_NODES, 0);
       }
     };
     const top = has(de);
@@ -10228,12 +10430,16 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       __layoutAllDirty = true;
       return null;
     }
-    const drop = (n) => {
-      __lstats.dropped++;
-      __styleCache.delete(n);
-      __layoutMemo.delete(n);
-      for (const k of (n.__ptKids || [])) if (k.__ptType === ELEMENT_NODE) drop(k);
-      if (n.__ptShadow) for (const k of (n.__ptShadow.__ptKids || [])) if (k.__ptType === ELEMENT_NODE) drop(k);
+    const drop = (root) => {
+      const st = [root];
+      while (st.length) {
+        const n = st.pop();
+        __lstats.dropped++;
+        __styleCache.delete(n);
+        __layoutMemo.delete(n);
+        for (const k of (n.__ptKids || __NO_NODES)) if (k.__ptType === ELEMENT_NODE) st.push(k);
+        if (n.__ptShadow) for (const k of (n.__ptShadow.__ptKids || __NO_NODES)) if (k.__ptType === ELEMENT_NODE) st.push(k);
+      }
     };
     const roots = __styleTouched;
     for (const r of roots) { drop(r); if (!__layoutAllDirty) __layoutDirty.push(r); }
@@ -11146,15 +11352,20 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   let __gatherKey = null, __gatherHit = null;
   function __gatherRulesCached(docEl) {
     const key = [docEl, LAYOUT.W, LAYOUT.H, __importGen];
-    const scan = (node, root) => {
-      for (const n of (node.__ptKids || [])) {
-        if (n.__ptType !== ELEMENT_NODE) continue;
-        if ((n.tagName === 'STYLE' || (n.tagName === 'LINK' && n.__ptSheetText)) && n.sheet) key.push(root, __sheetRules(n.sheet), __ptGetA(n, 'media'));
-        if (n.__ptShadow) scan(n.__ptShadow, n.__ptShadow);
-        scan(n, root);
-      }
-    };
-    scan(docEl, docEl);
+    // Tree order, a shadow tree before the children, no stack frame per
+    // level; the tag by the engine's field, not the page's `tagName`.
+    const st = [docEl.__ptKids || __NO_NODES, 0, docEl];
+    while (st.length) {
+      const top = st.length - 3;
+      const kids = st[top], i = st[top + 1], root = st[top + 2];
+      if (i >= kids.length) { st.length = top; continue; }
+      st[top + 1] = i + 1;
+      const n = kids[i];
+      if (n.__ptType !== ELEMENT_NODE) continue;
+      if (__isHtmlEl(n) && (n.__ptLocal === 'style' || (n.__ptLocal === 'link' && n.__ptSheetText)) && n.sheet) key.push(root, __sheetRules(n.sheet), __ptGetA(n, 'media'));
+      st.push(n.__ptKids || __NO_NODES, 0, root);
+      if (n.__ptShadow) st.push(n.__ptShadow.__ptKids || __NO_NODES, 0, n.__ptShadow);
+    }
     const old = __gatherKey;
     if (old && old.length === key.length && old.every((v, i) => v === key[i])) return __gatherHit;
     __gatherKey = key;
@@ -11244,7 +11455,19 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     // State-dependent ancestors make this one state-dependent too.
     let volatile = el.__ptDoc !== globalThis.document;
     const up = el.__ptParent;
-    if (!volatile && up && up.__ptType === ELEMENT_NODE) { __cascadeFor(up); volatile = __styleVolatile.has(up); }
+    if (!volatile && up && up.__ptType === ELEMENT_NODE) {
+      // Ancestors first, from the top, without a stack frame per level.
+      if (!(__styleCache.get(up) || __stylePass.get(up))) {
+        const chain = [];
+        for (let a = up.__ptParent; a && a.__ptType === ELEMENT_NODE && !(__styleCache.get(a) || __stylePass.get(a)); a = a.__ptParent) {
+          chain.push(a);
+          if (a.__ptDoc !== globalThis.document) break;
+        }
+        for (let i = chain.length - 1; i >= 0; i--) __cascadeFor(chain[i]);
+      }
+      __cascadeFor(up);
+      volatile = __styleVolatile.has(up);
+    }
     const out = new Map();
     __lstats.cascades++;
     // SVG presentation attributes are declarations of the lowest weight:
@@ -12034,7 +12257,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   let __tellLog = [];
   function __ptTellLogged(el, box) {
     __tellLog.push([el, box && __boxAt(box, 0, 0)]);
-    __ptTellFrame(el, box);
+    // A pass laid out in bands tells frames once, from its final log.
+    if (!__layoutDeep) __ptTellFrame(el, box);
   }
   const __on64 = (v) => typeof v === 'number' && Number.isInteger(v * 64) && Math.abs(v) < 2 ** 40;
   // A kept layout is a tree: the element's own result and, per child laid
@@ -12051,36 +12275,91 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // defines a property: unset stays unset.
   const __setDefH = (el, v) => { if (v != null || el.__ptDefH != null) el.__ptDefH = v; };
   const __setOff = (el, v) => { if (v || el.__ptOff) el.__ptOff = v; };
+  // Depth first without recursion: (entry, node, next child index) runs.
+  // A child is set from its own entry, then from where its parent left it.
   function __layoutRestore(ent, el) {
     __boxes.push(el);
-    const kids = ent.kids;
-    for (let i = 0; i < kids.length; i += 5) {
-      const c = kids[i];
-      __layoutRestore(kids[i + 1], c);
-      if (kids[i + 2]) {
-        c.__ptBox = kids[i + 2];
-        c.__ptBoxV = __layoutBuilt;
-        __setDefH(c, kids[i + 3]);
-        __setOff(c, __offCopy(kids[i + 4]));
+    const stack = [ent, el, 0];
+    while (stack.length) {
+      const top = stack.length - 3;
+      const e = stack[top], i = stack[top + 2], kids = e.kids;
+      if (i < kids.length) {
+        stack[top + 2] = i + 5;
+        __boxes.push(kids[i]);
+        stack.push(kids[i + 1], kids[i], 0);
+        continue;
+      }
+      const node = stack[top + 1];
+      stack.length = top;
+      if (e.box) {
+        node.__ptBox = e.box;
+        node.__ptBoxV = __layoutBuilt;
+        __setDefH(node, e.defH);
+        __setOff(node, __offCopy(e.off));
+      }
+      if (!stack.length) break;
+      const rec = stack[stack.length - 3].kids, j = stack[stack.length - 1] - 5;
+      if (rec[j + 2]) {
+        node.__ptBox = rec[j + 2];
+        node.__ptBoxV = __layoutBuilt;
+        __setDefH(node, rec[j + 3]);
+        __setOff(node, __offCopy(rec[j + 4]));
       }
     }
-    if (ent.box) {
-      el.__ptBox = ent.box;
-      el.__ptBoxV = __layoutBuilt;
-      __setDefH(el, ent.defH);
-      __setOff(el, __offCopy(ent.off));
+  }
+  // Layout recurses a few frames per level, and the JS stack a page sees is
+  // Chrome's size: 467 nested blocks threw RangeError (Chrome lays out
+  // tens of thousands). A pass goes at most `__LAYOUT_BAND` levels deep; an
+  // element below is put off (its ancestors' results are not kept), laid
+  // out from a shallow stack into the kept layouts, and the band above is
+  // laid out again, restoring it.
+  const __LAYOUT_BAND = 64;
+  let __layoutDepth = 0, __layoutDeferred = [], __layoutTaint = 0;
+  // Some element was put off in this pass: frames are told at its end.
+  let __layoutDeep = false;
+  // The next call is a put-off element's own: kept even when absolute.
+  let __layoutForceKeep = false;
+  // A solve that has not settled after many rounds lays out unbanded.
+  let __layoutUnbanded = false;
+  function __layoutSolve(call) {
+    for (let round = 0; ; round++) {
+      const sDepth = __layoutDepth, sDef = __layoutDeferred, sKids = __layoutKids;
+      __layoutDepth = 0;
+      __layoutDeferred = [];
+      __layoutKids = null;
+      const sUnb = __layoutUnbanded;
+      if (round >= 64) __layoutUnbanded = true;
+      let put;
+      try { call(); } finally {
+        __layoutUnbanded = sUnb;
+        put = __layoutDeferred;
+        __layoutDepth = sDepth;
+        __layoutDeferred = sDef;
+        __layoutKids = sKids;
+      }
+      if (!put.length) return;
+      for (const d of put) {
+        __layoutSolve(() => {
+          __layoutForceKeep = true;
+          __layoutOne(d.el, d.x, d.y, d.w, d.strut, d.forced);
+        });
+      }
     }
   }
   function __layoutOne(el, originX, originY, availW, strut, forced) {
-    // Absolute children are placed against a containing block the key does
-    // not hold: laid out fresh, never kept on their own.
-    const keep = !(forced && forced.cb);
+    // Absolute children are placed against a containing block: kept only
+    // when put off below a band, keyed by that block and the origin.
+    const cb = forced && forced.cb;
+    const forceKeep = __layoutForceKeep;
+    __layoutForceKeep = false;
+    const keep = !cb || forceKeep;
     let key = null, mine;
-    if (keep) {
+    {
       const up = el.__ptParent;
       key = availW + '|' + (strut ? strut.line + ',' + strut.asc + ',' + strut.desc : '-') + '|'
         + (forced ? (forced.w === undefined ? 'u' : forced.w) + ',' + (forced.h === undefined ? 'u' : forced.h) + ',' + (forced.block ? 1 : 0) : '-')
         + '|' + (up && up.__ptType === ELEMENT_NODE ? (up.__ptDefH == null ? null : up.__ptDefH) : '-');
+      if (cb) key += '|cb' + cb.x + ',' + cb.y + ',' + cb.w + ',' + cb.h + '|' + originX + ',' + originY;
       mine = __layoutMemo.get(el);
       const hit = mine && mine.get(key);
       if (hit) {
@@ -12098,20 +12377,26 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         }
       }
     }
-    const outer = __layoutKids, tellStart = __tellLog.length;
+    if (__layoutDepth >= __LAYOUT_BAND && !__layoutUnbanded) {
+      __layoutTaint++;
+      __layoutDeep = true;
+      __layoutDeferred.push({ el, x: originX, y: originY, w: availW, strut, forced });
+      return null;
+    }
+    const outer = __layoutKids, tellStart = __tellLog.length, taint = __layoutTaint;
     __layoutKids = true;
+    __layoutDepth++;
     let ret, kids;
     try {
       ret = __layoutOneRaw(el, originX, originY, availW, strut, forced);
     } finally {
       kids = __layoutKids;
       __layoutKids = outer;
+      __layoutDepth--;
     }
     const list = [];
-    __lstats.keptRecords++;
     if (kids !== true) {
       for (const [c, e] of kids) list.push(c, e, c.__ptBox, c.__ptDefH, __offCopy(c.__ptOff));
-      __lstats.keptRecords += kids.size;
     }
     const ent = {
       ox: originX, oy: originY, box: el.__ptBox, defH: el.__ptDefH, off: __offCopy(el.__ptOff),
@@ -12123,7 +12408,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (outer === true) __layoutKids = new Map();
       __layoutKids.set(el, ent);
     }
-    if (keep) {
+    // A result built on a put-off element's stand-in is not kept.
+    if (keep && taint === __layoutTaint) {
+      __lstats.keptRecords += 1 + list.length / 5;
       if (!mine) __layoutMemo.set(el, (mine = new Map()));
       // Kept across passes now: a few constraint sets per element, not all of
       // them ever seen.
@@ -12762,7 +13049,16 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __layoutForget();
     __tellLog = [];
     const r0 = __perfNow();
-    __layoutOne(de, 0, 0, LAYOUT.W);
+    __layoutDeep = false;
+    __layoutSolve(() => {
+      __boxes = [];
+      __tellLog = [];
+      __layoutOne(de, 0, 0, LAYOUT.W);
+    });
+    if (__layoutDeep) {
+      __layoutDeep = false;
+      for (const [n, b] of __tellLog) __ptTellFrame(n, b);
+    }
     __layoutSettle(de);
     __lstats.relayoutMs += __perfNow() - r0;
     // In quirks mode the root and body stretch to the viewport: an empty
@@ -12883,19 +13179,35 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   /// step at a time, each answer kept with the element's cascade (dropped
   /// with it), so a tree costs one lookup per element and property, not one
   /// walk to the root.
+  // Up to the nearest ancestor that sets it or has it kept, then each one's
+  // kept value on the way back down: no stack frame per level.
   const __inheritedValue = (el, prop) => {
     if (!el || el.__ptType !== ELEMENT_NODE) return null;
-    const cs = __cascadeFor(el);
-    const own = cs.__ptInh || (cs.__ptInh = new Map());
-    const hit = own.get(prop);
-    if (hit !== undefined) return hit;
-    const p = el.__ptParent;
-    let out = null;
-    if (p && p.__ptType === ELEMENT_NODE) {
-      const raw = __cascadeFor(p).get(prop);
-      out = raw != null ? __resolveLength(raw, prop, __usedFontSize(p), p) : __inheritedValue(p, prop);
+    {
+      const inh = __cascadeFor(el).__ptInh;
+      const hit = inh && inh.get(prop);
+      if (hit !== undefined) return hit;
     }
-    own.set(prop, out);
+    const chain = [];
+    let out = null;
+    for (let e = el; ; ) {
+      const cs = __cascadeFor(e);
+      const own = cs.__ptInh || (cs.__ptInh = new Map());
+      const hit = own.get(prop);
+      if (hit !== undefined) { out = hit; break; }
+      chain.push(own);
+      const p = e.__ptParent;
+      if (!p || p.__ptType !== ELEMENT_NODE) { out = null; break; }
+      const raw = __cascadeFor(p).get(prop);
+      if (raw != null) {
+        out = __resolveLength(raw, prop, __usedFontSize(p), p);
+        own.set(prop, out);
+        chain.pop();
+        break;
+      }
+      e = p;
+    }
+    for (let i = chain.length - 1; i >= 0; i--) chain[i].set(prop, out);
     return out;
   };
 
@@ -13124,8 +13436,10 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
   // Whether a node is in the flat tree: a shadow host's child gets there only
   // through a slot of the same name; the rest are hidden and have no style.
   function __inFlatTree(el) {
+    // Every step goes up (a slot is below the host it leads back to), so no
+    // cap: a cap of 10,000 gave elements deeper than that no style.
     let n = el;
-    for (let guard = 0; n && guard < 10000; guard++) {
+    while (n) {
       const p = n.__ptParent;
       // The root is a document (the caller checks which one via ownerDocument:
       // in a realm the tree root and the global `document` differ).
@@ -14205,16 +14519,32 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     // A non-rendered element returns its `textContent`, styles and scripts
     // included: in Chrome `d.style.display='none'; d.innerText` gives
     // ".z{color:red}text".
-    if (__isHiddenEl(el)) return el.textContent || '';
+    if (__isHiddenEl(el)) return __descText(el);
     // `innerText` renders only visible content — the text inside <script>/<style>
     // etc. is not rendered, so it must not leak into it (`textContent` includes it).
-    if (__INNERTEXT_SKIP.has(el.tagName)) return '';
-    let s = '';
-    for (const c of el.__ptKids) {
-      if (c.__ptType === TEXT_NODE) s += c.data;
-      else if (c.__ptType === ELEMENT_NODE && !__isHiddenEl(c)) s += ' ' + __innerText(c);
+    if (__INNERTEXT_SKIP.has(el.__ptTag)) return '';
+    // Each element's text collapsed, then added to its parent's after a
+    // space; frames of (element, text so far, next child index), no stack
+    // frame per level.
+    const st = [el, '', 0];
+    for (;;) {
+      const top = st.length - 3;
+      const e = st[top], i = st[top + 2], kids = e.__ptKids;
+      if (i < kids.length) {
+        st[top + 2] = i + 1;
+        const c = kids[i];
+        if (c.__ptType === TEXT_NODE) st[top + 1] += c.__ptData;
+        else if (c.__ptType === ELEMENT_NODE && !__isHiddenEl(c)) {
+          if (__INNERTEXT_SKIP.has(c.__ptTag)) st[top + 1] += ' ';
+          else st.push(c, '', 0);
+        }
+        continue;
+      }
+      const out = __s_trim(__s_replace(st[top + 1], /\s+/g, ' '));
+      st.length = top;
+      if (!st.length) return out;
+      st[st.length - 2] += ' ' + out;
     }
-    return __s_trim(__s_replace(s, /\s+/g, ' '));
   }
 
   // Called from the CDP layer (server.rs). Nodes are resolved there and passed in.
