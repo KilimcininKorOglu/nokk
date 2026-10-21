@@ -2316,9 +2316,17 @@
       if (!src && !this.textContent) return;
       Object.defineProperty(this, '__ptRan', { value: true, configurable: true, enumerable: false });
       // CSP: inline without nonce and foreign URLs do not run.
+      // 'strict-dynamic' trusts what a script inserts, not what a parser does.
       if (globalThis.__pt_cspActive && __pt_cspActive()) {
-        if (!src && __pt_cspBlocksInline(this)) return;
-        if (src && __pt_cspBlocksScriptUrl(this, String(src))) return;
+        const dyn = !this.__ptParserIns;
+        if (!src && __pt_cspBlocksInline(this, dyn)) return;
+        if (src && __pt_cspBlocksScriptUrl(this, String(src), dyn)) {
+          // A refused fetch is a network error: `error` on a later task, as
+          // Chrome fires it (script loaders wait for load or error).
+          this.__ptHoldLoad();
+          __ptLater(() => this.__ptFireLoad(false), 0);
+          return;
+        }
       }
       // A module has its own parsing, `import` and scope; the engine runs it,
       // both external and inline.
@@ -6460,9 +6468,11 @@
       else if (spec.k === 'd') n = __makeDoctype(doc, spec.name, spec.publicId, spec.systemId);
       else if (spec.k === 'e') {
         const el = __parserElement(doc, spec);
-        if (spec.tag === 'script' && !spec.ns && !live) {
-          Object.defineProperty(el, '__ptRan', { value: true, configurable: true, enumerable: false });
-          el.__ptNoForceAsync = true;
+        if (spec.tag === 'script' && !spec.ns) {
+          if (!live) {
+            Object.defineProperty(el, '__ptRan', { value: true, configurable: true, enumerable: false });
+            el.__ptNoForceAsync = true;
+          } else Object.defineProperty(el, '__ptParserIns', { value: true, configurable: true, enumerable: false });
         }
         for (const [name, value] of spec.attrs) __ptSetA(el, name, value);
         n = el;
@@ -8205,10 +8215,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return null;
   };
   // Whether a script URL is allowed by a source list (ignoring nonce/hash).
-  const __cspAllowsUrl = (list, url, nonce) => {
+  const __cspAllowsUrl = (list, url, nonce, dyn) => {
     const u = String(url || '');
     if (nonce && list.some((t) => __s_toLowerCase(t) === "'nonce-" + __s_toLowerCase(nonce) + "'" || t === "'nonce-" + nonce + "'")) return true;
-    if (__cspHas(list, "'strict-dynamic'")) return false;
+    if (__cspHas(list, "'strict-dynamic'")) return !!dyn;
     const scheme = (__s_match(u, /^([a-z][a-z0-9+.-]*):/i) || [])[1];
     const self_ = (globalThis.location && location.origin) || '';
     for (const t of list) {
@@ -8278,11 +8288,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return false;
   };
   // Inline script: nonce/hash/'unsafe-inline' (the last is voided by nonce/hash).
-  const __cspAllowsInline = (el) => {
+  const __cspAllowsInline = (el, dyn) => {
     for (const p of __csp.policies) {
       const d = __cspScriptDirective(p);
       if (!d) continue;
       const list = d[1];
+      if (dyn && __cspHas(list, "'strict-dynamic'")) continue;
       const hasNonceOrHash = list.some((t) => /^'(nonce-|sha(256|384|512)-)/i.test(t));
       const nonce = el && (__ptGetA(el, 'nonce') || el.__ptNonce || '');
       if (nonce && list.some((t) => t === "'nonce-" + nonce + "'")) continue;
@@ -8293,8 +8304,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return null;
   };
   const __cspReport = (what) => { try { (globalThis.__pt_parentConsole || console).error(what); } catch (e) {} };
-  globalThis.__pt_cspBlocksInline = (el) => {
-    const v = __cspAllowsInline(el);
+  globalThis.__pt_cspBlocksInline = (el, dyn) => {
+    const v = __cspAllowsInline(el, dyn);
     if (!v) return false;
     const text = __cspDirectiveText(v.name, v.list);
     __cspReport("Refused to execute inline script because it violates the following Content Security Policy directive: \"" + text + "\". Either the 'unsafe-inline' keyword, a hash ('sha256-…'), or a nonce ('nonce-...') is required to enable inline execution.\n");
@@ -8310,7 +8321,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     __cspViolation(v.name, v.list, 'inline', '', { violatedDirective: 'script-src-attr', effectiveDirective: 'script-src-attr', sourceFile: String((globalThis.location && location.href) || '') });
     return true;
   };
-  globalThis.__pt_cspBlocksScriptUrl = (el, url) => {
+  globalThis.__pt_cspBlocksScriptUrl = (el, url, dyn) => {
     if (!__csp.policies.length) return false;
     // Matched, and reported, as the absolute URL.
     try { url = new URL(String(url), document.baseURI).href; } catch (e) {}
@@ -8318,7 +8329,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const d = __cspScriptDirective(p);
       if (!d) continue;
       const nonce = el && (__ptGetA(el, 'nonce') || el.__ptNonce || '');
-      if (__cspAllowsUrl(d[1], url, nonce)) continue;
+      if (__cspAllowsUrl(d[1], url, nonce, dyn)) continue;
       const text = __cspDirectiveText(d[0], d[1]);
       __cspReport("Refused to load the script '" + url + "' because it violates the following Content Security Policy directive: \"" + text + "\". Note that 'script-src-elem' was not explicitly set, so 'script-src' is used as a fallback.\n");
       __cspViolation(d[0], d[1], String(url), '', { violatedDirective: 'script-src-elem', effectiveDirective: 'script-src-elem', sourceFile: '', lineNumber: 0, columnNumber: 0, noSite: true });
@@ -9641,9 +9652,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (el && document.__ptCurScript === el) document.__ptCurScript = null;
     if (!el) return;
     __scriptEls.delete(id);
-    const ev = { type: ok ? 'load' : 'error', target: el, currentTarget: el, isTrusted: true };
     // dispatchEvent calls `on…` itself; calling it separately fires twice.
-    try { el.dispatchEvent && el.dispatchEvent(ev); } catch (e) {}
+    try { el.dispatchEvent && el.dispatchEvent(__ptTrust(new Event(ok ? 'load' : 'error'))); } catch (e) {}
     try { el.__ptReleaseLoad(); } catch (e) {}
   };
 

@@ -3059,7 +3059,7 @@ impl BrowserContext {
         let mut gate_last_seen = t;
         // A gate that was there and went away was passed (AWS WAF reloads into
         // the site), which is not the same answer as "no gate at all".
-        let mut gate_seen = false;
+        let mut gate_seen: Option<ChallengeKind> = None;
         // In stop-at-clearance mode only a fresh lock counts: one already in the
         // jar may be the stale cookie that sent us to the gate.
         let lock_at_start = self.clearance_value();
@@ -3114,11 +3114,14 @@ impl BrowserContext {
             }
             if pressed == 0 && gate_checked.elapsed() >= std::time::Duration::from_millis(500) {
                 gate_checked = std::time::Instant::now();
-                if self.challenge_state().await.kind != ChallengeKind::None {
+                let state = self.challenge_state().await;
+                if state.kind != ChallengeKind::None {
                     gate_last_seen = gate_checked;
-                    gate_seen = true;
-                } else if gate_seen && gate_last_seen.elapsed() >= std::time::Duration::from_secs(1) {
-                    tracing::info!(target: "nokk", elapsed_ms = t.elapsed().as_millis(), "the gate went away");
+                    gate_seen = Some(state.kind);
+                } else if let Some(kind) = gate_seen.filter(|_| gate_last_seen.elapsed() >= std::time::Duration::from_secs(1)) {
+                    // Which gate, and whether it left a lock: a gone interstitial
+                    // without `cf_clearance` is not a clearance a caller can replay.
+                    tracing::info!(target: "nokk", elapsed_ms = t.elapsed().as_millis(), gate = kind.as_str(), cf_clearance = state.cleared, "the gate went away");
                     break ChallengeStatus::Cleared;
                 } else if gate_last_seen.elapsed() >= NO_GATE_GRACE {
                     tracing::info!(target: "nokk", elapsed_ms = t.elapsed().as_millis(), "no challenge on the page");
@@ -5687,6 +5690,11 @@ impl BrowserContext {
                 } else {
                     resp.url.clone()
                 };
+                // A script answered with an error status is not run: Chrome
+                // fires `error` on the element (a 404 page is not code).
+                if matches!(resource_type, "script" | "script-low" | "module") && !(200..300).contains(&resp.status) {
+                    return Err(EngineError::Js(format!("script {url} answered {}", resp.status)));
+                }
                 let mut body = String::from_utf8_lossy(&resp.body).into_owned();
                 // A text or JSON document is shown the way Chrome builds it; the
                 // document then reports its real type.
@@ -11543,6 +11551,83 @@ body { margin: 0; font-family: sans-serif; }
         assert_eq!(out["g"], "7px", "{out}");
         assert_eq!(out["h"], serde_json::json!([200, "200px"]), "{out}");
         assert_eq!(out["grid"], serde_json::json!([152, "16px", 112]), "{out}");
+    }
+
+    /// Under `'strict-dynamic'` a script inserted by another runs, inline or not, and
+    /// one in the markup needs its nonce (bandcamp.com loads reCAPTCHA this way and
+    /// got none). A refused script and one answered 404 fire a trusted `error` and do
+    /// not run; jQuery's loader waits for it. Expected values from Chrome 151.
+    #[tokio::test]
+    async fn strict_dynamic_trusts_inserted_scripts_and_refusals_fire_error() {
+        let _serial = serial().await;
+        const SD: &str = r#"<html><head><meta http-equiv="Content-Security-Policy" content="script-src 'nonce-abc' 'strict-dynamic' https: http: 'self' 'unsafe-inline'">
+          <script nonce="abc">
+            window.L = []; window.E = [];
+            const ev = (e) => [e instanceof Event, e.type, e.bubbles, e.cancelable, e.isTrusted].join();
+            const s = document.createElement('script'); s.src = '/b.js?dyn'; s.onload = (e) => E.push(ev(e)); document.head.appendChild(s);
+            const i = document.createElement('script'); i.textContent = "L.push('inline-dyn')"; document.head.appendChild(i);
+            const n = document.createElement('script'); n.src = '/nope.js'; n.onerror = (e) => E.push(ev(e)); document.head.appendChild(n);
+          </script>
+          <script src="/b.js?markup"></script><script nonce="abc" src="/b.js?markupnonce"></script>
+          </head><body><script>L.push('inline-markup')</script></body></html>"#;
+        const NE: &str = r#"<html><head><meta http-equiv="Content-Security-Policy" content="script-src 'nonce-abc'">
+          <script nonce="abc">
+            window.L = []; window.E = [];
+            const s = document.createElement('script'); s.src = '/b.js?dyn';
+            s.addEventListener('error', (e) => E.push([e.type, e.bubbles, e.cancelable, e.isTrusted].join()));
+            document.head.appendChild(s); E.push('sync');
+          </script></head><body></body></html>"#;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let (status, ct, body) = if req.starts_with("GET /b.js") {
+                        ("200 OK", "text/javascript", "L.push(new URL(document.currentScript.src).search);")
+                    } else if req.starts_with("GET /nope.js") {
+                        ("404 Not Found", "text/javascript", "window.BAD = 1;")
+                    } else if req.starts_with("GET /ne") {
+                        ("200 OK", "text/html", NE)
+                    } else {
+                        ("200 OK", "text/html", SD)
+                    };
+                    let out = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(out.as_bytes()).await;
+                });
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let settle = |ctx: BrowserContext| async move {
+            for _ in 0..40 {
+                ctx.run_event_loop().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            ctx
+        };
+        let ctx = settle(engine.new_context().await.unwrap()).await;
+        ctx.navigate(&format!("http://{addr}/sd")).await.unwrap();
+        let ctx = settle(ctx).await;
+        let out = probe(&ctx, "__ptJSON.stringify({ L: L.slice().sort(), E: E.slice().sort(), bad: 'BAD' in window })").await;
+        assert_eq!(out["L"], serde_json::json!(["?dyn", "?markupnonce", "inline-dyn"]), "{out}");
+        assert_eq!(out["E"], serde_json::json!(["true,error,false,false,true", "true,load,false,false,true"]), "{out}");
+        assert_eq!(out["bad"], false, "a 404 body is not run: {out}");
+        ctx.navigate(&format!("http://{addr}/ne")).await.unwrap();
+        let ctx = settle(ctx).await;
+        let out = probe(&ctx, "__ptJSON.stringify({ L, E })").await;
+        assert_eq!(out["L"], serde_json::json!([]), "{out}");
+        assert_eq!(out["E"], serde_json::json!(["sync", "error,false,false,true"]), "{out}");
     }
 
     /// A page-inserted script sees itself as in a browser: `document.currentScript` is
