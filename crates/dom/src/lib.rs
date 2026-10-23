@@ -281,13 +281,18 @@ fn serialize(node: &Handle, out: &mut String, scripts: &mut Vec<Script>, modes: 
                 }
                 out.push('[');
                 // `xlink:href`, `xml:lang`: the qualified name, as Chrome
-                // reports it.
+                // reports it (`xmlns` has an empty prefix, not one).
                 match &a.name.prefix {
-                    Some(p) => push_json_str(out, &format!("{}:{}", p, a.name.local)),
-                    None => push_json_str(out, &a.name.local),
+                    Some(p) if !p.is_empty() => push_json_str(out, &format!("{}:{}", p, a.name.local)),
+                    _ => push_json_str(out, &a.name.local),
                 }
                 out.push(',');
                 push_json_str(out, &a.value);
+                // Its namespace, in foreign content.
+                if !a.name.ns.is_empty() {
+                    out.push(',');
+                    push_json_str(out, &a.name.ns);
+                }
                 out.push(']');
             }
             out.push_str("],\"children\":[");

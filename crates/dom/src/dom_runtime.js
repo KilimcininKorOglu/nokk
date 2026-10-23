@@ -180,6 +180,41 @@
     const s = String(n);
     return el.__ptNS === undefined || el.__ptNS === 'http://www.w3.org/1999/xhtml' ? __s_toLowerCase(s) : s;
   }
+  // Attributes are kept by qualified name; one in a namespace has
+  // [namespace, prefix, local name] beside it, by the same name.
+  const __XMLNS_NS = 'http://www.w3.org/2000/xmlns/', __XML_NS = 'http://www.w3.org/XML/1998/namespace';
+  const __attrNsOf = (el, q) => (el.__ptAttrNS && el.__ptAttrNS.get(q)) || null;
+  const __attrNsMap = (el) => {
+    if (!el.__ptAttrNS) Object.defineProperty(el, '__ptAttrNS', { value: new Map(), enumerable: false, configurable: true });
+    return el.__ptAttrNS;
+  };
+  const __nsArg = (ns) => (ns === null || ns === undefined || ns === '' ? null : String(ns));
+  // The qualified name of the attribute with this namespace and local name.
+  function __attrNsFind(el, ns, local) {
+    const N = __nsArg(ns), L = String(local);
+    for (const q of el.__ptAttrs.keys()) {
+      const info = __attrNsOf(el, q);
+      if (info ? info[0] === N && info[2] === L : N === null && q === L) return q;
+    }
+    return null;
+  }
+  // DOM "validate and extract", with Chrome 151's messages.
+  function __attrNsExtract(ns, qname, method) {
+    const N = __nsArg(ns), q = String(qname);
+    const fail = (what, kind) => __pt_mkErr(globalThis.DOMException || Error, "Failed to execute '" + method + "' on 'Element': " + what, kind);
+    const bad = /[\t\n\f\r \0\/>]/.exec(q);
+    if (bad) throw fail("The qualified name provided ('" + q + "') contains the invalid character '" + bad[0] + "'.", 'InvalidCharacterError');
+    const c = __s_indexOf(q, ':');
+    const prefix = c < 0 ? null : __s_slice(q, 0, c), local = c < 0 ? q : __s_slice(q, c + 1);
+    if (!local) throw fail("The qualified name provided ('" + q + "') has an empty local name.", 'InvalidCharacterError');
+    if (prefix === '') throw fail("The qualified name provided ('" + q + "') has an empty namespace prefix.", 'InvalidCharacterError');
+    const nsBad = () => fail("'" + (N || '') + "' is an invalid namespace for attributes.", 'NamespaceError');
+    if (prefix !== null && N === null) throw nsBad();
+    if (prefix === 'xml' && N !== __XML_NS) throw nsBad();
+    if ((q === 'xmlns' || prefix === 'xmlns') && N !== __XMLNS_NS) throw nsBad();
+    if (N === __XMLNS_NS && q !== 'xmlns' && prefix !== 'xmlns') throw nsBad();
+    return [N, prefix, local];
+  }
   // Depth first without a stack frame per level; a node's children as they
   // were right after `fn` saw it, then its shadow tree.
   function __walkTree(node, fn) {
@@ -278,11 +313,19 @@
       list = Object.create(proto);
       Object.defineProperty(node, '__ptList', { value: list, enumerable: false, writable: true });
     }
+    if (list.__ptNode !== node) Object.defineProperty(list, '__ptNode', { value: node, enumerable: false });
+    __nodeListFill(list, node);
+    return list;
+  }
+  function __nodeListFill(list, node) {
     const kids = node.__ptKids, prev = list.__ptLen | 0;
+    // Unchanged since the last fill: every change to a tree bumps the
+    // layout sequence.
+    if (list.__ptSeq === __layoutSeq && prev === kids.length) return;
     for (let i = 0; i < kids.length; i++) list[i] = kids[i];
     for (let i = kids.length; i < prev; i++) delete list[i];
     Object.defineProperty(list, '__ptLen', { value: kids.length, enumerable: false, configurable: true });
-    return list;
+    Object.defineProperty(list, '__ptSeq', { value: __layoutSeq, enumerable: false, configurable: true });
   }
   // A prototype is linked to its interface on first use: interfaces are
   // declared after this file, lists are created later by the page. Members move
@@ -347,14 +390,18 @@
     get [Symbol.toStringTag]() { return 'NodeList'; },
     // `length` is on the prototype: a list's own properties are indices only,
     // as getOwnPropertyNames shows.
-    get length() { return this.__ptLen | 0; },
-    item(i) { return this[i] != null ? this[i] : null; },
-    forEach(fn, thisArg) { for (let i = 0; i < this.length; i++) fn.call(thisArg, this[i], i, this); },
-    *entries() { for (let i = 0; i < this.length; i++) yield [i, this[i]]; },
-    *keys() { for (let i = 0; i < this.length; i++) yield i; },
-    *values() { for (let i = 0; i < this.length; i++) yield this[i]; },
-    [Symbol.iterator]() { return this.values(); },
+    // A live list (childNodes) reads its node's children again: an array
+    // iterator reads `length` at each step.
+    get length() { const n = this.__ptNode; if (n) __nodeListFill(this, n); return this.__ptLen | 0; },
+    item(i) { const n = this.__ptNode; if (n) __nodeListFill(this, n); return this[i] != null ? this[i] : null; },
   };
+  // As in Chrome, a value iterator is Array.prototype's: `entries`, `keys`,
+  // `values` and `forEach` are those functions, the iterator `values`.
+  const __arrayIterable = (proto) => {
+    for (const k of ['entries', 'keys', 'values', 'forEach']) Object.defineProperty(proto, k, { value: Array.prototype[k], writable: true, enumerable: true, configurable: true });
+    Object.defineProperty(proto, Symbol.iterator, { value: Array.prototype.values, writable: true, enumerable: false, configurable: true });
+  };
+  __arrayIterable(__nodeListProto);
 
   const __collectionProto = {
     get length() { return this.__ptLen | 0; },
@@ -405,14 +452,14 @@
   // read `Object.prototype.toString` and the prototype chain.
   const __attrProto = {
     get [Symbol.toStringTag]() { return 'Attr'; },
-    get localName() { return this.__ptName; },
+    get localName() { const i = __attrNsOf(this.__ptOwner, this.__ptName); return i ? i[2] : this.__ptName; },
     get name() { return this.__ptName; },
     get nodeName() { return this.__ptName; },
     get value() { return this.__ptValue; },
     get nodeValue() { return this.__ptValue; },
     get textContent() { return this.__ptValue; },
-    get namespaceURI() { return null; },
-    get prefix() { return null; },
+    get namespaceURI() { const i = __attrNsOf(this.__ptOwner, this.__ptName); return i ? i[0] : null; },
+    get prefix() { const i = __attrNsOf(this.__ptOwner, this.__ptName); return i ? i[1] : null; },
     get specified() { return true; },
     get ownerElement() { return this.__ptOwner; },
   };
@@ -455,7 +502,9 @@
     get [Symbol.toStringTag]() { return 'DOMTokenList'; },
     get value() { return __ptGetA(this.__ptEl, 'class') || ''; },
     set value(v) { __ptSetA(this.__ptEl, 'class', String(v)); },
-    get length() { return this.__ptTokens().length; },
+    // Indices follow the attribute: an array iterator reads `length` at
+    // each step.
+    get length() { return __tokenFill(this).length; },
     item(i) { const t = this.__ptTokens(); return i >= 0 && i < t.length ? t[i] : null; },
     contains(c) { return __s_includes(this.__ptTokens(), String(c)); },
     add(...cs) { const t = this.__ptTokens();
@@ -475,13 +524,21 @@
       if (i < 0) return false;
       t[i] = String(to); __ptSetA(this.__ptEl, 'class', t.join(' ')); return true; },
     supports() { throw __pt_mkErr(TypeError, "Failed to execute 'supports' on 'DOMTokenList': DOMTokenList has no supported tokens."); },
-    forEach(fn, thisArg) { this.__ptTokens().forEach((v, i) => fn.call(thisArg, v, i, this)); },
-    *entries() { const t = this.__ptTokens(); for (let i = 0; i < t.length; i++) yield [i, t[i]]; },
-    *keys() { const t = this.__ptTokens(); for (let i = 0; i < t.length; i++) yield i; },
-    *values() { yield* this.__ptTokens(); },
-    [Symbol.iterator]() { return this.values(); },
     toString() { return this.value; },
   };
+  __arrayIterable(__tokenListProto);
+  // Refilled only when the attribute changed since the last fill.
+  const __tokenSeen = new WeakMap();
+  function __tokenFill(list) {
+    const raw = __ptGetA(list.__ptEl, 'class') || '';
+    const seen = __tokenSeen.get(list);
+    if (seen && seen.raw === raw) return seen.t;
+    const t = list.__ptTokens(), prev = seen ? seen.t.length : 0;
+    for (let i = 0; i < t.length; i++) list[i] = t[i];
+    for (let i = t.length; i < prev; i++) delete list[i];
+    __tokenSeen.set(list, { raw, t });
+    return t;
+  }
   function __tokenList(el) {
     const proto = __link('DOMTokenList', __tokenListProto);
     let list = el.__ptTokenList;
@@ -494,10 +551,7 @@
       Object.defineProperty(el, '__ptTokenList', { value: list, enumerable: false, writable: true });
     }
     // Indices are own properties, as in Chrome: `list[0]` works.
-    const t = list.__ptTokens(), prev = list.__ptCount | 0;
-    for (let i = 0; i < t.length; i++) list[i] = t[i];
-    for (let i = t.length; i < prev; i++) delete list[i];
-    Object.defineProperty(list, '__ptCount', { value: t.length, configurable: true });
+    __tokenFill(list);
     return list;
   }
 
@@ -1651,21 +1705,68 @@
         }
       }
       __markDirty(this);
-      __mutation({ type: 'attributes', target: this, attributeName: name, attributeNamespace: null,
+      const info = __attrNsOf(this, name);
+      __mutation({ type: 'attributes', target: this, attributeName: info ? info[2] : name, attributeNamespace: info ? info[0] : null,
         oldValue: old === undefined ? null : old, addedNodes: [], removedNodes: [],
         previousSibling: null, nextSibling: null });
     }
     removeAttribute(n) {
       const name = __attrName(this, n), old = this.__ptAttrs.get(name);
       this.__ptAttrs.delete(name);
+      const info = __attrNsOf(this, name);
+      if (info) this.__ptAttrNS.delete(name);
       __markDirty(this);
       __styleTouchAttr(this, name, old, null);
       __hasNoteAttr(name, old, null);
-      __mutation({ type: 'attributes', target: this, attributeName: name, attributeNamespace: null,
+      __mutation({ type: 'attributes', target: this, attributeName: info ? info[2] : name, attributeNamespace: info ? info[0] : null,
         oldValue: old === undefined ? null : old, addedNodes: [], removedNodes: [],
         previousSibling: null, nextSibling: null });
     }
     hasAttribute(n) { return this.__ptAttrs.has(__attrName(this, n)); }
+    getAttributeNS(ns, local) {
+      __needArgs(arguments.length, 2, 'getAttributeNS', 'Element');
+      const q = __attrNsFind(this, ns, local);
+      return q === null ? null : this.__ptAttrs.get(q);
+    }
+    hasAttributeNS(ns, local) {
+      __needArgs(arguments.length, 2, 'hasAttributeNS', 'Element');
+      return __attrNsFind(this, ns, local) !== null;
+    }
+    getAttributeNodeNS(ns, local) {
+      __needArgs(arguments.length, 2, 'getAttributeNodeNS', 'Element');
+      const q = __attrNsFind(this, ns, local);
+      return q === null ? null : __attr(this, q, this.__ptAttrs.get(q));
+    }
+    setAttributeNS(ns, qname, v) {
+      __needArgs(arguments.length, 3, 'setAttributeNS', 'Element');
+      const [N, prefix, local] = __attrNsExtract(ns, qname, 'setAttributeNS');
+      // An attribute already there keeps its prefix; only its value changes.
+      const was = __attrNsFind(this, N, local);
+      const q = was !== null ? was : prefix !== null ? prefix + ':' + local : local;
+      const old = this.__ptAttrs.get(q), val = String(v);
+      this.__ptAttrs.set(q, val);
+      if (was === null) { if (N !== null) __attrNsMap(this).set(q, [N, prefix, local]); else if (this.__ptAttrNS) this.__ptAttrNS.delete(q); }
+      __styleTouchAttr(this, q, old, val);
+      __hasNoteAttr(q, old, val);
+      __markDirty(this);
+      __mutation({ type: 'attributes', target: this, attributeName: local, attributeNamespace: N,
+        oldValue: old === undefined ? null : old, addedNodes: [], removedNodes: [],
+        previousSibling: null, nextSibling: null });
+    }
+    removeAttributeNS(ns, local) {
+      __needArgs(arguments.length, 2, 'removeAttributeNS', 'Element');
+      const q = __attrNsFind(this, ns, local);
+      if (q === null) return;
+      const info = __attrNsOf(this, q), old = this.__ptAttrs.get(q);
+      this.__ptAttrs.delete(q);
+      if (info) this.__ptAttrNS.delete(q);
+      __markDirty(this);
+      __styleTouchAttr(this, q, old, null);
+      __hasNoteAttr(q, old, null);
+      __mutation({ type: 'attributes', target: this, attributeName: info ? info[2] : q, attributeNamespace: info ? info[0] : null,
+        oldValue: old === undefined ? null : old, addedNodes: [], removedNodes: [],
+        previousSibling: null, nextSibling: null });
+    }
     getAttributeNames() { return [...this.__ptAttrs.keys()]; }
     get attributes() { return __namedNodeMap(this); }
 
@@ -2663,6 +2764,7 @@
     __ptShallowClone() {
       const e = new Element(this.localName);
       e.__ptAttrs = new Map(this.__ptAttrs);
+      if (this.__ptAttrNS && this.__ptAttrNS.size) Object.defineProperty(e, '__ptAttrNS', { value: new Map(this.__ptAttrNS), enumerable: false, configurable: true });
       // A clone sits on the same interface step as the original: a copy of
       // `<template>` is an HTMLTemplateElement, of `<div>` an HTMLDivElement.
       try {
@@ -6474,7 +6576,11 @@
             el.__ptNoForceAsync = true;
           } else Object.defineProperty(el, '__ptParserIns', { value: true, configurable: true, enumerable: false });
         }
-        for (const [name, value] of spec.attrs) __ptSetA(el, name, value);
+        for (const a of spec.attrs) {
+          __ptSetA(el, a[0], a[1]);
+          // Foreign content: `xlink:href`, `xml:lang`, `xmlns` in their namespaces.
+          if (a[2]) { const c = __s_indexOf(a[0], ':'); __attrNsMap(el).set(a[0], [a[2], c < 0 ? null : __s_slice(a[0], 0, c), c < 0 ? a[0] : __s_slice(a[0], c + 1)]); }
+        }
         n = el;
         // The parser puts template children into its content and leaves the
         // element empty (`t.childNodes.length === 0` in Chrome too).

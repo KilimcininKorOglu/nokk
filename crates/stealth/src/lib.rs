@@ -8373,7 +8373,9 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     const resp = globalThis.__pt_makeResponse({
       status, statusText: statusText || '', url: finalU, type,
       redirected: !!finalUrl && __s_replace(finalUrl, /#.*$/, '') !== __s_replace(String(p.url), /#.*$/, ''),
-      headers: new globalThis.Headers(lower),
+      // One by one: a name a server sent that Headers refuses is left out,
+      // not the whole response.
+      headers: (() => { const h = new globalThis.Headers(); for (const k of Object.keys(lower)) { try { h.append(k, lower[k]); } catch (e) {} } return h; })(),
       bytes: bytes64 ? (__b64bytes ? __b64bytes(bytes64) : Uint8Array.from(globalThis.atob(bytes64), (c) => __s_charCodeAt(c, 0))) : null,
       text: bytes64 ? undefined : (body == null ? '' : String(body)),
     });
@@ -8996,31 +8998,118 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     };
   }
 
+  // Iterators of Headers, FormData and URLSearchParams, as Chrome makes them:
+  // one prototype per interface ("Headers Iterator") above Iterator's, with
+  // an enumerable `next`; live, so pairs added during a walk are seen.
+  if (!globalThis.__pt_pairIter) {
+    const PAIR_ST = new WeakMap();
+    const PROTOS = new Map();
+    const ITER_PROTO = Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()));
+    const nat = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
+    const protoFor = (tag) => {
+      let P = PROTOS.get(tag);
+      if (P) return P;
+      P = Object.create(ITER_PROTO);
+      const next = nat({ next() {
+        const st = this !== null && typeof this === 'object' ? PAIR_ST.get(this) : undefined;
+        if (!st || st.tag !== tag) throw __pt_mkErr(TypeError, 'Illegal invocation');
+        const l = st.list();
+        if (st.i >= l.length) { st.i = Infinity; return { done: true, value: undefined }; }
+        const p = l[st.i++];
+        return { done: false, value: st.kind === 1 ? p[0] : st.kind === 2 ? p[1] : [p[0], p[1]] };
+      } }.next);
+      Object.defineProperty(P, 'next', { value: next, writable: true, enumerable: true, configurable: true });
+      Object.defineProperty(P, Symbol.toStringTag, { value: tag + ' Iterator', writable: false, enumerable: false, configurable: true });
+      PROTOS.set(tag, P);
+      return P;
+    };
+    // kind: 0 entries, 1 keys, 2 values; `list` answers the pairs now.
+    Object.defineProperty(globalThis, '__pt_pairIter', {
+      value: (tag, list, kind) => { const it = Object.create(protoFor(tag)); PAIR_ST.set(it, { tag, list, kind, i: 0 }); return it; },
+      configurable: true, enumerable: false,
+    });
+  }
   if (!globalThis.Headers) {
+    // A header list as Fetch keeps it: pairs in insertion order, names
+    // lowercased; read back sorted by name and combined (`set-cookie` stays
+    // one pair per value).
+    const H_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+    const hErr = (op, what) => __pt_mkErr(TypeError, (op ? "Failed to execute '" + op + "' on 'Headers': " : "Failed to construct 'Headers': ") + what);
+    const hName = (k, op) => { const n = String(k); if (!H_NAME.test(n)) throw hErr(op, 'Invalid name'); return __s_toLowerCase(n); };
+    const H_EDGE = /^[\t\n\r ]|[\t\n\r ]$/, H_BAD = /[\0\n\r]/;
+    const hValue = (v, op) => {
+      let t = String(v);
+      if (H_EDGE.test(t)) t = __s_replace(t, /^[\t\n\r ]+|[\t\n\r ]+$/g, '');
+      if (H_BAD.test(t)) throw hErr(op, 'Invalid value');
+      return t;
+    };
+    const sorted = (l) => {
+      const names = [];
+      for (const [n] of l) if (!names.includes(n)) names.push(n);
+      names.sort((x, y) => (x < y ? -1 : x > y ? 1 : 0));
+      const out = [];
+      for (const n of names) {
+        if (n === 'set-cookie') { for (const [k, v] of l) if (k === n) out.push([n, v]); continue; }
+        const vs = [];
+        for (const [k, v] of l) if (k === n) vs.push(v);
+        out.push([n, vs.join(', ')]);
+      }
+      return out;
+    };
+    // Sorted once per change of the list.
+    const SORTED = new WeakMap();
+    const sortedOf = (h) => {
+      const c = SORTED.get(h);
+      if (c && c.v === h.__hv) return c.l;
+      const l = sorted(h.__h);
+      SORTED.set(h, { v: h.__hv, l });
+      return l;
+    };
     globalThis.Headers = class Headers {
       constructor(init) {
-        Object.defineProperty(this, '__h', { value: new Map(), enumerable: false });
-        if (init) {
-          const put = (k, v) => this.append(k, v);
-          if (typeof init.forEach === 'function' && !Array.isArray(init)) init.forEach((v, k) => put(k, v));
-          else if (Array.isArray(init)) for (const [k, v] of init) put(k, v);
-          else for (const k of Object.keys(init)) put(k, init[k]);
+        Object.defineProperty(this, '__h', { value: [], enumerable: false });
+        Object.defineProperty(this, '__hv', { value: 0, writable: true, enumerable: false });
+        if (init === undefined) return;
+        if (init === null || (typeof init !== 'object' && typeof init !== 'function')) {
+          throw hErr(null, "The provided value is not of type '(record<ByteString, ByteString> or sequence<sequence<ByteString>>)'.");
+        }
+        if (typeof init[Symbol.iterator] === 'function') {
+          for (const pair of init) {
+            const p = pair !== null && typeof pair === 'object' && typeof pair[Symbol.iterator] === 'function' ? [...pair] : null;
+            if (!p || p.length !== 2) throw hErr(null, 'Invalid value');
+            this.__h.push([hName(p[0], null), hValue(p[1], null)]);
+          }
+        } else {
+          for (const k of Object.keys(init)) this.__h.push([hName(k, null), hValue(init[k], null)]);
         }
       }
-      append(k, v) {
-        const key = __s_toLowerCase(String(k)), cur = this.__h.get(key);
-        this.__h.set(key, cur === undefined ? String(v) : cur + ', ' + String(v));
+      append(k, v) { this.__h.push([hName(k, 'append'), hValue(v, 'append')]); this.__hv++; }
+      set(k, v) {
+        const n = hName(k, 'set'), val = hValue(v, 'set'), l = this.__h;
+        let at = -1;
+        for (let i = 0; i < l.length; i++) if (l[i][0] === n) { at = i; break; }
+        this.__hv++;
+        if (at < 0) { l.push([n, val]); return; }
+        l[at] = [n, val];
+        for (let i = l.length - 1; i > at; i--) if (l[i][0] === n) l.splice(i, 1);
       }
-      set(k, v) { this.__h.set(__s_toLowerCase(String(k)), String(v)); }
-      get(k) { const v = this.__h.get(__s_toLowerCase(String(k))); return v === undefined ? null : v; }
-      has(k) { return this.__h.has(__s_toLowerCase(String(k))); }
-      delete(k) { this.__h.delete(__s_toLowerCase(String(k))); }
-      forEach(fn, thisArg) { for (const [k, v] of this.__h) fn.call(thisArg, v, k, this); }
-      keys() { return this.__h.keys(); }
-      values() { return this.__h.values(); }
-      entries() { return this.__h.entries(); }
-      [Symbol.iterator]() { return this.__h.entries(); }
+      get(k) {
+        const n = hName(k, 'get'), vs = [];
+        for (const [x, v] of this.__h) if (x === n) vs.push(v);
+        return vs.length ? vs.join(', ') : null;
+      }
+      getSetCookie() { const out = []; for (const [x, v] of this.__h) if (x === 'set-cookie') out.push(v); return out; }
+      has(k) { const n = hName(k, 'has'); return this.__h.some((p) => p[0] === n); }
+      delete(k) { const n = hName(k, 'delete'), l = this.__h; for (let i = l.length - 1; i >= 0; i--) if (l[i][0] === n) l.splice(i, 1); this.__hv++; }
+      forEach(fn, thisArg) {
+        if (typeof fn !== 'function') throw __pt_mkErr(TypeError, "Failed to execute 'forEach' on 'Headers': The callback provided as parameter 1 is not a function.");
+        for (let i = 0; ; i++) { const l = sortedOf(this); if (i >= l.length) break; fn.call(thisArg, l[i][1], l[i][0], this); }
+      }
+      keys() { return __pt_pairIter('Headers', () => sortedOf(this), 1); }
+      values() { return __pt_pairIter('Headers', () => sortedOf(this), 2); }
+      entries() { return __pt_pairIter('Headers', () => sortedOf(this), 0); }
     };
+    Object.defineProperty(Headers.prototype, Symbol.iterator, { value: Headers.prototype.entries, writable: true, enumerable: false, configurable: true });
   }
   // ---- Streams, Request and Response, as Chrome has them ------------------
   // Streams follow the WHATWG algorithms: a queue measured against the
@@ -14420,7 +14509,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
   }
   if (!globalThis.FormData) {
-    globalThis.FormData = class FormData { constructor() { this.__ptD = []; } append(k, v, f) { this.__ptD.push(f === undefined ? [String(k), v] : [String(k), v, String(f)]); } set(k, v, f) { this.delete(k); this.append(k, v, f); } get(k) { const e = this.__ptD.find((x) => x[0] === k); return e ? e[1] : null; } getAll(k) { return this.__ptD.filter((x) => x[0] === k).map((x) => x[1]); } has(k) { return this.__ptD.some((x) => x[0] === k); } delete(k) { this.__ptD = this.__ptD.filter((x) => x[0] !== k); } forEach(f) { for (const [k, v] of this.__ptD) f(v, k, this); } keys() { return this.__ptD.map((x) => x[0])[Symbol.iterator](); } values() { return this.__ptD.map((x) => x[1])[Symbol.iterator](); } entries() { return this.__ptD.map((x) => [x[0], x[1]])[Symbol.iterator](); } [Symbol.iterator]() { return this.entries(); } toString() { return this.__ptD.map(([k, v]) => k + '=' + v).join('&'); } };
+    globalThis.FormData = class FormData { constructor() { this.__ptD = []; } append(k, v, f) { this.__ptD.push(f === undefined ? [String(k), v] : [String(k), v, String(f)]); } set(k, v, f) { this.delete(k); this.append(k, v, f); } get(k) { const e = this.__ptD.find((x) => x[0] === k); return e ? e[1] : null; } getAll(k) { return this.__ptD.filter((x) => x[0] === k).map((x) => x[1]); } has(k) { return this.__ptD.some((x) => x[0] === k); } delete(k) { this.__ptD = this.__ptD.filter((x) => x[0] !== k); } forEach(f) { for (const [k, v] of this.__ptD) f(v, k, this); } keys() { return __pt_pairIter('FormData', () => this.__ptD, 1); } values() { return __pt_pairIter('FormData', () => this.__ptD, 2); } entries() { return __pt_pairIter('FormData', () => this.__ptD, 0); } toString() { return this.__ptD.map(([k, v]) => k + '=' + v).join('&'); } };
+    Object.defineProperty(FormData.prototype, Symbol.iterator, { value: FormData.prototype.entries, writable: true, enumerable: false, configurable: true });
   }
 
   // Params owned by a URL (`url.searchParams`) rewrite its query when edited;
@@ -14428,27 +14518,107 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   const PARAMS_OWNER = new WeakMap();
   const syncOwner = (p) => { const st = PARAMS_OWNER.get(p); if (!st) return; const q = p.toString(); st.query = q ? '?' + q : ''; };
   if (!globalThis.URLSearchParams) {
-    globalThis.URLSearchParams = class URLSearchParams {
-      constructor(init) { this.__ptD = [];
-        if (typeof init === 'string') { __s_split(__s_replace(init, /^[?]/, ''), '&').forEach((p) => { if (!p) return; const i = __s_indexOf(p, '='); const k = decodeURIComponent(i < 0 ? p : __s_slice(p, 0, i)); const v = i < 0 ? '' : decodeURIComponent(__s_replace(__s_slice(p, i + 1), /[+]/g, ' ')); this.__ptD.push([k, v]); }); }
-        else if (init && typeof init === 'object') { for (const k in init) this.__ptD.push([k, String(init[k])]); } }
-      get(k) { const e = this.__ptD.find((x) => x[0] === k); return e ? e[1] : null; }
-      getAll(k) { return this.__ptD.filter((x) => x[0] === k).map((x) => x[1]); }
-      has(k) { return this.__ptD.some((x) => x[0] === k); }
-      set(k, v) { const e = this.__ptD.find((x) => x[0] === k); if (e) e[1] = String(v); else this.__ptD.push([k, String(v)]); syncOwner(this); }
-      append(k, v) { this.__ptD.push([k, String(v)]); syncOwner(this); }
-      delete(k) { this.__ptD = this.__ptD.filter((x) => x[0] !== k); syncOwner(this); }
-      forEach(f) { for (const [k, v] of this.__ptD) f(v, k, this); }
-      keys() { return this.__ptD.map((x) => x[0])[Symbol.iterator](); }
-      values() { return this.__ptD.map((x) => x[1])[Symbol.iterator](); }
-      entries() { return this.__ptD.map((x) => [x[0], x[1]])[Symbol.iterator](); }
-      // The browser provides iteration and count on the object itself:
-      // `[...params]` and `params.size` are common on any page.
-      [Symbol.iterator]() { return this.entries(); }
-      get size() { return this.__ptD.length; }
-      sort() { this.__ptD.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); syncOwner(this); }
-      toString() { return this.__ptD.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&'); }
+    // application/x-www-form-urlencoded, as the URL Standard has it: `+` is
+    // a space, bad percent escapes stay as written, bytes are UTF-8 with
+    // replacement; written back with only alphanumerics and `*-._` kept and
+    // a space as `+`.
+    // Fast paths: most names and values are plain ASCII.
+    const SURR = /[\ud800-\udfff]/, PLAIN = /^[A-Za-z0-9*\-._]*$/;
+    const wellFormed = (t) => {
+      t = String(t);
+      return SURR.test(t) ? __s_replace(t, /[\ud800-\udbff](?![\udc00-\udfff])|(?:^|[^\ud800-\udbff])[\udc00-\udfff]/g, (m) => (m.length === 2 ? m[0] + '\ufffd' : '\ufffd')) : t;
     };
+    const ODD = /[!'()~]/, ODD_ALL = /[!'()~]/g;
+    const formEncode = (t) => {
+      if (PLAIN.test(t)) return t;
+      let e = encodeURIComponent(t);
+      if (__s_indexOf(e, '%20') >= 0) e = __s_replace(e, /%20/g, '+');
+      return ODD.test(e) ? __s_replace(e, ODD_ALL, (c) => '%' + __s_toUpperCase(__s_charCodeAt(c, 0).toString(16))) : e;
+    };
+    const utf8Out = (bytes) => {
+      if (globalThis.TextDecoder) { try { return new globalThis.TextDecoder().decode(new Uint8Array(bytes)); } catch (e) {} }
+      return String.fromCharCode(...bytes);
+    };
+    const formDecode = (t) => {
+      t = __s_replace(t, /[+]/g, ' ');
+      if (__s_indexOf(t, '%') < 0) return t;
+      try { return decodeURIComponent(t); } catch (e) {}
+      const bytes = [];
+      const enc = globalThis.TextEncoder ? new globalThis.TextEncoder() : null;
+      for (let i = 0; i < t.length;) {
+        if (t[i] === '%' && /^[0-9a-fA-F]{2}$/.test(__s_slice(t, i + 1, i + 3))) { bytes.push(parseInt(__s_slice(t, i + 1, i + 3), 16)); i += 3; continue; }
+        const cp = __s_codePointAt(t, i), ch = String.fromCodePoint(cp);
+        if (enc) for (const b of enc.encode(ch)) bytes.push(b); else bytes.push(cp & 255);
+        i += ch.length;
+      }
+      return utf8Out(bytes);
+    };
+    const formParse = (q) => {
+      const out = [];
+      for (const part of __s_split(q, '&')) {
+        if (!part) continue;
+        const i = __s_indexOf(part, '=');
+        out.push([formDecode(i < 0 ? part : __s_slice(part, 0, i)), formDecode(i < 0 ? '' : __s_slice(part, i + 1))]);
+      }
+      return out;
+    };
+    const uspErr = (what) => __pt_mkErr(TypeError, "Failed to construct 'URLSearchParams': " + what);
+    globalThis.URLSearchParams = class URLSearchParams {
+      constructor(init) {
+        this.__ptD = [];
+        if (init === undefined) return;
+        if (init !== null && (typeof init === 'object' || typeof init === 'function')) {
+          if (typeof init[Symbol.iterator] === 'function') {
+            for (const pair of init) {
+              const p = pair !== null && typeof pair === 'object' && typeof pair[Symbol.iterator] === 'function' ? [...pair] : null;
+              if (!p || p.length !== 2) throw uspErr("Failed to construct 'URLSearchParams': Sequence initializer must only contain pair elements");
+              this.__ptD.push([wellFormed(p[0]), wellFormed(p[1])]);
+            }
+          } else {
+            for (const k of Object.keys(init)) this.__ptD.push([wellFormed(k), wellFormed(init[k])]);
+          }
+          return;
+        }
+        const q = wellFormed(init);
+        this.__ptD = formParse(__s_charCodeAt(q, 0) === 63 ? __s_slice(q, 1) : q);
+      }
+      get(k) { k = wellFormed(k); const e = this.__ptD.find((x) => x[0] === k); return e ? e[1] : null; }
+      getAll(k) { k = wellFormed(k); return this.__ptD.filter((x) => x[0] === k).map((x) => x[1]); }
+      has(k, v) { k = wellFormed(k); const w = v === undefined ? undefined : wellFormed(v); return this.__ptD.some((x) => x[0] === k && (w === undefined || x[1] === w)); }
+      set(k, v) {
+        k = wellFormed(k); v = wellFormed(v);
+        const l = this.__ptD;
+        let at = -1;
+        for (let i = 0; i < l.length; i++) if (l[i][0] === k) { at = i; break; }
+        if (at < 0) l.push([k, v]);
+        else { l[at] = [k, v]; for (let i = l.length - 1; i > at; i--) if (l[i][0] === k) l.splice(i, 1); }
+        syncOwner(this);
+      }
+      append(k, v) { this.__ptD.push([wellFormed(k), wellFormed(v)]); syncOwner(this); }
+      delete(k, v) {
+        k = wellFormed(k);
+        const w = v === undefined ? undefined : wellFormed(v), l = this.__ptD;
+        for (let i = l.length - 1; i >= 0; i--) if (l[i][0] === k && (w === undefined || l[i][1] === w)) l.splice(i, 1);
+        syncOwner(this);
+      }
+      forEach(f, thisArg) {
+        if (typeof f !== 'function') throw __pt_mkErr(TypeError, "Failed to execute 'forEach' on 'URLSearchParams': The callback provided as parameter 1 is not a function.");
+        for (let i = 0; i < this.__ptD.length; i++) f.call(thisArg, this.__ptD[i][1], this.__ptD[i][0], this);
+      }
+      keys() { return __pt_pairIter('URLSearchParams', () => this.__ptD, 1); }
+      values() { return __pt_pairIter('URLSearchParams', () => this.__ptD, 2); }
+      entries() { return __pt_pairIter('URLSearchParams', () => this.__ptD, 0); }
+      get size() { return this.__ptD.length; }
+      // By name in code units, stable.
+      sort() {
+        const keyed = this.__ptD.map((p, i) => [p, i]);
+        keyed.sort((a, b) => (a[0][0] < b[0][0] ? -1 : a[0][0] > b[0][0] ? 1 : a[1] - b[1]));
+        this.__ptD = keyed.map((x) => x[0]);
+        syncOwner(this);
+      }
+      toString() { return this.__ptD.map(([k, v]) => formEncode(k) + '=' + formEncode(v)).join('&'); }
+    };
+    Object.defineProperty(URLSearchParams.prototype, Symbol.iterator, { value: URLSearchParams.prototype.entries, writable: true, enumerable: false, configurable: true });
   }
   if (!globalThis.URL || !globalThis.URL.prototype || !('searchParams' in (globalThis.URL.prototype || {}))) {
     const parse = (s) => { const m = /^([a-zA-Z][a-zA-Z0-9+.-]*:)?([/][/]([^/?#]*))?([^?#]*)([?][^#]*)?([#].*)?$/.exec(String(s)) || []; return { protocol: m[1] || '', authority: m[3] || '', path: m[4] || '', search: m[5] || '', hash: m[6] || '' }; };

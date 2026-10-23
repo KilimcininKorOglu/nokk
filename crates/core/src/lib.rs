@@ -12463,6 +12463,92 @@ body { margin: 0; font-family: sans-serif; }
         assert_eq!(ctx.evaluate("document.cookie").await.unwrap(), Value::String("js=v".into()));
     }
 
+    // URLSearchParams serializes and parses as the URL Standard has it (a
+    // space is `+`, bad escapes stay), takes pairs, records and other params
+    // and the two-argument delete/has; Headers sort and combine, keep
+    // set-cookie apart and refuse bad names; their iterators and FormData's
+    // are Chrome's "X Iterator" objects and live, NodeList and DOMTokenList
+    // iterate with Array.prototype's own functions; attributes in a namespace
+    // (parsed in SVG, or set with setAttributeNS) answer their namespace,
+    // prefix and local name. Every value read in Chrome 151 on this page.
+    #[tokio::test]
+    async fn url_params_headers_iterators_and_namespaced_attributes_match_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<!doctype html><meta charset=utf-8><body class=\"a b\"><p>x</p><p>y</p></body>\n").await.unwrap();
+        let out = ctx.evaluate(r##"(() => {
+  const o = [];
+  const t = (f) => { try { return String(f()); } catch (e) { return 'ERR ' + e.name + ': ' + e.message; } };
+  const tag = (x) => Object.prototype.toString.call(x);
+  o.push(t(() => new URLSearchParams({ a: 'x y', b: "!'()~*-._", c: 'é€', d: 'a+b&c=d%' })));
+  o.push(t(() => [...new URLSearchParams('?a=1+2&b=%zz&c=%E2%82%AC&f=%C3&&g+h=i%20j')].map((x) => x.join('=')).join('|')));
+  o.push(t(() => new URLSearchParams([['a', '1'], ['b', '2']]) + ' ' + new URLSearchParams(new Map([['m', '1']])) + ' ' + new URLSearchParams(null)));
+  o.push(t(() => new URLSearchParams([['a']])));
+  o.push(t(() => { const p = new URLSearchParams('a=1&a=2&b=3'); p.delete('a', '2'); return p + ' ' + p.has('a', '1') + ' ' + p.has('a', '2'); }));
+  o.push(t(() => { const u = new URL('https://e.com/'); u.searchParams.append('k', 'a b+c'); return u.href; }));
+  o.push(t(() => { const h = new Headers({ B: '2', a: ' 1 ', 'Set-Cookie': 'x=1' }); h.append('set-cookie', 'y=2'); h.append('b', '3'); return JSON.stringify([...h]) + ' ' + JSON.stringify(h.getSetCookie()); }));
+  o.push(t(() => new Headers({ 'bad name': '1' })));
+  o.push(t(() => new Headers(5)));
+  for (const [n, it] of [['p', new URLSearchParams('a=1').entries()], ['h', new Headers({ a: '1' }).keys()], ['f', new FormData().values()],
+    ['nl', document.body.childNodes.values()], ['dt', document.body.classList.entries()]]) {
+    const P = Object.getPrototypeOf(it);
+    o.push(n + ' ' + tag(it) + ' ' + Object.getOwnPropertyDescriptor(P, 'next').enumerable + ' ' + JSON.stringify(it.next()));
+  }
+  o.push(t(() => { const p = new URLSearchParams('a=1'); const it = p.keys(); it.next(); p.append('b', '2'); return JSON.stringify([...it]); }));
+  o.push(t(() => Object.getPrototypeOf(new Headers().entries()).next.call({})));
+  o.push([NodeList.prototype.forEach === Array.prototype.forEach, DOMTokenList.prototype.values === Array.prototype.values, document.body.classList[Symbol.iterator] === Array.prototype.values].join(' '));
+  o.push(t(() => { const l = document.body.childNodes; const it = l.values(); it.next(); document.body.append(document.createElement('i')); return [...it].map((n) => n.nodeName).join(','); }));
+  o.push(t(() => { const c = document.body.classList; const r = []; for (const x of c) { r.push(x); if (x === 'a') document.body.className = 'a q z'; } return r.join(','); }));
+  const X = 'http://www.w3.org/1999/xlink';
+  const d = document.createElement('div');
+  d.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="' + X + '"><use xlink:href="#a"/></svg><p xmlns="y"></p>';
+  for (const e of d.querySelectorAll('*')) for (const a of e.attributes) o.push(e.localName + ' ' + [a.name, a.prefix, a.localName, a.namespaceURI].join('|'));
+  o.push(d.innerHTML);
+  const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  o.push(t(() => { s.setAttributeNS(X, 'xlink:href', '#a'); s.setAttributeNS(X, 'other:href', '#b'); s.setAttributeNS(null, 'Foo', '1');
+    return [...s.attributes].map((a) => a.name + '|' + a.prefix + '|' + a.namespaceURI + '|' + a.value).join(' ') + ' ' + s.getAttributeNS(X, 'href') + ' ' + s.hasAttributeNS(null, 'Foo') + ' ' + s.outerHTML; }));
+  o.push(t(() => { s.removeAttributeNS(X, 'href'); return s.attributes.length + ' ' + s.getAttributeNodeNS(null, 'Foo').name + ' ' + [...s.cloneNode().attributes].map((a) => a.name).join(','); }));
+  o.push(t(() => s.setAttributeNS(null, 'a:b', '1')));
+  o.push(t(() => s.setAttributeNS(X, 'xmlns', '1')));
+  o.push(t(() => s.setAttributeNS(X, 'a b', '1')));
+  o.push(t(() => s.setAttributeNS(X, 'a:', '1')));
+  o.push(t(() => { const m = new MutationObserver(() => {}); const e = document.createElement('div'); m.observe(e, { attributes: true }); e.setAttributeNS(X, 'xlink:href', '1'); e.removeAttributeNS(X, 'href'); return m.takeRecords().map((r) => r.attributeName + '|' + r.attributeNamespace).join(' '); }));
+  return o.join('\n');
+})()"##).await.unwrap();
+        assert_eq!(out, Value::String("a=x+y&b=%21%27%28%29%7E*-._&c=%C3%A9%E2%82%AC&d=a%2Bb%26c%3Dd%25
+a=1 2|b=%zz|c=€|f=�|g h=i j
+a=1&b=2 m=1 null=
+ERR TypeError: Failed to construct 'URLSearchParams': Failed to construct 'URLSearchParams': Sequence initializer must only contain pair elements
+a=1&b=3 true false
+https://e.com/?k=a+b%2Bc
+[[\"a\",\"1\"],[\"b\",\"2, 3\"],[\"set-cookie\",\"x=1\"],[\"set-cookie\",\"y=2\"]] [\"x=1\",\"y=2\"]
+ERR TypeError: Failed to construct 'Headers': Invalid name
+ERR TypeError: Failed to construct 'Headers': The provided value is not of type '(record<ByteString, ByteString> or sequence<sequence<ByteString>>)'.
+p [object URLSearchParams Iterator] true {\"done\":false,\"value\":[\"a\",\"1\"]}
+h [object Headers Iterator] true {\"done\":false,\"value\":\"a\"}
+f [object FormData Iterator] true {\"done\":true}
+nl [object Array Iterator] false {\"value\":{},\"done\":false}
+dt [object Array Iterator] false {\"value\":[0,\"a\"],\"done\":false}
+[\"b\"]
+ERR TypeError: Illegal invocation
+true true true
+P,#text,I
+a,q,z
+svg xmlns||xmlns|http://www.w3.org/2000/xmlns/
+svg xmlns:xlink|xmlns|xlink|http://www.w3.org/2000/xmlns/
+use xlink:href|xlink|href|http://www.w3.org/1999/xlink
+p xmlns||xmlns|
+<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\"><use xlink:href=\"#a\"></use></svg><p xmlns=\"y\"></p>
+xlink:href|xlink|http://www.w3.org/1999/xlink|#b Foo|null|null|1 #b true <svg xlink:href=\"#b\" Foo=\"1\"></svg>
+1 Foo Foo
+ERR NamespaceError: Failed to execute 'setAttributeNS' on 'Element': '' is an invalid namespace for attributes.
+ERR NamespaceError: Failed to execute 'setAttributeNS' on 'Element': 'http://www.w3.org/1999/xlink' is an invalid namespace for attributes.
+ERR InvalidCharacterError: Failed to execute 'setAttributeNS' on 'Element': The qualified name provided ('a b') contains the invalid character ' '.
+ERR InvalidCharacterError: Failed to execute 'setAttributeNS' on 'Element': The qualified name provided ('a:') has an empty local name.
+href|http://www.w3.org/1999/xlink href|http://www.w3.org/1999/xlink".into()));
+    }
+
     /// A host that accepts and never answers must not hold the page: in Chrome a hung
     /// stylesheet or fetch blocks nothing an async script or a timer does. Here every
     /// round waited for all its requests, and peet.ws (a dead stylesheet host) sat for
