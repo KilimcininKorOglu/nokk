@@ -1731,7 +1731,7 @@ impl Conn {
                 self.targets[idx].ran_js.store(true, Ordering::Relaxed);
                 tokio::spawn(async move {
                     let ro = match frame {
-                        Some(f) => frame_eval(&ctx, f, &expr, by_value).await,
+                        Some(f) => frame_eval(&ctx, f, &expr, by_value, await_promise).await,
                         None => remote_eval(&ctx, &expr, by_value, await_promise).await,
                     };
                     let _ = tx.send(Message::Text(
@@ -1808,7 +1808,7 @@ impl Conn {
                 self.targets[idx].ran_js.store(true, Ordering::Relaxed);
                 tokio::spawn(async move {
                     let ro = match frame {
-                        Some(f) => frame_eval(&ctx, f, &expr, by_value).await,
+                        Some(f) => frame_eval(&ctx, f, &expr, by_value, await_promise).await,
                         None => remote_eval(&ctx, &expr, by_value, await_promise).await,
                     };
                     let _ = tx.send(Message::Text(
@@ -2115,23 +2115,66 @@ impl Conn {
 /// `Runtime.evaluate` against a frame's own document. Same wrapper as the page
 /// path so the result shape matches; a frame that has gone away answers
 /// `undefined` rather than failing the command, since frames die on their own.
-async fn frame_eval(ctx: &BrowserContext, frame: u32, expr: &str, by_value: bool) -> Value {
+async fn frame_eval(ctx: &BrowserContext, frame: u32, expr: &str, by_value: bool, await_promise: bool) -> Value {
     let by = if by_value { "true" } else { "false" };
     // The expression goes into the script itself, compiled by the engine: an `eval`
     // of the string is what a frame under Trusted Types refuses (Turnstile's is one),
     // and DevTools evaluates there regardless. Statements fall back to `eval`.
-    let inline = format!(
-        "(() => {{ try {{ return JSON.stringify(__pt_wrap((\n{expr}\n), {by})); }} \
-           catch (e) {{ return JSON.stringify(__pt_wrap(String(e), true)); }} }})()"
-    );
-    let via_eval = format!(
-        "(() => {{ try {{ return JSON.stringify(__pt_wrap((0, eval)({}), {by})); }} \
-           catch (e) {{ return JSON.stringify(__pt_wrap(String(e), true)); }} }})()",
-        js_str(expr)
-    );
-    let r = match ctx.evaluate_in_frame(frame, &inline).await {
+    let compiled = format!("(\n{expr}\n)");
+    let evaled = format!("(0, eval)({})", js_str(expr));
+    if await_promise {
+        // As for the page: the settled value lands in a hidden slot of the
+        // frame's global while the loop (frames included) runs.
+        let slot = format!("__pt_cdp{}", IDS.fetch_add(1, Ordering::Relaxed));
+        let setup = |value: &str| {
+            format!(
+                "(() => {{ Object.defineProperty(globalThis, '{slot}', {{ value: {{ done: false, v: undefined }}, configurable: true, enumerable: false, writable: true }}); \
+                   let p; try {{ p = Promise.resolve({value}); }} catch (e) {{ p = Promise.reject(e); }} \
+                   p.then(v => {{ globalThis.{slot}.v = v; globalThis.{slot}.done = true; }}, \
+                          e => {{ globalThis.{slot}.v = String(e); globalThis.{slot}.done = true; }}); }})()"
+            )
+        };
+        let started = match ctx.evaluate_in_frame(frame, &setup(&compiled)).await {
+            Ok(_) => true,
+            Err(_) => ctx.evaluate_in_frame(frame, &setup(&evaled)).await.is_ok(),
+        };
+        if !started {
+            return json!({ "type": "undefined" });
+        }
+        let deadline = std::time::Instant::now() + AWAIT_PROMISE_TIMEOUT;
+        loop {
+            let settled = matches!(
+                ctx.evaluate_in_frame(frame, &format!("String(globalThis.{slot}.done)")).await,
+                Ok(Value::String(ref s)) if s == "true"
+            );
+            if settled || std::time::Instant::now() >= deadline {
+                break;
+            }
+            let _ = ctx.run_event_loop_idle(AWAIT_PROMISE_POLL).await;
+            let nap = ctx
+                .next_timer_in()
+                .unwrap_or(AWAIT_PROMISE_POLL)
+                .clamp(std::time::Duration::from_millis(1), AWAIT_PROMISE_POLL);
+            tokio::time::sleep(nap).await;
+        }
+        let read = format!(
+            "(() => {{ const s = globalThis.{slot}; delete globalThis.{slot}; \
+               return JSON.stringify(__pt_wrap(s && s.done ? s.v : undefined, {by})); }})()"
+        );
+        return match ctx.evaluate_in_frame(frame, &read).await {
+            Ok(Value::String(s)) => serde_json::from_str(&s).unwrap_or(json!({ "type": "undefined" })),
+            _ => json!({ "type": "undefined" }),
+        };
+    }
+    let wrap = |value: &str| {
+        format!(
+            "(() => {{ try {{ return JSON.stringify(__pt_wrap({value}, {by})); }} \
+               catch (e) {{ return JSON.stringify(__pt_wrap(String(e), true)); }} }})()"
+        )
+    };
+    let r = match ctx.evaluate_in_frame(frame, &wrap(&compiled)).await {
         Ok(v) => Ok(v),
-        Err(_) => ctx.evaluate_in_frame(frame, &via_eval).await,
+        Err(_) => ctx.evaluate_in_frame(frame, &wrap(&evaled)).await,
     };
     match r {
         Ok(Value::String(s)) => serde_json::from_str(&s).unwrap_or(json!({ "type": "undefined" })),
@@ -2193,7 +2236,7 @@ async fn remote_eval(
             if settled || std::time::Instant::now() >= deadline {
                 break;
             }
-            let _ = ctx.run_event_loop().await;
+            let _ = ctx.run_event_loop_idle(AWAIT_PROMISE_POLL).await;
             // Nothing runnable this instant: sleep until the page's next timer is
             // due (capped, so a promise settled by I/O is not missed for long).
             let nap = ctx
@@ -2710,6 +2753,52 @@ mod tests {
         assert!(super::parse_proxy_server("ftp://h:1").is_none());
         assert!(super::parse_proxy_server("no-port").is_none());
         assert_eq!(super::parse_proxy_server("http://p.webshare.io:80/").unwrap().port, 80);
+    }
+
+    /// `awaitPromise` with a frame's context waits for the promise, as with the
+    /// page's: it answered `{}` for a pending promise (reCAPTCHA's bframe).
+    #[tokio::test]
+    async fn a_frame_evaluate_awaits_its_promise() {
+        let _s = SERIAL.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let body = if req.starts_with("GET /f") { "<html><body><b>x</b></body></html>" } else { r#"<html><body><iframe src="/f"></iframe></body></html>"# };
+                    let out = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = stream.write_all(out.as_bytes()).await;
+                });
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 4, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&format!("http://{addr}/")).await.unwrap();
+        let mut frame = None;
+        for _ in 0..50 {
+            ctx.run_event_loop().await.unwrap();
+            if let Some(f) = ctx.frame_list().first() {
+                frame = Some(f.id);
+                break;
+            }
+        }
+        let frame = frame.expect("the frame");
+        let expr = "(async () => { await new Promise(r => setTimeout(r, 50)); return document.body.textContent + 'y'; })()";
+        let v = frame_eval(&ctx, frame, expr, true, true).await;
+        assert_eq!(v, json!({ "type": "string", "value": "xy" }));
+        let v = frame_eval(&ctx, frame, "Promise.reject(new Error('no'))", true, true).await;
+        assert_eq!(v["value"], json!("Error: no"));
+        // Without awaitPromise a promise is an object, as in Chrome.
+        assert_eq!(frame_eval(&ctx, frame, expr, true, false).await["type"], json!("object"));
     }
 
     #[tokio::test]

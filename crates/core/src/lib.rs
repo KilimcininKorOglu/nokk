@@ -2213,6 +2213,15 @@ impl BrowserContext {
         self.run_event_loop_waiting(IDLE_WAIT_BUDGET, None).await
     }
 
+    /// [`Self::run_event_loop`] for a caller keeping its own clock (a press
+    /// pausing 8 ms between pointer moves, a driver polling a promise): the
+    /// call returns within about `within`, work left queued for the next one.
+    /// reCAPTCHA's frames always have a timer pending and a frame with work, and
+    /// each such pump ran 150 ms to over a second, so a press took 5-10 s.
+    pub async fn run_event_loop_idle(&self, within: std::time::Duration) -> Result<u32, EngineError> {
+        self.run_event_loop_core(within.min(IDLE_WAIT_BUDGET), None, Some(within)).await
+    }
+
     /// [`Self::run_event_loop`] with a longer patience for timers, used while a
     /// document is loading: work deferred by a few hundred milliseconds is still
     /// part of the load, and a caller that just navigated is waiting anyway.
@@ -2229,6 +2238,16 @@ impl BrowserContext {
         &self,
         idle_wait: std::time::Duration,
         until: Option<&str>,
+    ) -> Result<u32, EngineError> {
+        self.run_event_loop_core(idle_wait, until, None).await
+    }
+
+    /// The loop itself; `within` cuts the whole call shorter than the budget.
+    async fn run_event_loop_core(
+        &self,
+        idle_wait: std::time::Duration,
+        until: Option<&str>,
+        within: Option<std::time::Duration>,
     ) -> Result<u32, EngineError> {
         const TIMER_CAP: u32 = 10_000;
         const MAX_FETCHES: usize = 200;
@@ -2248,7 +2267,8 @@ impl BrowserContext {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(3_000);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+        let budget = std::time::Duration::from_millis(budget_ms);
+        let deadline = std::time::Instant::now() + within.map_or(budget, |w| w.min(budget));
         let index = self.idx();
         let base = self.base_url.lock().map(|b| b.clone()).unwrap_or_default();
 
@@ -2996,11 +3016,11 @@ impl BrowserContext {
     /// not a pause a page can feel — its timers would all fire at the far end.
     async fn settle(&self, how_long: std::time::Duration) {
         let until = std::time::Instant::now() + how_long;
-        while std::time::Instant::now() < until {
+        while let Some(left) = until.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero()) {
             // While the page is busy sleep 0.5 ms between pumps, not 5: a browser's 1 ms timer
             // fires after 1 ms (we got 3, and 5 instead of 4 for nested ones). Frame rate and
             // nested-timer clamping are common engine probes.
-            let worked = self.run_event_loop().await.unwrap_or(0);
+            let worked = self.run_event_loop_idle(left).await.unwrap_or(0);
             let nap = if worked > 0 { 500 } else { 5_000 };
             tokio::time::sleep(std::time::Duration::from_micros(nap)).await;
         }
@@ -11628,6 +11648,80 @@ body { margin: 0; font-family: sans-serif; }
         let out = probe(&ctx, "__ptJSON.stringify({ L, E })").await;
         assert_eq!(out["L"], serde_json::json!([]), "{out}");
         assert_eq!(out["E"], serde_json::json!(["sync", "error,false,false,true"]), "{out}");
+    }
+
+    /// `el.attributes` is one live NamedNodeMap with a read-only Attr per index
+    /// (enumerable) and per name (not), and one Attr per attribute shared with
+    /// getAttributeNode; reCAPTCHA's grid images read `img.attributes.src.value`.
+    /// currentSrc is the address of the image's request: at once for markup,
+    /// from the next task for a script's src, gone with the attribute, taken
+    /// from srcset when there is one. Expected values from Chrome 151.
+    #[tokio::test]
+    async fn attributes_by_name_attr_nodes_and_current_src_answer_as_in_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><body><img id="i" src="p.gif" data-x="1" length="5"><img id="b" srcset="w.png 640w, x2.png 2x, x1.png 1x"><svg id="s" viewBox="0 0 1 1"></svg><script>
+              const R = globalThis.R = {};
+              const i = document.getElementById('i'), a = i.attributes;
+              R.same = a === i.attributes;
+              R.src = [a.src.value, a.src === a.getNamedItem('src'), a.src === i.getAttributeNode('src'), i.getAttributeNode('nope')];
+              R.len = [a.length, typeof a.item];
+              R.keys = Object.keys(a).join();
+              R.d = [Object.getOwnPropertyDescriptor(a, 'src').enumerable, Object.getOwnPropertyDescriptor(a, 'src').writable, Object.getOwnPropertyDescriptor(a, '0').enumerable];
+              const n = i.getAttributeNode('data-x');
+              i.setAttribute('data-x', '2'); i.setAttribute('alt', 'A');
+              R.live = [n.value, a.length, a.alt.value];
+              i.removeAttribute('data-x');
+              R.gone = [n.value, n.ownerElement, a['data-x'], a.length];
+              R.svg = [!!document.getElementById('s').attributes.viewBox, !!document.getElementById('s').attributes.viewbox];
+              R.cur = [i.currentSrc, document.getElementById('b').currentSrc];
+              const m = new Image(); m.src = 'q.png'; R.sync = m.currentSrc;
+              setTimeout(() => { R.task = m.currentSrc; m.removeAttribute('src'); R.removed = m.currentSrc; }, 0);
+            </script></body></html>"#,
+        )
+        .await
+        .unwrap();
+        ctx.run_event_loop().await.unwrap();
+        let out = probe(&ctx, "__ptJSON.stringify(R)").await;
+        assert_eq!(out["same"], true, "{out}");
+        assert_eq!(out["src"], serde_json::json!(["p.gif", true, true, null]), "{out}");
+        assert_eq!(out["len"], serde_json::json!([4, "function"]), "a member of the prototype wins: {out}");
+        assert_eq!(out["keys"], "0,1,2,3", "{out}");
+        assert_eq!(out["d"], serde_json::json!([false, false, true]), "{out}");
+        assert_eq!(out["live"], serde_json::json!(["2", 5, "A"]), "{out}");
+        assert_eq!(out["gone"], serde_json::json!(["2", null, null, 4]), "{out}");
+        assert_eq!(out["svg"], serde_json::json!([true, false]), "{out}");
+        assert_eq!(out["cur"], serde_json::json!(["https://example.com/p.gif", "https://example.com/x1.png"]), "{out}");
+        assert_eq!(out["sync"], "", "{out}");
+        assert_eq!(out["task"], "https://example.com/q.png", "{out}");
+        assert_eq!(out["removed"], "", "{out}");
+    }
+
+    /// A caller pumping on its own clock gets the loop back in about that time,
+    /// even when a frame always has work and a timer is always pending (a
+    /// reCAPTCHA frame); run_event_loop ran 150 ms to a second each time.
+    #[tokio::test]
+    async fn a_bounded_pump_returns_on_time_beside_a_busy_frame() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><body><iframe srcdoc="<script>setInterval(() => { const t = performance.now(); while (performance.now() - t < 2) {} }, 3);</script>"></iframe><script>setInterval(() => {}, 40);</script></body></html>"#,
+        )
+        .await
+        .unwrap();
+        ctx.run_event_loop().await.unwrap();
+        let mut worst = std::time::Duration::ZERO;
+        for _ in 0..10 {
+            let t = std::time::Instant::now();
+            ctx.run_event_loop_idle(std::time::Duration::from_millis(10)).await.unwrap();
+            worst = worst.max(t.elapsed());
+        }
+        assert!(worst < std::time::Duration::from_millis(80), "a 10 ms pump took {worst:?}");
     }
 
     /// A page-inserted script sees itself as in a browser: `document.currentScript` is

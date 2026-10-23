@@ -455,28 +455,94 @@
     get localName() { const i = __attrNsOf(this.__ptOwner, this.__ptName); return i ? i[2] : this.__ptName; },
     get name() { return this.__ptName; },
     get nodeName() { return this.__ptName; },
-    get value() { return this.__ptValue; },
-    get nodeValue() { return this.__ptValue; },
-    get textContent() { return this.__ptValue; },
+    get value() { return __attrValue(this); },
+    get nodeValue() { return __attrValue(this); },
+    get textContent() { return __attrValue(this); },
     get namespaceURI() { const i = __attrNsOf(this.__ptOwner, this.__ptName); return i ? i[0] : null; },
     get prefix() { const i = __attrNsOf(this.__ptOwner, this.__ptName); return i ? i[1] : null; },
     get specified() { return true; },
     get ownerElement() { return this.__ptOwner; },
   };
+  // The image a browser at this device pixel ratio picks: from srcset (density
+  // `x`, or width `w` against the viewport width as `sizes` defaults to
+  // 100vw), the smallest density not below the ratio, else the largest; src
+  // counts as 1x when srcset has no 1x.
+  function __imgSource(el) {
+    const src = __ptGetA(el, 'src') || '';
+    const set = __ptGetA(el, 'srcset');
+    if (!set) return src;
+    const vw = (globalThis.innerWidth | 0) || 1, dpr = globalThis.devicePixelRatio || 1;
+    const cands = [];
+    let i = 0;
+    const n = set.length;
+    while (i < n) {
+      while (i < n && /[\s,]/.test(set[i])) i++;
+      if (i >= n) break;
+      let j = i;
+      while (j < n && !/\s/.test(set[j])) j++;
+      let url = __s_slice(set, i, j), desc = '';
+      if (/,$/.test(url)) url = __s_replace(url, /,+$/, '');
+      else {
+        let k = j;
+        while (k < n && set[k] !== ',') k++;
+        desc = __s_trim(__s_slice(set, j, k));
+        j = k;
+      }
+      i = j;
+      const m = /^(\d*\.?\d+)([xw])$/i.exec(desc);
+      const d = !desc ? 1 : m ? (__s_toLowerCase(m[2]) === 'x' ? +m[1] : +m[1] / vw) : NaN;
+      if (url && d > 0) cands.push([url, d]);
+    }
+    if (src && !cands.some((c) => c[1] === 1)) cands.push([src, 1]);
+    if (!cands.length) return src;
+    let best = null;
+    for (const c of cands) if (c[1] >= dpr && (!best || c[1] < best[1])) best = c;
+    if (!best) for (const c of cands) if (!best || c[1] > best[1]) best = c;
+    return best[0];
+  }
+  function __imgCurrent(el, url, later) {
+    Object.defineProperty(el, '__ptCurWant', { value: url, writable: true, configurable: true, enumerable: false });
+    const put = () => { if (el.__ptCurWant === url) Object.defineProperty(el, '__ptCurSrc', { value: url, writable: true, configurable: true, enumerable: false }); };
+    if (later) __ptLater(put, 0); else put();
+  }
+  // An attached Attr reads its element's current value; a removed one keeps
+  // the last value it had.
+  const __attrValue = (a) => {
+    const o = a.__ptOwner;
+    if (o && o.__ptAttrs.has(a.__ptName)) return o.__ptAttrs.get(a.__ptName);
+    return a.__ptValue;
+  };
   function __attr(el, name, value) {
     const a = Object.create(__link('Attr', __attrProto));
     Object.defineProperty(a, '__ptName', { value: name });
-    Object.defineProperty(a, '__ptValue', { value: value });
-    Object.defineProperty(a, '__ptOwner', { value: el });
+    Object.defineProperty(a, '__ptValue', { value: value, writable: true });
+    Object.defineProperty(a, '__ptOwner', { value: el, writable: true });
+    return a;
+  }
+  // One Attr per attribute while it is on its element, as in Chrome:
+  // `el.attributes.src === el.getAttributeNode('src')`.
+  function __attrNode(el, name) {
+    let m = el.__ptAttrNodes;
+    if (!m) { m = new Map(); Object.defineProperty(el, '__ptAttrNodes', { value: m }); }
+    let a = m.get(name);
+    if (!a) { a = __attr(el, name, el.__ptAttrs.get(name)); m.set(name, a); }
+    return a;
+  }
+  // An attribute went away: its Attr is detached with its last value.
+  function __attrDetach(el, name, old) {
+    const m = el.__ptAttrNodes, a = m && m.get(name);
+    if (!a) return null;
+    m.delete(name);
+    a.__ptValue = old;
+    a.__ptOwner = null;
     return a;
   }
   const __namedNodeMapProto = {
     get [Symbol.toStringTag]() { return 'NamedNodeMap'; },
     get length() { return this.__ptLen | 0; },
     item(i) { return this[i] != null ? this[i] : null; },
-    getNamedItem(n) { const k = __s_toLowerCase(String(n));
-      for (let i = 0; i < this.length; i++) if (this[i].name === k) return this[i];
-      return null; },
+    getNamedItem(n) { const el = this.__ptOwner, k = __attrName(el, n);
+      return el.__ptAttrs.has(k) ? __attrNode(el, k) : null; },
     getNamedItemNS(_ns, n) { return this.getNamedItem(n); },
     setNamedItem(a) { if (a && this.__ptOwner) __ptSetA(this.__ptOwner, a.name, a.value); return null; },
     setNamedItemNS(a) { return this.setNamedItem(a); },
@@ -487,13 +553,38 @@
     [Symbol.iterator]() { let i = 0; const self = this;
       return { next: () => i < self.length ? { value: self[i++], done: false } : { value: undefined, done: true } }; },
   };
+  // `el.attributes` is one live map per element. Chrome's has an index per
+  // attribute (enumerable) and a property per name (not enumerable; skipped
+  // where the prototype has a member of that name, and for an HTML element
+  // names with capitals); all read-only. reCAPTCHA reads `img.attributes.src`.
   function __namedNodeMap(el) {
-    const map = Object.create(__link('NamedNodeMap', __namedNodeMapProto));
-    let i = 0;
-    for (const [name, value] of el.__ptAttrs) map[i++] = __attr(el, name, value);
-    Object.defineProperty(map, '__ptLen', { value: i, enumerable: false, configurable: true });
-    Object.defineProperty(map, '__ptOwner', { value: el });
+    let map = el.__ptAttrMap;
+    if (!map) {
+      map = Object.create(__link('NamedNodeMap', __namedNodeMapProto));
+      Object.defineProperty(map, '__ptOwner', { value: el });
+      Object.defineProperty(el, '__ptAttrMap', { value: map });
+    }
+    __attrMapSync(el);
     return map;
+  }
+  function __attrMapSync(el) {
+    const map = el.__ptAttrMap;
+    if (!map) return;
+    const prev = map.__ptLen | 0, names = map.__ptNames || [];
+    const proto = Object.getPrototypeOf(map), html = !el.__ptNS;
+    let i = 0;
+    const now = [];
+    for (const name of el.__ptAttrs.keys()) {
+      const a = __attrNode(el, name);
+      Object.defineProperty(map, i++, { value: a, writable: false, enumerable: true, configurable: true });
+      if (name in proto || (html && __s_toLowerCase(name) !== name)) continue;
+      Object.defineProperty(map, name, { value: a, writable: false, enumerable: false, configurable: true });
+      now.push(name);
+    }
+    for (let k = i; k < prev; k++) delete map[k];
+    for (const name of names) if (!__s_includes(now, name)) delete map[name];
+    Object.defineProperty(map, '__ptLen', { value: i, enumerable: false, configurable: true });
+    Object.defineProperty(map, '__ptNames', { value: now, enumerable: false, configurable: true });
   }
 
   // `classList` is a live DOMTokenList that writes back to the attribute; an
@@ -1694,6 +1785,7 @@
       if (name === 'src' && this.__ptLocal === 'script') v = __pt_ttSink('TrustedScriptURL', 'HTMLScriptElement src', v, "Failed to execute 'setAttribute' on 'Element'");
       else if (name === 'srcdoc' && this.__ptLocal === 'iframe') v = __pt_ttSink('TrustedHTML', 'HTMLIFrameElement srcdoc', v, "Failed to execute 'setAttribute' on 'Element'");
       this.__ptAttrs.set(name, String(v));
+      if (old === undefined) __attrMapSync(this);
       __styleTouchAttr(this, name, old, String(v));
       __hasNoteAttr(name, old, String(v));
       if (name === 'src' && (this.__ptLocal === 'video' || this.__ptLocal === 'audio') && globalThis.__pt_mediaLoad) __pt_mediaLoad(this);
@@ -1712,7 +1804,14 @@
     }
     removeAttribute(n) {
       const name = __attrName(this, n), old = this.__ptAttrs.get(name);
+      if (old === undefined) return;
       this.__ptAttrs.delete(name);
+      __attrDetach(this, name, old);
+      __attrMapSync(this);
+      if (name === 'src' && this.__ptLocal === 'img' && this.__ptCurWant !== undefined) {
+        this.__ptCurWant = undefined;
+        Object.defineProperty(this, '__ptCurSrc', { value: '', writable: true, configurable: true, enumerable: false });
+      }
       const info = __attrNsOf(this, name);
       if (info) this.__ptAttrNS.delete(name);
       __markDirty(this);
@@ -1735,7 +1834,7 @@
     getAttributeNodeNS(ns, local) {
       __needArgs(arguments.length, 2, 'getAttributeNodeNS', 'Element');
       const q = __attrNsFind(this, ns, local);
-      return q === null ? null : __attr(this, q, this.__ptAttrs.get(q));
+      return q === null ? null : __attrNode(this, q);
     }
     setAttributeNS(ns, qname, v) {
       __needArgs(arguments.length, 3, 'setAttributeNS', 'Element');
@@ -1745,6 +1844,7 @@
       const q = was !== null ? was : prefix !== null ? prefix + ':' + local : local;
       const old = this.__ptAttrs.get(q), val = String(v);
       this.__ptAttrs.set(q, val);
+      if (old === undefined) __attrMapSync(this);
       if (was === null) { if (N !== null) __attrNsMap(this).set(q, [N, prefix, local]); else if (this.__ptAttrNS) this.__ptAttrNS.delete(q); }
       __styleTouchAttr(this, q, old, val);
       __hasNoteAttr(q, old, val);
@@ -1759,6 +1859,8 @@
       if (q === null) return;
       const info = __attrNsOf(this, q), old = this.__ptAttrs.get(q);
       this.__ptAttrs.delete(q);
+      __attrDetach(this, q, old);
+      __attrMapSync(this);
       if (info) this.__ptAttrNS.delete(q);
       __markDirty(this);
       __styleTouchAttr(this, q, old, null);
@@ -1768,6 +1870,11 @@
         previousSibling: null, nextSibling: null });
     }
     getAttributeNames() { return [...this.__ptAttrs.keys()]; }
+    getAttributeNode(n) {
+      __needArgs(arguments.length, 1, 'getAttributeNode', 'Element');
+      const name = __attrName(this, n);
+      return this.__ptAttrs.has(name) ? __attrNode(this, name) : null;
+    }
     get attributes() { return __namedNodeMap(this); }
 
     get id() { return __ptGetA(this, 'id') || ''; }
@@ -1790,7 +1897,7 @@
       // (`new Image().src = …` is a common way to send a GET). The browser
       // makes the request, so it bypasses the page's `fetch`; then `load` or
       // `error` fires.
-      if (this.__ptLocal === 'img') { this.__ptLoadImage(); return; }
+      if (this.__ptLocal === 'img') { this.__ptLoadImage(true); return; }
       if (!this.isConnected) return;
       // The src can arrive after the element is in the document, in either order:
       // `el.src = …; head.appendChild(el)` or `head.appendChild(el); el.src = …`.
@@ -1798,16 +1905,19 @@
       if (this.__ptRunScript) this.__ptRunScript();
     }
 
-    __ptLoadImage() {
-      const raw = __ptGetA(this, 'src');
+    // `later`: the address came from script. Chrome then shows it in
+    // currentSrc from the next task on; an image from markup has it at once.
+    __ptLoadImage(later) {
+      const raw = __imgSource(this);
       if (!raw) return;
       let url = raw;
       try { url = new URL(raw, document.baseURI || location.href).href; } catch (e) {}
       if (this.__ptImgAt === url) return;                 // same URL: do not load twice
       // A new address ends the old decode: Chrome rejects what waited on it.
       if (this.__ptDecodeWait) __imgDecodeSettle(this, false);
-      if (__imageSkipped(url)) return;
+      if (__imageSkipped(url)) { __imgCurrent(this, url, later); return; }
       if (__lazyDeferred(this)) return;
+      __imgCurrent(this, url, later);
       Object.defineProperty(this, '__ptImgAt', { value: url, configurable: true, enumerable: false });
       Object.defineProperty(this, '__ptImgDone', { value: false, writable: true, configurable: true, enumerable: false });
       if (__s_toLowerCase(String(__ptGetA(this, 'loading') || '')) !== 'lazy') this.__ptHoldLoad();
@@ -10120,9 +10230,13 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         get() { return this.__ptUrlAttr ? this.__ptUrlAttr('src') : (__ptGetA(this, 'src') || ''); },
         set(v) {
           __ptSetA(this, 'src', v);
-          if (this.__ptLoadImage) this.__ptLoadImage();
+          if (this.__ptLoadImage) this.__ptLoadImage(true);
         },
         enumerable: true, configurable: true,
+      });
+      Object.defineProperty(IP, 'currentSrc', {
+        get: (globalThis.__pt_native || ((f) => f))(Object.getOwnPropertyDescriptor({ get currentSrc() { return this.__ptCurSrc || ''; } }, 'currentSrc').get),
+        set: undefined, enumerable: true, configurable: true,
       });
     }
   } catch (e) {}
