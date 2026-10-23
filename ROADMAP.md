@@ -251,6 +251,10 @@ Keep in JS (the advantage is real):
 
 ## Near-term: protocol & DOM completeness (Phase 5)
 
+- 🔲 **Origin of srcdoc and about:blank frames.** A `srcdoc` frame inherits its
+  parent's origin in Chrome (`http://host`); nokk reports `null`, so IndexedDB is
+  refused inside it with a SecurityError.
+
 - ✅ **A fresh global per document.** Every navigation builds a new V8 context, so
   one page's `var`s and patched built-ins no longer show through on the next.
   `localStorage`, `sessionStorage` and IndexedDB are carried per origin, as Chrome

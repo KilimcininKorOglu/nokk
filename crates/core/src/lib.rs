@@ -13440,6 +13440,47 @@ href|http://www.w3.org/1999/xlink href|http://www.w3.org/1999/xlink".into()));
         assert_eq!(run_and_read(&elsewhere, read).await, Value::String("empty v1".into()));
     }
 
+    /// IndexedDB keeps working through navigations, the profile binding is no
+    /// property a page can find, and engines that held framed pages tear down
+    /// cleanly: the binding was a context slot, freed by a weak handle V8
+    /// could release twice as the isolate went ("Check failed:
+    /// node->IsInUse()").
+    #[tokio::test]
+    async fn storage_binding_is_hidden_and_engines_tear_down_cleanly() {
+        let _serial = serial().await;
+        let js = r#"(() => { window.__r = 'pending';
+            const w = document.getElementById('f').contentWindow;
+            const req = indexedDB.open('frame-db', 1);
+            req.onupgradeneeded = () => req.result.createObjectStore('s');
+            req.onsuccess = () => {
+              const tx = req.result.transaction('s', 'readwrite');
+              tx.objectStore('s').put(42, 'k');
+              tx.oncomplete = () => {
+                req.result.close();
+                const top = indexedDB.open('frame-db');
+                top.onsuccess = () => {
+                  const g = top.result.transaction('s').objectStore('s').get('k');
+                  g.onsuccess = () => {
+                    const seen = [window, w].some((o) => Object.getOwnPropertySymbols(o).some((y) => /nokk/.test(String(y))));
+                    window.__r = g.result + ' ' + seen;
+                    top.result.close();
+                  };
+                };
+              };
+            };
+          })()"#;
+        for _ in 0..5 {
+            let engine = engine(1, 2);
+            let ctx = engine.new_context().await.unwrap();
+            ctx.load_html("https://example.com/", r#"<html><body><iframe id=f srcdoc="<b>x</b>"></iframe></body></html>"#).await.unwrap();
+            ctx.run_event_loop().await.unwrap();
+            assert_eq!(run_and_read(&ctx, js).await, Value::String("42 false".into()));
+            ctx.load_html("https://example.com/next", "<html><body>y</body></html>").await.unwrap();
+            drop(ctx);
+            drop(engine);
+        }
+    }
+
     /// Chrome's shapes for what fingerprinting scripts poke at (creepjs,
     /// khanacademy.org): the builtin frame of `Function.prototype.toString` in
     /// a thrown stack, a real AudioBuffer and completion event, and a

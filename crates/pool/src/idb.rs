@@ -18,7 +18,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
@@ -559,17 +558,33 @@ pub fn drop_partition(name: &str) {
     }
 }
 
-/// The partition bound to a V8 context, set once when the engine built it.
-pub struct StorageBinding(pub u64);
+/// The partition bound to a V8 context, set once when the engine built it:
+/// a private property of its global, which no page can see or reach. Not a
+/// context slot: rusty_v8 frees those with a weak handle whose callback could
+/// run twice when the isolate was torn down ("Check failed:
+/// node->IsInUse()").
+fn storage_key<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Private> {
+    let name = v8::String::new(scope, "nokk.storage").unwrap();
+    v8::Private::for_api(scope, Some(name))
+}
 
 pub fn bind_context(scope: &mut v8::PinScope, partition: u64) {
     let context = scope.get_current_context();
-    context.set_slot(Rc::new(StorageBinding(partition)));
+    let global = context.global(scope);
+    let key = storage_key(scope);
+    let id = v8::Number::new(scope, partition as f64);
+    global.set_private(scope, key, id.into());
 }
 
 fn partition_of(scope: &mut v8::PinScope) -> Option<Arc<Partition>> {
     let context = scope.get_current_context();
-    let id = context.get_slot::<StorageBinding>()?.0;
+    let global = context.global(scope);
+    let key = storage_key(scope);
+    let v = global.get_private(scope, key)?;
+    if !v.is_number() {
+        return None;
+    }
+    let id = v.number_value(scope)? as u64;
     PARTITIONS.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned()
 }
 
