@@ -77,6 +77,9 @@ pub struct ParsedPage {
     /// instructions (`document.childNodes` lists them in Chrome).
     pub before: String,
     pub after: String,
+    /// The `href` of the document's first `<base>` that has one, as written:
+    /// the base its markup's scripts resolve against.
+    pub base_href: Option<String>,
 }
 
 impl ParsedPage {
@@ -98,6 +101,25 @@ impl ParsedPage {
             self.after
         )
     }
+}
+
+/// The first HTML `<base href>` in tree order, stopping there. No stack
+/// frame per level: trees can be thousands deep.
+fn first_base_href(root: &Handle) -> Option<String> {
+    let mut stack = vec![root.clone()];
+    while let Some(node) = stack.pop() {
+        if let NodeData::Element { name, attrs, .. } = &node.data {
+            if &*name.local == "base" && (name.ns.is_empty() || &*name.ns == "http://www.w3.org/1999/xhtml") {
+                if let Some(a) = attrs.borrow().iter().find(|a| &*a.name.local == "href") {
+                    return Some(a.value.to_string());
+                }
+            }
+        }
+        for c in node.children.borrow().iter().rev() {
+            stack.push(c.clone());
+        }
+    }
+    None
 }
 
 /// Parse an HTML document into a JSON tree plus its ordered script list.
@@ -156,6 +178,7 @@ pub fn parse(html: &str) -> ParsedPage {
         mode: quirks_name(dom.quirks_mode.get()),
         before,
         after,
+        base_href: first_base_href(&dom.document),
     }
 }
 

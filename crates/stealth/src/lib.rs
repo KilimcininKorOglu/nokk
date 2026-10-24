@@ -8102,6 +8102,12 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       opts = merged;
       url = parts.url;
     }
+    // A relative address is the document's base URL's (`<base href>`), as in
+    // Chrome; in a worker its own location's.
+    if (typeof url === 'string' || (url !== null && typeof url === 'object')) {
+      const base = (globalThis.document && globalThis.document.baseURI) || (globalThis.location && globalThis.location.href) || undefined;
+      try { if (base) url = new URL(String(url), base).href; } catch (e) {}
+    }
     const local = localResponse(url);
     if (local) {
       const id = fid++;
@@ -9864,7 +9870,9 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       init = init || {};
       const from = input !== null && typeof input === 'object' ? REQ.get(input) : undefined;
       let url = from ? from.url : String(input);
-      try { url = new globalThis.URL(url, globalThis.location && globalThis.location.href).href; }
+      // Against the document's base URL (`<base href>`), as fetch resolves.
+      const reqBase = (globalThis.document && globalThis.document.baseURI) || (globalThis.location && globalThis.location.href);
+      try { url = new globalThis.URL(url, reqBase).href; }
       catch (e) { throw __pt_mkErr(TypeError, "Failed to construct 'Request': Failed to parse URL from " + url); }
       const method = __s_toUpperCase(String(init.method !== undefined ? init.method : from ? from.method : 'GET'));
       const headers = new globalThis.Headers(init.headers !== undefined ? init.headers : from ? from.headers : undefined);
@@ -10113,7 +10121,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       super();
       // ws:/wss: only. http(s) is upgraded as the URL parser does; anything else
       // is a SyntaxError, exactly as in a browser.
-      const base = globalThis.location ? String(location.href) : 'https://localhost/';
+      const base = (globalThis.document && globalThis.document.baseURI) || (globalThis.location ? String(location.href) : 'https://localhost/');
       let abs;
       try { abs = new globalThis.URL(String(url), base).href; } catch (e) { abs = String(url); }
       const scheme = __s_toLowerCase(String((/^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(abs) || [])[1] || ''));

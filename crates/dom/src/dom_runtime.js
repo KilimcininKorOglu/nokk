@@ -2546,7 +2546,10 @@
         const id = __nextScriptId++;
         this.__ptHoldLoad();
         __scriptEls.set(id, this);
-        __scriptOps.push({ op: 'load', id, src: String(src), module: isModule });
+        // Resolved here, against the document's base URL (`<base href>`).
+        let abs = String(src);
+        try { abs = new URL(abs, (this.ownerDocument || document).baseURI).href; } catch (e) {}
+        __scriptOps.push({ op: 'load', id, src: abs, module: isModule });
         return;
       }
       const code = this.textContent;
@@ -2608,7 +2611,9 @@
       this.__ptHoldLoad();
       st.win = __frameWindow(id, st);
       __frames.set(id, st);
-      __frameOps.push({ op: 'open', id, src, name: __ptGetA(this, 'name') || '', w: box[0] || 300, h: box[1] || 150 });
+      let abs = String(src);
+      try { abs = new URL(abs, (this.ownerDocument || document).baseURI).href; } catch (e) {}
+      __frameOps.push({ op: 'open', id, src: abs, name: __ptGetA(this, 'name') || '', w: box[0] || 300, h: box[1] || 150 });
     }
 
     // A form aimed at this frame (`target` = its name) navigates it, as `src`
@@ -3068,7 +3073,23 @@
     get URL() { return (globalThis.location && globalThis.location.href) || 'about:blank'; }
     get documentURI() { return this.URL; }
     // `about:blank`'s base URL is the creator's (the spec fallback).
-    __ptBaseURI() { return (this.URL === 'about:blank' || this.URL === 'about:srcdoc') && globalThis.__pt_creatorURL ? globalThis.__pt_creatorURL : this.URL; }
+    // The document's base URL: its first `<base href>`, resolved against the
+    // fallback (the URL, or the creator's for about:blank and srcdoc).
+    // Remembered until the tree or the URL changes.
+    __ptBaseURI() {
+      const fallback = (this.URL === 'about:blank' || this.URL === 'about:srcdoc') && globalThis.__pt_creatorURL ? globalThis.__pt_creatorURL : this.URL;
+      const memo = __baseMemo.get(this);
+      if (memo && memo.seq === __layoutSeq && memo.fallback === fallback) return memo.base;
+      let base = fallback;
+      for (const b of __docTags(this, 'base')) {
+        const h = __ptGetA(b, 'href');
+        if (h == null) continue;
+        try { base = new URL(String(h), fallback).href; } catch (e) {}
+        break;
+      }
+      __baseMemo.set(this, { seq: __layoutSeq, fallback, base });
+      return base;
+    }
     get domain() { return (globalThis.location && globalThis.location.hostname) || globalThis.__pt_inheritedHost || ''; }
     set domain(v) { /* only ever narrowed to a parent domain; nothing to do here */ }
 
@@ -3499,6 +3520,10 @@
     for (const h of (W.listeners.error || [])) { try { h.call(W.worker, ev); } catch (e) {} }
   };
 
+  // A worker's script address against the document's base URL (`<base href>`).
+  const __workerSrc = (src) => {
+    try { return new URL(src, (globalThis.document && document.baseURI) || (globalThis.location && location.href) || undefined).href; } catch (e) { return src; }
+  };
   class Worker extends EventTarget {
     constructor(scriptURL, options) {
       super();
@@ -3522,7 +3547,7 @@
           if (o === 'null' || o !== mine) throw __pt_mkErr(globalThis.DOMException || Error, "Failed to construct 'Worker': Script at '" + src + "' cannot be accessed from origin '" + mine + "'.", 'SecurityError');
         }
       }
-      __workerOps.push({ op: 'open', id, src, body, name: (options && options.name) || '' });
+      __workerOps.push({ op: 'open', id, src: __workerSrc(src), body, name: (options && options.name) || '' });
     }
     postMessage(data) {
       const W = this.__ptW;
@@ -3574,7 +3599,7 @@
         try { body = globalThis.__pt_localSource ? __pt_localSource(src) : null; } catch (e) {}
       }
       const name = typeof options === 'string' ? options : (options && options.name !== undefined ? String(options.name) : '');
-      __workerOps.push({ op: 'open', id, src, body, name, shared: true });
+      __workerOps.push({ op: 'open', id, src: __workerSrc(src), body, name, shared: true });
     }
     get port() { return this.__ptW.port; }
     get onerror() { return this.__ptW.onerror; }
@@ -5618,6 +5643,7 @@
   // ---- tree walking ---------------------------------------------------------
   // The engine uses an array internally (concat/filter); pages get a collection.
   function __docTags(doc, t) { return doc.documentElement ? __tags(doc.documentElement, t) : []; }
+  const __baseMemo = new WeakMap();
   function __tags(root, t) {
     // By internal name, not `tagName`: internal walks must not use
     // page-visible accessors, which a page can wrap and log.
@@ -6789,7 +6815,11 @@
     }
   };
   const __nodeMembers = {
-    baseURI: { get: function () { const d = this.__ptType === 9 ? this : this.ownerDocument; return (d && d.URL) || (globalThis.location && location.href) || 'about:blank'; } },
+    baseURI: { get: function () {
+      const d = this.__ptType === 9 ? this : this.ownerDocument;
+      if (d && typeof d.__ptBaseURI === 'function') return d.__ptBaseURI();
+      return (d && d.URL) || (globalThis.location && location.href) || 'about:blank';
+    } },
     nodeName: { get: __nodeName },
     parentElement: { get: function () { const p = this.__ptParent; return p && p.__ptType === 1 ? p : null; } },
     nodeValue: {
@@ -8776,7 +8806,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (!__pt_cspActive()) return false;
       const el = scriptNodes[i]; if (!el) return false;
       const src = __ptGetA(el, 'src');
-      if (src) { let abs = String(src); try { abs = new URL(src, (globalThis.location && location.href) || undefined).href; } catch (e) {} return __pt_cspBlocksScriptUrl(el, abs); }
+      if (src) { let abs = String(src); try { abs = new URL(src, document.baseURI || (globalThis.location && location.href) || undefined).href; } catch (e) {} return __pt_cspBlocksScriptUrl(el, abs); }
       return __pt_cspBlocksInline(el);
     } catch (e) { return false; }
   };
@@ -8787,7 +8817,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const dt = performance.now() - __ptScriptT0;
       if (dt > 50 && typeof globalThis.__pt_noteLoaf === 'function') {
         let src = el ? __ptGetA(el, 'src') : null;
-        try { if (src) src = new URL(src, location.href).href; } catch (e) {}
+        try { if (src) src = new URL(src, document.baseURI || location.href).href; } catch (e) {}
         const url = src || String(location.href || '');
         __pt_noteLoaf(__ptScriptT0, dt, url, 'classic-script', null, url);
       }

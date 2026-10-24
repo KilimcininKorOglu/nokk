@@ -1912,6 +1912,13 @@ impl BrowserContext {
         let t_parse = std::time::Instant::now();
         tracing::debug!(target: "nokk::load", bytes = html.len(), "parse start");
         let page = nokk_dom::parse(html);
+        // Markup scripts resolve against the document's base URL: its first
+        // `<base href>`, else its own URL.
+        let script_base = page
+            .base_href
+            .as_deref()
+            .and_then(|h| resolve_url(base_url, h.trim()))
+            .unwrap_or_else(|| base_url.to_string());
         tracing::debug!(target: "nokk::load", ms = t_parse.elapsed().as_millis() as u64, "parsed");
         let install = page.install_script();
         tracing::debug!(target: "nokk::load", bytes = install.len(), ms = t_parse.elapsed().as_millis() as u64, "install script built");
@@ -1993,7 +2000,7 @@ impl BrowserContext {
                 } else {
                     "script-low"
                 };
-                let Some(abs) = resolve_url(base_url, src) else { continue };
+                let Some(abs) = resolve_url(&script_base, src) else { continue };
                 if preload.contains_key(&abs)
                     || abs.starts_with("data:")
                     || abs.starts_with("blob:")
@@ -2032,7 +2039,7 @@ impl BrowserContext {
                     let mut ready = Vec::new();
                     for &i in &asyncs {
                         let fetched = match &page.scripts[i] {
-                            nokk_dom::Script::External(src) | nokk_dom::Script::ExternalModule(src) => resolve_url(base_url, src)
+                            nokk_dom::Script::External(src) | nokk_dom::Script::ExternalModule(src) => resolve_url(&script_base, src)
                                 .and_then(|abs| preload.get(&abs).map(|(_, h)| h.is_finished()))
                                 .unwrap_or(true),
                             _ => true,
@@ -2060,7 +2067,7 @@ impl BrowserContext {
                 Step::Late => {
                     // The async scripts still out, each when its answer is in; the page
                     // lives meanwhile.
-                    if let Some(i) = self.next_arrived(base_url, &preload, &mut late, &srcs).await {
+                    if let Some(i) = self.next_arrived(&script_base, &preload, &mut late, &srcs).await {
                         plan.push_back(Step::Script(i));
                         plan.push_back(Step::Late);
                     }
@@ -2110,7 +2117,7 @@ impl BrowserContext {
                 let outcome = if inline {
                     self.run_module(index, base_url, code.clone()).await
                 } else {
-                    match resolve_url(base_url, code) {
+                    match resolve_url(&script_base, code) {
                         Some(abs) => match self.with_frames_live(self.take_preloaded(preload.remove(&abs), &abs)).await {
                             Ok((_, source)) => self.run_module(index, &abs, source).await,
                             Err(e) => Err(EngineError::Js(e.to_string())),
@@ -2138,7 +2145,7 @@ impl BrowserContext {
                 // document URL, not `<anonymous>`, and pages parse `new Error().stack`.
                 nokk_dom::Script::Inline(code) if !base_url.is_empty() => code.clone(),
                 nokk_dom::Script::Inline(code) => code.clone(),
-                nokk_dom::Script::External(src) => match resolve_url(base_url, src) {
+                nokk_dom::Script::External(src) => match resolve_url(&script_base, src) {
                     Some(abs) => {
                         // Don't fetch or run tracker/analytics scripts — the point
                         // of the blocklist is that they never execute.
@@ -13072,6 +13079,56 @@ href|http://www.w3.org/1999/xlink href|http://www.w3.org/1999/xlink".into()));
             built = ctx.frame_list().iter().any(|f| f.url.contains("/slow-doc"));
         }
         assert!(built, "the late frame was never built");
+    }
+
+    /// The document's base URL is its first `<base href>`, as in Chrome 151:
+    /// `baseURI`, URL attributes, `Request`, `fetch`, markup and inserted
+    /// scripts and stylesheets all resolve against it, and it follows the
+    /// element as a script changes or removes it. It was the page's URL.
+    #[tokio::test]
+    async fn base_href_sets_the_document_base_url() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let (status, ctype, body) = match path.as_str() {
+                        "/" => ("200 OK", "text/html", "<!doctype html><html><head><base target=_blank><base href=\"sub/\"><base href=\"other/\"><link rel=stylesheet href=\"s.css\"><script src=\"a.js\"></script></head><body><p id=p>x</p><a id=a href=\"y\">y</a><script>const s = document.createElement('script'); s.src = 'b.js'; document.head.append(s); window.r = [document.baseURI, document.getElementById('a').href, new Request('x.txt').url]; fetch('x.txt').then((r) => r.text()).then((t) => { window.ft = t; });</script></body></html>"),
+                        "/sub/a.js" => ("200 OK", "text/javascript", "window.loaded = (window.loaded || []); loaded.push('a');"),
+                        "/sub/b.js" => ("200 OK", "text/javascript", "window.loaded = (window.loaded || []); loaded.push('b');"),
+                        "/sub/s.css" => ("200 OK", "text/css", "p { color: rgb(1, 2, 3) }"),
+                        "/sub/x.txt" => ("200 OK", "text/plain", "sub-x"),
+                        _ => ("404 Not Found", "text/plain", "missing"),
+                    };
+                    let resp = format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        let root = format!("http://127.0.0.1:{}/", addr.port());
+        ctx.navigate(&root).await.unwrap();
+        let t = std::time::Instant::now();
+        while t.elapsed() < std::time::Duration::from_secs(5) && ctx.evaluate("String(window.ft)").await.unwrap() != Value::String("sub-x".into()) {
+            let _ = ctx.run_event_loop().await;
+        }
+        let got = ctx.evaluate(r#"(() => { const o = [...window.r, (window.loaded || []).join(','), window.ft, getComputedStyle(document.getElementById('p')).color];
+            const b = document.querySelectorAll('base')[1]; b.href = '/elsewhere/'; o.push(document.baseURI, document.getElementById('a').href);
+            b.remove(); document.querySelectorAll('base')[1].remove(); o.push(document.baseURI); return o.join(' | '); })()"#).await.unwrap();
+        let r = &root;
+        assert_eq!(got, Value::String(format!("{r}sub/ | {r}sub/y | {r}sub/x.txt | a,b | sub-x | rgb(1, 2, 3) | {r}elsewhere/ | {r}elsewhere/y | {r}")));
     }
 
     /// What a stylesheet loads, and what `load` waits for, as measured in
