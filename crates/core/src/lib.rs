@@ -1028,7 +1028,7 @@ struct PendingFrame {
 
 /// A script a page or frame inserted, its source on the way. It runs on a
 /// later turn once it has arrived, in insertion order: the loop is not held
-/// while it loads (a press in reCAPTCHA's frame waited 20 s for one).
+/// while it loads (a press in a widget frame waited 20 s for one).
 struct PendingScript {
     index: usize,
     id: u64,
@@ -1342,7 +1342,7 @@ pub enum ChallengeKind {
     /// AWS WAF's challenge page: the page's own script earns the token and
     /// reloads; the solver waits for it.
     AwsWaf,
-    /// A reCAPTCHA checkbox, no token yet (Google's /sorry/ page). An image puzzle
+    /// A checkbox widget, no token yet (Google's /sorry/ page). An image puzzle
     /// behind it is not something this engine solves.
     RecaptchaWidget,
 }
@@ -1385,8 +1385,8 @@ pub enum ChallengeStatus {
     Timeout,
     /// The page showed no gate at all: nothing to solve.
     NoChallenge,
-    /// The press was answered with a task for a person (reCAPTCHA's image or audio
-    /// puzzle, or its "try again later"): waiting out the budget changes nothing.
+    /// The press was answered with a task for a person (an image or audio puzzle,
+    /// or "try again later"): waiting out the budget changes nothing.
     NeedsHuman,
 }
 
@@ -2283,8 +2283,8 @@ impl BrowserContext {
     /// [`Self::run_event_loop`] for a caller keeping its own clock (a press
     /// pausing 8 ms between pointer moves, a driver polling a promise): the
     /// call returns within about `within`, work left queued for the next one.
-    /// reCAPTCHA's frames always have a timer pending and a frame with work, and
-    /// each such pump ran 150 ms to over a second, so a press took 5-10 s.
+    /// A widget frame that always has a timer pending and work to do held each
+    /// such pump 150 ms to over a second, so a press took 5-10 s.
     pub async fn run_event_loop_idle(&self, within: std::time::Duration) -> Result<u32, EngineError> {
         self.run_event_loop_core(within.min(IDLE_WAIT_BUDGET), None, Some(within)).await
     }
@@ -3243,14 +3243,14 @@ impl BrowserContext {
                 tracing::warn!(target: "nokk", presses = pressed, "challenge did not clear in time");
                 break ChallengeStatus::Timeout;
             }
-            // A pressed reCAPTCHA that answers with a puzzle is not going to clear by
+            // A pressed checkbox that answers with a puzzle is not going to clear by
             // itself. Give a checkbox-only pass its moment, then stop.
             if pressed > 0
                 && last_press.is_some_and(|at| at.elapsed() >= std::time::Duration::from_secs(2))
                 && puzzle_checked.elapsed() >= std::time::Duration::from_millis(500)
             {
                 puzzle_checked = std::time::Instant::now();
-                if self.recaptcha_wants_a_person().await {
+                if self.widget_wants_a_person().await {
                     tracing::info!(target: "nokk", elapsed_ms = t.elapsed().as_millis(), presses = pressed, "the widget asks for a person");
                     break ChallengeStatus::NeedsHuman;
                 }
@@ -3387,7 +3387,7 @@ impl BrowserContext {
 
     /// Press the first element matching `selector` in the frame whose URL contains
     /// `frame_url` (the page itself when `None`), with [`Self::human_press`]. A
-    /// widget's own buttons (reCAPTCHA's audio, verify, reload) are read for the
+    /// widget's own buttons (audio, verify, reload) are read for the
     /// pointer trail that led to them; a script `click()` has none. False when
     /// there is no such frame or element.
     pub async fn press_selector(&self, frame_url: Option<&str>, selector: &str) -> Result<bool, EngineError> {
@@ -3462,9 +3462,9 @@ impl BrowserContext {
         Ok(true)
     }
 
-    /// Whether a reCAPTCHA challenge frame shows a task for a person: the image
+    /// Whether a checkbox widget's challenge frame shows a task for a person: the image
     /// grid, the audio task, or the "try again later" refusal.
-    async fn recaptcha_wants_a_person(&self) -> bool {
+    async fn widget_wants_a_person(&self) -> bool {
         const JS: &str = "!!document.querySelector('.rc-imageselect-challenge .rc-imageselect-tile, .rc-imageselect-target, .rc-audiochallenge-response-field, .rc-doscaptcha-header')";
         for f in self.frame_list() {
             if !f.url.contains("/recaptcha/") || !f.url.contains("/bframe") {
@@ -5166,8 +5166,8 @@ impl BrowserContext {
     }
 
     /// Give every frame the page's current frame list, so `parent.frames[name]` and
-    /// `parent.frames[i]` inside one reach the others (reCAPTCHA's checkbox frame
-    /// talks to its challenge frame this way).
+    /// `parent.frames[i]` inside one reach the others (a widget's checkbox frame
+    /// can talk to its challenge frame this way).
     async fn tell_frames_their_siblings(&self) {
         let list = self
             .evaluate("typeof __pt_frameList === 'function' ? __pt_frameList() : '[]'")
@@ -11829,7 +11829,7 @@ body { margin: 0; font-family: sans-serif; }
     }
 
     /// Under `'strict-dynamic'` a script inserted by another runs, inline or not, and
-    /// one in the markup needs its nonce (bandcamp.com loads reCAPTCHA this way and
+    /// one in the markup needs its nonce (bandcamp.com loads a widget this way and
     /// got none). A refused script and one answered 404 fire a trusted `error` and do
     /// not run; jQuery's loader waits for it. Expected values from Chrome 151.
     #[tokio::test]
@@ -11907,7 +11907,7 @@ body { margin: 0; font-family: sans-serif; }
 
     /// `el.attributes` is one live NamedNodeMap with a read-only Attr per index
     /// (enumerable) and per name (not), and one Attr per attribute shared with
-    /// getAttributeNode; reCAPTCHA's grid images read `img.attributes.src.value`.
+    /// getAttributeNode; pages read `img.attributes.src.value`.
     /// currentSrc is the address of the image's request: at once for markup,
     /// from the next task for a script's src, gone with the attribute, taken
     /// from srcset when there is one. Expected values from Chrome 151.
@@ -12012,8 +12012,8 @@ body { margin: 0; font-family: sans-serif; }
     }
 
     /// A caller pumping on its own clock gets the loop back in about that time,
-    /// even when a frame always has work and a timer is always pending (a
-    /// reCAPTCHA frame); run_event_loop ran 150 ms to a second each time.
+    /// even when a frame always has work and a timer is always pending;
+    /// run_event_loop ran 150 ms to a second each time.
     #[tokio::test]
     async fn a_bounded_pump_returns_on_time_beside_a_busy_frame() {
         let _serial = serial().await;
@@ -12726,7 +12726,7 @@ body { margin: 0; font-family: sans-serif; }
     }
 
     /// A binary body leaves as its bytes. `String(new Uint8Array(…))` is "1,2,3", and that
-    /// is what went out: reCAPTCHA's protobuf `reload` came back "Invalid API parameter(s)"
+    /// is what went out: a widget's protobuf `reload` came back "Invalid API parameter(s)"
     /// and no token was ever issued.
     #[tokio::test]
     async fn a_binary_request_body_leaves_as_bytes() {
@@ -13005,7 +13005,7 @@ href|http://www.w3.org/1999/xlink href|http://www.w3.org/1999/xlink".into()));
 
     /// A press in a frame answers on time though what it set off is slow: a
     /// script or a frame the click inserts loads in the background and runs, or
-    /// is built, on the turn it arrives (a reCAPTCHA reload press waited 20 s).
+    /// is built, on the turn it arrives (a press that started a reload waited 20 s).
     #[tokio::test]
     async fn a_press_does_not_wait_for_what_it_inserts() {
         let _serial = serial().await;

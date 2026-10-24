@@ -2686,8 +2686,8 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 mod tests {
     // Fetch.enable pauses what its patterns match: wildcards as CDP has them,
     // the resource type when given, request stage only, everything without
-    // patterns (a reCAPTCHA demo's subresources were all paused by a pattern
-    // naming the document alone).
+    // patterns (a page's subresources were all paused by a pattern naming the
+    // document alone).
     #[test]
     fn fetch_patterns_pause_only_what_they_match() {
         assert!(wildcard_match("https://a.com/x", "https://a.com/x"));
@@ -2698,10 +2698,10 @@ mod tests {
         assert!(!wildcard_match("https://*.com/?", "https://a.com/xy"));
         assert!(wildcard_match(r"https://a.com/\*", "https://a.com/*"));
         assert!(!wildcard_match(r"https://a.com/\*", "https://a.com/b"));
-        assert!(wildcard_match("*recaptcha*", "https://www.google.com/recaptcha/api2/demo"));
-        let p = FetchPatterns::from_params(&json!({ "patterns": [{ "urlPattern": "https://www.google.com/recaptcha/api2/demo", "requestStage": "Request" }] }));
-        assert!(p.pauses("https://www.google.com/recaptcha/api2/demo", "Document"));
-        assert!(!p.pauses("https://www.google.com/recaptcha/api.js", "Script"));
+        assert!(wildcard_match("*widget*", "https://www.example.com/widget/api2/demo"));
+        let p = FetchPatterns::from_params(&json!({ "patterns": [{ "urlPattern": "https://www.example.com/widget/api2/demo", "requestStage": "Request" }] }));
+        assert!(p.pauses("https://www.example.com/widget/api2/demo", "Document"));
+        assert!(!p.pauses("https://www.example.com/widget/api.js", "Script"));
         let p = FetchPatterns::from_params(&json!({ "patterns": [{ "urlPattern": "*", "resourceType": "Image" }, { "urlPattern": "*", "requestStage": "Response" }] }));
         assert!(p.pauses("https://a.com/i.png", "Image"));
         assert!(!p.pauses("https://a.com/", "Document"));
@@ -2862,7 +2862,7 @@ mod tests {
     }
 
     /// `awaitPromise` with a frame's context waits for the promise, as with the
-    /// page's: it answered `{}` for a pending promise (reCAPTCHA's bframe).
+    /// page's: it answered `{}` for a pending promise.
     #[tokio::test]
     async fn a_frame_evaluate_awaits_its_promise() {
         let _s = SERIAL.lock().await;

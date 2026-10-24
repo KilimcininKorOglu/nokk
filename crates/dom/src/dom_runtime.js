@@ -556,7 +556,7 @@
   // `el.attributes` is one live map per element. Chrome's has an index per
   // attribute (enumerable) and a property per name (not enumerable; skipped
   // where the prototype has a member of that name, and for an HTML element
-  // names with capitals); all read-only. reCAPTCHA reads `img.attributes.src`.
+  // names with capitals); all read-only. Pages read `img.attributes.src`.
   function __namedNodeMap(el) {
     let map = el.__ptAttrMap;
     if (!map) {
@@ -9951,8 +9951,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // its own bootstrap is still running.
   globalThis.__pt_markAsFrame = (id, name) => {
     globalThis.__pt_frameId = id;
-    // `window.name` is the element's `name`: reCAPTCHA's checkbox frame derives
-    // its challenge frame's name from its own and looks it up in `parent.frames`.
+    // `window.name` is the element's `name`: a frame can derive a sibling's name
+    // from its own and look it up in `parent.frames`.
     if (name) { try { globalThis.name = String(name); } catch (e) {} }
     // The other frames of the same page: the engine keeps the list current.
     let siblings = [];
@@ -15241,7 +15241,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         if (!n || n.__ptType !== ELEMENT_NODE) return;
         const t = n.__ptLocal;
         if (t === 'iframe' && /challenges\.cloudflare\.com/.test(__ptGetA(n, 'src') || '')) out.widget = true;
-        // A reCAPTCHA checkbox (Google's /sorry/ page among others); the invisible
+        // A checkbox widget (Google's /sorry/ page among others); the invisible
         // kind asks nothing of a user.
         if (t === 'iframe' && /\/recaptcha\/(api2|enterprise)\/anchor/.test(__ptGetA(n, 'src') || '') && !/size=invisible/.test(__ptGetA(n, 'src') || '')) out.recaptcha = true;
         if (t === 'script') {
@@ -15329,7 +15329,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     return __ptJSON.stringify([ox, oy]);
   };
   // A press aimed at a known element goes to it: our layout can put another element
-  // under its centre (reCAPTCHA's footer buttons land below the frame's window).
+  // under its centre (a widget's footer buttons can land below the frame's window).
   let __pressTarget = null;
   globalThis.__pt_setPressTarget = (sel) => {
     __pressTarget = sel ? (globalThis.document && globalThis.document.querySelector(sel)) || null : null;

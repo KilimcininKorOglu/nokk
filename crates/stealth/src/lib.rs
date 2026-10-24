@@ -8121,7 +8121,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     if (cacheMode === 'no-cache' && !('cache-control' in hdrs)) hdrs['cache-control'] = 'max-age=0';
     else if ((cacheMode === 'no-store' || cacheMode === 'reload') && !('cache-control' in hdrs)) { hdrs['cache-control'] = 'no-cache'; hdrs['pragma'] = 'no-cache'; }
     // Bytes travel as base64: `String(new Uint8Array(…))` is "1,2,3", which sent every
-    // binary body (reCAPTCHA's protobuf, a beacon's ArrayBuffer) as digits and commas.
+    // binary body (a protobuf, a beacon's ArrayBuffer) as digits and commas.
     let body = null, bodyB64 = false;
     const b = opts.body;
     // The body's own type, as the Fetch spec extracts it, unless the page set one.
