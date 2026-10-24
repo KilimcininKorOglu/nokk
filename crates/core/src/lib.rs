@@ -865,6 +865,10 @@ impl Engine {
             worker_init_scripts: std::sync::Mutex::new(Vec::new()),
             init_scripts: std::sync::Mutex::new(Vec::new()),
             inflight: std::sync::Mutex::new(Vec::new()),
+            pending_scripts: std::sync::Mutex::new(Vec::new()),
+            doc_gen: std::sync::atomic::AtomicU64::new(0),
+            pending_frames: std::sync::Mutex::new(Vec::new()),
+            round_deadline: std::sync::Mutex::new(None),
             port_ends: std::sync::Mutex::new(HashMap::new()),
             next_timer_at: std::sync::Mutex::new(None),
             session,
@@ -1008,6 +1012,35 @@ enum Prepared {
     Send(Box<Request>, FetchInfo),
 }
 
+/// A frame the page opened during a bounded pump, its document on the way;
+/// built on the turn it arrives.
+struct PendingFrame {
+    id: u32,
+    op: Value,
+    base: String,
+    url: String,
+    nav_started: std::time::Instant,
+    handle: tokio::task::JoinHandle<Result<nokk_net::Response, NetError>>,
+    /// The page document that opened it.
+    doc: u64,
+}
+
+/// A script a page or frame inserted, its source on the way. It runs on a
+/// later turn once it has arrived, in insertion order: the loop is not held
+/// while it loads (a press in reCAPTCHA's frame waited 20 s for one).
+struct PendingScript {
+    index: usize,
+    id: u64,
+    url: String,
+    module: bool,
+    ty: &'static str,
+    started: std::time::Instant,
+    handle: tokio::task::JoinHandle<Result<nokk_net::Response, NetError>>,
+    /// The page document it belongs to; dropped once the page moved on. `None`
+    /// in a frame.
+    doc: Option<u64>,
+}
+
 pub struct BrowserContext {
     engine: Arc<EngineInner>,
     /// This context's HTTP client — its own proxy + cookie jar when created with
@@ -1114,6 +1147,18 @@ pub struct BrowserContext {
     init_scripts: std::sync::Mutex<Vec<String>>,
     /// Frame and worker requests still on the network: JS keeps running meanwhile, as in a browser.
     inflight: std::sync::Mutex<Vec<InFlight>>,
+    /// Inserted scripts whose source is still loading (see [`PendingScript`]).
+    pending_scripts: std::sync::Mutex<Vec<PendingScript>>,
+    /// The page document now loading or loaded, counted from the start of its
+    /// load (`doc_seq` counts finished loads): what the page inserted during a
+    /// load is its own document's.
+    doc_gen: std::sync::atomic::AtomicU64,
+    /// Frames opened during a bounded pump whose documents are loading.
+    pending_frames: std::sync::Mutex<Vec<PendingFrame>>,
+    /// How long a bounded pump (`run_event_loop_idle`) may still take: a
+    /// script that has not arrived by then runs on a later turn. `None`: an
+    /// unbounded run, which waits for it as before.
+    round_deadline: std::sync::Mutex<Option<std::time::Instant>>,
     /// Where each end of a MessageChannel sent across a frame boundary lives:
     /// `<id>:a` stayed with the sender, `<id>:b` went with the message.
     port_ends: std::sync::Mutex<HashMap<String, usize>>,
@@ -1612,6 +1657,8 @@ impl BrowserContext {
         if let Ok(mut h) = self.doc_hints.lock() {
             h.clear();
         }
+        // From here what the page inserts belongs to the new document.
+        self.doc_gen.fetch_add(1, std::sync::atomic::Ordering::Release);
         self.carry_in(base_url).await;
         self.load_html_into(self.idx(), base_url, html).await?;
         self.doc_seq.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -2249,6 +2296,28 @@ impl BrowserContext {
         until: Option<&str>,
         within: Option<std::time::Duration>,
     ) -> Result<u32, EngineError> {
+        // A bounded run tells the script loader (in the page and its frames)
+        // how long it may wait; the bound in force before is put back after.
+        let before = self.round_deadline.lock().ok().and_then(|d| *d);
+        if let Some(w) = within {
+            let d = std::time::Instant::now() + w;
+            if let Ok(mut slot) = self.round_deadline.lock() {
+                *slot = Some(before.map_or(d, |b| b.min(d)));
+            }
+        }
+        let out = self.run_event_loop_rounds(idle_wait, until, within).await;
+        if let Ok(mut slot) = self.round_deadline.lock() {
+            *slot = before;
+        }
+        out
+    }
+
+    async fn run_event_loop_rounds(
+        &self,
+        idle_wait: std::time::Duration,
+        until: Option<&str>,
+        within: Option<std::time::Duration>,
+    ) -> Result<u32, EngineError> {
         const TIMER_CAP: u32 = 10_000;
         const MAX_FETCHES: usize = 200;
         const MAX_ROUNDS: usize = 2_000;
@@ -2441,6 +2510,8 @@ impl BrowserContext {
                 || !reqs.is_empty()
                 || !ws_ops.is_empty()
                 || !script_ops.is_empty()
+                || self.scripts_pending(index)
+                || self.frames_pending()
                 || delivered > 0;
 
             // 5. Perform each fetch off the isolate thread, then settle its
@@ -4013,6 +4084,198 @@ impl BrowserContext {
     /// this browser is the same machine), its own `location`, its own document and
     /// its own scripts — after which `contentWindow` answers, which is precisely
     /// what a widget polls for before it will do anything.
+    /// Frames whose documents are still loading (see [`PendingFrame`]).
+    fn frames_pending(&self) -> bool {
+        self.pending_frames.lock().map(|v| !v.is_empty()).unwrap_or(false)
+    }
+
+    /// Build the frames whose documents have arrived, in the order they were
+    /// opened; one still loading holds those after it until the bounded
+    /// pump's deadline (an unbounded one waits for it). Returns how many.
+    async fn run_arrived_frames(&self) -> usize {
+        let mut built = 0;
+        loop {
+            let deadline = self.round_deadline.lock().ok().and_then(|d| *d);
+            let next = {
+                let Ok(mut v) = self.pending_frames.lock() else { return built };
+                // Those a page that has moved on opened are dropped, not waited for.
+                let doc_now = self.doc_gen.load(std::sync::atomic::Ordering::Acquire);
+                v.retain(|p| {
+                    if p.doc != doc_now {
+                        p.handle.abort();
+                    }
+                    p.doc == doc_now
+                });
+                if v.is_empty() {
+                    return built;
+                }
+                if v[0].handle.is_finished() || deadline.is_none() { Some(v.remove(0)) } else { None }
+            };
+            let Some(p) = next else {
+                let Some(d) = deadline else { return built };
+                let now = std::time::Instant::now();
+                if now >= d {
+                    return built;
+                }
+                tokio::time::sleep((d - now).min(std::time::Duration::from_millis(5))).await;
+                continue;
+            };
+            let sent = match p.handle.await {
+                Ok(r) => r,
+                Err(e) => Err(NetError::Connect(format!("frame fetch task failed: {e}"))),
+            };
+            // A frame of a document the page has left is not built.
+            if p.doc != self.doc_gen.load(std::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
+            let fetched = self.finish_text(self.idx(), &p.url, "iframe", p.nav_started, sent);
+            self.frame_open_finish(&p.base, &p.op, p.id, &p.url, p.nav_started, fetched).await;
+            built += 1;
+        }
+    }
+
+    /// The rest of opening a frame once its document is here: its context on
+    /// the right thread, who it is, its viewport, init scripts, its document,
+    /// then `load` on the element.
+    async fn frame_open_finish(
+        &self,
+        base: &str,
+        op: &Value,
+        id: u32,
+        url: &str,
+        nav_started: std::time::Instant,
+        fetched: Result<(String, String), EngineError>,
+    ) {
+        let url = url.to_string();
+            let Ok((_, html)) = fetched else {
+                let _ = self.evaluate(&format!("__pt_frameFailed({id})")).await;
+                return;
+            };
+            let boot = self.bootstrap.clone();
+            // A cross-origin frame gets its own thread: in a browser it runs in its own process
+            // while the page is busy. On a shared thread the Turnstile widget waited for the
+            // page's hundred chunks, and its own clock showed intervals 3-5x Chrome's, which go
+            // into the first POST. A same-origin frame stays with the page.
+            let cross = origin_of(&url) != origin_of(base);
+            let place = if cross && std::env::var_os("NOKK_FRAMES_SHARED").is_none() {
+                self.frame_worker()
+            } else {
+                self.worker
+            };
+            let storage = self.storage;
+            let Ok(Ok(raw_index)) = self
+                .engine
+                .pool
+                .dispatch(place, move |iso| {
+                    let r = iso.create_context(&boot);
+                    if let Ok(i) = r {
+                        iso.bind_storage(i, storage);
+                    }
+                    r
+                })
+                .await
+            else {
+                return;
+            };
+            let (index, load) = if place == self.worker {
+                (raw_index, None)
+            } else {
+                (
+                    own_thread_index(place, raw_index),
+                    Some(std::sync::Arc::new(self.engine.pool.register_context(place))),
+                )
+            };
+            // The frame's clock starts at its navigation, not at context construction: the
+            // document has already arrived by now.
+            let ago = nav_started.elapsed().as_secs_f64() * 1000.0;
+            let _ = self
+                .eval_in(index, &format!("globalThis.__pt_shiftOrigin && __pt_shiftOrigin({ago:.3});"))
+                .await;
+            // Teach the child who it is before anything runs in it: its own
+            // frame id (so its `postMessage` can be routed back) and that it
+            // is not the top-level window.
+            let _ = self
+                .eval_in(index, &format!("__pt_markAsFrame({id}, {});", js_str(op["name"].as_str().unwrap_or(""))))
+                .await;
+            // Third-party status and referrer: in a third-party frame Chrome answers "denied"
+            // to permissions, and `document.referrer` under strict-origin-when-cross-origin is
+            // just the parent's origin.
+            let referrer = if cross {
+                format!("{}/", origin_of(base))
+            } else {
+                base.split('#').next().unwrap_or(base).to_string()
+            };
+            let _ = self
+                .eval_in(
+                    index,
+                    &format!(
+                        "Object.defineProperty(globalThis, '__pt_crossSite', {{ value: {cross}, configurable: true }});\n\
+                         if ({cross}) globalThis.__ptStorageAccess = true;\n\
+                         Object.defineProperty(globalThis, '__pt_referrer', {{ value: {0}, configurable: true }});\n\
+                         try {{ document.referrer = {0}; }} catch (e) {{}}",
+                        js_str(&referrer)
+                    ),
+                )
+                .await;
+            // The frame's window is the size of its `<iframe>`, not the page: the Turnstile
+            // widget lives in 300x65 and reads it.
+            let (mut fw, mut fh) = (
+                op["w"].as_f64().unwrap_or(300.0),
+                op["h"].as_f64().unwrap_or(150.0),
+            );
+            // The element may get its size after insertion (styles parse later): ask the parent again now.
+            let raw = self.eval_in(self.idx(), &format!("__pt_frameBox({id})")).await;
+            tracing::debug!(?raw, "frame box from parent");
+            if let Ok(Value::String(box_)) = raw {
+                if let Ok(v) = serde_json::from_str::<Vec<f64>>(&box_) {
+                    if v.len() == 2 && v[0] > 0.0 && v[1] > 0.0 {
+                        fw = v[0];
+                        fh = v[1];
+                    }
+                }
+            }
+            tracing::debug!(frame = id, w = fw, h = fh, "frame viewport");
+            let _ = self
+                .eval_in(index, &format!("__pt_setViewport({fw}, {fh});"))
+                .await;
+            // Init scripts run before the frame's document, as they do for
+            // a page — that is how a client instruments a frame at all,
+            // since a frame's own scripts run the moment it is built.
+            let init = self
+                .frame_init_scripts
+                .lock()
+                .map(|v| v.clone())
+                .unwrap_or_default();
+            for src in init {
+                if let Err(e) = self.eval_in(index, &src).await {
+                    tracing::debug!(error = %e, "frame init script threw");
+                }
+            }
+            let origin = origin_of(&url);
+            if let Ok(mut frames) = self.frames.lock() {
+                frames.insert(
+                    id,
+                    FrameState {
+                        index,
+                        url: url.clone(),
+                        origin: origin.clone(),
+                        viewport: (fw, fh),
+                        _load: load,
+                    },
+                );
+            }
+            // Before its document runs: it may look its siblings up at once.
+            self.tell_frames_their_siblings().await;
+            if let Err(e) = self.load_html_into(index, &url, &html).await {
+                tracing::debug!(url = %url, error = %e, "iframe document failed to load");
+            }
+            // Only now does `contentWindow` exist, and only now does the
+            // element's `load` fire — the order a page relies on.
+            let _ = self
+                .evaluate(&format!("__pt_frameReady({id}, {});", js_str(&origin)))
+                .await;
+    }
+
     async fn apply_frame_ops(&self, base: &str, ops: &[Value]) {
         const MAX_FRAMES: usize = 16;
         for op in ops {
@@ -4064,7 +4327,23 @@ impl BrowserContext {
                         docs.insert(url.clone(), id);
                     }
                     // A form aimed at the frame posts its body; otherwise the frame GETs its `src`.
-                    let fetched = if op["method"].as_str() == Some("POST") {
+                    let post = op["method"].as_str() == Some("POST");
+                    // In a bounded pump the frame's document loads in the background and the
+                    // frame is built on the turn it arrives: a press that made a frame waited
+                    // for the whole document.
+                    let bounded = self.round_deadline.lock().ok().and_then(|d| *d).is_some();
+                    if bounded && !post {
+                        let mut req = self.get_request(&url, "iframe", Some(base));
+                        req.context = Some(self.idx());
+                        let client = self.client.clone();
+                        let handle = tokio::spawn(async move { client.send(req).await });
+                        let doc = self.doc_gen.load(std::sync::atomic::Ordering::Acquire);
+                        if let Ok(mut v) = self.pending_frames.lock() {
+                            v.push(PendingFrame { id, op: op.clone(), base: base.to_string(), url, nav_started, handle, doc });
+                        }
+                        continue;
+                    }
+                    let fetched = if post {
                         let from = (!base.is_empty() && base != "about:blank").then_some(base);
                         self.fetch_document_post(
                             &url,
@@ -4077,135 +4356,18 @@ impl BrowserContext {
                         // A frame's document: `iframe`, with the page as referrer.
                         self.fetch_text_from(&url, "iframe", Some(base)).await
                     };
-                    let Ok((_, html)) = fetched else {
-                        let _ = self.evaluate(&format!("__pt_frameFailed({id})")).await;
-                        continue;
-                    };
-                    let boot = self.bootstrap.clone();
-                    // A cross-origin frame gets its own thread: in a browser it runs in its own process
-                    // while the page is busy. On a shared thread the Turnstile widget waited for the
-                    // page's hundred chunks, and its own clock showed intervals 3-5x Chrome's, which go
-                    // into the first POST. A same-origin frame stays with the page.
-                    let cross = origin_of(&url) != origin_of(base);
-                    let place = if cross && std::env::var_os("NOKK_FRAMES_SHARED").is_none() {
-                        self.frame_worker()
-                    } else {
-                        self.worker
-                    };
-                    let storage = self.storage;
-                    let Ok(Ok(raw_index)) = self
-                        .engine
-                        .pool
-                        .dispatch(place, move |iso| {
-                            let r = iso.create_context(&boot);
-                            if let Ok(i) = r {
-                                iso.bind_storage(i, storage);
-                            }
-                            r
-                        })
-                        .await
-                    else {
-                        continue;
-                    };
-                    let (index, load) = if place == self.worker {
-                        (raw_index, None)
-                    } else {
-                        (
-                            own_thread_index(place, raw_index),
-                            Some(std::sync::Arc::new(self.engine.pool.register_context(place))),
-                        )
-                    };
-                    // The frame's clock starts at its navigation, not at context construction: the
-                    // document has already arrived by now.
-                    let ago = nav_started.elapsed().as_secs_f64() * 1000.0;
-                    let _ = self
-                        .eval_in(index, &format!("globalThis.__pt_shiftOrigin && __pt_shiftOrigin({ago:.3});"))
-                        .await;
-                    // Teach the child who it is before anything runs in it: its own
-                    // frame id (so its `postMessage` can be routed back) and that it
-                    // is not the top-level window.
-                    let _ = self
-                        .eval_in(index, &format!("__pt_markAsFrame({id}, {});", js_str(op["name"].as_str().unwrap_or(""))))
-                        .await;
-                    // Third-party status and referrer: in a third-party frame Chrome answers "denied"
-                    // to permissions, and `document.referrer` under strict-origin-when-cross-origin is
-                    // just the parent's origin.
-                    let referrer = if cross {
-                        format!("{}/", origin_of(base))
-                    } else {
-                        base.split('#').next().unwrap_or(base).to_string()
-                    };
-                    let _ = self
-                        .eval_in(
-                            index,
-                            &format!(
-                                "Object.defineProperty(globalThis, '__pt_crossSite', {{ value: {cross}, configurable: true }});\n\
-                                 if ({cross}) globalThis.__ptStorageAccess = true;\n\
-                                 Object.defineProperty(globalThis, '__pt_referrer', {{ value: {0}, configurable: true }});\n\
-                                 try {{ document.referrer = {0}; }} catch (e) {{}}",
-                                js_str(&referrer)
-                            ),
-                        )
-                        .await;
-                    // The frame's window is the size of its `<iframe>`, not the page: the Turnstile
-                    // widget lives in 300x65 and reads it.
-                    let (mut fw, mut fh) = (
-                        op["w"].as_f64().unwrap_or(300.0),
-                        op["h"].as_f64().unwrap_or(150.0),
-                    );
-                    // The element may get its size after insertion (styles parse later): ask the parent again now.
-                    let raw = self.eval_in(self.idx(), &format!("__pt_frameBox({id})")).await;
-                    tracing::debug!(?raw, "frame box from parent");
-                    if let Ok(Value::String(box_)) = raw {
-                        if let Ok(v) = serde_json::from_str::<Vec<f64>>(&box_) {
-                            if v.len() == 2 && v[0] > 0.0 && v[1] > 0.0 {
-                                fw = v[0];
-                                fh = v[1];
-                            }
-                        }
-                    }
-                    tracing::debug!(frame = id, w = fw, h = fh, "frame viewport");
-                    let _ = self
-                        .eval_in(index, &format!("__pt_setViewport({fw}, {fh});"))
-                        .await;
-                    // Init scripts run before the frame's document, as they do for
-                    // a page — that is how a client instruments a frame at all,
-                    // since a frame's own scripts run the moment it is built.
-                    let init = self
-                        .frame_init_scripts
-                        .lock()
-                        .map(|v| v.clone())
-                        .unwrap_or_default();
-                    for src in init {
-                        if let Err(e) = self.eval_in(index, &src).await {
-                            tracing::debug!(error = %e, "frame init script threw");
-                        }
-                    }
-                    let origin = origin_of(&url);
-                    if let Ok(mut frames) = self.frames.lock() {
-                        frames.insert(
-                            id,
-                            FrameState {
-                                index,
-                                url: url.clone(),
-                                origin: origin.clone(),
-                                viewport: (fw, fh),
-                                _load: load,
-                            },
-                        );
-                    }
-                    // Before its document runs: it may look its siblings up at once.
-                    self.tell_frames_their_siblings().await;
-                    if let Err(e) = self.load_html_into(index, &url, &html).await {
-                        tracing::debug!(url = %url, error = %e, "iframe document failed to load");
-                    }
-                    // Only now does `contentWindow` exist, and only now does the
-                    // element's `load` fire — the order a page relies on.
-                    let _ = self
-                        .evaluate(&format!("__pt_frameReady({id}, {});", js_str(&origin)))
-                        .await;
+                    self.frame_open_finish(base, op, id, &url, nav_started, fetched).await;
                 }
                 "close" => {
+                    // Removed before its document arrived: it is never built.
+                    if let Ok(mut v) = self.pending_frames.lock() {
+                        v.retain(|p| {
+                            if p.id == id {
+                                p.handle.abort();
+                            }
+                            p.id != id
+                        });
+                    }
                     let gone = self.frames.lock().ok().and_then(|mut f| f.remove(&id));
                     if let Some(f) = gone {
                         let idx = f.index;
@@ -4301,6 +4463,7 @@ impl BrowserContext {
                 _ => {}
             }
         }
+        self.run_arrived_frames().await;
     }
 
     /// Fetch and run what the page inserted into itself. A `<script src>` added to
@@ -4540,15 +4703,79 @@ impl BrowserContext {
                 let _ = self.eval_in(index, &done(true)).await;
                 continue;
             }
-            let ty = if op["module"].as_bool().unwrap_or(false) { "module" } else { "script-low" };
-            match self.fetch_text_in(index, &url, ty, None).await {
+            let module = op["module"].as_bool().unwrap_or(false);
+            let ty = if module { "module" } else { "script-low" };
+            // To the network now; it runs once it has arrived (`run_arrived_scripts`).
+            let mut req = self.get_request(&url, ty, None);
+            req.context = Some(index);
+            req.doc_hints = self.doc_hints_of(index);
+            let client = self.client.clone();
+            let handle = tokio::spawn(async move { client.send(req).await });
+            let doc = (index == self.idx()).then(|| self.doc_gen.load(std::sync::atomic::Ordering::Acquire));
+            if let Ok(mut v) = self.pending_scripts.lock() {
+                v.push(PendingScript { index, id, url, module, ty, started: std::time::Instant::now(), handle, doc });
+            }
+        }
+        self.run_arrived_scripts(index).await;
+    }
+
+    /// Whether `index` has inserted scripts still loading.
+    fn scripts_pending(&self, index: usize) -> bool {
+        self.pending_scripts.lock().map(|v| v.iter().any(|p| p.index == index)).unwrap_or(false)
+    }
+
+    /// Run `index`'s inserted scripts that have arrived, in the order they were
+    /// inserted. One still loading holds those after it: an unbounded run waits
+    /// for it, a bounded one (`round_deadline`) until its deadline, and then
+    /// leaves the rest to a later turn. Returns how many ran.
+    async fn run_arrived_scripts(&self, index: usize) -> usize {
+        let mut ran = 0;
+        loop {
+            let deadline = self.round_deadline.lock().ok().and_then(|d| *d);
+            let next = {
+                let Ok(mut v) = self.pending_scripts.lock() else { return ran };
+                // A page script of a document the page has left is dropped, not waited for.
+                let doc_now = self.doc_gen.load(std::sync::atomic::Ordering::Acquire);
+                v.retain(|p| {
+                    let stale = p.doc.is_some_and(|d| d != doc_now);
+                    if stale {
+                        p.handle.abort();
+                    }
+                    !stale
+                });
+                let Some(pos) = v.iter().position(|p| p.index == index) else { return ran };
+                let ready = v[pos].handle.is_finished();
+                if ready || deadline.is_none() { Some(v.remove(pos)) } else { None }
+            };
+            let Some(p) = next else {
+                // Still loading: wait a little, within the deadline.
+                let Some(d) = deadline else { return ran };
+                let now = std::time::Instant::now();
+                if now >= d {
+                    return ran;
+                }
+                tokio::time::sleep((d - now).min(std::time::Duration::from_millis(5))).await;
+                continue;
+            };
+            let sent = match p.handle.await {
+                Ok(r) => r,
+                Err(e) => Err(NetError::Connect(format!("script fetch task failed: {e}"))),
+            };
+            // A page script of a document the page has left is dropped.
+            if p.doc.is_some_and(|d| d != self.doc_gen.load(std::sync::atomic::Ordering::Acquire)) {
+                continue;
+            }
+            ran += 1;
+            let (id, url) = (p.id, p.url);
+            let done = |ok: bool| format!("__pt_scriptDone({id}, {ok});");
+            match self.finish_text(index, &url, p.ty, p.started, sent) {
                 Ok((_, code)) => {
                     // A script reads its own <script> timing on its first line: the entry must exist
                     // before it starts, not at the end of the round.
                     if index == self.idx() {
                         self.flush_resource_timings(index).await;
                     }
-                    if op["module"].as_bool().unwrap_or(false) {
+                    if p.module {
                         if let Err(e) = self.run_module(index, &url, code).await {
                             tracing::debug!(url = %url, error = %e, "module threw");
                         }
@@ -4861,11 +5088,12 @@ impl BrowserContext {
             work += self.settle_inflight().await?;
 
             // A frame loads code into itself the same way a page does.
-            if let Some(ops) = queues["scripts"].as_array() {
-                if !ops.is_empty() {
-                    work += ops.len();
-                    self.apply_script_ops(index, &base, ops).await;
-                }
+            let ops = queues["scripts"].as_array().cloned().unwrap_or_default();
+            if !ops.is_empty() {
+                work += ops.len();
+                self.apply_script_ops(index, &base, &ops).await;
+            } else if self.scripts_pending(index) {
+                work += self.run_arrived_scripts(index).await;
             }
 
             // And `import()` the engine is waiting on: it asks through its own hook, not the
@@ -12690,6 +12918,77 @@ href|http://www.w3.org/1999/xlink href|http://www.w3.org/1999/xlink".into()));
         }
         assert_eq!(ctx.evaluate("document.title").await.unwrap(), Value::String("async;timer;".into()));
         assert!(t.elapsed() < std::time::Duration::from_secs(8), "took {:?}", t.elapsed());
+    }
+
+    /// A press in a frame answers on time though what it set off is slow: a
+    /// script or a frame the click inserts loads in the background and runs, or
+    /// is built, on the turn it arrives (a reCAPTCHA reload press waited 20 s).
+    #[tokio::test]
+    async fn a_press_does_not_wait_for_what_it_inserts() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    if path.starts_with("/slow") {
+                        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                    }
+                    let (ctype, body) = if path.starts_with("/slow.js") {
+                        ("text/javascript", "window.slowRan = (window.slowRan || 0) + 1;".to_string())
+                    } else if path.starts_with("/frame") {
+                        ("text/html", "<button id=b style='width:80px;height:30px'>go</button><script>document.getElementById('b').addEventListener('click', () => { const s = document.createElement('script'); s.src = '/slow.js'; document.head.append(s); });</script>".to_string())
+                    } else if path.starts_with("/slow-doc") {
+                        ("text/html", "<p>late</p>".to_string())
+                    } else {
+                        ("text/html", "<iframe src=/frame width=200 height=100></iframe>".to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&format!("http://127.0.0.1:{}/", addr.port())).await.unwrap();
+        let t = std::time::Instant::now();
+        assert!(ctx.press_selector(Some("/frame"), "#b").await.unwrap());
+        assert!(t.elapsed() < std::time::Duration::from_secs(3), "press took {:?}", t.elapsed());
+        // The script still runs once it has come.
+        let frame = ctx.frame_list().into_iter().find(|f| f.url.contains("/frame")).unwrap().id;
+        let mut ran = Value::Null;
+        while t.elapsed() < std::time::Duration::from_secs(12) {
+            let _ = ctx.run_event_loop_idle(std::time::Duration::from_millis(300)).await;
+            ran = ctx.evaluate_in_frame(frame, "String(window.slowRan)").await.unwrap();
+            if ran == Value::String("1".into()) {
+                break;
+            }
+        }
+        assert_eq!(ran, Value::String("1".into()));
+        // A frame the page opens during a bounded pump is built when its document arrives.
+        ctx.evaluate("(() => { const f = document.createElement('iframe'); f.src = '/slow-doc'; document.body.append(f); })()").await.unwrap();
+        let t = std::time::Instant::now();
+        let _ = ctx.run_event_loop_idle(std::time::Duration::from_millis(500)).await;
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "pump took {:?}", t.elapsed());
+        let mut built = false;
+        while t.elapsed() < std::time::Duration::from_secs(12) && !built {
+            let _ = ctx.run_event_loop_idle(std::time::Duration::from_millis(300)).await;
+            built = ctx.frame_list().iter().any(|f| f.url.contains("/slow-doc"));
+        }
+        assert!(built, "the late frame was never built");
     }
 
     /// What a stylesheet loads, and what `load` waits for, as measured in
