@@ -1268,6 +1268,7 @@ impl Conn {
             // `setRequestInterception`): each request is announced, then held
             // until the driver continues, fails or fulfills it.
             "Fetch.enable" => {
+                let patterns = FetchPatterns::from_params(params);
                 let mut rx = self.targets[idx].ctx.intercept_requests();
                 let page = self.targets[idx].ctx.clone();
                 let (frame, sess, out, loader, held, ids) = (
@@ -1282,6 +1283,9 @@ impl Conn {
                     // A navigation's document request carries its loader's id, once.
                     let mut loader_taken = String::new();
                     while let Some(p) = rx.recv().await {
+                        // Only a request one of the patterns matches is paused; the
+                        // rest go out as they are, announced as before.
+                        let pause = patterns.pauses(&p.url, p.resource_type);
                         // A frame's request belongs to that frame and its own document.
                         let in_frame = p.context.and_then(|c| page.frame_of_context(c)).or_else(|| {
                             (p.resource_type == "Document").then(|| page.frame_for_document(&p.url)).flatten()
@@ -1330,6 +1334,13 @@ impl Conn {
                                 "resourceType": p.resource_type, "networkId": net_id,
                             }),
                         );
+                        if !pause {
+                            let _ = p.reply.send(nokk::Decision::Continue { url: None, method: None, headers: None, body: None });
+                            if out.send(Message::Text(sent.to_string())).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
                         if let Ok(mut h) = held.lock() {
                             h.insert(job, p.reply);
                         }
@@ -2602,8 +2613,103 @@ fn event(method: &str, session: &Option<String>, params: Value) -> Value {
     m
 }
 
+/// `Fetch.enable`'s patterns: a request is paused when one of them matches its
+/// URL (`*` any run, `?` one character, a backslash escapes) and resource type,
+/// at the request stage. No patterns given: every request; an empty list:
+/// none (both as Chrome 151 answers).
+struct FetchPatterns(Option<Vec<(String, Option<String>)>>);
+
+impl FetchPatterns {
+    fn from_params(params: &Value) -> Self {
+        let Some(list) = params.get("patterns").and_then(|v| v.as_array()) else {
+            return FetchPatterns(None);
+        };
+        let mut out = Vec::new();
+        for p in list {
+            // Only the request stage is intercepted here; a response-stage
+            // pattern pauses nothing before the request goes out.
+            let stage = p.get("requestStage").and_then(|v| v.as_str()).unwrap_or("Request");
+            if stage != "Request" {
+                continue;
+            }
+            let url = p.get("urlPattern").and_then(|v| v.as_str()).unwrap_or("*").to_string();
+            let kind = p.get("resourceType").and_then(|v| v.as_str()).map(str::to_string);
+            out.push((url, kind));
+        }
+        FetchPatterns(Some(out))
+    }
+
+    fn pauses(&self, url: &str, resource_type: &str) -> bool {
+        let Some(list) = &self.0 else { return true };
+        list.iter().any(|(pat, kind)| kind.as_deref().is_none_or(|k| k == resource_type) && wildcard_match(pat, url))
+    }
+}
+
+/// CDP's URL wildcard: `*` matches any run of characters, `?` one, and a
+/// backslash makes the next character literal.
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut i, mut j) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    while j < t.len() {
+        if i < p.len() && p[i] == '*' {
+            star = Some(i);
+            i += 1;
+            mark = j;
+            continue;
+        }
+        if i < p.len() {
+            let (lit, step) = if p[i] == '\\' && i + 1 < p.len() { (Some(p[i + 1]), 2) } else if p[i] == '?' { (None, 1) } else { (Some(p[i]), 1) };
+            if lit.is_none_or(|c| c == t[j]) {
+                i += step;
+                j += 1;
+                continue;
+            }
+        }
+        match star {
+            Some(s) => {
+                i = s + 1;
+                mark += 1;
+                j = mark;
+            }
+            None => return false,
+        }
+    }
+    while i < p.len() && p[i] == '*' {
+        i += 1;
+    }
+    i == p.len()
+}
+
 #[cfg(test)]
 mod tests {
+    // Fetch.enable pauses what its patterns match: wildcards as CDP has them,
+    // the resource type when given, request stage only, everything without
+    // patterns (a reCAPTCHA demo's subresources were all paused by a pattern
+    // naming the document alone).
+    #[test]
+    fn fetch_patterns_pause_only_what_they_match() {
+        assert!(wildcard_match("https://a.com/x", "https://a.com/x"));
+        assert!(!wildcard_match("https://a.com/x", "https://a.com/x.js"));
+        assert!(wildcard_match("*", "https://a.com/x"));
+        assert!(wildcard_match("*.js", "https://a.com/app.js"));
+        assert!(wildcard_match("https://*.com/?", "https://a.com/x"));
+        assert!(!wildcard_match("https://*.com/?", "https://a.com/xy"));
+        assert!(wildcard_match(r"https://a.com/\*", "https://a.com/*"));
+        assert!(!wildcard_match(r"https://a.com/\*", "https://a.com/b"));
+        assert!(wildcard_match("*recaptcha*", "https://www.google.com/recaptcha/api2/demo"));
+        let p = FetchPatterns::from_params(&json!({ "patterns": [{ "urlPattern": "https://www.google.com/recaptcha/api2/demo", "requestStage": "Request" }] }));
+        assert!(p.pauses("https://www.google.com/recaptcha/api2/demo", "Document"));
+        assert!(!p.pauses("https://www.google.com/recaptcha/api.js", "Script"));
+        let p = FetchPatterns::from_params(&json!({ "patterns": [{ "urlPattern": "*", "resourceType": "Image" }, { "urlPattern": "*", "requestStage": "Response" }] }));
+        assert!(p.pauses("https://a.com/i.png", "Image"));
+        assert!(!p.pauses("https://a.com/", "Document"));
+        assert!(FetchPatterns::from_params(&json!({})).pauses("https://a.com/", "Document"));
+        assert!(FetchPatterns::from_params(&json!({ "patterns": [{}] })).pauses("https://a.com/", "Script"));
+        assert!(!FetchPatterns::from_params(&json!({ "patterns": [] })).pauses("https://a.com/", "Script"));
+    }
+
     use super::*;
     use nokk::{EngineConfig, PoolConfig};
 
