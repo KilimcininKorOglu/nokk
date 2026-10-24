@@ -868,6 +868,7 @@ impl Engine {
             pending_scripts: std::sync::Mutex::new(Vec::new()),
             doc_gen: std::sync::atomic::AtomicU64::new(0),
             pending_frames: std::sync::Mutex::new(Vec::new()),
+            frame_places: std::sync::Mutex::new(HashMap::new()),
             round_deadline: std::sync::Mutex::new(None),
             port_ends: std::sync::Mutex::new(HashMap::new()),
             next_timer_at: std::sync::Mutex::new(None),
@@ -1155,6 +1156,9 @@ pub struct BrowserContext {
     doc_gen: std::sync::atomic::AtomicU64,
     /// Frames opened during a bounded pump whose documents are loading.
     pending_frames: std::sync::Mutex<Vec<PendingFrame>>,
+    /// The thread each cross-origin frame being opened will run on, by frame
+    /// id, with its load already counted there (see `reserve_frame_worker`).
+    frame_places: std::sync::Mutex<HashMap<u32, (WorkerId, nokk_pool::ContextLoadGuard)>>,
     /// How long a bounded pump (`run_event_loop_idle`) may still take: a
     /// script that has not arrived by then runs on a later turn. `None`: an
     /// unbounded run, which waits for it as before.
@@ -1424,6 +1428,22 @@ impl BrowserContext {
             *fw = self.engine.pool.pick_worker_except(self.worker);
         }
         *fw
+    }
+
+    /// The thread for the cross-origin frame `id` about to open: the least
+    /// loaded one but the page's, counted as loaded at once. Picked once per
+    /// page, and counted only when the frame's context was built, every widget
+    /// of eight pages solving at once landed on one isolate (95% busy, seven
+    /// idle) and parallel solves queued behind it.
+    fn reserve_frame_worker(&self, id: u32) -> WorkerId {
+        let pool = &self.engine.pool;
+        let place = pool.pick_worker_except(self.worker);
+        let guard = pool.register_context(place);
+        if let Ok(mut m) = self.frame_places.lock() {
+            m.insert(id, (place, guard));
+        }
+        *self.frame_worker.lock().unwrap_or_else(|e| e.into_inner()) = place;
+        place
     }
 
     /// The context's index within its isolate.
@@ -3605,6 +3625,7 @@ impl BrowserContext {
                     // parallel and a reply costs message latency, not "the page is free". On a shared
                     // isolate every worker turn was taken from the page.
                     let place = self.engine.pool.pick_worker_avoiding(&[self.worker, self.frame_worker()]);
+                    tracing::debug!(target: "nokk::place", page = ?self.worker, ?place, "worker context");
                     let load = std::sync::Arc::new(self.engine.pool.register_context(place));
                     let t_create = std::time::Instant::now();
                     let Ok(Ok(child)) = self
@@ -4147,6 +4168,8 @@ impl BrowserContext {
         fetched: Result<(String, String), EngineError>,
     ) {
         let url = url.to_string();
+            // The thread reserved when the frame started; held until its context counts.
+            let reserved = self.frame_places.lock().ok().and_then(|mut m| m.remove(&id));
             let Ok((_, html)) = fetched else {
                 let _ = self.evaluate(&format!("__pt_frameFailed({id})")).await;
                 return;
@@ -4158,7 +4181,7 @@ impl BrowserContext {
             // into the first POST. A same-origin frame stays with the page.
             let cross = origin_of(&url) != origin_of(base);
             let place = if cross && std::env::var_os("NOKK_FRAMES_SHARED").is_none() {
-                self.frame_worker()
+                reserved.as_ref().map_or_else(|| self.frame_worker(), |r| r.0)
             } else {
                 self.worker
             };
@@ -4177,6 +4200,7 @@ impl BrowserContext {
             else {
                 return;
             };
+            tracing::debug!(target: "nokk::place", page = ?self.worker, ?place, cross, "frame context");
             let (index, load) = if place == self.worker {
                 (raw_index, None)
             } else {
@@ -4185,6 +4209,7 @@ impl BrowserContext {
                     Some(std::sync::Arc::new(self.engine.pool.register_context(place))),
                 )
             };
+            drop(reserved);
             // The frame's clock starts at its navigation, not at context construction: the
             // document has already arrived by now.
             let ago = nav_started.elapsed().as_secs_f64() * 1000.0;
@@ -4296,6 +4321,8 @@ impl BrowserContext {
                     if self.frames.lock().map(|f| f.len()).unwrap_or(0) >= MAX_FRAMES {
                         continue;
                     }
+                    let cross_place = (origin_of(&url) != origin_of(base) && std::env::var_os("NOKK_FRAMES_SHARED").is_none())
+                        .then(|| self.reserve_frame_worker(id));
                     // Build spare realms on the frame thread while the frame document loads: the
                     // challenge program needs them immediately.
                     if origin_of(&url) != origin_of(base)
@@ -4305,7 +4332,7 @@ impl BrowserContext {
                         let boot = self.bootstrap.clone();
                         self.engine
                             .pool
-                            .dispatch_detached(self.frame_worker(), {
+                            .dispatch_detached(cross_place.unwrap_or_else(|| self.frame_worker()), {
                                 let boot = boot.clone();
                                 move |iso| iso.prewarm_realms(&boot, 3)
                             });
@@ -11926,6 +11953,62 @@ body { margin: 0; font-family: sans-serif; }
         assert_eq!(out["sync"], "", "{out}");
         assert_eq!(out["task"], "https://example.com/q.png", "{out}");
         assert_eq!(out["removed"], "", "{out}");
+    }
+
+    /// Cross-origin frames of pages loading at once each get a thread of their
+    /// own: the frame thread was picked once per page and counted only when the
+    /// frame was built, so eight Turnstile widgets solving in parallel shared one
+    /// isolate at 95% while seven idled.
+    #[tokio::test]
+    async fn frames_of_parallel_pages_spread_over_threads() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let body = if req.starts_with("GET /f") {
+                        "<html><body>f</body></html>".to_string()
+                    } else {
+                        format!(r#"<html><body><iframe src="http://localhost:{port}/f"></iframe></body></html>"#)
+                    };
+                    let out = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = stream.write_all(out.as_bytes()).await;
+                });
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 8, max_live_contexts: 8, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let mut ctxs = Vec::new();
+        for _ in 0..4 {
+            ctxs.push(engine.new_context().await.unwrap());
+        }
+        let url = format!("http://127.0.0.1:{port}/");
+        futures_util::future::join_all(ctxs.iter().map(|c| c.navigate(&url))).await;
+        let pages: Vec<_> = ctxs.iter().map(|c| c.worker()).collect();
+        let mut frames = Vec::new();
+        for c in &ctxs {
+            for _ in 0..50 {
+                if !c.frame_list().is_empty() {
+                    break;
+                }
+                c.run_event_loop().await.unwrap();
+            }
+            let f = c.frames.lock().unwrap();
+            let s = f.values().next().expect("a frame");
+            frames.push(c.route(s.index).0);
+        }
+        let distinct: std::collections::HashSet<_> = frames.iter().collect();
+        assert_eq!(distinct.len(), frames.len(), "frames {frames:?}, pages {pages:?}");
+        assert!(frames.iter().all(|w| !pages.contains(w)), "frames {frames:?}, pages {pages:?}");
     }
 
     /// A caller pumping on its own clock gets the loop back in about that time,
