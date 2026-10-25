@@ -1222,6 +1222,62 @@
     const r = on.call(t, event);
     if (r === false && event.cancelable) event.preventDefault();
   }
+  // Event handler content attributes (`onclick="…"`, `<body onload="…">`),
+  // compiled when first asked for, as Chrome does: `function onclick(event)
+  // {\n…\n}` with the document, the form and the element on its scope
+  // chain, compiled as page script (not eval: a CSP without 'unsafe-eval'
+  // still runs them; script-src-attr decides). The handler properties ask
+  // here unless the page assigned one since the attribute last changed
+  // (`__ptOnSet`, kept by the accessors). A body's window handlers (load,
+  // resize, …) are the window's.
+  const __WIN_HANDLERS = new Set(['afterprint', 'beforeprint', 'beforeunload', 'hashchange', 'languagechange',
+    'message', 'messageerror', 'offline', 'online', 'pagehide', 'pageshow', 'popstate', 'rejectionhandled',
+    'storage', 'unhandledrejection', 'unload', 'blur', 'error', 'focus', 'load', 'resize', 'scroll']);
+  function __ptAttrHandler(target, type) {
+    let host = target;
+    if (target === globalThis) {
+      const d = globalThis.document, b = d && d.body;
+      if (!b || (b.__ptLocal !== 'body' && b.__ptLocal !== 'frameset') || !__WIN_HANDLERS.has(type)) return null;
+      host = b;
+    } else if (!target || target.__ptType !== ELEMENT_NODE) return null;
+    else if ((target.__ptLocal === 'body' || target.__ptLocal === 'frameset') && __WIN_HANDLERS.has(type)) return null;
+    const attrs = host.__ptAttrs;
+    const src = attrs ? attrs.get('on' + type) : undefined;
+    if (src === undefined) return null;
+    let cache = host.__ptOnCache;
+    if (!cache) {
+      cache = new Map();
+      try { Object.defineProperty(host, '__ptOnCache', { value: cache, configurable: true }); } catch (e) { return null; }
+    }
+    const hit = cache.get(type);
+    if (hit && hit[0] === src) return hit[1];
+    let fn = null;
+    if (!(typeof globalThis.__pt_cspBlocksHandler === 'function' && globalThis.__pt_cspBlocksHandler(host, 'on' + type, src))
+        && typeof __pt_evalScript === 'function') {
+      const params = target === globalThis && type === 'error' ? 'event, source, lineno, colno, error'
+        : host.__ptNS === 'http://www.w3.org/2000/svg' ? 'evt' : 'event';
+      try {
+        // Names no object has: a `with` scope looks every name up on its object
+        // first (`__ptE` is an engine field every event carries).
+        const make = __pt_evalScript('(function (__ptScopeDoc, __ptScopeForm, __ptScopeEl) { with (__ptScopeDoc) { with (__ptScopeForm) { with (__ptScopeEl) { return function on'
+          + type + '(' + params + ') {\n' + src + '\n}; } } } })', String((globalThis.location && location.href) || ''), 0);
+        const doc = host.ownerDocument || globalThis.document;
+        const form = host.form && typeof host.form === 'object' ? host.form : {};
+        if (typeof make === 'function') fn = make(doc, form, host);
+      } catch (e) { __pt_reportError(e, 'on' + type); fn = null; }
+    }
+    cache.set(type, [src, fn]);
+    return fn;
+  }
+  Object.defineProperty(globalThis, '__pt_attrHandler', { value: __ptAttrHandler, configurable: true, enumerable: false });
+  // A changed `on…` attribute replaces what the page assigned.
+  const __ptOnTouched = (el, name) => {
+    if (__s_charCodeAt(name, 0) !== 111 || __s_charCodeAt(name, 1) !== 110) return;
+    const type = __s_slice(name, 2);
+    // Kept as false, not deleted: the assignment is gone, not just unmarked.
+    if (el.__ptOnSet && el.__ptOnSet[type]) el.__ptOnSet[type] = false;
+    if ((el.__ptLocal === 'body' || el.__ptLocal === 'frameset') && __WIN_HANDLERS.has(type) && globalThis.__ptOnSet && globalThis.__ptOnSet[type]) globalThis.__ptOnSet[type] = false;
+  };
   function fireCapture(node, event) {
     const l = node.__ptLis && node.__ptLis[event.type]; if (!l) return;
     for (const e of __s_slice(l)) { if (!e.cap) continue; if (event.__ptStopImm) break; __ptCallListener(node, e, event, 'capture'); }
@@ -1838,6 +1894,7 @@
       this.__ptAttrs.set(name, String(v));
       if (old === undefined) __attrMapSync(this);
       __styleTouchAttr(this, name, old, String(v));
+      __ptOnTouched(this, name);
       __hasNoteAttr(name, old, String(v));
       if (name === 'src' && (this.__ptLocal === 'video' || this.__ptLocal === 'audio') && globalThis.__pt_mediaLoad) __pt_mediaLoad(this);
       if (this.__ptUpgraded) {
@@ -1867,6 +1924,7 @@
       if (info) this.__ptAttrNS.delete(name);
       __markDirty(this);
       __styleTouchAttr(this, name, old, null);
+      __ptOnTouched(this, name);
       __hasNoteAttr(name, old, null);
       __mutation({ type: 'attributes', target: this, attributeName: info ? info[2] : name, attributeNamespace: info ? info[0] : null,
         oldValue: old === undefined ? null : old, addedNodes: [], removedNodes: [],
@@ -1898,6 +1956,7 @@
       if (old === undefined) __attrMapSync(this);
       if (was === null) { if (N !== null) __attrNsMap(this).set(q, [N, prefix, local]); else if (this.__ptAttrNS) this.__ptAttrNS.delete(q); }
       __styleTouchAttr(this, q, old, val);
+      __ptOnTouched(this, q);
       __hasNoteAttr(q, old, val);
       __markDirty(this);
       __mutation({ type: 'attributes', target: this, attributeName: local, attributeNamespace: N,
@@ -1915,6 +1974,7 @@
       if (info) this.__ptAttrNS.delete(q);
       __markDirty(this);
       __styleTouchAttr(this, q, old, null);
+      __ptOnTouched(this, q);
       __hasNoteAttr(q, old, null);
       __mutation({ type: 'attributes', target: this, attributeName: info ? info[2] : q, attributeNamespace: info ? info[0] : null,
         oldValue: old === undefined ? null : old, addedNodes: [], removedNodes: [],
@@ -2160,7 +2220,12 @@
             const finish = () => { release(); if (this.__ptFireLoad) this.__ptFireLoad(true); };
             if (imports) imports.then(finish, finish); else finish();
           };
-          if (wanted && res && typeof res.text === 'function') {
+          // An answer that is not ok (404, 500) is no stylesheet: no rules,
+          // and `error` (Chrome's 404 page parsed as CSS gave rules).
+          if (wanted && res && res.ok === false) {
+            release();
+            if (this.__ptFireLoad) this.__ptFireLoad(false);
+          } else if (wanted && res && typeof res.text === 'function') {
             res.text().then(take, () => take(null));
           } else take(null);
           // A manifest names an icon for installability: Chrome fetches the

@@ -2976,6 +2976,70 @@ pub fn shape_fixes_script() -> String {
 }
 
 const SHAPE_FIXES: &str = r#"(() => {
+  // Handler properties (`onclick`) answer with the compiled `on…` attribute
+  // until the page assigns one (`__pt_attrHandler` in the DOM runtime); a
+  // body's window handlers (`onload`, `onresize`…) are the window's.
+  {
+    const attr = globalThis.__pt_attrHandler;
+    const native = globalThis.__pt_native || ((f) => f);
+    const mark = (t, type) => {
+      try {
+        let st = t.__ptOnSet;
+        if (!st) { Object.defineProperty(t, '__ptOnSet', { value: Object.create(null), configurable: true }); st = t.__ptOnSet; }
+        st[type] = true;
+      } catch (e) {}
+    };
+    const wrap = (P, key) => {
+      const d = P && Object.getOwnPropertyDescriptor(P, key);
+      if (!d || !d.configurable) return;
+      // The window's are plain values here; Chrome has accessors.
+      let g = d.get, s = d.set;
+      if ('value' in d) {
+        let val = d.value;
+        g = function () { return val; };
+        s = function (v) { val = typeof v === 'function' || (v !== null && typeof v === 'object') ? v : null; };
+      }
+      if (!g || !s) return;
+      const type = key.slice(2);
+      const pair = Object.getOwnPropertyDescriptor({
+        // One handler per event, as in HTML: the page's assignment until the
+        // attribute changes, then the attribute's (none once it is removed).
+        get [key]() {
+          const st = this.__ptOnSet;
+          if (st && st[type]) return g.call(this);
+          if (st && type in st) return attr(this, type);
+          const f = attr(this, type);
+          return f !== null ? f : g.call(this);
+        },
+        set [key](v) { s.call(this, v); mark(this, type); },
+      }, key);
+      Object.defineProperty(P, key, { get: native(pair.get), set: native(pair.set), enumerable: d.enumerable, configurable: true });
+    };
+    const forward = (P, key) => {
+      const d = P && Object.getOwnPropertyDescriptor(P, key);
+      if (!d || !d.get || !d.set || !d.configurable) return;
+      const pair = Object.getOwnPropertyDescriptor({
+        get [key]() { return globalThis[key]; },
+        set [key](v) { globalThis[key] = v; },
+      }, key);
+      Object.defineProperty(P, key, { get: native(pair.get), set: native(pair.set), enumerable: d.enumerable, configurable: true });
+    };
+    if (typeof attr === 'function') {
+      const WIN = ['afterprint', 'beforeprint', 'beforeunload', 'hashchange', 'languagechange', 'message', 'messageerror',
+        'offline', 'online', 'pagehide', 'pageshow', 'popstate', 'rejectionhandled', 'storage', 'unhandledrejection',
+        'unload', 'blur', 'error', 'focus', 'load', 'resize', 'scroll'];
+      for (const name of ['HTMLElement', 'SVGElement', 'MathMLElement']) {
+        const P = globalThis[name] && globalThis[name].prototype;
+        if (P) for (const key of Object.getOwnPropertyNames(P)) if (key.startsWith('on')) wrap(P, key);
+      }
+      for (const name of ['HTMLBodyElement', 'HTMLFrameSetElement']) {
+        const P = globalThis[name] && globalThis[name].prototype;
+        if (P) for (const t of WIN) forward(P, 'on' + t);
+      }
+      const W = Object.getOwnPropertyDescriptor(globalThis, 'onload') ? globalThis : (globalThis.Window && Window.prototype);
+      for (const t of WIN) wrap(W, 'on' + t);
+    }
+  }
   // String methods taken before any page script. A page may replace them
   // (Klarna replaces `trim`); the engine must not call the page's copies.
   // Other receivers keep their own method, errors included.

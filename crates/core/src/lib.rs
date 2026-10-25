@@ -13374,6 +13374,95 @@ href|http://www.w3.org/1999/xlink href|http://www.w3.org/1999/xlink".into()));
         assert_eq!(got, Value::String(format!("{r}sub/ | {r}sub/y | {r}sub/x.txt | a,b | sub-x | rgb(1, 2, 3) | {r}elsewhere/ | {r}elsewhere/y | {r}")));
     }
 
+    // Event handler attributes run, as in Chrome 151 (every value read there
+    // on this page): `onclick` in markup and from setAttribute, compiled as
+    // `function onclick(event) {\n…\n}` with `this` the element, `return
+    // false` cancelling, `evt` on SVG, `<body onload>` as the window's
+    // handler (an accessor, as Chrome's), a property assignment winning until
+    // the attribute changes, a syntax error giving null. Not one of them ran
+    // before.
+    #[tokio::test]
+    async fn event_handler_attributes_run() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", r##"<!doctype html><html><head><script>window.r=[];</script></head><body onload="r.push('load:' + (this === window))"><div id=d onclick="r.push('click:' + this.id + ':' + event.type)">x</div><svg id=s onclick="r.push(typeof evt)"></svg><a id=a onclick="return false" href="#x">a</a></body></html>"##).await.unwrap();
+        let _ = ctx.run_event_loop().await;
+        let out = ctx.evaluate(r##"(() => {
+            const d = document.getElementById('d');
+            d.click();
+            document.getElementById('s').dispatchEvent(new MouseEvent('click'));
+            const e = new MouseEvent('click', { cancelable: true });
+            document.getElementById('a').dispatchEvent(e);
+            r.push('prevented:' + e.defaultPrevented, String(d.onclick), String(document.body.onload === window.onload) + ':' + typeof window.onload);
+            const w = Object.getOwnPropertyDescriptor(window, 'onload');
+            r.push(Object.keys(w).join(','), w.get.name);
+            d.setAttribute('onclick', 'r.push(2)'); d.click();
+            d.onclick = null; d.click();
+            d.setAttribute('onclick', 'r.push(3)'); d.click();
+            d.removeAttribute('onclick'); d.click();
+            r.push(String(d.onclick));
+            const b = document.createElement('b'); b.setAttribute('onclick', '{'); r.push(String(b.onclick));
+            return JSON.stringify(r);
+        })()"##).await.unwrap();
+        assert_eq!(out, Value::String(r#"["load:true","click:d:click","object","prevented:true","function onclick(event) {\nr.push('click:' + this.id + ':' + event.type)\n}","true:function","get,set,enumerable,configurable","get onload",2,3,"null","null"]"#.into()));
+    }
+
+    // A stylesheet answered with an error status is no stylesheet: no rules
+    // and an `error` event, as in Chrome 151 (the 404 page was parsed as CSS).
+    #[tokio::test]
+    async fn a_stylesheet_that_fails_has_no_rules() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (status, body) = if req.contains("GET /missing.css") {
+                    ("404 Not Found", "<html><body>p { color: red } div{x:y}</body></html>")
+                } else {
+                    ("200 OK", "<!doctype html><link rel=stylesheet href=/missing.css><p>x</p>")
+                };
+                let resp = format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        let _ = ctx.navigate(&format!("http://127.0.0.1:{}/", addr.port())).await;
+        ctx.evaluate(r#"(() => { window.out = ''; const l = document.createElement('link'); l.rel = 'stylesheet'; l.href = '/missing.css?2';
+            l.onerror = () => { window.out = 'error ' + l.sheet.cssRules.length + ' ' + document.styleSheets[0].cssRules.length; };
+            l.onload = () => { window.out = 'load'; }; document.head.append(l); })()"#).await.unwrap();
+        let t = std::time::Instant::now();
+        while t.elapsed() < std::time::Duration::from_secs(8) && ctx.evaluate("window.out").await.unwrap_or_default() == Value::String(String::new()) {
+            let _ = ctx.run_event_loop().await;
+        }
+        assert_eq!(ctx.evaluate("window.out").await.unwrap(), Value::String("error 0 0".into()));
+    }
+
+    /// One handler per event, as in Chrome 151: an `on…` attribute set after
+    /// an assigned handler replaces it, and removing the attribute leaves none
+    /// (the assigned one came back and still ran).
+    #[tokio::test]
+    async fn an_event_handler_attribute_replaces_the_assigned_one() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<!doctype html><button id=b>x</button>").await.unwrap();
+        let out = ctx.evaluate(r#"(() => { const b = document.getElementById('b'); let n = 0; b.onclick = () => { n++; };
+            b.setAttribute('onclick', 'window.k = (window.k || 0) + 1'); b.click(); b.removeAttribute('onclick'); b.click();
+            return [n, window.k, String(b.onclick)].join(' '); })()"#).await.unwrap();
+        assert_eq!(out, Value::String("0 1 null".into()));
+    }
+
     /// What a stylesheet loads, and what `load` waits for, as measured in
     /// Chrome 151: an `@import` (its rules in the cascade), a background image
     /// resolved against the importing sheet and fetched with it as referrer,
