@@ -14329,7 +14329,7 @@ href|http://www.w3.org/1999/xlink href|http://www.w3.org/1999/xlink".into()));
                 let req = String::from_utf8_lossy(&buf[..n]).to_string();
                 log.lock().unwrap().push(req.clone());
                 let (ctype, body) = if req.starts_with("GET / ") {
-                    ("text/html", "<html><head><link rel=stylesheet href=/s.css><link rel=manifest href=/m.json><link rel=prefetch href=/pf.js><script type=module src=/mod.js></script></head><body><img src=/i.png><iframe src=/f.html></iframe><script>navigator.sendBeacon('/b', 'x')</script></body></html>")
+                    ("text/html", "<html><head><link rel=stylesheet href=/s.css><link rel=manifest href=/m.json><link rel=prefetch href=/pf.js><script type=module src=/mod.js></script></head><body><img src=/i.png><iframe src=/f.html></iframe><script>navigator.sendBeacon('/b', 'x'); fetch('/fa', { headers: { Accept: 'application/json' } })</script></body></html>")
                 } else if req.starts_with("GET /f.html") {
                     ("text/html", "<html><body>f</body></html>")
                 } else {
@@ -14377,6 +14377,16 @@ href|http://www.w3.org/1999/xlink href|http://www.w3.org/1999/xlink".into()));
         assert_eq!(header("/b", "content-type"), s("text/plain;charset=UTF-8"));
         assert_eq!(dm("/favicon.ico"), (s("image"), s("no-cors")));
         assert!(seen.iter().all(|r| !r.to_ascii_lowercase().contains("\r\npriority:")), "no priority over HTTP/1.1");
+        // A fetch keeps the Accept its page set, where Chrome puts it: right
+        // after user-agent (GitHub answered the navigation default with 406).
+        assert_eq!(header("/fa", "accept"), s("application/json"));
+        let names: Vec<String> = seen
+            .iter()
+            .find(|r| r.starts_with("GET /fa "))
+            .map(|r| r.lines().skip(1).filter_map(|l| l.split_once(':').map(|(k, _)| k.to_ascii_lowercase())).collect())
+            .unwrap_or_default();
+        let at = |n: &str| names.iter().position(|k| k == n);
+        assert_eq!(at("accept").map(|i| i - 1), at("user-agent"), "{names:?}");
     }
 
     /// What a site asked for with `Accept-CH` stays with a named session across

@@ -851,6 +851,8 @@ impl FingerprintClient {
                 rb = rb.header(*name, v);
             }
         }
+        // An Accept the page set on a fetch/XHR is the page's, in Blink's map
+        // with its other headers.
         let page_accept = req.headers.keys().any(|k| k.eq_ignore_ascii_case("accept"));
         let own_accept = !(page_accept && req.kind == RequestKind::Xhr);
         if own_accept {
@@ -917,7 +919,7 @@ impl FingerprintClient {
                 .keys()
                 .map(|k| k.to_ascii_lowercase())
                 .filter(|k| {
-                    !FP_OWNED_HEADERS.contains(&k.as_str())
+                    (!FP_OWNED_HEADERS.contains(&k.as_str()) || (k == "accept" && !own_accept))
                         && !k.starts_with("sec-")
                         && !matches!(k.as_str(), "content-length" | "referer" | "origin" | "cookie" | "priority" | "upgrade-insecure-requests")
                 })
@@ -959,7 +961,9 @@ impl FingerprintClient {
         if !subresource {
             order.insert("user-agent");
         }
-        order.insert("accept");
+        if own_accept {
+            order.insert("accept");
+        }
         if req.kind == RequestKind::Prerender {
             order.insert("sec-purpose");
         }
@@ -1027,7 +1031,10 @@ impl FingerprintClient {
             let lk = k.to_ascii_lowercase();
             // Forbidden header names: a page cannot set these, so a value that
             // arrived in one is ours to ignore, not to honour.
-            if FP_OWNED_HEADERS.contains(&lk.as_str())
+            // A fetch/XHR keeps the Accept its page set (GitHub's JSON
+            // endpoints answer 406 to the navigation default).
+            let page_owned = lk == "accept" && !own_accept;
+            if (FP_OWNED_HEADERS.contains(&lk.as_str()) && !page_owned)
                 || lk.starts_with("sec-")
                 || lk == "priority"
                 || lk == "upgrade-insecure-requests"
