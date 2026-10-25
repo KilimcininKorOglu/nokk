@@ -155,3 +155,34 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+
+  # `nokk-mcp` (python-mcp/): the MCP server's own command, `uvx nokk-mcp`,
+  # published at the same version as `nokk` once `nokk` is out. Trusted
+  # Publishing again: the PyPI project needs a publisher for this workflow
+  # (owner koloss777, repo nokk, workflow python-wheels.yml, environment pypi).
+  publish-mcp:
+    name: Publish nokk-mcp to PyPI
+    needs: [publish]
+    runs-on: ubuntu-latest
+    if: always() && github.ref_type == 'tag' && needs.publish.result == 'success'
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build nokk-mcp at the tag's version
+        run: |
+          RAW="${GITHUB_REF_NAME#v}"
+          PEP="${RAW/-alpha/a1}"; PEP="${PEP/-beta/b1}"; PEP="${PEP/-rc./rc}"
+          cd python-mcp
+          sed -i "s/^version = \".*\"/version = \"$PEP\"/" pyproject.toml
+          sed -i "s/\"nokk>=[^\"]*\"/\"nokk>=$PEP\"/" pyproject.toml
+          grep -E '^version|nokk>=' pyproject.toml
+          python3 -m pip install --quiet build
+          python3 -m build --outdir dist
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python-mcp/dist

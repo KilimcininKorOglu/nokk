@@ -1,0 +1,24 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.koloss777/nokk",
+  "title": "nokk",
+  "description": "Headless browser for AI agents with Chrome's fingerprint that passes Cloudflare challenges.",
+  "websiteUrl": "https://github.com/koloss777/nokk",
+  "repository": { "url": "https://github.com/koloss777/nokk", "source": "github" },
+  "version": "0.1.46a1",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "nokk-mcp",
+      "version": "0.1.46a1",
+      "runtimeHint": "uvx",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        { "name": "NOKK_PROXY", "description": "Upstream proxy, e.g. socks5://host:1080", "isRequired": false },
+        { "name": "NOKK_ROTATE_FINGERPRINT", "description": "1: each session gets its own coherent fingerprint", "isRequired": false },
+        { "name": "NOKK_NO_AUTO_SOLVE", "description": "1: do not solve challenges during navigation", "isRequired": false }
+      ]
+    }
+  ]
+}

@@ -62,8 +62,9 @@ cargo clippy --release --workspace --all-targets
 
 ## Using nokk from an agent
 
-- **MCP:** `pip install "nokk[mcp]"`, then run `python -m nokk.mcp`. Tools: `open`,
-  `read_text`, `read_html`, `click`, `fill`, `evaluate`, `links`, `reset`.
+- **MCP:** `uvx nokk-mcp` (or `pip install "nokk[mcp]"`, then `python -m nokk.mcp`).
+  Tools: `open`, `read_text`, `read_html`, `click`, `fill`, `evaluate`, `links`,
+  `solve_challenge`, `challenge_state`, `reset`.
 - **CDP:** run `nokk --port 9222 --auto-solve` and connect to
   `ws://127.0.0.1:9222/devtools/browser/nokk`. Use the `ws://` address: an
   `http://` one goes through `HTTP_PROXY` if that is set. A server started with `--token`

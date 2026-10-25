@@ -86,7 +86,7 @@ nokk --port 9222 --auto-solve
 ```
 
 Checked with @playwright/mcp 0.0.83. Screenshots do not work (no rendering engine).
-nokk also has its own MCP server, `pip install "nokk[mcp]"`, see the README.
+nokk also has its own MCP server, `uvx nokk-mcp`, see the README.
 
 ## Playwright and Puppeteer
 

@@ -69,8 +69,18 @@ asyncio.run(main())
 
 `nokk` ships an [MCP](https://modelcontextprotocol.io) server, so an AI agent
 (Claude Desktop, Claude Code, …) can browse and scrape through nokk's
-fingerprinted engine instead of a headful browser that anti-bots flag. Install
-the extra and register it:
+fingerprinted engine instead of a headful browser that anti-bots flag. With
+[uv](https://docs.astral.sh/uv/), register `uvx nokk-mcp`:
+
+```json
+{
+  "mcpServers": {
+    "nokk": { "command": "uvx", "args": ["nokk-mcp", "--rotate-fingerprint"] }
+  }
+}
+```
+
+Without uv, install the extra and register it:
 
 ```bash
 pip install "nokk[mcp]"

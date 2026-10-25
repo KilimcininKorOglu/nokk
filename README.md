@@ -63,7 +63,7 @@ with nokk.launch(auto_solve=True) as server, sync_playwright() as pw:
     print(page.title())
 ```
 
-For AI agents, `pip install "nokk[mcp]"` turns it into an [MCP server](#for-ai-agents-mcp).
+For AI agents, `uvx nokk-mcp` runs it as an [MCP server](#for-ai-agents-mcp).
 Puppeteer, Node, sessions and the Cloudflare options are [below](#usage).
 
 ## Why nokk
@@ -163,15 +163,17 @@ work the same way. See [docs/integrations.md](docs/integrations.md).
 
 ### For AI agents (MCP)
 
-With the `nokk[mcp]` extra, nokk runs as a [Model Context Protocol](https://modelcontextprotocol.io)
-server, so an agent such as Claude Desktop or Claude Code browses through the fingerprinted engine.
+nokk runs as a [Model Context Protocol](https://modelcontextprotocol.io) server, so an agent
+such as Claude Desktop or Claude Code browses through the fingerprinted engine. With
+[uv](https://docs.astral.sh/uv/) nothing needs installing first:
 
-```jsonc
-// pip install "nokk[mcp]"   (use the python from that environment)
-{ "mcpServers": { "nokk": { "command": "python", "args": ["-m", "nokk.mcp", "--rotate-fingerprint"] } } }
+```json
+{ "mcpServers": { "nokk": { "command": "uvx", "args": ["nokk-mcp", "--rotate-fingerprint"] } } }
 ```
 
-Tools: `open`, `read_text`, `read_html`, `click`, `fill`, `evaluate`, `links`, `reset`.
+Without uv: `pip install "nokk[mcp]"`, then `"command": "python", "args": ["-m", "nokk.mcp"]`.
+Tools: `open`, `read_text`, `read_html`, `click`, `fill`, `evaluate`, `links`, `solve_challenge`,
+`challenge_state`, `reset`.
 
 ### Cloudflare challenges
 
