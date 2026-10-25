@@ -30,6 +30,7 @@ use serde_json::Value;
 pub use nokk_net::{CookieRecord, ProxyConfig, ProxyScheme, Response as HttpResponse};
 pub use nokk_pool::{PoolConfig, WorkerId};
 
+mod importmap;
 mod intercept;
 pub use intercept::{Decision, PausedRequest};
 use intercept::PageClient;
@@ -869,6 +870,7 @@ impl Engine {
             doc_gen: std::sync::atomic::AtomicU64::new(0),
             pending_frames: std::sync::Mutex::new(Vec::new()),
             frame_places: std::sync::Mutex::new(HashMap::new()),
+            import_maps: std::sync::Mutex::new(HashMap::new()),
             round_deadline: std::sync::Mutex::new(None),
             port_ends: std::sync::Mutex::new(HashMap::new()),
             next_timer_at: std::sync::Mutex::new(None),
@@ -1156,6 +1158,8 @@ pub struct BrowserContext {
     doc_gen: std::sync::atomic::AtomicU64,
     /// Frames opened during a bounded pump whose documents are loading.
     pending_frames: std::sync::Mutex<Vec<PendingFrame>>,
+    /// Each document's import map, by realm index.
+    import_maps: std::sync::Mutex<HashMap<usize, importmap::ImportMap>>,
     /// The thread each cross-origin frame being opened will run on, by frame
     /// id, with its load already counted there (see `reserve_frame_worker`).
     frame_places: std::sync::Mutex<HashMap<u32, (WorkerId, nokk_pool::ContextLoadGuard)>>,
@@ -1806,6 +1810,38 @@ impl BrowserContext {
         self.stopped_at_clearance.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Record a document's `<script type="importmap">` (later maps add to it).
+    fn add_import_map(&self, index: usize, json: &str, base: &str) {
+        let Some(map) = importmap::ImportMap::parse(json, base) else {
+            tracing::debug!(target: "nokk::load", "import map is not valid JSON");
+            return;
+        };
+        if let Ok(mut maps) = self.import_maps.lock() {
+            match maps.get_mut(&index) {
+                Some(m) => m.merge(map),
+                None => {
+                    maps.insert(index, map);
+                }
+            }
+        }
+    }
+
+    /// A module specifier imported from `base` in the realm `index`, through
+    /// that document's import map.
+    fn resolve_specifier(&self, index: usize, base: &str, spec: &str) -> Option<String> {
+        // Code with no address of its own (a DevTools evaluation, an `eval`)
+        // imports relative to the document, as in Chrome.
+        let doc;
+        let base = if url::Url::parse(base).is_ok() {
+            base
+        } else {
+            doc = self.document_url();
+            doc.as_str()
+        };
+        let maps = self.import_maps.lock().ok()?;
+        importmap::resolve(maps.get(&index), base, spec)
+    }
+
     /// `cf_clearance` for the site of `url`, not anywhere in the jar: pages of
     /// one browser context share the jar, and another site's lock counted as
     /// this page's, so its solve stopped with the page still on the gate
@@ -1962,6 +1998,10 @@ impl BrowserContext {
         // deferred ones in order, `DOMContentLoaded`, and the remaining `async`
         // scripts as they arrive: Chrome's DOMContentLoaded does not wait for an
         // async script still on the network, its `load` does.
+        // A new document starts without the last one's import map.
+        if let Ok(mut maps) = self.import_maps.lock() {
+            maps.remove(&index);
+        }
         let n = page.scripts.len();
         let asyncs: Vec<usize> = (0..n).filter(|&i| mode_of(i) == nokk_dom::ScriptMode::Async).collect();
         let mut plan: std::collections::VecDeque<Step> = (0..n)
@@ -2083,6 +2123,7 @@ impl BrowserContext {
                 nokk_dom::Script::InlineModule(_) => "inline module",
                 nokk_dom::Script::ExternalModule(_) => "module",
                 nokk_dom::Script::Skipped => "skipped",
+                nokk_dom::Script::ImportMap(_) => "import map",
                 _ => "script",
             }, "script step");
             // Give frames a turn before every document script: pages like chess.com load
@@ -2098,6 +2139,12 @@ impl BrowserContext {
             // halves (every Vite build does) runs its whole app twice if we take
             // the fallback as well.
             if matches!(script, nokk_dom::Script::Skipped) {
+                continue;
+            }
+            // An import map takes effect where the parser meets it, for the
+            // module scripts after it (they run after parsing).
+            if let nokk_dom::Script::ImportMap(json) = script {
+                self.add_import_map(index, json, base_url);
                 continue;
             }
             // Document CSP: inline without a nonce, or a blocked URL, is skipped.
@@ -2178,7 +2225,8 @@ impl BrowserContext {
                 // Handled above, before this match.
                 nokk_dom::Script::InlineModule(_)
                 | nokk_dom::Script::ExternalModule(_)
-                | nokk_dom::Script::Skipped => continue,
+                | nokk_dom::Script::Skipped
+                | nokk_dom::Script::ImportMap(_) => continue,
             };
             // The script's timing entry must be visible while it runs: in a browser the
             // response arrived before the script started. Turnstile's api.js looks up its own
@@ -4541,9 +4589,9 @@ impl BrowserContext {
                     .map_err(EngineError::Js)?;
 
                 for spec in requests {
-                    // A bare specifier ("react") needs an import map to mean anything;
-                    // a bundled page never has one, and guessing would be worse.
-                    let Some(target) = resolve_url(&at, &spec) else {
+                    // A bare specifier ("react") means something only through an
+                    // import map; unresolved, the graph fails as in Chrome.
+                    let Some(target) = self.resolve_specifier(index, &at, &spec) else {
                         continue;
                     };
                     let (from, sp, to) = (at.clone(), spec.clone(), target.clone());
@@ -4630,7 +4678,7 @@ impl BrowserContext {
         }
         // The referrer is the address the module was compiled under, so a
         // relative specifier resolves against it exactly as in a browser.
-        let targets: Vec<Option<String>> = asked.iter().map(|(_, _, r, sp)| resolve_url(r, sp)).collect();
+        let targets: Vec<Option<String>> = asked.iter().map(|(_, i, r, sp)| self.resolve_specifier(*i, r, sp)).collect();
         // All roots load together, as in a browser; one after another cost GitHub
         // a second and a half per round of chunks.
         // One request per address and realm (the module map), however many ask.
@@ -11964,6 +12012,173 @@ body { margin: 0; font-family: sans-serif; }
         assert_eq!(out["sync"], "", "{out}");
         assert_eq!(out["task"], "https://example.com/q.png", "{out}");
         assert_eq!(out["removed"], "", "{out}");
+    }
+
+    // select.add and remove (and the options collection's), with Chrome
+    // 151's errors; a drop-down selects its first enabled option as options go
+    // in and keeps it when more go before it.
+    #[tokio::test]
+    async fn select_add_and_remove_answer_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<!doctype html><body></body>").await.unwrap();
+        let out = ctx.evaluate(r##"(() => {
+  const r = [];
+  const s = document.createElement('select');
+  s.innerHTML = '<option>a</option><optgroup><option>b</option></optgroup>';
+  const t = (f) => { try { f(); r.push('ok'); } catch (e) { r.push(e.name + ': ' + e.message); } };
+  t(() => s.add(document.createElement('div')));
+  t(() => s.add(new Option('x'), document.createElement('option')));
+  t(() => s.options.add(document.createElement('div')));
+  t(() => s.add(new Option('z'), s.options[2]));
+  t(() => s.add(new Option('n'), '1'));
+  r.push(s.innerHTML);
+  t(() => s.remove(0)); t(() => s.options.remove(0));
+  r.push(s.innerHTML, '__ptSelect' in s.options, Object.getOwnPropertyNames(s.options).join());
+  const d = document.createElement('div'); d.append(s); s.remove(); r.push(d.childNodes.length);
+  const s2 = document.createElement('select'); s2.add(new Option('p')); s2.add(new Option('q'), 0);
+  r.push(s2.selectedIndex, [...s2.options].map((o) => o.selected).join());
+  const s3 = document.createElement('select'); const g = new Option('g'); g.disabled = true; s3.append(g, new Option('h'));
+  r.push(s3.selectedIndex, s3.value, [...s3.options].map((o) => o.selected).join());
+  return r.join('\n');
+})()"##).await.unwrap();
+        assert_eq!(out, Value::String("TypeError: Failed to execute 'add' on 'HTMLSelectElement': The provided value is not of type '(HTMLOptGroupElement or HTMLOptionElement)'.
+NotFoundError: Failed to execute 'add' on 'HTMLSelectElement': The node before which the new node is to be inserted is not a child of this node.
+TypeError: Failed to execute 'add' on 'HTMLOptionsCollection': The provided value is not of type '(HTMLOptGroupElement or HTMLOptionElement)'.
+ok
+ok
+<option>a</option><optgroup><option>n</option><option>b</option></optgroup><option>z</option>
+ok
+ok
+<optgroup><option>b</option></optgroup><option>z</option>
+false
+0,1
+0
+1
+false,true
+1
+h
+false,true".into()));
+    }
+
+    /// Web components as Chrome 151 builds them, each checked against it on the same
+    /// page: a `<template shadowrootmode>` in the document becomes its host's shadow
+    /// root (not in innerHTML or DOMParser, not on a host that cannot have one or has
+    /// one); getHTML writes a serializable root back as such a template and cloneNode
+    /// copies a clonable one; a definition upgrades elements already there by running
+    /// the class constructor on them (Lit's state lives there); slots hand out the host's
+    /// children; text and comments have element siblings. MDN's dropdowns rendered
+    /// nothing before.
+    #[tokio::test]
+    async fn shadow_roots_upgrades_and_slots_work_as_in_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><body>
+            <div id="h"><template shadowrootmode="open" shadowrootserializable shadowrootclonable><b>in</b><slot></slot></template><i>light</i></div>
+            <a id="a"><template shadowrootmode="open">no</template></a>
+            <div id="c"><template shadowrootmode="closed">c</template></div>
+            <my-el id="m">x<!--k--><span slot="s">s</span></my-el>
+            <script>
+              const R = globalThis.R = {};
+              const h = document.getElementById('h');
+              R.dsd = [h.shadowRoot && h.shadowRoot.innerHTML, h.innerHTML, document.querySelectorAll('template').length, document.getElementById('c').innerHTML];
+              R.notHost = document.getElementById('a').shadowRoot;
+              const d = document.createElement('div'); d.innerHTML = '<template shadowrootmode="open">i</template>';
+              R.inner = [d.shadowRoot, d.innerHTML];
+              R.dp = !!new DOMParser().parseFromString('<div><template shadowrootmode="open">p</template></div>', 'text/html').querySelector('div').shadowRoot;
+              R.getHTML = h.getHTML({ serializableShadowRoots: true });
+              R.clone = !!h.cloneNode(true).shadowRoot;
+              class M extends HTMLElement { constructor() { super(); this.made = (this.made || 0) + 1; } connectedCallback() { this.conn = this.made; } }
+              customElements.define('my-el', M);
+              const m = document.getElementById('m');
+              R.upgrade = [m.made, m.conn, m instanceof M];
+              const sr = m.attachShadow({ mode: 'open' }); sr.innerHTML = '<slot name="s"></slot><slot id="d"></slot>';
+              R.slots = [sr.querySelector('slot').assignedElements().map((e) => e.tagName).join(), sr.getElementById('d').assignedNodes().map((n) => n.nodeName).join(), m.firstChild.assignedSlot === sr.getElementById('d')];
+              R.sib = [m.firstChild.nextElementSibling.tagName, m.childNodes[1].previousElementSibling];
+            </script></body></html>"#,
+        )
+        .await
+        .unwrap();
+        let out = probe(&ctx, "__ptJSON.stringify(R)").await;
+        assert_eq!(out["dsd"], serde_json::json!(["<b>in</b><slot></slot>", "<i>light</i>", 1, ""]), "{out}");
+        assert_eq!(out["notHost"], serde_json::Value::Null, "{out}");
+        assert_eq!(out["inner"], serde_json::json!([null, "<template shadowrootmode=\"open\">i</template>"]), "{out}");
+        assert_eq!(out["dp"], false, "{out}");
+        assert_eq!(out["getHTML"], "<template shadowrootmode=\"open\" shadowrootserializable=\"\" shadowrootclonable=\"\"><b>in</b><slot></slot></template><i>light</i>", "{out}");
+        assert_eq!(out["clone"], true, "{out}");
+        assert_eq!(out["upgrade"], serde_json::json!([1, 1, true]), "the constructor ran once, on the element: {out}");
+        assert_eq!(out["slots"], serde_json::json!(["SPAN", "#text", true]), "{out}");
+        assert_eq!(out["sib"], serde_json::json!(["SPAN", null]), "{out}");
+    }
+
+    /// A non-special URL with a path and no host (`x:/a`) is hierarchical: relative
+    /// references resolve against it and `..` collapses, as in Chrome. webpack's
+    /// `new URL(path, "x:/")` threw, and MDN loaded none of its components.
+    #[tokio::test]
+    async fn a_url_without_a_host_resolves_relative_references() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        let v = ctx
+            .evaluate(r#"(() => { const t = (a, b) => { try { return new URL(a, b).href; } catch (e) { return 'ERR'; } };
+              return [t('/static/1.js', 'x:/'), t('a/b.js', 'x:/c/d'), t('?q', 'x:/p'), t('//h/p', 'x:/'), t('x:/a/../b'), t('p', 'x:'), t('q', 'mailto:a@b'),
+                      new URL('x:/a/b?c#d').pathname, new URL('x:abc').pathname].join(' '); })()"#)
+            .await
+            .unwrap();
+        assert_eq!(v, Value::String("x:/static/1.js x:/c/a/b.js x:/p?q x://h/p x:/b ERR ERR /a/b abc".into()));
+    }
+
+    /// Bare module specifiers resolve through the document's import map, statically
+    /// and in `import()`, with prefix keys; an unmapped bare name fails. GitHub
+    /// imports `react` this way and none of its React apps ran.
+    #[tokio::test]
+    async fn modules_resolve_bare_names_through_the_import_map() {
+        let _serial = serial().await;
+        const PAGE: &str = r#"<html><head><script type="importmap">{"imports":{"dep":"/m/dep.js","lib/":"/m/lib/"}}</script></head><body>
+          <script type="module">
+            import { v } from "dep";
+            globalThis.R = [v];
+            import("lib/x.js").then((m) => R.push(m.x), (e) => R.push('ERR'));
+            import("nope").then(() => R.push('nope ok'), (e) => R.push(e.name));
+          </script></body></html>"#;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let (ct, body) = if req.starts_with("GET /m/dep.js") {
+                        ("text/javascript", "export const v = 'dep';")
+                    } else if req.starts_with("GET /m/lib/x.js") {
+                        ("text/javascript", "export const x = 'lib';")
+                    } else {
+                        ("text/html", PAGE)
+                    };
+                    let out = format!("HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = stream.write_all(out.as_bytes()).await;
+                });
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&format!("http://{addr}/")).await.unwrap();
+        for _ in 0..20 {
+            ctx.run_event_loop().await.unwrap();
+        }
+        let out = probe(&ctx, "__ptJSON.stringify(globalThis.R || null)").await;
+        assert_eq!(out, serde_json::json!(["dep", "lib", "TypeError"]), "{out}");
     }
 
     /// A page counts as cleared by its own site's `cf_clearance` only. Pages of one

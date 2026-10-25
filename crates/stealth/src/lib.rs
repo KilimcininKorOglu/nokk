@@ -3501,11 +3501,15 @@ const SHAPE_FIXES: &str = r#"(() => {
     if (globalThis.HTMLOptionsCollection && typeof __pt_selSetLength === 'function') {
       const OC = HTMLOptionsCollection.prototype;
       const nat2 = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
-      const own = (c) => (c && c.__ptSelect) || null;
+      const own = (c) => (typeof __pt_optsSelect === "function" ? __pt_optsSelect(c) : null);
       Object.defineProperty(OC, 'length', { get: nat2(({ get length() { return this.__ptLen | 0; } }).__lookupGetter__('length')),
         set: nat2(({ set length(v) { const s = own(this); if (s) __pt_selSetLength(s, v); } }).__lookupSetter__('length')), enumerable: true, configurable: true });
       Object.defineProperty(OC, 'selectedIndex', { get: nat2(({ get selectedIndex() { const s = own(this); return s ? s.selectedIndex : -1; } }).__lookupGetter__('selectedIndex')),
         set: nat2(({ set selectedIndex(v) { const s = own(this); if (s) __pt_selSetIndex(s, v); } }).__lookupSetter__('selectedIndex')), enumerable: true, configurable: true });
+      if (typeof __pt_selAdd === 'function') {
+        Object.defineProperty(OC, 'add', { value: nat2(({ add(element) { const s = own(this); if (s) __pt_selAdd(s, element, arguments[1], 'HTMLOptionsCollection'); } }).add), writable: true, enumerable: true, configurable: true });
+        Object.defineProperty(OC, 'remove', { value: nat2(({ remove(index) { const s = own(this); if (s) __pt_selRemove(s, index); } }).remove), writable: true, enumerable: true, configurable: true });
+      }
     }
     // SVGElement.className is a read-only SVGAnimatedString.
     if (globalThis.SVGElement) { const d = Object.getOwnPropertyDescriptor(SVGElement.prototype, 'className'); if (d && d.set) Object.defineProperty(SVGElement.prototype, 'className', { get: d.get, set: undefined, enumerable: true, configurable: true }); }
@@ -14751,7 +14755,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           st.scheme = scheme;
           st.username = b.username; st.password = b.password;
           st.host = b.host; __pt_write(st, 'port', b.port);
-          st.opaque = false;
+          st.opaque = false; st.noAuth = !!b.noAuth;
           let rest = s;
           const hi = __s_indexOf(rest, '#'); st.fragment = hi >= 0 ? encFrag(__s_slice(rest, hi)) : '';
           if (hi >= 0) rest = __s_slice(rest, 0, hi);
@@ -14768,7 +14772,20 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       }
       st.scheme = scheme;
       const special = Object.prototype.hasOwnProperty.call(SPECIAL, scheme);
-      st.opaque = !special && !__s_startsWith(s, '//');
+      st.opaque = !special && !__s_startsWith(s, '/');
+      st.noAuth = false;
+      if (!special && __s_startsWith(s, '/') && !__s_startsWith(s, '//')) {
+        // `x:/a/b`: a path without a host, resolved like any other
+        // (webpack's `new URL(path, "x:/")` builds chunk URLs this way).
+        const hi = __s_indexOf(s, '#'); st.fragment = hi >= 0 ? encFrag(__s_slice(s, hi)) : '';
+        if (hi >= 0) s = __s_slice(s, 0, hi);
+        const qi = __s_indexOf(s, '?'); st.query = qi >= 0 ? encQuery(__s_slice(s, qi), false) : '';
+        if (qi >= 0) s = __s_slice(s, 0, qi);
+        st.host = ''; __pt_write(st, 'port', ''); st.username = ''; st.password = '';
+        st.noAuth = true;
+        st.path = encPath(normPath(s));
+        return true;
+      }
       if (st.opaque) {
         // `mailto:`, `data:`, `about:`, `blob:`: the whole path, no host.
         const hi = __s_indexOf(s, '#'); const frag = hi >= 0 ? __s_slice(s, hi) : '';
@@ -14878,7 +14895,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       }
       get href() {
         const st = URL_STATE.get(this);
-        if (st.opaque) return st.scheme + st.path + this.search + st.fragment;
+        if (st.opaque || st.noAuth) return st.scheme + st.path + this.search + st.fragment;
         const cred = st.username ? st.username + (st.password ? ':' + st.password : '') + '@' : '';
         return st.scheme + '//' + cred + this.host + st.path + this.search + st.fragment;
       }

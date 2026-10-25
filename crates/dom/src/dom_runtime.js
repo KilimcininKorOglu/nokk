@@ -217,6 +217,40 @@
   }
   // Depth first without a stack frame per level; a node's children as they
   // were right after `fn` saw it, then its shadow tree.
+  // ---- slots ----------------------------------------------------------------
+  const __slotRoot = (slot) => { let r = slot; while (r.__ptParent) r = r.__ptParent; return r.__ptHost && r.__ptType === 11 ? r : null; };
+  const __slotsIn = (root) => { const out = []; __walkTree(root, (n) => { if (n.__ptType === ELEMENT_NODE && n.__ptLocal === 'slot' && !n.__ptNS) out.push(n); }); return out; };
+  // The slot a host's child is assigned to; with `openOnly`, none behind a
+  // closed root (`assignedSlot` does not reveal it).
+  function __slotFor(node, openOnly) {
+    const host = node.__ptParent, root = host && host.__ptShadow;
+    if (!root || (openOnly && root.mode !== 'open')) return null;
+    if (node.__ptType !== ELEMENT_NODE && node.__ptType !== TEXT_NODE) return null;
+    const slots = __slotsIn(root);
+    if (root.__ptSlotAssignment === 'manual') { for (const sl of slots) if (sl.__ptManual && __s_includes(sl.__ptManual, node)) return sl; return null; }
+    const name = node.__ptType === ELEMENT_NODE ? (__ptGetA(node, 'slot') || '') : '';
+    for (const sl of slots) if ((__ptGetA(sl, 'name') || '') === name) return sl;
+    return null;
+  }
+  function __slotAssigned(slot) {
+    const root = __slotRoot(slot);
+    if (!root) return [];
+    const kids = root.__ptHost.__ptKids;
+    if (root.__ptSlotAssignment === 'manual') return (slot.__ptManual || []).filter((n) => __s_includes(kids, n) && __slotFor(n, false) === slot);
+    return kids.filter((n) => __slotFor(n, false) === slot);
+  }
+  // Assigned nodes with slots inside expanded, the slot's own children when
+  // nothing is assigned.
+  function __slotFlat(slot) {
+    const out = [];
+    const assigned = __slotAssigned(slot);
+    const src = assigned.length ? assigned : (__slotRoot(slot) ? slot.__ptKids.filter((n) => n.__ptType === ELEMENT_NODE || n.__ptType === TEXT_NODE) : []);
+    for (const n of src) {
+      if (n.__ptType === ELEMENT_NODE && n.__ptLocal === 'slot' && !n.__ptNS && __slotRoot(n)) for (const m of __slotFlat(n)) out.push(m);
+      else out.push(n);
+    }
+    return out;
+  }
   function __walkTree(node, fn) {
     if (!node) return;
     const st = [node];
@@ -821,6 +855,12 @@
   // One node copied as `cloneNode(false)` copies it.
   function __cloneOne(n) {
     const c = n.__ptShallowClone();
+    // A clonable shadow root is copied with its host, its children deep.
+    const sr = n.__ptType === ELEMENT_NODE && n.__ptShadow;
+    if (sr && sr.__ptClonable) {
+      const copy = __ptAttachShadow.call(c, { mode: sr.mode, delegatesFocus: !!sr.__ptDelegatesFocus, clonable: true, serializable: !!sr.__ptSerializable, slotAssignment: sr.__ptSlotAssignment });
+      for (const k of sr.__ptKids) __ptAdd.call(copy, __ptCloneNode.call(k, true));
+    }
     // A clone carries the exact inline style numbers, not the six-digit
     // printed ones: Chrome clones the parsed declaration, so
     // `scale(1.000998)` stays 1.000998 though the attribute says 1.001.
@@ -930,6 +970,7 @@
       const i = (ref === null || ref === undefined) ? -1 : __s_indexOf(this.__ptKids, ref);
       if (i < 0) this.__ptKids.push(child); else this.__ptKids.splice(i, 0, child);
       child.__ptParent = this;
+      if ((this.__ptTag === 'SELECT' || this.__ptTag === 'OPTGROUP') && child.__ptType === ELEMENT_NODE) __ptSelReset(this);
       __markDirty(this);
       __styleTouchKids(this, child, __s_indexOf(this.__ptKids, child));
       __hasNoteTree(child);
@@ -1351,6 +1392,10 @@
     get data() { return this.__ptData; }
     // [LegacyNullToEmptyString]
     set data(v) { __cdSetAll(this, v === null ? '' : String(v)); }
+    // NonDocumentTypeChildNode: text and comments have element siblings too
+    // (Lit finds the element after its `<!--lit-node-->` marker this way).
+    get nextElementSibling() { let n = this.nextSibling; while (n && n.__ptType !== ELEMENT_NODE) n = n.nextSibling; return n; }
+    get previousElementSibling() { let n = this.previousSibling; while (n && n.__ptType !== ELEMENT_NODE) n = n.previousSibling; return n; }
     get length() { return this.__ptData.length; }
     appendData(data) {
       __needArgs(arguments.length, 1, 'appendData', 'CharacterData');
@@ -1383,6 +1428,7 @@
   }
   class Text extends CharacterData {
     constructor(data) { super(TEXT_NODE); this.__ptData = data === undefined ? '' : String(data); }
+    get assignedSlot() { return __slotFor(this, true); }
     // The data of this node and the Text nodes next to it.
     get wholeText() {
       const p = this.__ptParent;
@@ -1689,9 +1735,14 @@
   const __customUpgrade = (el, Ctor) => {
     if (el.__ptUpgraded) return;
     Object.defineProperty(el, '__ptUpgraded', { value: true, configurable: true, enumerable: false });
-    // A constructor body cannot be rerun on an existing node, so the element
-    // gets the class prototype: methods and callbacks are in place.
     try { Object.setPrototypeOf(el, Ctor.prototype); } catch (e) { return; }
+    // The constructor runs on the element itself (its fields, its state);
+    // one that throws is reported and the element stays as it is.
+    const prev = __upgrading;
+    __upgrading = { el, ctor: Ctor };
+    try { Reflect.construct(Ctor, []); }
+    catch (e) { if (typeof globalThis.__pt_reportError === 'function') __pt_reportError(e, 'custom element'); }
+    finally { __upgrading = prev; }
     const watched = Ctor.observedAttributes;
     if (Array.isArray(watched)) {
       for (const a of watched) {
@@ -2661,7 +2712,11 @@
     getHTML(opts) {
       const kids = (this.__ptLocal === 'template' ? __templateContent(this) : this).__ptKids;
       const withShadow = !!(opts && opts.serializableShadowRoots);
-      return kids.map((n) => serializeNode(n, withShadow)).join('');
+      // The element's own serializable shadow root comes first, as a
+      // declarative <template shadowrootmode>.
+      const sr = withShadow && this.__ptShadow && this.__ptShadow.__ptSerializable ? this.__ptShadow : null;
+      const own = sr ? `<template shadowrootmode="${sr.mode}"${sr.__ptDelegatesFocus ? ' shadowrootdelegatesfocus=""' : ''}${sr.__ptSerializable ? ' shadowrootserializable=""' : ''}${sr.__ptClonable ? ' shadowrootclonable=""' : ''}>` + sr.__ptKids.map((n) => serializeNode(n, true)).join('') + '</template>' : '';
+      return own + kids.map((n) => serializeNode(n, withShadow)).join('');
     }
     get shadowRoot() {
       const r = this.__ptShadow;
@@ -3720,9 +3775,46 @@
   // through names a page can wrap: in Chrome neither `appendChild` inside
   // `innerHTML` nor `setAttribute` inside `new Image` is visible.
   const __ptInsert = Node.prototype.insertBefore;
+  // A drop-down's options, in tree order (those in its optgroups too).
+  function __ptSelOptions(sel) {
+    const out = [];
+    for (const k of (sel.__ptKids || [])) {
+      if (k.__ptType !== ELEMENT_NODE) continue;
+      if (k.__ptTag === 'OPTION') out.push(k);
+      else if (k.__ptTag === 'OPTGROUP') for (const o of (k.__ptKids || [])) if (o.__ptType === ELEMENT_NODE && o.__ptTag === 'OPTION') out.push(o);
+    }
+    return out;
+  }
+  const __ptOptOn = (o) => !!(o.__ptSelected != null ? o.__ptSelected : __ptHasA(o, 'selected'));
+  const __ptOptEnabled = (o) => !__ptHasA(o, 'disabled') && !(o.__ptParent && o.__ptParent.__ptTag === 'OPTGROUP' && __ptHasA(o.__ptParent, 'disabled'));
+  const __ptDropDown = (sel) => !__ptHasA(sel, 'multiple') && !(parseInt(__ptGetA(sel, 'size'), 10) > 1);
+  // The option a drop-down shows: the last one selected, else its first
+  // enabled one.
+  function __ptSelChosen(sel) {
+    let last = null, first = null;
+    for (const o of __ptSelOptions(sel)) {
+      if (__ptOptOn(o)) last = o;
+      else if (!first && __ptOptEnabled(o)) first = o;
+    }
+    return last || first;
+  }
+  // Inserting into a drop-down with nothing selected selects its first
+  // enabled option, and that choice stays when options go in before it.
+  function __ptSelReset(node) {
+    const sel = node.__ptTag === 'OPTGROUP' ? node.__ptParent : node;
+    if (!sel || sel.__ptTag !== 'SELECT' || !__ptDropDown(sel)) return;
+    let first = null;
+    for (const o of __ptSelOptions(sel)) {
+      if (__ptOptOn(o)) return;
+      if (!first && __ptOptEnabled(o)) first = o;
+    }
+    if (first) first.__ptSelected = true;
+  }
   const __ptAdd = Node.prototype.appendChild;
   const __ptDrop = Node.prototype.removeChild;
   const __ptSetAttr = Element.prototype.setAttribute;
+  const __ptAttachShadow = Element.prototype.attachShadow;
+  const __ptCloneNode = Node.prototype.cloneNode;
   // Internal attribute access. Reflecting properties (`el.src`, `el.id`,
   // `style.color`, `classList`) do not call `getAttribute`/`setAttribute` in
   // Chrome; it is native work a page hook does not see.
@@ -6690,7 +6782,27 @@
   // `into` the top-level nodes are appended there, else returned. Scripts the
   // parser builds are "already started" unless `live`: the engine runs a
   // document's own, and markup set later (`innerHTML`) never runs.
-  function __buildSpecs(doc, specs, into, live) {
+  // Elements a shadow root can be attached to (Chrome's list).
+  const __SHADOW_HOSTS = new Set(['article', 'aside', 'blockquote', 'body', 'div', 'footer', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'main', 'nav', 'p', 'section', 'span']);
+  // `<template shadowrootmode>` in a document the parser builds becomes its
+  // parent's shadow root, as Chrome's parser makes it; null when it stays a
+  // template (another mode, a host that cannot have one or already has one).
+  function __declarativeShadow(parent, spec) {
+    if (!parent || parent.__ptType !== ELEMENT_NODE || parent.__ptShadow) return null;
+    let mode = null, delegates = false, clonable = false, serializable = false;
+    for (const a of spec.attrs) {
+      const k = __s_toLowerCase(a[0]);
+      if (k === 'shadowrootmode') mode = __s_toLowerCase(a[1]);
+      else if (k === 'shadowrootdelegatesfocus') delegates = true;
+      else if (k === 'shadowrootclonable') clonable = true;
+      else if (k === 'shadowrootserializable') serializable = true;
+    }
+    if (mode !== 'open' && mode !== 'closed') return null;
+    const host = parent.__ptLocal;
+    if (parent.__ptNS || !(__SHADOW_HOSTS.has(host) || __s_indexOf(host, '-') > 0)) return null;
+    try { return __ptAttachShadow.call(parent, { mode, delegatesFocus: delegates, clonable, serializable }); } catch (e) { return null; }
+  }
+  function __buildSpecs(doc, specs, into, live, dsd) {
     const out = [];
     const st = [specs, 0, into];
     while (st.length) {
@@ -6705,6 +6817,10 @@
       else if (spec.k === 'p') n = __makePI(doc, spec.t, spec.v);
       else if (spec.k === 'd') n = __makeDoctype(doc, spec.name, spec.publicId, spec.systemId);
       else if (spec.k === 'e') {
+        if (dsd && spec.tag === 'template' && !spec.ns) {
+          const sr = __declarativeShadow(parent, spec);
+          if (sr) { if (spec.children.length) st.push(spec.children, 0, sr); continue; }
+        }
         const el = __parserElement(doc, spec);
         if (spec.tag === 'script' && !spec.ns) {
           if (!live) {
@@ -6735,7 +6851,7 @@
     doc.__ptKids = [];
     doc.__ptDocEl = null;
     doc.__ptDoctype = null;
-    for (const n of __buildSpecs(doc, r.children, null, !!live)) {
+    for (const n of __buildSpecs(doc, r.children, null, !!live, !!live)) {
       if (n.__ptType === 10) {
         n.__ptParent = doc;
         doc.__ptKids.push(n);
@@ -6778,7 +6894,8 @@
   }
   globalThis.__pt_templateContent = __templateContent;
 
-  const buildNode = (doc, spec) => __buildSpecs(doc, [spec], null, false)[0];
+  // The page's own document: declarative shadow roots attach.
+  const buildNode = (doc, spec) => __buildSpecs(doc, [spec], null, false, true)[0];
 
   // ---- install globals ------------------------------------------------------
   const document = new Document();
@@ -6918,6 +7035,10 @@
   // right. Members still live on Element; their distribution comes later.
   const __ifaceProto = new Map();
   let __pendingTag = 'div';
+  // The element a custom element definition is upgrading, with its class:
+  // `super()` from that class hands back the existing element, as Chrome's
+  // HTMLElement constructor does, so the constructor body runs on it.
+  let __upgrading = null;
   // Strict mode matters: a sloppy function has own `arguments` and `caller`,
   // a browser interface does not, and the graph walk would see two extra
   // properties on each of ~100 `HTML*Element` names.
@@ -6928,7 +7049,11 @@
     const C = ({ [name]: function () {
       // `new HTMLElement()` throws in Chrome, but `super()` from a custom
       // element class must work.
-      if (new.target && new.target !== C) return Reflect.construct(Element, [__pendingTag], new.target);
+      if (new.target && new.target !== C) {
+        const up = __upgrading;
+        if (up && up.ctor === new.target) { __upgrading = null; return up.el; }
+        return Reflect.construct(Element, [__pendingTag], new.target);
+      }
       throw __pt_mkErr(TypeError, "Illegal constructor");
     } })[name];
     C.prototype = Object.create(parentProto);
@@ -7060,7 +7185,37 @@
     };
     const isSelected = (o) => !!(o.__ptSelected != null ? o.__ptSelected : __ptHasA(o, 'selected'));
     const SEL = proto('HTMLSelectElement');
-    defGet(SEL, 'options', function () { const c = branded(selOptions(this), 'HTMLOptionsCollection'); try { Object.defineProperty(c, '__ptSelect', { value: this, configurable: true }); } catch (e) {} return c; });
+    // The select an options collection is of, for its setters.
+    const selOfOpts = new WeakMap();
+    globalThis.__pt_optsSelect = (c) => selOfOpts.get(c) || null;
+    defGet(SEL, 'options', function () { const c = branded(selOptions(this), 'HTMLOptionsCollection'); selOfOpts.set(c, this); return c; });
+    // add(option or optgroup, before: an element in it, an option index, or null).
+    const selAdd = (sel, el, before, on) => {
+      const fail = (what, name) => __pt_mkErr(name ? (globalThis.DOMException || Error) : TypeError, "Failed to execute 'add' on '" + on + "': " + what, name);
+      if (!isTag(el, 'option', 'optgroup')) throw fail('The provided value is not of type \'(HTMLOptGroupElement or HTMLOptionElement)\'.');
+      let ref = null;
+      if (before != null) {
+        if (typeof before === 'object') {
+          let p = before.__ptParent;
+          while (p && p !== sel) p = p.__ptParent;
+          if (!p) throw fail('The node before which the new node is to be inserted is not a child of this node.', 'NotFoundError');
+          ref = before;
+        } else ref = selOptions(sel)[Number(before) | 0] || null;
+      }
+      if (ref === el) return;
+      __ptInsert.call(ref ? ref.__ptParent : sel, el, ref);
+    };
+    const selRemove = (sel, i) => {
+      const o = selOptions(sel)[Number(i) | 0];
+      if (o && o.__ptParent) o.__ptParent.removeChild(o);
+    };
+    defFn(SEL, 'add', function add(element) { selAdd(this, element, arguments[1], 'HTMLSelectElement'); });
+    defFn(SEL, 'remove', function remove() {
+      if (!arguments.length) { const p = this.__ptParent; if (p) p.removeChild(this); return; }
+      selRemove(this, arguments[0]);
+    });
+    globalThis.__pt_selAdd = selAdd;
+    globalThis.__pt_selRemove = selRemove;
     // selectedIndex and length setters, as Chrome's HTMLSelectElement/HTMLOptionsCollection.
     const selSetIndex = (sel, i) => {
       const opts = selOptions(sel); i = i | 0;
@@ -7076,16 +7231,20 @@
     // A select's `value` is the selected option's; option `selected`/`value`/`text`.
     const optValue = (o) => { const v = __ptGetA(o, 'value'); return v != null ? String(v) : __s_trim(__s_replace(String(o.textContent || ''), /\s+/g, ' ')); };
     defPair(SEL, 'value', function () {
-      const opts = selOptions(this); const multiple = __ptHasA(this, 'multiple');
-      let chosen = opts.filter(isSelected);
-      if (!multiple) { if (chosen.length > 1) chosen = [chosen[chosen.length - 1]]; if (!chosen.length && opts.length && __ptGetA(this, 'size') == null) chosen = [opts[0]]; }
+      if (__ptDropDown(this)) { const o = __ptSelChosen(this); return o ? optValue(o) : ''; }
+      const chosen = selOptions(this).filter(isSelected);
       return chosen.length ? optValue(chosen[0]) : '';
     }, function (v) {
       const opts = selOptions(this); v = String(v); let hit = false;
       for (const o of opts) { if (!hit && optValue(o) === v) { o.__ptSelected = true; hit = true; } else o.__ptSelected = false; }
     });
     const O_ = proto('HTMLOptionElement');
-    defPair(O_, 'selected', function () { return isSelected(this); }, function (v) {
+    defPair(O_, 'selected', function () {
+      let p = this.__ptParent;
+      if (p && p.__ptTag === 'OPTGROUP') p = p.__ptParent;
+      if (p && p.__ptTag === 'SELECT' && __ptDropDown(p)) return __ptSelChosen(p) === this;
+      return isSelected(this);
+    }, function (v) {
       this.__ptSelected = !!v;
       __markDirty(this);
       if (v) { let p = this.__ptParent; if (p && isTag(p, 'optgroup')) p = p.__ptParent; if (p && isTag(p, 'select') && !__ptHasA(p, 'multiple')) for (const o of selOptions(p)) if (o !== this) o.__ptSelected = false; }
@@ -7204,6 +7363,25 @@
     defGet(M, 'areas', function () { const out = []; __walkTree(this, (n) => { if (isTag(n, 'area')) out.push(n); }); return __collection(out); });
     const O = proto('HTMLOptionElement');
     defGet(O, 'index', function () { let p = this.__ptParent; if (p && isTag(p, 'optgroup')) p = p.__ptParent; return p && isTag(p, 'select') ? __s_indexOf(selOptions(p), this) : 0; });
+    // Slots: a host's child goes to the first slot of its shadow tree with
+    // the same name (or the slot it was assigned to in manual mode); Lit and
+    // other components read `assignedElements()` to find their content.
+    const SL = proto('HTMLSlotElement');
+    defFn(SL, 'assignedNodes', function assignedNodes(opts) { return opts && opts.flatten ? __slotFlat(this) : __slotAssigned(this); });
+    defFn(SL, 'assignedElements', function assignedElements(opts) { return (opts && opts.flatten ? __slotFlat(this) : __slotAssigned(this)).filter((n) => n.__ptType === ELEMENT_NODE); });
+    defFn(SL, 'assign', function assign(...nodes) {
+      const root = __slotRoot(this);
+      const list = [];
+      for (const n of nodes) {
+        if (!n || (n.__ptType !== ELEMENT_NODE && n.__ptType !== TEXT_NODE)) throw __pt_mkErr(TypeError, "Failed to execute 'assign' on 'HTMLSlotElement': Failed to convert value to 'Element or Text'.");
+        if (!__s_includes(list, n)) list.push(n);
+      }
+      // A node is assigned to one slot at a time.
+      if (root) for (const other of __slotsIn(root)) if (other !== this && other.__ptManual) other.__ptManual = other.__ptManual.filter((n) => !__s_includes(list, n));
+      Object.defineProperty(this, '__ptManual', { value: list, writable: true, configurable: true, enumerable: false });
+    });
+    const slotGet = function () { return __slotFor(this, true); };
+    defGet(globalThis.Element && Element.prototype, 'assignedSlot', slotGet);
   }
   globalThis.__pt_elementProto = (tag) => {
     tag = __s_toLowerCase(String(tag));
@@ -8586,6 +8764,20 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // Violation from a direct eval/Function: called from the codegen hook
   // (modify_codegen in pool) before the EvalError is thrown.
   try { Object.defineProperty(globalThis, '__pt_cspEvalViolation', { value: () => { const e = __cspEvalMessage(); if (e) __cspViolation(e.name, e.list, 'eval'); }, writable: true, enumerable: false, configurable: true }); } catch (e) {}
+  // DevTools evaluation (CDP Runtime.evaluate, callFunctionOn) is not the
+  // page's code: Chrome runs it whatever the page's CSP or Trusted Types say.
+  // Playwright's evaluate on GitHub got an EvalError instead.
+  globalThis.__pt_devEval = (src) => {
+    const allowed = !globalThis.__pt_cspEval && !globalThis.__pt_ttOn;
+    const tt = __csp.ttBypass;
+    try { if (typeof globalThis.__pt_setCodegen === 'function') __pt_setCodegen(true); } catch (e) {}
+    __csp.ttBypass = true;
+    try { return (0, eval)(src); }
+    finally {
+      __csp.ttBypass = tt;
+      try { if (typeof globalThis.__pt_setCodegen === 'function') __pt_setCodegen(allowed); } catch (e) {}
+    }
+  };
   const __cspWrapEval = () => {
     const ev = __cspEvalMessage();
     const tt = __ttRequired();

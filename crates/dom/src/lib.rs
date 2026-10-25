@@ -35,6 +35,8 @@ pub enum Script {
     /// The element is still counted so the numbering stays the document's own:
     /// `__pt_beginScript(i)` indexes every `<script>` the parser saw.
     Skipped,
+    /// `<script type="importmap">`, inline: the map module specifiers resolve through.
+    ImportMap(String),
 }
 
 /// When a script runs. A browser runs a classic script during parsing,
@@ -262,9 +264,10 @@ fn serialize(node: &Handle, out: &mut String, scripts: &mut Vec<Script>, modes: 
                         t.is_empty() || t == "module" || is_javascript_type(&t)
                     }
                 };
-                if !executable {
-                    scripts.push(Script::Skipped);
-                } else if nomodule && !module {
+                let import_map = attr("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("importmap"));
+                if import_map && attr("src").is_none() {
+                    scripts.push(Script::ImportMap(text_content(node)));
+                } else if !executable || (nomodule && !module) {
                     scripts.push(Script::Skipped);
                 } else {
                     match attr("src") {
@@ -592,7 +595,7 @@ mod tests {
             page.scripts,
             vec![
                 Script::Skipped,
-                Script::Skipped,
+                Script::ImportMap(r#"{"imports": {}}"#.into()),
                 Script::Skipped,
                 Script::Skipped,
                 Script::Inline("var a = 1".into()),

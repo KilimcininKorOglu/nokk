@@ -2132,7 +2132,7 @@ async fn frame_eval(ctx: &BrowserContext, frame: u32, expr: &str, by_value: bool
     // of the string is what a frame under Trusted Types refuses (Turnstile's is one),
     // and DevTools evaluates there regardless. Statements fall back to `eval`.
     let compiled = format!("(\n{expr}\n)");
-    let evaled = format!("(0, eval)({})", js_str(expr));
+    let evaled = format!("__pt_devEval({})", js_str(expr));
     if await_promise {
         // As for the page: the settled value lands in a hidden slot of the
         // frame's global while the loop (frames included) runs.
@@ -2223,7 +2223,7 @@ async fn remote_eval(
         let slot = format!("__pt_cdp{}", IDS.fetch_add(1, Ordering::Relaxed));
         let setup = format!(
             "Object.defineProperty(globalThis, '{slot}', {{ value: {{ done: false, v: undefined }}, configurable: true, enumerable: false, writable: true }}); \
-             Promise.resolve((0, eval)({src})).then(\
+             Promise.resolve(__pt_devEval({src})).then(\
                v => {{ globalThis.{slot}.v = v; globalThis.{slot}.done = true; }}, \
                e => {{ globalThis.{slot}.v = String(e); globalThis.{slot}.done = true; }});"
         );
@@ -2262,7 +2262,7 @@ async fn remote_eval(
         )
     } else {
         format!(
-            "(() => {{ try {{ return JSON.stringify(__pt_wrap((0, eval)({src}), {by})); }} \
+            "(() => {{ try {{ return JSON.stringify(__pt_wrap(__pt_devEval({src}), {by})); }} \
                catch (e) {{ return JSON.stringify(__pt_wrap(String(e), true)); }} }})()"
         )
     };
@@ -2859,6 +2859,29 @@ mod tests {
         assert!(super::parse_proxy_server("ftp://h:1").is_none());
         assert!(super::parse_proxy_server("no-port").is_none());
         assert_eq!(super::parse_proxy_server("http://p.webshare.io:80/").unwrap().port, 80);
+    }
+
+    /// DevTools evaluation is not the page's code: Chrome runs it under any CSP.
+    /// Playwright's evaluate on GitHub (script-src without 'unsafe-eval') got an
+    /// EvalError; the page's own eval stays refused.
+    #[tokio::test]
+    async fn evaluate_runs_under_a_csp_without_unsafe_eval() {
+        let _s = SERIAL.lock().await;
+        let conn = test_conn();
+        let ctx = conn.engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><head><meta http-equiv="Content-Security-Policy" content="script-src 'self' 'nonce-n'"></head><body><script nonce="n">try { eval('1'); globalThis.pageEval = 'ran'; } catch (e) { globalThis.pageEval = e.name; }</script></body></html>"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(remote_eval(&ctx, "1 + 2", true, false).await["value"], json!(3));
+        assert_eq!(remote_eval(&ctx, "Promise.resolve(globalThis.pageEval)", true, true).await["value"], json!("EvalError"));
+        // Still refused for the page after the evaluation.
+        assert_eq!(
+            ctx.evaluate("(() => { try { eval('1'); return 'ran'; } catch (e) { return e.name; } })()").await.unwrap(),
+            json!("EvalError")
+        );
     }
 
     /// `awaitPromise` with a frame's context waits for the promise, as with the
