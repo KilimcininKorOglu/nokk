@@ -1368,7 +1368,7 @@ pub struct ChallengeState {
     pub url: String,
     /// A standalone widget has issued its token.
     pub token: bool,
-    /// A `cf_clearance` cookie is in the jar.
+    /// A `cf_clearance` cookie for the page's site is in the jar.
     pub cleared: bool,
 }
 
@@ -1540,7 +1540,7 @@ impl BrowserContext {
                     .lock()
                     .ok()
                     .and_then(|l| l.clone())
-                    .unwrap_or_else(|| self.clearance_value())
+                    .unwrap_or_else(|| self.clearance_value_for(&current))
             } else {
                 None
             };
@@ -1554,7 +1554,7 @@ impl BrowserContext {
             // a solve: indeed.com spent 16 s on its own React bundles after the
             // challenge had already cleared.
             if stop {
-                let after = self.clearance_value();
+                let after = self.clearance_value_for(&final_url);
                 if after.is_some() && after != lock_before {
                     tracing::info!(target: "nokk", url = %final_url, "clearance received; not loading the page behind it");
                     self.stopped_at_clearance.store(true, std::sync::atomic::Ordering::Release);
@@ -1660,7 +1660,7 @@ impl BrowserContext {
 
     async fn load_html_now(&self, base_url: &str, html: &str) -> Result<(), EngineError> {
         if let Ok(mut l) = self.lock_at_doc.lock() {
-            *l = Some(self.clearance_value());
+            *l = Some(self.clearance_value_for(base_url));
         }
         // The outgoing document takes its workers with it.
         self.terminate_workers_of(None).await;
@@ -1806,8 +1806,12 @@ impl BrowserContext {
         self.stopped_at_clearance.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    fn clearance_value(&self) -> Option<String> {
-        self.client.cookies().into_iter().find(|c| c.name == "cf_clearance").map(|c| c.value)
+    /// `cf_clearance` for the site of `url`, not anywhere in the jar: pages of
+    /// one browser context share the jar, and another site's lock counted as
+    /// this page's, so its solve stopped with the page still on the gate
+    /// (scrapy-playwright opens every page in one context).
+    fn clearance_value_for(&self, url: &str) -> Option<String> {
+        self.cookies(&[url.to_string()]).into_iter().find(|c| c.name == "cf_clearance").map(|c| c.value)
     }
 
     /// The number of documents this page has loaded so far (see `doc_seq`).
@@ -3135,7 +3139,7 @@ impl BrowserContext {
             .and_then(|x| x.as_str())
             .and_then(|t| serde_json::from_str(t).ok());
         let g = |k: &str| parsed.as_ref().and_then(|o| o[k].as_bool()).unwrap_or(false);
-        let cleared = self.cookies(&[]).iter().any(|c| c.name == "cf_clearance");
+        let cleared = self.clearance_value_for(&self.document_url()).is_some();
         let kind = if g("inter") {
             ChallengeKind::CloudflareInterstitial
         } else if g("datadome") {
@@ -3180,13 +3184,13 @@ impl BrowserContext {
         let mut gate_seen: Option<ChallengeKind> = None;
         // In stop-at-clearance mode only a fresh lock counts: one already in the
         // jar may be the stale cookie that sent us to the gate.
-        let lock_at_start = self.clearance_value();
+        let lock_at_start = self.clearance_value_for(&self.document_url());
         let mut gate_checked = t - std::time::Duration::from_secs(1);
         let mut last_press: Option<std::time::Instant> = None;
         let mut puzzle_checked = t;
         let status = loop {
             let worked = self.run_event_loop().await.unwrap_or(0);
-            let cleared = self.cookies(&[]).iter().any(|c| c.name == "cf_clearance");
+            let cleared = self.clearance_value_for(&self.document_url()).is_some();
             // A standalone widget (not an interstitial) sets no cookie: its
             // success is the token in `cf-turnstile-response`.
             let token = self
@@ -3207,7 +3211,7 @@ impl BrowserContext {
             }
             if self.stop_at_clearance.load(std::sync::atomic::Ordering::Acquire)
                 && (self.stopped_at_clearance.load(std::sync::atomic::Ordering::Acquire)
-                    || (cleared && self.clearance_value() != lock_at_start))
+                    || (cleared && self.clearance_value_for(&self.document_url()) != lock_at_start))
             {
                 tracing::info!(target: "nokk", elapsed_ms = t.elapsed().as_millis(), presses = pressed, "challenge cleared");
                 break ChallengeStatus::Cleared;
@@ -11960,6 +11964,30 @@ body { margin: 0; font-family: sans-serif; }
         assert_eq!(out["sync"], "", "{out}");
         assert_eq!(out["task"], "https://example.com/q.png", "{out}");
         assert_eq!(out["removed"], "", "{out}");
+    }
+
+    /// A page counts as cleared by its own site's `cf_clearance` only. Pages of one
+    /// browser context share the jar; another site's lock stopped this page's solve
+    /// with the page still on the gate (3 of 5 runs beside another solve).
+    #[tokio::test]
+    async fn another_sites_clearance_does_not_clear_this_page() {
+        let _serial = serial().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://www.site-a.test/", "<html><head><title>Just a moment...</title></head><body></body></html>")
+            .await
+            .unwrap();
+        ctx.set_cookie("cf_clearance=other; Domain=site-b.test; Path=/", "https://www.site-b.test/");
+        assert!(!ctx.challenge_state().await.cleared, "site-b's lock is not site-a's");
+        assert_eq!(ctx.clearance_value_for("https://www.site-a.test/"), None);
+        ctx.set_cookie("cf_clearance=mine; Domain=site-a.test; Path=/", "https://www.site-a.test/");
+        assert!(ctx.challenge_state().await.cleared);
+        assert_eq!(ctx.clearance_value_for("https://www.site-a.test/x").as_deref(), Some("mine"));
     }
 
     /// Cross-origin frames of pages loading at once each get a thread of their
